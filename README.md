@@ -2,7 +2,7 @@
 
 A self-hosted systems-language experiment that grew much bigger than I intended.
 
-[The story](docs/PROJECT_STORY.md) ? [Language reference](docs/QUARTZ_REFERENCE.md) ? [Architecture](docs/ARCHITECTURE.md) ? [Known limits](STATUS.md)
+[The story](docs/PROJECT_STORY.md) | [Language reference](docs/QUARTZ_REFERENCE.md) | [Architecture](docs/ARCHITECTURE.md) | [Known limits](STATUS.md)
 
 ```quartz
 def fizzbuzz(n: Int): String when n % 15 == 0 = "FizzBuzz"
@@ -32,6 +32,6 @@ clang /tmp/workshop.o -o /tmp/workshop -lm -lpthread
 
 That example was compiled, linked and run for this edition. It does not establish a clean-source bootstrap on other platforms or a green full test suite. [Build notes](docs/BUILD.md) explain the boundary.
 
-[Public-edition notes](docs/PUBLIC_EDITION.md) ? [Third-party notices](THIRD_PARTY_NOTICES.md) ? [MIT license](LICENSE)
+[Public-edition notes](docs/PUBLIC_EDITION.md) | [Third-party notices](THIRD_PARTY_NOTICES.md) | [MIT license](LICENSE)
 
 Made by [Matt Kelly](https://mattkelly.io/).
