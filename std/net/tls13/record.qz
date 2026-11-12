@@ -1,0 +1,417 @@
+## std/net/tls13/record — TLS 1.3 record layer + transcript hash (RFC 8446 §5)
+##
+## NET.5c.2 substrate. Two related pieces folded into one file per the design
+## memo:
+##
+## 1. **Transcript hash** — incremental SHA-256 / SHA-384 over the
+##    concatenation of every handshake message exchanged. The key schedule
+##    (NET.5c.3) reads `Transcript-Hash(...)` snapshots at HKDF-Expand-Label
+##    callsites; the state machine (NET.5d) feeds each handshake message's
+##    raw bytes (the `raw_ptr`/`raw_len` populated by `handshake.qz`
+##    decoders / written by encoders) as it sends or receives them.
+##
+## 2. **Record layer** — TLSCiphertext wire format (RFC 8446 §5.2):
+##    `struct { ContentType opaque_type=23 | ProtocolVersion legacy_record_version=0x0303 | uint16 length | encrypted_record payload }`
+##    where `encrypted_record = AEAD-Seal(key, nonce, additional_data,
+##    TLSInnerPlaintext)` and `TLSInnerPlaintext = content || real_content_type || zeros[pad_len]`.
+##    AAD is the 5-byte record header itself.
+##    Per-direction `seq` counter (u64, starts at 0, increments per record).
+##    Nonce = `static_iv XOR (seq big-endian padded to 12 bytes)`.
+##    AEAD dispatch via cipher-suite tag.
+##
+## ## Prior art
+##
+## | Project | What we take from it |
+## |---|---|
+## | rustls `tls13/record.rs` | `MessageDecrypter`/`MessageEncrypter` traits with per-suite specialisations; transcript-hash "clone for derive_secret" pattern. |
+## | picotls `picotls.c` `derive_traffic_key` | XOR-iv-with-seq construction; minimal record-layer code |
+## | RFC 8446 §5.1-5.3 + §7.1 | Canonical references. |
+## | BoringSSL `ssl/tls13_record.cc` | Sequence counter overflow handling (RFC says rekey via KeyUpdate before overflow; v1 panics instead). |
+##
+## ## Scope
+##
+## | Supported                                       | NOT (filed forward)                |
+## |-------------------------------------------------|------------------------------------|
+## | TLS_AES_128_GCM_SHA256 (AES-128-GCM + SHA-256)  | TLS_AES_128_CCM_SHA256             |
+## | TLS_AES_256_GCM_SHA384 (AES-256-GCM + SHA-384)  | TLS_AES_128_CCM_8_SHA256           |
+## | TLS_CHACHA20_POLY1305_SHA256                    | KeyUpdate-driven rekey             |
+## | Max plaintext 16384, max ciphertext +256        | Record-protocol back-pressure      |
+## | Padding stripped on open                        | Application-driven padding policy  |
+## | Sequence counter (per direction)                | Out-of-order record handling       |
+##
+## ## API
+##
+## ```quartz
+## # Record header constants
+## def RECORD_TYPE_CHANGE_CIPHER_SPEC = 0x14   # legacy compat (recv-only ignore)
+## def RECORD_TYPE_ALERT = 0x15
+## def RECORD_TYPE_HANDSHAKE = 0x16
+## def RECORD_TYPE_APP_DATA = 0x17             # always sent over the wire after key_schedule live
+##
+## # Hash IDs
+## def TRANSCRIPT_HASH_SHA256 = 1
+## def TRANSCRIPT_HASH_SHA384 = 2
+##
+## # Transcript-hash incremental state
+## struct Transcript { hash_id, ctx }
+## def transcript_new(hash_id) -> Transcript
+## def transcript_update(t, msg_ptr, msg_len) -> Void
+## def transcript_digest(t, out) -> Void       # snapshot, t stays usable
+## def transcript_clone(t) -> Transcript
+## def transcript_digest_size(hash_id) -> Int  # 32 or 48
+## def transcript_free(t) -> Void
+##
+## # Per-direction record-layer state
+## struct TrafficKeys { key_ptr, key_len, iv_ptr, cipher_suite, seq }
+## def traffic_keys_new(cs, key, key_len, iv12) -> TrafficKeys
+##
+## # Record seal/open
+## def record_seal(w: CodecWriter, keys: TrafficKeys,
+##                 content_type, plaintext_ptr, plaintext_len): Int
+## def record_open(record_bytes, record_len, keys,
+##                 plaintext_out_addr, plaintext_out_len_addr,
+##                 content_type_out): Int   # 0 OK, -1 bad tag
+## ```
+##
+## ## Transcript-hash lifetime + clone discipline
+##
+## `sha256_finalize` / `sha384_finalize` FREE the underlying context (no
+## "finalize-without-free" variant). Since the transcript hash is consumed at
+## multiple HKDF-Expand-Label callsites (`derive_secret(hs_secret,
+## "c hs traffic", Transcript-Hash(ClientHello..ServerHello))`,
+## `derive_secret(hs_secret, "s hs traffic", same)`,
+## `derive_secret(master_secret, "c ap traffic", Transcript-Hash(...Finished))`,
+## etc.), each `transcript_digest` call CLONES the context internally
+## (`memcpy` of the 112-byte SHA-256 ctx or 208-byte SHA-384/512 ctx), then
+## finalizes the clone. The live ctx stays alive for more `transcript_update`
+## calls. `transcript_free` `free`s the underlying ctx (which is a single
+## `malloc` from `sha256_new` / `sha384_new`).
+
+import * from ffi/socket
+import * from std/core/crypto/secret
+import * from std/core/crypto/sha256
+import * from std/core/crypto/sha384
+import * from std/core/crypto/aes_gcm
+import * from std/core/crypto/chacha20poly1305
+import * from std/net/tls13/handshake   # for CodecWriter, cipher-suite IDs
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+def RECORD_TYPE_CHANGE_CIPHER_SPEC(): Int = 0x14
+def RECORD_TYPE_ALERT(): Int = 0x15
+def RECORD_TYPE_HANDSHAKE(): Int = 0x16
+def RECORD_TYPE_APP_DATA(): Int = 0x17
+
+# RFC 8446 §5.1 — maximum plaintext fragment length.
+def RECORD_MAX_PLAINTEXT(): Int = 16384
+
+# §5.2 — max ciphertext is plaintext + content_type byte + 256 max padding +
+# 16 tag = 16384 + 273. We round to 16640 to leave headroom.
+def RECORD_MAX_CIPHERTEXT(): Int = 16640
+
+def TRANSCRIPT_HASH_SHA256(): Int = 1
+def TRANSCRIPT_HASH_SHA384(): Int = 2
+
+def RECORD_ERR_TOO_LARGE(): Int = 0 - 1
+def RECORD_ERR_BAD_TAG(): Int = 0 - 2
+def RECORD_ERR_MALFORMED(): Int = 0 - 3
+def RECORD_ERR_SUITE(): Int = 0 - 4
+
+# =============================================================================
+# Transcript hash
+# =============================================================================
+
+struct Transcript
+  hash_id: Int
+  ctx: Int    # sha256/sha384 streaming ctx (size depends on hash_id)
+end
+
+# Context byte sizes (matches sha256.qz _sha256_CTX_SIZE = 112 + sha512.qz
+# _SHA512_CTX_SIZE = 208; SHA-384 reuses the SHA-512 ctx).
+def _ctx_size_for(hash_id: Int): Int
+  if hash_id == TRANSCRIPT_HASH_SHA256() then return 112 end
+  return 208
+end
+
+## Digest size in bytes — 32 for SHA-256, 48 for SHA-384.
+def transcript_digest_size(hash_id: Int): Int
+  if hash_id == TRANSCRIPT_HASH_SHA256() then return 32 end
+  return 48
+end
+
+## Construct a new Transcript over `hash_id` (SHA-256 or SHA-384).
+def transcript_new(hash_id: Int): Transcript
+  var ctx = 0
+  if hash_id == TRANSCRIPT_HASH_SHA256()
+    ctx = sha256_new()
+  end
+  if hash_id == TRANSCRIPT_HASH_SHA384()
+    ctx = sha384_new()
+  end
+  return Transcript { hash_id: hash_id, ctx: ctx, }
+end
+
+## Feed handshake message bytes (typically `raw_ptr`/`raw_len` from a
+## handshake.qz decoder/encoder — i.e. tag+length header included).
+def transcript_update(t: Transcript, msg_ptr: Int, msg_len: Int): Void
+  if t.hash_id == TRANSCRIPT_HASH_SHA256()
+    sha256_update(t.ctx, msg_ptr, msg_len)
+  end
+  if t.hash_id == TRANSCRIPT_HASH_SHA384()
+    sha384_update(t.ctx, msg_ptr, msg_len)
+  end
+end
+
+## Snapshot the current digest into `out` (32 or 48 bytes). Internally clones
+## the ctx — `t` remains alive for more updates afterwards.
+def transcript_digest(t: Transcript, out: Int): Void
+  var sz = _ctx_size_for(t.hash_id)
+  var clone = malloc(sz)
+  memcpy(clone, t.ctx, sz)
+  if t.hash_id == TRANSCRIPT_HASH_SHA256()
+    sha256_finalize(clone, out)
+  end
+  if t.hash_id == TRANSCRIPT_HASH_SHA384()
+    sha384_finalize(clone, out)
+  end
+end
+
+## Clone the entire Transcript — independent ctx, same in-progress state.
+def transcript_clone(t: Transcript): Transcript
+  var sz = _ctx_size_for(t.hash_id)
+  var new_ctx = malloc(sz)
+  memcpy(new_ctx, t.ctx, sz)
+  return Transcript { hash_id: t.hash_id, ctx: new_ctx, }
+end
+
+## Free the transcript's underlying ctx without finalizing. Use when the
+## handshake is over and no more digests will be taken.
+def transcript_free(t: Transcript): Void
+  if t.ctx != 0 then free(t.ctx) end
+  t.ctx = 0
+end
+
+# =============================================================================
+# Record layer
+# =============================================================================
+
+## Per-direction traffic keys + sequence counter.
+##
+## `key_ptr` is the AEAD key bytes (16 for AES-128 / 32 for AES-256 / 32 for
+## ChaCha20-Poly1305). `iv_ptr` is the 12-byte static IV. `cipher_suite` is one
+## of `CIPHER_AES_128_GCM_SHA256` / `..._SHA384` / `..._CHACHA20_POLY1305_SHA256`.
+## `seq` is the per-direction u64 sequence counter — starts at 0, increments
+## once per record sent/received.
+##
+## Caller owns the key + iv buffers (typically derived once by the key schedule
+## and kept alive for the connection's life).
+struct TrafficKeys
+  key_ptr: Int
+  key_len: Int
+  iv_ptr: Int
+  cipher_suite: Int
+  seq: Int
+end
+
+## Construct a TrafficKeys with seq = 0.
+def traffic_keys_new(cipher_suite: Int, key_ptr: Int, key_len: Int, iv_ptr: Int): TrafficKeys
+  return TrafficKeys {
+    key_ptr: key_ptr, key_len: key_len, iv_ptr: iv_ptr,
+    cipher_suite: cipher_suite, seq: 0,
+  }
+end
+
+# Build the per-record nonce: nonce[12] = static_iv XOR (seq left-padded to 12).
+# Writes into `out12`. Caller-owned 12-byte buffer.
+def _build_nonce(out12: Int, iv12: Int, seq: Int): Void
+  var i = 0
+  while i < 4
+    ptr_write_byte(out12 + i, ptr_read_byte(iv12 + i))
+    i = i + 1
+  end
+  # Bytes 4..12 = static_iv[4..12] XOR seq_big_endian_8.
+  ptr_write_byte(out12 +  4, ptr_read_byte(iv12 +  4) ^ ((seq >> 56) & 0xff))
+  ptr_write_byte(out12 +  5, ptr_read_byte(iv12 +  5) ^ ((seq >> 48) & 0xff))
+  ptr_write_byte(out12 +  6, ptr_read_byte(iv12 +  6) ^ ((seq >> 40) & 0xff))
+  ptr_write_byte(out12 +  7, ptr_read_byte(iv12 +  7) ^ ((seq >> 32) & 0xff))
+  ptr_write_byte(out12 +  8, ptr_read_byte(iv12 +  8) ^ ((seq >> 24) & 0xff))
+  ptr_write_byte(out12 +  9, ptr_read_byte(iv12 +  9) ^ ((seq >> 16) & 0xff))
+  ptr_write_byte(out12 + 10, ptr_read_byte(iv12 + 10) ^ ((seq >>  8) & 0xff))
+  ptr_write_byte(out12 + 11, ptr_read_byte(iv12 + 11) ^ (seq & 0xff))
+end
+
+# AEAD seal: encrypts `pt_len` plaintext bytes from `pt` under (key, nonce,
+# aad), writing `pt_len` ciphertext bytes to `ct` and 16 tag bytes to `tag`.
+# Dispatches by cipher suite. Returns 0 on success, -1 on unsupported suite.
+def _aead_seal(cipher_suite: Int,
+               key_ptr: Int, key_len: Int, nonce12: Int,
+               aad: Int, aad_len: Int,
+               pt: Int, pt_len: Int,
+               ct: Int, tag: Int): Int
+  if cipher_suite == CIPHER_AES_128_GCM_SHA256()
+    aes_gcm_encrypt(ct, tag, pt, pt_len, aad, aad_len, secret_wrap<Int>(key_ptr), 16, nonce12)
+    return 0
+  end
+  if cipher_suite == CIPHER_AES_256_GCM_SHA384()
+    aes_gcm_encrypt(ct, tag, pt, pt_len, aad, aad_len, secret_wrap<Int>(key_ptr), 32, nonce12)
+    return 0
+  end
+  if cipher_suite == CIPHER_CHACHA20_POLY1305_SHA256()
+    chacha20poly1305_encrypt(ct, tag, pt, pt_len, aad, aad_len, secret_wrap<Int>(key_ptr), nonce12)
+    return 0
+  end
+  return 0 - 1
+end
+
+# AEAD open: decrypts `ct_len` bytes from `ct`, verifies the 16-byte `tag`
+# under (key, nonce, aad). Returns 0 on success, -1 on tag mismatch or
+# unsupported suite.
+def _aead_open(cipher_suite: Int,
+               key_ptr: Int, key_len: Int, nonce12: Int,
+               aad: Int, aad_len: Int,
+               ct: Int, ct_len: Int, tag: Int,
+               pt: Int): Int
+  if cipher_suite == CIPHER_AES_128_GCM_SHA256()
+    return aes_gcm_decrypt(pt, ct, ct_len, aad, aad_len, secret_wrap<Int>(key_ptr), 16, nonce12, tag)
+  end
+  if cipher_suite == CIPHER_AES_256_GCM_SHA384()
+    return aes_gcm_decrypt(pt, ct, ct_len, aad, aad_len, secret_wrap<Int>(key_ptr), 32, nonce12, tag)
+  end
+  if cipher_suite == CIPHER_CHACHA20_POLY1305_SHA256()
+    return chacha20poly1305_decrypt(pt, ct, ct_len, aad, aad_len, secret_wrap<Int>(key_ptr), nonce12, tag)
+  end
+  return 0 - 1
+end
+
+## Seal a record: append a full TLSCiphertext (5-byte header + AEAD payload)
+## to `w`. `content_type` is the REAL content type (HANDSHAKE / APP_DATA /
+## ALERT); the wire `opaque_type` is always APP_DATA (0x17) per RFC 8446
+## §5.2, with the real type tucked into the plaintext suffix.
+##
+## Increments `keys.seq` on success. Returns 0 on success or RECORD_ERR_*.
+##
+## v1 emits zero padding bytes (TLSInnerPlaintext = content || content_type).
+## Adding a padding policy is a future-perf knob — not a security control
+## given AEAD already hides plaintext byte values.
+def record_seal(w: CodecWriter, keys: TrafficKeys, content_type: Int,
+                pt: Int, pt_len: Int): Int
+  if pt_len > RECORD_MAX_PLAINTEXT() then return RECORD_ERR_TOO_LARGE() end
+
+  # TLSInnerPlaintext = plaintext || content_type byte (no padding for v1)
+  var inner_len = pt_len + 1
+  var inner = malloc(inner_len)
+  if pt_len > 0 then memcpy(inner, pt, pt_len) end
+  ptr_write_byte(inner + pt_len, content_type & 0xff)
+
+  # AEAD output: inner_len ciphertext bytes + 16 tag bytes appended.
+  var ct = malloc(inner_len)
+  var tag = malloc(16)
+
+  # AAD = the 5-byte record header we're about to emit.
+  var record_len = inner_len + 16   # ciphertext + tag
+  var aad = malloc(5)
+  ptr_write_byte(aad,     RECORD_TYPE_APP_DATA())
+  ptr_write_byte(aad + 1, 0x03)   # legacy_record_version high
+  ptr_write_byte(aad + 2, 0x03)   # legacy_record_version low
+  ptr_write_byte(aad + 3, (record_len >> 8) & 0xff)
+  ptr_write_byte(aad + 4, record_len & 0xff)
+
+  # Build per-record nonce.
+  var nonce = malloc(12)
+  _build_nonce(nonce, keys.iv_ptr, keys.seq)
+
+  # Seal.
+  var rc = _aead_seal(keys.cipher_suite, keys.key_ptr, keys.key_len,
+                     nonce, aad, 5, inner, inner_len, ct, tag)
+  if rc != 0
+    free(nonce); free(aad); free(tag); free(ct); free(inner)
+    return RECORD_ERR_SUITE()
+  end
+
+  # Write the wire bytes: 5-byte AAD header + ciphertext + tag.
+  cw_bytes(w, aad, 5)
+  cw_bytes(w, ct, inner_len)
+  cw_bytes(w, tag, 16)
+
+  keys.seq = keys.seq + 1
+
+  free(nonce); free(aad); free(tag); free(ct); free(inner)
+  return 0
+end
+
+## Open a record: parse the 5-byte header from `record_bytes`, verify-decrypt
+## the payload, strip the trailing TLSInnerPlaintext content_type + zero
+## padding, malloc a fresh buffer for the plaintext content, return it via
+## `pt_out_addr` / `pt_out_len_addr` (8-byte writes) + the REAL content_type
+## via `content_type_out` (1 byte).
+##
+## Increments `keys.seq` on success. Caller frees `*pt_out_addr` on success.
+## Returns 0 on success or RECORD_ERR_* on bad tag / malformed / suite.
+def record_open(record_bytes: Int, record_len: Int, keys: TrafficKeys,
+                pt_out_addr: Int, pt_out_len_addr: Int,
+                content_type_out: Int): Int
+  if record_len < 5 + 16 + 1 then return RECORD_ERR_MALFORMED() end
+  var op = ptr_read_byte(record_bytes)
+  # Permit legacy 0x14 ChangeCipherSpec records (RFC 8446 §5 — sent unprotected
+  # for compat, callers handle separately).
+  if op != RECORD_TYPE_APP_DATA() then return RECORD_ERR_MALFORMED() end
+
+  # length = u16 BE at offset 3.
+  var payload_len = (ptr_read_byte(record_bytes + 3) << 8) | ptr_read_byte(record_bytes + 4)
+  if payload_len + 5 > record_len then return RECORD_ERR_MALFORMED() end
+  if payload_len < 17 then return RECORD_ERR_MALFORMED() end   # 16 tag + ≥1 plaintext
+
+  var ct_len = payload_len - 16
+  var ct = record_bytes + 5
+  var tag = record_bytes + 5 + ct_len
+
+  var aad = record_bytes   # the 5-byte header IS the AAD
+  var pt = malloc(ct_len)
+  var nonce = malloc(12)
+  _build_nonce(nonce, keys.iv_ptr, keys.seq)
+
+  var rc = _aead_open(keys.cipher_suite, keys.key_ptr, keys.key_len,
+                     nonce, aad, 5, ct, ct_len, tag, pt)
+  free(nonce)
+  if rc != 0
+    free(pt)
+    return RECORD_ERR_BAD_TAG()
+  end
+
+  # Strip TLSInnerPlaintext suffix: trailing zeros, then a single content_type
+  # byte. Walk back from the end.
+  var i = ct_len - 1
+  while (i >= 0) & (ptr_read_byte(pt + i) == 0)
+    i = i - 1
+  end
+  if i < 0
+    free(pt)
+    return RECORD_ERR_MALFORMED()
+  end
+  var real_ct = ptr_read_byte(pt + i)
+  var content_len = i
+
+  # Copy out the plaintext content (caller-freed).
+  var out_buf = malloc(if content_len == 0 then 1 else content_len end)
+  if content_len > 0 then memcpy(out_buf, pt, content_len) end
+  free(pt)
+
+  # Write out the (ptr, len) pair as 8-byte values via byte writes.
+  var p = out_buf
+  var bi = 0
+  while bi < 8
+    ptr_write_byte(pt_out_addr + bi, (p >> (bi * 8)) & 0xff)
+    bi = bi + 1
+  end
+  bi = 0
+  while bi < 8
+    ptr_write_byte(pt_out_len_addr + bi, (content_len >> (bi * 8)) & 0xff)
+    bi = bi + 1
+  end
+  ptr_write_byte(content_type_out, real_ct)
+
+  keys.seq = keys.seq + 1
+  return 0
+end

@@ -1,0 +1,144 @@
+## std/sync/exclusion/mutex — Mutex + Scoped guard (B.8 Phase 5 first impl)
+##
+## A thin struct wrapper around the procedural `mutex_new` / `mutex_lock` /
+## `mutex_unlock` intrinsics that exposes the canonical Scoped-resource
+## surface. Same semantics, no overhead — both `Mutex` and `MutexGuard`
+## are existentially erased to `Int` at runtime per the type system's
+## existential-types policy.
+##
+## Usage:
+##
+##   var m = mutex(0)
+##   with m.lock do v ->
+##     # v: Int — the protected value snapshot at lock time
+##     # ... work with v ...
+##   end
+##   # implicit: mutex_unlock fires on normal block exit (Phase 4a).
+##   # Throw-safe release_on_throw lands in B.8 Phase 4b.
+##
+## Phase 4a is normal-exit only. A `throw` or `panic` inside the body
+## leaks the lock — same shape as today's manual `mutex_lock` /
+## `mutex_unlock` pairs, so no regression. Phase 4b retrofits a Throws
+## handler around the body so unwind paths fire `release_on_throw` too.
+
+import * from std/scoped
+import * from std/selectable
+
+## A guard handle representing an unclaimed lock. Construction is
+## free (the inner mutex_lock fires from Scoped::acquire, NOT from
+## the guard's construction). Pass to `with` to enter a locked region.
+struct MutexGuard
+  handle: Int
+end
+
+extend MutexGuard with Scoped
+  ## Take the lock. Blocks until the inner mutex is owned by this
+  ## thread, then returns the protected value snapshot.
+  def acquire(self): Int = mutex_lock(@handle)
+
+  ## Release on normal block exit. Writes `value` back as the new
+  ## protected value (write-back semantics — caller's mutations to the
+  ## bound `v` flow through if they reassign or pass an updated value
+  ## explicitly).
+  def release(self, value: Int): Void
+    mutex_unlock(@handle, value)
+  end
+
+  ## Release on exceptional block exit. Default-equivalent for now;
+  ## kept distinct so per-impl errdefer semantics can override later.
+  def release_on_throw(self, value: Int, exc_msg: String): Void
+    mutex_unlock(@handle, value)
+  end
+end
+
+## A mutex carrying a protected `Int` value. Construct via `mutex(initial)`;
+## acquire a Scoped lock via `m.lock`. Direct procedural use of the inner
+## `mutex_lock` / `mutex_unlock` intrinsics still works for callers that
+## need explicit control.
+struct Mutex
+  handle: Int
+end
+
+extend Mutex
+  ## Construct a new Mutex protecting `initial` as its starting value.
+  ## Canonical constructor (D.10). Equivalent to the legacy `mutex(initial)`
+  ## free function.
+  def new(initial: Int): Mutex = Mutex { handle: mutex_new(initial) }
+
+  ## Build a one-shot guard for a `with`-block. The guard's `acquire`
+  ## method actually grabs the lock; constructing the guard is free.
+  def lock(self): MutexGuard = MutexGuard { handle: @handle }
+end
+
+## Legacy free-fn constructor — kept during the D.10 migration window.
+## Prefer `Mutex.new(initial)` in new code.
+def mutex(initial: Int): Mutex = Mutex { handle: mutex_new(initial) }
+
+## A Selectable that races on "can I acquire `mutex_handle` right now?".
+## Use as the right-hand side of `case v = try_lockable(m) => ...` in
+## `select`. `try_poll` issues `mutex_try_lock`; on success the bound `v`
+## is the protected value snapshot AND THE LOCK IS HELD by the current
+## thread — the arm body MUST eventually unlock (typically by mutating
+## `v` and falling out of the with-block, or by calling
+## `mutex_unlock(m.handle, v)` directly).
+##
+## Phase 5 active-wake (2026-05-10): register_waker wires the polling
+## task's frame onto the task-waiter side-table keyed by mutex handle.
+## When any thread calls `mutex_unlock(handle, _)`, the runtime walks
+## the table and `sched_wake`s every matching waiter. Latency:
+## ~us (was ~10ms via Phase 4a chunked-poll).
+##
+## **Lock semantics on win**: try_poll calls `mutex_try_lock` which
+## takes the lock (pthread_mutex_trylock). `complete` is side-effect
+## free — the lock stays held into the arm body. Like FutureSelectable,
+## the user's pattern binding is sourced from try_poll's Option payload,
+## not from `complete`'s return value.
+##
+## **Failure value**: `mutex_try_lock` returns -1 when the lock is
+## already held by another thread. If the protected value can
+## legitimately be -1, the caller must reach for a sentinel value or
+## wrap with a discriminated Option/Result at the application layer.
+struct MutexTrySelectable
+  mutex_handle: Int
+end
+
+extend MutexTrySelectable with Selectable<Int>
+  ## try_poll: attempt `mutex_try_lock`. Returns `Some(value)` if the
+  ## lock was acquired (lock is now held by current thread!),
+  ## `None` if another thread holds it.
+  def try_poll(self): Option<Int>
+    var v = mutex_try_lock(@mutex_handle)
+    if v == -1
+      return option_none()
+    end
+    return option_some(v)
+  end
+
+  ## register_waker: append (mutex_handle, waiter_frame) to the shared
+  ## resource-waiter side-table. The `mutex_unlock` codegen fires
+  ## `__qz_waiter_notify_all(mutex_handle)` after every unlock, which
+  ## wakes us.
+  def register_waker(self, frame: Int): Void
+    waiter_register(@mutex_handle, frame)
+  end
+
+  ## unregister_waker: remove (mutex_handle, waiter_frame) from the
+  ## side-table. Called eagerly in the body prologue before the arm
+  ## body runs.
+  def unregister_waker(self, frame: Int): Void
+    waiter_unregister(@mutex_handle, frame)
+  end
+
+  ## complete: no-op. The protected value was read by mutex_try_lock
+  ## and lives in the Option payload set by try_poll. The lock remains
+  ## held by the current thread.
+  def complete(self): Int
+    return 0
+  end
+end
+
+## Wrap a Mutex as a Selectable that fires when the lock becomes
+## acquirable. The wrapper is free — the actual `mutex_try_lock` fires
+## on each `try_poll` from the select runtime. On win, the lock IS
+## HELD; the arm body must arrange for unlock.
+def try_lockable(m: Mutex): MutexTrySelectable = MutexTrySelectable { mutex_handle: m.handle }

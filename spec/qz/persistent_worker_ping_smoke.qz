@@ -1,0 +1,199 @@
+## QSpec runner Phase 5.0b smoke — persistent worker ping/shutdown round-trip.
+##
+## This smoke is the executable verification described in
+## `docs/design/QUARTZD.md` for Phase 5.0b ("manual: send a request, get
+## a valid response"). It dogfoods the same wire protocol the qspec
+## runner will speak in Phase 5.0c, so the helpers here become the
+## reference implementation for the runner-side framing logic.
+##
+## Pipeline:
+##   1. Open TCP listener on 127.0.0.1:0 (kernel picks port).
+##   2. Spawn `quartz --persistent-worker --connect-port=PORT` inside a
+##      goroutine via `go posix_spawn_wait(...)` — async so main can
+##      enter `tcp_accept` while the child is starting up.
+##   3. Accept worker's connection.
+##   4. Send a `ping` request frame; read + decode response; assert
+##      request_id and status.
+##   5. Send a `shutdown` request frame; read + decode response; assert.
+##   6. Await the worker future and check exit code.
+##
+## Build + run:
+##   ./self-hosted/bin/quartz \
+##     -I std -I . -I self-hosted/shared \
+##     spec/qz/persistent_worker_ping_smoke.qz | \
+##     llc -filetype=obj -o /tmp/pw.o && \
+##     clang /tmp/pw.o -o /tmp/pw -lm -lpthread && /tmp/pw
+
+import * from std/net/tcp
+import std/ffi/socket
+import * from persistent_worker_protocol
+
+## Read exactly N bytes from `stream`. Binary-safe — bypasses
+## `cstr_to_string` truncation by routing through cptr_to_string_with_len.
+def smoke_read_exact(stream: TcpStream, n: Int): String
+  if n <= 0
+    return ""
+  end
+  var buf = qz_malloc(n)
+  if buf == 0
+    return ""
+  end
+  var got = 0
+  while got < n
+    var bytes = socket::socket_recv(stream.fd, buf + got, n - got, 0)
+    if bytes <= 0
+      mem_free(buf)
+      return ""
+    end
+    got = got + bytes
+  end
+  var s = cptr_to_string_with_len(buf, n)
+  mem_free(buf)
+  return s
+end
+
+## Read one full length-prefixed frame (4-byte LE prefix + body).
+def smoke_read_frame(stream: TcpStream): String
+  var prefix = smoke_read_exact(stream, 4)
+  if str_byte_len(prefix) != 4
+    return ""
+  end
+  var body_len = read_frame_length(prefix)
+  if body_len <= 0
+    return prefix
+  end
+  var body = smoke_read_exact(stream, body_len)
+  if str_byte_len(body) != body_len
+    return ""
+  end
+  return prefix + body
+end
+
+## Binary-safe write — bypasses tcp_write's strdup-truncation.
+def smoke_write_all(stream: TcpStream, data: String): Int
+  var total = str_byte_len(data)
+  if total == 0
+    return 0
+  end
+  var ptr = str_to_ptr(data)
+  var sent = 0
+  while sent < total
+    var n = socket::socket_send(stream.fd, ptr + sent, total - sent, 0)
+    if n < 0
+      return -1
+    end
+    sent = sent + n
+  end
+  return sent
+end
+
+## Build a control-only WorkRequest (no argv, no cwd).
+def smoke_make_request(request_id: Int, kind: String): WorkRequest
+  return WorkRequest {
+    request_id: request_id,
+    kind: kind,
+    argv: vec_new<String>(),
+    cwd: "",
+    path_env: "",
+    stderr_path: "",
+  }
+end
+
+## Send a request and read the response on the same stream. Returns the
+## decoded WorkResponse — caller checks .status / .request_id.
+def smoke_round_trip(stream: TcpStream, req: WorkRequest): WorkResponse
+  var encoded = encode_request(req)
+  var written = smoke_write_all(stream, encoded)
+  if written < 0
+    puts("FAIL: write to worker failed")
+    exit(1)
+  end
+  var frame = smoke_read_frame(stream)
+  if str_byte_len(frame) == 0
+    puts("FAIL: read from worker returned empty (EOF or error)")
+    exit(1)
+  end
+  var dec = decode_response(frame)
+  if dec.ok == false
+    puts("FAIL: decode_response failed: #{dec.error_msg}")
+    exit(1)
+  end
+  return dec.response
+end
+
+## Run the worker subprocess. Inside `go ...`, this becomes a future the
+## smoke awaits at the end so we observe the exit code.
+def smoke_run_worker(port: Int): Int
+  var cmd = "./self-hosted/bin/quartz --persistent-worker --connect-port=#{port.to_s()}"
+  return posix_spawn_wait(cmd)
+end
+
+def main(): Int
+  # Step 1: listener on kernel-assigned port.
+  var listen_result = tcp_listen(0)
+  match listen_result
+    ListenResult::Err(e) => {
+      puts("FAIL: tcp_listen failed: #{e.message}")
+      return 1
+    }
+    ListenResult::Ok(listener) => {
+      var port = listener.port
+      puts("smoke: listener on 127.0.0.1:#{port.to_s()}")
+
+      # Step 2: spawn worker as a goroutine so main can accept().
+      var worker = go smoke_run_worker(port)
+
+      # Step 3: accept the worker's connect-back.
+      var accept_result = tcp_accept(listener)
+      match accept_result
+        AcceptResult::Err(e) => {
+          puts("FAIL: tcp_accept failed: #{e.message}")
+          var _wc = tcp_close_listener(listener)
+          return 1
+        }
+        AcceptResult::Ok(stream) => {
+          puts("smoke: worker connected (fd=#{stream.fd.to_s()})")
+
+          # Step 4: ping round-trip.
+          var ping_resp = smoke_round_trip(stream, smoke_make_request(1, REQ_PING()))
+          if ping_resp.request_id != 1
+            puts("FAIL: ping response request_id=#{ping_resp.request_id.to_s()}, expected 1")
+            return 1
+          end
+          if ping_resp.status != RESP_OK()
+            puts("FAIL: ping response status=#{ping_resp.status}, expected ok")
+            return 1
+          end
+          puts("smoke: ping OK (#{ping_resp.duration_ms.to_s()}ms)")
+
+          # Step 5: shutdown round-trip.
+          var sd_resp = smoke_round_trip(stream, smoke_make_request(2, REQ_SHUTDOWN()))
+          if sd_resp.request_id != 2
+            puts("FAIL: shutdown response request_id=#{sd_resp.request_id.to_s()}, expected 2")
+            return 1
+          end
+          if sd_resp.status != RESP_OK()
+            puts("FAIL: shutdown response status=#{sd_resp.status}, expected ok")
+            return 1
+          end
+          puts("smoke: shutdown OK (#{sd_resp.duration_ms.to_s()}ms)")
+
+          var _close = tcp_close(stream)
+
+          # Step 6: await worker's posix_spawn_wait future.
+          var wait_status = await worker
+          if wait_status != 0
+            puts("FAIL: worker exited with non-zero wait status #{wait_status.to_s()}")
+            return 1
+          end
+          puts("smoke: worker exited cleanly")
+
+          var _wc = tcp_close_listener(listener)
+          puts("PASS")
+          return 0
+        }
+      end
+    }
+  end
+  return 0
+end

@@ -1,0 +1,1675 @@
+##! # Type Checker Pattern Matching
+##!
+##! Pattern matching validation, variable binding, and exhaustiveness checking.
+##!
+##! @see typecheck_walk Main AST walking module
+
+import typecheck
+import typecheck_util
+import typecheck_registry
+import ast
+import diagnostic
+import node_constants
+import type_constants
+import std/diag
+import * from str_compat
+
+# ============================================================================
+# Pattern Variable Binding
+# ============================================================================
+
+## Resolve a variant payload annotation to a concrete type.
+## If the annotation matches a generic type parameter name (e.g., "A", "B"),
+## extract the corresponding type argument from the subject ptype.
+## Otherwise, parse the annotation as a concrete type.
+##
+## Parameters:
+##   tc              - Type checker context
+##   annotation      - The variant field annotation string (e.g., "A", "Int")
+##   type_params_str - The enum's type parameter string (e.g., "A, B" or "T")
+##   subject_type    - The match subject's type (may be a ptype like Option<Int>)
+##
+## Returns: Resolved TypeId, or TYPE_INT as fallback
+def tc_resolve_variant_type(tc: TypecheckState, annotation: String, type_params_str: String, subject_type: TypeId): TypeId
+  # If no type params, the annotation is a concrete type name
+  if str_byte_len(type_params_str) == 0
+    return typecheck::tc_parse_type(tc, annotation)
+  end
+
+  # Clean type_params_str: remove spaces so "A, B" becomes "A,B"
+  var tp_clean = str_replace(type_params_str, " ", "")
+
+  # Find which type parameter position the annotation matches
+  var param_idx = -1
+  var param_count = 0
+  var start = 0
+  var tlen = str_byte_len(tp_clean)
+  var ci = 0
+  while ci <= tlen
+    var at_end = ci == tlen
+    var is_comma = false
+    if at_end == false
+      is_comma = str_byte_at(tp_clean, ci) == ','
+    end
+    if is_comma or at_end
+      var param_name = str_byte_slice(tp_clean, start, ci)
+      if param_name == annotation
+        param_idx = param_count
+      end
+      param_count += 1
+      start = ci + 1
+    end
+    ci += 1
+  end
+
+  # If annotation matches a type parameter, extract from ptype
+  if param_idx >= 0 and subject_type >= type_constants::PTYPE_BASE
+    if param_idx == 0
+      var arg1 = typecheck::tc_ptype_arg1(tc, subject_type)
+      return arg1 if as_int(arg1) != type_constants::TYPE_ERROR
+    elsif param_idx == 1
+      var arg2 = typecheck::tc_ptype_arg2(tc, subject_type)
+      return arg2 if as_int(arg2) != type_constants::TYPE_ERROR
+    end
+  end
+
+  # Not a type parameter — try parsing as a concrete type
+  if param_idx < 0
+    var parsed = typecheck::tc_parse_type(tc, annotation)
+    if parsed != type_constants::TYPE_ERROR
+      return parsed
+    end
+  end
+
+  return type_constants::TYPE_INT
+end
+
+## Bind pattern variables from an enum_access pattern.
+## Called when typechecking match arms - binds each non-wildcard name to scope.
+##
+## Parameters:
+##   tc            - Type checker context
+##   bound_names   - Vector of string pointers (names to bind), 0 if no bindings
+##   subject_type  - Type of the match subject (may be ptype for generic enums)
+##   enum_name     - Name of the enum being matched (from pattern str1)
+##   variant_name  - Name of the variant being matched (from pattern str2)
+##   line          - Source line for errors
+##   col           - Source column for errors
+##
+## For generic enums like Option<Int> or Either<String, Int>, resolves each
+## payload binding to the correct concrete type by looking up variant field
+## annotations and mapping type parameters to the subject ptype arguments.
+def tc_bind_pattern_variables(tc: TypecheckState, bound_names: Int, subject_type: TypeId, enum_name: String, variant_name: String, line: Int, col: Int): Void
+  return if bound_names == 0
+
+  var count = vec_size(bound_names)
+
+  # Try to resolve per-binding types from enum registry
+  var resolved_types = vec_new()
+  var resolved_anns = vec_new()
+  var has_resolved = 0
+
+  # CMP-VARIANT-PATTERN fix: when an unqualified variant is used in a match
+  # arm (e.g. `ListenOk(x) =>`), the parser produces NODE_ENUM_ACCESS with an
+  # empty enum_name and only the variant_name. Scan all registered enums for
+  # one containing this variant so we can resolve payload types — mirrors how
+  # built-in Option/Result variants already work.
+  if str_byte_len(enum_name) == 0 and str_byte_len(variant_name) > 0
+    var all_names = typecheck_registry::tc_all_enum_names(tc)
+    var ne_count = all_names.size
+    for ei in 0..ne_count
+      var cand_name = all_names[ei]
+      var cand_lookup = typecheck_registry::tc_lookup_enum(tc, cand_name)
+      var cand_idx = match cand_lookup
+        Found(v) => v
+        NotFound => -1
+      end
+      if cand_idx >= 0
+        if typecheck_registry::tc_enum_has_variant(tc, cand_idx, variant_name) == 1
+          enum_name = cand_name
+          break
+        end
+      end
+    end
+  end
+
+  if str_byte_len(enum_name) > 0 and str_byte_len(variant_name) > 0
+    # Look up enum in registry
+    var enum_result = typecheck_registry::tc_lookup_enum(tc, enum_name)
+    var enum_idx = match enum_result
+      Found(v) => v
+      NotFound => -1
+    end
+
+    if enum_idx >= 0
+      # Get variant names, field annotations, and type params for this enum
+      var variant_names_vec = tc.registry.enum_variant_names[enum_idx]
+      var type_params_str = tc.registry.enum_type_params[enum_idx]
+      # enum_variant_field_annotations is Vec<Vec<String>> — each entry is an
+      # untyped vector whose elements are Vec<String> (payload annotations per variant).
+      # Due to existential types, access it via untyped operations.
+      var all_variant_anns_raw = as_int(tc.registry.enum_variant_field_annotations[enum_idx])
+
+      # Find variant index by name
+      var variant_idx = -1
+      var vcount = variant_names_vec.size
+      for vi in 0..vcount
+        if variant_names_vec[vi] == variant_name
+          variant_idx = vi
+        end
+      end
+
+      if variant_idx >= 0 and vec_size(all_variant_anns_raw) > 0
+        # Get per-field annotations for this variant
+        # all_variant_anns_raw[variant_idx] is a Vec<String> (as i64 pointer)
+        var variant_anns_raw = all_variant_anns_raw[variant_idx]
+        var ann_count = vec_size(variant_anns_raw)
+
+        if ann_count > 0
+          # Resolve each field annotation to a concrete type
+          var ri = 0
+          while ri < ann_count and ri < count
+            var ann_str = as_string(variant_anns_raw[ri])
+            if str_byte_len(ann_str) > 0
+              var resolved = tc_resolve_variant_type(tc, ann_str, type_params_str, subject_type)
+              resolved_types.push(as_int(resolved))
+              # Only store annotation if it's not a bare type parameter name (e.g., "T").
+              # Bare type params would cause "Unknown struct: T" when used for field access.
+              # Concrete annotations like "Vec<Int>" or "Point" are safe to store.
+              var safe_ann = ann_str
+              if str_byte_len(type_params_str) > 0 and str_contains(type_params_str, ann_str)
+                # ann_str matches a type param — try to get the resolved annotation
+                if as_int(resolved) >= type_constants::PTYPE_BASE
+                  safe_ann = typecheck::tc_type_name_full(tc, as_int(resolved))
+                elsif subject_type >= type_constants::PTYPE_BASE
+                  # The variant payload's type-arg resolved to a bare struct/enum
+                  # kind (TYPE_STRUCT or TYPE_ENUM) with no per-instance ptype —
+                  # tc_parse_type collapses bare struct names. Recover the
+                  # struct identity from the subject ptype's stamped name (set
+                  # by tc_parse_type for `EnumBase<Inner>` shapes). This lets
+                  # downstream field access on the bound variable resolve to
+                  # the right struct.
+                  var _subj_name = typecheck::tc_ptype_name(tc, subject_type)
+                  if str_byte_len(_subj_name) > 0
+                    safe_ann = _subj_name
+                  else
+                    safe_ann = ""
+                  end
+                else
+                  safe_ann = ""
+                end
+              end
+              resolved_anns.push(as_int(safe_ann))
+            else
+              resolved_types.push(type_constants::TYPE_INT)
+              resolved_anns.push(as_int(""))
+            end
+            ri += 1
+          end
+          # If more bound names than annotations, fill with TYPE_INT
+          while ri < count
+            resolved_types.push(type_constants::TYPE_INT)
+            resolved_anns.push(as_int(""))
+            ri += 1
+          end
+          has_resolved = 1
+        end
+      end
+    end
+  end
+
+  # Fall back to ptype extraction if enum registry lookup didn't resolve
+  if has_resolved == 0
+    var binding_type = type_constants::TYPE_INT
+    # Extract type arg from ptype if available
+    if subject_type >= type_constants::PTYPE_BASE
+      var base = typecheck::tc_ptype_base(tc, subject_type)
+      if base == type_constants::TYPE_OPTION or base == type_constants::TYPE_RESULT
+        binding_type = typecheck::tc_ptype_arg1(tc, subject_type)
+      end
+    end
+    for ri in 0..count
+      resolved_types.push(binding_type)
+      resolved_anns.push(as_int(""))
+    end
+  end
+
+  for i in 0..count
+    var name = as_string(bound_names[i])
+    # Skip wildcard bindings
+    if name != "_"
+      var btype = resolved_types[i]
+      var b_ann = as_string(resolved_anns[i])
+      # Set struct_name when the resolved annotation names a known struct,
+      # so downstream field access on the bound variable can resolve through
+      # the struct registry. Mirrors what `var x: Card = as_type<Card>(c)`
+      # does at the let-binding path; closes the cards example dogfood.
+      var b_struct_name = ""
+      if str_byte_len(b_ann) > 0
+        var _b_lt = __char_index(b_ann, '<')
+        var _b_base = b_ann
+        if _b_lt > 0
+          _b_base = str_byte_slice(b_ann, 0, _b_lt)
+        end
+        if typecheck_registry::tc_lookup_struct(tc, _b_base).is_found()
+          b_struct_name = _b_base
+        end
+      end
+      typecheck_util::tc_scope_bind_full(tc, name, btype, 0, -1, b_struct_name, b_ann)
+    end
+  end
+end
+
+## enum-niche tail item 6 — resolve the concrete TypeId of the OUTER variant's
+## payload field at slot `field_idx`, against the (possibly-generic) subject type.
+## This is the SUBJECT type for the inner sub-pattern's recursion. Mirrors the
+## registry walk in tc_bind_pattern_variables (variant field annotations +
+## tc_resolve_variant_type). Returns TYPE_ERROR when it can't be resolved.
+def tc_outer_field_type(tc: TypecheckState, subject_type: TypeId, enum_name: String, variant_name: String, field_idx: Int): TypeId
+  return type_constants::TYPE_ERROR if str_byte_len(enum_name) == 0 or str_byte_len(variant_name) == 0
+  var enum_result = typecheck_registry::tc_lookup_enum(tc, enum_name)
+  var enum_idx = match enum_result
+    Found(v) => v
+    NotFound => -1
+  end
+  return type_constants::TYPE_ERROR if enum_idx < 0
+  var variant_names_vec = tc.registry.enum_variant_names[enum_idx]
+  var type_params_str = tc.registry.enum_type_params[enum_idx]
+  var all_variant_anns_raw = as_int(tc.registry.enum_variant_field_annotations[enum_idx])
+  var variant_idx = -1
+  var vcount = variant_names_vec.size
+  for vi in 0..vcount
+    if variant_names_vec[vi] == variant_name
+      variant_idx = vi
+    end
+  end
+  return type_constants::TYPE_ERROR if variant_idx < 0 or vec_size(all_variant_anns_raw) == 0
+  var variant_anns_raw = all_variant_anns_raw[variant_idx]
+  return type_constants::TYPE_ERROR if field_idx >= vec_size(variant_anns_raw)
+  var ann_str = as_string(variant_anns_raw[field_idx])
+  return type_constants::TYPE_ERROR if str_byte_len(ann_str) == 0
+  return tc_resolve_variant_type(tc, ann_str, type_params_str, subject_type)
+end
+
+## enum-niche tail item 6 — recurse ONE LEVEL into a constructor pattern's
+## sub-patterns and bind any inner payload names (`Outer(Inner::V(x)) => ... x`).
+## The parser captures the inner name on the inner NODE_ENUM_ACCESS child node
+## (reachable via ast_get_bound_names); typecheck never descended, so `x` was
+## "Undefined variable". For each NODE_ENUM_ACCESS child: resolve the inner
+## enum/variant (with the same bare-name fallback as tc_bind_pattern_variables),
+## compute the inner subject type = the outer variant's field type at that slot,
+## then delegate to tc_bind_pattern_variables to bind the inner names with the
+## inner variant's payload field types (so `x.v` resolves). Representation-
+## agnostic: this only registers SCOPE bindings; the niche-vs-spill recovery is a
+## MIR concern (mir_bind_enum_payload_nested). Deeper nesting
+## (Outer(Mid(Inner(x)))) is OUT OF SCOPE — filed as item 6c.
+def tc_bind_nested_subpatterns(tc: TypecheckState, ast_storage: AstStorage, pattern_node: Int, subject_type: TypeId, line: Int, col: Int): Void
+  var pk = ast::ast_get_kind(ast_storage, pattern_node)
+  return if pk != node_constants::NODE_ENUM_ACCESS
+  var outer_enum = ast::ast_get_str1(ast_storage, pattern_node)
+  var outer_variant = ast::ast_get_str2(ast_storage, pattern_node)
+  # Bare-name fallback: an unqualified outer variant has empty enum_name.
+  if str_byte_len(outer_enum) == 0 and str_byte_len(outer_variant) > 0
+    var all_names = typecheck_registry::tc_all_enum_names(tc)
+    var ne_count = all_names.size
+    for ei in 0..ne_count
+      var cand_name = all_names[ei]
+      var cand_lookup = typecheck_registry::tc_lookup_enum(tc, cand_name)
+      var cand_idx = match cand_lookup
+        Found(v) => v
+        NotFound => -1
+      end
+      if cand_idx >= 0
+        if typecheck_registry::tc_enum_has_variant(tc, cand_idx, outer_variant) == 1
+          outer_enum = cand_name
+          break
+        end
+      end
+    end
+  end
+  var sub_pats = ast::ast_get_children(ast_storage, pattern_node)
+  return if sub_pats == 0
+  var sub_count = vec_size(sub_pats)
+  for spi in 0..sub_count
+    var sub_pat = sub_pats[spi]
+    if sub_pat > 0
+      if ast::ast_get_kind(ast_storage, sub_pat) == node_constants::NODE_ENUM_ACCESS
+        var inner_bound = ast::ast_get_bound_names(ast_storage, sub_pat)
+        # Only recurse when the inner sub-pattern binds at least one named slot.
+        if inner_bound > 0 and inner_bound.size > 0
+          var inner_enum = ast::ast_get_str1(ast_storage, sub_pat)
+          var inner_variant = ast::ast_get_str2(ast_storage, sub_pat)
+          # Inner subject type = the outer variant's field type at this slot.
+          var inner_subject_type = tc_outer_field_type(tc, subject_type, outer_enum, outer_variant, spi)
+          # tc_bind_pattern_variables applies its OWN bare-name fallback for an
+          # unqualified inner variant, so an empty inner_enum is fine. The inner
+          # subject type carries the generic args (e.g. Result<Inner,Inner>) so
+          # the inner payload binds to its concrete type (Ok ⇒ Inner ⇒ `x.v`).
+          tc_bind_pattern_variables(tc, as_int(inner_bound), inner_subject_type, inner_enum, inner_variant, line, col)
+        end
+      end
+    end
+  end
+end
+
+# Bind pattern variables for `if PATTERN = EXPR` conditionals.
+# Dispatches on pattern kind to reuse match arm binding logic.
+def tc_bind_if_pattern(tc: TypecheckState, ast_storage: AstStorage, pattern_node: Int, subject_type: TypeId, line: Int, col: Int): Void
+  var pk = ast::ast_get_kind(ast_storage, pattern_node)
+  if pk == node_constants::NODE_ENUM_ACCESS
+    var bound_names = ast::ast_get_extra(ast_storage, pattern_node)
+    var pat_enum = ast::ast_get_str1(ast_storage, pattern_node)
+    var pat_variant = ast::ast_get_str2(ast_storage, pattern_node)
+    tc_bind_pattern_variables(tc, bound_names, subject_type, pat_enum, pat_variant, line, col)
+    # enum-niche tail item 6 — also bind any nested inner-payload names.
+    tc_bind_nested_subpatterns(tc, ast_storage, pattern_node, subject_type, line, col)
+  elsif pk == node_constants::NODE_WILDCARD
+    # Wildcard: no bindings needed
+    return
+  elsif pk == node_constants::NODE_IDENT
+    var ident_name = ast::ast_get_str1(ast_storage, pattern_node)
+    typecheck_util::tc_scope_bind(tc, ident_name, subject_type, 0, "")
+  elsif pk == node_constants::NODE_STRUCT_DESTRUCTURE
+    var sd_type_name = ast::ast_get_str1(ast_storage, pattern_node)
+    var sd_field_specs = ast::ast_get_str2(ast_storage, pattern_node)
+    var sd_resolved = sd_type_name
+    if str_byte_len(sd_resolved) > 0
+      var sd_lookup = typecheck_registry::tc_lookup_struct(tc, sd_resolved)
+      if sd_lookup.is_found()
+        var sd_si = sd_lookup.unwrap()
+        var sd_fnames = tc.registry.struct_field_names[sd_si]
+        var sd_ftypes = tc.registry.struct_field_types[sd_si]
+        var sd_fcount = sd_fnames.size
+        var sd_specs = str_split(sd_field_specs, ",")
+        for sd_fi in 0..sd_specs.size
+          var sd_spec = sd_specs[sd_fi]
+          var sd_fname = sd_spec
+          var sd_bname = sd_spec
+          var sd_cp = __char_index(sd_spec, ':')
+          if sd_cp >= 0
+            sd_fname = str_byte_slice(sd_spec, 0, sd_cp)
+            sd_bname = str_byte_slice(sd_spec, sd_cp + 1, str_byte_len(sd_spec))
+          end
+          var sd_fidx = -1
+          for sd_ri in 0..sd_fcount
+            if sd_fnames[sd_ri] == sd_fname
+              sd_fidx = sd_ri
+            end
+          end
+          if sd_fidx >= 0
+            var sd_ftype = sd_ftypes[sd_fidx]
+            var sd_fann = typecheck::tc_struct_field_annotation(tc, sd_si, sd_fname)
+            typecheck_util::tc_scope_bind(tc, sd_bname, sd_ftype, 0, sd_fann)
+          else
+            typecheck_util::tc_scope_bind(tc, sd_bname, type_constants::TYPE_INT, 0, "")
+          end
+        end
+      end
+    end
+  elsif pk == node_constants::NODE_VEC_DESTRUCTURE
+    var vd_elems_str = ast::ast_get_str1(ast_storage, pattern_node)
+    var vd_rest = ast::ast_get_str2(ast_storage, pattern_node)
+    var vd_has_rest = ast::ast_get_op(ast_storage, pattern_node)
+    var vd_elems = str_split(vd_elems_str, ",")
+    for vd_ei in 0..vd_elems.size
+      var vd_ename = vd_elems[vd_ei]
+      if str_byte_len(vd_ename) > 0
+        typecheck_util::tc_scope_bind(tc, vd_ename, type_constants::TYPE_INT, 0, "")
+      end
+    end
+    if vd_has_rest == 1 and str_byte_len(vd_rest) > 0
+      typecheck_util::tc_scope_bind(tc, vd_rest, type_constants::TYPE_INT, 0, "")
+    end
+  elsif pk == node_constants::NODE_OR_PATTERN
+    # Or-pattern: bind from first sub-pattern with bindings
+    var or_pats = ast::ast_get_children(ast_storage, pattern_node)
+    if or_pats != 0
+      var or_cnt = vec_size(or_pats)
+      for opi in 0..or_cnt
+        var sub_pat = or_pats[opi]
+        var sub_kind = ast::ast_get_kind(ast_storage, sub_pat)
+        if sub_kind == node_constants::NODE_ENUM_ACCESS and opi == 0
+          var op_bound = ast::ast_get_extra(ast_storage, sub_pat)
+          var op_enum = ast::ast_get_str1(ast_storage, sub_pat)
+          var op_variant = ast::ast_get_str2(ast_storage, sub_pat)
+          if op_bound > 0
+            tc_bind_pattern_variables(tc, op_bound, subject_type, op_enum, op_variant, line, col)
+          end
+        end
+        if sub_kind == node_constants::NODE_IDENT and opi == 0
+          var op_name = ast::ast_get_str1(ast_storage, sub_pat)
+          if op_name != "_"
+            typecheck_util::tc_scope_bind(tc, op_name, subject_type, 0, "")
+          end
+        end
+      end
+    end
+  end
+end
+
+# ============================================================================
+# Match Expression
+# ============================================================================
+
+## Check match expression.
+## Verifies subject type and arm patterns.
+##
+## Parameters:
+##   tc           - Type checker context
+##   subject_type - Type of the match subject
+##   arm_count    - Number of match arms
+##   line         - Source line for errors
+##   col          - Source column for errors
+##
+## Returns: Result type of the match (type of arms)
+def tc_check_match(subject_type: TypeId, arm_count: Int, line: Int, col: Int): Int can Diag
+  if arm_count == 0
+    error("Match expression must have at least one arm", line, col)
+    return type_constants::TYPE_ERROR
+  end
+
+  # Exhaustiveness is checked separately via tc_check_exhaustiveness (called after arm type-checking)
+  # Return unknown here and let arm types determine result
+  return type_constants::TYPE_ERROR
+end
+
+
+# ============================================================================
+# Maranget Pattern Matrix — Exhaustiveness & Reachability
+# ============================================================================
+# Based on Maranget (2007) "Warnings for pattern matching" (JFP).
+# Same core algorithm as Rust (rustc_pattern_analysis), OCaml, and GHC.
+#
+# Key concepts:
+#   DeconstructedPat — pattern = constructor tag + sub-patterns (recursive)
+#   PatStack        — row of pattern IDs (one per scrutinee column)
+#   PatMatrix       — list of PatStacks (rows from match arms)
+#   Usefulness      — "is a new row useful given existing rows?"
+#
+# Guards are treated conservatively: guarded arms do not count toward
+# exhaustiveness coverage (the guard might fail at runtime).
+
+# ---- Phase 0: Constructor Tags ----
+
+const CTOR_WILDCARD = 0
+const CTOR_VARIANT = 1
+const CTOR_BOOL_TRUE = 2
+const CTOR_BOOL_FALSE = 3
+const CTOR_INT_LIT = 4
+const CTOR_STRING_LIT = 5
+const CTOR_STRUCT = 6
+const CTOR_OR = 7
+const CTOR_MISSING = 8
+
+# ---- Phase 0: Pattern Store (flat parallel vectors) ----
+
+struct MxPatStore
+  tags: Vec<Int>
+  names: Vec<Int>
+  ints: Vec<Int>
+  arities: Vec<Int>
+  subs: Vec<Int>
+  types: Vec<Int>
+end
+
+def mx_store_new(): MxPatStore
+  return MxPatStore {
+    tags: vec_new(),
+    names: vec_new(),
+    ints: vec_new(),
+    arities: vec_new(),
+    subs: vec_new(),
+    types: vec_new()
+  }
+end
+
+def mx_pat_alloc(store: MxPatStore, tag: Int, name: String, int_val: Int, arity: Int, fields: Int, type_id: Int): Int
+  var id = store.tags.size
+  store.tags.push(tag)
+  store.names.push(as_int(name))
+  store.ints.push(int_val)
+  store.arities.push(arity)
+  store.subs.push(fields)
+  store.types.push(type_id)
+  return id
+end
+
+def mx_pat_wildcard(store: MxPatStore, type_id: Int): Int
+  return mx_pat_alloc(store, CTOR_WILDCARD, "", 0, 0, as_int(vec_new()), type_id)
+end
+
+def mx_pat_variant(store: MxPatStore, name: String, fields: Int, type_id: Int): Int
+  return mx_pat_alloc(store, CTOR_VARIANT, name, 0, vec_size(fields), fields, type_id)
+end
+
+def mx_pat_bool(store: MxPatStore, val: Int, type_id: Int): Int
+  if val == 1
+    return mx_pat_alloc(store, CTOR_BOOL_TRUE, "", 1, 0, as_int(vec_new()), type_id)
+  end
+  return mx_pat_alloc(store, CTOR_BOOL_FALSE, "", 0, 0, as_int(vec_new()), type_id)
+end
+
+def mx_pat_int_lit(store: MxPatStore, val: Int, type_id: Int): Int
+  return mx_pat_alloc(store, CTOR_INT_LIT, "", val, 0, as_int(vec_new()), type_id)
+end
+
+def mx_pat_string_lit(store: MxPatStore, val: String, type_id: Int): Int
+  return mx_pat_alloc(store, CTOR_STRING_LIT, val, 0, 0, as_int(vec_new()), type_id)
+end
+
+def mx_pat_or(store: MxPatStore, alternatives: Int, type_id: Int): Int
+  return mx_pat_alloc(store, CTOR_OR, "", 0, vec_size(alternatives), alternatives, type_id)
+end
+
+def mx_pat_missing(store: MxPatStore, name: String, sub_pats: Int, type_id: Int): Int
+  return mx_pat_alloc(store, CTOR_MISSING, name, 0, vec_size(sub_pats), sub_pats, type_id)
+end
+
+def mx_pat_tag(store: MxPatStore, id: Int): Int = store.tags[id]
+def mx_pat_name(store: MxPatStore, id: Int): String = as_string(store.names[id])
+def mx_pat_int(store: MxPatStore, id: Int): Int = store.ints[id]
+def mx_pat_arity(store: MxPatStore, id: Int): Int = store.arities[id]
+def mx_pat_fields(store: MxPatStore, id: Int): Int = store.subs[id]
+def mx_pat_type(store: MxPatStore, id: Int): Int = store.types[id]
+
+# ---- Phase 0: Matrix ----
+
+struct MxMatrix
+  rows: Vec<Int>
+  arm_indices: Vec<Int>
+end
+
+def mx_matrix_new(): MxMatrix
+  return MxMatrix { rows: vec_new(), arm_indices: vec_new() }
+end
+
+def mx_add_row(mx: MxMatrix, row: Int, arm_idx: Int): Void
+  mx.rows.push(row)
+  mx.arm_indices.push(arm_idx)
+end
+
+def mx_row_count(mx: MxMatrix): Int = mx.rows.size
+
+def mx_get_row(mx: MxMatrix, i: Int): Int = mx.rows[i]
+
+# ---- Phase 1: Constructor Helpers ----
+
+def mx_ctor_equal(store: MxPatStore, a: Int, b: Int): Int
+  var ta = mx_pat_tag(store, a)
+  var tb = mx_pat_tag(store, b)
+  if ta != tb
+    return 0
+  end
+  if ta == CTOR_VARIANT
+    if mx_pat_name(store, a) == mx_pat_name(store, b)
+      return 1
+    end
+    return 0
+  end
+  if ta == CTOR_INT_LIT
+    if mx_pat_int(store, a) == mx_pat_int(store, b)
+      return 1
+    end
+    return 0
+  end
+  if ta == CTOR_STRING_LIT
+    if mx_pat_name(store, a) == mx_pat_name(store, b)
+      return 1
+    end
+    return 0
+  end
+  return 1
+end
+
+def mx_ctor_covers(store: MxPatStore, ctor: Int, pat: Int): Int
+  var pt = mx_pat_tag(store, pat)
+  if pt == CTOR_WILDCARD
+    return 1
+  end
+  if pt == CTOR_OR
+    return 0
+  end
+  return mx_ctor_equal(store, ctor, pat)
+end
+
+def mx_strip_module_prefix(name: String): String
+  var len = str_byte_len(name)
+  var last_sep = -1
+  var last_sep_width = 0
+  var i = 0
+  while i < len
+    if str_byte_at(name, i) == '$'
+      last_sep = i
+      last_sep_width = 1
+      i += 1
+    elsif i < len - 1 and str_byte_at(name, i) == ':' and str_byte_at(name, i + 1) == ':'
+      last_sep = i
+      last_sep_width = 2
+      i += 2
+    else
+      i += 1
+    end
+  end
+  if last_sep >= 0
+    return str_byte_slice(name, last_sep + last_sep_width, len)
+  end
+  return name
+end
+
+def mx_try_lookup_enum(tc: TypecheckState, name: String): Int
+  var lookup = typecheck_registry::tc_lookup_enum(tc, name)
+  var idx = match lookup
+    Found(v) => v
+    NotFound => -1
+  end
+  if idx >= 0
+    return idx
+  end
+  var stripped = mx_strip_module_prefix(name)
+  if stripped != name
+    var lookup2 = typecheck_registry::tc_lookup_enum(tc, stripped)
+    return match lookup2
+      Found(v) => v
+      NotFound => -1
+    end
+  end
+  return -1
+end
+
+def mx_resolve_enum_name(tc: TypecheckState, ast_storage: ast::AstStorage, node: Int, subject_type: Int): String
+  var arms = ast::ast_get_children(ast_storage, node)
+  var arm_count = arms.size
+  var enum_name = ""
+
+  var subject_node = ast::ast_get_left(ast_storage, node)
+  if subject_node >= 0
+    if ast::ast_get_kind(ast_storage, subject_node) == node_constants::NODE_IDENT
+      var subject_ident = ast::ast_get_str1(ast_storage, subject_node)
+      enum_name = typecheck_util::tc_scope_lookup_struct_name(tc, subject_ident)
+    end
+  end
+
+  if str_byte_len(enum_name) == 0
+    for i in 0..arm_count
+      var arm = arms[i]
+      var pattern = ast::ast_get_left(ast_storage, arm)
+      if pattern >= 0
+        if ast::ast_get_kind(ast_storage, pattern) == node_constants::NODE_ENUM_ACCESS
+          var candidate = ast::ast_get_str1(ast_storage, pattern)
+          if str_byte_len(candidate) > 0
+            # Try qualified name first, then stripped
+            var bare = mx_strip_module_prefix(candidate)
+            if mx_try_lookup_enum(tc, bare) >= 0
+              enum_name = bare
+            else
+              enum_name = candidate
+            end
+            break
+          else
+            var vname = ast::ast_get_str2(ast_storage, pattern)
+            var all_names = typecheck_registry::tc_all_enum_names(tc)
+            for ei in 0..all_names.size
+              var eidx = mx_try_lookup_enum(tc, all_names[ei])
+              if eidx >= 0
+                if typecheck_registry::tc_enum_has_variant(tc, eidx, vname)
+                  enum_name = all_names[ei]
+                end
+              end
+            end
+          end
+          if str_byte_len(enum_name) > 0
+            break
+          end
+        end
+      end
+    end
+  end
+  return enum_name
+end
+
+def mx_type_all_ctors(tc: TypecheckState, store: MxPatStore, subject_type: Int, enum_name: String): Int
+  var ctors = vec_new()
+
+  if subject_type == type_constants::TYPE_BOOL
+    var t = mx_pat_bool(store, 1, subject_type)
+    var f = mx_pat_bool(store, 0, subject_type)
+    ctors.push(t)
+    ctors.push(f)
+    return as_int(ctors)
+  end
+
+  # Bare TYPE_OPTION (not ptype) — Some/None with Int payloads
+  if subject_type == type_constants::TYPE_OPTION
+    var some_subs = vec_new()
+    some_subs.push(mx_pat_wildcard(store, type_constants::TYPE_INT))
+    ctors.push(mx_pat_variant(store, "Some", as_int(some_subs), subject_type))
+    ctors.push(mx_pat_variant(store, "None", as_int(vec_new()), subject_type))
+    return as_int(ctors)
+  end
+
+  # Bare TYPE_RESULT (not ptype) — Ok/Err with Int payloads
+  if subject_type == type_constants::TYPE_RESULT
+    var ok_subs = vec_new()
+    ok_subs.push(mx_pat_wildcard(store, type_constants::TYPE_INT))
+    var err_subs = vec_new()
+    err_subs.push(mx_pat_wildcard(store, type_constants::TYPE_INT))
+    ctors.push(mx_pat_variant(store, "Ok", as_int(ok_subs), subject_type))
+    ctors.push(mx_pat_variant(store, "Err", as_int(err_subs), subject_type))
+    return as_int(ctors)
+  end
+
+  if subject_type == type_constants::TYPE_ENUM and str_byte_len(enum_name) > 0
+    var idx = mx_try_lookup_enum(tc, enum_name)
+    if idx >= 0
+      var actual_name = enum_name
+      # Resolve to the bare name that the registry knows
+      var lookup_check = typecheck_registry::tc_lookup_enum(tc, enum_name)
+      var direct_idx = match lookup_check
+        Found(v) => v
+        NotFound => -1
+      end
+      if direct_idx < 0
+        actual_name = mx_strip_module_prefix(enum_name)
+      end
+      var vnames = typecheck_registry::tc_enum_variant_names(tc, idx)
+      for vi in 0..vnames.size
+        var vn = vnames[vi]
+        var payload_count = typecheck_registry::tc_enum_variant_payload_count(tc, actual_name, vn)
+        if payload_count < 0
+          payload_count = 0
+        end
+        var sub_pats = vec_new()
+        for pi in 0..payload_count
+          sub_pats.push(mx_pat_wildcard(store, type_constants::TYPE_INT))
+        end
+        ctors.push(mx_pat_variant(store, vn, as_int(sub_pats), subject_type))
+      end
+    end
+    return as_int(ctors)
+  end
+
+  if subject_type >= type_constants::PTYPE_BASE
+    var base = typecheck::tc_ptype_base(tc, subject_type)
+    if base == type_constants::TYPE_OPTION
+      var arg1 = typecheck::tc_ptype_arg1(tc, subject_type)
+      var some_subs = vec_new()
+      some_subs.push(mx_pat_wildcard(store, arg1))
+      ctors.push(mx_pat_variant(store, "Some", as_int(some_subs), subject_type))
+      ctors.push(mx_pat_variant(store, "None", as_int(vec_new()), subject_type))
+      return as_int(ctors)
+    end
+    if base == type_constants::TYPE_RESULT
+      var ok_type = typecheck::tc_ptype_arg1(tc, subject_type)
+      var err_type = typecheck::tc_ptype_arg2(tc, subject_type)
+      if err_type == 0
+        err_type = type_constants::TYPE_INT
+      end
+      var ok_subs = vec_new()
+      ok_subs.push(mx_pat_wildcard(store, ok_type))
+      var err_subs = vec_new()
+      err_subs.push(mx_pat_wildcard(store, err_type))
+      ctors.push(mx_pat_variant(store, "Ok", as_int(ok_subs), subject_type))
+      ctors.push(mx_pat_variant(store, "Err", as_int(err_subs), subject_type))
+      return as_int(ctors)
+    end
+    if base == type_constants::TYPE_ENUM
+      var pname = typecheck::tc_ptype_name(tc, subject_type)
+      if str_byte_len(pname) > 0
+        var lookup = typecheck_registry::tc_lookup_enum(tc, pname)
+        var idx = match lookup
+          Found(v) => v
+          NotFound => -1
+        end
+        if idx >= 0
+          var vnames = typecheck_registry::tc_enum_variant_names(tc, idx)
+          for vi in 0..vnames.size
+            var vn = vnames[vi]
+            var pc = typecheck_registry::tc_enum_variant_payload_count(tc, pname, vn)
+            if pc < 0
+              pc = 0
+            end
+            var sp = vec_new()
+            for pi in 0..pc
+              sp.push(mx_pat_wildcard(store, type_constants::TYPE_INT))
+            end
+            ctors.push(mx_pat_variant(store, vn, as_int(sp), subject_type))
+          end
+        end
+      end
+      return as_int(ctors)
+    end
+  end
+
+  if typecheck_registry::tc_is_union_type(subject_type)
+    var members = typecheck_registry::tc_union_members(tc, subject_type)
+    for mi in 0..members.size
+      var mname = str_trim(members[mi])
+      ctors.push(mx_pat_variant(store, mname, as_int(vec_new()), subject_type))
+    end
+    return as_int(ctors)
+  end
+
+  return as_int(ctors)
+end
+
+def mx_ctors_complete(tc: TypecheckState, store: MxPatStore, seen_ctors: Int, subject_type: Int, enum_name: String): Int
+  var all = mx_type_all_ctors(tc, store, subject_type, enum_name)
+  var all_count = vec_size(all)
+  if all_count == 0
+    return 0
+  end
+  var seen_count = vec_size(seen_ctors)
+  for ai in 0..all_count
+    var needed = all[ai]
+    var found = 0
+    for si in 0..seen_count
+      if mx_ctor_equal(store, needed, seen_ctors[si]) == 1
+        found = 1
+        break
+      end
+    end
+    if found == 0
+      return 0
+    end
+  end
+  return 1
+end
+
+def mx_missing_ctors(tc: TypecheckState, store: MxPatStore, seen_ctors: Int, subject_type: Int, enum_name: String): Int
+  var all = mx_type_all_ctors(tc, store, subject_type, enum_name)
+  var all_count = vec_size(all)
+  var missing = vec_new()
+  var seen_count = vec_size(seen_ctors)
+  for ai in 0..all_count
+    var needed = all[ai]
+    var found = 0
+    for si in 0..seen_count
+      if mx_ctor_equal(store, needed, seen_ctors[si]) == 1
+        found = 1
+        break
+      end
+    end
+    if found == 0
+      missing.push(needed)
+    end
+  end
+  return as_int(missing)
+end
+
+# ---- Phase 2: AST → DeconstructedPat ----
+
+def mx_pat_from_ast(tc: TypecheckState, ast_storage: ast::AstStorage, store: MxPatStore, pat_node: Int, subject_type: Int, enum_name: String): Int
+  var kind = ast::ast_get_kind(ast_storage, pat_node)
+
+  if kind == node_constants::NODE_WILDCARD
+    return mx_pat_wildcard(store, subject_type)
+  end
+
+  if kind == node_constants::NODE_IDENT
+    var name = ast::ast_get_str1(ast_storage, pat_node)
+    if name == "_"
+      return mx_pat_wildcard(store, subject_type)
+    end
+    # Check if this ident is actually a variant name
+    if subject_type == type_constants::TYPE_ENUM and str_byte_len(enum_name) > 0
+      var elookup = typecheck_registry::tc_lookup_enum(tc, enum_name)
+      var eidx = match elookup
+        Found(v) => v
+        NotFound => -1
+      end
+      if eidx >= 0
+        if typecheck_registry::tc_enum_has_variant(tc, eidx, name) == 1
+          return mx_pat_variant(store, name, as_int(vec_new()), subject_type)
+        end
+      end
+    end
+    # Check builtin enum variants
+    if subject_type >= type_constants::PTYPE_BASE
+      var base = typecheck::tc_ptype_base(tc, subject_type)
+      if base == type_constants::TYPE_OPTION
+        if name == "None"
+          return mx_pat_variant(store, "None", as_int(vec_new()), subject_type)
+        end
+        if name == "Some"
+          var some_subs = vec_new()
+          some_subs.push(mx_pat_wildcard(store, typecheck::tc_ptype_arg1(tc, subject_type)))
+          return mx_pat_variant(store, "Some", as_int(some_subs), subject_type)
+        end
+      end
+      if base == type_constants::TYPE_RESULT
+        if name == "Ok"
+          var ok_subs = vec_new()
+          ok_subs.push(mx_pat_wildcard(store, typecheck::tc_ptype_arg1(tc, subject_type)))
+          return mx_pat_variant(store, "Ok", as_int(ok_subs), subject_type)
+        end
+        if name == "Err"
+          var err_subs = vec_new()
+          var err_type = typecheck::tc_ptype_arg2(tc, subject_type)
+          if err_type == 0
+            err_type = type_constants::TYPE_INT
+          end
+          err_subs.push(mx_pat_wildcard(store, err_type))
+          return mx_pat_variant(store, "Err", as_int(err_subs), subject_type)
+        end
+      end
+      if base == type_constants::TYPE_ENUM
+        var pname = typecheck::tc_ptype_name(tc, subject_type)
+        if str_byte_len(pname) > 0
+          var plookup = typecheck_registry::tc_lookup_enum(tc, pname)
+          var pidx = match plookup
+            Found(v) => v
+            NotFound => -1
+          end
+          if pidx >= 0
+            if typecheck_registry::tc_enum_has_variant(tc, pidx, name) == 1
+              return mx_pat_variant(store, name, as_int(vec_new()), subject_type)
+            end
+          end
+        end
+      end
+    end
+    # Also check variant-by-search for TYPE_ENUM when enum_name not resolved
+    if subject_type == type_constants::TYPE_ENUM and str_byte_len(enum_name) == 0
+      var all_names = typecheck_registry::tc_all_enum_names(tc)
+      for ei in 0..all_names.size
+        var elookup = typecheck_registry::tc_lookup_enum(tc, all_names[ei])
+        var eidx = match elookup
+          Found(v) => v
+          NotFound => -1
+        end
+        if eidx >= 0
+          if typecheck_registry::tc_enum_has_variant(tc, eidx, name) == 1
+            return mx_pat_variant(store, name, as_int(vec_new()), subject_type)
+          end
+        end
+      end
+    end
+    return mx_pat_wildcard(store, subject_type)
+  end
+
+  if kind == node_constants::NODE_ENUM_ACCESS
+    var variant_name = ast::ast_get_str2(ast_storage, pat_node)
+    var bound = ast::ast_get_extra(ast_storage, pat_node)
+    var field_count = 0
+    if bound > 0
+      field_count = vec_size(bound)
+    end
+    # PATTERN_PARSER_REJECTS_QUALIFIED_VARIANT sub-bug (b) fix: when the parser
+    # produced sub-pattern AST nodes for nested constructor patterns (e.g.
+    # `Some(Focus::SaveList)`), recurse on them so Maranget treats distinct
+    # inner variants as distinct constructors. The parser stores sub-pattern
+    # AstNodeIds in the children/payloads slot.
+    var pat_children = ast::ast_get_children(ast_storage, pat_node)
+    var sub_pats = vec_new()
+    for fi in 0..field_count
+      var child_ast = 0
+      if pat_children > 0 and vec_size(pat_children) > fi
+        child_ast = pat_children[fi]
+      end
+      if child_ast > 0
+        var ck = ast::ast_get_kind(ast_storage, child_ast)
+        # NODE_IDENT and NODE_WILDCARD as immediate children always lower to
+        # a wildcard sub-pattern at this level (binding-only); the binder
+        # handles the name via bound_names. Only NODE_ENUM_ACCESS sub-pats
+        # carry discriminator information that Maranget needs to see.
+        if ck == node_constants::NODE_ENUM_ACCESS
+          sub_pats.push(mx_pat_from_ast(tc, ast_storage, store, child_ast, type_constants::TYPE_INT, ""))
+        else
+          sub_pats.push(mx_pat_wildcard(store, type_constants::TYPE_INT))
+        end
+      else
+        sub_pats.push(mx_pat_wildcard(store, type_constants::TYPE_INT))
+      end
+    end
+    return mx_pat_variant(store, variant_name, as_int(sub_pats), subject_type)
+  end
+
+  if kind == node_constants::NODE_BOOL_LIT
+    return mx_pat_bool(store, ast::ast_get_int_val(ast_storage, pat_node), subject_type)
+  end
+
+  if kind == node_constants::NODE_INT_LIT
+    return mx_pat_int_lit(store, ast::ast_get_int_val(ast_storage, pat_node), subject_type)
+  end
+
+  if kind == node_constants::NODE_STRING_LIT
+    return mx_pat_string_lit(store, ast::ast_get_str1(ast_storage, pat_node), subject_type)
+  end
+
+  if kind == node_constants::NODE_OR_PATTERN
+    var children = ast::ast_get_children(ast_storage, pat_node)
+    if children != 0
+      var alts = vec_new()
+      var cnt = vec_size(children)
+      for ci in 0..cnt
+        alts.push(mx_pat_from_ast(tc, ast_storage, store, children[ci], subject_type, enum_name))
+      end
+      return mx_pat_or(store, as_int(alts), subject_type)
+    end
+    return mx_pat_wildcard(store, subject_type)
+  end
+
+  if kind == node_constants::NODE_STRUCT_DESTRUCTURE
+    return mx_pat_wildcard(store, subject_type)
+  end
+
+  if kind == node_constants::NODE_VEC_DESTRUCTURE
+    return mx_pat_wildcard(store, subject_type)
+  end
+
+  return mx_pat_wildcard(store, subject_type)
+end
+
+# ---- Phase 3: Core Algorithm (specialize, default, usefulness) ----
+
+def mx_row_specialize(store: MxPatStore, ctor_id: Int, row_vec: Int, arity: Int): Int
+  var row_len = vec_size(row_vec)
+  if row_len == 0
+    return -1
+  end
+  var first = row_vec[0]
+  var ft = mx_pat_tag(store, first)
+
+  if ft == CTOR_WILDCARD
+    var new_row = vec_new()
+    for wi in 0..arity
+      new_row.push(mx_pat_wildcard(store, mx_pat_type(store, first)))
+    end
+    for ri in 1..row_len
+      new_row.push(row_vec[ri])
+    end
+    return as_int(new_row)
+  end
+
+  if ft == CTOR_OR
+    return -1
+  end
+
+  if mx_ctor_equal(store, ctor_id, first) == 1
+    var new_row = vec_new()
+    var first_fields = mx_pat_fields(store, first)
+    var fa = mx_pat_arity(store, first)
+    for fi in 0..fa
+      new_row.push(first_fields[fi])
+    end
+    for ri in 1..row_len
+      new_row.push(row_vec[ri])
+    end
+    return as_int(new_row)
+  end
+
+  return -1
+end
+
+def mx_specialize(store: MxPatStore, ctor_id: Int, mx: MxMatrix, arity: Int): MxMatrix
+  var result = mx_matrix_new()
+  var count = mx_row_count(mx)
+  for i in 0..count
+    var row_vec = mx_get_row(mx, i)
+    var arm_idx = mx.arm_indices[i]
+    var row_len = vec_size(row_vec)
+    if row_len == 0
+      continue
+    end
+    var first = row_vec[0]
+    var ft = mx_pat_tag(store, first)
+
+    if ft == CTOR_OR
+      var or_subs = mx_pat_fields(store, first)
+      var or_count = mx_pat_arity(store, first)
+      for oi in 0..or_count
+        var sub_pat = or_subs[oi]
+        var temp_row = vec_new()
+        temp_row.push(sub_pat)
+        for ri in 1..row_len
+          temp_row.push(row_vec[ri])
+        end
+        var spec = mx_row_specialize(store, ctor_id, as_int(temp_row), arity)
+        if spec != -1
+          mx_add_row(result, spec, arm_idx)
+        end
+      end
+    else
+      var spec = mx_row_specialize(store, ctor_id, row_vec, arity)
+      if spec != -1
+        mx_add_row(result, spec, arm_idx)
+      end
+    end
+  end
+  return result
+end
+
+def mx_default(store: MxPatStore, mx: MxMatrix): MxMatrix
+  var result = mx_matrix_new()
+  var count = mx_row_count(mx)
+  for i in 0..count
+    var row_vec = mx_get_row(mx, i)
+    var arm_idx = mx.arm_indices[i]
+    var row_len = vec_size(row_vec)
+    if row_len == 0
+      continue
+    end
+    var first = row_vec[0]
+    var ft = mx_pat_tag(store, first)
+
+    if ft == CTOR_WILDCARD
+      var new_row = vec_new()
+      for ri in 1..row_len
+        new_row.push(row_vec[ri])
+      end
+      mx_add_row(result, as_int(new_row), arm_idx)
+    elsif ft == CTOR_OR
+      var or_subs = mx_pat_fields(store, first)
+      var or_count = mx_pat_arity(store, first)
+      for oi in 0..or_count
+        var sub = or_subs[oi]
+        if mx_pat_tag(store, sub) == CTOR_WILDCARD
+          var new_row = vec_new()
+          for ri in 1..row_len
+            new_row.push(row_vec[ri])
+          end
+          mx_add_row(result, as_int(new_row), arm_idx)
+          break
+        end
+      end
+    end
+  end
+  return result
+end
+
+def mx_collect_col0_ctors(store: MxPatStore, mx: MxMatrix): Int
+  var ctors = vec_new()
+  var count = mx_row_count(mx)
+  for i in 0..count
+    var row_vec = mx_get_row(mx, i)
+    if vec_size(row_vec) == 0
+      continue
+    end
+    var first = row_vec[0]
+    var ft = mx_pat_tag(store, first)
+    if ft == CTOR_WILDCARD
+      continue
+    end
+    if ft == CTOR_OR
+      var or_subs = mx_pat_fields(store, first)
+      var or_count = mx_pat_arity(store, first)
+      for oi in 0..or_count
+        var sub = or_subs[oi]
+        var st = mx_pat_tag(store, sub)
+        if st != CTOR_WILDCARD and st != CTOR_OR
+          var already = 0
+          for ci in 0..ctors.size
+            if mx_ctor_equal(store, ctors[ci], sub) == 1
+              already = 1
+              break
+            end
+          end
+          if already == 0
+            ctors.push(sub)
+          end
+        end
+      end
+    else
+      var already = 0
+      for ci in 0..ctors.size
+        if mx_ctor_equal(store, ctors[ci], first) == 1
+          already = 1
+          break
+        end
+      end
+      if already == 0
+        ctors.push(first)
+      end
+    end
+  end
+  return as_int(ctors)
+end
+
+def mx_is_useful(tc: TypecheckState, store: MxPatStore, mx: MxMatrix, query: Int, subject_type: Int, enum_name: String, depth: Int): Int
+  if depth > 100
+    return 0
+  end
+
+  var q_len = vec_size(query)
+
+  if q_len == 0
+    if mx_row_count(mx) == 0
+      return 1
+    end
+    return 0
+  end
+
+  var first = query[0]
+  var ft = mx_pat_tag(store, first)
+
+  if ft == CTOR_OR
+    var or_subs = mx_pat_fields(store, first)
+    var or_count = mx_pat_arity(store, first)
+    for oi in 0..or_count
+      var sub = or_subs[oi]
+      var temp_q = vec_new()
+      temp_q.push(sub)
+      for qi in 1..q_len
+        temp_q.push(query[qi])
+      end
+      if mx_is_useful(tc, store, mx, as_int(temp_q), subject_type, enum_name, depth + 1) == 1
+        return 1
+      end
+    end
+    return 0
+  end
+
+  if ft != CTOR_WILDCARD
+    var arity = mx_pat_arity(store, first)
+    var spec_mx = mx_specialize(store, first, mx, arity)
+    var spec_q = vec_new()
+    var first_fields = mx_pat_fields(store, first)
+    for fi in 0..arity
+      spec_q.push(first_fields[fi])
+    end
+    for qi in 1..q_len
+      spec_q.push(query[qi])
+    end
+    return mx_is_useful(tc, store, spec_mx, as_int(spec_q), subject_type, enum_name, depth + 1)
+  end
+
+  # Wildcard case
+  var col0_ctors = mx_collect_col0_ctors(store, mx)
+  var col0_count = vec_size(col0_ctors)
+
+  var col_type = mx_pat_type(store, first)
+  var col_enum_name = enum_name
+  if col_type != subject_type
+    col_enum_name = ""
+  end
+  # PATTERN_PARSER_REJECTS_QUALIFIED_VARIANT sub-bug (b) fix: when col0 holds
+  # variant patterns from a nested constructor pattern (e.g. `Some(Focus::X)`
+  # specialized on `Some`), col_type may be TYPE_INT (because sub-pat wildcards
+  # default to TYPE_INT) but the seen variant names actually identify a known
+  # enum. Recover col_enum_name + col_type by searching the registry for an
+  # enum that contains the seen variant names. Without this, Maranget can't
+  # reach mx_ctors_complete's enum-aware path and falsely reports the inner
+  # match as non-exhaustive.
+  if str_byte_len(col_enum_name) == 0 and col0_count > 0
+    for vi in 0..col0_count
+      var vc = col0_ctors[vi]
+      if mx_pat_tag(store, vc) == CTOR_VARIANT
+        var vname = mx_pat_name(store, vc)
+        if str_byte_len(vname) > 0
+          var all = typecheck_registry::tc_all_enum_names(tc)
+          for ei in 0..all.size
+            var elookup = typecheck_registry::tc_lookup_enum(tc, all[ei])
+            var eidx = match elookup
+              Found(v) => v
+              NotFound => -1
+            end
+            if eidx >= 0 and typecheck_registry::tc_enum_has_variant(tc, eidx, vname) == 1
+              col_enum_name = all[ei]
+              col_type = type_constants::TYPE_ENUM
+              break
+            end
+          end
+        end
+      end
+      if str_byte_len(col_enum_name) > 0
+        break
+      end
+    end
+  end
+
+  if mx_ctors_complete(tc, store, col0_ctors, col_type, col_enum_name) == 1
+    for ci in 0..col0_count
+      var ctor = col0_ctors[ci]
+      var arity = mx_pat_arity(store, ctor)
+      var spec_mx = mx_specialize(store, ctor, mx, arity)
+      var spec_q = vec_new()
+      for ai in 0..arity
+        spec_q.push(mx_pat_wildcard(store, type_constants::TYPE_INT))
+      end
+      for qi in 1..q_len
+        spec_q.push(query[qi])
+      end
+      if mx_is_useful(tc, store, spec_mx, as_int(spec_q), col_type, col_enum_name, depth + 1) == 1
+        return 1
+      end
+    end
+    return 0
+  end
+
+  var def_mx = mx_default(store, mx)
+  var def_q = vec_new()
+  for qi in 1..q_len
+    def_q.push(query[qi])
+  end
+  return mx_is_useful(tc, store, def_mx, as_int(def_q), subject_type, enum_name, depth + 1)
+end
+
+# ---- Phase 4: Witness Generation ----
+
+def mx_find_witness(tc: TypecheckState, store: MxPatStore, mx: MxMatrix, query: Int, subject_type: Int, enum_name: String, depth: Int): Int
+  if depth > 100
+    return -1
+  end
+
+  var q_len = vec_size(query)
+
+  if q_len == 0
+    if mx_row_count(mx) == 0
+      return as_int(vec_new())
+    end
+    return -1
+  end
+
+  var first = query[0]
+  var ft = mx_pat_tag(store, first)
+
+  if ft == CTOR_OR
+    var or_subs = mx_pat_fields(store, first)
+    var or_count = mx_pat_arity(store, first)
+    for oi in 0..or_count
+      var sub = or_subs[oi]
+      var temp_q = vec_new()
+      temp_q.push(sub)
+      for qi in 1..q_len
+        temp_q.push(query[qi])
+      end
+      var w = mx_find_witness(tc, store, mx, as_int(temp_q), subject_type, enum_name, depth + 1)
+      if w != -1
+        return w
+      end
+    end
+    return -1
+  end
+
+  if ft != CTOR_WILDCARD
+    var arity = mx_pat_arity(store, first)
+    var spec_mx = mx_specialize(store, first, mx, arity)
+    var spec_q = vec_new()
+    var first_fields = mx_pat_fields(store, first)
+    for fi in 0..arity
+      spec_q.push(first_fields[fi])
+    end
+    for qi in 1..q_len
+      spec_q.push(query[qi])
+    end
+    var w = mx_find_witness(tc, store, spec_mx, as_int(spec_q), subject_type, enum_name, depth + 1)
+    if w == -1
+      return -1
+    end
+    var witness_subs = vec_new()
+    for wi in 0..arity
+      witness_subs.push(w[wi])
+    end
+    var rebuilt = mx_pat_variant(store, mx_pat_name(store, first), as_int(witness_subs), mx_pat_type(store, first))
+    var result = vec_new()
+    result.push(rebuilt)
+    for wi in arity..vec_size(w)
+      result.push(w[wi])
+    end
+    return as_int(result)
+  end
+
+  # Wildcard case
+  var col0_ctors = mx_collect_col0_ctors(store, mx)
+  var col0_count = vec_size(col0_ctors)
+
+  var col_type = mx_pat_type(store, first)
+  var col_enum_name = enum_name
+  if col_type != subject_type
+    col_enum_name = ""
+  end
+  # PATTERN_PARSER_REJECTS_QUALIFIED_VARIANT sub-bug (b) fix: when col0 holds
+  # variant patterns from a nested constructor pattern (e.g. `Some(Focus::X)`
+  # specialized on `Some`), col_type may be TYPE_INT (because sub-pat wildcards
+  # default to TYPE_INT) but the seen variant names actually identify a known
+  # enum. Recover col_enum_name + col_type by searching the registry for an
+  # enum that contains the seen variant names. Without this, Maranget can't
+  # reach mx_ctors_complete's enum-aware path and falsely reports the inner
+  # match as non-exhaustive.
+  if str_byte_len(col_enum_name) == 0 and col0_count > 0
+    for vi in 0..col0_count
+      var vc = col0_ctors[vi]
+      if mx_pat_tag(store, vc) == CTOR_VARIANT
+        var vname = mx_pat_name(store, vc)
+        if str_byte_len(vname) > 0
+          var all = typecheck_registry::tc_all_enum_names(tc)
+          for ei in 0..all.size
+            var elookup = typecheck_registry::tc_lookup_enum(tc, all[ei])
+            var eidx = match elookup
+              Found(v) => v
+              NotFound => -1
+            end
+            if eidx >= 0 and typecheck_registry::tc_enum_has_variant(tc, eidx, vname) == 1
+              col_enum_name = all[ei]
+              col_type = type_constants::TYPE_ENUM
+              break
+            end
+          end
+        end
+      end
+      if str_byte_len(col_enum_name) > 0
+        break
+      end
+    end
+  end
+
+  if mx_ctors_complete(tc, store, col0_ctors, col_type, col_enum_name) == 1
+    for ci in 0..col0_count
+      var ctor = col0_ctors[ci]
+      var arity = mx_pat_arity(store, ctor)
+      var spec_mx = mx_specialize(store, ctor, mx, arity)
+      var spec_q = vec_new()
+      for ai in 0..arity
+        spec_q.push(mx_pat_wildcard(store, type_constants::TYPE_INT))
+      end
+      for qi in 1..q_len
+        spec_q.push(query[qi])
+      end
+      var w = mx_find_witness(tc, store, spec_mx, as_int(spec_q), col_type, col_enum_name, depth + 1)
+      if w != -1
+        var witness_subs = vec_new()
+        for wi in 0..arity
+          witness_subs.push(w[wi])
+        end
+        var rebuilt = mx_pat_variant(store, mx_pat_name(store, ctor), as_int(witness_subs), col_type)
+        var result = vec_new()
+        result.push(rebuilt)
+        for wi in arity..vec_size(w)
+          result.push(w[wi])
+        end
+        return as_int(result)
+      end
+    end
+    return -1
+  end
+
+  # Incomplete: use default matrix
+  var def_mx = mx_default(store, mx)
+  var def_q = vec_new()
+  for qi in 1..q_len
+    def_q.push(query[qi])
+  end
+  var w = mx_find_witness(tc, store, def_mx, as_int(def_q), subject_type, enum_name, depth + 1)
+  if w == -1
+    return -1
+  end
+
+  # Find a missing constructor for witness
+  var missing = mx_missing_ctors(tc, store, col0_ctors, col_type, col_enum_name)
+  var missing_count = vec_size(missing)
+  if missing_count > 0
+    var mc = missing[0]
+    var result = vec_new()
+    result.push(mc)
+    for wi in 0..vec_size(w)
+      result.push(w[wi])
+    end
+    return as_int(result)
+  end
+
+  # Open type (Int/String): wildcard as witness
+  var result = vec_new()
+  result.push(mx_pat_wildcard(store, col_type))
+  for wi in 0..vec_size(w)
+    result.push(w[wi])
+  end
+  return as_int(result)
+end
+
+def mx_pat_to_string(store: MxPatStore, id: Int): String
+  var tag = mx_pat_tag(store, id)
+  if tag == CTOR_WILDCARD
+    return "_"
+  end
+  if tag == CTOR_BOOL_TRUE
+    return "true"
+  end
+  if tag == CTOR_BOOL_FALSE
+    return "false"
+  end
+  if tag == CTOR_INT_LIT
+    return str_from_int(mx_pat_int(store, id))
+  end
+  if tag == CTOR_STRING_LIT
+    return "\"#{mx_pat_name(store, id)}\""
+  end
+  if tag == CTOR_VARIANT or tag == CTOR_MISSING
+    var name = mx_pat_name(store, id)
+    var arity = mx_pat_arity(store, id)
+    if arity == 0
+      return name
+    end
+    var fields = mx_pat_fields(store, id)
+    var s = "#{name}("
+    for fi in 0..arity
+      if fi > 0
+        s = s + ", "
+      end
+      s = s + mx_pat_to_string(store, fields[fi])
+    end
+    s = s + ")"
+    return s
+  end
+  return "_"
+end
+
+# ---- Phase 5: Integration ----
+
+def tc_check_exhaustiveness(tc: TypecheckState, ast_storage: ast::AstStorage, node: Int, subject_type: Int, line: Int, col: Int): Void can Diag
+  var arms = ast::ast_get_children(ast_storage, node)
+  var arm_count = arms.size
+
+  var store = mx_store_new()
+  var enum_name = ""
+
+  if subject_type == type_constants::TYPE_ENUM
+    enum_name = mx_resolve_enum_name(tc, ast_storage, node, subject_type)
+  end
+  if subject_type >= type_constants::PTYPE_BASE
+    var base = typecheck::tc_ptype_base(tc, subject_type)
+    if base == type_constants::TYPE_ENUM
+      enum_name = typecheck::tc_ptype_name(tc, subject_type)
+    end
+  end
+
+  # For enum types, verify we can enumerate constructors before proceeding.
+  # If the enum_name can't be resolved (e.g. the scrutinee has no annotations
+  # and no patterns hint at the enum), we can't check exhaustiveness.
+  if subject_type == type_constants::TYPE_ENUM
+    if str_byte_len(enum_name) == 0 or mx_try_lookup_enum(tc, enum_name) < 0
+      return
+    end
+  end
+
+  # Build pattern matrix (skip guarded arms for exhaustiveness)
+  var mx = mx_matrix_new()
+  var mx_all = mx_matrix_new()
+  for i in 0..arm_count
+    var arm = arms[i]
+    var pattern = ast::ast_get_left(ast_storage, arm)
+    if pattern < 0
+      continue
+    end
+    var guard = ast::ast_get_extra(ast_storage, arm)
+    var pat_id = mx_pat_from_ast(tc, ast_storage, store, pattern, subject_type, enum_name)
+    var row = vec_new()
+    row.push(pat_id)
+
+    mx_add_row(mx_all, as_int(row), i)
+    # Guarded arms don't count for exhaustiveness
+    if guard <= 0
+      var row2 = vec_new()
+      row2.push(pat_id)
+      mx_add_row(mx, as_int(row2), i)
+    end
+  end
+
+  # Exhaustiveness check: is [_] useful against the unguarded matrix?
+  var query = vec_new()
+  query.push(mx_pat_wildcard(store, subject_type))
+
+  var witness = mx_find_witness(tc, store, mx, as_int(query), subject_type, enum_name, 0)
+  if witness != -1
+    var witness_count = vec_size(witness)
+    if witness_count > 0
+      var witness_str = mx_pat_to_string(store, witness[0])
+      error("QZ0107: non-exhaustive match: missing pattern '#{witness_str}'", line, col)
+    else
+      error("QZ0107: non-exhaustive match", line, col)
+    end
+    return
+  end
+
+  # B4-b1 — exhaustiveness-to-`never` stamp. Reaching here means the match is
+  # TOTAL: `[_]` is NOT useful against the unguarded matrix (mx_find_witness
+  # returned -1), i.e. either every constructor is covered or a `_` wildcard
+  # arm is present. Either way there is NO fall-through path. Record that fact
+  # on the NODE_MATCH's own int_val slot (free on match nodes — no MIR/liveness/
+  # capture pass reads int_val on NODE_MATCH) so tc_stmt_diverges can, without
+  # rebuilding the Maranget matrix, treat an all-arms-diverge total match as a
+  # diverging statement. The Maranget cost is paid exactly once, here.
+  ast::ast_set_int_val(ast_storage, node, 1)
+
+  # Reachability check: only for closed types (enum, bool, Option, Result)
+  # Open types (Int, String) have variable-binding patterns that shadow wildcards,
+  # producing confusing warnings.
+  var all_ctors_check = mx_type_all_ctors(tc, store, subject_type, enum_name)
+  if vec_size(all_ctors_check) == 0
+    return
+  end
+
+  for i in 1..arm_count
+    var arm = arms[i]
+    var guard = ast::ast_get_extra(ast_storage, arm)
+    if guard > 0
+      continue
+    end
+
+    var prior = mx_matrix_new()
+    for j in 0..i
+      var prior_arm = arms[j]
+      var prior_pat = ast::ast_get_left(ast_storage, prior_arm)
+      if prior_pat < 0
+        continue
+      end
+      var prior_id = mx_pat_from_ast(tc, ast_storage, store, prior_pat, subject_type, enum_name)
+      var prior_row = vec_new()
+      prior_row.push(prior_id)
+      mx_add_row(prior, as_int(prior_row), j)
+    end
+
+    var arm_pat = ast::ast_get_left(ast_storage, arm)
+    if arm_pat < 0
+      continue
+    end
+    var arm_id = mx_pat_from_ast(tc, ast_storage, store, arm_pat, subject_type, enum_name)
+    var arm_query = vec_new()
+    arm_query.push(arm_id)
+
+    if mx_is_useful(tc, store, prior, as_int(arm_query), subject_type, enum_name, 0) == 0
+      var arm_line = ast::ast_get_line(ast_storage, arm)
+      var arm_col = ast::ast_get_col(ast_storage, arm)
+      warn("QZ0108: unreachable match arm", arm_line, arm_col)
+    end
+  end
+end

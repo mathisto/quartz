@@ -1,0 +1,138 @@
+## QSpec coverage for Phase A.4 — Alloc-effect static fast-path optimization.
+##
+## Locks in:
+##   - Wrapper body declares `alwaysinline`. The build pipeline runs
+##     `opt --passes=always-inline` so the wrapper folds at every call
+##     site — no out-of-line `@__qz_alloc` call instruction in the binary.
+##   - The blessed-handler watermark global `@__qz_alloc_blessed_watermark`
+##     is captured ONCE at qz_main's main prelude immediately after the
+##     blessed defaults install. The wrapper body uses it to fast-path
+##     direct `@malloc` when no user `with Alloc {...}` is installed on
+##     top of the blessed defaults.
+##   - The wrapper performs a TWO-stage check: stage 1 is the watermark
+##     `top <= bw` (cheap, no TLS); stage 2 is the
+##     `__qz_alloc_in_handler` flag (TLS, only on slow path). Reordering
+##     the check matters — stage 1 catches the >99% common case at zero
+##     cost above direct @malloc.
+##   - Behavior: a tracking handler installed via `with Alloc {...}` STILL
+##     intercepts allocations, AND the watermark check correctly
+##     distinguishes "in scope" vs "not in scope".
+##
+## Phase A.7 deleted the `--alloc-routing` flag — routing is the only
+## mode; spec-flag variants in this file have been retired.
+
+import * from qspec
+
+# Tiny program with one allocation. Used for IR-shape assertions.
+var _IR_SRC: String = """def main(): Int
+  var p = mem_alloc(8)
+  store(p, 0, 7)
+  var v = load(p, 0)
+  mem_free(p)
+  return v
+end
+"""
+
+# Tracking-handler probe: inside `with Alloc do work() end` the handler
+# fires; outside the with-block the watermark fast-path bypasses it.
+#
+# NOTE: avoid `#{var}` interpolation inside a triple-quote spec-string.
+# It interpolates at SPEC compile-time, not at the SUBPROCESS runtime
+# (see memory file feedback_quartz_module_quirks.md). We emit two
+# literal sentinel lines instead — one per phase observation.
+var _SCOPE_SRC: String = """import std/alloc
+
+var inside_calls = 0
+var outside_calls = 0
+var phase = 0
+
+def probe_alloc(op: Int, argc: Int, argv: Int): Int
+  if phase == 1
+    inside_calls = inside_calls + 1
+  else
+    outside_calls = outside_calls + 1
+  end
+  return default_alloc_handler(op, argc, argv)
+end
+
+def probe_dealloc(op: Int, argc: Int, argv: Int): Int
+  return default_dealloc_handler(op, argc, argv)
+end
+
+def do_work(): Void
+  var p = mem_alloc(8)
+  store(p, 0, 99)
+  mem_free(p)
+end
+
+def main(): Int
+  # Phase 0: outside any with-Alloc block. The watermark fast-path
+  # should bypass our handler entirely (probe never fires).
+  phase = 0
+  do_work()
+
+  # Phase 1: inside `with Alloc { ... } do ... end`. The watermark
+  # check sees `top > bw` and routes through perform → handler fires.
+  phase = 1
+  with Alloc { alloc: probe_alloc, dealloc: probe_dealloc } do ->
+    do_work()
+  end
+
+  # Phase 2: post-uninstall. Watermark restored to bw → fast-path again.
+  phase = 2
+  do_work()
+
+  if outside_calls == 0
+    puts(\"outside_bypass\")
+  else
+    puts(\"outside_intercept\")
+  end
+  if inside_calls > 0
+    puts(\"inside_intercept\")
+  else
+    puts(\"inside_bypass\")
+  end
+  return 0
+end
+"""
+
+def main(): Int
+  describe("Alloc-effect static fast-path (A.4)") do ->
+    it("wrapper definitions declare `alwaysinline`") do ->
+      # The wrapper bodies are tagged `alwaysinline`. The build
+      # pipeline's `opt --passes=always-inline` step folds them —
+      # without alwaysinline the inliner ignores them at -O0/-O1 and
+      # the wrapper stays as a real call.
+      assert_ir_contains(_IR_SRC, "ptr @__qz_alloc(i64 %bytes) nounwind alwaysinline")
+      assert_ir_contains(_IR_SRC, "void @__qz_dealloc(ptr %p) nounwind alwaysinline")
+    end
+
+    it("blessed-handler watermark global declared + initialized at main prelude") do ->
+      # The watermark global lives alongside @__qz_alloc_in_handler, and
+      # its capture is wired into `__qz_effect_install_defaults` (Phase
+      # E.1.c) which is called both from qz_main and from each scheduler
+      # worker's entry block. TLS so each thread captures its own value.
+      assert_ir_contains(_IR_SRC, "@__qz_alloc_blessed_watermark = ")
+      assert_ir_contains(_IR_SRC, "thread_local global i64 0")
+      assert_ir_contains(_IR_SRC, "store i64 %bw_top, ptr @__qz_alloc_blessed_watermark")
+    end
+
+    it("wrapper body checks watermark before TLS bypass flag") do ->
+      # Stage-1 check is the watermark; stage-2 (TLS load) only fires when
+      # stage 1 says "user handler installed". The qza_check_h block name
+      # is the marker for the second-stage entry.
+      assert_ir_contains(_IR_SRC, "%qza.no_user = icmp sle i64 %qza.top, %qza.bw")
+      assert_ir_contains(_IR_SRC, "qza_check_h:")
+    end
+
+    it("handler fires inside with-block, bypassed outside") do ->
+      # The probe handler increments inside_calls inside the with-block
+      # and outside_calls outside. After A.4's watermark fast-path:
+      # outside_calls MUST be 0 (the wrapper short-circuits before perform
+      # ever scans the handler stack); inside_calls MUST be ≥1 (the with
+      # block pushed `top` above the watermark, so the via_eff path runs).
+      assert_run_stdout_eq(_SCOPE_SRC, "outside_bypass\ninside_intercept\n")
+    end
+  end
+  return qspec_main()
+end

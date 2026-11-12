@@ -1,0 +1,164 @@
+## QSpec coverage for Phase E.7 — implicit per-worker arena pool.
+##
+## Phase E.7 (2026-04-29): under high task churn, the per-task arena
+## pattern from E.1 (`arena_new(8192)` / `arena_destroy(ar)` per spawn)
+## burns the mmap/munmap syscall pair on the hot path. E.7 adds a
+## thread-local LIFO arena pool (cap=64) and routes the per-task path
+## through `arena_acquire(size)` / `arena_release(handle)` stdlib helpers
+## that pop from the pool first. The released handle's chain pages are
+## retained and re-handed to the next `arena_acquire` after `arena_reset`
+## clears the offsets.
+##
+## Both the `go` keyword auto-wrap synthesizer (E.1.b) and the stdlib
+## `_go_arena_body` helper (E.1.a / E.6) are wired through the new
+## acquire/release pair, so all per-task spawn paths benefit.
+##
+## Pool primitives `__qz_arena_pool_take` / `__qz_arena_pool_give` are
+## emitted as inline IR intrinsics over TLS storage globals
+## `@__qz_arena_pool_handles[64]` and `@__qz_arena_pool_count`. TLS keeps
+## per-worker pools isolated — same lifetime model as the effect-stack
+## arrays (Phase E.1.c).
+##
+## What these tests prove:
+##
+##   E7.a — LIFO reuse: release then acquire returns the same handle.
+##   E7.b — Reset on acquire: a pooled handle's alloc_count is 0 after
+##           re-acquire (offsets cleared by `arena_reset` even though the
+##           chain pages are retained).
+##   E7.c — Pooled sequential go path (E.1.d regression under E.7): 50
+##           sequential `go_arena` tasks each Vec.push 50 ints; sum matches.
+##   E7.d — Pool fill + overflow: 65 fill+release cycles complete cleanly;
+##           after pool fills at 64, the 65th release falls back to
+##           `arena_destroy` without panic; subsequent acquire still works.
+
+import * from qspec
+import * from qspec/subprocess
+
+# -----------------------------------------------------------------------------
+# E7.a — direct LIFO reuse: arena_release(h) then arena_acquire(...) returns h.
+# -----------------------------------------------------------------------------
+
+var _LIFO_REUSE: String = """import * from std/alloc
+
+def main(): Int
+  var ar1 = arena_acquire(8192)
+  arena_release(ar1)
+  var ar2 = arena_acquire(8192)
+  if ar1 == ar2
+    puts(\"reused\")
+  else
+    puts(\"not_reused\")
+  end
+  arena_release(ar2)
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E7.b — arena_reset on acquire clears the pooled handle's alloc count.
+# Before E.7, every per-task arena was fresh (count starts at 0 trivially).
+# Under E.7, a pooled arena retains its chain pages but `arena_reset` clears
+# the per-block `offset` fields and the head's `alloc_count`. Re-acquired
+# handle MUST appear empty.
+# -----------------------------------------------------------------------------
+
+var _RESET_ON_ACQUIRE: String = """import * from std/alloc
+
+def main(): Int
+  var ar = arena_acquire(8192)
+  arena_alloc(ar, 1024)
+  arena_alloc(ar, 1024)
+  arena_alloc(ar, 1024)
+  arena_release(ar)
+  var ar2 = arena_acquire(8192)
+  puts(str_from_int(arena_alloc_count(ar2)))
+  arena_release(ar2)
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E7.c — regression: 50 sequential go_arena tasks under the pooled path
+# return correct total. Mirrors E1.d but exercises the E.7 acquire/release
+# wiring inside `_go_arena_body`. Each task pushes 50 ints (0..49); sum=1225;
+# 50 tasks * 1225 = 61250.
+# -----------------------------------------------------------------------------
+
+var _POOLED_SEQUENTIAL: String = """import std/sync/composition/go
+
+def per_task_sum(): Int
+  var v = vec_new<Int>()
+  var s = 0
+  for i in 0..50
+    v.push(i)
+    s += i
+  end
+  return s
+end
+
+def main(): Int
+  sched_init(0)
+  var total = 0
+  for j in 0..50
+    total += await go_arena(per_task_sum)
+  end
+  puts(str_from_int(total))
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E7.d — pool fill + overflow path. 65 sequential acquire+release pairs
+# complete without panic. The 65th release must fall back to arena_destroy
+# (pool full at 64). A subsequent acquire after the burst still works,
+# returning a pool-resident handle (the most recent push survived overflow).
+# Asserts presence of "ok" rather than handle identity (overflow drops the
+# 65th in favor of keeping the prior 64).
+# -----------------------------------------------------------------------------
+
+var _FILL_AND_OVERFLOW: String = """import * from std/alloc
+
+def main(): Int
+  for i in 0..65
+    var ar = arena_acquire(8192)
+    arena_alloc(ar, 64)
+    arena_release(ar)
+  end
+  var post = arena_acquire(8192)
+  if post != 0
+    puts(\"ok\")
+  else
+    puts(\"failed\")
+  end
+  arena_release(post)
+  return 0
+end
+"""
+
+# =============================================================================
+# Spec entry point
+# =============================================================================
+
+def main(): Int
+  describe("Phase E.7 — implicit per-worker arena pool") do ->
+
+    it("LIFO reuse: release(h) then acquire(...) returns h") do ->
+      assert_run_stdout_eq(_LIFO_REUSE, "reused\n")
+    end
+
+    it("arena_reset on acquire: pooled handle's alloc_count is 0") do ->
+      assert_run_stdout_eq(_RESET_ON_ACQUIRE, "0\n")
+    end
+
+    it("pooled sequential go_arena (50 tasks, 50 pushes each)") do ->
+      assert_run_stdout_eq(_POOLED_SEQUENTIAL, "61250\n")
+    end
+
+    it("pool fill + overflow: 65 cycles + post-acquire all clean") do ->
+      assert_run_stdout_eq(_FILL_AND_OVERFLOW, "ok\n")
+    end
+
+  end
+  return qspec_main()
+end

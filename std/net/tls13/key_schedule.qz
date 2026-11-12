@@ -1,0 +1,295 @@
+## std/net/tls13/key_schedule — TLS 1.3 HKDF-Expand-Label ladder (RFC 8446 §7.1)
+##
+## NET.5c.3 substrate. Final piece of NET.5c: the secret-derivation
+## machinery that turns the (EC)DHE shared secret + transcript hash into
+## the per-direction traffic keys used by the record layer (NET.5c.2).
+##
+## ## RFC 8446 §7.1 ladder (the entire schedule)
+##
+## ```
+##              0
+##              |
+##              v
+##    PSK ->  HKDF-Extract = Early Secret               (PSK = 0 v1)
+##              |
+##              v
+##        Derive-Secret(., "derived", "")
+##              |
+##              v
+##    (EC)DHE -> HKDF-Extract = Handshake Secret
+##              |
+##              +-----> Derive-Secret(., "c hs traffic", CH..SH)
+##              |                     = client_handshake_traffic_secret
+##              |
+##              +-----> Derive-Secret(., "s hs traffic", CH..SH)
+##              |                     = server_handshake_traffic_secret
+##              v
+##        Derive-Secret(., "derived", "")
+##              |
+##              v
+##        0 -> HKDF-Extract = Master Secret
+##              |
+##              +-----> Derive-Secret(., "c ap traffic", CH..server.Finished)
+##              |                     = client_application_traffic_secret_0
+##              |
+##              +-----> Derive-Secret(., "s ap traffic", CH..server.Finished)
+##              |                     = server_application_traffic_secret_0
+##              |
+##              +-----> Derive-Secret(., "exp master", CH..server.Finished)
+##              |                     = exporter_master_secret
+##              |
+##              +-----> Derive-Secret(., "res master", CH..client.Finished)
+##                                    = resumption_master_secret
+## ```
+##
+## Where:
+##
+## ```
+## HKDF-Expand-Label(Secret, Label, Context, Length) =
+##     HKDF-Expand(Secret, HkdfLabel, Length)
+##
+## struct {
+##   uint16 length = Length;
+##   opaque label<7..255>   = "tls13 " || Label;
+##   opaque context<0..255> = Context;
+## } HkdfLabel;
+##
+## Derive-Secret(Secret, Label, Messages) =
+##     HKDF-Expand-Label(Secret, Label,
+##                       Transcript-Hash(Messages),
+##                       Hash.length)
+##
+## # Per-direction key + iv from a traffic_secret:
+## sender_write_key = HKDF-Expand-Label(traffic_secret, "key", "", key_length)
+## sender_write_iv  = HKDF-Expand-Label(traffic_secret, "iv",  "", iv_length)
+## ```
+##
+## ## Prior art
+##
+## - **rustls** `tls13/key_schedule.rs` — labeled-secret algebra mirrored
+##   here (named Quartz API: `ks_extract_early`, `ks_extract_handshake`,
+##   `ks_extract_master`, `ks_derive_secret`, `ks_derive_keys`).
+## - **picotls** `picotls.c` — minimal HkdfLabel encode (we match the byte
+##   layout exactly).
+## - **BoringSSL** `ssl/tls13_enc.cc` — Hash-dispatch on `cipher_suite`.
+## - RFC 8446 §7.1, RFC 5869.
+##
+## ## Validation
+##
+## RFC 8448 §3 (full handshake trace) provides byte-for-byte secrets +
+## derived keys; the smoke verifies the early / handshake / master
+## extracts, all six derive_secrets, and the key+iv derivation.
+
+import * from ffi/socket
+import * from std/core/crypto/secret
+import * from std/core/crypto/hkdf
+import * from std/net/tls13/handshake   # cipher-suite IDs
+import * from std/net/tls13/record      # transcript, TrafficKeys
+
+# =============================================================================
+# Hash dispatch helpers (which hash binds to which cipher suite)
+# =============================================================================
+
+## Hash ID for the cipher suite (1 = SHA-256, 2 = SHA-384).
+def ks_hash_for_suite(cipher_suite: Int): Int
+  if cipher_suite == CIPHER_AES_256_GCM_SHA384() then return TRANSCRIPT_HASH_SHA384() end
+  # AES-128-GCM-SHA256 + CHACHA20_POLY1305_SHA256 both bind SHA-256.
+  return TRANSCRIPT_HASH_SHA256()
+end
+
+## Digest size for the cipher suite's hash (32 or 48 bytes).
+def ks_hash_size(cipher_suite: Int): Int = transcript_digest_size(ks_hash_for_suite(cipher_suite))
+
+## Key length for the cipher suite (16 for AES-128-GCM, 32 for AES-256-GCM,
+## 32 for ChaCha20-Poly1305).
+def ks_key_size(cipher_suite: Int): Int
+  if cipher_suite == CIPHER_AES_128_GCM_SHA256() then return 16 end
+  return 32
+end
+
+## IV length is always 12 bytes for TLS 1.3 AEAD.
+def ks_iv_size(): Int = 12
+
+# Internal: dispatch HKDF-Extract by hash.
+def _ks_hkdf_extract(hash_id: Int, prk: Int, salt: Int, salt_len: Int,
+                     ikm: Secret<Int>, ikm_len: Int): Void
+  if hash_id == TRANSCRIPT_HASH_SHA256()
+    hkdf_extract_sha256(prk, salt, salt_len, ikm, ikm_len)
+  end
+  if hash_id == TRANSCRIPT_HASH_SHA384()
+    hkdf_extract_sha384(prk, salt, salt_len, ikm, ikm_len)
+  end
+end
+
+# Internal: dispatch HKDF-Expand by hash.
+def _ks_hkdf_expand(hash_id: Int, okm: Int, prk: Secret<Int>, info: Int, info_len: Int, len: Int): Void
+  if hash_id == TRANSCRIPT_HASH_SHA256()
+    hkdf_expand_sha256(okm, prk, info, info_len, len)
+  end
+  if hash_id == TRANSCRIPT_HASH_SHA384()
+    hkdf_expand_sha384(okm, prk, info, info_len, len)
+  end
+end
+
+# =============================================================================
+# HKDF-Expand-Label (RFC 8446 §7.1)
+# =============================================================================
+
+# Build the HkdfLabel structure:
+#   uint16 length
+#   opaque label<7..255>   = "tls13 " || Label   (note the literal space)
+#   opaque context<0..255> = Context
+def _build_hkdf_label(out: Int, length: Int,
+                      label: String, context: Int, context_len: Int): Int
+  var pos = 0
+  ptr_write_byte(out + pos, (length >> 8) & 0xff); pos = pos + 1
+  ptr_write_byte(out + pos, length & 0xff);        pos = pos + 1
+
+  # opaque label<7..255> — total label is "tls13 " + Label, 8-bit length prefix.
+  var label_bytes = "tls13 " + label
+  var label_len = str_byte_len(label_bytes)
+  ptr_write_byte(out + pos, label_len & 0xff); pos = pos + 1
+  var i = 0
+  while i < label_len
+    ptr_write_byte(out + pos, str_byte_at(label_bytes, i))
+    pos = pos + 1
+    i = i + 1
+  end
+
+  # opaque context<0..255>
+  ptr_write_byte(out + pos, context_len & 0xff); pos = pos + 1
+  if context_len > 0
+    memcpy(out + pos, context, context_len)
+    pos = pos + context_len
+  end
+
+  return pos
+end
+
+## HKDF-Expand-Label(Secret, Label, Context, Length) — writes Length bytes
+## of OKM into `out`. `secret` is the Secret<Int> input; `label` is the
+## ASCII label (e.g. "c hs traffic"); `context` + `context_len` is the
+## context bytes (often a Transcript-Hash digest); `len` is the requested
+## output length.
+def hkdf_expand_label(hash_id: Int, out: Int, secret: Secret<Int>,
+                      label: String, context: Int, context_len: Int, len: Int): Void
+  # HkdfLabel max size = 2 (length) + 1 (label-len) + 255 (label) + 1 (ctx-len)
+  # + 255 (ctx) = 514. Caller-side label + ctx are bounded so 600 fits.
+  var info = malloc(600)
+  var info_len = _build_hkdf_label(info, len, label, context, context_len)
+  _ks_hkdf_expand(hash_id, out, secret, info, info_len, len)
+  free(info)
+end
+
+## Derive-Secret(Secret, Label, Messages) — convenience wrapper that
+## evaluates Transcript-Hash(Messages) internally via a cloned snapshot
+## (does NOT consume `t`), then runs HKDF-Expand-Label with the digest
+## as context and Hash.length as the OKM length.
+def derive_secret(out: Int, secret: Secret<Int>, label: String, t: Transcript): Void
+  var dsize = transcript_digest_size(t.hash_id)
+  var th = malloc(dsize)
+  transcript_digest(t, th)
+  hkdf_expand_label(t.hash_id, out, secret, label, th, dsize, dsize)
+  free(th)
+end
+
+## Derive-Secret variant that takes the transcript-hash bytes directly
+## (use this when you have a pre-computed Transcript-Hash from somewhere
+## else — e.g., a finished_key for HMAC over Transcript-Hash).
+def derive_secret_with_hash(hash_id: Int, out: Int, secret: Secret<Int>,
+                            label: String, transcript_hash: Int): Void
+  var dsize = transcript_digest_size(hash_id)
+  hkdf_expand_label(hash_id, out, secret, label, transcript_hash, dsize, dsize)
+end
+
+# =============================================================================
+# Extract steps (early / handshake / master)
+# =============================================================================
+
+## Early Secret = HKDF-Extract(0, PSK). In v1 (no PSK), PSK is hash_size
+## zero bytes and salt is 0 (empty). Output is hash_size bytes.
+def ks_extract_early(hash_id: Int, out: Int): Void
+  var dsize = transcript_digest_size(hash_id)
+  var psk = malloc(dsize)
+  memset(psk, 0, dsize)
+  _ks_hkdf_extract(hash_id, out, 0, 0, secret_wrap<Int>(psk), dsize)
+  free(psk)
+end
+
+## Handshake Secret = HKDF-Extract(Derive-Secret(early, "derived", ""), (EC)DHE)
+##
+## `early_secret` is the output of `ks_extract_early`. `dhe_shared` is the
+## (EC)DHE shared secret bytes (32 for X25519 alone, 64 for X25519MLKEM768 —
+## but X25519MLKEM768 combiner is in std/crypto/hybrid.qz).
+def ks_extract_handshake(hash_id: Int, out: Int, early_secret: Secret<Int>,
+                         dhe_shared: Secret<Int>, dhe_shared_len: Int): Void
+  var dsize = transcript_digest_size(hash_id)
+  var derived = malloc(dsize)
+
+  # Derive-Secret(., "derived", "") with empty-string Transcript-Hash.
+  # RFC 8446 §7.1: Transcript-Hash of empty message list is Hash("") —
+  # SHA-256("") = e3b0c4..., SHA-384("") = 38b060...
+  var empty_hash = malloc(dsize)
+  var empty_tr = transcript_new(hash_id)
+  transcript_digest(empty_tr, empty_hash)
+  transcript_free(empty_tr)
+
+  hkdf_expand_label(hash_id, derived, early_secret, "derived", empty_hash, dsize, dsize)
+
+  _ks_hkdf_extract(hash_id, out, derived, dsize, dhe_shared, dhe_shared_len)
+
+  free(empty_hash); free(derived)
+end
+
+## Master Secret = HKDF-Extract(Derive-Secret(handshake, "derived", ""), 0)
+def ks_extract_master(hash_id: Int, out: Int, handshake_secret: Secret<Int>): Void
+  var dsize = transcript_digest_size(hash_id)
+  var derived = malloc(dsize)
+
+  var empty_hash = malloc(dsize)
+  var empty_tr = transcript_new(hash_id)
+  transcript_digest(empty_tr, empty_hash)
+  transcript_free(empty_tr)
+
+  hkdf_expand_label(hash_id, derived, handshake_secret, "derived", empty_hash, dsize, dsize)
+
+  # IKM is the all-zero hash_size buffer.
+  var zero_ikm = malloc(dsize)
+  memset(zero_ikm, 0, dsize)
+  _ks_hkdf_extract(hash_id, out, derived, dsize, secret_wrap<Int>(zero_ikm), dsize)
+
+  free(zero_ikm); free(empty_hash); free(derived)
+end
+
+# =============================================================================
+# Per-direction traffic key derivation
+# =============================================================================
+
+## From a `*_traffic_secret`, derive the AEAD (key, iv) and return a fresh
+## TrafficKeys with seq=0. Caller owns the secret_in_ptr buffer (the
+## traffic secret) and the returned `TrafficKeys.key_ptr` / `.iv_ptr`
+## buffers (this function malloc's them).
+def ks_derive_keys(cipher_suite: Int, traffic_secret: Secret<Int>): TrafficKeys
+  var hid = ks_hash_for_suite(cipher_suite)
+  var klen = ks_key_size(cipher_suite)
+  var key = malloc(klen)
+  hkdf_expand_label(hid, key, traffic_secret, "key", 0, 0, klen)
+  var iv = malloc(12)
+  hkdf_expand_label(hid, iv, traffic_secret, "iv", 0, 0, 12)
+  return traffic_keys_new(cipher_suite, key, klen, iv)
+end
+
+# =============================================================================
+# Finished-key derivation (RFC 8446 §4.4.4)
+# =============================================================================
+
+## finished_key = HKDF-Expand-Label(Base.handshake_traffic_secret, "finished",
+##                                  "", Hash.length)
+##
+## The Finished message's `verify_data` = HMAC(finished_key, Transcript-Hash(...))
+## using the cipher suite's hash. Caller computes the HMAC themselves; this
+## helper just derives the key.
+def ks_derive_finished_key(hash_id: Int, out: Int, traffic_secret: Secret<Int>): Void
+  var dsize = transcript_digest_size(hash_id)
+  hkdf_expand_label(hash_id, out, traffic_secret, "finished", 0, 0, dsize)
+end

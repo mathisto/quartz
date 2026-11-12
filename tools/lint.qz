@@ -1,0 +1,2379 @@
+## Quartz Linter — World-Class Style & Correctness Checker
+##
+## Two-tier architecture:
+##   Tier 1 (text-based): Fast, works on broken files, pattern-matches source lines.
+##   Tier 2 (AST-based): Semantic analysis after successful parse.
+##
+## All rules emit Diagnostic structs via diagnostic.qz for colored, formatted output.
+## Error codes use the QZ7xxx range (7 = lint).
+##
+## Usage:
+##   import tools/lint
+##   var result = lint_file_with_config(source, filename, lint_default_config())
+##   # result.count is total warnings/errors
+
+import diagnostic
+import ast
+import node_constants
+import string_intern
+import toml/value
+import toml/parser
+
+## Lint severity constants
+const LINT_WARNING = 1
+const LINT_ERROR = 0
+
+## Auto-fix: a byte-offset replacement in source text.
+struct LintFix
+  start_byte: Int
+  end_byte: Int
+  replacement: String
+  code: String
+end
+
+## Lint result container
+struct LintResult
+  count: Int
+  diagnostics: Vec<Diagnostic>
+  fixes: Vec<LintFix>
+end
+
+def lint_result_new(): LintResult
+  return LintResult { count: 0, diagnostics: vec_new<Diagnostic>(), fixes: vec_new<LintFix>() }
+end
+
+def lint_result_add(r: LintResult, d: Diagnostic): Void
+  r.diagnostics.push(d)
+  r.count += 1
+end
+
+def lint_result_add_fix(r: LintResult, fix: LintFix): Void
+  r.fixes.push(fix)
+end
+
+## Emit all diagnostics in a result.
+def lint_result_emit(r: LintResult): Void
+  for i in 0..r.diagnostics.size()
+    diag_emit(r.diagnostics.get(i))
+  end
+end
+
+## Create a lint warning diagnostic with source context.
+def lint_warn(code: String, msg: String, filename: String, line: Int, col: Int, src_lines: Vec<String>): Diagnostic
+  var d = diag_new(LINT_WARNING, code, msg, filename, line, col)
+  diag_set_source(d, src_lines)
+  return d
+end
+
+## ========================================================================
+## Configuration
+## ========================================================================
+
+struct LintConfig
+  disabled_rules: Vec<String>
+  nesting_depth: Int
+  chain_length: Int
+end
+
+def lint_default_config(): LintConfig
+  return LintConfig {
+    disabled_rules: vec_new<String>(),
+    nesting_depth: 4,
+    chain_length: 3
+  }
+end
+
+def lint_config_disable(config: LintConfig, code: String): Void
+  config.disabled_rules.push(code)
+end
+
+def lint_config_is_enabled(config: LintConfig, code: String): Bool
+  for i in 0..config.disabled_rules.size()
+    if config.disabled_rules.get(i) == code
+      return false
+    end
+  end
+  return true
+end
+
+## Load lint config from a .quartzlint.toml config file using the TOML parser.
+def lint_load_config(path: String): LintConfig
+  var config = lint_default_config()
+  var source = read_file(path)
+  if str_byte_len(source) == 0
+    return config
+  end
+  var result = parser::toml_parse(source)
+  match result
+    Result::Ok(doc) => do
+      # Pass doc directly to get_path (NOT toml_as_table(doc))
+      var disable_opt = value::toml_get_path(doc, "rules.disable")
+      if disable_opt.is_some()
+        var disable_val = disable_opt.unwrap()
+        var arr = value::toml_as_array(disable_val)
+        var arr_size = vec_size(arr)
+        for i in 0..arr_size
+          var rule_str = value::toml_as_string(arr[i])
+          if str_byte_len(rule_str) > 0
+            config.disabled_rules.push(rule_str)
+          end
+        end
+      end
+      var nd = value::toml_get_int(doc, "thresholds.nesting_depth")
+      if nd > 0
+        config.nesting_depth = nd
+      end
+      var cl = value::toml_get_int(doc, "thresholds.chain_length")
+      if cl > 0
+        config.chain_length = cl
+      end
+    end
+    Result::Err(e) => do
+      eputs("Warning: could not parse config '#{path}'")
+    end
+  end
+  return config
+end
+
+## Search for .quartzlint.toml in cwd and parent dirs.
+def lint_find_config(): String
+  var cwd = getcwd()
+  var path = "#{cwd}/.quartzlint.toml"
+  if file_exists(path)
+    return path
+  end
+  # Try parent directories (up to 10 levels)
+  var dir = cwd
+  var i = 0
+  while i < 10
+    var last_slash = -1
+    var dlen = str_byte_len(dir)
+    var j = dlen - 1
+    while j >= 0
+      if dir.str_byte_at(j) == '/'
+        last_slash = j
+        break
+      end
+      j -= 1
+    end
+    if last_slash <= 0
+      return ""
+    end
+    dir = str_byte_slice(dir, 0, last_slash)
+    path = "#{dir}/.quartzlint.toml"
+    if file_exists(path)
+      return path
+    end
+    i += 1
+  end
+  return ""
+end
+
+## ========================================================================
+## Inline suppression
+## ========================================================================
+
+## Parse `# lint:disable QZxxxx` from a source line. Returns the code or "".
+def lint_parse_suppression(line: String): String
+  var len = str_byte_len(line)
+  var needle = "# lint:disable "
+  var nlen = 15
+  if len < nlen
+    return ""
+  end
+  # Scan for the pattern anywhere in the line
+  var i = 0
+  while i <= len - nlen
+    var found = true
+    var j = 0
+    while j < nlen
+      if line.str_byte_at(i + j) != needle.str_byte_at(j)
+        found = false
+        break
+      end
+      j += 1
+    end
+    if found
+      var after = i + nlen
+      var code = lnt_read_word(line, after)
+      if str_starts_with(code, "QZ") or code == "all"
+        return code
+      end
+    end
+    i += 1
+  end
+  return ""
+end
+
+## Check if a diagnostic at line_num is suppressed via inline comment.
+def lint_is_suppressed(src_lines: Vec<String>, line_num: Int, code: String): Bool
+  if line_num > 0 and line_num <= src_lines.size()
+    var current = src_lines.get(line_num - 1)
+    var sc = lint_parse_suppression(current)
+    if sc == code or sc == "all"
+      return true
+    end
+  end
+  if line_num > 1 and line_num <= src_lines.size()
+    var prev = src_lines.get(line_num - 2)
+    var sc = lint_parse_suppression(prev)
+    if sc == code or sc == "all"
+      return true
+    end
+  end
+  return false
+end
+
+## Add a diagnostic to result, respecting inline suppression.
+def lint_result_add_checked(r: LintResult, d: Diagnostic, src_lines: Vec<String>): Void
+  if not lint_is_suppressed(src_lines, d.line, d.code)
+    lint_result_add(r, d)
+  end
+end
+
+## Compute byte offset for the start of a given 1-based line number.
+def lint_line_byte_offset(source: String, line_num: Int): Int
+  var offset = 0
+  var current_line = 1
+  var len = str_byte_len(source)
+  while offset < len and current_line < line_num
+    if source.str_byte_at(offset) == '\n'
+      current_line += 1
+    end
+    offset += 1
+  end
+  return offset
+end
+
+## Apply all accumulated fixes to source text.
+## Fixes are sorted by start_byte descending so offsets remain valid.
+def lint_apply_fixes(source: String, fixes: Vec<LintFix>): String
+  if fixes.size() == 0
+    return source
+  end
+  # Sort descending by start_byte (simple insertion sort — fix count is small)
+  var sorted = vec_new<LintFix>()
+  for i in 0..fixes.size()
+    sorted.push(fixes.get(i))
+  end
+  var n = sorted.size()
+  var i = 1
+  while i < n
+    var key = sorted.get(i)
+    var j = i - 1
+    while j >= 0 and sorted.get(j).start_byte < key.start_byte
+      sorted.set(j + 1, sorted.get(j))
+      j -= 1
+    end
+    sorted.set(j + 1, key)
+    i += 1
+  end
+  # Apply fixes from end of file to start, skipping overlapping fixes
+  var result = source
+  var last_start = str_byte_len(source)
+  for i in 0..sorted.size()
+    var fix = sorted.get(i)
+    # Skip if this fix overlaps with a previously applied one
+    if fix.end_byte > last_start
+      continue
+    end
+    # Bounds check
+    var rlen = str_byte_len(result)
+    if fix.start_byte < 0 or fix.end_byte > rlen or fix.start_byte > fix.end_byte
+      continue
+    end
+    var before = str_byte_slice(result, 0, fix.start_byte)
+    var after = str_byte_slice(result, fix.end_byte, rlen)
+    result = "#{before}#{fix.replacement}#{after}"
+    last_start = fix.start_byte
+  end
+  return result
+end
+
+## Kind constants for opening constructs
+def KIND_DEF(): Int = 1
+def KIND_IF(): Int = 2
+def KIND_WHILE(): Int = 3
+def KIND_FOR(): Int = 4
+def KIND_STRUCT(): Int = 5
+def KIND_ENUM(): Int = 6
+def KIND_MATCH(): Int = 7
+
+## Convert a kind constant to its keyword name.
+def kind_to_str(kind: Int): String
+  if kind == KIND_DEF()
+    return "def"
+  elsif kind == KIND_IF()
+    return "if"
+  elsif kind == KIND_WHILE()
+    return "while"
+  elsif kind == KIND_FOR()
+    return "for"
+  elsif kind == KIND_STRUCT()
+    return "struct"
+  elsif kind == KIND_ENUM()
+    return "enum"
+  elsif kind == KIND_MATCH()
+    return "match"
+  end
+  return "unknown"
+end
+
+## Return the kind constant for an opening keyword, or 0 if not an opener.
+def keyword_to_kind(word: String): Int
+  if word == "def"
+    return KIND_DEF()
+  elsif word == "if"
+    return KIND_IF()
+  elsif word == "while"
+    return KIND_WHILE()
+  elsif word == "for"
+    return KIND_FOR()
+  elsif word == "struct"
+    return KIND_STRUCT()
+  elsif word == "enum"
+    return KIND_ENUM()
+  elsif word == "match"
+    return KIND_MATCH()
+  end
+  return 0
+end
+
+def lnt_char_at(s: String, i: Int): String = str_from_char(s.str_byte_at(i))
+
+def is_upper_code(c: Int): Bool = c >= 'A' and c <= 'Z'
+
+def is_lower_code(c: Int): Bool = c >= 'a' and c <= 'z'
+
+def is_digit_code(c: Int): Bool = c >= '0' and c <= '9'
+
+def is_underscore(s: String): Bool = s == "_"
+
+def str_is_upper(s: String): Bool = is_upper_code(s.str_byte_at(0))
+
+def str_is_lower(s: String): Bool = is_lower_code(s.str_byte_at(0))
+
+def is_word_char(c: Int): Bool
+  return is_lower_code(c) or is_upper_code(c) or c == '_' or is_digit_code(c)
+end
+
+def is_snake_case(name: String): Bool
+  len = str_byte_len(name)
+  for i in 0..len
+    c = name.str_byte_at(i)
+    if not (is_lower_code(c) or c == '_' or is_digit_code(c))
+      return false
+    end
+  end
+  return true
+end
+
+def is_pascal_case(name: String): Bool
+  if str_byte_len(name) == 0
+    return false
+  end
+  return is_upper_code(name.str_byte_at(0))
+end
+
+def lnt_skip_ws(source: String, pos: Int): Int
+  len = str_byte_len(source)
+  var p = pos
+  while p < len
+    c = lnt_char_at(source, p)
+    if c == " " or c == "\t" or c == "\n" or c == "\r"
+      p += 1
+    else
+      return p
+    end
+  end
+  return p
+end
+
+def lnt_read_word(source: String, pos: Int): String
+  len = str_byte_len(source)
+  var p = pos
+  var word = ""
+  while p < len
+    c = source.str_byte_at(p)
+    if is_word_char(c)
+      word = "#{word}#{str_from_char(c)}"
+      p += 1
+    else
+      return word
+    end
+  end
+  return word
+end
+
+## Skip the rest of a line comment (from # to newline).
+## Returns the position after the newline (or end of string).
+def lnt_skip_comment(source: String, pos: Int): Int
+  len = str_byte_len(source)
+  var p = pos
+  while p < len and lnt_char_at(source, p) != "\n"
+    p += 1
+  end
+  return p
+end
+
+## Skip a double-quoted string literal, handling backslash escapes.
+## pos should point at the opening `"`. Returns position after closing `"`.
+def lnt_skip_string(source: String, pos: Int): Int
+  len = str_byte_len(source)
+  var p = pos + 1
+  while p < len
+    c = lnt_char_at(source, p)
+    if c == "\\"
+      # Escape: skip next char
+      p += 2
+    elsif c == "\""
+      return p + 1
+    else
+      p += 1
+    end
+  end
+  return p
+end
+
+## Skip non-word whitespace (spaces and tabs only, not newlines).
+## Returns position of first non-whitespace-non-newline char.
+def lnt_skip_spaces(source: String, pos: Int): Int
+  len = str_byte_len(source)
+  var p = pos
+  while p < len
+    c = lnt_char_at(source, p)
+    if c == " " or c == "\t"
+      p += 1
+    else
+      return p
+    end
+  end
+  return p
+end
+
+## Balance checker — counts opening constructs vs end keywords.
+##
+## Enhanced features:
+##   - Tracks `else if` as opening a new nesting level (needs its own `end`)
+##   - Skips string literals ("...") and line comments (# ...)
+##   - Reports specific line numbers for each unclosed construct
+##   - `elsif` does NOT create extra nesting (it's part of the parent if/end)
+##
+## Returns the number of balance errors found.
+def check_balance(source: String): Int
+  len = str_byte_len(source)
+  var pos = 0
+  var end_count = 0
+  var line = 1
+  var errors = 0
+
+  # Stack of (keyword_kind, line_number) for open constructs
+  var open_kinds = vec_new()
+  var open_lines = vec_new()
+
+  while pos < len
+    c = lnt_char_at(source, pos)
+
+    if c == "\n"
+      # Track line numbers
+      line += 1
+      pos += 1
+    elsif c == " " or c == "\t" or c == "\r"
+      pos += 1
+    elsif c == "#"
+      # Skip line comments
+      pos = lnt_skip_comment(source, pos)
+    elsif c == "\""
+      # Skip string literals
+      pos = lnt_skip_string(source, pos)
+    else
+      word = lnt_read_word(source, pos)
+      word_len = str_byte_len(word)
+
+      if word_len > 0
+        kind = keyword_to_kind(word)
+
+        if kind > 0
+          # Opening construct found
+          open_kinds.push(kind)
+          open_lines.push(line)
+        elsif word == "else"
+          # Check for `else if` pattern: else followed by `if`
+          # on the same line (with possible whitespace between)
+          after_else = pos + 4
+          after_spaces = lnt_skip_spaces(source, after_else)
+          next_word = lnt_read_word(source, after_spaces)
+          if next_word == "if"
+            # `else if` — the `if` creates a new nesting level
+            open_kinds.push(KIND_IF())
+            open_lines.push(line)
+            # Skip past "else if"
+            pos = after_spaces + 2
+          end
+        elsif word == "end"
+          end_count += 1
+          # Try to pop from stack
+          if open_kinds.size > 0
+            open_kinds.pop()
+            open_lines.pop()
+          end
+        end
+        pos += word_len
+      else
+        pos += 1
+      end
+    end
+  end
+
+  # Report errors
+  total_opens = open_kinds.size
+
+  if total_opens > 0
+    # Unclosed constructs remain
+    print("error: ")
+    print_int(total_opens)
+    puts(" missing 'end' keyword(s)")
+    puts("Unclosed constructs (last opened first):")
+    # Show all unclosed, from most recent
+    var i = total_opens - 1
+    while i >= 0
+      open_line = open_lines[i]
+      kind = open_kinds[i]
+      name = kind_to_str(kind)
+      print("  line ")
+      print_int(open_line)
+      print(": ")
+      puts(name)
+      i -= 1
+    end
+    errors = total_opens
+  elsif end_count > 0 and total_opens == 0
+    # We've popped everything but there might be extra ends
+    # (end_count tracked each end, so if we still have more ends than opens
+    #  after popping, the stack would have been empty at some pop attempt)
+    # Since we pop on each end, if end_count > original opens, the stack
+    # went empty early. We need a different approach: count total opens seen.
+  end
+
+  open_kinds.free()
+  open_lines.free()
+
+  return errors
+end
+
+## Check for extra `end` keywords by counting total opens vs ends.
+## This is a second pass that catches the "too many ends" case.
+def check_extra_ends(source: String): Int
+  len = str_byte_len(source)
+  var pos = 0
+  var open_count = 0
+  var end_count = 0
+
+  while pos < len
+    c = lnt_char_at(source, pos)
+
+    if c == "\n" or c == " " or c == "\t" or c == "\r"
+      pos += 1
+    elsif c == "#"
+      pos = lnt_skip_comment(source, pos)
+    elsif c == "\""
+      pos = lnt_skip_string(source, pos)
+    else
+      word = lnt_read_word(source, pos)
+      word_len = str_byte_len(word)
+
+      if word_len > 0
+        kind = keyword_to_kind(word)
+        if kind > 0
+          open_count += 1
+        elsif word == "else"
+          after_else = pos + 4
+          after_spaces = lnt_skip_spaces(source, after_else)
+          next_word = lnt_read_word(source, after_spaces)
+          if next_word == "if"
+            open_count += 1
+            pos = after_spaces + 2
+          end
+        elsif word == "end"
+          end_count += 1
+        end
+        pos += word_len
+      else
+        pos += 1
+      end
+    end
+  end
+
+  if end_count > open_count
+    extra = end_count - open_count
+    print("error: ")
+    print_int(extra)
+    puts(" extra 'end' keyword(s) - more ends than opening constructs")
+    return extra
+  end
+  return 0
+end
+
+def lint_source(source: String): Int
+  len = str_byte_len(source)
+  var pos = 0
+  var errors = 0
+  var line = 1
+
+  while pos < len
+    pos = lnt_skip_ws(source, pos)
+    if pos >= len
+      return errors
+    end
+
+    word = lnt_read_word(source, pos)
+    word_len = str_byte_len(word)
+
+    if word == "def"
+      pos += 3
+      pos = lnt_skip_ws(source, pos)
+      name = lnt_read_word(source, pos)
+      if str_byte_len(name) > 0 and not is_snake_case(name)
+        print("warning: function '")
+        print(name)
+        puts("' should be snake_case")
+        errors += 1
+      end
+      pos += str_byte_len(name)
+    elsif word == "struct" or word == "enum"
+      pos += word_len
+      pos = lnt_skip_ws(source, pos)
+      name = lnt_read_word(source, pos)
+      if str_byte_len(name) > 0 and not is_pascal_case(name)
+        print("warning: type '")
+        print(name)
+        puts("' should be PascalCase")
+        errors += 1
+      end
+      pos += str_byte_len(name)
+    elsif word_len > 0
+      pos += word_len
+    else
+      c = lnt_char_at(source, pos)
+      if c == "\n"
+        line += 1
+      end
+      pos += 1
+    end
+  end
+
+  return errors
+end
+
+def lint_file(source: String): Int
+  var total_errors = 0
+
+  # First check balance - most critical
+  balance_errors = check_balance(source)
+  total_errors += balance_errors
+
+  # Also check for extra ends
+  extra_errors = check_extra_ends(source)
+  total_errors += extra_errors
+
+  # Then check naming conventions
+  style_errors = lint_source(source)
+  total_errors += style_errors
+
+  # Bool hygiene
+  bool_warnings = check_bool_hygiene(source)
+  total_errors += bool_warnings
+
+  return total_errors
+end
+
+## ========================================================================
+## Bool hygiene checker
+## ========================================================================
+
+## Strip string literals and trailing comments from a source line.
+def lnt_bhyg_strip(line: String): String
+  var result = ""
+  var pos = 0
+  len = str_byte_len(line)
+  while pos < len
+    c = line.str_byte_at(pos)
+    if c == '#'
+      return result
+    elsif c == '"'
+      pos += 1
+      while pos < len
+        sc = line.str_byte_at(pos)
+        if sc == '\\'
+          pos += 2
+        elsif sc == '"'  # closing quote
+          pos += 1
+          break
+        else
+          pos += 1
+        end
+      end
+    else
+      result = "#{result}#{str_from_char(c)}"
+      pos += 1
+    end
+  end
+  return result
+end
+
+## Check if text contains a known boolean predicate name.
+def lnt_bhyg_has_pred(text: String): Bool
+  return str_contains(text, "is_") or str_contains(text, "has_") or
+         str_contains(text, "contains(") or str_contains(text, "starts_with(") or
+         str_contains(text, "ends_with(") or str_contains(text, "_eq(") or
+         str_contains(text, "exists(") or str_contains(text, "closed(")
+end
+
+## Check for redundant boolean comparisons.
+##
+## Tier 1 (always warn): == true, == false, != true, != false
+## Tier 2 (heuristic):   known_pred() == 1, known_pred() == 0
+##
+## Returns number of warnings.
+def check_bool_hygiene(source: String): Int
+  var warnings = 0
+  var line_num = 1
+  var pos = 0
+  len = str_byte_len(source)
+  var line_start = 0
+
+  while pos <= len
+    if pos == len or source.str_byte_at(pos) == '\n'
+      var line = str_byte_slice(source, line_start, pos)
+      var clean = lnt_bhyg_strip(line)
+
+      # Tier 1: literal boolean comparisons
+      if str_contains(clean, "== true")
+        print("bool-hygiene: line ")
+        print_int(line_num)
+        puts(": redundant '== true'")
+        warnings += 1
+      elsif str_contains(clean, "!= false")
+        print("bool-hygiene: line ")
+        print_int(line_num)
+        puts(": redundant '!= false'")
+        warnings += 1
+      elsif str_contains(clean, "== false")
+        print("bool-hygiene: line ")
+        print_int(line_num)
+        puts(": '== false' -- use 'not' instead")
+        warnings += 1
+      elsif str_contains(clean, "!= true")
+        print("bool-hygiene: line ")
+        print_int(line_num)
+        puts(": '!= true' -- use 'not' instead")
+        warnings += 1
+      end
+
+      # Tier 2: known predicates compared to 1 or 0
+      if str_contains(clean, ") == 1") or str_contains(clean, ") == 0")
+        if lnt_bhyg_has_pred(clean)
+          print("bool-hygiene: line ")
+          print_int(line_num)
+          if str_contains(clean, ") == 1")
+            puts(": redundant '== 1' on boolean predicate")
+          else
+            puts(": '== 0' on boolean predicate -- use 'not'")
+          end
+          warnings += 1
+        end
+      end
+
+      line_num += 1
+      line_start = pos + 1
+    end
+    pos += 1
+  end
+
+  return warnings
+end
+
+## ========================================================================
+## Main entry point — runs all Tier 1 (text-based) lint rules
+## ========================================================================
+
+## Run all Tier 1 lint checks with configuration.
+def lint_file_with_config(source: String, filename: String, config: LintConfig): LintResult
+  var result = lint_result_new()
+  var src_lines = diag_split_source(source)
+
+  if lint_config_is_enabled(config, "QZ7000")
+    lint_t1_balance(source, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7001")
+    lint_t1_naming(source, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7101")
+    lint_t1_bool_hygiene(source, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7102")
+    lint_t1_use_unless(source, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7103")
+    lint_t1_compound_assign(source, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7104")
+    lint_t1_use_size(source, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7105")
+    lint_t1_endless_def(source, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7106")
+    lint_t1_trailing_ws(source, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7201")
+    lint_t1_done_flag(source, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7202")
+    lint_t1_deep_nesting(source, filename, src_lines, config.nesting_depth, result)
+  end
+  if lint_config_is_enabled(config, "QZ7205")
+    lint_t1_negated_match(source, filename, src_lines, config.chain_length, result)
+  end
+  if lint_config_is_enabled(config, "QZ7206")
+    lint_t1_bare_go(source, filename, src_lines, result)
+  end
+
+  return result
+end
+
+## Backward-compatible wrapper.
+def lint_file_with_diagnostics(source: String, filename: String): LintResult
+  return lint_file_with_config(source, filename, lint_default_config())
+end
+
+## Tier 1: Balance checker adapted for diagnostic output.
+def lint_t1_balance(source: String, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var len = str_byte_len(source)
+  var pos = 0
+  var line = 1
+  var open_kinds = vec_new()
+  var open_lines = vec_new()
+
+  while pos < len
+    c = lnt_char_at(source, pos)
+    if c == "\n"
+      line += 1
+      pos += 1
+    elsif c == " " or c == "\t" or c == "\r"
+      pos += 1
+    elsif c == "#"
+      pos = lnt_skip_comment(source, pos)
+    elsif c == "\""
+      pos = lnt_skip_string(source, pos)
+    else
+      word = lnt_read_word(source, pos)
+      word_len = str_byte_len(word)
+      if word_len > 0
+        kind = keyword_to_kind(word)
+        if kind > 0
+          open_kinds.push(kind)
+          open_lines.push(line)
+        elsif word == "else"
+          after_else = pos + 4
+          after_spaces = lnt_skip_spaces(source, after_else)
+          next_word = lnt_read_word(source, after_spaces)
+          if next_word == "if"
+            open_kinds.push(KIND_IF())
+            open_lines.push(line)
+            pos = after_spaces + 2
+          end
+        elsif word == "end"
+          if open_kinds.size > 0
+            open_kinds.pop()
+            open_lines.pop()
+          end
+        end
+        pos += word_len
+      else
+        pos += 1
+      end
+    end
+  end
+
+  if open_kinds.size > 0
+    var i = open_kinds.size - 1
+    while i >= 0
+      var d = lint_warn("QZ7000", "unclosed '#{kind_to_str(open_kinds[i])}' — missing 'end'", filename, open_lines[i], 1, src_lines)
+      lint_result_add(result, d)
+      i -= 1
+    end
+  end
+end
+
+## Tier 1: Naming convention checks with diagnostic output.
+def lint_t1_naming(source: String, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var len = str_byte_len(source)
+  var pos = 0
+  var line = 1
+
+  while pos < len
+    c = lnt_char_at(source, pos)
+    if c == "\n"
+      line += 1
+      pos += 1
+    elsif c == " " or c == "\t" or c == "\r"
+      pos += 1
+    elsif c == "#"
+      pos = lnt_skip_comment(source, pos)
+    elsif c == "\""
+      pos = lnt_skip_string(source, pos)
+    else
+      word = lnt_read_word(source, pos)
+      word_len = str_byte_len(word)
+      if word == "def"
+        pos += 3
+        var sp = lnt_skip_ws(source, pos)
+        name = lnt_read_word(source, sp)
+        if str_byte_len(name) > 0 and not is_snake_case(name)
+          var col = sp - lnt_line_start(source, sp) + 1
+          var d = lint_warn("QZ7001", "function '#{name}' should be snake_case", filename, line, col, src_lines)
+          diag_set_span(d, str_byte_len(name))
+          lint_result_add(result, d)
+        end
+        pos = sp + str_byte_len(name)
+      elsif word == "struct" or word == "enum" or word == "trait"
+        pos += word_len
+        var sp = lnt_skip_ws(source, pos)
+        name = lnt_read_word(source, sp)
+        if str_byte_len(name) > 0 and not is_pascal_case(name)
+          var col = sp - lnt_line_start(source, sp) + 1
+          var d = lint_warn("QZ7002", "type '#{name}' should be PascalCase", filename, line, col, src_lines)
+          diag_set_span(d, str_byte_len(name))
+          lint_result_add(result, d)
+        end
+        pos = sp + str_byte_len(name)
+      elsif word == "const"
+        pos += 5
+        var sp = lnt_skip_ws(source, pos)
+        name = lnt_read_word(source, sp)
+        if str_byte_len(name) > 0 and not lnt_is_screaming_snake(name)
+          var col = sp - lnt_line_start(source, sp) + 1
+          var d = lint_warn("QZ7003", "constant '#{name}' should be SCREAMING_SNAKE_CASE", filename, line, col, src_lines)
+          diag_set_span(d, str_byte_len(name))
+          lint_result_add(result, d)
+        end
+        pos = sp + str_byte_len(name)
+      elsif word_len > 0
+        pos += word_len
+      else
+        pos += 1
+      end
+    end
+  end
+end
+
+## Tier 1: Bool hygiene with diagnostic output.
+def lint_t1_bool_hygiene(source: String, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var line_num = 1
+  var pos = 0
+  var len = str_byte_len(source)
+  var line_start = 0
+
+  while pos <= len
+    if pos == len or source.str_byte_at(pos) == '\n'
+      var line = str_byte_slice(source, line_start, pos)
+      var clean = lnt_bhyg_strip(line)
+
+      if str_contains(clean, "== true")
+        var d = lint_warn("QZ7101", "redundant '== true' — value is already boolean", filename, line_num, 1, src_lines)
+        diag_set_suggestion(d, "remove '== true'")
+        lint_result_add(result, d)
+        # Fix: remove " == true" (8 bytes including leading space)
+        var idx = lnt_str_find(line, " == true")
+        if idx >= 0
+          lint_result_add_fix(result, LintFix { start_byte: line_start + idx, end_byte: line_start + idx + 8, replacement: "", code: "QZ7101" })
+        end
+      elsif str_contains(clean, "!= false")
+        var d = lint_warn("QZ7101", "redundant '!= false' — value is already boolean", filename, line_num, 1, src_lines)
+        diag_set_suggestion(d, "remove '!= false'")
+        lint_result_add(result, d)
+        # Fix: remove " != false" (9 bytes including leading space)
+        var idx = lnt_str_find(line, " != false")
+        if idx >= 0
+          lint_result_add_fix(result, LintFix { start_byte: line_start + idx, end_byte: line_start + idx + 9, replacement: "", code: "QZ7101" })
+        end
+      elsif str_contains(clean, "== false")
+        var d = lint_warn("QZ7101", "'== false' — use 'not' instead", filename, line_num, 1, src_lines)
+        diag_set_suggestion(d, "replace with 'not expr'")
+        lint_result_add(result, d)
+        # Fix: replace "EXPR == false" with "not EXPR" — remove " == false" and prepend "not "
+        var idx = lnt_str_find(line, " == false")
+        if idx >= 0
+          lint_result_add_fix(result, LintFix { start_byte: line_start + idx, end_byte: line_start + idx + 9, replacement: "", code: "QZ7101" })
+        end
+      elsif str_contains(clean, "!= true")
+        var d = lint_warn("QZ7101", "'!= true' — use 'not' instead", filename, line_num, 1, src_lines)
+        diag_set_suggestion(d, "replace with 'not expr'")
+        lint_result_add(result, d)
+        var idx = lnt_str_find(line, " != true")
+        if idx >= 0
+          lint_result_add_fix(result, LintFix { start_byte: line_start + idx, end_byte: line_start + idx + 8, replacement: "", code: "QZ7101" })
+        end
+      end
+
+      if str_contains(clean, ") == 1") or str_contains(clean, ") == 0")
+        if lnt_bhyg_has_pred(clean)
+          var msg = "redundant comparison on boolean predicate"
+          if str_contains(clean, ") == 0")
+            msg = "comparison to 0 on boolean predicate — use 'not'"
+          end
+          var d = lint_warn("QZ7101", msg, filename, line_num, 1, src_lines)
+          lint_result_add(result, d)
+        end
+      end
+
+      line_num += 1
+      line_start = pos + 1
+    end
+    pos += 1
+  end
+end
+
+## Helper: check if a name is SCREAMING_SNAKE_CASE.
+def lnt_is_screaming_snake(name: String): Bool
+  var len = str_byte_len(name)
+  if len == 0
+    return false
+  end
+  for i in 0..len
+    c = name.str_byte_at(i)
+    if not (is_upper_code(c) or c == '_' or is_digit_code(c))
+      return false
+    end
+  end
+  return true
+end
+
+## Helper: find byte offset of needle in haystack. Returns -1 if not found.
+## Unlike str_find (which returns a raw pointer on LLVM), this returns a proper index.
+def lnt_str_find(haystack: String, needle: String): Int
+  var hlen = str_byte_len(haystack)
+  var nlen = str_byte_len(needle)
+  if nlen == 0 or nlen > hlen
+    return -1
+  end
+  var i = 0
+  while i <= hlen - nlen
+    var found = true
+    var j = 0
+    while j < nlen
+      if haystack.str_byte_at(i + j) != needle.str_byte_at(j)
+        found = false
+        break
+      end
+      j += 1
+    end
+    if found
+      return i
+    end
+    i += 1
+  end
+  return -1
+end
+
+## Helper: find the byte offset of the start of the line containing pos.
+def lnt_line_start(source: String, pos: Int): Int
+  var p = pos - 1
+  while p >= 0
+    if source.str_byte_at(p) == '\n'
+      return p + 1
+    end
+    p -= 1
+  end
+  return 0
+end
+
+## ========================================================================
+## Tier 1: Style rules (QZ7102-7106)
+## ========================================================================
+
+## QZ7102: `if not x` should be `unless x`
+def lint_t1_use_unless(source: String, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var line_num = 1
+  var pos = 0
+  var len = str_byte_len(source)
+  var line_start = 0
+
+  while pos <= len
+    if pos == len or source.str_byte_at(pos) == '\n'
+      var line = str_byte_slice(source, line_start, pos)
+      var clean = lnt_bhyg_strip(line)
+      var trimmed = clean.trim()
+
+      # Match: line starts with "if not " (after indent)
+      if str_starts_with(trimmed, "if not ")
+        var d = lint_warn("QZ7102", "'if not' — use 'unless' instead", filename, line_num, 1, src_lines)
+        diag_set_suggestion(d, "replace 'if not' with 'unless'")
+        lint_result_add(result, d)
+        # Fix: find "if not " in the raw line and replace with "unless "
+        var raw_idx = lnt_str_find(line, "if not ")
+        if raw_idx >= 0
+          var abs_start = line_start + raw_idx
+          lint_result_add_fix(result, LintFix { start_byte: abs_start, end_byte: abs_start + 7, replacement: "unless ", code: "QZ7102" })
+        end
+      end
+
+      line_num += 1
+      line_start = pos + 1
+    end
+    pos += 1
+  end
+end
+
+
+## Helper for QZ7103: check one compound assignment operator.
+def lnt_check_compound(lhs: String, rhs: String, op: String, op_char: String, filename: String, line_num: Int, src_lines: Vec<String>, result: LintResult): Int
+  var pattern = lhs + op
+  if str_starts_with(rhs, pattern) and str_byte_len(lhs) > 0
+    var d = lint_warn("QZ7103", "'#{lhs} = #{lhs} #{op_char} ...' — use '#{lhs} #{op_char}= ...'", filename, line_num, 1, src_lines)
+    diag_set_suggestion(d, "use compound assignment '#{op_char}='")
+    lint_result_add(result, d)
+    return 1
+  end
+  return 0
+end
+
+## QZ7103: `x = x + 1` should be `x += 1`
+def lint_t1_compound_assign(source: String, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var line_num = 1
+  var pos = 0
+  var len = str_byte_len(source)
+  var line_start = 0
+
+  while pos <= len
+    if pos == len or source.str_byte_at(pos) == '\n'
+      var line = str_byte_slice(source, line_start, pos)
+      var clean = lnt_bhyg_strip(line)
+      var trimmed = clean.trim()
+
+      # Pattern: `VAR = VAR + EXPR` or `VAR = VAR - EXPR` etc.
+      # Find first ` = ` (assignment, not ==)
+      var eq_pos = lnt_str_find(trimmed, " = ")
+      if eq_pos > 0
+        # Check it's not `==`
+        var after_eq = eq_pos + 3
+        if after_eq < str_byte_len(trimmed)
+          var lhs = str_slice(trimmed, 0, eq_pos)
+          var rhs = str_slice(trimmed, after_eq, str_byte_len(trimmed))
+          # Check if rhs starts with `lhs + ` or `lhs - ` or `lhs * `
+          var matched_op = ""
+          if lnt_check_compound(lhs, rhs, " + ", "+", filename, line_num, src_lines, result) == 1
+            matched_op = "+"
+          elsif lnt_check_compound(lhs, rhs, " - ", "-", filename, line_num, src_lines, result) == 1
+            matched_op = "-"
+          elsif lnt_check_compound(lhs, rhs, " * ", "*", filename, line_num, src_lines, result) == 1
+            matched_op = "*"
+          end
+          if str_byte_len(matched_op) > 0
+            # Fix: "lhs = lhs OP rest" => "lhs OP= rest"
+            var lhs_len = str_byte_len(lhs)
+            var rest = str_byte_slice(rhs, lhs_len + 3, str_byte_len(rhs))
+            # Find the trimmed content start within the raw line
+            var raw_eq = lnt_str_find(line, " = ")
+            if raw_eq >= 0
+              var fix_start = line_start + raw_eq
+              var fix_end = line_start + str_byte_len(line)
+              var new_text = " #{matched_op}= #{rest}"
+              lint_result_add_fix(result, LintFix { start_byte: fix_start, end_byte: fix_end, replacement: new_text, code: "QZ7103" })
+            end
+          end
+        end
+      end
+
+      line_num += 1
+      line_start = pos + 1
+    end
+    pos += 1
+  end
+end
+
+## QZ7104: `.len` / `.length` / `_len(` should be `.size` / `_size(`
+## Covers both UFCS method forms (.len, .length, .byte_len) and
+## function-call forms (str_len, vec_len, arr_len, etc.)
+def lint_t1_use_size(source: String, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var line_num = 1
+  var pos = 0
+  var len = str_byte_len(source)
+  var line_start = 0
+
+  while pos <= len
+    if pos == len or source.str_byte_at(pos) == '\n'
+      var line = str_byte_slice(source, line_start, pos)
+      var clean = lnt_bhyg_strip(line)
+
+      # UFCS method forms: .len( .len<space> .length( .length<space>
+      if str_contains(clean, ".len(") or str_contains(clean, ".len ")
+        var d = lint_warn("QZ7104", "'.len' — use '.size' instead", filename, line_num, 1, src_lines)
+        diag_set_suggestion(d, "replace '.len' with '.size'")
+        lint_result_add(result, d)
+        var idx = lnt_str_find(line, ".len(")
+        if idx < 0
+          idx = lnt_str_find(line, ".len ")
+        end
+        if idx >= 0
+          lint_result_add_fix(result, LintFix { start_byte: line_start + idx, end_byte: line_start + idx + 4, replacement: ".size", code: "QZ7104" })
+        end
+      end
+      if str_contains(clean, ".length(") or str_contains(clean, ".length ")
+        var d = lint_warn("QZ7104", "'.length' — use '.size' instead", filename, line_num, 1, src_lines)
+        diag_set_suggestion(d, "replace '.length' with '.size'")
+        lint_result_add(result, d)
+        var idx = lnt_str_find(line, ".length(")
+        if idx < 0
+          idx = lnt_str_find(line, ".length ")
+        end
+        if idx >= 0
+          lint_result_add_fix(result, LintFix { start_byte: line_start + idx, end_byte: line_start + idx + 7, replacement: ".size", code: "QZ7104" })
+        end
+      end
+      # UFCS .byte_len( → .byte_size(
+      if str_contains(clean, ".byte_len(")
+        var d = lint_warn("QZ7104", "'.byte_len' — use '.byte_size' instead", filename, line_num, 1, src_lines)
+        diag_set_suggestion(d, "replace '.byte_len' with '.byte_size'")
+        lint_result_add(result, d)
+        var idx = lnt_str_find(line, ".byte_len(")
+        if idx >= 0
+          lint_result_add_fix(result, LintFix { start_byte: line_start + idx, end_byte: line_start + idx + 9, replacement: ".byte_size", code: "QZ7104" })
+        end
+      end
+
+      # Function-call forms: str_len( → str_size(, vec_len( → vec_size(, etc.
+      lnt_check_deprecated_len(clean, line, "str_len(", "str_size(", line_start, filename, line_num, src_lines, result)
+      lnt_check_deprecated_len(clean, line, "str_byte_len(", "str_byte_size(", line_start, filename, line_num, src_lines, result)
+      lnt_check_deprecated_len(clean, line, "str_len_utf8(", "str_size(", line_start, filename, line_num, src_lines, result)
+      lnt_check_deprecated_len(clean, line, "vec_len(", "vec_size(", line_start, filename, line_num, src_lines, result)
+      lnt_check_deprecated_len(clean, line, "arr_len(", "arr_size(", line_start, filename, line_num, src_lines, result)
+      lnt_check_deprecated_len(clean, line, "slice_len(", "slice_size(", line_start, filename, line_num, src_lines, result)
+      lnt_check_deprecated_len(clean, line, "array_len(", "array_size(", line_start, filename, line_num, src_lines, result)
+      lnt_check_deprecated_len(clean, line, "range_len(", "range_size(", line_start, filename, line_num, src_lines, result)
+      lnt_check_deprecated_len(clean, line, "sb_len(", "sb_size(", line_start, filename, line_num, src_lines, result)
+      lnt_check_deprecated_len(clean, line, "channel_len(", "channel_size(", line_start, filename, line_num, src_lines, result)
+
+      line_num += 1
+      line_start = pos + 1
+    end
+    pos += 1
+  end
+end
+
+## Helper: check for a deprecated _len( function call and suggest _size( replacement.
+def lnt_check_deprecated_len(clean: String, line: String, old_pat: String, new_pat: String, line_start: Int, filename: String, line_num: Int, src_lines: Vec<String>, result: LintResult): Void
+  if str_contains(clean, old_pat)
+    var d = lint_warn("QZ7104", "'#{old_pat}' — use '#{new_pat}' instead", filename, line_num, 1, src_lines)
+    diag_set_suggestion(d, "replace '#{old_pat}' with '#{new_pat}'")
+    lint_result_add(result, d)
+    var idx = lnt_str_find(line, old_pat)
+    if idx >= 0
+      var old_len = str_byte_len(old_pat) - 1
+      var new_rep = str_byte_slice(new_pat, 0, str_byte_len(new_pat) - 1)
+      lint_result_add_fix(result, LintFix { start_byte: line_start + idx, end_byte: line_start + idx + old_len, replacement: new_rep, code: "QZ7104" })
+    end
+  end
+end
+
+## QZ7105: Single-return block def should use endless def form.
+## Detects: `def name(...)\n  return EXPR\nend`
+def lint_t1_endless_def(source: String, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var num_lines = src_lines.size()
+  var i = 0
+  while i < num_lines
+    var line = src_lines.get(i).trim()
+    # Look for `def NAME(...)` that doesn't have `=` (not already endless)
+    if str_starts_with(line, "def ") and not str_contains(line, " = ") and not str_contains(line, "do ")
+      # Check: next non-blank line is `return EXPR` and line after that is `end`
+      var j = i + 1
+      while j < num_lines and str_byte_len(src_lines.get(j).trim()) == 0
+        j += 1
+      end
+      if j < num_lines
+        var body_line = src_lines.get(j).trim()
+        if str_starts_with(body_line, "return ")
+          var k = j + 1
+          while k < num_lines and str_byte_len(src_lines.get(k).trim()) == 0
+            k += 1
+          end
+          if k < num_lines and src_lines.get(k).trim() == "end"
+            var expr = str_slice(body_line, 7, str_byte_len(body_line))
+            var d = lint_warn("QZ7105", "single-expression function — use endless def form", filename, i + 1, 1, src_lines)
+            diag_set_suggestion(d, "rewrite as: #{line} = #{expr}")
+            lint_result_add(result, d)
+            # Fix: replace from def line start through end line end
+            var fix_start = lint_line_byte_offset(source, i + 1)
+            var end_line_start = lint_line_byte_offset(source, k + 1)
+            var end_line_raw = src_lines.get(k)
+            var fix_end = end_line_start + str_byte_len(end_line_raw)
+            # Get the indentation from the original line
+            var orig_line = src_lines.get(i)
+            var indent_len = 0
+            while indent_len < str_byte_len(orig_line) and (orig_line.str_byte_at(indent_len) == ' ' or orig_line.str_byte_at(indent_len) == '\t')
+              indent_len += 1
+            end
+            var indent = str_byte_slice(orig_line, 0, indent_len)
+            var new_text = "#{indent}#{line} = #{expr}"
+            lint_result_add_fix(result, LintFix { start_byte: fix_start, end_byte: fix_end, replacement: new_text, code: "QZ7105" })
+          end
+        end
+      end
+    end
+    i += 1
+  end
+end
+
+## QZ7106: Trailing whitespace
+def lint_t1_trailing_ws(source: String, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  for i in 0..src_lines.size()
+    var line = src_lines.get(i)
+    var len = str_byte_len(line)
+    if len > 0
+      var last = line.str_byte_at(len - 1)
+      if last == 32 or last == 9
+        var d = lint_warn("QZ7106", "trailing whitespace", filename, i + 1, len, src_lines)
+        lint_result_add(result, d)
+        # Fix: trim trailing whitespace
+        var trim_pos = len - 1
+        while trim_pos > 0 and (line.str_byte_at(trim_pos - 1) == ' ' or line.str_byte_at(trim_pos - 1) == '\t')
+          trim_pos -= 1
+        end
+        var line_start = lint_line_byte_offset(source, i + 1)
+        lint_result_add_fix(result, LintFix { start_byte: line_start + trim_pos, end_byte: line_start + len, replacement: "", code: "QZ7106" })
+      end
+    end
+  end
+end
+
+## ========================================================================
+## Tier 1: Anti-pattern rules (QZ7201-7205)
+## ========================================================================
+
+## QZ7201: Done-flag loop pattern.
+## Detects: `var done = 0` followed by `while done == 0`
+def lint_t1_done_flag(source: String, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  # First pass: find `var NAME = 0` or `var NAME = false` declarations
+  var flag_names = vec_new<String>()
+  var flag_lines = vec_new<Int>()
+  var num_lines = src_lines.size()
+
+  for i in 0..num_lines
+    var line = src_lines.get(i).trim()
+    if str_starts_with(line, "var ") and (str_ends_with(line, " = 0") or str_ends_with(line, " = false"))
+      # Extract variable name: `var NAME = 0`
+      var rest = str_slice(line, 4, str_byte_len(line))
+      var eq_pos = lnt_str_find(rest, " = ")
+      if eq_pos > 0
+        var name = str_slice(rest, 0, eq_pos)
+        flag_names.push(name)
+        flag_lines.push(i + 1)
+      end
+    end
+  end
+
+  # Second pass: find `while NAME == 0` or `while NAME == false` or `while not NAME`
+  for i in 0..num_lines
+    var line = src_lines.get(i).trim()
+    if str_starts_with(line, "while ")
+      var cond = str_slice(line, 6, str_byte_len(line))
+      for fi in 0..flag_names.size()
+        var name = flag_names.get(fi)
+        if cond == "#{name} == 0" or cond == "#{name} == false" or cond == "not #{name}"
+          var d = lint_warn("QZ7201", "done-flag loop — use 'loop' + 'break' instead", filename, i + 1, 1, src_lines)
+          diag_add_note(d, "flag '#{name}' declared at line #{flag_lines.get(fi)}")
+          diag_set_suggestion(d, "replace with: loop ... break if <condition> ... end")
+          lint_result_add(result, d)
+        end
+      end
+    end
+  end
+end
+
+## QZ7202: Deep nesting (>4 levels)
+def lint_t1_deep_nesting(source: String, filename: String, src_lines: Vec<String>, max_depth: Int, result: LintResult): Void
+  var len = str_byte_len(source)
+  var pos = 0
+  var depth = 0
+  var line = 1
+  var warned_lines = vec_new<Int>()
+
+  while pos < len
+    c = lnt_char_at(source, pos)
+    if c == "\n"
+      line += 1
+      pos += 1
+    elsif c == " " or c == "\t" or c == "\r"
+      pos += 1
+    elsif c == "#"
+      pos = lnt_skip_comment(source, pos)
+    elsif c == "\""
+      pos = lnt_skip_string(source, pos)
+    else
+      word = lnt_read_word(source, pos)
+      word_len = str_byte_len(word)
+      if word_len > 0
+        kind = keyword_to_kind(word)
+        if kind > 0
+          depth += 1
+          if depth > max_depth
+            # Check we haven't already warned for this line
+            var already = false
+            for wi in 0..warned_lines.size()
+              if warned_lines.get(wi) == line
+                already = true
+              end
+            end
+            if not already
+              var d = lint_warn("QZ7202", "deep nesting (#{depth} levels) — consider guard clauses or extraction", filename, line, 1, src_lines)
+              lint_result_add(result, d)
+              warned_lines.push(line)
+            end
+          end
+        elsif word == "else"
+          after_else = pos + 4
+          after_spaces = lnt_skip_spaces(source, after_else)
+          next_word = lnt_read_word(source, after_spaces)
+          if next_word == "if"
+            depth += 1
+            pos = after_spaces + 2
+          end
+        elsif word == "end"
+          if depth > 0
+            depth -= 1
+          end
+        end
+        pos += word_len
+      else
+        pos += 1
+      end
+    end
+  end
+end
+
+## QZ7205: If/elsif chains that should be match.
+## Detects 3+ `if x == LIT` / `elsif x == LIT` on the same variable.
+def lint_t1_negated_match(source: String, filename: String, src_lines: Vec<String>, min_chain: Int, result: LintResult): Void
+  var num_lines = src_lines.size()
+  var i = 0
+  while i < num_lines
+    var line = src_lines.get(i).trim()
+    # Look for `if VAR == LIT`
+    if str_starts_with(line, "if ") and str_contains(line, " == ")
+      var chain_start = i
+      var chain_count = 1
+      # Extract variable before ` == `
+      var rest = str_slice(line, 3, str_byte_len(line))
+      var eq_pos = lnt_str_find(rest, " == ")
+      if eq_pos > 0
+        var var_name = str_slice(rest, 0, eq_pos)
+        # Count subsequent elsif with same var
+        var j = i + 1
+        while j < num_lines
+          var next = src_lines.get(j).trim()
+          if str_starts_with(next, "elsif #{var_name} == ")
+            chain_count += 1
+            j += 1
+          else
+            break
+          end
+        end
+        if chain_count >= min_chain
+          var d = lint_warn("QZ7205", "#{chain_count}-branch if/elsif chain on '#{var_name}' — use 'match' instead", filename, chain_start + 1, 1, src_lines)
+          diag_set_suggestion(d, "rewrite as: match #{var_name} ... end")
+          lint_result_add(result, d)
+          i = j
+        else
+          i += 1
+        end
+      else
+        i += 1
+      end
+    else
+      i += 1
+    end
+  end
+end
+
+## QZ7206: Warn on bare `go` outside structured concurrency scope.
+## Detects function bodies that call `go ` or `go_spawn` but don't call any
+## structured-concurrency primitive — preferred form is `scope_with` over a
+## scope created by `scope_with_cancel`/`scope_timeout`/`scope_supervised`
+## (B.7 unified scope). Legacy wrappers `go_scope`/`go_supervisor`/
+## `go_scope_timeout`/`structured_scope`/`structured_supervisor` are also
+## accepted (they thin-wrap the new substrate per Phase 5 Bucket 1).
+def lint_t1_bare_go(source: String, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var num_lines = src_lines.size()
+  var in_function = false
+  var func_start = 0
+  var has_go = false
+  var go_line = 0
+  var has_scope = false
+  var depth = 0
+  var i = 0
+  while i < num_lines
+    var line = src_lines.get(i).trim()
+    if str_starts_with(line, "def ")
+      in_function = true
+      func_start = i
+      has_go = false
+      has_scope = false
+      depth = 1
+      i += 1
+      continue
+    end
+    if in_function
+      if line == "end"
+        depth -= 1
+        if depth == 0
+          # End of function — check
+          if has_go and not has_scope
+            var d = lint_warn("QZ7206", "bare 'go' outside structured scope — consider scope_with(scope_with_cancel(current_scope()), -> ...)", filename, go_line + 1, 1, src_lines)
+            diag_set_suggestion(d, "wrap with: scope_with(scope_with_cancel(current_scope()), -> { ... })  (or legacy go_scope do -> ... end)")
+            lint_result_add(result, d)
+          end
+          in_function = false
+        end
+      elsif str_starts_with(line, "def ") or str_starts_with(line, "if ") or str_starts_with(line, "while ") or str_starts_with(line, "for ") or str_starts_with(line, "match ")
+        depth += 1
+      end
+      if str_contains(line, "scope_with") or str_contains(line, "go_scope") or str_contains(line, "go_supervisor") or str_contains(line, "structured_scope") or str_contains(line, "structured_supervisor")
+        has_scope = true
+      end
+      if not has_go
+        if str_starts_with(line, "go ") or str_contains(line, "go_spawn")
+          has_go = true
+          go_line = i
+        end
+      end
+    end
+    i += 1
+  end
+end
+
+def lint_tier2(storage: ast::AstStorage, program: Int, source: String, filename: String, src_lines: Vec<String>, config: LintConfig, result: LintResult): Void
+  if lint_config_is_enabled(config, "QZ7004")
+    lint_t2_unused_vars(storage, program, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7203")
+    lint_t2_variable_shadow(storage, program, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7204")
+    lint_t2_redundant_return(storage, program, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7301")
+    lint_t2_unreachable_code(storage, program, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7302")
+    lint_t2_empty_match_arm(storage, program, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7303")
+    lint_t2_missing_else(storage, program, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7401")
+    lint_t2_unused_param(storage, program, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7402")
+    lint_t2_empty_block(storage, program, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7403")
+    lint_t2_constant_condition(storage, program, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7501")
+    lint_t2_duplicate_imports(storage, program, filename, src_lines, result)
+  end
+  if lint_config_is_enabled(config, "QZ7502")
+    lint_t2_wildcard_imports(storage, program, filename, src_lines, result)
+  end
+end
+
+def lint_walk_functions(storage: ast::AstStorage, program: Int): Vec<Int>
+  var funcs = vec_new<Int>()
+  var items = ast::ast_get_children(storage, program)
+  if items == 0
+    return funcs
+  end
+  var count = items.size
+  for i in 0..count
+    var item = items[i]
+    if ast::ast_get_kind(storage, item) == node_constants::NODE_FUNCTION
+      funcs.push(item)
+    end
+  end
+  return funcs
+end
+
+def lint_name_in_vec(names: Vec<String>, name: String): Bool
+  for i in 0..names.size()
+    if names.get(i) == name
+      return true
+    end
+  end
+  return false
+end
+
+def lint_collect_idents(storage: ast::AstStorage, node: Int, names: Vec<String>): Void
+  if node <= 0 or node >= ast::ast_node_count(storage)
+    return
+  end
+  var kind = ast::ast_get_kind(storage, node)
+  if kind == node_constants::NODE_IDENT
+    names.push(ast::ast_get_str1(storage, node))
+    return
+  end
+  if kind == node_constants::NODE_LET
+    var init = ast::ast_get_left(storage, node)
+    if init > 0
+      lint_collect_idents(storage, init, names)
+    end
+    return
+  end
+  if kind == node_constants::NODE_BLOCK
+    var stmts = ast::ast_get_children(storage, node)
+    if stmts != 0
+      var c = stmts.size
+      for i in 0..c
+        lint_collect_idents(storage, stmts[i], names)
+      end
+    end
+    return
+  end
+  if kind == node_constants::NODE_IF
+    lint_collect_idents(storage, ast::ast_get_left(storage, node), names)
+    lint_collect_idents(storage, ast::ast_get_right(storage, node), names)
+    var els = ast::ast_get_extra(storage, node)
+    if els > 0
+      lint_collect_idents(storage, els, names)
+    end
+    return
+  end
+  if kind == node_constants::NODE_WHILE
+    lint_collect_idents(storage, ast::ast_get_left(storage, node), names)
+    lint_collect_idents(storage, ast::ast_get_right(storage, node), names)
+    return
+  end
+  if kind == node_constants::NODE_FOR
+    lint_collect_idents(storage, ast::ast_get_left(storage, node), names)
+    lint_collect_idents(storage, ast::ast_get_right(storage, node), names)
+    return
+  end
+  if kind == node_constants::NODE_RETURN
+    var val = ast::ast_get_left(storage, node)
+    if val > 0
+      lint_collect_idents(storage, val, names)
+    end
+    return
+  end
+  if kind == node_constants::NODE_CALL
+    lint_collect_idents(storage, ast::ast_get_left(storage, node), names)
+    var args = ast::ast_get_children(storage, node)
+    if args != 0
+      var c = args.size
+      for i in 0..c
+        lint_collect_idents(storage, args[i], names)
+      end
+    end
+    return
+  end
+  if kind == node_constants::NODE_MATCH
+    lint_collect_idents(storage, ast::ast_get_left(storage, node), names)
+    var arms = ast::ast_get_children(storage, node)
+    if arms != 0
+      var c = arms.size
+      for i in 0..c
+        lint_collect_idents(storage, ast::ast_get_right(storage, arms[i]), names)
+      end
+    end
+    return
+  end
+  if kind == node_constants::NODE_BINARY
+    lint_collect_idents(storage, ast::ast_get_left(storage, node), names)
+    lint_collect_idents(storage, ast::ast_get_right(storage, node), names)
+    return
+  end
+  if kind == node_constants::NODE_UNARY
+    lint_collect_idents(storage, ast::ast_get_left(storage, node), names)
+    return
+  end
+  if kind == node_constants::NODE_ASSIGN or kind == node_constants::NODE_FIELD_ASSIGN or kind == node_constants::NODE_INDEX_ASSIGN
+    lint_collect_idents(storage, ast::ast_get_left(storage, node), names)
+    lint_collect_idents(storage, ast::ast_get_right(storage, node), names)
+    return
+  end
+  if kind == node_constants::NODE_FIELD_ACCESS or kind == node_constants::NODE_SAFE_FIELD_ACCESS
+    lint_collect_idents(storage, ast::ast_get_left(storage, node), names)
+    return
+  end
+  if kind == node_constants::NODE_INDEX
+    lint_collect_idents(storage, ast::ast_get_left(storage, node), names)
+    lint_collect_idents(storage, ast::ast_get_right(storage, node), names)
+    return
+  end
+  if kind == node_constants::NODE_EXPR_STMT
+    lint_collect_idents(storage, ast::ast_get_left(storage, node), names)
+    return
+  end
+  if kind == node_constants::NODE_LAMBDA
+    lint_collect_idents(storage, ast::ast_get_right(storage, node), names)
+    return
+  end
+  if kind == node_constants::NODE_DEFER
+    lint_collect_idents(storage, ast::ast_get_left(storage, node), names)
+    return
+  end
+  # Generic fallback
+  var left = ast::ast_get_left(storage, node)
+  if left > 0
+    lint_collect_idents(storage, left, names)
+  end
+  var right = ast::ast_get_right(storage, node)
+  if right > 0
+    lint_collect_idents(storage, right, names)
+  end
+  var ch = ast::ast_get_children(storage, node)
+  if ch != 0
+    var c = ch.size
+    for i in 0..c
+      lint_collect_idents(storage, ch[i], names)
+    end
+  end
+end
+
+def lint_t2_unused_vars(storage: ast::AstStorage, program: Int, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var funcs = lint_walk_functions(storage, program)
+  for fi in 0..funcs.size()
+    var func = funcs.get(fi)
+    var body = ast::ast_get_right(storage, func)
+    if body <= 0
+      continue
+    end
+    var used = vec_new<String>()
+    lint_collect_idents(storage, body, used)
+    lint_check_unused_in_block(storage, body, used, filename, src_lines, result)
+  end
+end
+
+def lint_check_unused_in_block(storage: ast::AstStorage, node: Int, used: Vec<String>, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  if node <= 0 or node >= ast::ast_node_count(storage)
+    return
+  end
+  var kind = ast::ast_get_kind(storage, node)
+  if kind == node_constants::NODE_LET
+    var name = ast::ast_get_str1(storage, node)
+    if str_byte_len(name) > 0 and not str_starts_with(name, "_")
+      if not lint_name_in_vec(used, name)
+        var d = lint_warn("QZ7004", "unused variable", filename, ast::ast_get_line(storage, node), ast::ast_get_col(storage, node), src_lines)
+        lint_result_add_checked(result, d, src_lines)
+      end
+    end
+  end
+  if kind == node_constants::NODE_BLOCK
+    var stmts = ast::ast_get_children(storage, node)
+    if stmts != 0
+      var c = stmts.size
+      for i in 0..c
+        lint_check_unused_in_block(storage, stmts[i], used, filename, src_lines, result)
+      end
+    end
+  end
+  if kind == node_constants::NODE_IF
+    lint_check_unused_in_block(storage, ast::ast_get_right(storage, node), used, filename, src_lines, result)
+    var els = ast::ast_get_extra(storage, node)
+    if els > 0
+      lint_check_unused_in_block(storage, els, used, filename, src_lines, result)
+    end
+  end
+  if kind == node_constants::NODE_WHILE or kind == node_constants::NODE_FOR
+    lint_check_unused_in_block(storage, ast::ast_get_right(storage, node), used, filename, src_lines, result)
+  end
+  if kind == node_constants::NODE_MATCH
+    var arms = ast::ast_get_children(storage, node)
+    if arms != 0
+      var c = arms.size
+      for i in 0..c
+        lint_check_unused_in_block(storage, ast::ast_get_right(storage, arms[i]), used, filename, src_lines, result)
+      end
+    end
+  end
+end
+
+def lint_t2_variable_shadow(storage: ast::AstStorage, program: Int, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var funcs = lint_walk_functions(storage, program)
+  for fi in 0..funcs.size()
+    var func = funcs.get(fi)
+    var body = ast::ast_get_right(storage, func)
+    if body <= 0
+      continue
+    end
+    var outer = vec_new<String>()
+    var params = ast::ast_get_left(storage, func)
+    if params > 0
+      var pc = vec_size(params)
+      for pi in 0..pc
+        var pname = ast::ast_get_str1(storage, params[pi])
+        if str_byte_len(pname) > 0
+          outer.push(pname)
+        end
+      end
+    end
+    lint_shadow_walk(storage, body, outer, filename, src_lines, result)
+  end
+end
+
+def lint_shadow_walk(storage: ast::AstStorage, node: Int, outer: Vec<String>, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  if node <= 0 or node >= ast::ast_node_count(storage)
+    return
+  end
+  var kind = ast::ast_get_kind(storage, node)
+  if kind == node_constants::NODE_BLOCK
+    var combined = vec_new<String>()
+    for i in 0..outer.size()
+      combined.push(outer.get(i))
+    end
+    var stmts = ast::ast_get_children(storage, node)
+    if stmts != 0
+      var c = stmts.size
+      for i in 0..c
+        var stmt = stmts[i]
+        var sk = ast::ast_get_kind(storage, stmt)
+        if sk == node_constants::NODE_LET
+          var name = ast::ast_get_str1(storage, stmt)
+          if str_byte_len(name) > 0 and not str_starts_with(name, "_")
+            if lint_name_in_vec(outer, name)
+              var d = lint_warn("QZ7203", "variable shadows outer binding", filename, ast::ast_get_line(storage, stmt), ast::ast_get_col(storage, stmt), src_lines)
+              lint_result_add_checked(result, d, src_lines)
+            end
+            combined.push(name)
+          end
+        end
+        lint_shadow_walk_stmt(storage, stmt, combined, filename, src_lines, result)
+      end
+    end
+    return
+  end
+  lint_shadow_walk_stmt(storage, node, outer, filename, src_lines, result)
+end
+
+def lint_shadow_walk_stmt(storage: ast::AstStorage, node: Int, scope: Vec<String>, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  if node <= 0 or node >= ast::ast_node_count(storage)
+    return
+  end
+  var kind = ast::ast_get_kind(storage, node)
+  if kind == node_constants::NODE_IF
+    lint_shadow_walk(storage, ast::ast_get_right(storage, node), scope, filename, src_lines, result)
+    var els = ast::ast_get_extra(storage, node)
+    if els > 0
+      lint_shadow_walk(storage, els, scope, filename, src_lines, result)
+    end
+  elsif kind == node_constants::NODE_WHILE
+    lint_shadow_walk(storage, ast::ast_get_right(storage, node), scope, filename, src_lines, result)
+  elsif kind == node_constants::NODE_FOR
+    var for_scope = vec_new<String>()
+    for i in 0..scope.size()
+      for_scope.push(scope.get(i))
+    end
+    var fname = ast::ast_get_str1(storage, node)
+    if str_byte_len(fname) > 0
+      for_scope.push(fname)
+    end
+    lint_shadow_walk(storage, ast::ast_get_right(storage, node), for_scope, filename, src_lines, result)
+  elsif kind == node_constants::NODE_MATCH
+    var arms = ast::ast_get_children(storage, node)
+    if arms != 0
+      var c = arms.size
+      for i in 0..c
+        lint_shadow_walk(storage, ast::ast_get_right(storage, arms[i]), scope, filename, src_lines, result)
+      end
+    end
+  end
+end
+
+def lint_t2_redundant_return(storage: ast::AstStorage, program: Int, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var funcs = lint_walk_functions(storage, program)
+  for fi in 0..funcs.size()
+    var func = funcs.get(fi)
+    var body = ast::ast_get_right(storage, func)
+    if body <= 0
+      continue
+    end
+    if ast::ast_get_kind(storage, body) != node_constants::NODE_BLOCK
+      continue
+    end
+    var stmts = ast::ast_get_children(storage, body)
+    if stmts == 0
+      continue
+    end
+    if stmts.size != 1
+      continue
+    end
+    var only = stmts[0]
+    if ast::ast_get_kind(storage, only) == node_constants::NODE_RETURN
+      var ret_val = ast::ast_get_left(storage, only)
+      if ret_val > 0
+        # Skip if already endless def (func and return on same line)
+        var func_line = ast::ast_get_line(storage, func)
+        var ret_line = ast::ast_get_line(storage, only)
+        if func_line != ret_line
+          var fname = ast::ast_get_str1(storage, func)
+          var d = lint_warn("QZ7204", "single return, use endless def", filename, func_line, ast::ast_get_col(storage, func), src_lines)
+          diag_set_suggestion(d, "rewrite as endless def")
+          lint_result_add_checked(result, d, src_lines)
+        end
+      end
+    end
+  end
+end
+
+## ========================================================================
+## QZ7301: Unreachable code after return/break/continue
+## ========================================================================
+
+def lint_t2_unreachable_code(storage: ast::AstStorage, program: Int, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var funcs = lint_walk_functions(storage, program)
+  for fi in 0..funcs.size()
+    var func = funcs.get(fi)
+    var body = ast::ast_get_right(storage, func)
+    if body > 0
+      lint_check_unreachable(storage, body, filename, src_lines, result)
+    end
+  end
+end
+
+def lint_check_unreachable(storage: ast::AstStorage, node: Int, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  if node <= 0 or node >= ast::ast_node_count(storage)
+    return
+  end
+  var kind = ast::ast_get_kind(storage, node)
+  if kind == node_constants::NODE_BLOCK
+    var stmts = ast::ast_get_children(storage, node)
+    if stmts != 0
+      var c = stmts.size
+      var i = 0
+      while i < c
+        var stmt = stmts[i]
+        var sk = ast::ast_get_kind(storage, stmt)
+        if sk == node_constants::NODE_RETURN or sk == node_constants::NODE_BREAK or sk == node_constants::NODE_CONTINUE
+          if i + 1 < c
+            var next = stmts[i + 1]
+            var d = lint_warn("QZ7301", "unreachable code after return/break/continue", filename, ast::ast_get_line(storage, next), ast::ast_get_col(storage, next), src_lines)
+            lint_result_add_checked(result, d, src_lines)
+            break
+          end
+        end
+        # Recurse into nested blocks
+        lint_check_unreachable(storage, stmt, filename, src_lines, result)
+        i += 1
+      end
+    end
+    return
+  end
+  if kind == node_constants::NODE_IF
+    lint_check_unreachable(storage, ast::ast_get_right(storage, node), filename, src_lines, result)
+    var els = ast::ast_get_extra(storage, node)
+    if els > 0
+      lint_check_unreachable(storage, els, filename, src_lines, result)
+    end
+  end
+  if kind == node_constants::NODE_WHILE or kind == node_constants::NODE_FOR
+    lint_check_unreachable(storage, ast::ast_get_right(storage, node), filename, src_lines, result)
+  end
+  if kind == node_constants::NODE_MATCH
+    var arms = ast::ast_get_children(storage, node)
+    if arms != 0
+      var c = arms.size
+      for i in 0..c
+        lint_check_unreachable(storage, ast::ast_get_right(storage, arms[i]), filename, src_lines, result)
+      end
+    end
+  end
+end
+
+## ========================================================================
+## QZ7302: Empty match arm
+## ========================================================================
+
+def lint_t2_empty_match_arm(storage: ast::AstStorage, program: Int, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var funcs = lint_walk_functions(storage, program)
+  for fi in 0..funcs.size()
+    var func = funcs.get(fi)
+    var body = ast::ast_get_right(storage, func)
+    if body > 0
+      lint_check_empty_match_arms(storage, body, filename, src_lines, result)
+    end
+  end
+end
+
+def lint_check_empty_match_arms(storage: ast::AstStorage, node: Int, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  if node <= 0 or node >= ast::ast_node_count(storage)
+    return
+  end
+  var kind = ast::ast_get_kind(storage, node)
+  if kind == node_constants::NODE_MATCH
+    var arms = ast::ast_get_children(storage, node)
+    if arms != 0
+      var c = arms.size
+      for i in 0..c
+        var arm = arms[i]
+        var arm_body = ast::ast_get_right(storage, arm)
+        if arm_body <= 0
+          var d = lint_warn("QZ7302", "empty match arm body", filename, ast::ast_get_line(storage, arm), ast::ast_get_col(storage, arm), src_lines)
+          lint_result_add_checked(result, d, src_lines)
+        elsif arm_body < ast::ast_node_count(storage)
+          var bk = ast::ast_get_kind(storage, arm_body)
+          if bk == node_constants::NODE_BLOCK
+            var stmts = ast::ast_get_children(storage, arm_body)
+            if stmts == 0 or stmts.size == 0
+              var d = lint_warn("QZ7302", "empty match arm body", filename, ast::ast_get_line(storage, arm), ast::ast_get_col(storage, arm), src_lines)
+              lint_result_add_checked(result, d, src_lines)
+            end
+          end
+        end
+      end
+    end
+  end
+  # Recurse
+  if kind == node_constants::NODE_BLOCK
+    var stmts = ast::ast_get_children(storage, node)
+    if stmts != 0
+      var c = stmts.size
+      for i in 0..c
+        lint_check_empty_match_arms(storage, stmts[i], filename, src_lines, result)
+      end
+    end
+  end
+  if kind == node_constants::NODE_IF
+    lint_check_empty_match_arms(storage, ast::ast_get_right(storage, node), filename, src_lines, result)
+    var els = ast::ast_get_extra(storage, node)
+    if els > 0
+      lint_check_empty_match_arms(storage, els, filename, src_lines, result)
+    end
+  end
+  if kind == node_constants::NODE_WHILE or kind == node_constants::NODE_FOR
+    lint_check_empty_match_arms(storage, ast::ast_get_right(storage, node), filename, src_lines, result)
+  end
+end
+
+## ========================================================================
+## QZ7303: Missing else branch
+## ========================================================================
+
+## Detects `if` without `else` when:
+## 1. It's the last statement in a function body (may not return a value)
+## 2. It's used as the init expression of a let binding (value position)
+## Walks recursively to catch nested cases.
+def lint_t2_missing_else(storage: ast::AstStorage, program: Int, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var funcs = lint_walk_functions(storage, program)
+  for fi in 0..funcs.size()
+    var func = funcs.get(fi)
+    var body = ast::ast_get_right(storage, func)
+    if body <= 0
+      continue
+    end
+    # Check if function has a return type annotation (str2)
+    var ret_type = ast::ast_get_str2(storage, func)
+    if str_byte_len(ret_type) == 0 or ret_type == "Void"
+      continue
+    end
+    lint_check_missing_else(storage, body, filename, src_lines, result, true)
+  end
+end
+
+## Walk checking for missing else. is_tail indicates this node is in tail position.
+def lint_check_missing_else(storage: ast::AstStorage, node: Int, filename: String, src_lines: Vec<String>, result: LintResult, is_tail: Bool): Void
+  if node <= 0 or node >= ast::ast_node_count(storage)
+    return
+  end
+  var kind = ast::ast_get_kind(storage, node)
+
+  if kind == node_constants::NODE_BLOCK
+    var stmts = ast::ast_get_children(storage, node)
+    if stmts != 0
+      var c = stmts.size
+      for i in 0..c
+        var is_last = (i == c - 1) and is_tail
+        lint_check_missing_else(storage, stmts[i], filename, src_lines, result, is_last)
+      end
+    end
+    return
+  end
+
+  if kind == node_constants::NODE_IF
+    var else_branch = ast::ast_get_extra(storage, node)
+    if else_branch <= 0 and is_tail
+      var d = lint_warn("QZ7303", "if without else in tail position — may not return a value", filename, ast::ast_get_line(storage, node), ast::ast_get_col(storage, node), src_lines)
+      diag_set_suggestion(d, "add an else branch")
+      lint_result_add_checked(result, d, src_lines)
+    end
+    # Recurse into branches
+    lint_check_missing_else(storage, ast::ast_get_right(storage, node), filename, src_lines, result, is_tail)
+    if else_branch > 0
+      lint_check_missing_else(storage, else_branch, filename, src_lines, result, is_tail)
+    end
+    return
+  end
+
+  # Check let bindings with if as init expression
+  if kind == node_constants::NODE_LET
+    var init = ast::ast_get_left(storage, node)
+    if init > 0 and init < ast::ast_node_count(storage)
+      if ast::ast_get_kind(storage, init) == node_constants::NODE_IF
+        var else_branch = ast::ast_get_extra(storage, init)
+        if else_branch <= 0
+          var d = lint_warn("QZ7303", "if without else in value position — assigned value may be nil", filename, ast::ast_get_line(storage, init), ast::ast_get_col(storage, init), src_lines)
+          diag_set_suggestion(d, "add an else branch")
+          lint_result_add_checked(result, d, src_lines)
+        end
+      end
+    end
+    return
+  end
+
+  # Recurse into match arms
+  if kind == node_constants::NODE_MATCH
+    var arms = ast::ast_get_children(storage, node)
+    if arms != 0
+      var c = arms.size
+      for i in 0..c
+        lint_check_missing_else(storage, ast::ast_get_right(storage, arms[i]), filename, src_lines, result, is_tail)
+      end
+    end
+    return
+  end
+end
+
+## ========================================================================
+## QZ7401: Unused function parameter
+## ========================================================================
+
+def lint_t2_unused_param(storage: ast::AstStorage, program: Int, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var funcs = lint_walk_functions(storage, program)
+  for fi in 0..funcs.size()
+    var func = funcs.get(fi)
+    var body = ast::ast_get_right(storage, func)
+    if body <= 0
+      continue
+    end
+    var params = ast::ast_get_left(storage, func)
+    if params <= 0
+      continue
+    end
+    var pc = vec_size(params)
+    if pc == 0
+      continue
+    end
+    var used = vec_new<String>()
+    lint_collect_idents(storage, body, used)
+    for pi in 0..pc
+      var pname = ast::ast_get_str1(storage, params[pi])
+      if str_byte_len(pname) > 0 and not str_starts_with(pname, "_") and pname != "self"
+        if not lint_name_in_vec(used, pname)
+          var d = lint_warn("QZ7401", "unused parameter '#{pname}'", filename, ast::ast_get_line(storage, params[pi]), ast::ast_get_col(storage, params[pi]), src_lines)
+          diag_set_suggestion(d, "prefix with '_' to silence: _#{pname}")
+          lint_result_add_checked(result, d, src_lines)
+        end
+      end
+    end
+  end
+end
+
+## ========================================================================
+## QZ7402: Empty block body
+## ========================================================================
+
+def lint_t2_empty_block(storage: ast::AstStorage, program: Int, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var funcs = lint_walk_functions(storage, program)
+  for fi in 0..funcs.size()
+    var func = funcs.get(fi)
+    var body = ast::ast_get_right(storage, func)
+    if body > 0
+      lint_check_empty_blocks(storage, body, filename, src_lines, result)
+    end
+  end
+end
+
+def lint_check_empty_blocks(storage: ast::AstStorage, node: Int, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  if node <= 0 or node >= ast::ast_node_count(storage)
+    return
+  end
+  var kind = ast::ast_get_kind(storage, node)
+  if kind == node_constants::NODE_IF or kind == node_constants::NODE_WHILE or kind == node_constants::NODE_FOR
+    var body = ast::ast_get_right(storage, node)
+    if body > 0 and body < ast::ast_node_count(storage)
+      var bk = ast::ast_get_kind(storage, body)
+      if bk == node_constants::NODE_BLOCK
+        var stmts = ast::ast_get_children(storage, body)
+        if stmts == 0 or stmts.size == 0
+          var kw = "if"
+          if kind == node_constants::NODE_WHILE
+            kw = "while"
+          elsif kind == node_constants::NODE_FOR
+            kw = "for"
+          end
+          var d = lint_warn("QZ7402", "empty '#{kw}' body", filename, ast::ast_get_line(storage, node), ast::ast_get_col(storage, node), src_lines)
+          lint_result_add_checked(result, d, src_lines)
+        end
+      end
+    end
+  end
+  # Recurse
+  if kind == node_constants::NODE_BLOCK
+    var stmts = ast::ast_get_children(storage, node)
+    if stmts != 0
+      var c = stmts.size
+      for i in 0..c
+        lint_check_empty_blocks(storage, stmts[i], filename, src_lines, result)
+      end
+    end
+  end
+  if kind == node_constants::NODE_IF
+    lint_check_empty_blocks(storage, ast::ast_get_right(storage, node), filename, src_lines, result)
+    var els = ast::ast_get_extra(storage, node)
+    if els > 0
+      lint_check_empty_blocks(storage, els, filename, src_lines, result)
+    end
+  end
+  if kind == node_constants::NODE_WHILE or kind == node_constants::NODE_FOR
+    lint_check_empty_blocks(storage, ast::ast_get_right(storage, node), filename, src_lines, result)
+  end
+end
+
+## ========================================================================
+## QZ7403: Constant condition in if/while
+## ========================================================================
+
+def lint_t2_constant_condition(storage: ast::AstStorage, program: Int, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var funcs = lint_walk_functions(storage, program)
+  for fi in 0..funcs.size()
+    var func = funcs.get(fi)
+    var body = ast::ast_get_right(storage, func)
+    if body > 0
+      lint_check_const_cond(storage, body, filename, src_lines, result)
+    end
+  end
+end
+
+def lint_check_const_cond(storage: ast::AstStorage, node: Int, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  if node <= 0 or node >= ast::ast_node_count(storage)
+    return
+  end
+  var kind = ast::ast_get_kind(storage, node)
+  if kind == node_constants::NODE_IF or kind == node_constants::NODE_WHILE
+    var cond = ast::ast_get_left(storage, node)
+    if cond > 0 and cond < ast::ast_node_count(storage)
+      var ck = ast::ast_get_kind(storage, cond)
+      if ck == node_constants::NODE_BOOL_LIT
+        var val = ast::ast_get_int_val(storage, cond)
+        if kind == node_constants::NODE_WHILE and val == 1
+          var d = lint_warn("QZ7403", "'while true' — use 'loop' instead", filename, ast::ast_get_line(storage, node), ast::ast_get_col(storage, node), src_lines)
+          lint_result_add_checked(result, d, src_lines)
+        elsif kind == node_constants::NODE_IF
+          var bstr = "false"
+          if val == 1
+            bstr = "true"
+          end
+          var d = lint_warn("QZ7403", "constant condition '#{bstr}' in if", filename, ast::ast_get_line(storage, node), ast::ast_get_col(storage, node), src_lines)
+          lint_result_add_checked(result, d, src_lines)
+        elsif kind == node_constants::NODE_WHILE and val == 0
+          var d = lint_warn("QZ7403", "'while false' — loop body never executes", filename, ast::ast_get_line(storage, node), ast::ast_get_col(storage, node), src_lines)
+          lint_result_add_checked(result, d, src_lines)
+        end
+      end
+    end
+  end
+  # Recurse
+  if kind == node_constants::NODE_BLOCK
+    var stmts = ast::ast_get_children(storage, node)
+    if stmts != 0
+      var c = stmts.size
+      for i in 0..c
+        lint_check_const_cond(storage, stmts[i], filename, src_lines, result)
+      end
+    end
+  end
+  if kind == node_constants::NODE_IF
+    lint_check_const_cond(storage, ast::ast_get_right(storage, node), filename, src_lines, result)
+    var els = ast::ast_get_extra(storage, node)
+    if els > 0
+      lint_check_const_cond(storage, els, filename, src_lines, result)
+    end
+  end
+  if kind == node_constants::NODE_WHILE or kind == node_constants::NODE_FOR
+    lint_check_const_cond(storage, ast::ast_get_right(storage, node), filename, src_lines, result)
+  end
+end
+
+## ========================================================================
+## QZ7501: Duplicate imports
+## ========================================================================
+
+def lint_t2_duplicate_imports(storage: ast::AstStorage, program: Int, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var items = ast::ast_get_children(storage, program)
+  if items == 0
+    return
+  end
+  var seen = vec_new<String>()
+  var c = items.size
+  for i in 0..c
+    var item = items[i]
+    if ast::ast_get_kind(storage, item) == node_constants::NODE_IMPORT
+      var mod_name = ast::ast_get_str1(storage, item)
+      if str_byte_len(mod_name) > 0
+        if lint_name_in_vec(seen, mod_name)
+          var d = lint_warn("QZ7501", "duplicate import '#{mod_name}'", filename, ast::ast_get_line(storage, item), ast::ast_get_col(storage, item), src_lines)
+          lint_result_add_checked(result, d, src_lines)
+        else
+          seen.push(mod_name)
+        end
+      end
+    end
+  end
+end
+
+## ========================================================================
+## QZ7502: Wildcard imports
+## ========================================================================
+
+def lint_t2_wildcard_imports(storage: ast::AstStorage, program: Int, filename: String, src_lines: Vec<String>, result: LintResult): Void
+  var items = ast::ast_get_children(storage, program)
+  if items == 0
+    return
+  end
+  var c = items.size
+  for i in 0..c
+    var item = items[i]
+    if ast::ast_get_kind(storage, item) == node_constants::NODE_IMPORT
+      var is_wild = ast::ast_get_int_val(storage, item)
+      if is_wild == 1
+        var mod_name = ast::ast_get_str1(storage, item)
+        # Skip qspec wildcard imports in test files (conventional)
+        if mod_name != "qspec" and not str_starts_with(mod_name, "qspec/")
+          var d = lint_warn("QZ7502", "wildcard import from '#{mod_name}'", filename, ast::ast_get_line(storage, item), ast::ast_get_col(storage, item), src_lines)
+          diag_set_suggestion(d, "prefer explicit imports")
+          lint_result_add_checked(result, d, src_lines)
+        end
+      end
+    end
+  end
+end
+
+## Standalone demo / test harness (not used when imported as a library).
+def lint_demo(): Int
+  test_source = "def foo(): Int\n  if x > 0\n    return 1\n  # missing end for if!\nend\n"
+
+  puts("Quartz Linter - Balance & Style Checker")
+  puts("========================================")
+  puts("")
+
+  result = lint_file_with_diagnostics(test_source, "<demo>")
+  lint_result_emit(result)
+
+  if result.count == 0
+    puts("OK - no issues found")
+  else
+    puts("")
+    puts("#{result.count} issue(s)")
+  end
+
+  return result.count
+end

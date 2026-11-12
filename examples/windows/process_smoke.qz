@@ -1,0 +1,78 @@
+## Phase 5d acceptance probe — Quartz `proc_suspend` on Windows IOCP.
+##
+## Calls `proc_suspend(handle)` from a worker with a bogus HANDLE value
+## (the i64 sentinel `0x7FFFFFFE`) to exercise the `rw_fail` fast-path of
+## the Windows branch of `__qz_sched_register_proc`:
+##
+##   RegisterWaitForSingleObject(&wh, hProcess, callback, ..., INFINITE, 8)
+##     → returns FALSE (invalid HANDLE)
+##     → __qz_sched_reenqueue(task) inline
+##     → main's `await` returns
+##
+## **This smoke is Windows-target-only.** Running natively on macOS or
+## Linux will hang: on macOS, kevent(EVFILT_PROC, ident=0x7FFFFFFE) may
+## register without firing (no such pid); on Linux pidfd_open(0x7FFFFFFE)
+## returns -1 with ESRCH and reenqueues, but kqueue's behavior is less
+## predictable. The POSIX scheduler register_proc path is already covered
+## by `spec/qspec/proc_suspend_spec.qz` (3/3 passing), which forks real
+## children — the right primitive for POSIX validation.
+##
+## End-to-end this smoke exercises:
+##   - __qz_sched_register_proc Windows branch: alloca PHANDLE slot,
+##     inttoptr i64→ptr for the HANDLE, RegisterWaitForSingleObject call
+##     with @__qz_proc_exit_callback's address, branch on the BOOL return.
+##   - The rw_fail fast-path that re-enqueues the task without going
+##     through the IOCP poller's kind=Process dispatch.
+##   - The shim block's RegisterWaitForSingleObject declare and
+##     __qz_proc_exit_callback definition link cleanly. The callback's
+##     address is taken at the register-call site, so even on the
+##     rw_fail path the linker must resolve it (this is what gives the
+##     compile-only acceptance teeth — a missing-symbol regression
+##     in the shim block would surface here).
+##
+## What this probe does NOT do: spawn a real child process via
+## CreateProcessA, monitor its HANDLE through to natural exit, and verify
+## the threadpool callback → IOCP repost path. That's a filed-forward
+## follow-up — needs FFI declarations of CreateProcessA + STARTUPINFOA
+## / PROCESS_INFORMATION struct layout + command-line buffer setup. A
+## minimal `spawn_smoke.exe` is sized 0.2–0.5 quartz-day; not on the
+## 5d critical path since 5d's mechanical verification (cross-compile
+## clean + RegisterWaitForSingleObject import present) is sufficient
+## for the Darwin handoff and the actual runtime correctness is the
+## same constraint as 5a/5b/5c: needs a Windows host to verify.
+
+import * from time
+
+def wait_for_child(handle: Int): Int
+  # %handle carries a HANDLE on Windows. 0x7FFFFFFE is reliably not a
+  # process handle (legal handle values are kernel-allocated, far from
+  # this sentinel) → RegisterWaitForSingleObject returns FALSE → rw_fail.
+  proc_suspend(handle)
+  return 1
+end
+
+def main(): Int
+  var t0 = time_mono_ns()
+  var w = go wait_for_child(2147483646)
+  var ok = await w
+  var elapsed_ns = time_mono_ns() - t0
+  var elapsed_ms = elapsed_ns / 1000000
+
+  if ok == 1
+    puts("worker: woke")
+  else
+    puts("worker: UNEXPECTED return")
+  end
+
+  # The reenqueue is inline — should be effectively instantaneous (< 100
+  # ms on any reasonable host even under load, since no kernel wait is
+  # involved). We loosen the assertion to < 1000 ms to absorb noise.
+  if elapsed_ms < 1000
+    puts("main: elapsed ok (fast-path inline reenqueue)")
+  else
+    puts("main: elapsed TOO LONG (would indicate wait actually happened)")
+  end
+
+  puts("main: joined")
+  return 0
+end

@@ -1,0 +1,508 @@
+## Scheduler Benchmark History Recorder & Analyzer
+##
+## Reads BENCHJSON lines from stdin, appends to sched_history.jsonl,
+## compares against previous runs, detects regressions.
+##
+## Usage:
+##   sched_bench --quick | bench_history --record
+##   bench_history --show 10
+##   bench_history --trend spawn_rate
+##   bench_history --ci            # exit 1 on regression
+
+import io/file
+import string
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+var g_history_path = "benchmarks/sched_history.jsonl"
+var g_mode = ""
+var g_show_count = 10
+var g_trend_scenario = "spawn_rate"
+
+# ============================================================================
+# Arg parsing
+# ============================================================================
+
+def parse_args(): Void
+  var n = argc()
+  var i = 1
+  while i < n
+    var arg = argv(i)
+    if str_eq(arg, "--record")
+      g_mode = "record"
+    elsif str_eq(arg, "--show")
+      g_mode = "show"
+      i += 1
+      if i < n
+        g_show_count = str_to_int(argv(i))
+      end
+    elsif str_eq(arg, "--trend")
+      g_mode = "trend"
+      i += 1
+      if i < n
+        g_trend_scenario = argv(i)
+      end
+    elsif str_eq(arg, "--ci")
+      g_mode = "ci"
+    elsif str_eq(arg, "--history")
+      i += 1
+      if i < n
+        g_history_path = argv(i)
+      end
+    end
+    i += 1
+  end
+end
+
+# ============================================================================
+# String search helper (returns -1 if not found)
+# ============================================================================
+
+def find_str(haystack: String, needle: String): Int
+  match str_byte_find(haystack, needle)
+    Some(pos) => return pos
+    None => return -1
+  end
+end
+
+def find_str_from(haystack: String, needle: String, start: Int): Int
+  var sub = str_slice(haystack, start, str_byte_len(haystack))
+  match str_byte_find(sub, needle)
+    Some(pos) => return start + pos
+    None => return -1
+  end
+end
+
+# ============================================================================
+# JSONL field extraction (lightweight, no full JSON parser)
+# ============================================================================
+
+## Extract string value for a key like "scenario":"spawn_rate"
+def json_get_str(line: String, key: String): String
+  var search = str_concat(str_concat("\"", key), "\":\"")
+  var pos = find_str(line, search)
+  if pos < 0
+    return ""
+  end
+  var start = pos + str_byte_len(search)
+  var end_pos = find_str_from(line, "\"", start)
+  if end_pos < 0
+    return ""
+  end
+  return str_slice(line, start, end_pos)
+end
+
+## Extract integer value for a key like "median":1240000
+def json_get_int(line: String, key: String): Int
+  var search = str_concat(str_concat("\"", key), "\":")
+  var pos = find_str(line, search)
+  if pos < 0
+    return 0
+  end
+  var start = pos + str_byte_len(search)
+  # Read digits
+  var len = str_byte_len(line)
+  var end_pos = start
+  while end_pos < len
+    var ch = str_byte_at(line, end_pos)
+    if (ch >= '0' and ch <= '9') or ch == '-'
+      end_pos += 1
+    else
+      break
+    end
+  end
+  if end_pos == start
+    return 0
+  end
+  return str_to_int(str_slice(line, start, end_pos))
+end
+
+## Extract integer array for a key like "values":[1,2,3]
+def json_get_int_array(line: String, key: String): Vec<Int>
+  var result = vec_new()
+  var search = str_concat(str_concat("\"", key), "\":[")
+  var pos = find_str(line, search)
+  if pos < 0
+    return result
+  end
+  var start = pos + str_byte_len(search)
+  var len = str_byte_len(line)
+  var j = start
+  var num_start = j
+  while j < len
+    var ch = str_byte_at(line, j)
+    if ch == ',' or ch == ']'
+      if j > num_start
+        var s = str_slice(line, num_start, j)
+        result.push(str_to_int(s))
+      end
+      num_start = j + 1
+      if ch == ']'
+        break
+      end
+    end
+    j += 1
+  end
+  return result
+end
+
+# ============================================================================
+# History file operations
+# ============================================================================
+
+def load_history_lines(): Vec<String>
+  var content = read_file(g_history_path)
+  if str_byte_len(content) == 0
+    return vec_new<String>()
+  end
+  return str_split(content, "\n")
+end
+
+def append_line(line: String): Void
+  file_append(g_history_path, str_concat(line, "\n"))
+end
+
+# ============================================================================
+# Statistics
+# ============================================================================
+
+## Mann-Whitney U test (integer arithmetic)
+## Returns: 0 = not significant, 1 = regression, -1 = improvement
+def mann_whitney_u(xs: Vec<Int>, ys: Vec<Int>): Int
+  var n1 = xs.size
+  var n2 = ys.size
+  if n1 < 5 or n2 < 5
+    return 0
+  end
+  var u = 0
+  for i in 0..n1
+    for j in 0..n2
+      if xs[i] > ys[j]
+        u += 1
+      end
+    end
+  end
+  var u2 = u * 2
+  var mean_u2 = n1 * n2
+  var diff = u2 - mean_u2
+  var diff_sq = diff * diff
+  var sigma_sq_4 = n1 * n2 * (n1 + n2 + 1) / 3
+  var threshold = sigma_sq_4 * 38416 / 10000
+  if diff_sq > threshold
+    if u2 > mean_u2
+      return 1
+    else
+      return -1
+    end
+  end
+  return 0
+end
+
+# ============================================================================
+# Formatting
+# ============================================================================
+
+def format_rate(val: Int): String
+  if val >= 1000000000
+    var b = val / 1000000000
+    var r = (val % 1000000000) / 100000000
+    return "#{b}.#{r}B"
+  elsif val >= 1000000
+    var m = val / 1000000
+    var r = (val % 1000000) / 100000
+    return "#{m}.#{r}M"
+  elsif val >= 1000
+    var k = val / 1000
+    var r = (val % 1000) / 100
+    return "#{k}.#{r}K"
+  end
+  return val.to_s()
+end
+
+def pad_right(s: String, width: Int): String
+  var result = s
+  while str_byte_len(result) < width
+    result = str_concat(result, " ")
+  end
+  return result
+end
+
+# ============================================================================
+# Mode: --record
+# ============================================================================
+
+def mode_record(): Int
+  var regression_found = 0
+  var lines_recorded = 0
+
+  # Read input from file (passed as first non-flag arg or default tmp path)
+  var input_path = "/tmp/_sched_bench_output.txt"
+  var n = argc()
+  var i = 1
+  while i < n
+    var arg = argv(i)
+    if str_starts_with(arg, "--") == false
+      input_path = arg
+    end
+    i += 1
+  end
+  var all_input = read_file(input_path)
+
+  # Extract BENCHJSON lines
+  var input_lines = vec_new<String>()
+  var raw_lines = str_split(all_input, "\n")
+  for i in 0..raw_lines.size
+    var line = raw_lines[i]
+    if str_byte_len(line) > 10
+      if str_starts_with(line, "BENCHJSON:")
+        input_lines.push(str_slice(line, 10, str_byte_len(line)))
+      end
+    end
+  end
+
+  if input_lines.size == 0
+    eputs("No BENCHJSON lines found on stdin")
+    return 1
+  end
+
+  # Load existing history for comparison
+  var history = load_history_lines()
+
+  var current_sha = json_get_str(input_lines[0], "sha")
+  var workers = json_get_int(input_lines[0], "workers")
+  var iters = json_get_int(input_lines[0], "iters")
+
+  puts("=== Scheduler Benchmark Results ===")
+  puts("#{current_sha} | #{workers} workers | #{iters} iterations")
+  puts("")
+
+  for i in 0..input_lines.size
+    var line = input_lines[i]
+    var scenario = json_get_str(line, "scenario")
+    var unit = json_get_str(line, "unit")
+    var median = json_get_int(line, "median")
+    var p25 = json_get_int(line, "p25")
+    var p75 = json_get_int(line, "p75")
+    var current_values = json_get_int_array(line, "values")
+
+    # Find previous run for this scenario (different SHA)
+    var prev_median = 0
+    var prev_values = vec_new<Int>()
+    var j = history.size - 1
+    while j >= 0
+      var hline = history[j]
+      if str_byte_len(hline) > 5
+        var h_scenario = json_get_str(hline, "scenario")
+        var h_sha = json_get_str(hline, "sha")
+        if str_eq(h_scenario, scenario)
+          if str_eq(h_sha, current_sha) == false
+            prev_median = json_get_int(hline, "median")
+            prev_values = json_get_int_array(hline, "values")
+            j = 0  # break (will decrement to -1)
+          end
+        end
+      end
+      j -= 1
+    end
+
+    # Format change
+    var change_str = "  (first run)"
+    if prev_median > 0
+      var pct_change = (median - prev_median) * 100 / prev_median
+      if pct_change >= 0
+        change_str = "  +#{pct_change}%"
+      else
+        var abs_pct = 0 - pct_change
+        change_str = "  -#{abs_pct}%"
+      end
+
+      # Check for regression
+      var is_lower_better = str_eq(unit, "bytes_per_task")
+      var is_regression = 0
+      if is_lower_better
+        if pct_change > 5
+          is_regression = 1
+        end
+      else
+        if pct_change < -5
+          is_regression = 1
+        end
+      end
+
+      if is_regression == 1
+        change_str = str_concat(change_str, " \x1b[31m[WARN]\x1b[0m")
+        var u_result = mann_whitney_u(current_values, prev_values)
+        if u_result != 0
+          change_str = str_concat(change_str, " (p<0.05)")
+          regression_found = 1
+        end
+      end
+    end
+
+    var med_str = pad_right(format_rate(median), 8)
+    puts("  #{pad_right(scenario, 22)} #{med_str} #{unit}#{change_str}")
+
+    append_line(line)
+    lines_recorded += 1
+  end
+
+  puts("")
+  puts("#{lines_recorded} records appended to #{g_history_path}")
+
+  return regression_found
+end
+
+# ============================================================================
+# Mode: --show
+# ============================================================================
+
+def mode_show(): Int
+  var history = load_history_lines()
+  if history.size == 0
+    puts("No history found in #{g_history_path}")
+    return 0
+  end
+
+  # Collect unique SHAs from the end
+  var seen_shas = vec_new<String>()
+  var j = history.size - 1
+  while j >= 0 and seen_shas.size < g_show_count
+    var line = history[j]
+    if str_byte_len(line) > 5
+      var sha = json_get_str(line, "sha")
+      if str_byte_len(sha) > 0
+        var found = 0
+        for k in 0..seen_shas.size
+          if str_eq(seen_shas[k], sha)
+            found = 1
+          end
+        end
+        if found == 0
+          seen_shas.push(sha)
+        end
+      end
+    end
+    j -= 1
+  end
+
+  puts("=== Last #{seen_shas.size} benchmark runs ===")
+  puts("")
+
+  var si = seen_shas.size - 1
+  while si >= 0
+    var sha = seen_shas[si]
+    puts("--- #{sha} ---")
+    for k in 0..history.size
+      var line = history[k]
+      if str_byte_len(line) > 5
+        if str_eq(json_get_str(line, "sha"), sha)
+          var scenario = json_get_str(line, "scenario")
+          var median = json_get_int(line, "median")
+          var unit = json_get_str(line, "unit")
+          puts("  #{pad_right(scenario, 22)} #{pad_right(format_rate(median), 8)} #{unit}")
+        end
+      end
+    end
+    puts("")
+    si -= 1
+  end
+
+  return 0
+end
+
+# ============================================================================
+# Mode: --trend
+# ============================================================================
+
+def mode_trend(): Int
+  var history = load_history_lines()
+  var scenario = g_trend_scenario
+
+  var medians = vec_new()
+  var shas = vec_new<String>()
+  for i in 0..history.size
+    var line = history[i]
+    if str_byte_len(line) > 5
+      if str_eq(json_get_str(line, "scenario"), scenario)
+        medians.push(json_get_int(line, "median"))
+        shas.push(json_get_str(line, "sha"))
+      end
+    end
+  end
+
+  var start = 0
+  if medians.size > 20
+    start = medians.size - 20
+  end
+  var count = medians.size - start
+
+  puts("=== #{scenario} trend (last #{count} runs) ===")
+  puts("")
+
+  if count == 0
+    puts("No data for scenario: #{scenario}")
+    return 0
+  end
+
+  var min_val = medians[start]
+  var max_val = medians[start]
+  for i in start..medians.size
+    if medians[i] < min_val
+      min_val = medians[i]
+    end
+    if medians[i] > max_val
+      max_val = medians[i]
+    end
+  end
+
+  var height = 12
+  var range = max_val - min_val
+  if range == 0
+    range = 1
+  end
+
+  for row in 0..height
+    var threshold = max_val - (row * range / height)
+    var sb = sb_new()
+    sb_append(sb, pad_right(format_rate(threshold), 10))
+    sb_append(sb, " |")
+    for i in start..medians.size
+      if medians[i] >= threshold
+        sb_append(sb, " *")
+      else
+        sb_append(sb, "  ")
+      end
+    end
+    puts(sb_to_string(sb))
+  end
+
+  var axis = sb_new()
+  sb_append(axis, "           +")
+  for i in start..medians.size
+    sb_append(axis, "--")
+  end
+  puts(sb_to_string(axis))
+
+  return 0
+end
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main(): Int
+  parse_args()
+
+  if str_eq(g_mode, "record") or str_eq(g_mode, "ci")
+    return mode_record()
+  elsif str_eq(g_mode, "show")
+    return mode_show()
+  elsif str_eq(g_mode, "trend")
+    return mode_trend()
+  else
+    puts("Usage: bench_history [--record | --show N | --trend SCENARIO | --ci]")
+    return 1
+  end
+end

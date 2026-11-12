@@ -1,0 +1,775 @@
+## std/tui/widgets/form.qz — multi-field Form composer.
+##
+## A Form is an ordered list of TextInput fields with shared
+## FocusRing<Int>, per-field labels, per-field validators (tagged enum
+## — closure validators wait for the codegen fix), and per-field error
+## state. The Form's update handles Tab/Shift-Tab cycling, Enter
+## advance/submit, Esc cancel, and key forwarding to the focused field.
+##
+## Submit semantics are internal-with-event: `form_update` transitions
+## `state := Submitted` on Enter-on-last-field-with-all-valid AND emits
+## `FormEvent::Submitted` so the parent reacts to a one-shot signal
+## without inspecting state every frame.
+##
+## v0.3.3 step 1 ships homogeneous Vec<TextInput> only. Mixed field
+## types (Select / Confirm) land in v0.3.4+ via a `FormField` tagged
+## enum once a real consumer surfaces.
+##
+## Usage:
+##
+##   import std/tui/widgets/form as form
+##   import std/tui/widgets/text_input as ti
+##
+##   var f = form::form_new()
+##   f = form::form_with_field(f, "name", "Character name", ti::text_input_new())
+##   f = form::form_with_validator(f, "name", form::Validator::Required)
+##   f = form::form_with_field(f, "seed", "Random seed", ti::text_input_new())
+##   f = form::form_with_validator(f, "seed", form::Validator::Numeric)
+##
+##   # in update:
+##   var (next, cmd, ev) = form::form_update(f, msg)
+##   match ev
+##     form::FormEvent::Submitted => commit(form::form_get(next, "name"))
+##     form::FormEvent::Cancelled => # Esc pressed
+##     _ => # Idle / FieldChanged / FieldFocused
+##   end
+##
+## See `docs/design/TUI_FORM.md` for the full design memo.
+##
+## @since 5.28.x
+
+import std/tui/runtime as tui
+import std/terminal
+import std/string
+import style
+import std/tui/widgets/text_input as ti
+import std/tui/widgets/focus as fr
+import * from std/traits
+
+# ============================================================
+# Public types
+# ============================================================
+
+## Terminal state of the form. `Editing` is the working state. The form
+## transitions to `Submitted` on Enter-on-last-field-with-all-valid, and
+## to `Cancelled` on Esc. Once non-Editing the form does not respond to
+## further updates — the parent is expected to react to the event and
+## tear down / replace the form.
+enum FormState
+  Editing
+  Submitted
+  Cancelled
+end
+
+## Semantic events emitted by `form_update`. Mirror of v0.3.2 widget
+## convention: third slot of the update tuple is the event.
+##
+## - Idle: nothing semantic (cursor moved within field, no-op key, etc).
+## - FieldChanged(idx): value of field idx changed AND/OR validator
+##                      ran on that field (last_errors[idx] possibly
+##                      updated). Emitted on every keystroke that
+##                      mutates value, AND on Enter-with-validation-
+##                      failure-on-non-last-field.
+## - FieldFocused(idx): focus moved to field idx (Tab / Shift-Tab /
+##                      Enter-advance).
+## - Submitted: form_state transitioned to Submitted. All validators
+##              passed.
+## - Cancelled: form_state transitioned to Cancelled (Esc pressed).
+enum FormEvent
+  Idle
+  FieldChanged(idx: Int)
+  FieldFocused(idx: Int)
+  Submitted
+  Cancelled
+end
+
+## Per-field validator. Tagged enum, not closures — closures stored in
+## struct fields miscompile (v0.3.2 friction #6). Cases cover the 90%
+## case; custom validators wait for the codegen fix and a `Custom(fn)`
+## case in v0.3.4+.
+##
+## Semantics:
+## - Allow:        always valid (default if no validator set).
+## - Required:     value must be non-empty.
+## - MinLen(n):    str_size(value) >= n.
+## - MaxLen(n):    str_size(value) <= n.
+## - LenRange(a,b):  a <= str_size(value) <= b.
+## - Numeric:      value parses as Int (str_to_int / atoi-compatible).
+## - IntRange(a,b):  parses as Int AND result in [a, b].
+## - NonWhitespace: not all-whitespace.
+## - StartsWith(s):  value begins with s.
+## - EndsWith(s):    value ends with s.
+## - Equals(s):    exact match (e.g. password-confirm field).
+enum Validator
+  Allow
+  Required
+  MinLen(n: Int)
+  MaxLen(n: Int)
+  LenRange(min: Int, max: Int)
+  Numeric
+  IntRange(min: Int, max: Int)
+  NonWhitespace
+  StartsWith(prefix: String)
+  EndsWith(suffix: String)
+  Equals(target: String)
+end
+
+## Per-slot Style values for rendering.
+struct FormStyles
+  label:         Style    # unfocused field's label
+  label_focused: Style    # focused field's label
+  value:         Style    # field value (unfocused; focused field uses cursor styling internally)
+  error:         Style    # error message under invalid field
+end
+
+## Form widget.
+##
+## `fields`, `labels`, `keys`, `validators`, `last_errors` are parallel
+## Vecs — operations that grow them grow all five together. `focus` is
+## the field-index FocusRing (single integer ids 0..fields.size-1).
+## `state` is the terminal-state flag.
+struct Form
+  fields:      Vec<ti::TextInput>
+  labels:      Vec<String>
+  keys:        Vec<String>             # for form_get(key) lookup
+  validators:  Vec<Validator>
+  last_errors: Vec<Option<String>>     # parallel; None = valid, Some(msg) = error
+  focus:       fr::FocusRing<Int>
+  state:       FormState
+  width:       Int
+  height:      Int                      # 0 = auto from field count
+  styles:      FormStyles
+end
+
+# ============================================================
+# Constructors + builders
+# ============================================================
+
+## Default styles — no-op unstyled label, dim error.
+def form_styles_default(): FormStyles
+  return FormStyles {
+    label:         Style.new(),
+    label_focused: Style.new().bold(),
+    value:         Style.new(),
+    error:         Style.new().dim()
+  }
+end
+
+## Construct a fresh empty Form. `state := Editing`. No fields yet —
+## use `form_with_field` to add them.
+def form_new(): Form
+  var ids = vec_new<Int>()
+  return Form {
+    fields:      vec_new<ti::TextInput>(),
+    labels:      vec_new<String>(),
+    keys:        vec_new<String>(),
+    validators:  vec_new<Validator>(),
+    last_errors: vec_new<Option<String>>(),
+    focus:       fr::focus_ring_new<Int>(ids),
+    state:       FormState::Editing,
+    width:       0,
+    height:      0,
+    styles:      form_styles_default()
+  }
+end
+
+## Append a field to the form. The field is keyed by `key` for later
+## `form_get(key)` lookups. Initial validator is `Allow` (always valid);
+## use `form_with_validator(key, ...)` to set one. The new field is
+## given a fresh focus-ring entry; if the form had no focused field
+## before, the first added field becomes focused.
+##
+## Mutates the form's internal Vecs in place — do not retain a
+## reference to `f` after this call. The returned Form shares the same
+## Vec handles, now grown by one element.
+def form_with_field(
+  f: Form,
+  key: String,
+  label: String,
+  input: ti::TextInput
+): Form
+  var was_unfocused = f.focus.current is None
+  var idx = f.fields.size
+  f.fields.push(input)
+  f.labels.push(label)
+  f.keys.push(key)
+  f.validators.push(Validator::Allow)
+  f.last_errors.push(Option::None)
+  f.focus.ids.push(idx)
+  var new_focus = f.focus
+  if was_unfocused
+    # ids vec is now non-empty — focus_ring_new returns current=Some(0).
+    new_focus = fr::focus_ring_new<Int>(f.focus.ids)
+  end
+  return Form {
+    fields:      f.fields,
+    labels:      f.labels,
+    keys:        f.keys,
+    validators:  f.validators,
+    last_errors: f.last_errors,
+    focus:       new_focus,
+    state:       f.state,
+    width:       f.width,
+    height:      f.height,
+    styles:      f.styles
+  }
+end
+
+## Set the validator for a previously-added field. If `key` is not
+## present in the form, returns the input unchanged (caller error,
+## silently absorbed — matches FocusRing's `set` convention).
+##
+## Mutates the validators Vec in place; the returned Form shares the
+## same Vec handle.
+def form_with_validator(f: Form, key: String, v: Validator): Form
+  match _form_index_of(f, key)
+    Some(i) =>
+      f.validators[i] = v
+      return f
+    None =>
+      return f
+  end
+end
+
+## Set the rendering styles for the form (label, value, error slots).
+def form_with_styles(f: Form, s: FormStyles): Form
+  return Form {
+    fields:      f.fields,
+    labels:      f.labels,
+    keys:        f.keys,
+    validators:  f.validators,
+    last_errors: f.last_errors,
+    focus:       f.focus,
+    state:       f.state,
+    width:       f.width,
+    height:      f.height,
+    styles:      s
+  }
+end
+
+## Set the form's render area. `h == 0` lets the form auto-size from
+## the field count (one logical block per field: label + value + optional
+## error line).
+def form_with_size(f: Form, w: Int, h: Int): Form
+  return Form {
+    fields:      f.fields,
+    labels:      f.labels,
+    keys:        f.keys,
+    validators:  f.validators,
+    last_errors: f.last_errors,
+    focus:       f.focus,
+    state:       f.state,
+    width:       w,
+    height:      h,
+    styles:      f.styles
+  }
+end
+
+# ============================================================
+# Accessors
+# ============================================================
+
+## Number of fields in the form.
+def form_field_count(f: Form): Int = f.fields.size
+
+## Current state of the form (Editing | Submitted | Cancelled).
+def form_state(f: Form): FormState = f.state
+
+## Per-field validation errors. Parallel to fields — index i holds None
+## (valid) or Some(message) for field i.
+def form_errors(f: Form): Vec<Option<String>> = f.last_errors
+
+## Index of the currently-focused field, or None.
+def form_focused_index(f: Form): Option<Int> = f.focus.current
+
+## Run validators against the current values of all fields. Returns
+## true iff every field passes. Does not mutate the form's last_errors;
+## use `form_validate` if you want errors populated.
+def form_is_valid(f: Form): Bool
+  var i = 0
+  while i < f.fields.size
+    var v = ti::text_input_value(f.fields[i])
+    var err = _form_run_validator(f.validators[i], v)
+    if err is Some
+      return false
+    end
+    i = i + 1
+  end
+  return true
+end
+
+## Run validators against the current values of all fields, populating
+## last_errors with the results. Returns the new Form. The form's state
+## does NOT transition — caller decides what to do with the result
+## (typically: if all valid, set state := Submitted via form_set_state).
+def form_validate(f: Form): Form
+  var errs = vec_new<Option<String>>()
+  var i = 0
+  while i < f.fields.size
+    var v = ti::text_input_value(f.fields[i])
+    errs.push(_form_run_validator(f.validators[i], v))
+    i = i + 1
+  end
+  return Form {
+    fields:      f.fields,
+    labels:      f.labels,
+    keys:        f.keys,
+    validators:  f.validators,
+    last_errors: errs,
+    focus:       f.focus,
+    state:       f.state,
+    width:       f.width,
+    height:      f.height,
+    styles:      f.styles
+  }
+end
+
+## Current value of the field with the given key. Returns "" if the
+## key is not present.
+def form_get(f: Form, key: String): String
+  match _form_index_of(f, key)
+    Some(i) => return ti::text_input_value(f.fields[i])
+    None    => return ""
+  end
+end
+
+## Current value of the field at the given index. Returns "" if idx is
+## out of range.
+def form_get_at(f: Form, idx: Int): String
+  if idx < 0 or idx >= f.fields.size
+    return ""
+  end
+  return ti::text_input_value(f.fields[idx])
+end
+
+# ============================================================
+# State setters
+# ============================================================
+
+## Set the form's state. Programmatic; does not run validators or emit
+## events. Useful for parent-driven cancel/submit (e.g. a Cancel button
+## outside the form).
+def form_set_state(f: Form, s: FormState): Form
+  return Form {
+    fields:      f.fields,
+    labels:      f.labels,
+    keys:        f.keys,
+    validators:  f.validators,
+    last_errors: f.last_errors,
+    focus:       f.focus,
+    state:       s,
+    width:       f.width,
+    height:      f.height,
+    styles:      f.styles
+  }
+end
+
+## Move focus to the field at `idx`. No-op if idx is out of range.
+def form_set_focus(f: Form, idx: Int): Form
+  if idx < 0 or idx >= f.fields.size
+    return f
+  end
+  return Form {
+    fields:      f.fields,
+    labels:      f.labels,
+    keys:        f.keys,
+    validators:  f.validators,
+    last_errors: f.last_errors,
+    focus:       fr::focus_ring_set<Int>(f.focus, idx),
+    state:       f.state,
+    width:       f.width,
+    height:      f.height,
+    styles:      f.styles
+  }
+end
+
+## Reset all field values to empty, all errors to None, state to
+## Editing, focus to first field. Field labels, keys, and validators
+## are preserved. Useful for "reset" buttons.
+def form_clear(f: Form): Form
+  var new_fields = vec_new<ti::TextInput>()
+  var new_errors = vec_new<Option<String>>()
+  var i = 0
+  while i < f.fields.size
+    new_fields.push(ti::text_input_clear(f.fields[i]))
+    new_errors.push(Option::None)
+    i = i + 1
+  end
+  var new_focus = f.focus
+  if f.fields.size > 0
+    new_focus = fr::focus_ring_set<Int>(f.focus, 0)
+  end
+  return Form {
+    fields:      new_fields,
+    labels:      f.labels,
+    keys:        f.keys,
+    validators:  f.validators,
+    last_errors: new_errors,
+    focus:       new_focus,
+    state:       FormState::Editing,
+    width:       f.width,
+    height:      f.height,
+    styles:      f.styles
+  }
+end
+
+# ============================================================
+# Update
+# ============================================================
+
+## Drive the form forward by one input message. Returns:
+##   - the updated Form
+##   - a Cmd<M> (always Cmd::None in v1; widgets in v0.3.x emit no
+##     internal Cmds)
+##   - a FormEvent describing what happened semantically (Idle if
+##     nothing the parent cares about)
+##
+## Once `state` transitions to Submitted or Cancelled, further calls
+## return (f, Cmd::None, FormEvent::Idle) — the form is consumed and
+## the parent should react to the terminal-state event and tear down /
+## replace the form.
+def form_update<M>(
+  f: Form,
+  msg: tui::FrameMsg<M>
+): (Form, tui::Cmd<M>, FormEvent)
+  # Terminal states are absorbing.
+  match f.state
+    FormState::Editing => 0
+    _                  => return (f, tui::Cmd::None, FormEvent::Idle)
+  end
+  match msg
+    tui::FrameMsg::Key(k) => return _form_handle_key<M>(f, k, msg)
+    _                     => return (f, tui::Cmd::None, FormEvent::Idle)
+  end
+end
+
+# Top-level key dispatch: Tab / Shift-Tab / Enter / Esc routed
+# specially; everything else forwarded to the focused TextInput.
+def _form_handle_key<M>(
+  f: Form,
+  k: tui::KeyEvent,
+  msg: tui::FrameMsg<M>
+): (Form, tui::Cmd<M>, FormEvent)
+  if k.code == terminal::KEY_TAB()
+    return _form_focus_next<M>(f)
+  end
+  if k.code == 27                          # Esc
+    var fc = form_set_state(f, FormState::Cancelled)
+    return (fc, tui::Cmd::None, FormEvent::Cancelled)
+  end
+  if k.code == terminal::KEY_ENTER()
+    return _form_handle_enter<M>(f)
+  end
+  # Forward to focused field. If no field is focused, no-op.
+  match f.focus.current
+    Some(idx) => return _form_forward_to_field<M>(f, idx, msg)
+    None      => return (f, tui::Cmd::None, FormEvent::Idle)
+  end
+end
+
+# Tab: cycle focus forward (with wrap). Emits FieldFocused.
+def _form_focus_next<M>(f: Form): (Form, tui::Cmd<M>, FormEvent)
+  if f.fields.size == 0
+    return (f, tui::Cmd::None, FormEvent::Idle)
+  end
+  var new_focus = fr::focus_ring_next<Int>(f.focus)
+  var f2 = Form {
+    fields:      f.fields,
+    labels:      f.labels,
+    keys:        f.keys,
+    validators:  f.validators,
+    last_errors: f.last_errors,
+    focus:       new_focus,
+    state:       f.state,
+    width:       f.width,
+    height:      f.height,
+    styles:      f.styles
+  }
+  match new_focus.current
+    Some(idx) => return (f2, tui::Cmd::None, FormEvent::FieldFocused(idx))
+    None      => return (f2, tui::Cmd::None, FormEvent::Idle)
+  end
+end
+
+# Enter dispatch:
+# - on non-last field: validate focused; advance if valid, else mark error
+# - on last field:     validate ALL; transition Submitted if all valid,
+#                      else focus first invalid + mark errors.
+def _form_handle_enter<M>(f: Form): (Form, tui::Cmd<M>, FormEvent)
+  match f.focus.current
+    Some(idx) =>
+      var is_last = idx == f.fields.size - 1
+      if is_last
+        return _form_attempt_submit<M>(f)
+      end
+      return _form_validate_and_advance<M>(f, idx)
+    None =>
+      return (f, tui::Cmd::None, FormEvent::Idle)
+  end
+end
+
+def _form_validate_and_advance<M>(
+  f: Form,
+  idx: Int
+): (Form, tui::Cmd<M>, FormEvent)
+  var v = ti::text_input_value(f.fields[idx])
+  var err = _form_run_validator(f.validators[idx], v)
+  f.last_errors[idx] = err
+  if err is Some
+    # Validation failed — stay on this field, surface the error.
+    return (f, tui::Cmd::None, FormEvent::FieldChanged(idx))
+  end
+  # Valid — advance to next field.
+  return _form_focus_next<M>(f)
+end
+
+def _form_attempt_submit<M>(f: Form): (Form, tui::Cmd<M>, FormEvent)
+  var f_validated = form_validate(f)
+  var first_invalid = _form_first_invalid_index(f_validated)
+  match first_invalid
+    Some(idx) =>
+      # Some validator failed — focus the first invalid field, surface error.
+      var f_focused = form_set_focus(f_validated, idx)
+      return (f_focused, tui::Cmd::None, FormEvent::FieldChanged(idx))
+    None =>
+      # All valid — transition to Submitted.
+      var f_done = form_set_state(f_validated, FormState::Submitted)
+      return (f_done, tui::Cmd::None, FormEvent::Submitted)
+  end
+end
+
+def _form_first_invalid_index(f: Form): Option<Int>
+  var i = 0
+  while i < f.last_errors.size
+    if f.last_errors[i] is Some
+      return Option::Some(i)
+    end
+    i = i + 1
+  end
+  return Option::None
+end
+
+# Forward msg to the focused field's text_input_update. Re-run validator
+# if value changed; populate last_errors[idx] accordingly.
+def _form_forward_to_field<M>(
+  f: Form,
+  idx: Int,
+  msg: tui::FrameMsg<M>
+): (Form, tui::Cmd<M>, FormEvent)
+  var (next_input, _cmd, ev) = ti::text_input_update<M>(f.fields[idx], msg)
+  f.fields[idx] = next_input
+  if ev is Changed
+    var v = ti::text_input_value(next_input)
+    f.last_errors[idx] = _form_run_validator(f.validators[idx], v)
+    return (f, tui::Cmd::None, FormEvent::FieldChanged(idx))
+  end
+  return (f, tui::Cmd::None, FormEvent::Idle)
+end
+
+# ============================================================
+# View + size
+# ============================================================
+
+## Render the form. `focused` is the form-level focus from the parent
+## (typically: parent's outer FocusRing currently points at this form).
+## When `focused == false`, the form renders with no field highlighted
+## even if `f.focus.current` is Some — semantic is "this form isn't
+## getting keys right now."
+##
+## Layout (one logical block per field):
+##   [label or label_focused] {label}
+##   [value/cursor styled by text_input_view]  {value}
+##   [error]               {error message, only if last_errors[i] is Some}
+def form_view(f: Form, focused: Bool): String
+  if f.fields.size == 0
+    return ""
+  end
+  var sb = sb_new()
+  var i = 0
+  while i < f.fields.size
+    if i > 0
+      sb_append(sb, "\n")
+    end
+    var is_focused_field = false
+    if focused
+      match f.focus.current
+        Some(idx) => is_focused_field = (idx == i)
+        None      => is_focused_field = false
+      end
+    end
+    # Label line
+    if is_focused_field
+      sb_append(sb, f.styles.label_focused.render(f.labels[i]))
+    else
+      sb_append(sb, f.styles.label.render(f.labels[i]))
+    end
+    sb_append(sb, "\n")
+    # Value line — text_input_view handles its own cursor styling
+    sb_append(sb, ti::text_input_view(f.fields[i], is_focused_field))
+    # Optional error line
+    if f.last_errors[i] is Some
+      match f.last_errors[i]
+        Some(msg) =>
+          sb_append(sb, "\n")
+          sb_append(sb, f.styles.error.render(msg))
+        None =>
+          sb_append(sb, "")
+      end
+    end
+    i = i + 1
+  end
+  return sb_to_string(sb)
+end
+
+## Set the form's render area. Forwards width to each field's TextInput
+## (height is per-field implicit at 1 line). Mutates the field Vec in
+## place — caller should not retain the pre-call form.
+def form_set_size(f: Form, w: Int, h: Int): Form
+  var i = 0
+  while i < f.fields.size
+    f.fields[i] = ti::text_input_set_size(f.fields[i], w, 1)
+    i = i + 1
+  end
+  return form_with_size(f, w, h)
+end
+
+# ============================================================
+# Internal helpers
+# ============================================================
+
+# Linear search for `key` in `f.keys`, returning Option<Int>. Linear is
+# fine — forms have <20 fields in any realistic UI.
+def _form_index_of(f: Form, key: String): Option<Int>
+  var i = 0
+  while i < f.keys.size
+    if f.keys[i] == key
+      return Option::Some(i)
+    end
+    i = i + 1
+  end
+  return Option::None
+end
+
+# Parse `s` as a base-10 signed integer. Accepts an optional leading
+# '+' or '-'. Returns None if the string is empty, contains non-digit
+# characters after the optional sign, or is just the sign character.
+# Leading/trailing whitespace is NOT trimmed — the caller decides.
+#
+# This exists because Quartz's `to_int` is the F64→Int intrinsic, not
+# a string parser. std/parse.qz has parse_int but lives behind a
+# ParseError effect that's overkill for validator dispatch.
+def _form_parse_int(s: String): Option<Int>
+  var n = s.size
+  if n == 0
+    return Option::None
+  end
+  var i = 0
+  var negative = false
+  var c0 = s[0]
+  if c0 == 45            # '-'
+    negative = true
+    i = 1
+  end
+  if c0 == 43            # '+'
+    i = 1
+  end
+  if i >= n
+    return Option::None  # bare sign
+  end
+  var acc = 0
+  while i < n
+    var c = s[i]
+    if c < 48 or c > 57  # not '0'..'9'
+      return Option::None
+    end
+    acc = acc * 10 + (c - 48)
+    i = i + 1
+  end
+  if negative
+    acc = -acc
+  end
+  return Option::Some(acc)
+end
+
+# True iff `s` is non-empty and every byte is a whitespace character
+# (space, tab, CR, LF). Used by Validator::NonWhitespace.
+def _form_all_whitespace(s: String): Bool
+  if s.size == 0
+    return true   # empty is "all whitespace" by vacuous truth (caller composes with Required)
+  end
+  var i = 0
+  while i < s.size
+    var c = s[i]
+    var is_ws = c == 32 or c == 9 or c == 10 or c == 13
+    if not is_ws
+      return false
+    end
+    i = i + 1
+  end
+  return true
+end
+
+# Apply a single Validator to a value. Returns None (valid) or
+# Some(error_message). Error messages are short, lowercase, and
+# user-facing — render under the field with the `error` style.
+def _form_run_validator(v: Validator, value: String): Option<String>
+  match v
+    Validator::Allow =>
+      return Option::None
+    Validator::Required =>
+      if value.size == 0
+        return Option::Some("required")
+      end
+      return Option::None
+    Validator::MinLen(n) =>
+      if value.size < n
+        return Option::Some("must be at least " + n.to_s() + " characters")
+      end
+      return Option::None
+    Validator::MaxLen(n) =>
+      if value.size > n
+        return Option::Some("must be at most " + n.to_s() + " characters")
+      end
+      return Option::None
+    Validator::LenRange(min, max) =>
+      if value.size < min or value.size > max
+        return Option::Some("must be between " + min.to_s() + " and " + max.to_s() + " characters")
+      end
+      return Option::None
+    Validator::Numeric =>
+      if _form_parse_int(value) is None
+        return Option::Some("must be a number")
+      end
+      return Option::None
+    Validator::IntRange(lo, hi) =>
+      match _form_parse_int(value)
+        Some(n) =>
+          if n < lo or n > hi
+            return Option::Some("must be between " + lo.to_s() + " and " + hi.to_s())
+          end
+          return Option::None
+        None =>
+          return Option::Some("must be a number")
+      end
+    Validator::NonWhitespace =>
+      if _form_all_whitespace(value)
+        return Option::Some("required")
+      end
+      return Option::None
+    Validator::StartsWith(prefix) =>
+      if not str_starts_with(value, prefix)
+        return Option::Some("must start with \"" + prefix + "\"")
+      end
+      return Option::None
+    Validator::EndsWith(suffix) =>
+      if not str_ends_with(value, suffix)
+        return Option::Some("must end with \"" + suffix + "\"")
+      end
+      return Option::None
+    Validator::Equals(target) =>
+      if value != target
+        return Option::Some("does not match")
+      end
+      return Option::None
+  end
+end

@@ -1,0 +1,257 @@
+## std/tui/blend.qz — color blend modes (Phase 6.2 of the v0.6 cell engine).
+##
+## Photoshop-grade blend modes for compositing two cell colors. Ported
+## from libtcod's blend-mode enum, which shipped 15+ years ago and was
+## somehow never copied by modern TUI libraries — this is the single
+## biggest gap in the field, and Quartz closes it here.
+##
+## **Color encoding.** Inputs are `Int` color values matching the
+## `std/style.qz` scheme: -1 = none, 0-15 = ANSI 16, 16-255 = 256-palette,
+## ≥ `0x1000000` = packed truecolor `(r << 16) | (g << 8) | b`.
+##
+## For non-truecolor inputs, blend modes that need RGB math fall back to
+## last-writer-wins (top wins). v0.7 will extend this with an
+## ANSI16→RGB and 256→RGB expansion path so blend math composes
+## uniformly across all encodings. Filed as a v0.6.x polish task.
+##
+## **Use cases:**
+##   - `Add`       → light spillover (Brogue lighting, Phase 6.4)
+##   - `Multiply`  → dimming overlays (replaces v0.5's deferred
+##                   SGR-stack-aware dim with a one-liner)
+##   - `Alpha(50)` → ghosting / fade transitions
+##   - `Screen`    → HUD overlays that brighten without obscuring
+##   - `Overlay`   → damage flashes
+##   - `Lighten`   → soft contrast adjustments (max per channel)
+##   - `Darken`    → soft contrast adjustments (min per channel)
+##   - `Burn`      → contrast-darken
+##   - `Dodge`     → contrast-brighten
+##
+## See `docs/design/TUI_V06_CELL_ENGINE.md` D3.
+##
+## @since 5.28.x
+
+import style
+
+# =============================================================================
+# BlendMode — Photoshop-grade composition modes
+# =============================================================================
+
+## Per-cell color composition mode.
+##
+## `Alpha` carries the percentage 0-100 — at 0 the result is bottom,
+## at 100 the result is top, at 50 they average.
+enum BlendMode
+  None
+  Alpha(pct: Int)
+  Add
+  Multiply
+  Screen
+  Lighten
+  Darken
+  Overlay
+  Burn
+  Dodge
+end
+
+# =============================================================================
+# RGB extraction / packing
+# =============================================================================
+
+## Truecolor sentinel bit. Mirrors `style::_RGB_FLAG()` value.
+def _RGB_FLAG(): Int = 0x1000000
+
+## True iff `c` is a truecolor packed RGB Int.
+def _is_truecolor(c: Int): Bool = c >= _RGB_FLAG()
+
+## Extract R from a packed truecolor Int.
+def _rgb_r(c: Int): Int = (c >> 16) & 0xFF
+
+## Extract G from a packed truecolor Int.
+def _rgb_g(c: Int): Int = (c >> 8) & 0xFF
+
+## Extract B from a packed truecolor Int.
+def _rgb_b(c: Int): Int = c & 0xFF
+
+## Pack r, g, b (0-255 each) into a truecolor Int.
+def _pack_rgb(r: Int, g: Int, b: Int): Int
+  return _RGB_FLAG() | (r << 16) | (g << 8) | b
+end
+
+## Clamp `n` to [0, 255]. The hot path of every blend mode.
+def _clamp_byte(n: Int): Int
+  if n < 0
+    return 0
+  end
+  if n > 255
+    return 255
+  end
+  return n
+end
+
+# =============================================================================
+# Per-channel blend math
+# =============================================================================
+
+## Alpha-blend: `(top * pct + bottom * (100 - pct)) / 100`. `pct` is
+## clamped to [0, 100] internally — out-of-range percentages don't
+## explode.
+def _blend_alpha(top: Int, bottom: Int, pct: Int): Int
+  var p = pct
+  if p < 0
+    p = 0
+  end
+  if p > 100
+    p = 100
+  end
+  return (top * p + bottom * (100 - p)) / 100
+end
+
+## Additive: `clamp(top + bottom, 0, 255)`. The lighting primitive.
+def _blend_add(top: Int, bottom: Int): Int
+  return _clamp_byte(top + bottom)
+end
+
+## Multiplicative: `(top * bottom) / 255`. Dimming primitive.
+def _blend_multiply(top: Int, bottom: Int): Int
+  return (top * bottom) / 255
+end
+
+## Screen: `255 - ((255 - top) * (255 - bottom)) / 255`. Inverse-multiply.
+def _blend_screen(top: Int, bottom: Int): Int
+  return 255 - ((255 - top) * (255 - bottom)) / 255
+end
+
+## Lighten: per-channel max — pick whichever is brighter.
+def _blend_lighten(top: Int, bottom: Int): Int
+  if top > bottom
+    return top
+  end
+  return bottom
+end
+
+## Darken: per-channel min — pick whichever is darker.
+def _blend_darken(top: Int, bottom: Int): Int
+  if top < bottom
+    return top
+  end
+  return bottom
+end
+
+## Overlay: combination — multiply if bottom is dark, screen if light.
+##
+##   if bottom < 128: 2 * top * bottom / 255
+##   else:            255 - 2 * (255 - top) * (255 - bottom) / 255
+##
+## The "soft" version of mixing two values; preserves shadows AND
+## highlights better than alpha blend.
+def _blend_overlay(top: Int, bottom: Int): Int
+  if bottom < 128
+    return (2 * top * bottom) / 255
+  end
+  return 255 - (2 * (255 - top) * (255 - bottom)) / 255
+end
+
+## Color burn: makes bottom darker based on top. Commonly used for
+## contrast-darken effects.
+##
+##   if top == 0: 0
+##   else: 255 - clamp(((255 - bottom) * 255) / top, 0, 255)
+def _blend_burn(top: Int, bottom: Int): Int
+  if top == 0
+    return 0
+  end
+  return 255 - _clamp_byte(((255 - bottom) * 255) / top)
+end
+
+## Color dodge: makes bottom brighter based on top. Inverse of burn.
+##
+##   if top == 255: 255
+##   else: clamp((bottom * 255) / (255 - top), 0, 255)
+def _blend_dodge(top: Int, bottom: Int): Int
+  if top == 255
+    return 255
+  end
+  return _clamp_byte((bottom * 255) / (255 - top))
+end
+
+# =============================================================================
+# Whole-color blend dispatch
+# =============================================================================
+
+## Blend two color Ints producing a new color Int.
+##
+## When either input is non-truecolor (ANSI 16 / 256-palette / -1
+## sentinel), the function falls back to last-writer-wins (top wins
+## unchanged). v0.7 will lift this restriction by expanding non-RGB
+## inputs to truecolor before blending.
+##
+## `BlendMode::None` always returns `top` (last-writer-wins).
+def blend_colors(top: Int, bottom: Int, mode: BlendMode): Int
+  # Fast path: None always returns top.
+  if mode is None
+    return top
+  end
+
+  # Non-truecolor fallback.
+  if not _is_truecolor(top)
+    return top
+  end
+  if not _is_truecolor(bottom)
+    return top
+  end
+
+  var tr = _rgb_r(top)
+  var tg = _rgb_g(top)
+  var tb = _rgb_b(top)
+  var br = _rgb_r(bottom)
+  var bg = _rgb_g(bottom)
+  var bb = _rgb_b(bottom)
+
+  var rr = 0
+  var rg = 0
+  var rb = 0
+
+  # Match arm patterns must be fully qualified to avoid the
+  # `None` / `Option::None` collision (the QZ0210 trip).
+  match mode
+    BlendMode::None       => return top
+    BlendMode::Alpha(pct) =>
+      rr = _blend_alpha(tr, br, pct)
+      rg = _blend_alpha(tg, bg, pct)
+      rb = _blend_alpha(tb, bb, pct)
+    BlendMode::Add       =>
+      rr = _blend_add(tr, br)
+      rg = _blend_add(tg, bg)
+      rb = _blend_add(tb, bb)
+    BlendMode::Multiply  =>
+      rr = _blend_multiply(tr, br)
+      rg = _blend_multiply(tg, bg)
+      rb = _blend_multiply(tb, bb)
+    BlendMode::Screen    =>
+      rr = _blend_screen(tr, br)
+      rg = _blend_screen(tg, bg)
+      rb = _blend_screen(tb, bb)
+    BlendMode::Lighten   =>
+      rr = _blend_lighten(tr, br)
+      rg = _blend_lighten(tg, bg)
+      rb = _blend_lighten(tb, bb)
+    BlendMode::Darken    =>
+      rr = _blend_darken(tr, br)
+      rg = _blend_darken(tg, bg)
+      rb = _blend_darken(tb, bb)
+    BlendMode::Overlay   =>
+      rr = _blend_overlay(tr, br)
+      rg = _blend_overlay(tg, bg)
+      rb = _blend_overlay(tb, bb)
+    BlendMode::Burn      =>
+      rr = _blend_burn(tr, br)
+      rg = _blend_burn(tg, bg)
+      rb = _blend_burn(tb, bb)
+    BlendMode::Dodge     =>
+      rr = _blend_dodge(tr, br)
+      rg = _blend_dodge(tg, bg)
+      rb = _blend_dodge(tb, bb)
+  end
+
+  return _pack_rgb(rr, rg, rb)
+end

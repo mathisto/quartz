@@ -1,0 +1,463 @@
+## std/core/crypto/blake2s — Pure-Quartz BLAKE2s (RFC 7693)
+##
+## NET.1 Phase 2 native-primitive replacement, second after HChaCha20. Was a
+## thin FFI shim around HACL\* `Hacl_Hash_Blake2s_hash_with_key`; now a full
+## RFC 7693 implementation in Quartz. Step 2.13 (native HKDF) dropped the
+## HACL build artifact entirely — Hacl_HMAC was the last reach into HACL's
+## hash-dispatch graph, so Hash_Blake2{s,b} + Hash_MD5 + Hash_SHA{1,2,3} all
+## came out of the link in the same commit.
+##
+## Why BLAKE2s first among the big swaps:
+##   - Smallest of the WG primitive set (~300 LoC vs ChaCha20-Poly1305 ~600
+##     vs Curve25519 ~2000).
+##   - Used pervasively: WG's mac1, mac2, cookie compute, the entire Noise
+##     IKpsk2 hash chain — every handshake calls BLAKE2s 6+ times.
+##   - No SIMD/asm in the reference impl; pure ARX over 32-bit words. Easy
+##     to land safely.
+##
+## Wire-level validation (per design memo "gated by Wycheproof + interop"):
+##   - RFC 7693 §A KAT (BLAKE2s-256("abc")) — already in crypto:smoke.
+##   - wg:smoke 48/48 stays green (handshake hash chain end-to-end).
+##   - cross-impl interop with wireguard-go stays green (proves wire-format
+##     bit-identical output).
+##   - BLAKE2 doesn't have official Wycheproof vectors — Wycheproof only
+##     covers NIST-track primitives. We rely on the dense integration
+##     coverage above plus the RFC 7693 §A KAT.
+##
+## All buffers are caller-owned (ptr, len) pairs — typically `malloc`'d from
+## `std/ffi/socket`. Output length must be 1..32 (BLAKE2s digest cap is
+## 32 bytes per RFC 7693 §3.2).
+##
+## See:
+## - RFC 7693 https://datatracker.ietf.org/doc/html/rfc7693
+## - docs/design/CRYPTO_STDLIB_DESIGN.md "Phase 2 native-primitive plan"
+
+import * from ffi/socket  # malloc/free/memcpy/memset
+
+# =============================================================================
+# u32 ARX helpers (BLAKE2s uses right-rotates, distinct from ChaCha20's left-
+# rotates — kept private to this file rather than sharing across primitives).
+# =============================================================================
+
+def _u32(x: Int): Int = x & 4294967295
+
+def _u32_add(a: Int, b: Int): Int = (a + b) & 4294967295
+
+def _u32_rotr(v: Int, n: Int): Int
+  var x = v & 4294967295
+  return ((x >> n) | (x << (32 - n))) & 4294967295
+end
+
+# Read 4 bytes at `p` little-endian as a u32.
+def _u32_read_le(p: Int): Int
+  var b0 = ptr_read_byte(p)
+  var b1 = ptr_read_byte(p + 1)
+  var b2 = ptr_read_byte(p + 2)
+  var b3 = ptr_read_byte(p + 3)
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+end
+
+# Write u32 `v` to `p` little-endian (4 bytes).
+def _u32_write_le(p: Int, v: Int): Void
+  ptr_write_byte(p, v & 255)
+  ptr_write_byte(p + 1, (v >> 8) & 255)
+  ptr_write_byte(p + 2, (v >> 16) & 255)
+  ptr_write_byte(p + 3, (v >> 24) & 255)
+end
+
+# =============================================================================
+# Constants — IV (RFC 7693 §2.6) and SIGMA permutation (RFC 7693 §2.7)
+# =============================================================================
+
+# RFC 7693 §2.6 — same as SHA-256 IV (first 32 bits of the fractional parts
+# of the square roots of the first 8 primes).
+def _IV_0(): Int = 1779033703    # 0x6A09E667
+def _IV_1(): Int = 3144134277    # 0xBB67AE85
+def _IV_2(): Int = 1013904242    # 0x3C6EF372
+def _IV_3(): Int = 2773480762    # 0xA54FF53A
+def _IV_4(): Int = 1359893119    # 0x510E527F
+def _IV_5(): Int = 2600822924    # 0x9B05688C
+def _IV_6(): Int = 528734635     # 0x1F83D9AB
+def _IV_7(): Int = 1541459225    # 0x5BE0CD19
+
+# SIGMA permutation table — 10 rounds × 16 message-word indices each.
+# Lazily initialized once per process (160 bytes, lives until exit).
+var _sigma_table: Int = 0
+
+def _ensure_sigma_table(): Int
+  if _sigma_table != 0
+    return _sigma_table
+  end
+  var s = malloc(160)
+  # Round 0
+  ptr_write_byte(s, 0)
+  ptr_write_byte(s + 1, 1)
+  ptr_write_byte(s + 2, 2)
+  ptr_write_byte(s + 3, 3)
+  ptr_write_byte(s + 4, 4)
+  ptr_write_byte(s + 5, 5)
+  ptr_write_byte(s + 6, 6)
+  ptr_write_byte(s + 7, 7)
+  ptr_write_byte(s + 8, 8)
+  ptr_write_byte(s + 9, 9)
+  ptr_write_byte(s + 10, 10)
+  ptr_write_byte(s + 11, 11)
+  ptr_write_byte(s + 12, 12)
+  ptr_write_byte(s + 13, 13)
+  ptr_write_byte(s + 14, 14)
+  ptr_write_byte(s + 15, 15)
+  # Round 1
+  ptr_write_byte(s + 16, 14)
+  ptr_write_byte(s + 17, 10)
+  ptr_write_byte(s + 18, 4)
+  ptr_write_byte(s + 19, 8)
+  ptr_write_byte(s + 20, 9)
+  ptr_write_byte(s + 21, 15)
+  ptr_write_byte(s + 22, 13)
+  ptr_write_byte(s + 23, 6)
+  ptr_write_byte(s + 24, 1)
+  ptr_write_byte(s + 25, 12)
+  ptr_write_byte(s + 26, 0)
+  ptr_write_byte(s + 27, 2)
+  ptr_write_byte(s + 28, 11)
+  ptr_write_byte(s + 29, 7)
+  ptr_write_byte(s + 30, 5)
+  ptr_write_byte(s + 31, 3)
+  # Round 2
+  ptr_write_byte(s + 32, 11)
+  ptr_write_byte(s + 33, 8)
+  ptr_write_byte(s + 34, 12)
+  ptr_write_byte(s + 35, 0)
+  ptr_write_byte(s + 36, 5)
+  ptr_write_byte(s + 37, 2)
+  ptr_write_byte(s + 38, 15)
+  ptr_write_byte(s + 39, 13)
+  ptr_write_byte(s + 40, 10)
+  ptr_write_byte(s + 41, 14)
+  ptr_write_byte(s + 42, 3)
+  ptr_write_byte(s + 43, 6)
+  ptr_write_byte(s + 44, 7)
+  ptr_write_byte(s + 45, 1)
+  ptr_write_byte(s + 46, 9)
+  ptr_write_byte(s + 47, 4)
+  # Round 3
+  ptr_write_byte(s + 48, 7)
+  ptr_write_byte(s + 49, 9)
+  ptr_write_byte(s + 50, 3)
+  ptr_write_byte(s + 51, 1)
+  ptr_write_byte(s + 52, 13)
+  ptr_write_byte(s + 53, 12)
+  ptr_write_byte(s + 54, 11)
+  ptr_write_byte(s + 55, 14)
+  ptr_write_byte(s + 56, 2)
+  ptr_write_byte(s + 57, 6)
+  ptr_write_byte(s + 58, 5)
+  ptr_write_byte(s + 59, 10)
+  ptr_write_byte(s + 60, 4)
+  ptr_write_byte(s + 61, 0)
+  ptr_write_byte(s + 62, 15)
+  ptr_write_byte(s + 63, 8)
+  # Round 4
+  ptr_write_byte(s + 64, 9)
+  ptr_write_byte(s + 65, 0)
+  ptr_write_byte(s + 66, 5)
+  ptr_write_byte(s + 67, 7)
+  ptr_write_byte(s + 68, 2)
+  ptr_write_byte(s + 69, 4)
+  ptr_write_byte(s + 70, 10)
+  ptr_write_byte(s + 71, 15)
+  ptr_write_byte(s + 72, 14)
+  ptr_write_byte(s + 73, 1)
+  ptr_write_byte(s + 74, 11)
+  ptr_write_byte(s + 75, 12)
+  ptr_write_byte(s + 76, 6)
+  ptr_write_byte(s + 77, 8)
+  ptr_write_byte(s + 78, 3)
+  ptr_write_byte(s + 79, 13)
+  # Round 5
+  ptr_write_byte(s + 80, 2)
+  ptr_write_byte(s + 81, 12)
+  ptr_write_byte(s + 82, 6)
+  ptr_write_byte(s + 83, 10)
+  ptr_write_byte(s + 84, 0)
+  ptr_write_byte(s + 85, 11)
+  ptr_write_byte(s + 86, 8)
+  ptr_write_byte(s + 87, 3)
+  ptr_write_byte(s + 88, 4)
+  ptr_write_byte(s + 89, 13)
+  ptr_write_byte(s + 90, 7)
+  ptr_write_byte(s + 91, 5)
+  ptr_write_byte(s + 92, 15)
+  ptr_write_byte(s + 93, 14)
+  ptr_write_byte(s + 94, 1)
+  ptr_write_byte(s + 95, 9)
+  # Round 6
+  ptr_write_byte(s + 96, 12)
+  ptr_write_byte(s + 97, 5)
+  ptr_write_byte(s + 98, 1)
+  ptr_write_byte(s + 99, 15)
+  ptr_write_byte(s + 100, 14)
+  ptr_write_byte(s + 101, 13)
+  ptr_write_byte(s + 102, 4)
+  ptr_write_byte(s + 103, 10)
+  ptr_write_byte(s + 104, 0)
+  ptr_write_byte(s + 105, 7)
+  ptr_write_byte(s + 106, 6)
+  ptr_write_byte(s + 107, 3)
+  ptr_write_byte(s + 108, 9)
+  ptr_write_byte(s + 109, 2)
+  ptr_write_byte(s + 110, 8)
+  ptr_write_byte(s + 111, 11)
+  # Round 7
+  ptr_write_byte(s + 112, 13)
+  ptr_write_byte(s + 113, 11)
+  ptr_write_byte(s + 114, 7)
+  ptr_write_byte(s + 115, 14)
+  ptr_write_byte(s + 116, 12)
+  ptr_write_byte(s + 117, 1)
+  ptr_write_byte(s + 118, 3)
+  ptr_write_byte(s + 119, 9)
+  ptr_write_byte(s + 120, 5)
+  ptr_write_byte(s + 121, 0)
+  ptr_write_byte(s + 122, 15)
+  ptr_write_byte(s + 123, 4)
+  ptr_write_byte(s + 124, 8)
+  ptr_write_byte(s + 125, 6)
+  ptr_write_byte(s + 126, 2)
+  ptr_write_byte(s + 127, 10)
+  # Round 8
+  ptr_write_byte(s + 128, 6)
+  ptr_write_byte(s + 129, 15)
+  ptr_write_byte(s + 130, 14)
+  ptr_write_byte(s + 131, 9)
+  ptr_write_byte(s + 132, 11)
+  ptr_write_byte(s + 133, 3)
+  ptr_write_byte(s + 134, 0)
+  ptr_write_byte(s + 135, 8)
+  ptr_write_byte(s + 136, 12)
+  ptr_write_byte(s + 137, 2)
+  ptr_write_byte(s + 138, 13)
+  ptr_write_byte(s + 139, 7)
+  ptr_write_byte(s + 140, 1)
+  ptr_write_byte(s + 141, 4)
+  ptr_write_byte(s + 142, 10)
+  ptr_write_byte(s + 143, 5)
+  # Round 9
+  ptr_write_byte(s + 144, 10)
+  ptr_write_byte(s + 145, 2)
+  ptr_write_byte(s + 146, 8)
+  ptr_write_byte(s + 147, 4)
+  ptr_write_byte(s + 148, 7)
+  ptr_write_byte(s + 149, 6)
+  ptr_write_byte(s + 150, 1)
+  ptr_write_byte(s + 151, 5)
+  ptr_write_byte(s + 152, 15)
+  ptr_write_byte(s + 153, 11)
+  ptr_write_byte(s + 154, 9)
+  ptr_write_byte(s + 155, 14)
+  ptr_write_byte(s + 156, 3)
+  ptr_write_byte(s + 157, 12)
+  ptr_write_byte(s + 158, 13)
+  ptr_write_byte(s + 159, 0)
+  _sigma_table = s
+  return s
+end
+
+def _sigma(round: Int, pos: Int): Int
+  return ptr_read_byte(_sigma_table + round * 16 + pos)
+end
+
+# =============================================================================
+# Compression function F (RFC 7693 §3.2)
+# =============================================================================
+
+# G mixing function — operates on the 16-word v[] state buffer (64 bytes).
+# v[a], v[b], v[c], v[d] are the four state words selected per round/position;
+# x and y are two message words (selected via SIGMA).
+def _g(v: Int, a: Int, b: Int, c: Int, d: Int, x: Int, y: Int): Void
+  var va = _u32_read_le(v + a * 4)
+  var vb = _u32_read_le(v + b * 4)
+  var vc = _u32_read_le(v + c * 4)
+  var vd = _u32_read_le(v + d * 4)
+  va = _u32_add(_u32_add(va, vb), x)
+  vd = _u32_rotr(vd ^ va, 16)
+  vc = _u32_add(vc, vd)
+  vb = _u32_rotr(vb ^ vc, 12)
+  va = _u32_add(_u32_add(va, vb), y)
+  vd = _u32_rotr(vd ^ va, 8)
+  vc = _u32_add(vc, vd)
+  vb = _u32_rotr(vb ^ vc, 7)
+  _u32_write_le(v + a * 4, va)
+  _u32_write_le(v + b * 4, vb)
+  _u32_write_le(v + c * 4, vc)
+  _u32_write_le(v + d * 4, vd)
+end
+
+# Compression F: mixes the 64-byte message block `m` (16 LE u32s) into the
+# 32-byte chain state `h`, with counter `t` (8-byte total bytes-so-far) and
+# final-block flag `f` (1 if last block, else 0).
+#
+# h:  pointer to 8 u32 = 32 bytes (chain state, mutated in place).
+# m:  pointer to 16 u32 = 64 bytes (message block, read-only).
+# t:  total bytes processed including this block (0..N, capped 64-bit).
+# f:  1 = final block (apply XOR mask to v[14]); 0 = intermediate.
+def _f(h: Int, m: Int, t: Int, f: Int): Void
+  var v = malloc(64)
+
+  # v[0..8] = h[0..8]
+  memcpy(v, h, 32)
+  # v[8..16] = IV[0..8]
+  _u32_write_le(v + 8 * 4, _IV_0())
+  _u32_write_le(v + 9 * 4, _IV_1())
+  _u32_write_le(v + 10 * 4, _IV_2())
+  _u32_write_le(v + 11 * 4, _IV_3())
+  _u32_write_le(v + 12 * 4, _IV_4())
+  _u32_write_le(v + 13 * 4, _IV_5())
+  _u32_write_le(v + 14 * 4, _IV_6())
+  _u32_write_le(v + 15 * 4, _IV_7())
+
+  # Mix counter: v[12] ^= low32(t); v[13] ^= high32(t).
+  var t_lo = t & 4294967295
+  var t_hi = (t >> 32) & 4294967295
+  _u32_write_le(v + 12 * 4, _u32_read_le(v + 12 * 4) ^ t_lo)
+  _u32_write_le(v + 13 * 4, _u32_read_le(v + 13 * 4) ^ t_hi)
+
+  # Final-block flag: v[14] ^= 0xFFFFFFFF when f==1.
+  if f == 1
+    _u32_write_le(v + 14 * 4, _u32_read_le(v + 14 * 4) ^ 4294967295)
+  end
+
+  # Materialize 16 message words upfront so each round can index by SIGMA.
+  var m_words = malloc(64)
+  var i = 0
+  while i < 16
+    _u32_write_le(m_words + i * 4, _u32_read_le(m + i * 4))
+    i += 1
+  end
+
+  # 10 rounds.
+  var r = 0
+  while r < 10
+    # Column step.
+    _g(v, 0, 4, 8,  12, _u32_read_le(m_words + _sigma(r, 0)  * 4), _u32_read_le(m_words + _sigma(r, 1)  * 4))
+    _g(v, 1, 5, 9,  13, _u32_read_le(m_words + _sigma(r, 2)  * 4), _u32_read_le(m_words + _sigma(r, 3)  * 4))
+    _g(v, 2, 6, 10, 14, _u32_read_le(m_words + _sigma(r, 4)  * 4), _u32_read_le(m_words + _sigma(r, 5)  * 4))
+    _g(v, 3, 7, 11, 15, _u32_read_le(m_words + _sigma(r, 6)  * 4), _u32_read_le(m_words + _sigma(r, 7)  * 4))
+    # Diagonal step.
+    _g(v, 0, 5, 10, 15, _u32_read_le(m_words + _sigma(r, 8)  * 4), _u32_read_le(m_words + _sigma(r, 9)  * 4))
+    _g(v, 1, 6, 11, 12, _u32_read_le(m_words + _sigma(r, 10) * 4), _u32_read_le(m_words + _sigma(r, 11) * 4))
+    _g(v, 2, 7, 8,  13, _u32_read_le(m_words + _sigma(r, 12) * 4), _u32_read_le(m_words + _sigma(r, 13) * 4))
+    _g(v, 3, 4, 9,  14, _u32_read_le(m_words + _sigma(r, 14) * 4), _u32_read_le(m_words + _sigma(r, 15) * 4))
+    r += 1
+  end
+
+  # h[i] ^= v[i] ^ v[i+8]  for i in 0..8
+  i = 0
+  while i < 8
+    var hi = _u32_read_le(h + i * 4)
+    var vi = _u32_read_le(v + i * 4)
+    var vi8 = _u32_read_le(v + (i + 8) * 4)
+    _u32_write_le(h + i * 4, hi ^ vi ^ vi8)
+    i += 1
+  end
+
+  free(v)
+  free(m_words)
+end
+
+# =============================================================================
+# Top-level BLAKE2s — keyed and unkeyed variants
+# =============================================================================
+
+## Keyed BLAKE2s with a custom output length (1..32 bytes).
+## Pass `key=0, key_len=0` for the unkeyed variant.
+##
+## - output:     buffer of at least output_len bytes.
+## - output_len: 1..32 (BLAKE2s digest cap is 32 bytes).
+## - input:      message bytes (may be empty: input=0, input_len=0).
+## - input_len:  message length in bytes.
+## - key:        key bytes (0 / 0 = unkeyed).
+## - key_len:    1..32 (or 0 for unkeyed).
+def blake2s_keyed(
+  output: Int,
+  output_len: Int,
+  input: Int,
+  input_len: Int,
+  key: Int,
+  key_len: Int
+): Void
+  _ensure_sigma_table()
+
+  # Initialize chain state h = IV; mix in parameter block (RFC 7693 §3.3):
+  #   h[0] ^= 0x01010000 ^ (key_len << 8) ^ output_len
+  # Encodes depth=1, fanout=1, key_len, digest_len; rest of param block is zero
+  # for this mode (sequential, no salt/personalization).
+  # 0x01010000 = 16842752 (NOT 16843008 — that's 0x01010100, off by 0x100).
+  var h = malloc(32)
+  _u32_write_le(h + 0,  _IV_0() ^ ((16842752 ^ (key_len << 8)) ^ output_len))
+  _u32_write_le(h + 4,  _IV_1())
+  _u32_write_le(h + 8,  _IV_2())
+  _u32_write_le(h + 12, _IV_3())
+  _u32_write_le(h + 16, _IV_4())
+  _u32_write_le(h + 20, _IV_5())
+  _u32_write_le(h + 24, _IV_6())
+  _u32_write_le(h + 28, _IV_7())
+
+  var t = 0
+
+  # Keyed mode: prepend a virtual 64-byte block = key || zero-pad.
+  if key_len > 0
+    var key_block = malloc(64)
+    memset(key_block, 0, 64)
+    memcpy(key_block, key, key_len)
+    t = 64
+    # If input is empty, this single block is also the FINAL block.
+    if input_len == 0
+      _f(h, key_block, t, 1)
+      free(key_block)
+      _emit_digest(output, output_len, h)
+      free(h)
+      return
+    end
+    _f(h, key_block, t, 0)
+    free(key_block)
+  end
+
+  # Process intermediate full blocks (all blocks except the final one).
+  var processed = 0
+  while input_len - processed > 64
+    t = t + 64
+    _f(h, input + processed, t, 0)
+    processed = processed + 64
+  end
+
+  # Final block: zero-pad up to 64 bytes; t reflects total bytes hashed.
+  var last = malloc(64)
+  memset(last, 0, 64)
+  var remaining = input_len - processed
+  if remaining > 0
+    memcpy(last, input + processed, remaining)
+  end
+  t = t + remaining
+  _f(h, last, t, 1)
+  free(last)
+
+  _emit_digest(output, output_len, h)
+  free(h)
+end
+
+## Compute a 32-byte BLAKE2s-256 digest of `input` (`input_len` bytes) into
+## `output`. Output buffer must be at least 32 bytes. No key.
+def blake2s_256(input: Int, input_len: Int, output: Int): Void
+  blake2s_keyed(output, 32, input, input_len, 0, 0)
+end
+
+# Serialize the first `output_len` bytes of the chain state h (8 LE u32s)
+# into `output`. Output_len <= 32.
+def _emit_digest(output: Int, output_len: Int, h: Int): Void
+  var i = 0
+  while i < output_len
+    ptr_write_byte(output + i, ptr_read_byte(h + i))
+    i += 1
+  end
+end

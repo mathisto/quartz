@@ -1,0 +1,1195 @@
+##! # MIR Lower Async Registry
+##!
+##! Tracks async functions, suspendable leaves, and lazy async variables.
+##! Pure registry/query operations — no MIR emission.
+##!
+##! @see mir_lower Main MIR lowering module
+##! @since 5.25.0
+
+import mir
+import ast
+import node_constants
+import compiler_types
+import qzmod_format
+import * from str_compat
+
+# --- Async state machine lowering state ---
+# Registry of async function names — targets of `async func(...)` calls.
+# Populated during PASS 1 when NODE_ASYNC_CALL is encountered.
+# Used in PASS 1.2 to generate $new/$poll functions.
+# Initialized to 0; actual Vec created in mir_lower_all to avoid
+# bootstrap issues with module-level var HashMap/Vec globals.
+var _async_func_names = 0
+
+# Registry of variable names known to hold lazy Future frames.
+# Populated during PASS 1 in mir_lower_stmt_let when `var f = async func(...)`.
+# Used in NODE_AWAIT to decide poll-loop vs runtime dispatch.
+# Lazy-initialized to avoid bootstrap issues.
+var _lazy_async_vars = 0
+
+# Item 37 — payload (return) type of each future-holding variable.
+# Populated in mir_lower_stmt_let for `var f = go fn()` / `var f = async fn()`
+# with the resolved return type of `fn`. Consulted in the NODE_AWAIT var-decl
+# branch so `var v = await f` can mark `v` with the future's payload struct type
+# — without this, a value-layout (>16B COW) struct returned through a future
+# loses its type registration, so the field-read COW +1 shift never fires and
+# `v.field` reads the refcount header (word 0) instead of field 0 (word 1).
+# Two parallel flat vecs (name[i] ↔ type[i]); mirrors `_lazy_async_vars`.
+# Per-function scope, cleared by mir_clear_lazy_async_vars.
+# INERT at gate 0: the consumer (cow_field_shift) is keyed on
+# mir_value_is_cow_layout, which is false for every non-@value struct ⇒
+# byte-identical self-compile (the compiler uses zero @value structs).
+var _async_var_payload_names = 0
+var _async_var_payload_types = 0
+
+# A.17 QZ0210 — Set of function names whose PLAIN (non-$poll) body is
+# reachable at runtime from `main` via plain call edges (NODE_CALL not
+# nested inside a NODE_GO / NODE_ASYNC_CALL). Computed once at PASS 0.99c
+# by `mir_compute_plain_reachable`. The QZ0210 check uses this — NOT
+# `mir_is_async_target` — to decide whether a `sched_park`-containing
+# function is genuinely misused.
+#
+# Why a dedicated set: `_async_func_names` is an over-approximation —
+# `mir_propagate_suspend_ast` registers EVERY function that transitively
+# reaches a suspend leaf (including `sched_park`) as an async target so
+# colorless dispatch inside $poll bodies works. That over-approximation
+# is harmless for dispatch (a wrongly-marked function just gets an unused
+# $poll body) but FATAL for QZ0210: a plainly-called `def parker()` that
+# calls `sched_park()` gets auto-registered, so the old gate
+# `mir_is_async_target(parker)` wrongly exempted it. The plain-reachable
+# set asks the correct question: does this function's plain body actually
+# run? If so, a `sched_park` in it aborts at runtime — reject it.
+var _plain_reachable = 0
+
+# --- Suspendable analysis state ---
+# Functions that directly contain io_suspend calls (leaf suspendable functions).
+# The $poll variant is the one that contains io_suspend, but we track the original
+# function name (without __Future_ prefix) for use by the $new constructor.
+# Lazy-initialized to 0 to avoid bootstrap issues with module-level HashMap globals.
+var _suspendable_leaves = 0
+# Functions that transitively reach a suspendable leaf via call graph.
+var _suspendable_funcs = 0
+
+## Parallel Vec<String> of leaf names — kept in sync with _suspendable_leaves
+## map. Lets `mir_mark_suspendable` iterate leaves directly, which matters for
+## intrinsic leaves (posix_spawn_wait, sched_yield) that aren't MIR functions
+## and therefore aren't visible via mir_get_functions.
+var _suspendable_leaves_names = 0
+
+## D.11 Phase 7 / B.5e.3 — freestanding-target flag, mirror of
+## mir_lower's `_mir_is_freestanding`. Set from quartz.qz right after
+## `mir_set_freestanding`, from the same `--target` suffix check. The
+## PASS 1.2b async-target registration gate (mir_mark_suspendable) MUST
+## key on THIS, not `qzmod_active_target()`: the latter is only populated
+## on the multi-module qzmod/cache path, so a single-file `--target
+## …-none-elf` compile (e.g. the kernel build, which uses `--no-cache`)
+## would otherwise register async targets and synthesize orphan
+## `__Future_<fn>$poll` wrappers that reference hosted-only globals
+## (`@__qz_sched`, `@__qz_waiter_notify_all`, …) undefined in the kernel —
+## an llc-level "use of undefined value" error, not gc-droppable.
+var _async_reg_freestanding = 0
+
+## Set the freestanding flag (called from quartz.qz alongside
+## mir_set_freestanding).
+def mir_async_set_freestanding(val: Int): Void
+  _async_reg_freestanding = val
+end
+
+## Query the freestanding flag.
+def mir_async_is_freestanding(): Int = _async_reg_freestanding
+
+## Record a function as a suspendable leaf (contains io_suspend).
+## Called during PASS 1 MIR lowering when io_suspend is encountered in _gen_active==2.
+def mir_record_suspendable_leaf(name: String): Void
+  if _suspendable_leaves == 0
+    _suspendable_leaves = as_int_generic(map_new<String, Int>())
+  end
+  if _suspendable_leaves_names == 0
+    _suspendable_leaves_names = as_int_generic(vec_new<String>())
+  end
+  if not map_has(_suspendable_leaves, name)
+    vec_push(_suspendable_leaves_names, name)
+  end
+  map_set(_suspendable_leaves, name, 1)
+end
+
+## Initialize the suspendable leaf registry.
+## Registers builtin intrinsics that should NOT be eagerly pre-polled in $new.
+## The name "suspendable" is historical — it covers two flavors of "do not
+## inline-poll on the spawning thread":
+##   1. Cooperative yield points (sched_yield, io_suspend) — function may not
+##      complete in a single poll.
+##   2. Blocking C-level syscalls (system, posix_spawn_wait, sleep_ms) — function
+##      DOES complete in a single poll, but blocks the spawner's OS thread for
+##      arbitrary duration. Eagerly pre-polling defeats `go fn()`'s parallelism
+##      contract: the next `go` won't be reached until the previous task finishes.
+##      (Found 2026-05-09 while investigating qspec parallelism: 4× `go s()`
+##      where each s called posix_spawn_wait("sleep 2") ran strictly serial
+##      because $new pre-polled the body inline. See QSPEC_RUNNER_ARCH.md.)
+##
+## User functions reach suspendable status transitively via the call-graph
+## fixpoint in `mir_mark_suspendable` — any user function whose call graph
+## reaches one of these leaves gets its $new's pre-poll skipped.
+def mir_init_suspendable_leaves(): Void
+  # Cooperative yield points
+  mir_record_suspendable_leaf("sched_yield")
+  # Blocking subprocess intrinsics — block in waitpid for the duration of
+  # the child process. Pre-polling a goroutine that calls these serializes
+  # all sibling goroutines on the spawning thread.
+  mir_record_suspendable_leaf("system")
+  mir_record_suspendable_leaf("posix_spawn_wait")
+  mir_record_suspendable_leaf("popen")
+  mir_record_suspendable_leaf("pclose")
+  # Blocking sleep — `sleep_ms` calls usleep on the calling thread.
+  mir_record_suspendable_leaf("sleep_ms")
+end
+
+## Check if a function name is a suspendable leaf (directly calls io_suspend).
+def mir_is_suspendable_leaf(name: String): Bool
+  if _suspendable_leaves == 0
+    return false
+  end
+  return map_has(_suspendable_leaves, name)
+end
+
+## Check if a function was marked as transitively suspendable by call graph analysis.
+## A function is suspendable if it (or any transitive callee) calls io_suspend.
+def mir_is_suspendable(name: String): Bool
+  if _suspendable_funcs == 0
+    return false
+  end
+  return map_has(_suspendable_funcs, name)
+end
+
+## Mark all functions that transitively reach a suspendable leaf.
+## Fixed-point iteration over the call graph.
+## graph: Map<String, Vec<String>> mapping function name → callees.
+## prog: MirProgram to iterate function names from.
+def mir_mark_suspendable(graph: Map<String, Vec<String>>, prog: MirProgram): Void
+  # No suspendable leaves → nothing to propagate
+  if _suspendable_leaves == 0
+    return
+  end
+  # Lazy-init the result map
+  if _suspendable_funcs == 0
+    _suspendable_funcs = as_int_generic(map_new<String, Int>())
+  end
+
+  # Build function name list from MIR program (can't iterate HashMap keys)
+  var func_names = vec_new<String>()
+  var funcs = mir::mir_get_functions(prog)
+  for fi in 0..funcs.size
+    var fname = mir::mir_func_get_name(funcs[fi])
+    func_names.push(fname)
+  end
+  # Seed _suspendable_funcs with all leaf names. Iterate the parallel
+  # `_suspendable_leaves_names` Vec, NOT just MIR functions — so that
+  # intrinsic leaves (e.g. posix_spawn_wait, sched_yield) which are NOT
+  # MIR functions still seed propagation. Without this, a user fn `s()`
+  # that calls only `posix_spawn_wait` would never get marked: the call-
+  # graph fixpoint's check is `map_has(_suspendable_funcs, callee)`, but
+  # `posix_spawn_wait` was only in `_suspendable_leaves` (Map), never
+  # copied into `_suspendable_funcs`.
+  if _suspendable_leaves_names != 0
+    for li in 0..vec_size(_suspendable_leaves_names)
+      var leaf_name = as_string(_suspendable_leaves_names[li])
+      map_set(_suspendable_funcs, leaf_name, 1)
+    end
+  end
+  # Also seed: if any MIR function's $poll variant has the bare name as a
+  # leaf, mark the bare name too so consumers of `mir_is_suspendable("X")`
+  # see it. (Existing logic for direct-leaf user functions.)
+  for fi in 0..func_names.size
+    var fname = func_names[fi]
+    if str_starts_with(fname, "__Future_") and str_ends_with(fname, "$poll")
+      # Extract original name: __Future_X$poll → X
+      var inner = str_byte_slice(fname, 9, str_byte_len(fname) - 5)
+      if map_has(_suspendable_leaves, inner)
+        map_set(_suspendable_funcs, inner, 1)
+        map_set(_suspendable_funcs, fname, 1)
+      end
+    end
+  end
+
+  # Fixed-point: propagate suspendability through call graph
+  var changed = true
+  while changed
+    changed = false
+    for fi in 0..func_names.size
+      var fname = func_names[fi]
+      if map_has(_suspendable_funcs, fname)
+        # Already marked — skip
+      else
+        # Check if any callee is suspendable
+        if map_has(graph, fname)
+          var callees_raw = __map_get_raw(graph, fname)
+          for ci in 0..vec_size(callees_raw)
+            var callee = as_string(callees_raw[ci])
+            if map_has(_suspendable_funcs, callee)
+              map_set(_suspendable_funcs, fname, 1)
+              changed = true
+            end
+          end
+        end
+      end
+    end
+  end
+
+  # Bridge transitive suspendability from $poll names back to bare names.
+  # The pre-poll gate at `mir_lower_async_constructor` consults
+  # `mir_is_suspendable(name)` where `name` is the user's bare function
+  # name (e.g. "s") — but the call-graph fixpoint operates on MIR function
+  # names which only include `__Future_X$poll` and `__Future_X$new` (the
+  # sync `X` is often dead-stripped when only used via `go X(...)`). Without
+  # this bridge, `mir_is_suspendable("s")` returns false even when
+  # `__Future_s$poll` transitively reaches a suspendable leaf, causing
+  # incorrect eager pre-poll. (Found 2026-05-09 while debugging serialized
+  # `go fn()` calls that block in posix_spawn_wait.) Lines 122-130 only
+  # bridge DIRECTLY-registered leaves; this loop bridges TRANSITIVELY-
+  # marked $poll names too.
+  for fi in 0..func_names.size
+    var fname = func_names[fi]
+    if str_starts_with(fname, "__Future_") and str_ends_with(fname, "$poll")
+      if map_has(_suspendable_funcs, fname)
+        var bare = str_byte_slice(fname, 9, str_byte_len(fname) - 5)
+        map_set(_suspendable_funcs, bare, 1)
+      end
+    end
+  end
+end
+
+## Check if a function name is a known async target (target of `async func(...)`).
+def mir_is_async_target(name: String): Bool
+  if _async_func_names == 0
+    return false
+  end
+  for _ati in 0..vec_size(_async_func_names)
+    if as_string(_async_func_names[_ati]) == name
+      return true
+    end
+  end
+  return false
+end
+
+## Record a function name as an async target.
+## Called during PASS 1 when NODE_ASYNC_CALL is encountered.
+## Deduplicates by name.
+def mir_record_async_target(name: String, s: Int): Void
+  if _async_func_names == 0
+    _async_func_names = as_int_generic(vec_new<String>())
+  end
+  # Deduplicate
+  for i in 0..vec_size(_async_func_names)
+    if as_string(_async_func_names[i]) == name
+      return
+    end
+  end
+  vec_push(_async_func_names, name)
+end
+
+## Check if a variable name is known to hold a lazy Future frame.
+def mir_is_lazy_async_var(name: String): Bool
+  if _lazy_async_vars == 0
+    return false
+  end
+  for i in 0..vec_size(_lazy_async_vars)
+    if as_string(_lazy_async_vars[i]) == name
+      return true
+    end
+  end
+  return false
+end
+
+## Record a variable name as holding a lazy Future frame.
+## Called from mir_lower_stmt_let when `var f = async func(...)`.
+def mir_mark_lazy_async_var(name: String): Void
+  if _lazy_async_vars == 0
+    _lazy_async_vars = as_int_generic(vec_new<String>())
+  end
+  vec_push(_lazy_async_vars, name)
+end
+
+## Item 37 — record the payload (return) type of a future-holding variable.
+## Called from mir_lower_stmt_let when `var f = go fn()` / `var f = async fn()`.
+def mir_mark_async_var_payload_type(name: String, ty: String): Void
+  if _async_var_payload_names == 0
+    _async_var_payload_names = as_int_generic(vec_new<String>())
+    _async_var_payload_types = as_int_generic(vec_new<String>())
+  end
+  vec_push(_async_var_payload_names, name)
+  vec_push(_async_var_payload_types, ty)
+end
+
+## Item 37 — look up the payload type recorded for a future-holding variable.
+## Returns "" if unknown. Last write wins (mirrors var rebinding within a scope).
+def mir_async_var_payload_type(name: String): String
+  if _async_var_payload_names == 0
+    return ""
+  end
+  var result = ""
+  for i in 0..vec_size(_async_var_payload_names)
+    if as_string(_async_var_payload_names[i]) == name
+      result = as_string(_async_var_payload_types[i])
+    end
+  end
+  return result
+end
+
+## Check if a function name has been lowered as an async function (has $poll variant).
+def mir_is_async_function(name: String): Bool = mir_is_async_target(name)
+
+## Build call graph from MIR program for suspendable analysis.
+## Returns Map<String, Vec<String>> mapping function name → callees.
+def mir_build_call_graph(prog: MirProgram): Map<String, Vec<String>>
+  var graph = map_new<String, Vec<String>>()
+  var funcs = mir::mir_get_functions(prog)
+  for fi in 0..funcs.size
+    var func = funcs[fi]
+    var fname = mir::mir_func_get_name(func)
+    var callees = vec_new<String>()
+    var blocks = mir::mir_func_get_blocks(func)
+    for bi in 0..blocks.size
+      var block = blocks[bi]
+      var instrs = mir::mir_block_get_instructions(block)
+      for ii in 0..instrs.size
+        var instr = instrs[ii]
+        var kind = mir::mir_instr_get_kind(instr)
+        if kind == mir::MIR_CALL or kind == mir::MIR_INTRINSIC
+          var callee = mir::mir_instr_get_func_name(instr)
+          callees.push(callee)
+        elsif kind == mir::MIR_CALL_INDIRECT
+          # Indirect calls (function pointers, closures) — callee is unknown.
+          # Use sentinel name to trigger conservative EFFECT_ALL during propagation.
+          callees.push("__indirect_call__")
+        end
+      end
+    end
+    map_set(graph, fname, callees)
+  end
+  return graph
+end
+
+## Flat-scan AST storage for NODE_ASYNC_CALL nodes.
+## For each found, extract the target function name and add to _async_func_names.
+## Uses flat iteration over all node indices (no recursion) to avoid stack overflow.
+def mir_scan_async_targets(s: ast::AstStorage): Void
+  var num_nodes = ast::ast_node_count(s)
+  for i in 0..num_nodes
+    var nk = ast::ast_get_kind(s, i)
+    if nk == node_constants::NODE_ASYNC_CALL or nk == node_constants::NODE_GO
+      var inner = ast::ast_get_left(s, i)
+      if inner >= 0 and inner < num_nodes
+        if ast::ast_get_kind(s, inner) == node_constants::NODE_CALL
+          var callee_node = ast::ast_get_left(s, inner)
+          if callee_node >= 0 and callee_node < num_nodes
+            if ast::ast_get_kind(s, callee_node) == node_constants::NODE_IDENT
+              var target = ast::ast_get_str1(s, callee_node)
+              if str_byte_len(target) > 0
+                mir_record_async_target(target, s)
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+# --- Accessor functions for cross-module access ---
+
+## Get the number of registered async targets.
+def mir_async_target_count(): Int
+  if _async_func_names == 0
+    return 0
+  end
+  return vec_size(_async_func_names)
+end
+
+## Get the name of an async target by index.
+def mir_async_target_name(index: Int): String
+  return as_string(_async_func_names[index])
+end
+
+## Reset the lazy async variable tracking (per-function scope).
+def mir_clear_lazy_async_vars(): Void
+  _lazy_async_vars = 0
+  # Item 37 — payload-type tracking is per-function-scope too.
+  _async_var_payload_names = 0
+  _async_var_payload_types = 0
+end
+
+# ============================================================================
+# AST-level suspend-effect propagation (colorless-dispatch enabler)
+# ============================================================================
+#
+# Without this pre-pass, $poll bodies generated in PASS 1.2a cannot route
+# calls to user functions via colorless dispatch — the callee hasn't been
+# auto-registered as an async target yet (that happens in PASS 1.3, which
+# runs *after* PASS 1.2a). Result: a go-target whose body calls a
+# suspend-effected user function emits a plain sync call that parks its
+# worker in pthread_cond_wait / usleep instead of yielding cooperatively.
+#
+# This fixpoint scan walks each user function's AST body once, collects
+# direct callee names, then iterates to closure: any function whose
+# callee set intersects a known suspend-leaf intrinsic (or a previously
+# marked function) is registered as an async target. Runs at PASS 0.99.
+
+## Is this identifier a known suspend-leaf intrinsic?
+## Keep in sync with the EFFECT_SUSPEND entries of mir_init_effect_leaves.
+##
+## P4.B.8.b: "__qz_yield_marker__" is a synthetic edge name pushed by
+## `mir_ast_collect_callees` whenever a NODE_YIELD is encountered inside
+## a function body. It is not a real callee — there is no `__qz_yield_
+## marker__` symbol — the marker only exists to flow through
+## `mir_propagate_suspend_ast`'s edge-based seeding so that functions
+## containing `yield` (in the body, not via a call) get registered as
+## async targets at PASS 0.99 BEFORE PASS 1.2a synthesizes the parent
+## generator's `$poll` body. Without this, a `def emit_three(): Void
+## can Yield<Int> = emit_one(); emit_one(); emit_one()` doesn't
+## perform yield directly — only its callee `emit_one` does — so the
+## old hand-registration in `mir_lower_stmt_yield`'s `_gen_active==0`
+## branch never fires for emit_three. PASS 1.2a then misses the
+## colorless-dispatch gate and emits a plain `call @emit_three`, the
+## helper runs to completion against the program-default Yield handler,
+## and consumer drives never see a yielded value.
+def mir_is_suspend_leaf_name(name: String): Bool
+  return name == "sched_yield" or name == "sched_sleep" or name == "sched_park" or name == "io_suspend" or name == "io_suspend_timeout" or name == "proc_suspend" or name == "recv" or name == "__qz_yield_marker__" or name == "__qz_fn_param_call_marker__"
+end
+
+## Collect parameter names from a function-def node (NODE_FUNCTION). Returns
+## the names of every formal parameter — used by `mir_ast_collect_callees`
+## to detect calls through a fn-typed parameter (`body()` where `body` is
+## a Fn-typed param of the enclosing function).
+##
+## A.10 SCOPE_THROW_BYPASS fix (2026-05-03): scope_with's `result = body()`
+## call site lowers to a NODE_CALL whose left is NODE_IDENT("body"). When
+## the user happens to name their fn `body` matching the param name, the
+## global-name lookup in `mir_propagate_suspend_ast` accidentally bridges
+## scope_with's edge to the user's def — fixpoint correctly propagates
+## suspendability up to scope_with, which then auto-promotes to colorless.
+## When the user's fn is named anything else, the bridge is missing and
+## scope_with stays sync. The throw-perform's continuation chain then
+## breaks at the sync/async boundary inside scope_with's `with Throws`
+## install. This helper + the matching check below close that gap by
+## treating any call through a parameter name as suspend-equivalent
+## (over-approximation — same safety profile as the existing yield marker).
+def mir_extract_param_names(s: ast::AstStorage, fn_node: Int): Vec<String>
+  var out = vec_new<String>()
+  if fn_node <= 0
+    return out
+  end
+  var num_nodes = ast::ast_node_count(s)
+  if fn_node >= num_nodes
+    return out
+  end
+  var params = ast::ast_get_left(s, fn_node)
+  if params <= 0
+    return out
+  end
+  var pc = vec_size(params)
+  for pi in 0..pc
+    var pnode = params[pi]
+    if pnode > 0 and pnode < num_nodes
+      var pname = ast::ast_get_str1(s, pnode)
+      if str_byte_len(pname) > 0
+        out.push(pname)
+      end
+    end
+  end
+  return out
+end
+
+## Strip a `module$` prefix. "sync$semaphore_acquire" → "semaphore_acquire".
+## Leaves bare names alone.
+def mir_strip_module_prefix(name: String): String
+  var pos = __char_index(name, '$')
+  if pos < 0
+    return name
+  end
+  return str_byte_slice(name, pos + 1, str_byte_len(name))
+end
+
+## Collect bare callee names (NODE_IDENT text of NODE_CALL's left child)
+## from a function body subtree. Iterative DFS over the AST using the
+## same queue pattern as mir_body_has_ufcs_calls.
+##
+## `param_names` is the formal parameter list of the enclosing function:
+## when a NODE_CALL targets an IDENT that matches a parameter name, the
+## call is dispatching through a fn-typed parameter and we push the
+## synthetic `__qz_fn_param_call_marker__` edge so the suspend-fixpoint
+## treats the enclosing function as potentially suspendable. See
+## `mir_extract_param_names` for the bug-doc context.
+def mir_ast_collect_callees(s: ast::AstStorage, root: Int, param_names: Vec<String>): Vec<String>
+  var names = vec_new<String>()
+  if root <= 0
+    return names
+  end
+  var num_nodes = ast::ast_node_count(s)
+  var queue = vec_new()
+  queue.push(root)
+  while queue.size > 0
+    var node = queue[queue.size - 1]
+    queue.pop()
+    if node <= 0
+      continue
+    end
+    if node >= num_nodes
+      continue
+    end
+    var kind = ast::ast_get_kind(s, node)
+    if kind == node_constants::NODE_CALL
+      var callee = ast::ast_get_left(s, node)
+      if callee > 0 and callee < num_nodes
+        if ast::ast_get_kind(s, callee) == node_constants::NODE_IDENT
+          var nm = ast::ast_get_str1(s, callee)
+          if str_byte_len(nm) > 0
+            names.push(nm)
+            # A.10 fix: if the callee name matches a formal parameter of
+            # the enclosing function, the dispatch goes through a fn-typed
+            # local. Any caller could pass an async-target through that
+            # parameter, so treat the enclosing function as suspendable.
+            var pn = param_names.size
+            for pi in 0..pn
+              if nm == param_names[pi]
+                names.push("__qz_fn_param_call_marker__")
+                break
+              end
+            end
+          end
+        end
+      end
+    end
+    # P4.B.8.b: NODE_YIELD acts as a synthetic call to "__qz_yield_marker__".
+    # That sentinel is in `mir_is_suspend_leaf_name`'s list, so this edge
+    # seeds `susp` for any function whose body contains `yield`. The
+    # fixpoint then propagates suspendability up the call chain (helper-
+    # calling-helper-calling-yield etc.), and the post-fixpoint registration
+    # block enrolls every transitively-yielding user function as an async
+    # target with EFFECT_SUSPEND — exactly what the colorless-dispatch
+    # gate at mir_lower_call needs to lift them to a `$poll` and route
+    # via `mir_emit_colorless_call`. Surfaces both `def emit(v): Void
+    # can Yield<Int> = yield v` (direct) and `def emit_three(...) =
+    # emit_one(); emit_one(); emit_one()` (indirect-via-helper).
+    if kind == node_constants::NODE_YIELD
+      names.push("__qz_yield_marker__")
+    end
+    var children = ast::ast_get_children(s, node)
+    if children > 0
+      var ccount = vec_size(children)
+      for ci in 0..ccount
+        var child = children[ci]
+        if child > 0 and child < num_nodes
+          queue.push(child)
+        end
+      end
+    end
+    var left = ast::ast_get_left(s, node)
+    if left > 0 and left < num_nodes
+      queue.push(left)
+    end
+    var right = ast::ast_get_right(s, node)
+    if right > 0 and right < num_nodes
+      queue.push(right)
+    end
+  end
+  return names
+end
+
+## AST-level fixpoint: mark any user function that transitively calls a
+## suspend-leaf intrinsic as an async target. Must run BEFORE PASS 1.2a
+## generates $poll bodies so colorless dispatch inside those bodies sees
+## the complete set of async targets.
+##
+## Safety: over-approximation is fine. A function wrongly marked as
+## async simply gets a $poll body it won't be called through (the sync
+## call path still works). The cost is a larger binary; the benefit is
+## that no go-target caller ever sync-calls a suspend-effected callee.
+def mir_propagate_suspend_ast(all_funcs: Vec<ResolverEntry>): Void
+  # Flat parallel arrays (Vec<Vec<String>> nesting isn't reliable):
+  #   names[i]      = bare function name for caller i
+  #   stores[i]     = AST store for caller i
+  #   edge_caller[] + edge_callee[] = (caller_idx, bare_callee_name) edges
+  var names = vec_new<String>()
+  var orig_names = vec_new<String>()
+  var stores = vec_new<Int>()
+  var name_to_idx = map_new<String, Int>()
+  var edge_caller = vec_new<Int>()
+  var edge_callee = vec_new<String>()
+
+  var fcount = all_funcs.size
+  for fi in 0..fcount
+    var entry = all_funcs[fi]
+    if entry.tag != 0
+      continue
+    end
+    var body = ast::ast_get_right(entry.ast_store, entry.node_id)
+    if body < 0
+      continue
+    end
+    var bare = mir_strip_module_prefix(entry.name)
+    # Skip the program entry and compiler-internal helpers. `main` cannot
+    # be a $poll state machine (it's the scheduler's invoker, not an
+    # invokee), and the `__qz_*` synthesized symbols aren't user funcs.
+    if bare == "main"
+      continue
+    end
+    if str_starts_with(bare, "__qz_")
+      continue
+    end
+    if str_starts_with(bare, "__Future_")
+      continue
+    end
+    if str_starts_with(bare, "__GenState_")
+      continue
+    end
+    if str_starts_with(bare, "__lambda_")
+      continue
+    end
+    if str_starts_with(bare, "__closure_")
+      continue
+    end
+    if map_has(name_to_idx, bare)
+      continue
+    end
+    var idx = names.size
+    map_set(name_to_idx, bare, idx)
+    names.push(bare)
+    orig_names.push(entry.name)
+    stores.push(as_int_generic(entry.ast_store))
+    var pnames = mir_extract_param_names(entry.ast_store, entry.node_id)
+    var callees = mir_ast_collect_callees(entry.ast_store, body, pnames)
+    var cc = callees.size
+    for ci in 0..cc
+      edge_caller.push(idx)
+      edge_callee.push(callees[ci])
+    end
+  end
+
+  # Seed: any function whose callee list contains a suspend-leaf intrinsic.
+  var susp = map_new<String, Int>()
+  var ecount = edge_caller.size
+  for ei in 0..ecount
+    var cnm = edge_callee[ei]
+    if mir_is_suspend_leaf_name(cnm)
+      var caller_idx = edge_caller[ei]
+      var caller_nm = names[caller_idx]
+      map_set(susp, caller_nm, 1)
+    end
+  end
+
+  # Fixpoint: if edge(caller, callee) and callee is suspendable, caller is too.
+  var changed = 1
+  while changed == 1
+    changed = 0
+    for ei in 0..ecount
+      var callee_nm = edge_callee[ei]
+      if map_has(susp, callee_nm)
+        var caller_idx = edge_caller[ei]
+        var caller_nm = names[caller_idx]
+        if not map_has(susp, caller_nm)
+          map_set(susp, caller_nm, 1)
+          changed = 1
+        end
+      end
+    end
+  end
+
+  # Register every suspendable user function as an async target, and seed
+  # the effect-leaf bitset with EFFECT_SUSPEND=2 so the colorless dispatch
+  # check at call lowering (`mir_has_effect(callee, 2)`) returns true
+  # before the proper propagation runs in PASS 1.2b'. Both record fns
+  # dedup/merge so re-registration is harmless.
+  #
+  # D.11 Phase 7 / B.5d.1 — skip async-target registration in freestanding.
+  # See mir_lower.qz PASS 1.3 gate for the full rationale: kernel uses
+  # go_fn + seeded stacks (real switch_to), not Future-poll machinery, so
+  # __Future_X$poll wrappers are dead code that pulls in hosted runtime
+  # symbols at link. mir_record_effect_leaf is still called so the
+  # effect-bitset stays consistent for diagnostics + other passes.
+  # B.5e.3: gate on the unconditional freestanding flag (set from
+  # quartz.qz's `--target` check), NOT qzmod_active_target() — the latter
+  # is empty on the single-file kernel build (`--no-cache`), which would
+  # leak orphan $poll wrappers referencing undefined hosted globals.
+  var _bm_skip_register = 0
+  if mir_async_is_freestanding() == 1
+    _bm_skip_register = 1
+  end
+  var n = names.size
+  for i in 0..n
+    var nm = names[i]
+    if map_has(susp, nm)
+      if _bm_skip_register == 0
+        mir_record_async_target(nm, stores[i])
+      end
+      mir_record_effect_leaf(nm, 2)
+      # SYNC_RECV_WORKER_STARVATION_REGRESSION (2026-06-05): also register
+      # the module-PREFIXED original name. A cross-module call resolves to
+      # the prefixed `resolved_name` (`semaphore$semaphore_acquire`), but the
+      # bare registration above only answers for `semaphore_acquire`, so the
+      # colorless-dispatch gate's exact lookup missed → the imported
+      # recv-wrapper was plain-called and its blocking `recv` parked the
+      # WORKER thread instead of the task → deadlock. Registering the SPECIFIC
+      # prefixed name (vs. a bare-name fallback at the gate) keeps the match
+      # exact, avoiding false-positive over-dispatch on common bare names
+      # (e.g. `step` → a spurious `@__Future_quake$step$new`).
+      var orig = orig_names[i]
+      if orig != nm
+        if _bm_skip_register == 0
+          mir_record_async_target(orig, stores[i])
+        end
+        mir_record_effect_leaf(orig, 2)
+      end
+    end
+  end
+end
+
+## A.17 QZ0210 — Is this function's plain (non-$poll) body reachable from
+## `main` at runtime? Used by the QZ0210 check to reject `sched_park()`
+## in a function whose plain body actually runs. Returns false until
+## `mir_compute_plain_reachable` has run (PASS 0.99c).
+def mir_is_plain_reachable(name: String): Bool
+  if _plain_reachable == 0
+    return false
+  end
+  return map_has(_plain_reachable, name)
+end
+
+## A.17 QZ0210 — Collect bare callee names from a function body, EXCLUDING
+## any call nested inside a `go` / `async` spawn. Those spawned callees
+## run as `$poll` state machines on a scheduler worker, not as part of the
+## enclosing function's plain body, so they are not plain-call edges.
+##
+## Iterative DFS mirroring `mir_ast_collect_callees`, but when a NODE_GO
+## or NODE_ASYNC_CALL node is reached its subtree is NOT descended into:
+## the spawn target (and anything it transitively calls plainly) belongs
+## to the async side of the boundary.
+def mir_ast_collect_plain_callees(s: ast::AstStorage, root: Int): Vec<String>
+  var names = vec_new<String>()
+  if root <= 0
+    return names
+  end
+  var num_nodes = ast::ast_node_count(s)
+  var queue = vec_new()
+  queue.push(root)
+  while queue.size > 0
+    var node = queue[queue.size - 1]
+    queue.pop()
+    if node <= 0
+      continue
+    end
+    if node >= num_nodes
+      continue
+    end
+    var kind = ast::ast_get_kind(s, node)
+    # Boundary: do not descend into a spawned subtree. The spawn target is
+    # an async `$poll` body, not a plain-call edge of the enclosing fn.
+    if kind == node_constants::NODE_GO or kind == node_constants::NODE_ASYNC_CALL
+      continue
+    end
+    if kind == node_constants::NODE_CALL
+      var callee = ast::ast_get_left(s, node)
+      if callee > 0 and callee < num_nodes
+        if ast::ast_get_kind(s, callee) == node_constants::NODE_IDENT
+          var nm = ast::ast_get_str1(s, callee)
+          if str_byte_len(nm) > 0
+            names.push(nm)
+          end
+        end
+      end
+    end
+    var children = ast::ast_get_children(s, node)
+    if children > 0
+      var ccount = vec_size(children)
+      for ci in 0..ccount
+        var child = children[ci]
+        if child > 0 and child < num_nodes
+          queue.push(child)
+        end
+      end
+    end
+    var left = ast::ast_get_left(s, node)
+    if left > 0 and left < num_nodes
+      queue.push(left)
+    end
+    var right = ast::ast_get_right(s, node)
+    if right > 0 and right < num_nodes
+      queue.push(right)
+    end
+  end
+  return names
+end
+
+## A.17 QZ0210 — Compute the set of functions whose plain body runs at
+## runtime: the transitive closure from `main` over plain-call edges
+## (NODE_CALL not nested in NODE_GO / NODE_ASYNC_CALL).
+##
+## Runs at PASS 0.99c, after `mir_propagate_suspend_ast`. The QZ0210
+## check (mir_lower_expr_handlers.qz) then rejects a direct `sched_park()`
+## call iff the enclosing function is in this set — i.e. its plain body
+## genuinely executes. A `sched_park`-containing function reachable ONLY
+## via `go fn()` / `async fn()` is absent from this set and exempt: its
+## plain body is dead code, only the `$poll` variant (where park is legal)
+## ever runs.
+##
+## Limitation: indirect calls (function pointers / closures) are not
+## tracked — a `sched_park`-containing function reached only through a
+## function pointer would be a false negative. This matches the existing
+## name-based blind spot and indirect-called functions cannot be
+## colorless-promoted anyway.
+def mir_compute_plain_reachable(all_funcs: Vec<ResolverEntry>): Void
+  if _plain_reachable == 0
+    _plain_reachable = as_int_generic(map_new<String, Int>())
+  end
+  # Flat parallel arrays: names[i] = bare fn name; idx i's plain callees
+  # live in the (caller_idx -> callee_name) edge lists. Dedup by bare name
+  # (first definition wins — same convention as mir_propagate_suspend_ast).
+  var names = vec_new<String>()
+  var name_to_idx = map_new<String, Int>()
+  var edge_caller = vec_new<Int>()
+  var edge_callee = vec_new<String>()
+
+  var fcount = all_funcs.size
+  for fi in 0..fcount
+    var entry = all_funcs[fi]
+    if entry.tag != 0
+      continue
+    end
+    var bare = mir_strip_module_prefix(entry.name)
+    if str_starts_with(bare, "__Future_")
+      continue
+    end
+    if str_starts_with(bare, "__GenState_")
+      continue
+    end
+    if map_has(name_to_idx, bare)
+      continue
+    end
+    var body = ast::ast_get_right(entry.ast_store, entry.node_id)
+    var idx = names.size
+    map_set(name_to_idx, bare, idx)
+    names.push(bare)
+    if body >= 0
+      var callees = mir_ast_collect_plain_callees(entry.ast_store, body)
+      var cc = callees.size
+      for ci in 0..cc
+        edge_caller.push(idx)
+        edge_callee.push(callees[ci])
+      end
+    end
+  end
+
+  # Seed reachability with `main` (the program entry point). If there is
+  # no `main` in this translation unit, nothing is plain-reachable.
+  if not map_has(name_to_idx, "main")
+    return
+  end
+  map_set(_plain_reachable, "main", 1)
+
+  # Fixpoint: if caller is plain-reachable, every plain callee is too.
+  var ecount = edge_caller.size
+  var changed = 1
+  while changed == 1
+    changed = 0
+    for ei in 0..ecount
+      var caller_idx = edge_caller[ei]
+      var caller_nm = names[caller_idx]
+      if map_has(_plain_reachable, caller_nm)
+        var callee_nm = edge_callee[ei]
+        if not map_has(_plain_reachable, callee_nm)
+          map_set(_plain_reachable, callee_nm, 1)
+          changed = 1
+        end
+      end
+    end
+  end
+end
+
+# ============================================================================
+# Multi-Effect Inference System
+# ============================================================================
+#
+# Extends the single-effect suspendability system to track 5 effect types
+# via integer bitsets. Effects propagate bottom-up through the call graph
+# using the same fixed-point algorithm as mir_mark_suspendable.
+#
+# Effect constants (from effect_constants.qz):
+#   EFFECT_NONE    = 0    (pure)
+#   EFFECT_IO      = 1    (I/O operations)
+#   EFFECT_SUSPEND = 2    (may yield execution)
+#   EFFECT_PANIC   = 4    (may panic)
+#   EFFECT_ALLOC   = 8    (heap allocation)
+#   EFFECT_ALL     = 15   (all effects)
+#   EFFECT_ANNOTATED_PURE = 256 (user said @pure)
+
+# Leaf effect map: function name → effect bitset (directly observed).
+var _effect_leaves = 0
+# Transitive effect map: function name → effect bitset (after fixed-point).
+var _effect_funcs = 0
+
+## Record a leaf effect for a function. Merges via bitwise OR.
+def mir_record_effect_leaf(name: String, eff: Int): Void
+  if _effect_leaves == 0
+    _effect_leaves = as_int_generic(map_new<String, Int>())
+  end
+  if map_has(_effect_leaves, name)
+    var existing = __map_get_raw(_effect_leaves, name)
+    map_set(_effect_leaves, name, existing | eff)
+  else
+    map_set(_effect_leaves, name, eff)
+  end
+end
+
+## Record an IO leaf effect for a function.
+def mir_record_io_leaf(name: String): Void
+  mir_record_effect_leaf(name, 1)
+end
+
+## Record a Panic leaf effect for a function.
+def mir_record_panic_leaf(name: String): Void
+  mir_record_effect_leaf(name, 4)
+end
+
+## Record an Alloc leaf effect for a function.
+def mir_record_alloc_leaf(name: String): Void
+  mir_record_effect_leaf(name, 8)
+end
+
+## Initialize effect leaf registry with builtin intrinsic classifications.
+## Called once before call graph analysis.
+def mir_init_effect_leaves(): Void
+  # Suspend effects (existing — keep in sync with mir_init_suspendable_leaves)
+  mir_record_effect_leaf("sched_yield", 2)
+
+  # IO effects — output
+  mir_record_io_leaf("puts")
+  mir_record_io_leaf("print")
+  mir_record_io_leaf("eprint")
+  mir_record_io_leaf("eputs")
+  mir_record_io_leaf("print_int")
+  mir_record_io_leaf("eprint_int")
+
+  # IO effects — file operations
+  mir_record_io_leaf("file_read")
+  mir_record_io_leaf("file_write")
+  mir_record_io_leaf("file_read_line")
+  mir_record_io_leaf("file_write_line")
+  mir_record_io_leaf("file_exists")
+  mir_record_io_leaf("file_delete")
+  mir_record_io_leaf("file_size")
+  mir_record_io_leaf("fread")
+  mir_record_io_leaf("fwrite")
+  mir_record_io_leaf("readline")
+
+  # IO effects — fd/pipe operations
+  mir_record_io_leaf("fd_read")
+  mir_record_io_leaf("fd_write")
+  mir_record_io_leaf("fd_close")
+  mir_record_io_leaf("pipe_open")
+  mir_record_io_leaf("pipe_close")
+
+  # IO effects — process/system
+  mir_record_io_leaf("system")
+  mir_record_io_leaf("exit")
+  mir_record_io_leaf("getenv")
+  mir_record_io_leaf("getcwd")
+  mir_record_io_leaf("chdir")
+
+  # IO effects — network
+  mir_record_io_leaf("socket_create")
+  mir_record_io_leaf("socket_bind")
+  mir_record_io_leaf("socket_listen")
+  mir_record_io_leaf("socket_accept")
+  mir_record_io_leaf("socket_connect")
+  mir_record_io_leaf("socket_send")
+  mir_record_io_leaf("socket_recv")
+  mir_record_io_leaf("socket_close")
+  mir_record_io_leaf("socket_set_reuse")
+  mir_record_io_leaf("socket_set_nonblocking")
+
+  # IO effects — scheduler/concurrency (also SUSPEND for blocking ops)
+  mir_record_effect_leaf("io_suspend", 2 | 1)
+  mir_record_effect_leaf("io_suspend_timeout", 2 | 1)
+  mir_record_effect_leaf("proc_suspend", 2 | 1)
+  mir_record_effect_leaf("send", 1)
+  mir_record_effect_leaf("recv", 1 | 2)
+  mir_record_effect_leaf("channel_new", 1 | 8)
+  mir_record_io_leaf("channel_close")
+  mir_record_io_leaf("sched_init")
+  mir_record_io_leaf("sched_spawn")
+  mir_record_io_leaf("sched_shutdown")
+
+  # Panic effects
+  mir_record_panic_leaf("panic")
+
+  # Alloc effects — collections
+  mir_record_alloc_leaf("vec_new")
+  mir_record_alloc_leaf("map_new")
+  mir_record_alloc_leaf("set_new")
+  mir_record_alloc_leaf("arena_new")
+  mir_record_alloc_leaf("arena_alloc")
+  mir_record_alloc_leaf("strbuf_new")
+
+  # Alloc effects — string operations that allocate
+  mir_record_alloc_leaf("str_concat")
+  mir_record_alloc_leaf("str_byte_slice")
+  mir_record_alloc_leaf("to_str")
+  mir_record_alloc_leaf("int_to_str")
+  mir_record_alloc_leaf("float_to_str")
+
+  # Alloc effects — memory
+  mir_record_alloc_leaf("malloc")
+  mir_record_alloc_leaf("realloc")
+
+  # Alloc + IO combined
+  mir_record_effect_leaf("mutex_new", 1 | 8)
+  mir_record_effect_leaf("rwlock_new", 1 | 8)
+  mir_record_effect_leaf("atomic_new", 8)
+  mir_record_effect_leaf("cancel_token_new", 8)
+  mir_record_effect_leaf("waitgroup_new", 8)
+  mir_record_effect_leaf("oncecell_new", 8)
+
+  # Indirect calls (closures, function pointers) — conservative IO|Alloc.
+  # NOT EFFECT_SUSPEND: only named functions can be auto-registered for
+  # state machine compilation. Closures called indirectly block the thread
+  # (same behavior as Go — goroutines can't yield inside CGo calls).
+  mir_record_effect_leaf("__indirect_call__", 1 | 8)  # EFFECT_IO | EFFECT_ALLOC
+end
+
+## Get the effect bitset for a function (after propagation).
+## Returns 0 (pure) if function has no recorded effects.
+def mir_get_function_effects(name: String): Int
+  if _effect_funcs != 0
+    if map_has(_effect_funcs, name)
+      return __map_get_raw(_effect_funcs, name)
+    end
+  end
+  if _effect_leaves != 0
+    if map_has(_effect_leaves, name)
+      return __map_get_raw(_effect_leaves, name)
+    end
+  end
+  return 0
+end
+
+## Check if a function has a specific effect (after propagation).
+def mir_has_effect(name: String, eff: Int): Bool
+  return (mir_get_function_effects(name) & eff) != 0
+end
+
+## Propagate effects through the call graph using fixed-point iteration.
+## For each function, OR in all callee effects. Iterate until no changes.
+## This is structurally identical to mir_mark_suspendable but operates on
+## multi-effect bitsets instead of presence/absence.
+def mir_propagate_effects(graph: Map<String, Vec<String>>, prog: mir::MirProgram): Void
+  # Initialize _effect_funcs from _effect_leaves
+  if _effect_funcs == 0
+    _effect_funcs = as_int_generic(map_new<String, Int>())
+  end
+
+  # Build function name list and a set for O(1) membership checks
+  var func_names = vec_new<String>()
+  var func_name_set = map_new<String, Int>()
+  var funcs = mir::mir_get_functions(prog)
+  for fi in 0..funcs.size
+    var fname = mir::mir_func_get_name(funcs[fi])
+    func_names.push(fname)
+    map_set(func_name_set, fname, 1)
+  end
+
+  # Seed from leaves
+  if _effect_leaves != 0
+    for fi in 0..func_names.size
+      var fname = func_names[fi]
+      if map_has(_effect_leaves, fname)
+        var leaf_effects = __map_get_raw(_effect_leaves, fname)
+        map_set(_effect_funcs, fname, leaf_effects)
+      end
+      # Map $poll variant effects back to original name
+      if str_starts_with(fname, "__Future_") and str_ends_with(fname, "$poll")
+        var inner = str_byte_slice(fname, 9, str_byte_len(fname) - 5)
+        if map_has(_effect_leaves, inner)
+          var inner_effects = __map_get_raw(_effect_leaves, inner)
+          map_set(_effect_funcs, inner, inner_effects)
+          map_set(_effect_funcs, fname, inner_effects)
+        end
+      end
+    end
+  end
+
+  # Fixed-point: propagate effects through call graph
+  var changed = true
+  while changed
+    changed = false
+    for fi in 0..func_names.size
+      var fname = func_names[fi]
+      var current = 0
+      if map_has(_effect_funcs, fname)
+        current = __map_get_raw(_effect_funcs, fname)
+      end
+      if map_has(graph, fname)
+        var callees_raw = __map_get_raw(graph, fname)
+        for ci in 0..vec_size(callees_raw)
+          var callee = as_string(callees_raw[ci])
+          # Check both transitive effects and leaf effects for callees.
+          var callee_effects = mir_get_function_effects(callee)
+          # Unknown callees (not MIR functions, not registered leaves) are
+          # extern/FFI — default to IO|Alloc (conservative but not EFFECT_ALL,
+          # since FFI functions don't suspend or panic by default).
+          if callee_effects == 0
+            if not map_has(func_name_set, callee)
+              if not map_has(_effect_leaves, callee)
+                callee_effects = 1 | 8  # EFFECT_IO | EFFECT_ALLOC
+              end
+            end
+          end
+          var merged = current | callee_effects
+          if merged != current
+            map_set(_effect_funcs, fname, merged)
+            current = merged
+            changed = true
+          end
+        end
+      end
+    end
+  end
+end
+
+## Format an effect bitset as a human-readable label (e.g., "IO|Alloc").
+def mir_effect_label(effects: Int): String
+  if effects == 0
+    return "pure"
+  end
+  var label = ""
+  if (effects & 1) != 0
+    label = "IO"
+  end
+  if (effects & 2) != 0
+    if str_byte_len(label) > 0
+      label = str_concat(label, "|")
+    end
+    label = str_concat(label, "Suspend")
+  end
+  if (effects & 4) != 0
+    if str_byte_len(label) > 0
+      label = str_concat(label, "|")
+    end
+    label = str_concat(label, "Panic")
+  end
+  if (effects & 8) != 0
+    if str_byte_len(label) > 0
+      label = str_concat(label, "|")
+    end
+    label = str_concat(label, "Alloc")
+  end
+  return label
+end
+
+## Print inferred effects for all functions (for --dump-effects).
+def mir_dump_effects(prog: mir::MirProgram): Void
+  var funcs = mir::mir_get_functions(prog)
+  for fi in 0..funcs.size
+    var fname = mir::mir_func_get_name(funcs[fi])
+    var effects = mir_get_function_effects(fname)
+    puts("[effects] #{fname}: #{mir_effect_label(effects)}")
+  end
+end

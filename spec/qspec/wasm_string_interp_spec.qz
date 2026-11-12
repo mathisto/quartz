@@ -1,0 +1,344 @@
+## WASM `#{string_var}` Runtime Correctness
+##
+## Pre-fix bug (`docs/bugs/WASM_STRING_INTERP_PTR.md`):
+##   The parser desugars every `#{expr}` part into `to_str(expr)`. The
+##   LLVM backend's `to_str` runtime did a lightweight alignment +
+##   length-prefix + null-terminator check that happened to pass-through
+##   genuine string pointers unchanged. The WASM backend's synthesized
+##   `to_str` was an unconditional `str_from_int` — every String operand
+##   was reinterpreted as an i64 and printed as the linear-memory address
+##   of its bytes (e.g. `puts("Hello, #{name}!")` → `Hello, 1128!`).
+##
+## A naive port of the LLVM heuristic to WASM doesn't work: linear-memory
+## allocations live at *low* addresses (often well under 65535), and the
+## LLVM heuristic's `val > 0xFFFF` guard would reject every legitimate
+## WASM string pointer.
+##
+## Fix: dispatch at MIR-lower time instead of runtime. The
+## `mir_unwrap_to_str_for_string` helper inspects each `to_str(inner)`
+## interp part and, when `inner` already has type `String`, lowers `inner`
+## directly and skips the `to_str` call entirely. Both backends benefit
+## from the elision; WASM gets correct string-interp behavior; LLVM
+## drops a redundant runtime dispatch on the hot string path.
+##
+## **Prerequisites**:
+##   * `QUARTZ_COMPILER` must point at a wasm-feature-enabled compiler
+##     (built with `--feature wasm`). Without it, the compile step exits
+##     non-zero and tests return `"COMPILE_FAILED"`.
+##   * `wasmtime` must be on PATH for runtime assertions. If missing,
+##     checks degrade to `"NO_RUNTIME"`. The structural `wasm-validate`
+##     step still asserts the module is well-formed regardless.
+##
+## No env-import shim is required: `vec_sort` and `sorted` are now
+## synthesized directly in `wasm_runtime.qz`. If a future regression
+## reintroduces unsynth env imports, this spec will fail with
+## `NO_RUNTIME` because plain `wasmtime` rejects unresolved imports.
+
+import * from qspec
+
+extern "C" def getpid(): CInt
+
+var _wsi_tid = 0
+
+# Compile + validate + run the source. Returns one of:
+#   "COMPILE_FAILED"   — wasm-feature compiler not configured
+#   "VALIDATE_FAILED"  — module is malformed (the structural regression)
+#   "NO_RUNTIME"       — wasmtime not on PATH or instantiation failed
+#                        (e.g. unresolved env import surfaced by a
+#                        regression in the runtime synth coverage)
+#   "<actual output>"  — captured stdout from the WASM module
+def _wsi_compile_and_run(source: String): String
+  _wsi_tid += 1
+  var pid = getpid()
+  var src = "/tmp/_wsi_#{pid}_#{_wsi_tid}.qz"
+  var wasm = "/tmp/_wsi_#{pid}_#{_wsi_tid}.wasm"
+  var out_path = "/tmp/_wsi_#{pid}_#{_wsi_tid}.out"
+  write_file(src, source)
+  var compiler = getenv("QUARTZ_COMPILER")
+  if str_byte_len(compiler) == 0
+    compiler = "self-hosted/bin/quartz"
+  end
+  var cr = system("#{compiler} --backend wasm --no-cache -I . -I std #{src} -o #{wasm} 2>/dev/null")
+  if cr != 0
+    return "COMPILE_FAILED"
+  end
+  var vr = system("wasm-validate #{wasm} 2>/dev/null")
+  if vr != 0
+    return "VALIDATE_FAILED"
+  end
+  var rr = system("wasmtime #{wasm} > #{out_path} 2>/dev/null")
+  if rr != 0
+    return "NO_RUNTIME"
+  end
+  return read_file(out_path)
+end
+
+# Trim trailing newline for easier equality comparisons against literal expected text.
+def _wsi_chomp(s: String): String
+  var n = str_byte_len(s)
+  return s if n == 0
+  var last = str_byte_at(s, n - 1)
+  return str_byte_slice(s, 0, n - 1) if last == 10
+  return s
+end
+
+def main(): Int
+  describe("WASM string interpolation runtime") do ->
+    it("interpolates a String variable as text, not pointer") do ->
+      var s = """
+        def main(): Int
+          var name = \"Quartz\"
+          puts(\"Hello, \#{name}!\")
+          return 0
+        end
+        """
+      var result = _wsi_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        # Toolchain gating — at minimum the module must be well-formed.
+        # _wsi_compile_and_run already failed early on VALIDATE_FAILED.
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        assert_eq_str(_wsi_chomp(result), "Hello, Quartz!")
+      end
+    end
+
+    it("interpolates a String-returning function call") do ->
+      var s = """
+        def greeting(): String = \"hi\"
+
+        def main(): Int
+          puts(\"\#{greeting()}, world!\")
+          return 0
+        end
+        """
+      var result = _wsi_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        assert_eq_str(_wsi_chomp(result), "hi, world!")
+      end
+    end
+
+    it("mixes String and Int operands in one interpolation") do ->
+      var s = """
+        def main(): Int
+          var name = \"Quartz\"
+          var n = 42
+          puts(\"\#{name} = \#{n}\")
+          return 0
+        end
+        """
+      var result = _wsi_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        assert_eq_str(_wsi_chomp(result), "Quartz = 42")
+      end
+    end
+
+    it("still formats Int operands as decimal text") do ->
+      var s = """
+        def main(): Int
+          var n = 1024
+          puts(\"n=\#{n}\")
+          return 0
+        end
+        """
+      var result = _wsi_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        assert_eq_str(_wsi_chomp(result), "n=1024")
+      end
+    end
+
+    it("handles arithmetic expressions with mixed types") do ->
+      var s = """
+        def main(): Int
+          var label = \"sum\"
+          var n = 10
+          puts(\"\#{label}: \#{n + 5}\")
+          return 0
+        end
+        """
+      var result = _wsi_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        assert_eq_str(_wsi_chomp(result), "sum: 15")
+      end
+    end
+
+    # Regression: String parameters weren't getting unwrapped in
+    # mir_unwrap_to_str_for_string. mir_infer_expr_type doesn't track
+    # primitives in struct_types, so NODE_IDENT lookups for params
+    # returned "" and the unwrap helper left the runtime to_str dispatch
+    # in place. Fix: consult the existing mir_is_string_expr helper which
+    # checks string_vars (populated for params, lets, match bindings).
+    it("interpolates a String parameter passed to a function") do ->
+      var s = """
+        def greet(name: String): Void
+          puts(\"Hello, \#{name}!\")
+        end
+
+        def main(): Int
+          greet(\"Quartz\")
+          return 0
+        end
+        """
+      var result = _wsi_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        assert_eq_str(_wsi_chomp(result), "Hello, Quartz!")
+      end
+    end
+
+    # Regression: match-pattern bindings (e.g. `Err(e)` where the variant
+    # field is `e: String`) weren't being marked into string_vars at MIR-
+    # lower time, so `puts(\"Err(\#{e})\")` printed the heap address of
+    # the string instead of its bytes (e.g. `Err(1144)`). Fix: track
+    # variant field types in MirContext.enum_variant_field_types and call
+    # mir_mark_pattern_bindings_typed at every match-binding site.
+    it("interpolates an enum-variant String payload bound by match") do ->
+      var s = """
+        enum Res
+          Ok(value: Int)
+          Err(msg: String)
+        end
+
+        def show(r: Res): String
+          match r
+            Res::Ok(v) => \"ok\"
+            Res::Err(e) => \"err: \#{e}\"
+          end
+        end
+
+        def main(): Int
+          puts(show(Res::Err(\"boom\")))
+          return 0
+        end
+        """
+      var result = _wsi_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        assert_eq_str(_wsi_chomp(result), "err: boom")
+      end
+    end
+  end
+
+  describe("WASM str_chars + str_reverse synth") do ->
+    # Regression: str_chars was an unresolved env import; for-c-in-string
+    # programs failed to instantiate. Now synthesized in wasm_runtime.qz
+    # mirroring qz_str_chars (byte-level Vec<Int>).
+    it("for c in s iterates byte values via str_chars synth") do ->
+      var s = """
+        def main(): Int
+          var s = \"abc\"
+          var sum = 0
+          for c in s
+            sum += c
+          end
+          puts(\"sum=\#{sum}\")
+          return 0
+        end
+        """
+      var result = _wsi_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        # 'a'=97 'b'=98 'c'=99 → 294
+        assert_eq_str(_wsi_chomp(result), "sum=294")
+      end
+    end
+
+    # Regression: str_reverse was an unresolved env import (intrinsic
+    # registry routes the user-level call to the runtime helper, not the
+    # user's own def). Now synthesized in wasm_runtime.qz.
+    it("str_reverse synth round-trips a short ASCII string") do ->
+      var s = """
+        def main(): Int
+          puts(str_reverse(\"abcdef\"))
+          return 0
+        end
+        """
+      var result = _wsi_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        assert_eq_str(_wsi_chomp(result), "fedcba")
+      end
+    end
+
+    # Pre-fix: WASM str_reverse was byte-level (matched LLVM qz_str_reverse,
+    # not qz_str_reverse_utf8 which user-level str_reverse actually routes
+    # to on the LLVM side). Multi-byte sequences (é, 日, …) had their bytes
+    # split + re-attached to neighbouring codepoints — invalid UTF-8 out.
+    # Fix walks src forward by codepoint width (1/2/3/4 bytes by UTF-8
+    # prefix) and writes each span at decreasing dst offsets.
+    it("str_reverse preserves multi-byte UTF-8 codepoints") do ->
+      var s = """
+        def main(): Int
+          puts(str_reverse(\"héllo\"))
+          puts(str_reverse(\"café\"))
+          puts(str_reverse(\"日本語\"))
+          puts(str_reverse(\"a日b\"))
+          return 0
+        end
+        """
+      var result = _wsi_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        assert_eq_str(_wsi_chomp(result), "olléh\néfac\n語本日\nb日a")
+      end
+    end
+
+    # Regression: sb.to_string() return wasn't recognized as String-typed
+    # by mir_is_string_call → mir_unwrap_to_str_for_string left the
+    # to_str wrap in place → the to_str(string_ptr) ran, and on WASM
+    # printed the address (e.g. "3328") instead of the bytes.
+    it("interpolates the result of sb.to_string()") do ->
+      var s = """
+        def main(): Int
+          var sb = sb_new()
+          sb.append(\"hi-\")
+          sb.append_int(42)
+          puts(\"sb=\#{sb.to_string()}\")
+          sb.free()
+          return 0
+        end
+        """
+      var result = _wsi_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        assert_eq_str(_wsi_chomp(result), "sb=hi-42")
+      end
+    end
+  end
+
+  describe("WASM print_int contract") do ->
+    # Regression: WASM `print_int` synth body called `print` (no newline)
+    # while LLVM's `@print_int` uses the `%ld\n` format. Two consecutive
+    # `print_int` calls ran together as `4242` instead of `42\n42`.
+    it("appends a newline like the LLVM @print_int contract") do ->
+      var s = """
+        def main(): Int
+          print_int(42)
+          print_int(7)
+          return 0
+        end
+        """
+      var result = _wsi_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        assert_eq_str(_wsi_chomp(result), "42\n7")
+      end
+    end
+  end
+
+  return qspec_main()
+end

@@ -1,0 +1,2566 @@
+## Brogue Tribute v0.11 — the v0.6 cell-engine canonical demo.
+##
+## Multi-floor BSP-procgen dungeon. Each floor is a fresh BSP partition
+## (recursive bisection → leaves → rooms → L-corridor connections) with
+## a player at the first room, stairs at the last, and a brazier in
+## every middle room. Press `>` to descend.
+##
+## Stress-tests every v0.6 TUI surface end-to-end:
+##
+##   - **Cells + Channels** (Phase 6.0) — every dungeon glyph is a `Cell`
+##     with `Channel` fg/bg, attrs, alpha mode.
+##   - **Plane DAG** (Phase 6.1) — title / dungeon / minimap / status /
+##     hint render into independent planes; `plane_blit` composes them
+##     onto an 80×24 root.
+##   - **Blend modes** (Phase 6.2) — `BlendMode::None` for opaque
+##     overlays; light buffer's `_apply_channel` exercises the additive
+##     RGB blend.
+##   - **Diff renderer** (Phase 6.3) — `renderer_with_back` +
+##     `renderer_diff` with DEC 2026 sync. Player movement re-emits a
+##     handful of cells per frame.
+##   - **Light buffer** (Phase 6.4) — Brogue-shaped sqrt-falloff per-cell
+##     RGB lighting. Player carries a miner's light; every brazier
+##     flickers.
+##   - **FOV** (Phase 6.5) — `fov_for_each_visible` (Albert Ford
+##     symmetric shadowcasting) drives both the player's vision and the
+##     light buffer's per-light walks.
+##   - **Octants** (Phase 6.6 + 6.6.1) — top-right minimap is an
+##     `OctantBlitter` at sub-cell resolution showing wall layout +
+##     player position.
+##   - **Tier A on Tier B** (Phase 6.7) — title / status / hint planes
+##     are `Vec<Cell>` rows via the same pipeline `Style.render` uses
+##     internally now.
+##   - **Themes** (Phase 6.8) — `T` cycles all 11 bundled Base16 themes.
+##
+## Controls: hjkl / arrows to move; `T` cycles theme; `F` toggles torch;
+## `>` descends to the next floor; `q` quits. Player is `@`; brazier is
+## `!`; stairs down are `>`; walls are `#`; floor is `.`.
+
+import std/tui/cell as cl
+import std/tui/plane as pl
+import std/tui/render as rd
+import std/tui/light as lt
+import std/tui/fov as fv
+import std/tui/octant as oct
+import std/tui/blend as bl
+import std/tui/theme as th
+import std/algo/grid_bfs as bfs
+import std/terminal
+import std/sync/composition/scope
+import string
+import random
+import time
+import * from std/vec
+
+# =============================================================================
+# Layout constants
+# =============================================================================
+
+def W(): Int = 80
+def H(): Int = 24
+def DUNG_W():  Int = 80
+def DUNG_H():  Int = 21
+def DUNG_OY(): Int = 1
+def NUM_THEMES(): Int = 11
+
+# BSP tuning. MIN_LEAF_W/H gates further splitting; MAX_DEPTH bounds the
+# recursion. With 80×21 area the typical run produces 8-12 leaves.
+def BSP_MIN_LEAF_W(): Int = 9
+def BSP_MIN_LEAF_H(): Int = 6
+def BSP_MAX_DEPTH():  Int = 5
+
+# Player FOV radius in tiles. 8 is roguelike-canonical (Brogue ~12 in
+# fully-lit areas, less in dark; DCSS 8; NetHack ~8). v0.3 used 16
+# which from the centre of an 80×21 dungeon covers most of the map at
+# once — ate the whole "memory vs current FOV" contrast we want.
+def PLAYER_FOV_RADIUS(): Int = 8
+
+# =============================================================================
+# Rect — a sub-rectangle of the dungeon
+# =============================================================================
+
+struct Rect
+  x: Int
+  y: Int
+  w: Int
+  h: Int
+end
+
+def rect_cx(r: Rect): Int = r.x + r.w / 2
+def rect_cy(r: Rect): Int = r.y + r.h / 2
+
+# =============================================================================
+# BSP partition + room/corridor carving
+# =============================================================================
+
+## Recursively bisect `r` until either MAX_DEPTH is reached or further
+## splitting would produce a leaf smaller than `(MIN_LEAF_W, MIN_LEAF_H)`.
+## Returns the leaf rects in DFS order — consecutive entries are
+## spatially adjacent, which the corridor pass relies on.
+def bsp_split(r: Rect, depth: Int): Vec<Rect>
+  var leaves = vec_new<Rect>()
+  if depth == 0
+    leaves.push(r)
+    return leaves
+  end
+  var can_split_h = r.h >= 2 * BSP_MIN_LEAF_H()
+  var can_split_v = r.w >= 2 * BSP_MIN_LEAF_W()
+  if not can_split_h and not can_split_v
+    leaves.push(r)
+    return leaves
+  end
+  var split_h = false
+  if can_split_h and not can_split_v
+    split_h = true
+  end
+  if not can_split_h and can_split_v
+    split_h = false
+  end
+  if can_split_h and can_split_v
+    if r.w * 100 > r.h * 200
+      split_h = false
+    end
+    if r.h * 100 > r.w * 200
+      split_h = true
+    end
+    if (r.w * 100 <= r.h * 200) and (r.h * 100 <= r.w * 200)
+      split_h = rand_range_op(0, 2) == 1
+    end
+  end
+  if split_h
+    var lo = BSP_MIN_LEAF_H()
+    var hi = r.h - BSP_MIN_LEAF_H() + 1
+    if hi <= lo
+      leaves.push(r)
+      return leaves
+    end
+    var pos = rand_range_op(lo, hi)
+    var top = Rect { x: r.x, y: r.y, w: r.w, h: pos }
+    var bot = Rect { x: r.x, y: r.y + pos, w: r.w, h: r.h - pos }
+    var ts = bsp_split(top, depth - 1)
+    var bs = bsp_split(bot, depth - 1)
+    var i = 0
+    while i < ts.size
+      leaves.push(ts[i])
+      i += 1
+    end
+    i = 0
+    while i < bs.size
+      leaves.push(bs[i])
+      i += 1
+    end
+  else
+    var lo = BSP_MIN_LEAF_W()
+    var hi = r.w - BSP_MIN_LEAF_W() + 1
+    if hi <= lo
+      leaves.push(r)
+      return leaves
+    end
+    var pos = rand_range_op(lo, hi)
+    var left  = Rect { x: r.x, y: r.y, w: pos, h: r.h }
+    var right = Rect { x: r.x + pos, y: r.y, w: r.w - pos, h: r.h }
+    var ls = bsp_split(left, depth - 1)
+    var rs = bsp_split(right, depth - 1)
+    var i = 0
+    while i < ls.size
+      leaves.push(ls[i])
+      i += 1
+    end
+    i = 0
+    while i < rs.size
+      leaves.push(rs[i])
+      i += 1
+    end
+  end
+  return leaves
+end
+
+## Pick a sub-rect inside `leaf` with a 1-cell border on each side,
+## width 4..leaf.w-2, height 3..leaf.h-2. The room is what gets carved
+## as floor.
+def room_in_leaf(leaf: Rect): Rect
+  var max_w = leaf.w - 2
+  var max_h = leaf.h - 2
+  if max_w < 4
+    max_w = 4
+  end
+  if max_h < 3
+    max_h = 3
+  end
+  var w = rand_range_op(4, max_w + 1)
+  var h = rand_range_op(3, max_h + 1)
+  if w > leaf.w - 2
+    w = leaf.w - 2
+  end
+  if h > leaf.h - 2
+    h = leaf.h - 2
+  end
+  var x_off = rand_range_op(1, leaf.w - w)
+  var y_off = rand_range_op(1, leaf.h - h)
+  return Rect {
+    x: leaf.x + x_off,
+    y: leaf.y + y_off,
+    w: w,
+    h: h
+  }
+end
+
+# =============================================================================
+# World state
+# =============================================================================
+
+# =============================================================================
+# Biomes — per-room visual variation
+# =============================================================================
+#
+# Each room gets one of four biome ids assigned at world_init_floor time.
+# `floor_glyph(x, y, biome)` looks up a per-cell glyph based on a
+# deterministic hash of (x, y) and the cell's biome — sparse non-`.`
+# tiles give rooms texture without mucking with the actual walkability
+# grid (every biome's cells are still floor).
+
+def BIOME_STONE():   Int = 0   # `.` + sparse `,`
+def BIOME_MOSSY():   Int = 1   # `.` + sparse `"` and `'`
+def BIOME_CRACKED(): Int = 2   # `.` + sparse `,` and `:`
+def BIOME_WET():     Int = 3   # `.` + sparse `~`
+def NUM_BIOMES():    Int = 4
+
+## Sparse floor texture lookup. Deterministic per (x, y) — same cell
+## always renders the same glyph across frames. Density tuned so most
+## cells stay `.` (~85-95%) and texture cells feel "rare" rather than
+## "noisy."
+def floor_glyph(x: Int, y: Int, biome: Int): String
+  var h = ((x * 73856093) + (y * 19349663)) & 255
+  if biome == BIOME_MOSSY()
+    if h < 18
+      return "\""
+    end
+    if h >= 220
+      return "'"
+    end
+    return "."
+  end
+  if biome == BIOME_CRACKED()
+    if h < 14
+      return ","
+    end
+    if h >= 240
+      return ":"
+    end
+    return "."
+  end
+  if biome == BIOME_WET()
+    if h < 22
+      return "~"
+    end
+    return "."
+  end
+  # BIOME_STONE — default
+  if h < 8
+    return ","
+  end
+  return "."
+end
+
+# =============================================================================
+# World state
+# =============================================================================
+
+## Pure-data world. Re-built fresh each step for replay-clean update
+## semantics; no mutation across the event loop. v0.10 collapses every
+## state-transition function to one-line `World { ...w, ...overrides }`
+## via the C.1 struct update syntax (parser-level desugar landed in
+## compiler `8bfe1416`).
+##
+## Monsters live in four parallel Vecs (`monster_xs`, `monster_ys`,
+## `monster_hps`, `monster_kinds`) instead of a `Vec<Monster>` struct
+## vector — flat Int arrays sidestep the wrapped-element-type-arg
+## friction noted in the tile-map memory.
+struct World
+  walls:         Vec<Bool>
+  player_x:      Int
+  player_y:      Int
+  stairs_x:      Int
+  stairs_y:      Int
+  brazier_xs:    Vec<Int>
+  brazier_ys:    Vec<Int>
+  monster_xs:    Vec<Int>
+  monster_ys:    Vec<Int>
+  monster_hps:   Vec<Int>
+  monster_kinds: Vec<Int>     # MONSTER_RAT / MONSTER_GOBLIN / MONSTER_ORC / MONSTER_BOSS
+  door_indices:  Vec<Int>     # flat dungeon indices of door cells
+  door_open:     Vec<Bool>    # parallel: true = open, false = closed
+  item_types:    Vec<Int>     # ITEM_GOLD / ITEM_HEAL / ITEM_WEAPON
+  item_xs:       Vec<Int>
+  item_ys:       Vec<Int>
+  item_values:   Vec<Int>     # gold pieces for ITEM_GOLD; unused otherwise
+  torch_on:      Bool
+  theme_idx:     Int
+  hp:            Int
+  hp_max:        Int
+  gold:          Int
+  damage_bonus:  Int          # accumulated from picked-up weapons
+  floor:         Int
+  frame:         Int
+  visited:       Vec<Bool>
+  visible:       Vec<Bool>
+  biome_map:     Vec<Int>
+  light_pct:     Int
+  dead:          Bool
+  won:           Bool
+  boss_alive:    Bool          # true on boss floor while boss monster lives
+  log:           String
+  # Run stats (v0.9). turns advances on every player action; kills_total
+  # is the cross-floor counter that drives the 30-kill victory condition;
+  # kills_floor resets on descent.
+  kills_total:   Int
+  kills_floor:   Int
+  turns:         Int
+  # Death-debris particles (v0.9 A.2). Parallel arrays. Each particle
+  # ticks until w.frame == die_frame, then is evicted in world_tick.
+  particle_xs:        Vec<Int>
+  particle_ys:        Vec<Int>
+  particle_glyphs:    Vec<String>
+  particle_die_frame: Vec<Int>
+  # One-frame red hit-flash overlay cells (v0.9 A.2). Cleared each tick.
+  flash_xs: Vec<Int>
+  flash_ys: Vec<Int>
+  # Help overlay (v0.12 A.5). When true, `?` overlay is drawn and game
+  # is paused — world_tick no-ops, world_handle_key dismisses on any
+  # key. Quit `q` is also gated through dismiss-then-quit.
+  help_open: Bool
+end
+
+# =============================================================================
+# Monster archetypes (v0.10 A.3, v0.11 A.4)
+# =============================================================================
+#
+# Four archetypes with distinct stats. Spawn distribution scales with
+# floor depth — early floors are mostly rats; late floors get tougher
+# orc-heavy mixes. The Boss kind is reserved for boss floors; one Boss
+# is hand-placed in a tagged room and never participates in the
+# floor-scaled mix. Stats are looked up from kind via the `monster_*`
+# helpers so combat / AI / render code stays kind-agnostic.
+
+def MONSTER_RAT():    Int = 0
+def MONSTER_GOBLIN(): Int = 1
+def MONSTER_ORC():    Int = 2
+def MONSTER_BOSS():   Int = 3
+
+## Per-kind max HP. Player attacks subtract (PLAYER_ATK + damage_bonus)
+## per hit; this controls how many turns a monster lives.
+def monster_max_hp(kind: Int): Int
+  if kind == MONSTER_RAT()
+    return 4
+  end
+  if kind == MONSTER_ORC()
+    return 14
+  end
+  if kind == MONSTER_BOSS()
+    return 30
+  end
+  return 8
+end
+
+## Per-kind damage dealt to player on adjacent attack.
+def monster_dmg(kind: Int): Int
+  if kind == MONSTER_RAT()
+    return 1
+  end
+  if kind == MONSTER_ORC()
+    return 4
+  end
+  if kind == MONSTER_BOSS()
+    return 5
+  end
+  return 3
+end
+
+## Per-kind action cadence in ticks. Rats are fast (every 2 ticks),
+## goblins are normal (every 4), orcs are slow (every 8), bosses act
+## at goblin speed (every 4) — they hit hard enough that slow cadence
+## would trivialise the encounter.
+def monster_act_period(kind: Int): Int
+  if kind == MONSTER_RAT()
+    return 2
+  end
+  if kind == MONSTER_ORC()
+    return 8
+  end
+  if kind == MONSTER_BOSS()
+    return 4
+  end
+  return 4
+end
+
+## Glyph rendered on the dungeon plane.
+def monster_glyph(kind: Int): String
+  if kind == MONSTER_RAT()
+    return "r"
+  end
+  if kind == MONSTER_ORC()
+    return "o"
+  end
+  if kind == MONSTER_BOSS()
+    return "B"
+  end
+  return "g"
+end
+
+## Glyph fg color for a given kind, sourced from the active theme.
+## Rats = orange (`base09`), goblins = red (`base08`), orcs = mauve
+## (`base0E`), bosses = mauve (`base0E`). Shared with the active theme
+## so colour shifts cleanly when the player cycles themes.
+def monster_color(kind: Int, t: th::Theme): cl::Channel
+  if kind == MONSTER_RAT()
+    return cl::channel_rgb(t.base09)
+  end
+  if kind == MONSTER_ORC()
+    return cl::channel_rgb(t.base0E)
+  end
+  if kind == MONSTER_BOSS()
+    return cl::channel_rgb(t.base0E)
+  end
+  return cl::channel_rgb(t.base08)
+end
+
+## Orcs and bosses render bold (visual heft for heavier archetypes).
+def monster_bold(kind: Int): Bool
+  return kind == MONSTER_ORC() or kind == MONSTER_BOSS()
+end
+
+## Floor-scaled kind picker. Roll 0..100 against per-floor cumulative
+## thresholds — rat % decreases with depth, orc % increases. Tuning per
+## docs/design/POST_V06_ROADMAP.md §A.3:
+##
+##   floor 1: 80 rat / 20 goblin /  0 orc
+##   floor 2: 60 rat / 35 goblin /  5 orc
+##   floor 3: 40 rat / 45 goblin / 15 orc
+##   floor 4: 25 rat / 50 goblin / 25 orc
+##   floor 5: 10 rat / 55 goblin / 35 orc
+def pick_monster_kind(floor_num: Int): Int
+  var rat_pct = 80
+  var goblin_pct = 20
+  if floor_num == 2
+    rat_pct = 60
+    goblin_pct = 35
+  end
+  if floor_num == 3
+    rat_pct = 40
+    goblin_pct = 45
+  end
+  if floor_num == 4
+    rat_pct = 25
+    goblin_pct = 50
+  end
+  if floor_num >= 5
+    rat_pct = 10
+    goblin_pct = 55
+  end
+  var roll = rand_range_op(0, 100)
+  if roll < rat_pct
+    return MONSTER_RAT()
+  end
+  if roll < rat_pct + goblin_pct
+    return MONSTER_GOBLIN()
+  end
+  return MONSTER_ORC()
+end
+
+# Combat tuning. Player attacks deal PLAYER_ATK + damage_bonus
+# (which accumulates from picked-up weapons). Per-kind monster damage
+# is in `monster_dmg`. Keep small so combat is multi-turn and
+# FOV/lighting matters during fights.
+def PLAYER_ATK():     Int = 4
+def MONSTERS_PER_FLOOR(): Int = 3
+
+# Item types. Stored as Int IDs in World.item_types parallel array.
+def ITEM_GOLD():   Int = 0
+def ITEM_HEAL():   Int = 1
+def ITEM_WEAPON(): Int = 2
+
+# Item tuning.
+def HEAL_AMOUNT():    Int = 5    # scrolls restore 5 HP up to hp_max
+def WEAPON_BONUS():   Int = 1    # weapons add +1 damage permanently
+def GOLD_MIN():       Int = 3
+def GOLD_MAX():       Int = 12
+def ITEMS_PER_FLOOR(): Int = 5
+
+# Victory tuning. Reach floor 5 (after defeating its boss) OR rack up
+# 30 kills total to win. The 30-kill speedrun path is preserved as a
+# back-channel — players that grind early floors hard win regardless
+# of whether they ever see floor 5's boss.
+def VICTORY_FLOOR():  Int = 5
+def VICTORY_KILLS():  Int = 30
+
+# Boss-floor cadence (v0.11 A.4). Floors equal to BOSS_FLOOR() get one
+# Boss spawned in the largest BSP-generated room; stairs do not render
+# until the boss is dead. Currently colocated with VICTORY_FLOOR so
+# floor 5's boss IS the victory gate. If we add floors past 5 later,
+# bosses can repeat at floor % BOSS_PERIOD == 0 — for now, floor 5 only.
+def BOSS_FLOOR():     Int = 5
+
+## A floor is a "boss floor" when boss-room logic should fire.
+## Returns true on `floor_num == BOSS_FLOOR()`. Single-equality check
+## today; centralised so future cadence ("every 5th floor", "every 3rd")
+## drops in here without touching spawn / descent / render call-sites.
+def is_boss_floor(floor_num: Int): Bool = floor_num == BOSS_FLOOR()
+
+## Pick the boss room index from the BSP-generated rooms vector.
+## Fallback strategy per docs/design/POST_V06_ROADMAP.md §A.4 bail
+## clause: scan middle rooms (excluding rooms[0] = player spawn and
+## rooms[size-1] = stairs), pick the largest by area. Returns -1 if
+## there are no middle rooms (rooms.size <= 2) — caller must handle.
+def pick_boss_room_idx(rooms: Vec<Rect>): Int
+  if rooms.size <= 2
+    return -1
+  end
+  var best_idx = -1
+  var best_area = 0
+  var i = 1
+  while i < rooms.size - 1
+    var r = rooms[i]
+    var area = r.w * r.h
+    if area > best_area
+      best_area = area
+      best_idx = i
+    end
+    i += 1
+  end
+  return best_idx
+end
+
+# Death-debris (v0.9 A.2). Particles live PARTICLE_LIFETIME ticks.
+# Glyph cycles through `*` `'` `,` `.` over the lifetime; color fades
+# red → orange → dim across the same span.
+def PARTICLE_LIFETIME(): Int = 6
+
+def world_idx(x: Int, y: Int): Int = y * DUNG_W() + x
+
+## Carve a room into the walls grid (set every cell inside to floor).
+def carve_room_into(walls: Vec<Bool>, room: Rect): Void
+  var y = room.y
+  while y < room.y + room.h
+    var x = room.x
+    while x < room.x + room.w
+      if x > 0 and y > 0 and x < DUNG_W() - 1 and y < DUNG_H() - 1
+        walls[world_idx(x, y)] = false
+      end
+      x += 1
+    end
+    y += 1
+  end
+end
+
+## Carve an L-shaped corridor between (x1,y1) and (x2,y2). Random
+## choice of horizontal-first vs vertical-first.
+def carve_corridor_into(walls: Vec<Bool>, x1: Int, y1: Int, x2: Int, y2: Int): Void
+  var horiz_first = rand_range_op(0, 2) == 1
+  var corner_x = x2
+  var corner_y = y1
+  if not horiz_first
+    corner_x = x1
+    corner_y = y2
+  end
+  var ax = x1
+  var bx = corner_x
+  if ax > bx
+    var t = ax
+    ax = bx
+    bx = t
+  end
+  var ay = y1
+  var by = corner_y
+  if ay > by
+    var t = ay
+    ay = by
+    by = t
+  end
+  var x = ax
+  while x <= bx
+    if x > 0 and corner_y > 0 and x < DUNG_W() - 1 and corner_y < DUNG_H() - 1
+      walls[world_idx(x, corner_y)] = false
+    end
+    x += 1
+  end
+  var y = ay
+  while y <= by
+    if corner_x > 0 and y > 0 and corner_x < DUNG_W() - 1 and y < DUNG_H() - 1
+      walls[world_idx(corner_x, y)] = false
+    end
+    y += 1
+  end
+  # Second leg
+  ax = corner_x
+  bx = x2
+  if ax > bx
+    var t = ax
+    ax = bx
+    bx = t
+  end
+  ay = corner_y
+  by = y2
+  if ay > by
+    var t = ay
+    ay = by
+    by = t
+  end
+  if horiz_first
+    var yy = ay
+    while yy <= by
+      if corner_x > 0 and yy > 0 and corner_x < DUNG_W() - 1 and yy < DUNG_H() - 1
+        walls[world_idx(corner_x, yy)] = false
+      end
+      yy += 1
+    end
+  else
+    var xx = ax
+    while xx <= bx
+      if xx > 0 and corner_y > 0 and xx < DUNG_W() - 1 and corner_y < DUNG_H() - 1
+        walls[world_idx(xx, corner_y)] = false
+      end
+      xx += 1
+    end
+  end
+end
+
+## Generate a fresh floor at depth `floor_num`. Carries forward the
+## persistent state (theme, torch, hp, light intensity) from `prev`;
+## everything else is regenerated via BSP procgen.
+def world_init_floor(prev: World, floor_num: Int): World
+  var dw = DUNG_W()
+  var dh = DUNG_H()
+  var n = dw * dh
+  var walls = vec_new<Bool>()
+  var visited = vec_new<Bool>()
+  var visible = vec_new<Bool>()
+  var biome_map = vec_new<Int>()
+  var i = 0
+  while i < n
+    walls.push(true)
+    visited.push(false)
+    visible.push(false)
+    biome_map.push(BIOME_STONE())
+    i += 1
+  end
+  # BSP-partition the interior (1..dw-2 × 1..dh-2 leaves a 1-cell border).
+  var bbox = Rect { x: 1, y: 1, w: dw - 2, h: dh - 2 }
+  var leaves = bsp_split(bbox, BSP_MAX_DEPTH())
+  # Carve a room in each leaf and stamp its biome into the per-cell map.
+  var rooms = vec_new<Rect>()
+  i = 0
+  while i < leaves.size
+    var room = room_in_leaf(leaves[i])
+    rooms.push(room)
+    carve_room_into(walls, room)
+    var biome = rand_range_op(0, NUM_BIOMES())
+    var ry = room.y
+    while ry < room.y + room.h
+      var rx = room.x
+      while rx < room.x + room.w
+        biome_map[world_idx(rx, ry)] = biome
+        rx += 1
+      end
+      ry += 1
+    end
+    i += 1
+  end
+  # Connect consecutive rooms with L-corridors.
+  i = 1
+  while i < rooms.size
+    var a = rooms[i - 1]
+    var b = rooms[i]
+    carve_corridor_into(walls, rect_cx(a), rect_cy(a),
+                                rect_cx(b), rect_cy(b))
+    i += 1
+  end
+  # Detect "doorway" cells — floor cells with walls on a pair of
+  # opposite cardinal sides (a 1-cell-wide passage shape). Place a
+  # door at ~50% of those candidates.
+  var door_indices = vec_new<Int>()
+  var door_open = vec_new<Bool>()
+  var dy_scan = 1
+  while dy_scan < dh - 1
+    var dx_scan = 1
+    while dx_scan < dw - 1
+      var dscan_idx = world_idx(dx_scan, dy_scan)
+      if not walls[dscan_idx]
+        var n_wall = walls[world_idx(dx_scan, dy_scan - 1)]
+        var s_wall = walls[world_idx(dx_scan, dy_scan + 1)]
+        var e_wall = walls[world_idx(dx_scan + 1, dy_scan)]
+        var w_wall = walls[world_idx(dx_scan - 1, dy_scan)]
+        # Vertical doorway: walls L+R, open T+B
+        var v_door = e_wall and w_wall and not n_wall and not s_wall
+        # Horizontal doorway: walls T+B, open L+R
+        var h_door = n_wall and s_wall and not e_wall and not w_wall
+        if v_door or h_door
+          if rand_range_op(0, 100) < 50
+            door_indices.push(dscan_idx)
+            door_open.push(false)
+          end
+        end
+      end
+      dx_scan += 1
+    end
+    dy_scan += 1
+  end
+  # On boss floors, tag the largest middle room as the boss room. Its
+  # centre will host the Boss monster and skip both the brazier
+  # placement and the floor-scaled monster sprinkle. -1 means "no boss
+  # this floor" (rooms.size <= 2 fallback OR not is_boss_floor).
+  var boss_room_idx = -1
+  if is_boss_floor(floor_num)
+    boss_room_idx = pick_boss_room_idx(rooms)
+  end
+  # Place braziers in every middle room (skip first + last to keep the
+  # player and stairs unobstructed). On boss floors, also skip the boss
+  # room so the brazier doesn't sit on top of the Boss spawn.
+  var brazier_xs = vec_new<Int>()
+  var brazier_ys = vec_new<Int>()
+  if rooms.size > 2
+    i = 1
+    while i < rooms.size - 1
+      if i != boss_room_idx
+        var r = rooms[i]
+        var bx = rect_cx(r)
+        var by = rect_cy(r)
+        brazier_xs.push(bx)
+        brazier_ys.push(by)
+      end
+      i += 1
+    end
+  end
+  var first = rooms[0]
+  var last = rooms[rooms.size - 1]
+  var px = rect_cx(first)
+  var py = rect_cy(first)
+  var sx = rect_cx(last)
+  var sy = rect_cy(last)
+  # Spawn monsters in middle rooms. Each gets a small jitter from the
+  # room centre so they don't all start on the brazier. Per-spawn kind
+  # picked floor-scaled (early floors mostly rats; late floors get more
+  # orcs) — see `pick_monster_kind`. The boss room (if any) is skipped
+  # entirely; a single Boss is appended after this loop at the room's
+  # centre.
+  var mxs = vec_new<Int>()
+  var mys = vec_new<Int>()
+  var mhps = vec_new<Int>()
+  var mkinds = vec_new<Int>()
+  if rooms.size > 2
+    var spawned = 0
+    var ri = 1
+    while ri < rooms.size - 1 and spawned < MONSTERS_PER_FLOOR()
+      if ri != boss_room_idx
+        var r = rooms[ri]
+        var jx = rand_range_op(-1, 2)
+        var jy = rand_range_op(-1, 2)
+        var mx = rect_cx(r) + jx
+        var my = rect_cy(r) + jy
+        # Don't overlap brazier exactly — bump x by 1 if so.
+        if mx == rect_cx(r) and my == rect_cy(r)
+          mx += 1
+        end
+        # Make sure the cell is floor (BSP can produce thin rooms where
+        # a 1-cell jitter lands in a wall).
+        if mx > 0 and my > 0 and mx < dw - 1 and my < dh - 1 and not walls[world_idx(mx, my)]
+          var kind = pick_monster_kind(floor_num)
+          mxs.push(mx)
+          mys.push(my)
+          mhps.push(monster_max_hp(kind))
+          mkinds.push(kind)
+          spawned += 1
+        end
+      end
+      ri += 1
+    end
+  end
+  # Boss spawn (v0.11 A.4). Append exactly one Boss at the centre of
+  # the tagged boss room, no jitter — the centre is guaranteed floor
+  # by `room_in_leaf` (the carved room is a solid rect).
+  var boss_alive_in = false
+  if boss_room_idx >= 0
+    var br = rooms[boss_room_idx]
+    var bmx = rect_cx(br)
+    var bmy = rect_cy(br)
+    if bmx > 0 and bmy > 0 and bmx < dw - 1 and bmy < dh - 1 and not walls[world_idx(bmx, bmy)]
+      mxs.push(bmx)
+      mys.push(bmy)
+      mhps.push(monster_max_hp(MONSTER_BOSS()))
+      mkinds.push(MONSTER_BOSS())
+      boss_alive_in = true
+    end
+  end
+  var hp_in    = 15
+  var hp_max_in = 15
+  var torch_in  = true
+  var theme_in  = 0
+  # Default 20%. Anything higher washes the warm-flicker dungeon look
+  # into a flat lit-stadium effect; user ergonomic data confirms 20%
+  # reads as "dungeon at night with a glow." +/- in the live UI lets
+  # players push past the default if they want more brightness.
+  var light_pct_in = 20
+  var gold_in = 0
+  var dmg_bonus_in = 0
+  var kills_total_in = 0
+  var turns_in = 0
+  if floor_num > 1
+    hp_in           = prev.hp
+    hp_max_in       = prev.hp_max
+    torch_in        = prev.torch_on
+    theme_in        = prev.theme_idx
+    light_pct_in    = prev.light_pct
+    gold_in         = prev.gold
+    dmg_bonus_in    = prev.damage_bonus
+    kills_total_in  = prev.kills_total
+    turns_in        = prev.turns
+  end
+  # Spawn items in middle rooms, avoiding occupied cells. Mostly gold
+  # with a sprinkle of scrolls and weapons — replayability without
+  # turning the dungeon into a yard sale.
+  var item_types = vec_new<Int>()
+  var item_xs = vec_new<Int>()
+  var item_ys = vec_new<Int>()
+  var item_values = vec_new<Int>()
+  if rooms.size > 2
+    var spawned = 0
+    var attempts = 0
+    while spawned < ITEMS_PER_FLOOR() and attempts < 50
+      attempts += 1
+      var room_pick = rand_range_op(1, rooms.size - 1)
+      var room = rooms[room_pick]
+      var ix = room.x + rand_range_op(0, room.w)
+      var iy = room.y + rand_range_op(0, room.h)
+      if ix > 0 and iy > 0 and ix < dw - 1 and iy < dh - 1 and not walls[world_idx(ix, iy)]
+        var occupied = false
+        if ix == px and iy == py
+          occupied = true
+        end
+        if ix == sx and iy == sy
+          occupied = true
+        end
+        var bk = 0
+        while bk < brazier_xs.size
+          if ix == brazier_xs[bk] and iy == brazier_ys[bk]
+            occupied = true
+          end
+          bk += 1
+        end
+        var mk = 0
+        while mk < mxs.size
+          if ix == mxs[mk] and iy == mys[mk]
+            occupied = true
+          end
+          mk += 1
+        end
+        var ik = 0
+        while ik < item_xs.size
+          if ix == item_xs[ik] and iy == item_ys[ik]
+            occupied = true
+          end
+          ik += 1
+        end
+        if not occupied
+          # Item type roll: 60% gold, 25% heal, 15% weapon.
+          var roll = rand_range_op(0, 100)
+          var itype = ITEM_GOLD()
+          var ivalue = rand_range_op(GOLD_MIN(), GOLD_MAX() + 1)
+          if roll >= 60 and roll < 85
+            itype = ITEM_HEAL()
+            ivalue = HEAL_AMOUNT()
+          end
+          if roll >= 85
+            itype = ITEM_WEAPON()
+            ivalue = WEAPON_BONUS()
+          end
+          item_types.push(itype)
+          item_xs.push(ix)
+          item_ys.push(iy)
+          item_values.push(ivalue)
+          spawned += 1
+        end
+      end
+    end
+  end
+  # Filter doors that landed on player / stairs / brazier / monster /
+  # item cells — those need to be unblocked at game start.
+  var clean_door_indices = vec_new<Int>()
+  var clean_door_open = vec_new<Bool>()
+  var di = 0
+  while di < door_indices.size
+    var didx = door_indices[di]
+    var dx_d = didx % dw
+    var dy_d = didx / dw
+    var conflict = false
+    if dx_d == px and dy_d == py
+      conflict = true
+    end
+    if dx_d == sx and dy_d == sy
+      conflict = true
+    end
+    var bk = 0
+    while bk < brazier_xs.size
+      if dx_d == brazier_xs[bk] and dy_d == brazier_ys[bk]
+        conflict = true
+      end
+      bk += 1
+    end
+    var mk = 0
+    while mk < mxs.size
+      if dx_d == mxs[mk] and dy_d == mys[mk]
+        conflict = true
+      end
+      mk += 1
+    end
+    if not conflict
+      clean_door_indices.push(didx)
+      clean_door_open.push(false)
+    end
+    di += 1
+  end
+  return World {
+    walls:        walls,
+    player_x:     px,
+    player_y:     py,
+    stairs_x:     sx,
+    stairs_y:     sy,
+    brazier_xs:   brazier_xs,
+    brazier_ys:   brazier_ys,
+    monster_xs:   mxs,
+    monster_ys:   mys,
+    monster_hps:  mhps,
+    monster_kinds: mkinds,
+    door_indices: clean_door_indices,
+    door_open:    clean_door_open,
+    item_types:   item_types,
+    item_xs:      item_xs,
+    item_ys:      item_ys,
+    item_values:  item_values,
+    torch_on:     torch_in,
+    theme_idx:    theme_in,
+    hp:           hp_in,
+    hp_max:       hp_max_in,
+    gold:         gold_in,
+    damage_bonus: dmg_bonus_in,
+    floor:        floor_num,
+    frame:        0,
+    visited:      visited,
+    visible:      visible,
+    biome_map:    biome_map,
+    light_pct:    light_pct_in,
+    dead:         false,
+    won:          false,
+    boss_alive:   boss_alive_in,
+    log:          "",
+    kills_total:  kills_total_in,
+    kills_floor:  0,
+    turns:        turns_in,
+    particle_xs:        vec_new<Int>(),
+    particle_ys:        vec_new<Int>(),
+    particle_glyphs:    vec_new<String>(),
+    particle_die_frame: vec_new<Int>(),
+    flash_xs: vec_new<Int>(),
+    flash_ys: vec_new<Int>(),
+    help_open: false
+  }
+end
+
+## Bootstrap a brand new game at floor 1.
+def world_init(): World
+  var dummy = World {
+    walls:        vec_new<Bool>(),
+    player_x:     0,
+    player_y:     0,
+    stairs_x:     0,
+    stairs_y:     0,
+    brazier_xs:   vec_new<Int>(),
+    brazier_ys:   vec_new<Int>(),
+    monster_xs:   vec_new<Int>(),
+    monster_ys:   vec_new<Int>(),
+    monster_hps:  vec_new<Int>(),
+    monster_kinds: vec_new<Int>(),
+    door_indices: vec_new<Int>(),
+    door_open:    vec_new<Bool>(),
+    item_types:   vec_new<Int>(),
+    item_xs:      vec_new<Int>(),
+    item_ys:      vec_new<Int>(),
+    item_values:  vec_new<Int>(),
+    torch_on:     true,
+    theme_idx:    0,
+    hp:           15,
+    hp_max:       15,
+    gold:         0,
+    damage_bonus: 0,
+    floor:        0,
+    frame:        0,
+    visited:      vec_new<Bool>(),
+    visible:      vec_new<Bool>(),
+    biome_map:    vec_new<Int>(),
+    light_pct:    20,
+    dead:         false,
+    won:          false,
+    boss_alive:   false,
+    log:          "",
+    kills_total:  0,
+    kills_floor:  0,
+    turns:        0,
+    particle_xs:        vec_new<Int>(),
+    particle_ys:        vec_new<Int>(),
+    particle_glyphs:    vec_new<String>(),
+    particle_die_frame: vec_new<Int>(),
+    flash_xs: vec_new<Int>(),
+    flash_ys: vec_new<Int>(),
+    help_open: false
+  }
+  return world_init_floor(dummy, 1)
+end
+
+## Find the door index at (x, y), or -1 if no door. Linear scan; door
+## counts are tiny (~5-15 per dungeon) so this is fine.
+def door_at(w: World, x: Int, y: Int): Int
+  var idx = world_idx(x, y)
+  var i = 0
+  while i < w.door_indices.size
+    if w.door_indices[i] == idx
+      return i
+    end
+    i += 1
+  end
+  return -1
+end
+
+## True iff the cell is a wall, OR a closed door. Open doors are
+## walkable. FOV + monster movement both query this — closed doors
+## block sightlines and pathing alike.
+def is_wall(w: World, x: Int, y: Int): Bool
+  if x < 0 or y < 0 or x >= DUNG_W() or y >= DUNG_H()
+    return true
+  end
+  if w.walls[world_idx(x, y)]
+    return true
+  end
+  var di = door_at(w, x, y)
+  if di >= 0 and not w.door_open[di]
+    return true
+  end
+  return false
+end
+
+## Open the door at (x, y), if there is one. Returns the new world.
+def world_open_door(w: World, x: Int, y: Int): World
+  var di = door_at(w, x, y)
+  if di < 0
+    return w
+  end
+  var new_open = vec_new<Bool>()
+  var i = 0
+  while i < w.door_open.size
+    new_open.push(w.door_open[i])
+    i += 1
+  end
+  new_open[di] = true
+  return World { ...w, door_open: new_open, log: "You open the door.",
+                 turns: w.turns + 1 }
+end
+
+# =============================================================================
+# State transitions — every helper returns a fresh World via spread
+# =============================================================================
+#
+# Every state-transition function uses C.1 struct update syntax
+# (`World { ...w, k: v }`) — the parser-level desugar copies all
+# missing fields from `w`. The previous v0.9 codebase had a bespoke
+# `world_with` helper that took 8 positional Int/Bool/Vec arguments
+# and returned a 35-field World literal; v0.10 deletes it entirely
+# and lets each call-site name only the fields it actually changes.
+
+## Movement is now `world_player_move` (handles bump-attack); kept as a
+## thin alias so the main loop keeps reading naturally.
+def world_move(w: World, dx: Int, dy: Int): World
+  return world_player_move(w, dx, dy)
+end
+
+def world_with_theme(w: World, idx: Int): World
+  return World { ...w, theme_idx: idx }
+end
+
+def world_toggle_torch(w: World): World
+  return World { ...w, torch_on: not w.torch_on }
+end
+
+## Adjust light intensity. Clamped to [20, 200] so consumers can
+## brighten or dim without going to zero (which would erase all
+## torchlight) or running away into burn-out.
+def world_with_light_pct(w: World, pct: Int): World
+  var p = pct
+  if p < 20
+    p = 20
+  end
+  if p > 200
+    p = 200
+  end
+  return World { ...w, light_pct: p }
+end
+
+# =============================================================================
+# Combat — bump-to-attack + tick-driven monster wandering
+# =============================================================================
+
+## Helper: clone an Int Vec (Quartz Vecs don't have a builtin copy).
+def clone_int_vec(src: Vec<Int>): Vec<Int>
+  var out = vec_new<Int>()
+  var i = 0
+  while i < src.size
+    out.push(src[i])
+    i += 1
+  end
+  return out
+end
+
+def clone_string_vec(src: Vec<String>): Vec<String>
+  var out = vec_new<String>()
+  var i = 0
+  while i < src.size
+    out.push(src[i])
+    i += 1
+  end
+  return out
+end
+
+## Spawn 4-6 short-lived debris particles at (cx, cy). Each particle
+## carries a `*`/`'`/`,`/`.` glyph and a die_frame at frame +
+## PARTICLE_LIFETIME. Renderer fades them across the lifetime.
+def spawn_death_particles(w: World, cx: Int, cy: Int): World
+  var px = clone_int_vec(w.particle_xs)
+  var py = clone_int_vec(w.particle_ys)
+  var pg = clone_string_vec(w.particle_glyphs)
+  var pd = clone_int_vec(w.particle_die_frame)
+  var count = 4 + rand_range_op(0, 3)
+  var die_at = w.frame + PARTICLE_LIFETIME()
+  var i = 0
+  while i < count
+    var ox = rand_range_op(-1, 2)
+    var oy = rand_range_op(-1, 2)
+    var gx = cx + ox
+    var gy = cy + oy
+    if gx >= 0 and gy >= 0 and gx < DUNG_W() and gy < DUNG_H()
+      px.push(gx)
+      py.push(gy)
+      var pick = rand_range_op(0, 4)
+      var glyph = "*"
+      if pick == 1
+        glyph = "'"
+      end
+      if pick == 2
+        glyph = ","
+      end
+      if pick == 3
+        glyph = "."
+      end
+      pg.push(glyph)
+      pd.push(die_at)
+    end
+    i += 1
+  end
+  return World { ...w, particle_xs: px, particle_ys: py,
+                 particle_glyphs: pg, particle_die_frame: pd }
+end
+
+## Tick-driven cleanup: drop any particles whose die_frame == new frame
+## (the upcoming frame). Returns three new parallel vecs.
+def evict_expired_particles(w: World, new_frame: Int): World
+  var px = vec_new<Int>()
+  var py = vec_new<Int>()
+  var pg = vec_new<String>()
+  var pd = vec_new<Int>()
+  var i = 0
+  while i < w.particle_xs.size
+    if w.particle_die_frame[i] > new_frame
+      px.push(w.particle_xs[i])
+      py.push(w.particle_ys[i])
+      pg.push(w.particle_glyphs[i])
+      pd.push(w.particle_die_frame[i])
+    end
+    i += 1
+  end
+  return World { ...w, particle_xs: px, particle_ys: py,
+                 particle_glyphs: pg, particle_die_frame: pd,
+                 flash_xs: vec_new<Int>(), flash_ys: vec_new<Int>() }
+end
+
+## Find the item index at (x, y), or -1 if no item.
+def item_at(w: World, x: Int, y: Int): Int
+  var i = 0
+  while i < w.item_xs.size
+    if w.item_xs[i] == x and w.item_ys[i] == y
+      return i
+    end
+    i += 1
+  end
+  return -1
+end
+
+## Drop a single item from the parallel arrays at index `i`. Used by
+## the pickup path. Each parallel array is cloned-minus-one via
+## `vec_remove_at` from std/vec.
+def world_remove_item(w: World, i: Int): World
+  return World { ...w,
+                 item_types:  vec_remove_at(w.item_types, i),
+                 item_xs:     vec_remove_at(w.item_xs, i),
+                 item_ys:     vec_remove_at(w.item_ys, i),
+                 item_values: vec_remove_at(w.item_values, i) }
+end
+
+## Apply the effect of the item at index `i` (gold counter / heal /
+## weapon bonus), then remove the item from the world. Sets `log` to
+## a player-facing pickup message.
+def world_pickup_item(w: World, i: Int): World
+  var itype = w.item_types[i]
+  var ivalue = w.item_values[i]
+  var new_hp = w.hp
+  var new_gold = w.gold
+  var new_dmg = w.damage_bonus
+  var msg = ""
+  if itype == ITEM_GOLD()
+    new_gold = w.gold + ivalue
+    msg = "You pick up "
+    var sb = sb_new()
+    sb.append(msg)
+    sb.append(ivalue.to_s())
+    sb.append(" gold pieces.")
+    msg = sb.to_string()
+  end
+  if itype == ITEM_HEAL()
+    new_hp = w.hp + ivalue
+    if new_hp > w.hp_max
+      new_hp = w.hp_max
+    end
+    msg = "You drink a healing potion. (HP +"
+    var sb = sb_new()
+    sb.append(msg)
+    sb.append(ivalue.to_s())
+    sb.append(")")
+    msg = sb.to_string()
+  end
+  if itype == ITEM_WEAPON()
+    new_dmg = w.damage_bonus + ivalue
+    msg = "You find a sharper weapon. (+"
+    var sb = sb_new()
+    sb.append(msg)
+    sb.append(ivalue.to_s())
+    sb.append(" damage)")
+    msg = sb.to_string()
+  end
+  # Build the post-pickup world with mutated stat fields, then remove
+  # the item from the parallel arrays.
+  var with_stats = World { ...w, hp: new_hp, gold: new_gold,
+                           damage_bonus: new_dmg, log: msg }
+  return world_remove_item(with_stats, i)
+end
+
+## Find the index of a living monster at (x, y), or -1 if no monster.
+def monster_at(w: World, x: Int, y: Int): Int
+  var i = 0
+  while i < w.monster_xs.size
+    if w.monster_hps[i] > 0 and w.monster_xs[i] == x and w.monster_ys[i] == y
+      return i
+    end
+    i += 1
+  end
+  return -1
+end
+
+## Same as monster_at but operates on parallel arrays under
+## construction (used during the monster-tick where the canonical
+## world.monster_* are stale).
+def monster_at_arrays(xs: Vec<Int>, ys: Vec<Int>, hps: Vec<Int>,
+                       skip_i: Int, x: Int, y: Int): Int
+  var i = 0
+  while i < xs.size
+    if i != skip_i and hps[i] > 0 and xs[i] == x and ys[i] == y
+      return i
+    end
+    i += 1
+  end
+  return -1
+end
+
+## Player tries to move into (nx, ny). Three outcomes:
+##   1. Wall or out-of-bounds → no-op (return w unchanged).
+##   2. Cell holds a living monster → bump attack: monster takes
+##      PLAYER_ATK + damage_bonus; player stays put; log message
+##      reflects hit/kill.
+##   3. Empty floor → player moves.
+##
+## Always re-runs the monster step after — every player action is a
+## "turn," and the world advances once the player commits.
+def world_player_move(w: World, dx: Int, dy: Int): World
+  if w.dead or w.won
+    return w
+  end
+  var nx = w.player_x + dx
+  var ny = w.player_y + dy
+  # Closed door — bump opens it. Player stays put for the turn (the
+  # turn cost is the price of opening). Subsequent moves walk through.
+  var di = door_at(w, nx, ny)
+  if di >= 0 and not w.door_open[di]
+    return world_open_door(w, nx, ny)
+  end
+  if is_wall(w, nx, ny)
+    return w
+  end
+  var mi = monster_at(w, nx, ny)
+  if mi >= 0
+    var new_hps = clone_int_vec(w.monster_hps)
+    new_hps[mi] = w.monster_hps[mi] - (PLAYER_ATK() + w.damage_bonus)
+    var killed = new_hps[mi] <= 0
+    var killed_kind = w.monster_kinds[mi]
+    var msg = "You hit the monster."
+    if killed
+      msg = "You kill the monster!"
+      if killed_kind == MONSTER_BOSS()
+        msg = "You slay the boss! The stairs are revealed."
+      end
+    end
+    var new_kills_total = w.kills_total
+    var new_kills_floor = w.kills_floor
+    if killed
+      new_kills_total += 1
+      new_kills_floor += 1
+    end
+    var new_boss_alive = w.boss_alive
+    if killed and killed_kind == MONSTER_BOSS()
+      new_boss_alive = false
+    end
+    # Flash the monster's cell red on hit. One frame.
+    var fxs = clone_int_vec(w.flash_xs)
+    var fys = clone_int_vec(w.flash_ys)
+    fxs.push(nx)
+    fys.push(ny)
+    var won = w.won
+    if new_kills_total >= VICTORY_KILLS()
+      won = true
+    end
+    var hit_world = World { ...w, monster_hps: new_hps, won: won, log: msg,
+                            kills_total: new_kills_total,
+                            kills_floor: new_kills_floor,
+                            boss_alive: new_boss_alive,
+                            turns: w.turns + 1, flash_xs: fxs, flash_ys: fys }
+    if killed
+      return spawn_death_particles(hit_world, nx, ny)
+    end
+    return hit_world
+  end
+  # Item pickup: walking onto an item cell consumes it and applies
+  # the effect. Player still moves into the now-empty cell.
+  var ii = item_at(w, nx, ny)
+  var moved = World { ...w, player_x: nx, player_y: ny, turns: w.turns + 1 }
+  if ii >= 0
+    return world_pickup_item(moved, ii)
+  end
+  return moved
+end
+
+## Advance every monster by one step. Three behaviours per monster:
+##
+##   1. Adjacent to player → attack (deal `monster_dmg(kind)`).
+##   2. Player-visible (in FOV → so they see us, symmetric) → BFS
+##      pathfind one step toward the player. Closed doors block.
+##   3. Otherwise → random walk one step.
+##
+## Per-kind action cadence: a monster only acts when `w.frame %
+## monster_act_period(kind) == 0`. Rats (period 2) act on every even
+## frame; goblins (period 4) every fourth frame; orcs (period 8)
+## every eighth. The world tick callback calls this every frame —
+## the inner loop gates each monster individually.
+##
+## Player HP can drop to zero on attack — sets `dead=true` so the
+## main loop knows to render the game-over screen.
+def world_step_monsters(w: World): World
+  if w.dead or w.won or w.monster_xs.size == 0
+    return w
+  end
+  var new_xs  = clone_int_vec(w.monster_xs)
+  var new_ys  = clone_int_vec(w.monster_ys)
+  var new_hps = clone_int_vec(w.monster_hps)
+  var new_hp = w.hp
+  var new_log = w.log
+  var any_attack = false
+  var i = 0
+  while i < new_xs.size
+    if new_hps[i] > 0
+      var kind = w.monster_kinds[i]
+      # Skip this monster if its action cadence doesn't fire this
+      # frame. Rats act every 2 frames; goblins every 4; orcs every 8.
+      var period = monster_act_period(kind)
+      var should_act = w.frame > 0 and (w.frame % period) == 0
+      if should_act
+        var mx = new_xs[i]
+        var my = new_ys[i]
+        var ddx = w.player_x - mx
+        var ddy = w.player_y - my
+        var abs_dx = ddx
+        if abs_dx < 0
+          abs_dx = -abs_dx
+        end
+        var abs_dy = ddy
+        if abs_dy < 0
+          abs_dy = -abs_dy
+        end
+        var adj = abs_dx <= 1 and abs_dy <= 1 and (abs_dx + abs_dy) > 0
+        if adj
+          # Attack: deal kind-scaled damage to player.
+          new_hp = new_hp - monster_dmg(kind)
+          any_attack = true
+        else
+          # Pick a direction. Awake monsters (in player's FOV — symmetric,
+          # so they see us if we see them) BFS-pathfind toward the player.
+          # Asleep monsters wander.
+          var dir = -1
+          var monster_idx = my * DUNG_W() + mx
+          var awake = w.visible[monster_idx]
+          if awake
+            var blocks: Fn(Int, Int): Bool = (x: Int, y: Int) -> {
+              return is_wall(w, x, y)
+            }
+            dir = bfs::bfs_step(DUNG_W(), DUNG_H(), mx, my,
+                                w.player_x, w.player_y, blocks)
+          end
+          if dir < 0
+            dir = rand_range_op(0, 4)
+          end
+          var ndx = 0
+          var ndy = 0
+          if dir == 0
+            ndx = -1
+          end
+          if dir == 1
+            ndx = 1
+          end
+          if dir == 2
+            ndy = -1
+          end
+          if dir == 3
+            ndy = 1
+          end
+          var nmx = mx + ndx
+          var nmy = my + ndy
+          var blocked = false
+          if is_wall(w, nmx, nmy)
+            blocked = true
+          end
+          if nmx == w.player_x and nmy == w.player_y
+            blocked = true
+          end
+          if monster_at_arrays(new_xs, new_ys, new_hps, i, nmx, nmy) >= 0
+            blocked = true
+          end
+          if not blocked
+            new_xs[i] = nmx
+            new_ys[i] = nmy
+          end
+        end
+      end
+    end
+    i += 1
+  end
+  var dead = new_hp <= 0
+  if dead
+    new_hp = 0
+    new_log = "You die!"
+  end
+  if any_attack and not dead
+    new_log = "Monster bites you!"
+  end
+  # Flash the player's cell red on monster hit. One frame.
+  var fxs = clone_int_vec(w.flash_xs)
+  var fys = clone_int_vec(w.flash_ys)
+  if any_attack
+    fxs.push(w.player_x)
+    fys.push(w.player_y)
+  end
+  return World { ...w, monster_xs: new_xs, monster_ys: new_ys,
+                 monster_hps: new_hps, hp: new_hp, dead: dead,
+                 log: new_log, flash_xs: fxs, flash_ys: fys }
+end
+
+## A pure tick: advance the frame counter (so flicker hash advances)
+## and step every monster. Per-kind cadence is gated inside
+## `world_step_monsters` — rats act every 2 frames, goblins every 4,
+## orcs every 8. Frame ticks are the only "background" actions that
+## happen between keystrokes.
+##
+## Tick-driven cleanup: particles whose die_frame == new frame are
+## evicted; the one-frame hit-flash overlay is cleared every tick.
+def world_tick(w: World): World
+  # Clear last-frame's hit-flash + age-out particles BEFORE running the
+  # monster step. This way any flash/particle the monster step pushes
+  # this tick is preserved for the next render frame; only flashes
+  # from the previous tick get cleared.
+  if w.help_open
+    return w
+  end
+  var cleaned = evict_expired_particles(w, w.frame + 1)
+  var stepped = world_step_monsters(cleaned)
+  return World { ...stepped, frame: stepped.frame + 1 }
+end
+
+## Descend if the player is on the stairs; otherwise no-op. If the
+## current floor is a boss floor and the boss is still alive, the
+## stairs are sealed — descent is a no-op. If the descent would reach
+## the victory floor AND its boss is dead, flag won=true and stay put;
+## the main loop renders the YOU WIN overlay on the next frame.
+def world_descend(w: World): World
+  if w.player_x != w.stairs_x or w.player_y != w.stairs_y
+    return w
+  end
+  # Stairs sealed while boss alive. boss_alive is only true on boss
+  # floors so this is a no-op everywhere else.
+  if w.boss_alive
+    return World { ...w, log: "The stairs are sealed. Defeat the boss first." }
+  end
+  var next_floor = w.floor + 1
+  if next_floor >= VICTORY_FLOOR()
+    return World { ...w, floor: next_floor, won: true,
+                   log: "You escape the dungeon!", turns: w.turns + 1 }
+  end
+  return world_init_floor(w, next_floor)
+end
+
+# =============================================================================
+# FOV — drive Phase 6.5's symmetric shadowcasting from the player
+# =============================================================================
+
+def world_compute_fov(w: World): World
+  var dw = DUNG_W()
+  var dh = DUNG_H()
+  var n = dw * dh
+  var new_visible = vec_new<Bool>()
+  var new_visited = vec_new<Bool>()
+  var i = 0
+  while i < n
+    new_visible.push(false)
+    new_visited.push(w.visited[i])
+    i += 1
+  end
+  var blocks: Fn(Int, Int): Bool = (x: Int, y: Int) -> {
+    return is_wall(w, x, y)
+  }
+  var visit: Fn(Int, Int, Int): Void = (x: Int, y: Int, dist: Int) -> {
+    if x < 0 or y < 0 or x >= dw or y >= dh
+      return
+    end
+    var idx = y * dw + x
+    new_visible[idx] = true
+    new_visited[idx] = true
+  }
+  fv::fov_for_each_visible(w.player_x, w.player_y,
+                            PLAYER_FOV_RADIUS(), blocks, visit)
+  return World { ...w, visible: new_visible, visited: new_visited,
+                 frame: w.frame + 1 }
+end
+
+# =============================================================================
+# Theme cycle — index the Phase 6.8 bundle
+# =============================================================================
+
+def theme_for_idx(i: Int): th::Theme
+  if i == 0
+    return th::theme_catppuccin_mocha()
+  end
+  if i == 1
+    return th::theme_catppuccin_latte()
+  end
+  if i == 2
+    return th::theme_gruvbox_dark_hard()
+  end
+  if i == 3
+    return th::theme_gruvbox_light_hard()
+  end
+  if i == 4
+    return th::theme_tokyo_night_dark()
+  end
+  if i == 5
+    return th::theme_nord()
+  end
+  if i == 6
+    return th::theme_dracula()
+  end
+  if i == 7
+    return th::theme_solarized_dark()
+  end
+  if i == 8
+    return th::theme_solarized_light()
+  end
+  if i == 9
+    return th::theme_rose_pine_moon()
+  end
+  return th::theme_everforest_dark()
+end
+
+# =============================================================================
+# Plane builders — one per UI region, composed by build_back
+# =============================================================================
+
+def write_ascii_row(p: pl::Plane, s: String, col: Int,
+                    fg: cl::Channel, bg: cl::Channel, attrs: Int): pl::Plane
+  var out = p
+  var len = str_byte_len(s)
+  var i = 0
+  while i < len
+    var c = str_byte_at(s, i)
+    var cell = cl::Cell {
+      egc:   str_from_char(c),
+      fg:    fg,
+      bg:    bg,
+      attrs: attrs
+    }
+    out = pl::plane_putc(out, col + i, 0, cell)
+    i += 1
+  end
+  return out
+end
+
+## Per-biome floor colour. Walls stay neutral (`base05`) across all
+## biomes — but each room's floor takes a biome-tinted hue, so walking
+## from a stone room into a mossy room or a wet grotto is a visible
+## colour shift. Combined with the per-biome floor textures the rooms
+## now have a real sense of place.
+def biome_floor_color(t: th::Theme, biome: Int): Int
+  if biome == BIOME_MOSSY()
+    return t.base0B
+  end
+  if biome == BIOME_CRACKED()
+    return t.base09
+  end
+  if biome == BIOME_WET()
+    return t.base0C
+  end
+  return t.base04
+end
+
+## Build the dungeon plane: walls / floor / doors / brazier / stairs /
+## player glyphs with theme-driven channels, biome-tinted floor
+## colours, and FOV-aware visibility.
+def build_dungeon_plane(w: World, t: th::Theme): pl::Plane
+  var dw = DUNG_W()
+  var dh = DUNG_H()
+  var p = pl::plane_create(dw, dh)
+  var bg       = cl::channel_rgb(t.base00)
+  var fg_wall  = cl::channel_rgb(t.base05)
+  # Memory color one shade darker than `base02` for sharper contrast
+  # against lit-current-FOV cells. base01 is the "status bar bg" slot
+  # in the Base16 spec — almost-black on dark themes, almost-white on
+  # light themes — exactly the "barely-visible memory" look we want.
+  var fg_dim   = cl::channel_rgb(t.base01)
+  var blank    = cl::Cell { egc: " ", fg: bg, bg: bg, attrs: 0 }
+  p = pl::plane_fill(p, blank)
+
+  var y = 0
+  while y < dh
+    var x = 0
+    while x < dw
+      var idx = world_idx(x, y)
+      var seen   = w.visited[idx]
+      var in_fov = w.visible[idx]
+      if seen
+        var biome = w.biome_map[idx]
+        var glyph = floor_glyph(x, y, biome)
+        if w.walls[idx]
+          glyph = "#"
+        end
+        var fg = fg_dim
+        var attrs = cl::CELL_ATTR_DIM()
+        if in_fov
+          if w.walls[idx]
+            fg = fg_wall
+          else
+            fg = cl::channel_rgb(biome_floor_color(t, biome))
+          end
+          attrs = 0
+        end
+        var cell = cl::Cell {
+          egc:   glyph,
+          fg:    fg,
+          bg:    bg,
+          attrs: attrs
+        }
+        p = pl::plane_putc(p, x, y, cell)
+      end
+      x += 1
+    end
+    y += 1
+  end
+
+  # Doors — `+` (closed) or `'` (open). Distinct yellow accent so they
+  # pop against the room's biome-tinted floor.
+  var dn = w.door_indices.size
+  var ddi = 0
+  while ddi < dn
+    var didx = w.door_indices[ddi]
+    if w.visited[didx]
+      var dxx = didx % dw
+      var dyy = didx / dw
+      var glyph = "+"
+      if w.door_open[ddi]
+        glyph = "'"
+      end
+      var door_attrs = cl::CELL_ATTR_BOLD()
+      var door_fg = cl::channel_rgb(t.base0A)
+      if not w.visible[didx]
+        door_attrs = cl::CELL_ATTR_DIM()
+        door_fg = cl::channel_rgb(t.base01)
+      end
+      var door_cell = cl::Cell {
+        egc:   glyph,
+        fg:    door_fg,
+        bg:    bg,
+        attrs: door_attrs
+      }
+      p = pl::plane_putc(p, dxx, dyy, door_cell)
+    end
+    ddi += 1
+  end
+
+  # Stairs `>` — bright cyan when in FOV, dim when only visited.
+  # Boss-floor gate (v0.11 A.4): while boss_alive, the stairs render
+  # as `X` in red so the player can see "there is something here, but
+  # it's not yet usable" instead of an invisible-stairs trap. Once the
+  # boss is dead, normal `>` rendering returns.
+  var stairs_idx = world_idx(w.stairs_x, w.stairs_y)
+  if w.visited[stairs_idx]
+    var stairs_attrs = cl::CELL_ATTR_BOLD()
+    var stairs_fg = cl::channel_rgb(t.base0C)
+    var stairs_glyph = ">"
+    if w.boss_alive
+      stairs_glyph = "X"
+      stairs_fg = cl::channel_rgb(t.base08)
+    end
+    if not w.visible[stairs_idx]
+      stairs_attrs = cl::CELL_ATTR_DIM()
+      stairs_fg = cl::channel_rgb(t.base02)
+    end
+    var stairs_cell = cl::Cell {
+      egc:   stairs_glyph,
+      fg:    stairs_fg,
+      bg:    bg,
+      attrs: stairs_attrs
+    }
+    p = pl::plane_putc(p, w.stairs_x, w.stairs_y, stairs_cell)
+  end
+
+  # Braziers — only visible when in FOV.
+  var bn = w.brazier_xs.size
+  var bi = 0
+  while bi < bn
+    var bx = w.brazier_xs[bi]
+    var by = w.brazier_ys[bi]
+    if w.visible[world_idx(bx, by)]
+      var br = cl::Cell {
+        egc:   "!",
+        fg:    cl::channel_rgb(t.base09),
+        bg:    bg,
+        attrs: cl::CELL_ATTR_BOLD()
+      }
+      p = pl::plane_putc(p, bx, by, br)
+    end
+    bi += 1
+  end
+
+  # Items — `$` gold (yellow), `?` heal scroll (green), `(` weapon (cyan).
+  # Only render when in FOV (memory of items would be misleading since
+  # they get picked up on contact).
+  var inn = w.item_xs.size
+  var ii = 0
+  while ii < inn
+    var ix = w.item_xs[ii]
+    var iy = w.item_ys[ii]
+    if w.visible[world_idx(ix, iy)]
+      var iglyph = "$"
+      var icolor = cl::channel_rgb(t.base0A)
+      var itype = w.item_types[ii]
+      if itype == ITEM_HEAL()
+        iglyph = "?"
+        icolor = cl::channel_rgb(t.base0B)
+      end
+      if itype == ITEM_WEAPON()
+        iglyph = "("
+        icolor = cl::channel_rgb(t.base0C)
+      end
+      var icell = cl::Cell {
+        egc:   iglyph,
+        fg:    icolor,
+        bg:    bg,
+        attrs: cl::CELL_ATTR_BOLD()
+      }
+      p = pl::plane_putc(p, ix, iy, icell)
+    end
+    ii += 1
+  end
+
+  # Monsters — per-kind glyph (`r`/`g`/`o`) + color, only visible when
+  # in FOV. Bold for orcs only (extra visual heft for the heaviest
+  # archetype).
+  var mn = w.monster_xs.size
+  var mi = 0
+  while mi < mn
+    if w.monster_hps[mi] > 0
+      var mx = w.monster_xs[mi]
+      var my = w.monster_ys[mi]
+      if w.visible[world_idx(mx, my)]
+        var kind = w.monster_kinds[mi]
+        var m_attrs = 0
+        if monster_bold(kind)
+          m_attrs = cl::CELL_ATTR_BOLD()
+        end
+        var monster = cl::Cell {
+          egc:   monster_glyph(kind),
+          fg:    monster_color(kind, t),
+          bg:    bg,
+          attrs: m_attrs
+        }
+        p = pl::plane_putc(p, mx, my, monster)
+      end
+    end
+    mi += 1
+  end
+
+  # Player — always shown (they're at the camera origin).
+  var pl_cell = cl::Cell {
+    egc:   "@",
+    fg:    cl::channel_rgb(t.base0E),
+    bg:    bg,
+    attrs: cl::CELL_ATTR_BOLD()
+  }
+  p = pl::plane_putc(p, w.player_x, w.player_y, pl_cell)
+
+  # Death-debris particles (v0.9 A.2). Each particle's age in ticks
+  # decides its color: youngest = red (base08), middle = orange
+  # (base09), oldest = dim (base02). Glyph cycled with age too.
+  var pn = w.particle_xs.size
+  var pi = 0
+  while pi < pn
+    var pxc = w.particle_xs[pi]
+    var pyc = w.particle_ys[pi]
+    if pxc >= 0 and pyc >= 0 and pxc < DUNG_W() and pyc < DUNG_H()
+      var ttl = w.particle_die_frame[pi] - w.frame
+      if ttl < 0
+        ttl = 0
+      end
+      var pcolor = t.base02
+      if ttl >= PARTICLE_LIFETIME() * 2 / 3
+        pcolor = t.base08
+      else
+        if ttl >= PARTICLE_LIFETIME() / 3
+          pcolor = t.base09
+        end
+      end
+      var part_cell = cl::Cell {
+        egc:   w.particle_glyphs[pi],
+        fg:    cl::channel_rgb(pcolor),
+        bg:    bg,
+        attrs: cl::CELL_ATTR_BOLD()
+      }
+      p = pl::plane_putc(p, pxc, pyc, part_cell)
+    end
+    pi += 1
+  end
+
+  # Hit-flash overlay — single-frame red reverse on damaged cells.
+  # Pulled from flash_xs/flash_ys (cleared every tick, set on damage).
+  var fn = w.flash_xs.size
+  var fi = 0
+  while fi < fn
+    var fxc = w.flash_xs[fi]
+    var fyc = w.flash_ys[fi]
+    if fxc >= 0 and fyc >= 0 and fxc < DUNG_W() and fyc < DUNG_H()
+      # Preserve the existing glyph at this cell, but force red bg +
+      # reverse + bold so the cell visibly pops for a single frame.
+      var existing = pl::plane_getc(p, fxc, fyc)
+      var flash_cell = cl::Cell {
+        egc:   existing.egc,
+        fg:    cl::channel_rgb(t.base05),
+        bg:    cl::channel_rgb(t.base08),
+        attrs: cl::CELL_ATTR_REVERSE() | cl::CELL_ATTR_BOLD()
+      }
+      p = pl::plane_putc(p, fxc, fyc, flash_cell)
+    end
+    fi += 1
+  end
+
+  return p
+end
+
+## Zero out the light buffer's RGB contribution at every cell *not* in
+## the player's current FOV. Cells outside FOV will then render with
+## no lighting at all (the cell's own dim memory color, no ambient
+## warm-up, no torch bleed) — Brogue-style "remembered terrain" look
+## that contrasts dramatically with the lit-current-FOV cells.
+##
+## Note: ambient is also zeroed, not preserved — a uniformly-tinted
+## "memory" zone would mute the contrast we want. The cell's `fg_dim`
+## color carries the entire memory rendering.
+def mask_light_to_fov(buf: lt::LightBuffer, visible: Vec<Bool>): lt::LightBuffer
+  var n = buf.width * buf.height
+  var new_r = clone_int_vec(buf.light_r)
+  var new_g = clone_int_vec(buf.light_g)
+  var new_b = clone_int_vec(buf.light_b)
+  # Bool vec doesn't have a clone helper here; we don't mutate it, so a
+  # ref-share is fine. shadow_flags is similarly unchanged.
+  var i = 0
+  while i < n
+    if not visible[i]
+      new_r[i] = 0
+      new_g[i] = 0
+      new_b[i] = 0
+    end
+    i += 1
+  end
+  return lt::LightBuffer {
+    width:        buf.width,
+    height:       buf.height,
+    light_r:      new_r,
+    light_g:      new_g,
+    light_b:      new_b,
+    shadow_flags: buf.shadow_flags,
+    ambient_r:    0,
+    ambient_g:    0,
+    ambient_b:    0
+  }
+end
+
+## Phase 6.4 light buffer: ambient cool-blue tint + miner's-light at the
+## player + flickering torch at every brazier. Each light's color
+## components are scaled by `world.light_pct` so the user can tune
+## brightness live with `+`/`-` without losing per-source character.
+def build_light(w: World): lt::LightBuffer
+  # Scale ambient too — pure additive lighting otherwise pegs to ambient
+  # at the screen edges regardless of the user's preference.
+  var amb_r = 30 * w.light_pct / 100
+  var amb_g = 30 * w.light_pct / 100
+  var amb_b = 60 * w.light_pct / 100
+  var buf = lt::light_buffer_new(DUNG_W(), DUNG_H(), amb_r, amb_g, amb_b)
+  var blocks: Fn(Int, Int): Bool = (x: Int, y: Int) -> {
+    return is_wall(w, x, y)
+  }
+  if w.torch_on
+    # light_miners is (200, 200, 160) at radius 8, MAINTAIN_SHADOWS,
+    # fade_to_pct=30. Reconstruct via light_new with scaled colors.
+    var pr = 200 * w.light_pct / 100
+    var pg = 200 * w.light_pct / 100
+    var pb = 160 * w.light_pct / 100
+    var torch = lt::light_new(w.player_x, w.player_y, pr, pg, pb,
+                                8, 30, lt::LIGHT_FLAG_MAINTAIN_SHADOWS(), 0)
+    buf = lt::light_buffer_paint(buf, torch, w.frame, blocks)
+  end
+  # Brazier flicker base is (255, 180, 80) with 15% jitter.
+  var br_r = 255 * w.light_pct / 100
+  var br_g = 180 * w.light_pct / 100
+  var br_b =  80 * w.light_pct / 100
+  var bn = w.brazier_xs.size
+  var bi = 0
+  while bi < bn
+    var brazier = lt::light_new(w.brazier_xs[bi], w.brazier_ys[bi],
+                                  br_r, br_g, br_b,
+                                  9, 0, lt::LIGHT_FLAG_FLICKER(), 15)
+    buf = lt::light_buffer_paint(buf, brazier, w.frame, blocks)
+    bi += 1
+  end
+  return buf
+end
+
+def build_title_plane(w: World, t: th::Theme): pl::Plane
+  var p = pl::plane_create(W(), 1)
+  var bg = cl::channel_rgb(t.base02)
+  var fg = cl::channel_rgb(t.base05)
+  var accent = cl::channel_rgb(t.base0E)
+  var blank = cl::Cell { egc: " ", fg: fg, bg: bg, attrs: 0 }
+  p = pl::plane_fill(p, blank)
+  if str_byte_len(w.log) > 0
+    # Combat log takes the title bar — bright red/orange so the player
+    # can't miss "monster bites you" mid-fight.
+    var log_fg = cl::channel_rgb(t.base09)
+    if w.dead
+      log_fg = cl::channel_rgb(t.base08)
+    end
+    p = write_ascii_row(p, " ", 0, fg, bg, 0)
+    p = write_ascii_row(p, w.log, 1, log_fg, bg, cl::CELL_ATTR_BOLD())
+  else
+    p = write_ascii_row(p, " Brogue Tribute ", 0, accent, bg, cl::CELL_ATTR_BOLD())
+    p = write_ascii_row(p, " v0.11 - boss rooms ", 16, fg, bg, 0)
+  end
+  return p
+end
+
+## Game-over / victory overlay. Builds a centered plane with a
+## bordered title ("YOU DIED" or "YOU WIN") and a stats summary —
+## kills, floors descended, gold, weapon bonus, total turns. Used
+## when `w.dead` (red accent) or `w.won` (green accent).
+def build_outcome_plane(w: World, t: th::Theme, victory: Bool): pl::Plane
+  var pw = 38
+  var ph = 11
+  var p = pl::plane_create(pw, ph)
+  var bg = cl::channel_rgb(t.base01)
+  var fg = cl::channel_rgb(t.base05)
+  var label_fg = cl::channel_rgb(t.base04)
+  var accent_color = t.base08
+  if victory
+    accent_color = t.base0B
+  end
+  var accent = cl::channel_rgb(accent_color)
+  var num_color = cl::channel_rgb(t.base0A)
+  var blank = cl::Cell { egc: " ", fg: fg, bg: bg, attrs: 0 }
+  p = pl::plane_fill(p, blank)
+  # Top + bottom border
+  var border_x = 0
+  while border_x < pw
+    var top = cl::Cell {
+      egc:   "-",
+      fg:    accent,
+      bg:    bg,
+      attrs: cl::CELL_ATTR_BOLD()
+    }
+    p = pl::plane_putc(p, border_x, 0, top)
+    p = pl::plane_putc(p, border_x, ph - 1, top)
+    border_x += 1
+  end
+  # Left + right border
+  var border_y = 0
+  while border_y < ph
+    var side = cl::Cell {
+      egc:   "|",
+      fg:    accent,
+      bg:    bg,
+      attrs: cl::CELL_ATTR_BOLD()
+    }
+    p = pl::plane_putc(p, 0, border_y, side)
+    p = pl::plane_putc(p, pw - 1, border_y, side)
+    border_y += 1
+  end
+  var title = "  YOU DIED  "
+  if victory
+    title = "  YOU WIN  "
+  end
+  var title_col = (pw - str_byte_len(title)) / 2
+  p = write_ascii_row_at(p, title, title_col, 1, accent, bg,
+                          cl::CELL_ATTR_BOLD())
+  # Stats block. Each row formatted as "  Label   Value" so the
+  # numbers right-align visually under each other.
+  p = write_ascii_row_at(p, "Kills", 4, 3, label_fg, bg, 0)
+  p = write_ascii_row_at(p, w.kills_total.to_s(), 22, 3, num_color, bg,
+                          cl::CELL_ATTR_BOLD())
+  p = write_ascii_row_at(p, "Floor", 4, 4, label_fg, bg, 0)
+  p = write_ascii_row_at(p, w.floor.to_s(), 22, 4, num_color, bg,
+                          cl::CELL_ATTR_BOLD())
+  p = write_ascii_row_at(p, "Gold", 4, 5, label_fg, bg, 0)
+  p = write_ascii_row_at(p, w.gold.to_s(), 22, 5, num_color, bg,
+                          cl::CELL_ATTR_BOLD())
+  var atk_str = (PLAYER_ATK() + w.damage_bonus).to_s()
+  p = write_ascii_row_at(p, "Attack", 4, 6, label_fg, bg, 0)
+  p = write_ascii_row_at(p, atk_str, 22, 6, num_color, bg,
+                          cl::CELL_ATTR_BOLD())
+  p = write_ascii_row_at(p, "Turns", 4, 7, label_fg, bg, 0)
+  p = write_ascii_row_at(p, w.turns.to_s(), 22, 7, num_color, bg,
+                          cl::CELL_ATTR_BOLD())
+  p = write_ascii_row_at(p, "press q to quit", 11, 9, fg, bg, 0)
+  return p
+end
+
+## write_ascii_row writes to row 0 — game-over needs to write to other
+## rows. Variant that takes (col, row).
+def write_ascii_row_at(p: pl::Plane, s: String, col: Int, row: Int,
+                        fg: cl::Channel, bg: cl::Channel, attrs: Int): pl::Plane
+  var out = p
+  var len = str_byte_len(s)
+  var i = 0
+  while i < len
+    var c = str_byte_at(s, i)
+    var cell = cl::Cell {
+      egc:   str_from_char(c),
+      fg:    fg,
+      bg:    bg,
+      attrs: attrs
+    }
+    out = pl::plane_putc(out, col + i, row, cell)
+    i += 1
+  end
+  return out
+end
+
+def build_status_plane(w: World, t: th::Theme): pl::Plane
+  var p = pl::plane_create(W(), 2)
+  var bg = cl::channel_rgb(t.base01)
+  var fg = cl::channel_rgb(t.base04)
+  var accent_hp = cl::channel_rgb(t.base0B)
+  var blank = cl::Cell { egc: " ", fg: fg, bg: bg, attrs: 0 }
+  p = pl::plane_fill(p, blank)
+  # Row 0 — HP / Atk / Gold / Kills / Turns
+  var sb = sb_new()
+  sb.append(" HP ")
+  sb.append(w.hp.to_s())
+  sb.append("/")
+  sb.append(w.hp_max.to_s())
+  var hp_str = sb.to_string()
+  p = write_ascii_row_at(p, hp_str, 0, 0, accent_hp, bg, cl::CELL_ATTR_BOLD())
+  var col = str_byte_len(hp_str)
+  var atk_label = "  Atk +"
+  p = write_ascii_row_at(p, atk_label, col, 0, fg, bg, 0)
+  col += str_byte_len(atk_label)
+  var atk_value = (PLAYER_ATK() + w.damage_bonus).to_s()
+  p = write_ascii_row_at(p, atk_value, col, 0, cl::channel_rgb(t.base08),
+                          bg, cl::CELL_ATTR_BOLD())
+  col += str_byte_len(atk_value)
+  var gold_label = "  Gold "
+  p = write_ascii_row_at(p, gold_label, col, 0, fg, bg, 0)
+  col += str_byte_len(gold_label)
+  var gold_str = w.gold.to_s()
+  p = write_ascii_row_at(p, gold_str, col, 0, cl::channel_rgb(t.base0A),
+                          bg, cl::CELL_ATTR_BOLD())
+  col += str_byte_len(gold_str)
+  var kills_label = "  Kills "
+  p = write_ascii_row_at(p, kills_label, col, 0, fg, bg, 0)
+  col += str_byte_len(kills_label)
+  var kills_str = w.kills_total.to_s()
+  p = write_ascii_row_at(p, kills_str, col, 0, cl::channel_rgb(t.base0E),
+                          bg, cl::CELL_ATTR_BOLD())
+  col += str_byte_len(kills_str)
+  var turns_label = "  T "
+  p = write_ascii_row_at(p, turns_label, col, 0, fg, bg, 0)
+  col += str_byte_len(turns_label)
+  var turns_str = w.turns.to_s()
+  p = write_ascii_row_at(p, turns_str, col, 0, fg, bg, cl::CELL_ATTR_BOLD())
+
+  # Row 1 — Floor / Theme / Torch / Lit / hint
+  var theme = theme_for_idx(w.theme_idx)
+  var col2 = 0
+  var floor_label = " Floor "
+  p = write_ascii_row_at(p, floor_label, col2, 1, fg, bg, 0)
+  col2 += str_byte_len(floor_label)
+  var floor_str = w.floor.to_s()
+  p = write_ascii_row_at(p, floor_str, col2, 1, cl::channel_rgb(t.base0C),
+                          bg, cl::CELL_ATTR_BOLD())
+  col2 += str_byte_len(floor_str)
+  var theme_label = "  Theme "
+  p = write_ascii_row_at(p, theme_label, col2, 1, fg, bg, 0)
+  col2 += str_byte_len(theme_label)
+  p = write_ascii_row_at(p, theme.name, col2, 1, cl::channel_rgb(t.base0E),
+                          bg, cl::CELL_ATTR_BOLD())
+  col2 += str_byte_len(theme.name)
+  var torch_label = "  Torch:"
+  p = write_ascii_row_at(p, torch_label, col2, 1, fg, bg, 0)
+  col2 += str_byte_len(torch_label)
+  var torch_state = "off"
+  if w.torch_on
+    torch_state = "on"
+  end
+  var torch_color = cl::channel_rgb(t.base09)
+  if not w.torch_on
+    torch_color = cl::channel_rgb(t.base03)
+  end
+  p = write_ascii_row_at(p, torch_state, col2, 1, torch_color, bg,
+                          cl::CELL_ATTR_BOLD())
+  col2 += str_byte_len(torch_state)
+  var light_label = "  Lit "
+  p = write_ascii_row_at(p, light_label, col2, 1, fg, bg, 0)
+  col2 += str_byte_len(light_label)
+  var light_str = w.light_pct.to_s()
+  p = write_ascii_row_at(p, light_str, col2, 1, cl::channel_rgb(t.base0A),
+                          bg, cl::CELL_ATTR_BOLD())
+  col2 += str_byte_len(light_str)
+  p = write_ascii_row_at(p, "%", col2, 1, fg, bg, 0)
+  col2 += 1
+  # Compact "?: help" hint anchored to the right edge.
+  var help_hint = " ?: help "
+  var hint_col = W() - str_byte_len(help_hint)
+  if hint_col > col2 + 1
+    p = write_ascii_row_at(p, help_hint, hint_col, 1,
+                            cl::channel_rgb(t.base03), bg, 0)
+  end
+  return p
+end
+
+## Help overlay (v0.12 A.5). Pauses the game and lists every control.
+## Frame mirrors `build_outcome_plane` for visual consistency. Any
+## key dismisses (handled in `world_handle_key`).
+def build_help_plane(t: th::Theme): pl::Plane
+  var pw = 28
+  var ph = 13
+  var p = pl::plane_create(pw, ph)
+  var bg = cl::channel_rgb(t.base01)
+  var fg = cl::channel_rgb(t.base05)
+  var label_fg = cl::channel_rgb(t.base04)
+  var key_fg = cl::channel_rgb(t.base0D)
+  var accent = cl::channel_rgb(t.base0E)
+  var blank = cl::Cell { egc: " ", fg: fg, bg: bg, attrs: 0 }
+  p = pl::plane_fill(p, blank)
+  var border_x = 0
+  while border_x < pw
+    var top = cl::Cell {
+      egc:   "-",
+      fg:    accent,
+      bg:    bg,
+      attrs: cl::CELL_ATTR_BOLD()
+    }
+    p = pl::plane_putc(p, border_x, 0, top)
+    p = pl::plane_putc(p, border_x, ph - 1, top)
+    border_x += 1
+  end
+  var border_y = 0
+  while border_y < ph
+    var side = cl::Cell {
+      egc:   "|",
+      fg:    accent,
+      bg:    bg,
+      attrs: cl::CELL_ATTR_BOLD()
+    }
+    p = pl::plane_putc(p, 0, border_y, side)
+    p = pl::plane_putc(p, pw - 1, border_y, side)
+    border_y += 1
+  end
+  var title = "  HELP  "
+  var title_col = (pw - str_byte_len(title)) / 2
+  p = write_ascii_row_at(p, title, title_col, 1, accent, bg,
+                          cl::CELL_ATTR_BOLD())
+  var key_col = 4
+  var lab_col = 13
+  p = write_ascii_row_at(p, "hjkl",  key_col, 3, key_fg, bg, cl::CELL_ATTR_BOLD())
+  p = write_ascii_row_at(p, "Move",  lab_col, 3, label_fg, bg, 0)
+  p = write_ascii_row_at(p, ">",     key_col, 4, key_fg, bg, cl::CELL_ATTR_BOLD())
+  p = write_ascii_row_at(p, "Descend", lab_col, 4, label_fg, bg, 0)
+  p = write_ascii_row_at(p, "T",     key_col, 5, key_fg, bg, cl::CELL_ATTR_BOLD())
+  p = write_ascii_row_at(p, "Theme", lab_col, 5, label_fg, bg, 0)
+  p = write_ascii_row_at(p, "F",     key_col, 6, key_fg, bg, cl::CELL_ATTR_BOLD())
+  p = write_ascii_row_at(p, "Torch", lab_col, 6, label_fg, bg, 0)
+  p = write_ascii_row_at(p, "+/-",   key_col, 7, key_fg, bg, cl::CELL_ATTR_BOLD())
+  p = write_ascii_row_at(p, "Light", lab_col, 7, label_fg, bg, 0)
+  p = write_ascii_row_at(p, "?",     key_col, 8, key_fg, bg, cl::CELL_ATTR_BOLD())
+  p = write_ascii_row_at(p, "Help",  lab_col, 8, label_fg, bg, 0)
+  p = write_ascii_row_at(p, "q",     key_col, 9, key_fg, bg, cl::CELL_ATTR_BOLD())
+  p = write_ascii_row_at(p, "Quit",  lab_col, 9, label_fg, bg, 0)
+  var dismiss = "(any key dismisses)"
+  var dismiss_col = (pw - str_byte_len(dismiss)) / 2
+  p = write_ascii_row_at(p, dismiss, dismiss_col, 11, label_fg, bg, 0)
+  return p
+end
+
+## Octant minimap with FOV-state encoding. Three states per output
+## cell, each rendered with a different colour:
+##
+##   - **Walls in current FOV** → bright (theme.base0D blue) octant
+##     glyph. The lit-area pops on the minimap exactly like it pops in
+##     the dungeon view.
+##   - **Walls visited but no longer in FOV** → dim (theme.base03)
+##     octant glyph. Layout always shown once explored — Brogue's
+##     "you remember the geometry" map convention.
+##   - **Walls never seen** → blank.
+##
+## Two blitters drive this: one for "wall in FOV right now," one for
+## "wall ever visited." The memory blitter (index 0) sets the rendered
+## pattern; the FOV blitter (index 1) picks the colour via the picker.
+## `octant_blit_layered` does the per-cell composite.
+##
+## The player's cell on the minimap is overlaid in mauve
+## (theme.base0E) by a single `plane_putc` after the layered call.
+## When the player stands on an empty floor cell the minimap pattern
+## would be zero — we override to the full-block octant (0xFF) so the
+## player always shows up as a "you are here" marker.
+def build_minimap_plane(w: World, t: th::Theme): pl::Plane
+  var pw = 16
+  var ph = 16
+  var fov_blitter = oct::octant_blitter_new(pw, ph)
+  var mem_blitter = oct::octant_blitter_new(pw, ph)
+  var py = 0
+  while py < ph
+    var px = 0
+    while px < pw
+      var dx = px * DUNG_W() / pw
+      var dy = py * DUNG_H() / ph
+      var idx = world_idx(dx, dy)
+      if w.walls[idx]
+        if w.visible[idx]
+          fov_blitter = oct::octant_set(fov_blitter, px, py, true)
+          mem_blitter = oct::octant_set(mem_blitter, px, py, true)
+        end
+        if w.visited[idx] and not w.visible[idx]
+          mem_blitter = oct::octant_set(mem_blitter, px, py, true)
+        end
+      end
+      px += 1
+    end
+    py += 1
+  end
+
+  var cw = pw / 2
+  var ch = ph / 4
+  var p = pl::plane_create(cw, ch)
+  var bg = cl::channel_rgb(t.base02)
+  var fg_dim = cl::channel_rgb(t.base03)
+  var blank = cl::Cell { egc: " ", fg: fg_dim, bg: bg, attrs: 0 }
+  p = pl::plane_fill(p, blank)
+
+  # Layered blit: blitters[0] = memory (drives glyph), blitters[1] = FOV
+  # (picker reads pats[1] to choose bright vs dim).
+  var blitters = vec_new<oct::OctantBlitter>()
+  blitters.push(mem_blitter)
+  blitters.push(fov_blitter)
+  var fg_bright_int = t.base0D
+  var fg_dim_int = t.base03
+  var picker: Fn(Int, Int, Vec<Int>): Int = (cx: Int, cy: Int, pats: Vec<Int>) -> {
+    if pats[1] != 0
+      return fg_bright_int
+    end
+    return fg_dim_int
+  }
+  p = oct::octant_blit_layered(blitters, 0, picker, bg, p, 0, 0,
+                                oct::OctantQuality::Octant)
+
+  # Player overlay: force mauve fg, and force full-block glyph if the
+  # underlying memory cell was empty (so the player marker is always
+  # visible).
+  var pp_x = w.player_x * pw / DUNG_W()
+  var pp_y = w.player_y * ph / DUNG_H()
+  var player_cx = pp_x / 2
+  var player_cy = pp_y / 4
+  var fg_player = cl::channel_rgb(t.base0E)
+  var player_mem_pat = oct::octant_pattern_at(mem_blitter, player_cx, player_cy)
+  var player_pat = player_mem_pat
+  if player_pat == 0
+    player_pat = 255
+  end
+  var player_glyph = oct::codepoint_to_utf8(oct::octant_codepoint(player_pat))
+  var player_cell = cl::Cell {
+    egc:   player_glyph,
+    fg:    fg_player,
+    bg:    bg,
+    attrs: 0
+  }
+  p = pl::plane_putc(p, player_cx, player_cy, player_cell)
+  return p
+end
+
+## Compose every plane onto an 80×24 root via plane_blit. Phase 6.4
+## light buffer is applied to the dungeon plane right after construction,
+## so the lighting blend lands BEFORE the dungeon flows into the root.
+def build_back(w: World): pl::Plane
+  var t = theme_for_idx(w.theme_idx)
+  var bg = cl::channel_rgb(t.base00)
+  var blank = cl::Cell { egc: " ", fg: bg, bg: bg, attrs: 0 }
+  var root = pl::plane_create(W(), H())
+  root = pl::plane_fill(root, blank)
+
+  var title = build_title_plane(w, t)
+  root = pl::plane_blit(title, root, 0, 0, W(), 1, 0, 0, bl::BlendMode::None)
+
+  var dungeon = build_dungeon_plane(w, t)
+  # Build the raw light buffer (ambient + every light source painted),
+  # then mask it to the player's current FOV — non-FOV cells get zero
+  # light contribution, leaving them at their `fg_dim` memory color.
+  var raw_light = build_light(w)
+  var fov_light = mask_light_to_fov(raw_light, w.visible)
+  var lit_dungeon = lt::light_buffer_apply(fov_light, dungeon)
+  root = pl::plane_blit(lit_dungeon, root,
+                         0, 0, DUNG_W(), DUNG_H(),
+                         0, DUNG_OY(), bl::BlendMode::None)
+
+  var mm = build_minimap_plane(w, t)
+  root = pl::plane_blit(mm, root, 0, 0, 8, 4,
+                         W() - 8, 1, bl::BlendMode::None)
+
+  var status = build_status_plane(w, t)
+  root = pl::plane_blit(status, root, 0, 0, W(), 2,
+                         0, H() - 2, bl::BlendMode::None)
+
+  if w.dead or w.won
+    var op = build_outcome_plane(w, t, w.won)
+    var op_x = (W() - 38) / 2
+    var op_y = (H() - 11) / 2
+    root = pl::plane_blit(op, root, 0, 0, 38, 11,
+                           op_x, op_y, bl::BlendMode::None)
+  end
+
+  if w.help_open
+    var hp_plane = build_help_plane(t)
+    var hp_x = (W() - 28) / 2
+    var hp_y = (H() - 13) / 2
+    root = pl::plane_blit(hp_plane, root, 0, 0, 28, 13,
+                           hp_x, hp_y, bl::BlendMode::None)
+  end
+
+  return root
+end
+
+# =============================================================================
+# Event-loop messages + concurrency
+# =============================================================================
+
+## Messages flowing into the main loop's channel. Two producers:
+##   - input pump: emits Key on each keystroke, Quit on EOF.
+##   - tick pump:  emits Tick every 125ms (8Hz).
+##
+## Plain-data enum — the channel carries enum tag values which the
+## main loop dispatches on via `is`/`match`.
+enum BMsg
+  Key(code: Int)
+  Tick
+  Quit
+end
+
+## Silently absorb scope-cancel throws from term_read_key_cancellable
+## and scope_sleep_ms during teardown. These throws fire when main
+## cancels the runtime scope on clean exit; they are NOT errors.
+def bt_pump_throw_handler(op_name: Int, argc: Int, argv: Int): Int
+  return 0
+end
+
+## Input goroutine. Blocks on term_read_key_cancellable until a key
+## arrives (or the scope is cancelled), then injects a BMsg into the
+## channel. EOF emits Quit and exits the loop. Wraps in a child scope
+## so the goroutine's normal exit doesn't cancel the parent (see
+## `feedback_scope_aware_throws_needs_scope_with` for the rationale).
+def bt_pump_input(msg_ch: Int, parent_scope: Int): Int
+  with Throws { throw: bt_pump_throw_handler } do ->
+    scope_with(scope_with_cancel(parent_scope)) do ->
+      loop
+        var key = term_read_key_cancellable(current_scope())
+        if key == KEY_EOF()
+          send(msg_ch, BMsg::Quit)
+          break
+        end
+        send(msg_ch, BMsg::Key(key))
+      end
+      0
+    end
+    0
+  end
+  return 0
+end
+
+## Tick goroutine. Sleeps 125ms (8Hz tick) then injects a Tick
+## message. Brazier flicker hash advances each tick so the scene
+## animates between keystrokes; monsters wake every 4 ticks (~500ms).
+## Same scope-discipline as the input pump.
+def bt_pump_ticks(msg_ch: Int, parent_scope: Int): Int
+  with Throws { throw: bt_pump_throw_handler } do ->
+    scope_with(scope_with_cancel(parent_scope)) do ->
+      loop
+        scope_sleep_ms(125)
+        scope_send(msg_ch, BMsg::Tick)
+      end
+      0
+    end
+    0
+  end
+  return 0
+end
+
+# =============================================================================
+# Main loop
+# =============================================================================
+
+## Apply a key press to the world. Pure data flow — returns the
+## post-key world or `world` unchanged if the key is unrecognised.
+def world_handle_key(world: World, key: Int): World
+  var w = world
+  if w.help_open
+    return World { ...w, help_open: false }
+  end
+  if w.dead or w.won
+    return w
+  end
+  if key == '?'
+    return World { ...w, help_open: true }
+  end
+  var dx = 0
+  var dy = 0
+  if key == KEY_UP() or key == 'k' or key == 'K'
+    dy = -1
+  end
+  if key == KEY_DOWN() or key == 'j' or key == 'J'
+    dy = 1
+  end
+  if key == KEY_LEFT() or key == 'h' or key == 'H'
+    dx = -1
+  end
+  if key == KEY_RIGHT() or key == 'l' or key == 'L'
+    dx = 1
+  end
+  if key == 'T' or key == 't'
+    w = world_with_theme(w, (w.theme_idx + 1) % NUM_THEMES())
+  end
+  if key == 'F' or key == 'f'
+    w = world_toggle_torch(w)
+  end
+  if key == '>'
+    w = world_descend(w)
+  end
+  if key == '+' or key == '='
+    w = world_with_light_pct(w, w.light_pct + 10)
+  end
+  if key == '-' or key == '_'
+    w = world_with_light_pct(w, w.light_pct - 10)
+  end
+  if dx != 0 or dy != 0
+    w = world_move(w, dx, dy)
+  end
+  return world_compute_fov(w)
+end
+
+def main(): Int
+  # Seed PRNG with wall-clock so each run produces a different dungeon.
+  rand_seed_op(time_epoch_ms())
+
+  sched_init(0)
+  term_enter_raw_mode()
+  term_write("\x1b[?1049h")
+  term_write("\x1b[?25l")
+  term_write("\x1b[H\x1b[2J")
+
+  # Per-run scope so the pumps unwind cleanly on exit.
+  var scope = scope_with_cancel(current_scope())
+  var prev_scope = current_scope_load()
+  current_scope_store(scope)
+
+  var msg_ch = channel_new(64)
+  go bt_pump_input(msg_ch, scope)
+  go bt_pump_ticks(msg_ch, scope)
+
+  var world = world_init()
+  world = world_compute_fov(world)
+  var renderer = rd::renderer_new(W(), H())
+  renderer = rd::renderer_with_back(renderer, build_back(world))
+  term_write(rd::renderer_diff(renderer, true))
+  renderer = rd::renderer_swap(renderer)
+
+  var running = true
+  while running
+    var raw = recv(msg_ch)
+    var msg: BMsg = as_type<BMsg>(raw)
+    var key_quit = false
+    match msg
+      Quit => running = false
+      Tick => world = world_tick(world)
+      Key(code) => do
+        if (code == 'q' or code == 'Q') and not world.help_open
+          key_quit = true
+        else
+          world = world_handle_key(world, code)
+        end
+        end
+    end
+    if key_quit
+      running = false
+    end
+    if running
+      renderer = rd::renderer_with_back(renderer, build_back(world))
+      term_write(rd::renderer_diff(renderer, true))
+      renderer = rd::renderer_swap(renderer)
+    end
+  end
+
+  scope_cancel(scope)
+  current_scope_store(prev_scope)
+
+  term_write("\x1b[?25h")
+  term_write("\x1b[?1049l")
+  term_exit_raw_mode()
+  return 0
+end

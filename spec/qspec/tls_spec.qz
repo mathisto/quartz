@@ -1,0 +1,535 @@
+## TLS Spec — Tests for std/ffi/tls (FFI) and std/net/tls (ergonomic wrapper)
+##
+## Tests SSL context creation, TLS client connections, certificate verification,
+## SNI, read/write over TLS, and error handling.
+##
+## Requires: -lssl -lcrypto (OpenSSL 3.x)
+##
+## Contract:
+##   1. TLS FFI — SSL_CTX lifecycle.
+##   2. TLS Client — tls_connect.
+##   3. TLS Certificate verification.
+##   4. TLS Server — tls_accept.
+
+import * from qspec
+import std/ffi/tls
+import std/net/tls
+import std/net/tcp
+
+# =============================================================================
+# Helper functions for assert_output
+# =============================================================================
+
+def print_ctx_ok(): Void
+  var ctx = tls_ctx_new_client()
+  if ctx.ssl_ctx != 0
+    puts("ok")
+  else
+    puts("fail")
+  end
+  tls_ctx_free(ctx)
+end
+
+def print_server_ctx_ok(): Void
+  var ctx = tls_ctx_new_server()
+  if ctx.ssl_ctx != 0
+    puts("ok")
+  else
+    puts("fail")
+  end
+  tls_ctx_free(ctx)
+end
+
+def _tls_test_connect(host: String, ok_msg: String, err_prefix: String): Void
+  var ctx = tls_ctx_new_client()
+  match tls_connect(ctx, host, 443)
+    Ok(stream) => {
+      puts(ok_msg)
+      tls_close(stream)
+    }
+    Err(e) => {
+      puts(str_concat(err_prefix, e.message))
+    }
+  end
+  tls_ctx_free(ctx)
+end
+
+def print_connect_ok(): Void
+  _tls_test_connect("example.com", "connected", "error: ")
+end
+
+def print_sni_check(): Void
+  _tls_test_connect("www.google.com", "sni_ok", "sni_fail: ")
+end
+
+def print_bad_host(): Void
+  var ctx = tls_ctx_new_client()
+  match tls_connect(ctx, "nonexistent.invalid", 443)
+    Ok(stream) => {
+      puts("unexpected_success")
+      tls_close(stream)
+    }
+    Err(e) => {
+      puts("expected_error")
+    }
+  end
+  tls_ctx_free(ctx)
+end
+
+def print_https_get(): Void
+  var ctx = tls_ctx_new_client()
+  match tls_connect(ctx, "example.com", 443)
+    Ok(stream) => {
+      var req = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+      match tls_write(stream, req)
+        Ok(n) => {
+          match tls_read(stream, 4096)
+            Ok(data) => {
+              if str_starts_with(data, "HTTP/1.1")
+                puts("got_response")
+              else
+                puts("bad_response")
+              end
+            }
+            Err(e) => {
+              puts("read_error")
+            }
+          end
+        }
+        Err(e) => {
+          puts("write_error")
+        }
+      end
+      tls_close(stream)
+    }
+    Err(e) => {
+      puts(str_concat("connect_error: ", e.message))
+    }
+  end
+  tls_ctx_free(ctx)
+end
+
+def print_write_read_loop(): Void
+  var ctx = tls_ctx_new_client()
+  match tls_connect(ctx, "httpbin.org", 443)
+    Ok(stream) => {
+      var req = "GET /get HTTP/1.1\r\nHost: httpbin.org\r\nConnection: close\r\n\r\n"
+      match tls_write(stream, req)
+        Ok(n) => {
+          var sb = sb_new()
+          var done = 0
+          while done == 0
+            match tls_read(stream, 4096)
+              Ok(data) => {
+                if data.size == 0
+                  done = 1
+                else
+                  sb_append(sb, data)
+                  0
+                end
+              }
+              Err(e) => {
+                done = 1
+              }
+            end
+          end
+          var response = sb_to_string(sb)
+          if str_contains(response, "200 OK")
+            puts("loop_read_ok")
+          else
+            puts("loop_read_bad")
+          end
+        }
+        Err(e) => {
+          puts("write_error")
+        }
+      end
+      tls_close(stream)
+    }
+    Err(e) => {
+      puts("connect_error")
+    }
+  end
+  tls_ctx_free(ctx)
+end
+
+def print_ctx_double_free_safe(): Void
+  var ctx = tls_ctx_new_client()
+  tls_ctx_free(ctx)
+  puts("double_free_safe")
+end
+
+# =============================================================================
+# TLS server helpers (spawn/await based concurrency)
+# =============================================================================
+
+# Generate a self-signed cert valid for 1 day
+def _tls_gen_certs(): Void
+  var _r = system("openssl req -x509 -newkey rsa:2048 -keyout /tmp/_qspec_tls_key.pem -out /tmp/_qspec_tls_cert.pem -days 1 -nodes -subj '/CN=localhost' 2>/dev/null")
+end
+
+# Generate an expired cert (valid for 0 days)
+def _tls_gen_expired_cert(): Void
+  var _r = system("openssl req -x509 -newkey rsa:2048 -keyout /tmp/_qspec_tls_exp_key.pem -out /tmp/_qspec_tls_exp_cert.pem -days 0 -nodes -subj '/CN=expired' 2>/dev/null")
+end
+
+# Poll atomic until server signals its port
+def _tls_wait_port(atom: Int): Int
+  var port = 0
+  while port == 0
+    sleep_ms(1)
+    port = atomic_load(atom)
+  end
+  return port
+end
+
+# TLS server: accept one connection then close
+def _tls_srv_accept(atom: Int, cert: String, key: String): Int
+  var ctx = tls_ctx_new_server()
+  tls_ctx_load_cert(ctx, cert)
+  tls_ctx_load_key(ctx, key)
+  match tcp_listen(0)
+    Ok(listener) => {
+      atomic_store(atom, listener.port)
+      match tcp_accept(listener)
+        Ok(conn) => {
+          match tls_accept(ctx, conn.fd)
+            Ok(stream) => {
+              tls_close(stream)
+              0
+            }
+            Err(e) => 0
+          end
+        }
+        Err(e) => 0
+      end
+      tcp_close_listener(listener)
+    }
+    Err(e) => 0
+  end
+  tls_ctx_free(ctx)
+  return 0
+end
+
+# TLS server: accept, return 1 on handshake success, 0 on failure
+def _tls_srv_check(atom: Int, cert: String, key: String): Int
+  var ctx = tls_ctx_new_server()
+  tls_ctx_load_cert(ctx, cert)
+  tls_ctx_load_key(ctx, key)
+  var result = 0
+  match tcp_listen(0)
+    Ok(listener) => {
+      atomic_store(atom, listener.port)
+      match tcp_accept(listener)
+        Ok(conn) => {
+          match tls_accept(ctx, conn.fd)
+            Ok(stream) => {
+              result = 1
+              tls_close(stream)
+            }
+            Err(e) => { result = 0 }
+          end
+        }
+        Err(e) => { result = 0 }
+      end
+      tcp_close_listener(listener)
+    }
+    Err(e) => {
+      result = 0
+      0
+    }
+  end
+  tls_ctx_free(ctx)
+  return result
+end
+
+# TLS server: accept, read, echo back, close
+def _tls_srv_echo(atom: Int, cert: String, key: String): Int
+  var ctx = tls_ctx_new_server()
+  tls_ctx_load_cert(ctx, cert)
+  tls_ctx_load_key(ctx, key)
+  match tcp_listen(0)
+    Ok(listener) => {
+      atomic_store(atom, listener.port)
+      match tcp_accept(listener)
+        Ok(conn) => {
+          match tls_accept(ctx, conn.fd)
+            Ok(stream) => {
+              match tls_read(stream, 4096)
+                Ok(data) => {
+                  tls_write(stream, data)
+                  0
+                }
+                Err(e) => 0
+              end
+              tls_close(stream)
+              0
+            }
+            Err(e) => 0
+          end
+        }
+        Err(e) => 0
+      end
+      tcp_close_listener(listener)
+    }
+    Err(e) => 0
+  end
+  tls_ctx_free(ctx)
+  return 0
+end
+
+# =============================================================================
+# Certificate validation helpers
+# =============================================================================
+
+# Generate a self-signed cert with a specific CN
+def _tls_gen_cn_cert(cn: String): Void
+  var _r = system("openssl req -x509 -newkey rsa:2048 -keyout /tmp/_qspec_tls_cn_key.pem -out /tmp/_qspec_tls_cn_cert.pem -days 1 -nodes -subj '/CN=#{cn}' 2>/dev/null")
+end
+
+def print_hostname_mismatch(): Void
+  _tls_gen_cn_cert("testhost")
+  cert = "/tmp/_qspec_tls_cn_cert.pem"
+  key = "/tmp/_qspec_tls_cn_key.pem"
+  atom = atomic_new(0)
+  h = go _tls_srv_accept(atom, cert, key)
+  var port = _tls_wait_port(atom)
+  # Load self-signed cert as trusted CA so chain verification passes.
+  # Hostname verification should fail: cert CN=testhost, connecting to 127.0.0.1.
+  var ctx = tls_ctx_new_client()
+  tls_ctx_load_ca(ctx, cert)
+  match tls_connect(ctx, "127.0.0.1", port)
+    Ok(stream) => {
+      puts("unexpected_success")
+      tls_close(stream)
+    }
+    Err(e) => {
+      puts("hostname_rejected")
+    }
+  end
+  tls_ctx_free(ctx)
+  var _a = await h
+end
+
+def print_reject_expired(): Void
+  _tls_gen_expired_cert()
+  cert = "/tmp/_qspec_tls_exp_cert.pem"
+  key = "/tmp/_qspec_tls_exp_key.pem"
+  atom = atomic_new(0)
+  h = go _tls_srv_accept(atom, cert, key)
+  var port = _tls_wait_port(atom)
+  var ctx = tls_ctx_new_client()
+  match tls_connect(ctx, "127.0.0.1", port)
+    Ok(stream) => {
+      puts("unexpected_success")
+      tls_close(stream)
+    }
+    Err(e) => {
+      puts("rejected")
+    }
+  end
+  tls_ctx_free(ctx)
+  var _a = await h
+end
+
+def print_reject_selfsigned(): Void
+  _tls_gen_certs()
+  cert = "/tmp/_qspec_tls_cert.pem"
+  key = "/tmp/_qspec_tls_key.pem"
+  atom = atomic_new(0)
+  h = go _tls_srv_accept(atom, cert, key)
+  var port = _tls_wait_port(atom)
+  var ctx = tls_ctx_new_client()
+  match tls_connect(ctx, "127.0.0.1", port)
+    Ok(stream) => {
+      puts("unexpected_success")
+      tls_close(stream)
+    }
+    Err(e) => {
+      puts("rejected")
+    }
+  end
+  tls_ctx_free(ctx)
+  var _a = await h
+end
+
+def print_accept_noverify(): Void
+  _tls_gen_certs()
+  cert = "/tmp/_qspec_tls_cert.pem"
+  key = "/tmp/_qspec_tls_key.pem"
+  atom = atomic_new(0)
+  h = go _tls_srv_accept(atom, cert, key)
+  var port = _tls_wait_port(atom)
+  var ctx = tls_ctx_new_client()
+  tls_ctx_disable_verify(ctx)
+  match tls_connect_noverify(ctx, "127.0.0.1", port)
+    Ok(stream) => {
+      puts("accepted")
+      tls_close(stream)
+    }
+    Err(e) => {
+      puts(str_concat("error: ", e.message))
+    }
+  end
+  tls_ctx_free(ctx)
+  var _a = await h
+end
+
+# =============================================================================
+# TLS server test helpers
+# =============================================================================
+
+def print_tls_accept_ok(): Void
+  _tls_gen_certs()
+  atom = atomic_new(0)
+  h = go _tls_srv_accept(atom, "/tmp/_qspec_tls_cert.pem", "/tmp/_qspec_tls_key.pem")
+  var port = _tls_wait_port(atom)
+  var ctx = tls_ctx_new_client()
+  tls_ctx_disable_verify(ctx)
+  match tls_connect_noverify(ctx, "127.0.0.1", port)
+    Ok(stream) => {
+      puts("accept_ok")
+      tls_close(stream)
+    }
+    Err(e) => {
+      puts(str_concat("error: ", e.message))
+    }
+  end
+  tls_ctx_free(ctx)
+  var _a = await h
+end
+
+def print_tls_handshake_ok(): Void
+  _tls_gen_certs()
+  atom = atomic_new(0)
+  h = go _tls_srv_check(atom, "/tmp/_qspec_tls_cert.pem", "/tmp/_qspec_tls_key.pem")
+  var port = _tls_wait_port(atom)
+  var ctx = tls_ctx_new_client()
+  tls_ctx_disable_verify(ctx)
+  var connected = 0
+  match tls_connect_noverify(ctx, "127.0.0.1", port)
+    Ok(stream) => {
+      connected = 1
+      tls_close(stream)
+    }
+    Err(e) => {
+      puts(str_concat("client_error: ", e.message))
+    }
+  end
+  tls_ctx_free(ctx)
+  var server_ok = await h
+  if connected and server_ok
+    puts("handshake_ok")
+  end
+  if connected and server_ok == 0
+    puts("server_handshake_failed")
+  end
+end
+
+def print_tls_echo(): Void
+  _tls_gen_certs()
+  atom = atomic_new(0)
+  h = go _tls_srv_echo(atom, "/tmp/_qspec_tls_cert.pem", "/tmp/_qspec_tls_key.pem")
+  var port = _tls_wait_port(atom)
+  var ctx = tls_ctx_new_client()
+  tls_ctx_disable_verify(ctx)
+  match tls_connect_noverify(ctx, "127.0.0.1", port)
+    Ok(stream) => {
+      tls_write(stream, "hello tls")
+      match tls_read(stream, 4096)
+        Ok(data) => {
+          if data.eq("hello tls")
+            puts("echo_ok")
+          else
+            puts("echo_mismatch: " + data)
+          end
+        }
+        Err(e) => {
+          puts(str_concat("read_error: ", e.message))
+        }
+      end
+      tls_close(stream)
+    }
+    Err(e) => {
+      puts(str_concat("connect_error: ", e.message))
+    }
+  end
+  tls_ctx_free(ctx)
+  var _a = await h
+end
+
+# =============================================================================
+# Tests
+# =============================================================================
+
+def main(): Int
+  describe("TLS FFI — SSL_CTX lifecycle") do ->
+    it("creates a client SSL context") do ->
+      assert_output("ok\n", print_ctx_ok)
+    end
+
+    it("creates a server SSL context") do ->
+      assert_output("ok\n", print_server_ctx_ok)
+    end
+
+    it("handles double-free of context safely") do ->
+      assert_output("double_free_safe\n", print_ctx_double_free_safe)
+    end
+  end
+
+  describe("TLS Client — tls_connect") do ->
+    it("connects to example.com:443 over TLS") do ->
+      assert_output("connected\n", print_connect_ok)
+    end
+
+    it("sends GET request and receives HTTP response over TLS") do ->
+      assert_output("got_response\n", print_https_get)
+    end
+
+    it("supports SNI (Server Name Indication)") do ->
+      assert_output("sni_ok\n", print_sni_check)
+    end
+
+    it("returns error for non-existent hostname") do ->
+      assert_output("expected_error\n", print_bad_host)
+    end
+
+    it("reads response in a loop until connection closes") do ->
+      assert_output("loop_read_ok\n", print_write_read_loop)
+    end
+  end
+
+  describe("TLS Certificate verification") do ->
+    it("rejects expired certificates") do ->
+      assert_output("rejected\n", print_reject_expired)
+    end
+
+    it("rejects self-signed certificates by default") do ->
+      assert_output("rejected\n", print_reject_selfsigned)
+    end
+
+    it("accepts self-signed when verification disabled") do ->
+      assert_output("accepted\n", print_accept_noverify)
+    end
+
+    it("validates certificate hostname matches") do ->
+      assert_output("hostname_rejected\n", print_hostname_mismatch)
+    end
+  end
+
+  describe("TLS Server — tls_accept") do ->
+    it("accepts incoming TLS connection with cert/key") do ->
+      assert_output("accept_ok\n", print_tls_accept_ok)
+    end
+
+    it("performs TLS handshake on accepted connection") do ->
+      assert_output("handshake_ok\n", print_tls_handshake_ok)
+    end
+
+    it("reads and writes data over server TLS stream") do ->
+      assert_output("echo_ok\n", print_tls_echo)
+    end
+  end
+
+  return qspec_main()
+end

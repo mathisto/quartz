@@ -1,0 +1,169 @@
+## C.14.3b standalone smoke: DynamicSupervisor full functional surface.
+##
+## Covers the message-passing + restart cycle that the qspec lambda
+## context can't express (indirect actor-constructor calls inline-poll
+## instead of spawning real worker tasks — sister to the May 3 2026
+## qspec-async-lambda inline-poll caveat).
+##
+## Tests:
+##   1. spawn returns a fresh, message-processing actor inbox per call
+##   2. independent state across spawned actors
+##   3. on .stop() of a child, supervisor respawns into the same slot
+##      with fresh state, restart_count increments
+##   4. intensity escalation: > max_restarts within period_ms exits
+##      watcher; subsequent spawns return 0
+##   5. iter walks every current child inbox in insertion order
+##
+## Scale-to-100k lives in spec/qz/dynamic_supervisor_scale_smoke.qz so
+## that file can run independently for headline-perf benchmarking.
+
+import * from std/actor
+import * from time
+
+extern "C" def usleep(us: Int): Int
+
+actor Worker
+  var n: Int = 0
+  def inc(): Void
+    n += 1
+  end
+  def get(): Int = n
+end
+
+def spawn_worker(): Int = Worker()
+
+def _wait_for_restart(dsup: DynamicSupervisor, target: Int): Int
+  var attempts = 0
+  while attempts < 100
+    if dynamic_supervisor_restart_count(dsup) >= target
+      return 1
+    end
+    usleep(10000)
+    attempts = attempts + 1
+  end
+  return 0
+end
+
+def main(): Int
+  # Test 1: fresh inbox per spawn, message-passing works
+  var dsup = dynamic_supervisor_new(spawn_worker, 5, 10000)
+  var w1 = dynamic_supervisor_spawn(dsup)
+  var w2 = dynamic_supervisor_spawn(dsup)
+  var w3 = dynamic_supervisor_spawn(dsup)
+  if w1 == w2 or w2 == w3 or w1 == w3
+    puts("FAIL: spawned inboxes not distinct (#{str_from_int(w1)}, #{str_from_int(w2)}, #{str_from_int(w3)})")
+    return 1
+  end
+  w1.inc()
+  w1.inc()
+  w2.inc()
+  if w1.get() != 2
+    puts("FAIL: w1.get() = #{str_from_int(w1.get())} (expected 2)")
+    return 2
+  end
+  if w2.get() != 1
+    puts("FAIL: w2.get() = #{str_from_int(w2.get())} (expected 1)")
+    return 3
+  end
+  if w3.get() != 0
+    puts("FAIL: w3.get() = #{str_from_int(w3.get())} (expected 0)")
+    return 4
+  end
+  if dynamic_supervisor_alive(dsup) != 3
+    puts("FAIL: alive != 3 after 3 spawns")
+    return 5
+  end
+  puts("OK: 3 distinct actors with independent state")
+
+  # Test 2: stop child → supervisor respawns into same slot
+  w1.stop()
+  if _wait_for_restart(dsup, 1) == 0
+    puts("FAIL: restart_count never reached 1 after w1.stop()")
+    return 6
+  end
+  if dynamic_supervisor_restart_count(dsup) != 1
+    puts("FAIL: restart_count = #{str_from_int(dynamic_supervisor_restart_count(dsup))} (expected 1)")
+    return 7
+  end
+  puts("OK: stopped child triggered exactly 1 restart")
+
+  # Test 3: alive count stays at 3 across restarts (slot reuse)
+  if dynamic_supervisor_alive(dsup) != 3
+    puts("FAIL: alive = #{str_from_int(dynamic_supervisor_alive(dsup))} after restart (expected 3 — slot reused)")
+    return 8
+  end
+  puts("OK: child slot reused on respawn")
+
+  # Test 4: clean shutdown
+  dynamic_supervisor_stop(dsup)
+  if dynamic_supervisor_alive(dsup) != 0
+    puts("FAIL: alive != 0 after stop")
+    return 9
+  end
+  puts("OK: clean shutdown")
+
+  # Test 5: iter walks insertion-ordered children
+  var dsup2 = dynamic_supervisor_new(spawn_worker, 5, 10000)
+  var spawned = vec_new<Int>()
+  spawned.push(dynamic_supervisor_spawn(dsup2))
+  spawned.push(dynamic_supervisor_spawn(dsup2))
+  spawned.push(dynamic_supervisor_spawn(dsup2))
+  spawned.push(dynamic_supervisor_spawn(dsup2))
+  spawned.push(dynamic_supervisor_spawn(dsup2))
+  var visited = vec_new<Int>()
+  dynamic_supervisor_iter(dsup2, ib -> visited.push(ib))
+  if visited.size != 5
+    puts("FAIL: iter visited #{str_from_int(visited.size)} (expected 5)")
+    return 10
+  end
+  var i = 0
+  while i < 5
+    if visited[i] != spawned[i]
+      puts("FAIL: iter order — visited[#{str_from_int(i)}]=#{str_from_int(visited[i])} != spawned[#{str_from_int(i)}]=#{str_from_int(spawned[i])}")
+      return 11
+    end
+    i = i + 1
+  end
+  puts("OK: iter visited insertion order")
+  dynamic_supervisor_stop(dsup2)
+
+  # Test 6: intensity escalation
+  var dsup3 = dynamic_supervisor_new(spawn_worker, 1, 10000)  # max=1
+  var v1 = dynamic_supervisor_spawn(dsup3)
+  v1.stop()
+  if _wait_for_restart(dsup3, 1) == 0
+    puts("FAIL: restart 1 never observed")
+    return 12
+  end
+  # Find the fresh inbox via iter (slot 0 reused)
+  var fresh = vec_new<Int>()
+  dynamic_supervisor_iter(dsup3, ib -> fresh.push(ib))
+  if fresh.size != 1
+    puts("FAIL: fresh.size != 1 after restart (got #{str_from_int(fresh.size)})")
+    return 13
+  end
+  var v2 = fresh[0]
+  v2.stop()
+  # restart_count would go to 2 > max=1 → escalate
+  var attempts = 0
+  while attempts < 100
+    if dynamic_supervisor_alive(dsup3) == 0
+      attempts = 100
+    else
+      usleep(10000)
+      attempts = attempts + 1
+    end
+  end
+  if dynamic_supervisor_alive(dsup3) != 0
+    puts("FAIL: dsup3 not escalated after 2 deaths > max=1 (alive=#{str_from_int(dynamic_supervisor_alive(dsup3))})")
+    return 14
+  end
+  if dynamic_supervisor_spawn(dsup3) != 0
+    puts("FAIL: post-escalation spawn should return 0")
+    return 15
+  end
+  puts("OK: intensity escalation triggered after 2 deaths > max=1")
+
+  puts("ALL OK")
+  return 0
+end

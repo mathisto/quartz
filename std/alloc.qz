@@ -1,0 +1,673 @@
+## std/alloc — algebraic effect-based memory allocation.
+##
+## The Alloc effect lets a `with Alloc { alloc: my_h, dealloc: my_h2 } do
+## ... end` block route every allocation in the dynamic extent of `body`
+## through user-provided handlers. Use cases: arena-backed allocation,
+## allocation budgets, deny-all sandboxes, deterministic test isolation,
+## allocation tracing, per-task arenas.
+##
+## ## Status (Phase A.5, 2026-04-27)
+##
+## Effect declaration + stdlib default handlers + runtime-blessed prelude
+## install + `--alloc-routing` codegen routing + universal allocation
+## wrapper + static fast-path + **stdlib handler library (arena, counter,
+## deny, tracking) with D5 throw-on-refusal lock-in** all shipped.
+##
+## **D5 lock-in**: Handlers refuse via `throw(msg)` from `std/throws`
+## rather than returning null. Three reasons: (a) `Throws` is in the
+## runtime's blessed default-handler set so refusal becomes a clean
+## process termination with a diagnostic message by default, (b) callers
+## can still install `with Throws { throw: rec } do ... end` to recover,
+## (c) every-caller-checks-null is brittle and contradicts the existential
+## type model.
+##
+## ## Usage (post-A.3)
+##
+##   import std/alloc
+##
+##   def my_alloc(op: Int, argc: Int, argv: Int): Int
+##     var size = load(argv, 0)
+##     # custom strategy: arena, pool, tracking, denial, ...
+##     return arena_alloc(my_arena, size)
+##   end
+##
+##   def my_dealloc(op: Int, argc: Int, argv: Int): Int
+##     # arena: no-op (memory frees with arena drop)
+##     return 0
+##   end
+##
+##   def main(): Int
+##     with Alloc { alloc: my_alloc, dealloc: my_dealloc } do ->
+##       work()  # every allocation routes through my_alloc
+##     end
+##   end
+##
+## Handler ABI: `def h(op_name: Int, argc: Int, argv: Int): Int`. Decode
+## arguments via `load(argv, 0)` for the size/pointer, or use the
+## `effects::effect_arg_int(argv, 0)` helper for typed access.
+##
+## ## Design notes
+##
+## **Op kinds**: both ops are kind=1 (continuation-style). The handler
+## returns a value (pointer for `alloc`, ignored for `dealloc`) and
+## execution resumes at the call site. There is no `= resume(0)` body
+## marker because the unwind/abort semantics of kind=2 don't apply to
+## allocation.
+##
+## **Failure mode (D5 lock-in)**: handlers refuse via `throw(msg)` from
+## `std/throws`. The throw is kind=2 (unwind) — execution does NOT
+## continue past the refusal site. Composition with user recovery:
+## `with Throws { throw: rec } do with Alloc { ... } do work() end end`.
+## With no user `with Throws` frame, the runtime-blessed default Throws
+## handler writes the message to stderr and exits 66.
+##
+## **Bypass-flag longjmp safety (B.0a, 2026-04-27)**: when a refusal
+## `throw` longjmps out from inside an Alloc handler, the bypass flag
+## (`@__qz_alloc_in_handler`) is correctly restored at the with-block
+## catch site. Each with-block snapshots the flag before setjmp and
+## the wb.catch path stores the snapshot back, so a recovery via outer
+## `with Throws { throw: rec }` still observes subsequent allocations
+## through the user's Alloc handler. The fix lives at the with-block
+## codegen layer (`codegen_instr.qz`), not in `__qz_effect_perform`,
+## because the longjmp target is the user's setjmp not perform's frame.
+##
+## **Reentrancy**: a handler that itself allocates (e.g., a tracking
+## handler that grows a Vec to record allocations) recurses. The runtime
+## hook in Phase A.3 will swap the TLS allocator pointer back to the
+## default for the duration of the handler invocation, so handlers can
+## allocate freely without infinite recursion. Document this assumption
+## when the runtime ships.
+##
+## **Existential type model**: `CPtr` is i64-shaped at runtime, like
+## every other Quartz value. The handler ABI exposes `Int` because the
+## effect-perform machinery is type-erased; cast back to `CPtr` at the
+## call site or use the `effects::` helpers when they exist.
+##
+## **Default handler**: Phase A.3.a installed a runtime-blessed default
+## (`@__qz_default_alloc_handler` in `codegen_runtime.qz`) that
+## forwards to `@malloc`/`@free`. Programs that never invoke `alloc()` /
+## `dealloc()` and never get touched by A.3.b's `mem_alloc`/`mem_free`
+## codegen routing see zero overhead. Phase A.3.b adds the codegen-side
+## interception (gated behind `--alloc-routing`); Phase A.4 adds the
+## static fast-path so even the gated path is zero-cost when no `with
+## Alloc` lexically active and no `can Alloc` row is in scope.
+##
+## ## See also
+##
+## - `std/memory.qz` — Arena, Pool, Allocator trait. The Alloc effect
+##   composes with these — handlers are typically thin wrappers around
+##   `arena_alloc(handle, size)` etc.
+## - `docs/design/ALLOC_EFFECT_PLAN.md` — design memo for the full
+##   initiative (Phases A through F).
+
+import std/throws
+
+effect Alloc
+  def alloc(size: Int): CPtr
+  def dealloc(ptr: CPtr): Void
+end
+
+## Default handler for `alloc` — passthrough to the `mem_alloc` intrinsic.
+##
+## Composable: a custom handler can chain to the default by calling this
+## function explicitly. Used as the install target when a user writes
+## `with Alloc { alloc: default_alloc_handler, ... } do ... end`.
+##
+## Phase A.3 will install a runtime-blessed inline LLVM IR handler in
+## the main prelude so the explicit install ceases to be necessary.
+def default_alloc_handler(op_name: Int, argc: Int, argv: Int): Int
+  var size = load(argv, 0)
+  return mem_alloc(size)
+end
+
+## Default handler for `dealloc` — passthrough to the `mem_free` intrinsic.
+##
+## Composable companion to `default_alloc_handler`. The handler return
+## value is unused (op declares Void return); we return 0 by convention.
+def default_dealloc_handler(op_name: Int, argc: Int, argv: Int): Int
+  var ptr = load(argv, 0)
+  mem_free(ptr)
+  return 0
+end
+
+# =============================================================================
+# Phase A.5 — Stdlib handler library
+# =============================================================================
+#
+# The four handler families below cover the canonical Alloc use cases:
+# arena-backed allocation, budget tracking, deny-all sandboxing, and
+# instrumentation. Each handler is a free function with the standard
+# `(op_name, argc, argv)` perform-ABI shape — install via
+#
+#   with Alloc { alloc: arena_alloc_handler, dealloc: arena_dealloc_handler } do ->
+#     work()
+#   end
+#
+# State (arena handle, budget, counters) lives in module-level globals
+# accessed via `alloc_set_*` setters. This is the "stage zero" surface;
+# Phase B introduces ergonomic sugar (`with Alloc.in_arena(arena) do
+# ... end`) that wraps the install + state setup in a single call.
+# Until then, the explicit setter pattern is what user code uses.
+#
+# All handler bodies are byte-count semantics — `argv[0]` for `alloc` is
+# size-in-bytes per A.3.c, mirroring `mem_alloc(N)` / `arena_alloc(handle,
+# size)`. No slot-vs-byte conversion needed.
+
+# -----------------------------------------------------------------------------
+# Arena handler — forwards alloc to a shared arena handle.
+# -----------------------------------------------------------------------------
+#
+# Use case: scoped allocation lifetime (per-phase, per-request, per-task).
+# Memory frees in bulk when the arena is reset or destroyed; the
+# per-pointer dealloc is a no-op.
+#
+# Setup:
+#   var a = arena_new()              # raw handle from the arena intrinsic
+#   alloc_set_arena(a)
+#   with Alloc { alloc: arena_alloc_handler, dealloc: arena_dealloc_handler } do ->
+#     work()
+#   end
+#   arena_destroy(a)
+#
+# Single-arena-at-a-time today; for multiple concurrent arenas, install
+# different handler functions per arena (each handler reads its own
+# global). Phase B's `Alloc.in_arena(arena)` will eliminate the global.
+
+var _alloc_arena_handle: Int = 0
+
+## Set the active arena handle for `arena_alloc_handler`. Pass the result
+## of `arena_new()` (raw handle) or `my_arena.handle` (RAII wrapper).
+def alloc_set_arena(handle: Int): Void
+  _alloc_arena_handle = handle
+end
+
+## Read the active arena handle. Useful for assertion-style spec helpers.
+def alloc_get_arena(): Int = _alloc_arena_handle
+
+## Forward the allocation to the active arena. Size is in bytes.
+def arena_alloc_handler(op_name: Int, argc: Int, argv: Int): Int
+  var size = load(argv, 0)
+  return arena_alloc(_alloc_arena_handle, size)
+end
+
+## No-op dealloc — arena memory is freed in bulk via `arena_reset` /
+## `arena_destroy`. Pair with `arena_alloc_handler` to keep installs
+## structurally complete.
+def arena_dealloc_handler(op_name: Int, argc: Int, argv: Int): Int
+  return 0
+end
+
+# B.0c — env-aware arena handlers. Read the arena handle from the
+# per-install state slot via `__qz_effect_state_get()` rather than the
+# module-global `_alloc_arena_handle`. This is the substrate Phase B
+# sugar (`with Alloc.in_arena(arena) do ... end`) sits on top of —
+# nested or sequential uses of `Alloc.in_arena` get independent state,
+# unlike the module-global handlers above.
+extern "C" def __qz_effect_state_get(): Int
+extern "C" def __qz_effect_state_set(v: Int): Int
+
+def arena_alloc_handler_e(op_name: Int, argc: Int, argv: Int): Int
+  var size = load(argv, 0)
+  var handle = __qz_effect_state_get()
+  return arena_alloc(handle, size)
+end
+
+def arena_dealloc_handler_e(op_name: Int, argc: Int, argv: Int): Int
+  return 0
+end
+
+# B.4 — env-aware budget handlers for `with Alloc.with_budget(N) do ... end`.
+# Single-slot remaining-budget pattern: state_slot[install_idx] tracks
+# bytes still permitted. Init state is the user's budget arg N; each alloc
+# subtracts size from remaining (and throws via Throws when the request
+# exceeds remaining). Dealloc is a no-op — the budget tracks CUMULATIVE
+# allocation traffic, not live bytes (matches A.5's counter_*_handler
+# semantics; programs that need live-bytes tracking should write a custom
+# handler). Sequential `with Alloc.with_budget(N)` blocks each get their
+# own slot, so independence is automatic.
+def budget_alloc_handler_e(op_name: Int, argc: Int, argv: Int): Int
+  var size = load(argv, 0)
+  var remaining = __qz_effect_state_get()
+  if size > remaining
+    throw("Alloc: budget exceeded — remaining=#{remaining}B requested=#{size}B")
+  end
+  __qz_effect_state_set(remaining - size)
+  return mem_alloc(size)
+end
+
+def budget_dealloc_handler_e(op_name: Int, argc: Int, argv: Int): Int
+  var ptr = load(argv, 0)
+  mem_free(ptr)
+  return 0
+end
+
+# B.2 — TestAlloc backing arena.
+#
+# `with TestAlloc do body end` (handled in mir_lower as a bare-IDENT
+# alias for an Alloc install) calls `test_alloc_arena_acquire()` at
+# install time and threads the returned handle through state_slot as
+# env for the env-aware arena handlers. The arena is a singleton —
+# lazily created on first acquire, reset on each subsequent acquire so
+# sequential test scopes start from a clean slate without leaking
+# memory.
+#
+# Limitations: nested `with TestAlloc` blocks share the singleton; the
+# inner reset wipes outer's allocations. Test framework integration (one
+# `with TestAlloc` per `it` block) doesn't hit this. Per-scope arena
+# lifecycles need a per-install teardown substrate (filed as a Phase B
+# followup) before nesting can work.
+var _test_alloc_arena_handle: Int = 0
+
+## Acquire the singleton test arena. Lazy-creates on first call (8 KB
+## initial block, mmap-backed via `arena_new`); resets on every
+## subsequent call so each `with TestAlloc do ... end` block sees a
+## fresh arena with no carry-over from prior scopes. Returns the raw
+## arena handle for use as the install env.
+def test_alloc_arena_acquire(): Int
+  if _test_alloc_arena_handle == 0
+    _test_alloc_arena_handle = arena_new(8192)
+  else
+    arena_reset(_test_alloc_arena_handle)
+  end
+  return _test_alloc_arena_handle
+end
+
+## Read the singleton test arena handle without resetting. Useful in
+## spec assertions that need to inspect bytes-used after a TestAlloc
+## block exits (the arena still holds the post-body state until the next
+## acquire).
+def test_alloc_arena_peek(): Int = _test_alloc_arena_handle
+
+# -----------------------------------------------------------------------------
+# Counter handler — tracks total allocated bytes; throws on over-budget.
+# -----------------------------------------------------------------------------
+#
+# Use case: resource budgets — "this code path may allocate at most N
+# bytes; refuse the rest." When the next allocation would push past the
+# budget, the handler calls `throw(msg)` (D5 lock-in) and the runtime
+# longjmps to the nearest `with Throws` frame (or exits 66 via the
+# runtime-blessed default).
+#
+# Setup:
+#   alloc_set_budget(1024)             # 1 KB budget; resets used counter
+#   with Alloc { alloc: counter_alloc_handler, dealloc: counter_dealloc_handler } do ->
+#     work()                           # throws if total exceeds 1 KB
+#   end
+#   puts("used #{alloc_get_used()}B")
+#
+# Dealloc accounting: `counter_dealloc_handler` does NOT decrement `used`
+# — the budget is "total bytes allocated in this scope," not "bytes
+# currently live." This matches the canonical use case (bounding peak
+# allocation traffic, not steady-state). Programs that need live-bytes
+# tracking should write a custom handler.
+
+var _alloc_counter_budget: Int = 0
+var _alloc_counter_used: Int = 0
+
+## Set the alloc budget in bytes and reset the used counter.
+def alloc_set_budget(budget: Int): Void
+  _alloc_counter_budget = budget
+  _alloc_counter_used = 0
+end
+
+## Read total bytes allocated through `counter_alloc_handler` since the
+## last `alloc_set_budget` call.
+def alloc_get_used(): Int = _alloc_counter_used
+
+## Read the active budget in bytes.
+def alloc_get_budget(): Int = _alloc_counter_budget
+
+## Counter alloc — throws via `Throws` when the request would exceed
+## budget; otherwise forwards to `mem_alloc` and accumulates the size.
+def counter_alloc_handler(op_name: Int, argc: Int, argv: Int): Int
+  var size = load(argv, 0)
+  if _alloc_counter_used + size > _alloc_counter_budget
+    throw("Alloc: budget exceeded — limit=#{_alloc_counter_budget}B used=#{_alloc_counter_used}B requested=#{size}B")
+  end
+  _alloc_counter_used = _alloc_counter_used + size
+  return mem_alloc(size)
+end
+
+## Counter dealloc — forwards to `mem_free`. Does not decrement the used
+## counter; budget tracks cumulative allocation, not live bytes.
+def counter_dealloc_handler(op_name: Int, argc: Int, argv: Int): Int
+  var ptr = load(argv, 0)
+  mem_free(ptr)
+  return 0
+end
+
+# -----------------------------------------------------------------------------
+# Deny handler — refuses every allocation.
+# -----------------------------------------------------------------------------
+#
+# Use case: sandboxing untrusted code, or a hard guarantee that a region
+# performs no allocation. The handler immediately throws via `Throws` on
+# every alloc call. Dealloc is permitted (caller may have memory from
+# pre-sandbox code that needs to be freed) and forwards to `mem_free`.
+#
+# Setup:
+#   with Alloc { alloc: deny_alloc_handler, dealloc: deny_dealloc_handler } do ->
+#     untrusted_plugin()                # any alloc → throw → exit 66
+#   end
+#
+# To recover gracefully, wrap with `with Throws { throw: rec } do ... end`
+# (subject to the bypass-flag-leak limitation documented at the top of
+# this file).
+
+def deny_alloc_handler(op_name: Int, argc: Int, argv: Int): Int
+  throw("Alloc: allocation denied (sandbox)")
+  return 0
+end
+
+def deny_dealloc_handler(op_name: Int, argc: Int, argv: Int): Int
+  var ptr = load(argv, 0)
+  mem_free(ptr)
+  return 0
+end
+
+# -----------------------------------------------------------------------------
+# Tracking handler — counts ops + bytes; forwards to `mem_alloc`/`mem_free`.
+# -----------------------------------------------------------------------------
+#
+# Use case: instrumentation — count allocations per phase, profile
+# allocation hot spots, regress-test memory-usage claims. The handler
+# does NOT change allocation behavior; it just records what passes
+# through, then forwards to the default backing allocator.
+#
+# Setup:
+#   alloc_reset_tracking()
+#   with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+#     work()
+#   end
+#   puts("alloc=#{alloc_tracking_alloc_count()} dealloc=#{alloc_tracking_dealloc_count()} bytes=#{alloc_tracking_total_bytes()}")
+
+var _alloc_tracking_alloc_count: Int = 0
+var _alloc_tracking_dealloc_count: Int = 0
+var _alloc_tracking_total_bytes: Int = 0
+
+## Zero the tracking counters. Call before each measurement window.
+def alloc_reset_tracking(): Void
+  _alloc_tracking_alloc_count = 0
+  _alloc_tracking_dealloc_count = 0
+  _alloc_tracking_total_bytes = 0
+end
+
+## Total alloc ops observed since the last `alloc_reset_tracking` call.
+def alloc_tracking_alloc_count(): Int = _alloc_tracking_alloc_count
+
+## Total dealloc ops observed since the last `alloc_reset_tracking` call.
+def alloc_tracking_dealloc_count(): Int = _alloc_tracking_dealloc_count
+
+## Total bytes requested via alloc since the last `alloc_reset_tracking` call.
+def alloc_tracking_total_bytes(): Int = _alloc_tracking_total_bytes
+
+## Count one alloc, accumulate its size, then forward to `mem_alloc`.
+def tracking_alloc_handler(op_name: Int, argc: Int, argv: Int): Int
+  var size = load(argv, 0)
+  _alloc_tracking_alloc_count = _alloc_tracking_alloc_count + 1
+  _alloc_tracking_total_bytes = _alloc_tracking_total_bytes + size
+  return mem_alloc(size)
+end
+
+## Count one dealloc, then forward to `mem_free`.
+def tracking_dealloc_handler(op_name: Int, argc: Int, argv: Int): Int
+  var ptr = load(argv, 0)
+  _alloc_tracking_dealloc_count = _alloc_tracking_dealloc_count + 1
+  mem_free(ptr)
+  return 0
+end
+
+## Promote an arena-allocated String to the surrounding allocator.
+##
+## Returns a deep copy of `s` allocated via the currently-installed `Alloc`
+## handler. The intended pattern is to call this OUTSIDE a
+## `with Alloc.in_arena(ar) do ... end` block, passing a String that was
+## constructed INSIDE the block. The returned String survives `arena_destroy(ar)`
+## because the copy lives wherever the ambient handler points (libc heap by
+## default).
+##
+## Calling this INSIDE the same arena scope re-allocates into the arena and
+## defeats the purpose — the returned String is just another arena-bound copy.
+##
+## Phase E.4.a slice 1 (2026-04-28): the compiler synthesizes a call to this
+## function between `with Alloc.in_arena(ar) do orig_call end` and
+## `arena_destroy(ar)` whenever a goroutine's named-function callee returns
+## `String`. The deep-copy lands in the parent's installed `Alloc` (E.1.c.b's
+## spawn-time snapshot keeps the parent's handler routed across the boundary).
+##
+## Implementation: `str_byte_slice` always allocates fresh via `qz_alloc_str` →
+## `__qz_alloc`, which routes through whatever `Alloc` handler is currently
+## installed.
+def arena_promote_string(s: String): String = str_byte_slice(s, 0, str_byte_len(s))
+
+## Phase E.7 — implicit per-worker arena pool.
+##
+## `arena_acquire(size)` is the pooled equivalent of `arena_new(size)`:
+## pops the top of the worker's TLS arena pool (LIFO, cap=64) and returns
+## it after `arena_reset(h)` clears its offsets; mints a fresh
+## `arena_new(size)` if the pool is empty. The returned arena is observably
+## indistinguishable from a fresh one — `arena_alloc` works, `arena_destroy`
+## works, the chain layout is the same. Arenas returned from `arena_release`
+## (below) carry their old chain pages forward, so reuse amortizes the
+## mmap pair across tasks.
+##
+## `arena_release(handle)` is the pooled equivalent of `arena_destroy(handle)`:
+## pushes the handle to the worker's TLS pool if there's room, else
+## `arena_destroy`s. Pool fullness bounds RSS at
+## `worker_count × 64 × max_arena_size` (≈ 4 MB of pooled head blocks
+## per worker if every pooled arena was minimally-grown).
+##
+## Wired into `_go_arena_body` (E.1.a-style spawn variants) and the keyword
+## auto-arena synthesizer (E.1.b) so high task churn (1000s of short
+## tasks/sec) doesn't burn the mmap syscall hot path. Direct user calls are
+## supported for hand-rolled per-task patterns. Match acquire/release
+## strictly — calling `arena_release(h)` on a handle still aliased
+## elsewhere lets a subsequent `arena_acquire` hand the same arena out a
+## second time and corrupts both consumers.
+def arena_acquire(size: Int): Int
+  var h = __qz_arena_pool_take()
+  if h == 0
+    return arena_new(size)
+  end
+  arena_reset(h)
+  return h
+end
+
+def arena_release(handle: Int): Void
+  if __qz_arena_pool_give(handle) == 0
+    arena_destroy(handle)
+  end
+end
+
+## Promote an arena-allocated `Vec<8-byte-element-T>` to the surrounding
+## allocator.
+##
+## Allocates a fresh `Vec<Int>` via `vec_new` (which routes through the
+## currently-installed `Alloc` handler) and copies each element via
+## `v[i]` / `out.push(...)`. The signature uses `Vec<Int>` as a placeholder;
+## any 8-byte-element-typed Vec (Vec<Int>, Vec<Float>, Vec<Char>, Vec<CPtr>,
+## Vec<Symbol>, Vec<Int64>, Vec<UInt64>, Vec<Float64>) shares the same
+## runtime layout (i64-stride elements), so the same function correctly
+## deep-copies all of them.
+##
+## The compiler synthesizes calls into this function at MIR-lowering time
+## (Phase E.4.a slice 2), bypassing typecheck — at the source level the
+## function is `Vec<Int>`-typed but at the IR level it's an 8-byte-stride
+## vec copier.
+##
+## **Narrow-element Vec types** (`Vec<Bool>`, `Vec<I8>`/`U8` = 1-byte;
+## `Vec<I16>`/`U16` = 2-byte; `Vec<I32>`/`U32`/`F32` = 4-byte) have
+## width-specialized layouts and are NOT covered by this helper —
+## `_mir_should_auto_arena` rejects them via
+## `_mir_is_8byte_value_typed_annotation`. They fall through to libc-heap
+## fallback until a width-aware promote helper ships (slice 2.b or slice 4).
+##
+## **Reference-typed element vectors** (`Vec<String>`, `Vec<Struct>`,
+## `Vec<Vec<T>>`) need per-element promote — slice 4 territory.
+##
+## Calling this INSIDE the same arena scope re-allocates into the arena and
+## defeats the purpose, same as `arena_promote_string`.
+def arena_promote_vec_value(v: Vec<Int>): Vec<Int>
+  var out = vec_new<Int>()
+  for i in 0..v.size
+    out.push(v[i])
+  end
+  return out
+end
+
+## Promote an arena-allocated uniform-value-field struct to the surrounding
+## allocator.
+##
+## Allocates `slot_count * 8` bytes via `mem_alloc` (which routes through the
+## currently-installed `Alloc` handler) and copies the source struct's i64
+## slots into the new block. Returns the new heap pointer (as `Int`).
+##
+## Phase E.4.a slice 3.a: the compiler synthesizes a call to this function
+## between `with Alloc.in_arena(ar) do orig_call end` and `arena_destroy(ar)`
+## for goroutines whose return type is a registered struct with NO
+## narrow-fixed-width fields (I8/I16/I32/U8/U16/U32/CInt/CChar) and ALL fields
+## value-typed (no String/Vec/struct fields). In that case the heap struct is
+## a flat block of `field_count` i64 slots, so a slot-by-slot copy is correct.
+##
+## **Mixed-field structs** (with a String/Vec/struct field) need per-struct
+## walkers — slice 3.b territory. The gate predicate
+## `_mir_struct_is_uniform_value` rejects them, falling through to libc-heap
+## fallback.
+##
+## **Narrow-field structs** (any I8/I16/I32/U8/U16/U32/CInt/CChar field)
+## have width-specialized layout (`@struct.<Name> = type { i8, i32, i64 }`
+## etc) and would corrupt under slot-by-slot i64 copy — same hazard as
+## narrow-element Vecs. They also fall through to libc-heap fallback.
+def arena_promote_struct_value(src: Int, slot_count: Int): Int
+  var dst = mem_alloc(slot_count * 8)
+  for i in 0..slot_count
+    store(dst, i, load(src, i))
+  end
+  return dst
+end
+
+## Promote an arena-allocated `Vec<T>` whose elements are themselves
+## reference-typed (and therefore allocated INSIDE the arena) to the
+## surrounding allocator. Polymorphic dispatcher driven by an
+## `elem_kind` tag and `elem_aux` scalar:
+##
+##   elem_kind = 2 → each element is a `String`; promote via
+##                   `arena_promote_string` (slice 1's helper).
+##   elem_kind = 3 → each element is a `Vec<U>` whose `U` is a primitive
+##                   8-byte-value (slice 2's helper). One level of
+##                   nesting; deeper nesting is rejected by the gate.
+##   elem_kind = 4 → each element is a uniform-value-field struct
+##                   (slice 3.a's shape); promote via
+##                   `arena_promote_struct_value(elem, elem_aux)` where
+##                   `elem_aux` is the struct's i64-slot count.
+##
+## Phase E.4.a slice 4: the compiler synthesizes a call to this function
+## between `with Alloc.in_arena(ar) do orig_call end` and
+## `arena_destroy(ar)` for goroutines whose return type is
+## `Vec<String>` / `Vec<Vec<value-prim>>` / `Vec<UniformStruct>`.
+##
+## **Mixed-field struct elements** (`Vec<MyStruct-mixed>`) need slice 3.b's
+## per-struct walker. The gate rejects them; falls through to libc-heap
+## fallback. Slice 4's `elem_kind` taxonomy is forward-compatible — when
+## slice 3.b ships, an `elem_kind = 5` branch can be added that calls
+## the emitted struct walker by name.
+def arena_promote_vec_ref(v: Vec<Int>, elem_kind: Int, elem_aux: Int): Vec<Int>
+  var out = vec_new<Int>()
+  for i in 0..v.size
+    var src = v[i]
+    var dst = src
+    if elem_kind == 2
+      dst = as_int(arena_promote_string(as_string(src)))
+    end
+    if elem_kind == 3
+      dst = as_int(arena_promote_vec_value(as_vec(src)))
+    end
+    if elem_kind == 4
+      dst = arena_promote_struct_value(src, elem_aux)
+    end
+    out.push(dst)
+  end
+  return out
+end
+
+## Promote an arena-allocated mixed-field struct to the surrounding
+## allocator. Each field is promoted according to its kind in the
+## supplied `layout` descriptor:
+##
+##   layout = [n_fields, kind_0, aux_0, kind_1, aux_1, ..., kind_{N-1}, aux_{N-1}]
+##
+## Per-field kinds:
+##   0 → value-typed i64 (primitive scalar / reference-typed value
+##       already outside the arena); slot copied verbatim.
+##   2 → String; promote via `arena_promote_string` (slice 1).
+##   4 → uniform-value-field nested struct; promote via
+##       `arena_promote_struct_value(slot, aux)` with aux=slot_count.
+##
+## Phase E.4.a slice 3.b: the compiler synthesizes a
+## `vec_new()` + per-entry `vec_push` chain at MIR-lowering time to
+## construct the descriptor at runtime, then invokes this helper. The
+## descriptor is keyed by the goroutine's struct return type (looked up
+## via `_mir_struct_mixed_field_layout` in the gate) — so each unique
+## struct type produces its own per-call descriptor without requiring
+## any compiler-emitted helper functions per struct.
+##
+## **Mixed nested struct fields, `Vec<T>` fields, narrow-fixed-width
+## fields**, and similar are rejected by the gate; the goroutine falls
+## through to libc-heap fallback. Recursive slice 3.b (mixed struct
+## containing mixed struct field) is rejected — the per-field
+## classifier only accepts uniform-value nested structs as
+## `kind=4` (slice 3.a's shape). A future slice can extend the
+## classifier to handle nested mixed by recursive descriptor inlining.
+def arena_promote_struct_mixed(src: Int, layout: Vec<Int>): Int
+  var n_fields = layout[0]
+  var dst = mem_alloc(n_fields * 8)
+  for i in 0..n_fields
+    var kind = layout[1 + i * 2]
+    var aux = layout[2 + i * 2]
+    var slot_val = load(src, i)
+    var promoted = slot_val
+    if kind == 2
+      promoted = as_int(arena_promote_string(as_string(slot_val)))
+    end
+    if kind == 4
+      promoted = arena_promote_struct_value(slot_val, aux)
+    end
+    store(dst, i, promoted)
+  end
+  return dst
+end
+
+# ============================================================================
+# Phase E.4.b — panic-path arena cleanup helpers
+# ============================================================================
+
+## Module-global capturing the most-recent panic message intercepted by
+## `__qz_arena_panic_rec`. Re-thrown verbatim in `_go_arena_body`'s panic
+## path. NOT thread-safe: under multi-worker `sched_init(0)`, two workers
+## panicking concurrently can clobber each other's message — the arena
+## still deallocates correctly (the load-bearing piece), only the
+## diagnostic text may be wrong. TLS-ifying via `task_local` would lift
+## that limitation; deferred until concrete demand appears.
+var _qz_arena_panic_msg: String = ""
+
+## Panic-recovery handler installed by the auto-arena synthesizer's outer
+## `with Throws { throw: __qz_arena_panic_rec }` wrap. Captures the
+## panic message into `_qz_arena_panic_msg` and returns -1 — the with-block's
+## resulting value, which the surrounding code uses as a "did the body
+## panic?" sentinel.
+##
+## After the with-block returns -1, the synthesizer's caller calls
+## `arena_destroy` and re-throws via `__qz_arena_panic_msg_get()` so the
+## panic propagates to the parent's outer Throws handler (or the
+## runtime-blessed default).
+def __qz_arena_panic_rec(op_name: Int, argc: Int, argv: Int): Int
+  _qz_arena_panic_msg = as_string(load(argv, 0))
+  return -1
+end
+
+## Read the most-recent captured panic message. Available for diagnostic
+## tooling that wants to surface what crashed an auto-arena goroutine —
+## the panic itself is intercepted by the synthesizer (or `_go_arena_body`)
+## and its return-side becomes the `-1` panic sentinel; the message would
+## otherwise be lost.
+def __qz_arena_panic_msg_get(): String = _qz_arena_panic_msg

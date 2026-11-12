@@ -1,0 +1,146 @@
+## std/gen — the Yield<T> algebraic effect.
+##
+## Operation Piezoelectric Effects, Phase 4, Milestone 4a.1.
+##
+## Declares `effect Yield<T>` with a single op `yield(v: T): Void`. A
+## function that performs `yield` is a generator; the enclosing `with
+## Yield { yield: h } do ->` installs the consumer that observes each
+## yielded value. Phase 4a.3 wires the consumer-drive kind=3 state
+## machine that turns a generator call into a re-entrant `$poll` frame;
+## Phase 4a.4 lifts that frame into the user-facing `Stream<T>` value.
+##
+## Unlike `Log`, `FileIo`, and the other blessed-relaxation effects,
+## `Yield<T>` has **no default handler**. Calling `yield` outside a
+## `with Yield {...}` scope (or a function declaring `can Yield`) is a
+## typecheck error (QZ0611/QZ0610), matching `Throws`. The design
+## rationale: a yielded value with no consumer is a silent data-loss
+## bug, not a runtime concern to paper over.
+##
+## Surface syntax for callers is `yield EXPR`, which Milestone 4a.2
+## desugars to a perform-site call of this op. Until 4a.2 ships, the
+## op can only be observed via `--dump-effect-decls` — that's what this
+## milestone (4a.1) validates.
+##
+## Type-parameter note: `Yield<T>` parses but `<T>` is erased at
+## runtime. Everything is i64 by the time the op reaches
+## `__qz_effect_perform`; handlers decode via the usual argv slot.
+
+effect Yield<T>
+  def yield(v: T): Void
+end
+
+## Stream<T, e> — consumer-drive, row-polymorphic generator handle.
+##
+## Operation Piezoelectric Effects, Phase 4 Path B, Milestone 4.B.4.b
+## (lifted to row-poly in Phase 4D.2).
+##
+## Calling a `def g(): impl Iterator<T>` function produces a
+## `Stream<T, {}>` handle; an `def g(): impl Iterator<T> can Async`
+## produces `Stream<T, {Async}>`. The row-var `e` propagates the
+## generator body's effects to consumers — `s.next()` widens the
+## caller's row by `e`. A pure caller of a pure generator binds `e`
+## to `{}` (no widening); an async caller of an async generator
+## binds `e` to `{Async}` (caller widened by Async).
+##
+##     def three(): impl Iterator<Int>
+##       yield 1; yield 2; yield 3
+##     end
+##     var s = three()
+##     s.next()   # Option::Some(1)
+##     s.next()   # Option::Some(2)
+##     s.next()   # Option::Some(3)
+##     s.next()   # Option::None
+##
+## `frame` points at the underlying kind=3 `$poll` frame (synthesized
+## by `mir_lower_generator_effect` via the existing async PASS 1.2a/1.3c
+## machinery). `step` is a bound fn pointer to that frame's `$poll`
+## function — one function per generator concrete-type, wired at
+## construction by the compiler's `<name>` constructor stub. Return
+## convention: POLL_READY=1 / POLL_SUSPENDED=0 / park-encoding <0.
+##
+## `.next()` installs a `with Yield { yield: __qz_gen_yield_capture }
+## do ->` handler around `step(frame)`. Each `yield v` in the generator
+## body performs kind=3 on Yield; the handler stashes v into a TLS slot
+## via `__qz_gen_stash` and returns `__qz_effect_suspend()`. kind=3
+## dispatch longjmps back to the with install site, so the expression
+## evaluates to POLL_SUSPENDED(0). `.next()` reads the stashed value and
+## returns `Option::Some(v)`. POLL_READY(1) means the body completed
+## without another yield — emit `Option::None`.
+##
+## The `T` type parameter is erased at runtime (existential model);
+## `step` and `.next()` return `Option<Int>` at the ABI level. The
+## concrete type is preserved only in the typechecker for caller
+## matching — `Stream<String>.next()` typechecks as returning
+## `Option<String>`, even though runtime dispatches through the same
+## i64-valued slot. The `step` field's `Fn(CPtr): Int` deliberately
+## carries no `can` clause: step's effects are dispatched through the
+## kind=3 install/perform machinery at `with Yield`, not propagated
+## through the function-pointer call.
+struct Stream<T, e>
+  frame: CPtr
+  step: Fn(CPtr): Int
+end
+
+def Stream.next<T, e>(self: Stream<T, e>): Option<T> can e
+  var f = self.step
+  var rv = with Yield { yield: __qz_gen_yield_capture } do -> f(self.frame) end
+  if rv == 1
+    # POLL_READY: body ran to completion, no value stashed. Generator
+    # exhausted — subsequent .next() calls re-enter $poll, hit the
+    # state=-1 done dispatch, and return 1 again.
+    return Option::None
+  end
+  # POLL_SUSPENDED (0): handler stashed the yielded value via
+  # __qz_gen_stash before longjmping back here. Take and return it.
+  return Option::Some(__qz_gen_take_stashed())
+end
+
+## Yield-capture handler installed by Stream.next(). kind=3 ABI:
+## `(op_name: Int, argc: Int, argv: Int): Int`. argv points to an
+## `[argc x i64]` array holding op args; for `yield(v: T)` the value is
+## `argv[0]` (runtime type-erased to i64). Stashes into a TLS slot via
+## `__qz_gen_stash`, then returns `__qz_effect_suspend()` (0) — kind=3
+## dispatch sees resumed[i]=0 and longjmps out of $poll back to the
+## `with` install site, leaving the frame paused at post-yield state.
+def __qz_gen_yield_capture(op_name: Int, argc: Int, argv: Int): Int
+  __qz_gen_stash(__qz_effect_argv_load(argv, 0))
+  return __qz_effect_suspend()
+end
+
+## Loads argv[i] (i64) from the effect-op argument array. Pure i64
+## pointer arithmetic + load; emitted inline by cg_emit_effect_runtime.
+extern "C" def __qz_effect_argv_load(argv: Int, i: Int): Int
+
+## Writes `v` into the generator's outgoing-value TLS slot.
+extern "C" def __qz_gen_stash(v: Int): Void
+
+## Reads and returns the last-stashed yield value from the TLS slot.
+## Called by Stream.next() after a POLL_SUSPENDED return from `step`.
+extern "C" def __qz_gen_take_stashed(): Int
+
+## Piezo P4.B.3 — POLL_SUSPENDED sentinel setter.
+##
+## Called from a kind=3 effect handler to park the outer `$poll` frame at
+## the post-perform state WITHOUT resuming synchronously. The outer `$poll`
+## invocation returns 0 (POLL_SUSPENDED) instead of 1 (POLL_READY) or a
+## park-on-fd sentinel; the next poll re-enters via the state-machine
+## switch at the resume block (same mechanism as a park-wake). Consumer-
+## driven callers (e.g. the forthcoming `Stream<T>.next()` in 4.B.4) read
+## this return as "the handler stashed a value; frame is ready for another
+## drive." Scheduler-driven callers reenqueue via the task_yield branch
+## (poll_result >= -1).
+##
+## Handler pattern:
+## ```
+## def my_yield(op_name: Int, argc: Int, argv: Int): Int
+##   var v = load(argv, 0)
+##   stash(v)
+##   return __qz_effect_suspend()
+## end
+## ```
+##
+## The helper stores 0 into @__qz_effect_park_rv and returns 0, so the
+## handler can `return __qz_effect_suspend()` as a tail-call idiom.
+##
+## Runtime emission: see `cg_emit_effect_runtime` in `codegen_runtime.qz`.
+extern "C" def __qz_effect_suspend(): Int

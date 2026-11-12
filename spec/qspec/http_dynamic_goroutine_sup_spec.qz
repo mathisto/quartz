@@ -1,0 +1,499 @@
+## http_dynamic_goroutine_sup — D.11 Phase 2 chunk 2b.
+##
+## Validates the basic API surface synchronously. Goroutine-completion
+## observations + scale behavior live in
+## `spec/qz/http_dyn_gsup_smoke.qz` (standalone `def main()` so real
+## worker spawns happen — qspec lambda bodies inline-poll goroutines
+## per the project caveat in CLAUDE.md, so completion-count assertions
+## here would be flaky).
+##
+## qspec covers:
+##   - construction returns a valid struct with zeroed counters
+##   - spawn_one returns a positive task handle + increments spawn_count
+##   - reservation after stop fails before task/body construction
+##   - stop is idempotent (second call is a no-op, no hang)
+
+import * from qspec
+import * from std/net/http_dynamic_goroutine_sup
+
+# A body that returns immediately. Used purely to give `spawn_one`
+# something callable; we don't assert on completion in this spec.
+def hdgs_noop_body(): Int
+  return 0
+end
+
+var _hdgs_side_effects = atomic_new(0)
+
+def hdgs_side_effect_body(): Int
+  atomic_add(_hdgs_side_effects, 1)
+  return 0
+end
+
+def hdgs_slow_body(): Int
+  sched_sleep(100)
+  return 0
+end
+
+# ---------------------------------------------------------------------------
+# Test 1: construction returns a valid sup. spawn_count and
+# completion_count both zero; alive() returns 0 (no children yet);
+# watcher field is non-zero (set by http_dyn_gsup_new).
+# ---------------------------------------------------------------------------
+
+def hdgs_test_construction(): Int
+  var sup = http_dyn_gsup_new()
+  var ok = 0
+  if http_dyn_gsup_spawn_count(sup) == 0
+    if http_dyn_gsup_completion_count(sup) == 0
+      if http_dyn_gsup_alive(sup) == 0
+        if http_dyn_gsup_has_watcher(sup) == 1
+          ok = 1
+        end
+      end
+    end
+  end
+  http_dyn_gsup_stop(sup)
+  return ok
+end
+
+# ---------------------------------------------------------------------------
+# Test 2: spawn_one increments spawn_count. Three spawns → spawn_count
+# == 3. We do NOT assert on alive() (the inline-polled bodies may have
+# already completed under qspec) — that's the smoke's job.
+# ---------------------------------------------------------------------------
+
+def hdgs_test_spawn_increments(): Int
+  var sup = http_dyn_gsup_new()
+  http_dyn_gsup_spawn_one(sup, hdgs_noop_body)
+  http_dyn_gsup_spawn_one(sup, hdgs_noop_body)
+  http_dyn_gsup_spawn_one(sup, hdgs_noop_body)
+  var got = http_dyn_gsup_spawn_count(sup)
+  http_dyn_gsup_stop(sup)
+  return got
+end
+
+# ---------------------------------------------------------------------------
+# Test 3: spawn_one returns a positive task handle (non-zero, indicating
+# the goroutine was queued).
+# ---------------------------------------------------------------------------
+
+def hdgs_test_spawn_returns_handle(): Int
+  var sup = http_dyn_gsup_new()
+  var t = http_dyn_gsup_spawn_one(sup, hdgs_noop_body)
+  http_dyn_gsup_stop(sup)
+  if t > 0
+    return 1
+  end
+  return 0
+end
+
+# ---------------------------------------------------------------------------
+# Test 4: explicit admission after stop fails before the caller invokes the
+# side-effecting task constructor.
+# ---------------------------------------------------------------------------
+
+def hdgs_test_reserve_after_stop_prevents_construction(): Int
+  var sup = http_dyn_gsup_new()
+  http_dyn_gsup_stop(sup)
+  atomic_store(_hdgs_side_effects, 0)
+  var reservation = http_dyn_gsup_reserve(sup)
+  if reservation != 0
+    return 0
+  end
+  # This is the required caller ordering: no Future factory/body invocation
+  # occurs when reservation fails.
+  if reservation != 0
+    http_dyn_gsup_spawn_reserved(sup, reservation, hdgs_side_effect_body)
+  end
+  if atomic_load(_hdgs_side_effects) == 0 and http_dyn_gsup_spawn_count(sup) == 0
+    return 1
+  end
+  return 0
+end
+
+# ---------------------------------------------------------------------------
+# Test 5: stop is idempotent — second call is a no-op (returns without
+# hanging or erroring).
+# ---------------------------------------------------------------------------
+
+def hdgs_test_stop_idempotent(): Int
+  var sup = http_dyn_gsup_new()
+  http_dyn_gsup_stop(sup)
+  http_dyn_gsup_stop(sup)
+  return 1
+end
+
+# ---------------------------------------------------------------------------
+# Test 6: counters are accessible after stop (don't reset).
+# ---------------------------------------------------------------------------
+
+def hdgs_test_counters_survive_stop(): Int
+  var sup = http_dyn_gsup_new()
+  http_dyn_gsup_spawn_one(sup, hdgs_noop_body)
+  http_dyn_gsup_spawn_one(sup, hdgs_noop_body)
+  var before = http_dyn_gsup_spawn_count(sup)
+  http_dyn_gsup_stop(sup)
+  var after = http_dyn_gsup_spawn_count(sup)
+  if before == 2
+    if after == 2
+      return 1
+    end
+  end
+  return 0
+end
+
+def hdgs_test_immediate_completion_registration(): Int
+  var sup = http_dyn_gsup_new()
+  var i = 0
+  while i < 64
+    var reservation = http_dyn_gsup_reserve(sup)
+    if reservation == 0
+      http_dyn_gsup_stop(sup)
+      return 0
+    end
+    if http_dyn_gsup_claim(sup, reservation) == 0
+      http_dyn_gsup_stop(sup)
+      return 0
+    end
+    var task = http_dyn_gsup_task(hdgs_noop_body)
+    if http_dyn_gsup_publish(sup, reservation, task) == 0
+      http_dyn_gsup_abort_claim(sup, reservation)
+      http_dyn_gsup_stop(sup)
+      return 0
+    end
+    i = i + 1
+  end
+  http_dyn_gsup_stop(sup)
+  if http_dyn_gsup_spawn_count(sup) == 64
+    if http_dyn_gsup_completion_count(sup) == 64
+      if http_dyn_gsup_alive(sup) == 0
+        return 1
+      end
+    end
+  end
+  return 0
+end
+
+
+def hdgs_test_claim_survives_stop(): Int
+  var sup = http_dyn_gsup_new()
+  http_dyn_gsup_set_drain_timeout(sup, 20)
+  var reservation = http_dyn_gsup_reserve(sup)
+  if reservation == 0 or http_dyn_gsup_claim(sup, reservation) == 0
+    return 0
+  end
+  var started = time_mono_ns()
+  http_dyn_gsup_stop(sup)
+  var elapsed_ms = (time_mono_ns() - started) / 1000000
+  if elapsed_ms < 10 or elapsed_ms > 500
+    return 0
+  end
+  if http_dyn_gsup_pending_constructors(sup) != 1
+    return 0
+  end
+  var task = http_dyn_gsup_task(hdgs_noop_body)
+  if http_dyn_gsup_publish(sup, reservation, task) == 0
+    http_dyn_gsup_abort_claim(sup, reservation)
+    return 0
+  end
+  http_dyn_gsup_set_drain_timeout(sup, 200)
+  http_dyn_gsup_stop(sup)
+  if http_dyn_gsup_pending_constructors(sup) == 0 and http_dyn_gsup_spawn_count(sup) == 1 and http_dyn_gsup_completion_count(sup) == 1
+    return 1
+  end
+  return 0
+end
+
+def hdgs_test_abort_claim(): Int
+  var sup = http_dyn_gsup_new()
+  var reservation = http_dyn_gsup_reserve(sup)
+  if reservation == 0 or http_dyn_gsup_claim(sup, reservation) == 0
+    return 0
+  end
+  if http_dyn_gsup_abort_claim(sup, reservation) != 1
+    return 0
+  end
+  if http_dyn_gsup_abort_claim(sup, reservation) != 0 or http_dyn_gsup_pending_constructors(sup) != 0
+    return 0
+  end
+  http_dyn_gsup_stop(sup)
+  return 1
+end
+
+def hdgs_test_task_single_publication(): Int
+  var sup_a = http_dyn_gsup_new()
+  var sup_b = http_dyn_gsup_new()
+  var a = http_dyn_gsup_reserve(sup_a)
+  var a2 = http_dyn_gsup_reserve(sup_a)
+  var b = http_dyn_gsup_reserve(sup_b)
+  if http_dyn_gsup_claim(sup_a, a) == 0 or http_dyn_gsup_claim(sup_a, a2) == 0 or http_dyn_gsup_claim(sup_b, b) == 0
+    return 0
+  end
+  var task = http_dyn_gsup_task(hdgs_slow_body)
+  if http_dyn_gsup_publish(sup_a, a, task) == 0
+    return 0
+  end
+  if http_dyn_gsup_publish(sup_a, a2, task) != 0
+    return 0
+  end
+  if http_dyn_gsup_publish(sup_b, b, task) != 0
+    return 0
+  end
+  if http_dyn_gsup_abort_claim(sup_a, a2) != 1 or http_dyn_gsup_abort_claim(sup_b, b) != 1
+    return 0
+  end
+  http_dyn_gsup_stop(sup_a)
+  http_dyn_gsup_stop(sup_b)
+  return 1
+end
+
+def hdgs_test_available_not_claimed_rejected(): Int
+  var sup = http_dyn_gsup_new()
+  var reservation = http_dyn_gsup_reserve(sup)
+  var task = http_dyn_gsup_task(hdgs_noop_body)
+  if http_dyn_gsup_publish(sup, reservation, task) != 0
+    return 0
+  end
+  if http_dyn_gsup_release(sup, reservation) != 1
+    return 0
+  end
+  http_dyn_gsup_stop(sup)
+  return 1
+end
+
+def hdgs_test_token_exhaustion_and_slot_reuse(): Int
+  var sup = http_dyn_gsup_new()
+  http_dyn_gsup_set_token_limit_for_test(sup, 0)
+  if http_dyn_gsup_reserve(sup) != 0
+    return 0
+  end
+  http_dyn_gsup_set_token_limit_for_test(sup, 9223372036854775807)
+  var i = 0
+  while i < 10000
+    var reservation = http_dyn_gsup_reserve(sup)
+    if reservation == 0 or http_dyn_gsup_release(sup, reservation) != 1
+      return 0
+    end
+    i = i + 1
+  end
+  var storage = http_dyn_gsup_reservation_storage(sup)
+  http_dyn_gsup_stop(sup)
+  if storage == 1
+    return 1
+  end
+  return 0
+end
+
+def hdgs_test_created_future_rejection_keeps_ownership(): Int
+  var sup = http_dyn_gsup_new()
+  http_dyn_gsup_stop(sup)
+  atomic_store(_hdgs_side_effects, 0)
+  var task = http_dyn_gsup_task(hdgs_side_effect_body)
+  var published = http_dyn_gsup_spawn_task(sup, task)
+  if task != 0 and published == 0 and atomic_load(_hdgs_side_effects) == 1
+    return 1
+  end
+  return 0
+end
+
+def hdgs_test_max_children_counts_reservations(): Int
+  var sup = http_dyn_gsup_new()
+  http_dyn_gsup_set_max_children(sup, 1)
+  var first = http_dyn_gsup_reserve(sup)
+  if first == 0
+    return 0
+  end
+  if http_dyn_gsup_reserve(sup) != 0
+    return 0
+  end
+  if http_dyn_gsup_claim(sup, first) == 0
+    return 0
+  end
+  if http_dyn_gsup_reserve(sup) != 0
+    return 0
+  end
+  if http_dyn_gsup_abort_claim(sup, first) != 1
+    return 0
+  end
+  var replacement = http_dyn_gsup_reserve(sup)
+  if replacement == 0 or http_dyn_gsup_release(sup, replacement) != 1
+    return 0
+  end
+  http_dyn_gsup_stop(sup)
+  return 1
+end
+
+def hdgs_test_token_rejection(): Int
+  var sup_a = http_dyn_gsup_new()
+  var sup_b = http_dyn_gsup_new()
+  atomic_store(_hdgs_side_effects, 0)
+  var reservation = http_dyn_gsup_reserve(sup_a)
+  if reservation == 0
+    return 0
+  end
+  if http_dyn_gsup_spawn_reserved(sup_b, reservation, hdgs_side_effect_body) != 0
+    return 0
+  end
+  if http_dyn_gsup_spawn_reserved(sup_a, 0 - 77, hdgs_side_effect_body) != 0
+    return 0
+  end
+  if atomic_load(_hdgs_side_effects) != 0
+    return 0
+  end
+  if http_dyn_gsup_spawn_reserved(sup_a, reservation, hdgs_side_effect_body) == 0
+    return 0
+  end
+  if http_dyn_gsup_spawn_reserved(sup_a, reservation, hdgs_side_effect_body) != 0
+    return 0
+  end
+  http_dyn_gsup_stop(sup_a)
+  http_dyn_gsup_stop(sup_b)
+  if atomic_load(_hdgs_side_effects) == 1
+    return 1
+  end
+  return 0
+end
+
+def hdgs_test_abandoned_reservation_is_bounded(): Int
+  var sup = http_dyn_gsup_new()
+  http_dyn_gsup_set_drain_timeout(sup, 100)
+  var reservation = http_dyn_gsup_reserve(sup)
+  if reservation == 0
+    return 0
+  end
+  var started = time_mono_ns()
+  http_dyn_gsup_stop(sup)
+  var elapsed_ms = (time_mono_ns() - started) / 1000000
+  if elapsed_ms > 500
+    return 0
+  end
+  _hdgs_lock(sup.children_lock)
+  var pending_reservations = sup.pending_reservations
+  _hdgs_unlock(sup.children_lock)
+  if pending_reservations != 0
+    return 0
+  end
+  if http_dyn_gsup_release(sup, reservation) != 0
+    return 0
+  end
+  atomic_store(_hdgs_side_effects, 0)
+  if http_dyn_gsup_spawn_reserved(sup, reservation, hdgs_side_effect_body) != 0
+    return 0
+  end
+  if atomic_load(_hdgs_side_effects) == 0
+    return 1
+  end
+  return 0
+end
+
+def hdgs_test_repeated_lifecycle_churn(): Int
+  var cycle = 0
+  while cycle < 32
+    var sup = http_dyn_gsup_new()
+    var i = 0
+    while i < 4
+      if http_dyn_gsup_spawn_one(sup, hdgs_noop_body) == 0
+        http_dyn_gsup_stop(sup)
+        return 0
+      end
+      i = i + 1
+    end
+    http_dyn_gsup_stop(sup)
+    if http_dyn_gsup_spawn_count(sup) != 4 or http_dyn_gsup_completion_count(sup) != 4
+      return 0
+    end
+    cycle = cycle + 1
+  end
+  return 1
+end
+
+def hdgs_test_timeout_normalization(): Int
+  var sup = http_dyn_gsup_new()
+  http_dyn_gsup_set_drain_timeout(sup, 0 - 25)
+  _hdgs_lock(sup.children_lock)
+  var normalized = sup.drain_timeout_ms
+  _hdgs_unlock(sup.children_lock)
+  http_dyn_gsup_set_drain_timeout(sup, 100)
+  http_dyn_gsup_stop(sup)
+  return normalized
+end
+
+def main(): Int
+  describe("http_dynamic_goroutine_sup — D.11 Phase 2 chunk 2b") do ->
+    it("new() returns a valid sup with zeroed counters") do ->
+      assert_eq(hdgs_test_construction(), 1)
+    end
+
+    it("spawn_one increments spawn_count synchronously") do ->
+      assert_eq(hdgs_test_spawn_increments(), 3)
+    end
+
+    it("spawn_one returns a positive task handle") do ->
+      assert_eq(hdgs_test_spawn_returns_handle(), 1)
+    end
+
+    it("rejects reservation after stop before task construction") do ->
+      assert_eq(hdgs_test_reserve_after_stop_prevents_construction(), 1)
+    end
+
+    it("stop is idempotent — second call no-ops") do ->
+      assert_eq(hdgs_test_stop_idempotent(), 1)
+    end
+
+    it("counters survive stop (don't reset)") do ->
+      assert_eq(hdgs_test_counters_survive_stop(), 1)
+    end
+
+    it("accounts an already-completed task exactly once on publication") do ->
+      assert_eq(hdgs_test_immediate_completion_registration(), 1)
+    end
+
+    it("keeps a claimed constructor valid across bounded stop") do ->
+      assert_eq(hdgs_test_claim_survives_stop(), 1)
+    end
+
+    it("aborts a claim exactly once") do ->
+      assert_eq(hdgs_test_abort_claim(), 1)
+    end
+
+    it("rejects duplicate and cross-supervisor task publication") do ->
+      assert_eq(hdgs_test_task_single_publication(), 1)
+    end
+
+    it("rejects publication of an available but unclaimed token") do ->
+      assert_eq(hdgs_test_available_not_claimed_rejected(), 1)
+    end
+
+    it("fails token exhaustion without wrap and reuses 10000 reservation slots") do ->
+      assert_eq(hdgs_test_token_exhaustion_and_slot_reuse(), 1)
+    end
+
+    it("leaves an already-created Future caller-owned on rejection") do ->
+      assert_eq(hdgs_test_created_future_rejection_keeps_ownership(), 1)
+    end
+
+    it("enforces max children across available and claimed reservations") do ->
+      assert_eq(hdgs_test_max_children_counts_reservations(), 1)
+    end
+
+    it("rejects invalid, foreign, and double-used reservations") do ->
+      assert_eq(hdgs_test_token_rejection(), 1)
+    end
+
+    it("reconciles an abandoned reservation within the stop bound") do ->
+      assert_eq(hdgs_test_abandoned_reservation_is_bounded(), 1)
+    end
+
+    it("repeated create-spawn-stop lifecycle leaves no live children") do ->
+      assert_eq(hdgs_test_repeated_lifecycle_churn(), 1)
+    end
+
+
+    it("normalizes negative drain budgets to immediate zero") do ->
+      assert_eq(hdgs_test_timeout_normalization(), 0)
+    end
+  end
+  var result = qspec_main()
+  sched_shutdown()
+  return result
+end

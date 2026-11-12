@@ -1,0 +1,270 @@
+## QSpec runner Phase 5.0f smoke — persistent worker N-compile round-trip.
+##
+## Reproduces the fsc-trap: persistent workers crash at compile request 4
+## (per `docs/design/QUARTZD.md` D5 + the empirical finding section).
+##
+## Pipeline:
+##   1. Write trivial fixture to /tmp/qspec_5_0f_trivial.qz.
+##   2. Open TCP listener on 127.0.0.1:0.
+##   3. Spawn `quartz --persistent-worker --connect-port=PORT` inside a
+##      goroutine via `go posix_spawn_wait(...)` (async so main can enter
+##      tcp_accept while the child is starting up).
+##   4. Accept worker's connection.
+##   5. Send N=COMPILE_COUNT consecutive compile requests for the trivial
+##      fixture; assert each response is status=ok, exit_code=0, IR was
+##      written to the requested path and is non-empty.
+##   6. Send a shutdown request; await the worker future; check exit code.
+##
+## Build + run:
+##   ./self-hosted/bin/quartz \
+##     -I std -I . -I self-hosted/shared \
+##     spec/qz/persistent_worker_compile_smoke.qz | \
+##     llc -filetype=obj -o /tmp/pw_compile.o && \
+##     clang /tmp/pw_compile.o -o /tmp/pw_compile -lm -lpthread && /tmp/pw_compile
+
+import * from std/net/tcp
+import std/ffi/socket
+import * from persistent_worker_protocol
+
+## How many compiles to send. Trap was empirically reproduced at request 4;
+## we send 5 so the smoke fails on the trap and passes only when 5.0f works.
+def COMPILE_COUNT(): Int = 5
+
+## Path to the trivial source fixture (written at smoke startup).
+def FIXTURE_PATH(): String = "/tmp/qspec_5_0f_trivial.qz"
+
+## Per-request stderr path template — receives the worker's stderr for the
+## i'th compile. Useful when the worker dies and the crash diagnostic
+## lands in stderr (post-Phase-5.0c.1 stderr redirection).
+def STDERR_PATH_FOR(i: Int): String = "/tmp/qspec_5_0f_stderr_r#{i}.err"
+
+## Per-request IR path template — receives the LLVM IR emitted for the
+## i'th compile when the worker is healthy.
+def IR_PATH_FOR(i: Int): String = "/tmp/qspec_5_0f_ir_r#{i}.ll"
+
+## Read exactly N bytes from `stream`. Binary-safe — bypasses
+## `cstr_to_string` truncation by routing through cptr_to_string_with_len.
+def smoke_read_exact(stream: TcpStream, n: Int): String
+  if n <= 0
+    return ""
+  end
+  var buf = qz_malloc(n)
+  if buf == 0
+    return ""
+  end
+  var got = 0
+  while got < n
+    var bytes = socket::socket_recv(stream.fd, buf + got, n - got, 0)
+    if bytes <= 0
+      mem_free(buf)
+      return ""
+    end
+    got = got + bytes
+  end
+  var s = cptr_to_string_with_len(buf, n)
+  mem_free(buf)
+  return s
+end
+
+## Read one full length-prefixed frame (4-byte LE prefix + body).
+def smoke_read_frame(stream: TcpStream): String
+  var prefix = smoke_read_exact(stream, 4)
+  if str_byte_len(prefix) != 4
+    return ""
+  end
+  var body_len = read_frame_length(prefix)
+  if body_len <= 0
+    return prefix
+  end
+  var body = smoke_read_exact(stream, body_len)
+  if str_byte_len(body) != body_len
+    return ""
+  end
+  return prefix + body
+end
+
+## Binary-safe write — bypasses tcp_write's strdup-truncation.
+def smoke_write_all(stream: TcpStream, data: String): Int
+  var total = str_byte_len(data)
+  if total == 0
+    return 0
+  end
+  var ptr = str_to_ptr(data)
+  var sent = 0
+  while sent < total
+    var n = socket::socket_send(stream.fd, ptr + sent, total - sent, 0)
+    if n < 0
+      return -1
+    end
+    sent = sent + n
+  end
+  return sent
+end
+
+## Construct argv for the i'th compile request — fixture path, the same
+## set of -I paths a real qspec dispatch would pass, and --ir-output
+## redirecting IR to a worker-local tmpfile.
+def smoke_make_compile_argv(i: Int): Vec<String>
+  var v = vec_new<String>()
+  v.push(FIXTURE_PATH())
+  v.push("-I"); v.push("std")
+  v.push("-I"); v.push(".")
+  v.push("-I"); v.push("self-hosted/shared")
+  v.push("-I"); v.push("self-hosted/frontend")
+  v.push("-I"); v.push("self-hosted/middle")
+  v.push("-I"); v.push("self-hosted/backend")
+  v.push("--no-cache")
+  v.push("--ir-output"); v.push(IR_PATH_FOR(i))
+  return v
+end
+
+## Construct a WorkRequest for the i'th compile. `cwd` is the absolute
+## worktree path so relative `-I` paths resolve correctly.
+def smoke_make_compile_req(request_id: Int, i: Int, cwd: String): WorkRequest
+  return WorkRequest {
+    request_id: request_id,
+    kind: REQ_COMPILE(),
+    argv: smoke_make_compile_argv(i),
+    cwd: cwd,
+    path_env: "",
+    stderr_path: STDERR_PATH_FOR(i),
+  }
+end
+
+## Build a control-only request (shutdown).
+def smoke_make_control_req(request_id: Int, kind: String): WorkRequest
+  return WorkRequest {
+    request_id: request_id,
+    kind: kind,
+    argv: vec_new<String>(),
+    cwd: "",
+    path_env: "",
+    stderr_path: "",
+  }
+end
+
+## Send a request, read the response. Returns the decoded response —
+## caller checks .status / .request_id / .exit_code. If the worker died
+## mid-request (read returns empty), prints diagnostic and exits 1.
+def smoke_round_trip(stream: TcpStream, req: WorkRequest): WorkResponse
+  var encoded = encode_request(req)
+  var written = smoke_write_all(stream, encoded)
+  if written < 0
+    puts("FAIL: write to worker failed (request_id=#{req.request_id.to_s()})")
+    exit(1)
+  end
+  var frame = smoke_read_frame(stream)
+  if str_byte_len(frame) == 0
+    puts("FAIL: empty read for request_id=#{req.request_id.to_s()} (worker likely crashed)")
+    exit(1)
+  end
+  var dec = decode_response(frame)
+  if dec.ok == false
+    puts("FAIL: decode_response failed: #{dec.error_msg}")
+    exit(1)
+  end
+  return dec.response
+end
+
+## Run the worker subprocess. Inside `go ...`, this becomes a future the
+## smoke awaits at the end so we observe the exit code.
+def smoke_run_worker(port: Int): Int
+  var cmd = "./self-hosted/bin/quartz --persistent-worker --connect-port=#{port.to_s()}"
+  return posix_spawn_wait(cmd)
+end
+
+## Write the trivial fixture source. `def main(): Int = 0` — minimal but
+## still requires the full stdlib parse + typecheck path (auto-prelude).
+def smoke_write_fixture(): Void
+  var src = "def main(): Int = 0\n"
+  var _wr = write_file(FIXTURE_PATH(), src)
+end
+
+def main(): Int
+  # Step 1: write the fixture.
+  smoke_write_fixture()
+  puts("smoke: fixture at #{FIXTURE_PATH()}")
+
+  # Capture cwd so the worker's chdir lands in the same worktree.
+  var cwd_buf = getcwd()
+  if str_byte_len(cwd_buf) == 0
+    puts("FAIL: could not determine cwd")
+    return 1
+  end
+  puts("smoke: cwd=#{cwd_buf}")
+
+  # Step 2: listener on kernel-assigned port.
+  var listen_result = tcp_listen(0)
+  match listen_result
+    ListenResult::Err(e) => {
+      puts("FAIL: tcp_listen failed: #{e.message}")
+      return 1
+    }
+    ListenResult::Ok(listener) => {
+      var port = listener.port
+      puts("smoke: listener on 127.0.0.1:#{port.to_s()}")
+
+      # Step 3: spawn worker as a goroutine so main can accept().
+      var worker = go smoke_run_worker(port)
+
+      # Step 4: accept the worker's connect-back.
+      var accept_result = tcp_accept(listener)
+      match accept_result
+        AcceptResult::Err(e) => {
+          puts("FAIL: tcp_accept failed: #{e.message}")
+          var _wc = tcp_close_listener(listener)
+          return 1
+        }
+        AcceptResult::Ok(stream) => {
+          puts("smoke: worker connected (fd=#{stream.fd.to_s()})")
+
+          # Step 5: N consecutive compiles.
+          var n = COMPILE_COUNT()
+          var i = 0
+          while i < n
+            var request_id = i + 1
+            puts("smoke: sending compile request_id=#{request_id.to_s()} (i=#{i.to_s()})")
+            var resp = smoke_round_trip(stream, smoke_make_compile_req(request_id, i, cwd_buf))
+            if resp.request_id != request_id
+              puts("FAIL: compile #{request_id.to_s()} response request_id=#{resp.request_id.to_s()}")
+              return 1
+            end
+            if resp.status != RESP_OK()
+              puts("FAIL: compile #{request_id.to_s()} status=#{resp.status}, exit_code=#{resp.exit_code.to_s()}, duration=#{resp.duration_ms.to_s()}ms")
+              puts("      stderr_path=#{resp.stderr_path}")
+              return 1
+            end
+            if resp.exit_code != 0
+              puts("FAIL: compile #{request_id.to_s()} non-zero exit_code=#{resp.exit_code.to_s()}")
+              return 1
+            end
+            puts("smoke: compile #{request_id.to_s()} OK (#{resp.duration_ms.to_s()}ms, ir=#{resp.ir_path})")
+            i = i + 1
+          end
+
+          # Step 6: shutdown round-trip.
+          var sd_resp = smoke_round_trip(stream, smoke_make_control_req(n + 1, REQ_SHUTDOWN()))
+          if sd_resp.status != RESP_OK()
+            puts("FAIL: shutdown response status=#{sd_resp.status}")
+            return 1
+          end
+          puts("smoke: shutdown OK (#{sd_resp.duration_ms.to_s()}ms)")
+
+          var _close = tcp_close(stream)
+
+          var wait_status = await worker
+          if wait_status != 0
+            puts("FAIL: worker exited with non-zero wait status #{wait_status.to_s()}")
+            return 1
+          end
+          puts("smoke: worker exited cleanly")
+
+          var _wc = tcp_close_listener(listener)
+          puts("PASS")
+          return 0
+        }
+      end
+    }
+  end
+  return 0
+end

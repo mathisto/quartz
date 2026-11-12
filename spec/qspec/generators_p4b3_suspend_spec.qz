@@ -1,0 +1,193 @@
+## Phase 4.B.3 — POLL_SUSPENDED sentinel + __qz_effect_suspend runtime
+##
+## Operation Piezoelectric Effects, Phase 4 Path B, Milestone 4.B.3.
+##
+## This milestone adds the POLL_SUSPENDED=0 park-rv sentinel and the
+## `__qz_effect_suspend` runtime helper that sets it. Together they let
+## a kind=3 effect handler park the outer `$poll` frame at post-perform
+## state WITHOUT calling `resume(v)` — the scheduler (or a consumer-driven
+## caller) reenqueues the task and the next poll re-enters via the
+## state-machine switch at the resume block.
+##
+## This is the one ABI extension called out in
+## `docs/design/PHASE_4_GENERATORS_VIA_EFFECTS.md` §3.2 — reinterpreting
+## the previously-unused `park_rv==0` as "suspend, re-enter from same
+## state." Today no path emits 0 (default POLL_READY=1, park sentinels
+## ≤-1); the audit that cleared this collision is in the 4.B.3 handoff.
+##
+## What this spec pins down:
+##
+##   - `__qz_effect_suspend()` is declared and callable from user code
+##     via `extern "C" def` in `std/gen.qz`.
+##   - A scheduler-driven kind=3 routine whose handler calls suspend
+##     (rather than resume) runs to completion: each `pause(v)` call
+##     invokes the handler, which stashes v and suspends; the scheduler
+##     reenqueues; the task's next poll lands in the post-pause resume
+##     block; subsequent pauses behave identically; body's final return
+##     lands via normal task-done path and the awaiter observes it.
+##   - The handler observes every yielded value in order — proof the
+##     body progresses one state per poll rather than skipping or
+##     double-running.
+##
+## Out of scope (deferred to 4.B.4+):
+##
+##   - `yield v` surface syntax routed through kind=3 perform (NODE_YIELD
+##     routing still uses the bespoke `mir_lower_generator` path).
+##   - `impl Iterator<T>` return-type → $poll-ification.
+##   - `Stream<T>` + `.next()` consumer-drive surface.
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("4.B.3 — POLL_SUSPENDED park-rv sentinel + __qz_effect_suspend") do ->
+    it("__qz_effect_suspend is emitted in the runtime and callable via extern") do ->
+      assert_ir_contains("""
+import * from std/gen
+
+def main(): Int
+  return __qz_effect_suspend()
+end
+""", "define i64 @__qz_effect_suspend()")
+    end
+
+    it("handler-driven POLL_SUSPENDED stores 0 to park_rv TLS") do ->
+      assert_ir_contains("""
+import * from std/gen
+
+def main(): Int
+  return __qz_effect_suspend()
+end
+""", "store i64 0, ptr @__qz_effect_park_rv")
+    end
+
+    it("scheduler-drive: suspend handler lets body progress one perform per poll") do ->
+      # Each pause(v) call: handler captures v into _collected, calls
+      # __qz_effect_suspend (park_rv=0 → outer $poll rets 0), scheduler
+      # reenqueues task (task_yield branch since poll_result >= -1),
+      # next poll dispatches to post-pause state. Three pauses →
+      # three entries in _collected, in order. Body's final `return 999`
+      # fires task_done path; awaiter reads frame[1]=999.
+      #
+      # Phase E.1.c.b (2026-04-28): canonical `with E { ... } do go fn() end`
+      # works again because spawn-time effect-stack snapshot inherits
+      # parent's handlers into the goroutine. (Pre-E.1.c.b the test had
+      # to wrap `my_gen()` in a `my_gen_with_handler` helper because
+      # E.1.c's per-worker TLS stacks meant main-thread installs weren't
+      # visible to workers. With snapshot-based inheritance, main's
+      # `with Suspendy {...}` install is captured at `go fn()` and
+      # re-applied on every $poll dispatch.)
+      assert_run_stdout_eq("""
+import * from std/gen
+
+effect Suspendy
+  def pause(x: Int): Void
+    do_nothing()
+    resume(0)
+    return 0
+  end
+end
+
+def do_nothing(): Int = 0
+
+var _collected: Vec<Int> = vec_new<Int>()
+
+def yield_capture(op_name: Int, argc: Int, argv: Int): Int
+  var v = load(argv, 0)
+  _collected.push(v)
+  return __qz_effect_suspend()
+end
+
+def my_gen(): Int can Suspendy
+  pause(10)
+  pause(20)
+  pause(30)
+  return 999
+end
+
+def main(): Int
+  sched_init(2)
+  with Suspendy { pause: yield_capture } do ->
+    var fut = go my_gen()
+    var r = await fut
+    puts(str_from_int(r))
+    for v in _collected
+      puts(str_from_int(v))
+    end
+    0
+  end
+  return 0
+end
+""", "999\n10\n20\n30\n")
+    end
+
+    it("suspend and resume paths can interleave within a single routine") do ->
+      # Closes the kind=3 resume(0) + with-block-in-goroutine bug filed
+      # at docs/bugs/KIND3_RESUME_INTERLEAVE_IN_GOROUTINE.md (which the
+      # E.1.c-era body-wrap workaround triggered cleanly). E.1.c.b's
+      # snapshot-based handler inheritance lets the test express the
+      # pattern WITHOUT the with-block-as-function-body wrap that the
+      # bug needed to manifest.
+      assert_run_stdout_eq("""
+import * from std/gen
+
+effect Blend
+  def notify(x: Int): Void
+    do_nothing()
+    resume(0)
+    return 0
+  end
+  def pause(x: Int): Void
+    do_nothing()
+    resume(0)
+    return 0
+  end
+end
+
+def do_nothing(): Int = 0
+
+var _collected: Vec<Int> = vec_new<Int>()
+var _notified: Vec<Int> = vec_new<Int>()
+
+def capture_pause(op_name: Int, argc: Int, argv: Int): Int
+  _collected.push(load(argv, 0))
+  return __qz_effect_suspend()
+end
+
+def capture_notify(op_name: Int, argc: Int, argv: Int): Int
+  _notified.push(load(argv, 0))
+  resume(0)
+  return 0
+end
+
+def my_gen(): Int can Blend
+  notify(1)
+  pause(2)
+  notify(3)
+  pause(4)
+  return 77
+end
+
+def main(): Int
+  sched_init(2)
+  with Blend { notify: capture_notify, pause: capture_pause } do ->
+    var fut = go my_gen()
+    var r = await fut
+    puts(str_from_int(r))
+    puts("paused:")
+    for v in _collected
+      puts(str_from_int(v))
+    end
+    puts("notified:")
+    for v in _notified
+      puts(str_from_int(v))
+    end
+    0
+  end
+  return 0
+end
+""", "77\npaused:\n2\n4\nnotified:\n1\n3\n")
+    end
+  end
+  return qspec_main()
+end

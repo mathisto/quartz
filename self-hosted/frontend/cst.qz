@@ -1,0 +1,776 @@
+##! # Lossless Concrete Syntax Tree (CST) — Formatter M1.2
+##!
+##! Arena-style green-tree storage for the Quartz formatter and codemod engine
+##! (FORMATTER.md D1). The CST is the **lossless** source-of-truth surface tree:
+##! every byte of the original source — including trivia (comments, doc-comments,
+##! blank-line runs, whitespace) and author-chosen surface forms the AST desugars
+##! or conflates — is recoverable from it. The AST stays the *semantic* tree;
+##! CST→AST lowering (M1.3) keeps the existing pipeline byte-identical.
+##!
+##! ## Why a CST (vs. formatting from the AST)
+##!
+##! The AST (`ast.qz`) is lossy *by construction*. It:
+##!   - desugars `for…in`, string interpolation, compound assignment,
+##!     list/map comprehensions, struct-update spread, range literals;
+##!   - conflates surface variants — `if let x = e`, `if Some(v) = e`, and plain
+##!     `if cond` collapse toward the same `NodeIf`; `{ }`-lambdas and
+##!     `do…end`-lambdas collapse to `NodeLambda`; endless-`def` and block-`def`
+##!     collapse to `NodeFunction`;
+##!   - drops every comment, blank line, and paren-grouping.
+##! None of that round-trips. The CST adds the surface granularity the AST lacks
+##! so M1.3 can build a tree from which source is byte-reconstructable and M2.2
+##! can re-emit canonical layout.
+##!
+##! ## Architecture (mirrors AstStorage)
+##!
+##! Instead of pointer structs, the CST uses a flat handle/index arena: parallel
+##! `Vec<Int>` fields indexed by node handle. A node's handle is its index. All
+##! constructors are append-only and return the new handle; accessors take
+##! storage + handle. Handle 0 is the null sentinel (matching ast.qz).
+##!
+##! | Index slot              | Purpose                                        |
+##! |-------------------------|------------------------------------------------|
+##! | kinds                   | CstNodeKind enum value                         |
+##! | byte_starts             | half-open span start (byte offset into source) |
+##! | byte_ends               | half-open span end   (exclusive)               |
+##! | lines / cols            | 1-based line/col of the node start (diagnostics)|
+##! | ops                     | operator/keyword discriminant (CstOp)          |
+##! | str1s / str2s           | interned payloads (lexeme, name, type text)    |
+##! | lefts / rights          | structural child handles (binary/unary/etc.)   |
+##! | extras                  | flag bag — trailing-comma flag lives here (D4) |
+##! | children                | Vec<Int> handle of n-ary child handles         |
+##! | docs                    | interned doc-comment text (sparse)             |
+##! | lead_trivia/trail_trivia| Vec<Int> handles of trivia records (Roslyn)    |
+##!
+##! ## Byte spans are the losslessness anchor
+##!
+##! Every node carries `[byte_start, byte_end)` into the *original* source. For a
+##! verbatim leaf (`CST_TOKEN`) the span IS its bytes: `source[start..end]`
+##! reproduces the token exactly (proven for tokens by the M1.1 lexer spec).
+##! Structured nodes span from their first child/token to their last. Because the
+##! parser (M1.3) will attach a `CST_TOKEN` (or structured leaf) for *every*
+##! lexed token and every trivia run, a pre-order walk that emits each node's
+##! own non-child bytes plus its trivia reconstructs the source byte-for-byte.
+##!
+##! ## Trivia model (Roslyn end-of-line rule)
+##!
+##! Trivia (line comments `#`, doc-comments `##`/`##!`/`##^`, blank-line runs,
+##! whitespace runs) are stored as records in a *separate* parallel-vec trivia
+##! arena (kind + byte span) and attached to nodes as ordered **leading** and
+##! **trailing** lists. Attachment rule (Roslyn / Prettier):
+##!
+##!   > A token owns *trailing* trivia up to and including the end of its line;
+##!   > trivia after that newline becomes *leading* trivia of the next token.
+##!
+##! So `x = 1  # inline` → the comment is trailing trivia of `1`; a comment on
+##! its own line before the next token is that token's leading trivia. Blank-line
+##! *runs* are preserved verbatim here as `TRIVIA_BLANK_LINES` (the M2 printer
+##! collapses runs to ≤1 — NOT this module's job). M1.2 only stores; the parser
+##! (M1.3) decides attachment per the rule above using byte offsets.
+##!
+##! ## Trailing-comma-as-author-signal (D4)
+##!
+##! "Did the author write a trailing comma?" is recoverable on every delimited
+##! list node (call args, collection literals, param lists, generic/type-arg
+##! lists, enum-variant payloads, struct-init field lists). We encode it as a
+##! **boolean flag bit in `extras`** (`CST_EXTRA_TRAILING_COMMA`) rather than
+##! distinct node kinds — the parallel-vec-friendly choice; one bit, no enum
+##! blowup, set/read via `cst_set_trailing_comma` / `cst_has_trailing_comma`.
+##! The M2 printer reads it as a "magic trailing comma → keep broken" steering
+##! signal (FORMATTER.md §3.4).
+##!
+##! ## Determinism
+##!
+##! The arena is append-only, handle-indexed, insertion-ordered. No hash-map
+##! iteration anywhere. Children read back in insertion order. Fixpoint
+##! (gen1 == gen2) depends on this; downstream M1.3/M2 inherit it.
+##!
+##! @see ast.qz The semantic tree this lowers to (M1.3)
+##! @see lexer.qz Full-fidelity mode + byte offsets (M1.1)
+##! @see docs/design/FORMATTER.md D1/D2/D4, §3.1
+##! @since 5.12.21-alpha (formatter epic)
+
+import string_intern
+
+# ===========================================================================
+# Trivia kinds
+# ===========================================================================
+
+## Kinds of trivia — source text with no semantic meaning, preserved for
+## lossless round-trip. Each trivia record carries a kind + a half-open byte
+## span; `source[byte_start..byte_end]` reproduces the trivia verbatim.
+enum CstTriviaKind
+  TRIVIA_WHITESPACE   # 0 - a run of spaces/tabs (intra-line indentation/padding)
+  TRIVIA_LINE_COMMENT # 1 - `# ...` to end of line (not a doc-comment)
+  TRIVIA_DOC_COMMENT  # 2 - `## ...` regular doc-comment
+  TRIVIA_DOC_MODULE   # 3 - `##! ...` module-level doc-comment
+  TRIVIA_DOC_INLINE   # 4 - `##^ ...` inline/field doc-comment
+  TRIVIA_BLANK_LINES  # 5 - a run of one-or-more blank lines (preserved as a run)
+  TRIVIA_NEWLINE      # 6 - a single end-of-line marker (line break between tokens)
+end
+
+# ===========================================================================
+# Operator / keyword discriminants (slot: ops)
+# ===========================================================================
+
+## Operator and surface-form discriminants stored in the `ops` slot. Lets a
+## single structured kind (e.g. CST_BINARY, CST_RANGE, CST_COMPOUND_ASSIGN)
+## carry which concrete operator/keyword the author wrote, so it round-trips.
+enum CstOp
+  CST_OP_NONE   # 0  - no operator
+  # arithmetic / comparison / logical (binary)
+  CST_OP_ADD    # 1  - +
+  CST_OP_SUB    # 2  - -
+  CST_OP_MUL    # 3  - *
+  CST_OP_DIV    # 4  - /
+  CST_OP_MOD    # 5  - %
+  CST_OP_EQ     # 6  - ==
+  CST_OP_NE     # 7  - !=
+  CST_OP_LT     # 8  - <
+  CST_OP_LE     # 9  - <=
+  CST_OP_GT     # 10 - >
+  CST_OP_GE     # 11 - >=
+  CST_OP_AND    # 12 - and
+  CST_OP_OR     # 13 - or
+  CST_OP_NOT    # 14 - not / ! (unary)
+  CST_OP_NEG    # 15 - unary -
+  CST_OP_BITAND # 16 - &
+  CST_OP_BITOR  # 17 - |
+  CST_OP_BITXOR # 18 - ^
+  CST_OP_BITNOT # 19 - ~ (unary)
+  CST_OP_SHL    # 20 - <<
+  CST_OP_SHR    # 21 - >>
+  # compound-assignment operators (the op the author wrote for `x OP= e`)
+  CST_OP_ADD_ASSIGN # 22 - +=
+  CST_OP_SUB_ASSIGN # 23 - -=
+  CST_OP_MUL_ASSIGN # 24 - *=
+  CST_OP_DIV_ASSIGN # 25 - /=
+  CST_OP_MOD_ASSIGN # 26 - %=
+  # range flavors (which range token the author wrote)
+  CST_OP_RANGE_EXCL # 27 - ..   (exclusive end)
+  CST_OP_RANGE_INCL # 28 - ..=  (inclusive end)
+  CST_OP_RANGE_DOTS # 29 - ...  (legacy / spread-style range)
+end
+
+# ===========================================================================
+# Green node-kind taxonomy
+# ===========================================================================
+
+## CstNodeKind — green node kinds covering the FULL Quartz surface grammar
+## losslessly. Categories:
+##   - Leaves / tokens
+##   - Literals (each surface literal flavor distinct)
+##   - Expressions (incl. surface forms the AST conflates/desugars)
+##   - Statements & control flow (surface granularity for if/while/for/match)
+##   - Patterns (match/`if let` patterns kept structurally)
+##   - Definitions & declarations
+##   - Types & signatures (where-clauses, effect rows)
+##   - Module / FFI / concurrency / memory
+##   - List wrappers (the D4 trailing-comma carriers)
+## Every kind is documented one-line. CST_TOKEN is the universal verbatim leaf
+## so any token can always be represented even before a structured kind exists.
+enum CstNodeKind
+  # --- Leaves -------------------------------------------------------------
+  CST_NULL              # 0  - null sentinel (handle 0; never a real node)
+  CST_TOKEN             # 1  - verbatim token leaf; its bytes ARE its span
+  CST_TRIVIA            # 2  - a trivia record materialized as a node (rare; lists preferred)
+
+  # --- Literals (each surface flavor distinct for faithful re-emit) -------
+  CST_INT_LIT           # 3  - 42, 0xFF, 1_000 (suffix/base preserved via span)
+  CST_FLOAT_LIT         # 4  - 3.14, 1.5e3
+  CST_BOOL_LIT          # 5  - true / false
+  CST_NIL_LIT           # 6  - nil
+  CST_STRING_LIT        # 7  - "..." simple string (no interpolation)
+  CST_INTERP_STRING     # 8  - "...#{e}..." interpolated string (AST desugars this)
+  CST_INTERP_PART       # 9  - literal text chunk inside an interpolated string
+  CST_INTERP_EXPR       # 10 - #{ expr } hole inside an interpolated string
+  CST_CHAR_LIT          # 11 - 'a' character literal
+  CST_SYMBOL_LIT        # 12 - :ok, :not_found
+  CST_REGEX_LIT         # 13 - ~r"pattern"
+  CST_CAPTURE_VAR       # 14 - $0..$9 regex capture variable
+
+  # --- Expressions --------------------------------------------------------
+  CST_IDENT             # 15 - bare identifier reference
+  CST_PATH              # 16 - a/b path / qualified name (import + qualified access)
+  CST_PAREN             # 17 - ( expr ) explicit grouping (AST drops the parens)
+  CST_UNARY             # 18 - prefix unary op (op in `ops`)
+  CST_BINARY            # 19 - binary op (op in `ops`)
+  CST_RANGE             # 20 - a..b / a..=b / a...b (flavor in `ops`; AST desugars)
+  CST_CALL              # 21 - callee(args)  [args list is a CST_ARG_LIST child]
+  CST_METHOD_CALL       # 22 - recv.method(args) UFCS/method-style call
+  CST_FIELD_ACCESS      # 23 - recv.field
+  CST_SAFE_FIELD_ACCESS # 24 - recv?.field safe navigation
+  CST_INDEX             # 25 - recv[index]
+  CST_STRUCT_INIT       # 26 - Point { x: 1, y: 2 } (fields via CST_FIELD_LIST)
+  CST_STRUCT_SPREAD     # 27 - Point { ...base, x: 9 } update-spread (AST desugars)
+  CST_FIELD_INIT        # 28 - `name: value` one field inside a struct/map literal
+  CST_ARRAY_LIT         # 29 - [1, 2, 3] (elements via CST_ELEM_LIST)
+  CST_SET_LIT           # 30 - {1, 2, 3} set literal
+  CST_MAP_LIT           # 31 - {a: 1} / {:a => 1} map literal
+  CST_MAP_ENTRY         # 32 - one `k => v` (or `k: v`) entry of a map literal
+  CST_FUNC_REF          # 33 - &func reference to a function value
+  CST_LAMBDA_BRACE      # 34 - { x -> e } / { it * 2 } brace lambda (surface form)
+  CST_LAMBDA_DO         # 35 - do x -> ... end block lambda (surface form)
+  CST_LAMBDA_ARROW      # 36 - (x, y) -> e / x -> e parenthesized/arrow lambda
+  CST_LIST_COMP         # 37 - [x*2 for x in xs] list comprehension (AST desugars)
+  CST_MAP_COMP          # 38 - {k => v for x in it} map comprehension (AST desugars)
+  CST_ALLOC_EXPR        # 39 - @heap [..] / @arena [..] allocation expression
+  CST_MACRO_CALL        # 40 - $try(e), $unwrap(e), $assert(...), $debug(...)
+  CST_TRY_EXPR          # 41 - $try(e) / postfix try surface (kept distinct)
+  CST_AWAIT             # 42 - await handle
+
+  # --- Statements & control flow (surface granularity) -------------------
+  CST_BLOCK             # 43 - a brace/`do…end` statement sequence (n-ary children)
+  CST_EXPR_STMT         # 44 - an expression used as a statement
+  CST_RETURN            # 45 - return [expr]
+  CST_BREAK             # 46 - break
+  CST_CONTINUE          # 47 - continue
+  CST_YIELD             # 48 - yield expr (generator)
+  CST_ASSIGN            # 49 - lhs = rhs (plain assignment)
+  CST_COMPOUND_ASSIGN   # 50 - lhs OP= rhs (op in `ops`; AST desugars to lhs = lhs OP rhs)
+  CST_INDEX_ASSIGN      # 51 - recv[i] = rhs
+  CST_FIELD_ASSIGN      # 52 - recv.f = rhs
+  CST_VAR_DECL          # 53 - var x [: T] = e  (mutable binding)
+  CST_CONST_BINDING     # 54 - x [: T] = e  (const-by-default binding; no `let`)
+  CST_IF                # 55 - plain `if cond ... [elsif ...] [else ...] end`
+  CST_IF_LET            # 56 - `if let pat = e` (surface; distinct from if Some(v)=e)
+  CST_IF_BIND           # 57 - `if Some(v) = e` refutable-bind form (distinct surface)
+  CST_ELSIF_CLAUSE      # 58 - one `elsif cond ...` clause of an if-chain
+  CST_ELSE_CLAUSE       # 59 - the `else ...` tail of an if-chain
+  CST_WHILE             # 60 - `while cond ... end`
+  CST_WHILE_LET         # 61 - `while let pat = e ... end` (surface; AST conflates)
+  CST_FOR_IN            # 62 - `for x in iter ... end` (AST desugars to iter/next)
+  CST_LOOP              # 63 - bare infinite loop form (if surfaced)
+  CST_MATCH             # 64 - `match e ... end`
+  CST_MATCH_ARM         # 65 - `pat [when guard] => body` one arm
+  CST_WHEN_GUARD        # 66 - `when cond` guard on an arm or multi-clause def
+  CST_IS_EXPR           # 67 - `x is Variant` variant test
+  CST_DEFER             # 68 - defer expr
+  CST_WITH_BLOCK        # 69 - with Handler { ... } do -> ... end (effects/Scoped)
+  CST_WITH_HANDLER      # 70 - one `op: handler` entry inside a with-block
+  CST_SELECT            # 71 - select { arms } block
+  CST_SELECT_ARM        # 72 - one select arm (recv/send/timeout/case = Selectable)
+  CST_TASK_GROUP        # 73 - task_group |g| ... end
+  CST_TRY_CATCH         # 74 - try expr catch pattern handler (surface)
+
+  # --- Patterns -----------------------------------------------------------
+  CST_PAT_WILDCARD      # 75 - `_`
+  CST_PAT_BINDING       # 76 - a bare name binding pattern
+  CST_PAT_LITERAL       # 77 - a literal pattern (int/string/bool/symbol)
+  CST_PAT_VARIANT       # 78 - Some(v) / Color::Red(...) variant/constructor pattern
+  CST_PAT_TUPLE         # 79 - (a, b, ...) tuple/sequence pattern
+  CST_PAT_STRUCT        # 80 - Point { x, y } struct pattern
+  CST_PAT_OR            # 81 - p1 | p2 alternative pattern
+  CST_PAT_RANGE         # 82 - a..b range pattern (flavor in `ops`)
+
+  # --- Definitions & declarations ----------------------------------------
+  CST_FUNCTION_BLOCK    # 83 - block-body `def f(...) ... end` (surface form)
+  CST_FUNCTION_ENDLESS  # 84 - endless `def f(...) = expr` (surface form; AST conflates)
+  CST_CONST_DEF         # 85 - `const def f(...)` compile-time function
+  CST_PARAM             # 86 - one parameter (name [: T] [= default]) / pattern param
+  CST_PARAM_LIST        # 87 - the (…) parameter list (D4 trailing-comma carrier)
+  CST_STRUCT_DEF        # 88 - `struct Name ... end`
+  CST_FIELD_DEF         # 89 - one struct field `name: T [= default]`
+  CST_ENUM_DEF          # 90 - `enum Name ... end`
+  CST_VARIANT_DEF       # 91 - one enum variant (possibly with payload)
+  CST_TRAIT_DEF         # 92 - `trait Name ... end`
+  CST_IMPL_BLOCK        # 93 - `impl Trait for Type ... end`
+  CST_EXTEND_BLOCK      # 94 - `extend Type ... end`
+  CST_ACTOR_DEF         # 95 - `actor Name ... end`
+  CST_TYPE_ALIAS        # 96 - `type Name = T`
+  CST_NEWTYPE_DEF       # 97 - `newtype Name = T`
+  CST_CONST_DECL        # 98 - `const NAME = expr`
+  CST_STATIC_ASSERT     # 99 - `static_assert(cond, "msg")`
+  CST_GLOBAL_VAR        # 100 - module-level `var g = expr`
+  CST_DECORATOR         # 101 - `@derive(...)`, `@repr(C)`, `@inline`, etc.
+  CST_VISIBILITY        # 102 - `priv` / `pub` visibility marker/section
+
+  # --- Types & signatures -------------------------------------------------
+  CST_TYPE_REF          # 103 - a named/applied type in a signature (text payload)
+  CST_TYPE_PARAM_LIST   # 104 - `<T, U>` generic param list (D4 carrier)
+  CST_TYPE_ARG_LIST     # 105 - `<Int, String>` type-argument list (D4 carrier)
+  CST_WHERE_CLAUSE      # 106 - `where T: Trait, ...` bound clause (surface; hoistable)
+  CST_WHERE_BOUND       # 107 - one `T: Trait` bound inside a where-clause
+  CST_CAN_CLAUSE        # 108 - `can Effect | tail` effect row on a signature
+  CST_EFFECT_LABEL      # 109 - one effect label inside a `can` row
+  CST_RETURN_TYPE       # 110 - the `: T` return-type annotation segment
+
+  # --- Module / FFI -------------------------------------------------------
+  CST_IMPORT            # 111 - `import a/b`, `import * from m`, `from m import x`
+  CST_IMPORT_SYMBOL     # 112 - one imported symbol inside an import list
+  CST_EXTERN_FN         # 113 - `extern "C" fn name(...)`
+  CST_INLINE_C          # 114 - `@c("...")`
+  CST_C_INCLUDE         # 115 - `@cInclude("header.h")`
+  CST_C_IMPORT          # 116 - `@cImport(@cInclude(...))`
+  CST_ARENA_BLOCK       # 117 - `arena name do ... end`
+
+  # --- Root ---------------------------------------------------------------
+  CST_PROGRAM           # 118 - root: ordered list of top-level items
+
+  # --- Delimited list wrappers (the D4 trailing-comma carriers) ----------
+  CST_ARG_LIST          # 119 - `(a, b, c)` call-argument list
+  CST_ELEM_LIST         # 120 - `[a, b, c]` array/collection element list
+  CST_FIELD_LIST        # 121 - `{ x: 1, y: 2 }` struct-init / map field list
+  CST_VARIANT_PAYLOAD   # 122 - `(T, U)` variant payload type list
+
+  # --- Effect reifier ----------------------------------------------------
+  CST_REIFY             # 123 - `reify { expr }` effect-to-Result reifier (piezo)
+
+  # --- Macro definition --------------------------------------------------
+  CST_MACRO_DEF         # 124 - `macro name(params) do <template> end`
+
+  # --- Typed cast --------------------------------------------------------
+  CST_CAST              # 125 - `expr as Type` typed bitcast
+
+  # --- Macro template forms (quote/unquote) ------------------------------
+  CST_QUOTE             # 126 - `quote do ... end` macro template body
+  CST_UNQUOTE           # 127 - `unquote(expr)` splice inside a quote block
+  CST_UNQUOTE_EACH      # 128 - `unquote_each(param, "sep")` variadic splice
+
+  # --- Binary DSL: packed struct -----------------------------------------
+  CST_PACKED_STRUCT     # 129 - `packed struct(uN) Name ... end` (NODE_PACKED_STRUCT)
+end
+
+# ===========================================================================
+# Storage struct
+# ===========================================================================
+
+## Trailing-comma flag bit for the `extras` slot (D4). Set on delimited list
+## nodes (CST_ARG_LIST / CST_ELEM_LIST / CST_FIELD_LIST / CST_PARAM_LIST /
+## CST_TYPE_PARAM_LIST / CST_TYPE_ARG_LIST / CST_VARIANT_PAYLOAD) when the
+## author wrote a trailing comma before the closing delimiter.
+const CST_EXTRA_TRAILING_COMMA = 1
+
+## Flat CST storage arena. Parallel `Vec<Int>` fields indexed by node handle,
+## plus a separate trivia arena (parallel vecs indexed by trivia handle). All
+## append-only; handle 0 reserved as the null sentinel in both arenas.
+##
+## @since 5.12.21-alpha (formatter epic)
+@repr(C)
+struct CstStorage
+  ## CstNodeKind enum values
+  kinds: Vec<Int>
+  ## Half-open span start: byte offset into the original source
+  byte_starts: Vec<Int>
+  ## Half-open span end (exclusive): byte offset into the original source
+  byte_ends: Vec<Int>
+  ## 1-based source line of the node start (diagnostics; not load-bearing for round-trip)
+  lines: Vec<Int>
+  ## 1-based source column of the node start (diagnostics)
+  cols: Vec<Int>
+  ## Operator / surface-form discriminant (CstOp)
+  ops: Vec<Int>
+  ## Primary interned payload (lexeme / name)
+  str1s: Vec<Int>
+  ## Secondary interned payload (type text / second name)
+  str2s: Vec<Int>
+  ## Left structural child handle
+  lefts: Vec<Int>
+  ## Right structural child handle
+  rights: Vec<Int>
+  ## Flag bag (trailing-comma bit etc.)
+  extras: Vec<Int>
+  ## Vec<Int> handle of n-ary child handles (0 = none)
+  children: Vec<Int>
+  ## Interned doc-comment text attached as a node's docstring (sparse; 0 = none)
+  docs: Vec<Int>
+  ## Vec<Int> handle of LEADING trivia records, in source order (0 = none)
+  lead_trivia: Vec<Int>
+  ## Vec<Int> handle of TRAILING trivia records, in source order (0 = none)
+  trail_trivia: Vec<Int>
+  ## String interner (shared, for payload dedup)
+  interner: StringInterner
+
+  ## --- Trivia arena (parallel vecs indexed by trivia handle) ---
+  ## CstTriviaKind enum values
+  triv_kinds: Vec<Int>
+  ## Trivia half-open span start (byte offset)
+  triv_byte_starts: Vec<Int>
+  ## Trivia half-open span end (byte offset, exclusive)
+  triv_byte_ends: Vec<Int>
+end
+
+## Creates a new, empty CST storage arena.
+##
+## Reserves handle 0 in BOTH the node arena and the trivia arena as the null
+## sentinel (so the first real node/trivia gets handle >= 1, distinguishable
+## from "none"). Mirrors ast.qz's sentinel discipline.
+##
+## @returns CstStorage with all parallel vectors initialized
+def cst_new_storage(): CstStorage
+  var s = CstStorage {
+    kinds: vec_new(),
+    byte_starts: vec_new(),
+    byte_ends: vec_new(),
+    lines: vec_new(),
+    cols: vec_new(),
+    ops: vec_new(),
+    str1s: vec_new(),
+    str2s: vec_new(),
+    lefts: vec_new(),
+    rights: vec_new(),
+    extras: vec_new(),
+    children: vec_new(),
+    docs: vec_new(),
+    lead_trivia: vec_new(),
+    trail_trivia: vec_new(),
+    interner: string_intern::intern_global(),
+    triv_kinds: vec_new(),
+    triv_byte_starts: vec_new(),
+    triv_byte_ends: vec_new()
+  }
+  # Reserve node handle 0 as null sentinel.
+  s.kinds.push(0)
+  s.byte_starts.push(0)
+  s.byte_ends.push(0)
+  s.lines.push(0)
+  s.cols.push(0)
+  s.ops.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  s.lead_trivia.push(0)
+  s.trail_trivia.push(0)
+  # Reserve trivia handle 0 as null sentinel.
+  s.triv_kinds.push(0)
+  s.triv_byte_starts.push(0)
+  s.triv_byte_ends.push(0)
+  return s
+end
+
+## Total number of CST nodes (including the handle-0 sentinel).
+def cst_node_count(s: CstStorage): Int = s.kinds.size
+
+## Total number of trivia records (including the handle-0 sentinel).
+def cst_trivia_count(s: CstStorage): Int = s.triv_kinds.size
+
+# ===========================================================================
+# Core node allocator
+# ===========================================================================
+
+## Allocates a CST node with the given kind and byte span, returning its handle.
+##
+## All other slots default to 0 (no op, no payload, no children, no trivia);
+## use the setter helpers below to populate them. Append-only.
+##
+## @param s     CstStorage
+## @param kind  CstNodeKind enum value
+## @param bs    byte_start (half-open span start)
+## @param be    byte_end   (half-open span end, exclusive)
+## @param line  1-based source line of node start
+## @param col   1-based source column of node start
+## @returns the new node's handle
+def cst_alloc(s: CstStorage, kind: Int, bs: Int, be: Int, line: Int, col: Int): Int
+  var h = s.kinds.size
+  s.kinds.push(kind)
+  s.byte_starts.push(bs)
+  s.byte_ends.push(be)
+  s.lines.push(line)
+  s.cols.push(col)
+  s.ops.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  s.lead_trivia.push(0)
+  s.trail_trivia.push(0)
+  return h
+end
+
+## Allocates a verbatim CST_TOKEN leaf. Its bytes ARE its span; the interned
+## lexeme is stored in str1 so a printer can re-emit without re-slicing source.
+##
+## @param s       CstStorage
+## @param lexeme  the token text (interned)
+## @param bs/be   half-open byte span
+## @param line/col 1-based position
+## @returns handle of the new token leaf
+def cst_token(s: CstStorage, lexeme: String, bs: Int, be: Int, line: Int, col: Int): Int
+  var h = cst_alloc(s, 1, bs, be, line, col)  # CST_TOKEN = 1
+  s.str1s[h] = string_intern::intern_id(s.interner, lexeme)
+  return h
+end
+
+# ===========================================================================
+# Field accessors / setters (mirror ast.qz naming)
+# ===========================================================================
+
+## Gets the CstNodeKind of a node.
+def cst_get_kind(s: CstStorage, h: Int): Int
+  if h < 0
+    return 0
+  end
+  return s.kinds[h]
+end
+
+## Sets the CstNodeKind of a node (rewrites during lowering/codemod).
+def cst_set_kind(s: CstStorage, h: Int, kind: Int): Void
+  s.kinds[h] = kind
+end
+
+## Gets the half-open span start (byte offset) of a node.
+def cst_get_byte_start(s: CstStorage, h: Int): Int = s.byte_starts[h]
+
+## Gets the half-open span end (byte offset, exclusive) of a node.
+def cst_get_byte_end(s: CstStorage, h: Int): Int = s.byte_ends[h]
+
+## Sets the half-open span start.
+def cst_set_byte_start(s: CstStorage, h: Int, v: Int): Void
+  s.byte_starts[h] = v
+end
+
+## Sets the half-open span end.
+def cst_set_byte_end(s: CstStorage, h: Int, v: Int): Void
+  s.byte_ends[h] = v
+end
+
+## Gets the 1-based source line of the node start.
+def cst_get_line(s: CstStorage, h: Int): Int = s.lines[h]
+
+## Gets the 1-based source column of the node start.
+def cst_get_col(s: CstStorage, h: Int): Int = s.cols[h]
+
+## Gets the operator / surface-form discriminant (CstOp).
+def cst_get_op(s: CstStorage, h: Int): Int = s.ops[h]
+
+## Sets the operator / surface-form discriminant (CstOp).
+def cst_set_op(s: CstStorage, h: Int, op: Int): Void
+  s.ops[h] = op
+end
+
+## Gets the primary interned payload (lexeme / name) as a String.
+def cst_get_str1(s: CstStorage, h: Int): String = string_intern::intern_resolve_int(s.interner, s.str1s[h])
+
+## Sets the primary interned payload.
+def cst_set_str1(s: CstStorage, h: Int, v: String): Void
+  s.str1s[h] = string_intern::intern_id(s.interner, v)
+end
+
+## Gets the secondary interned payload (type text / second name) as a String.
+def cst_get_str2(s: CstStorage, h: Int): String = string_intern::intern_resolve_int(s.interner, s.str2s[h])
+
+## Sets the secondary interned payload.
+def cst_set_str2(s: CstStorage, h: Int, v: String): Void
+  s.str2s[h] = string_intern::intern_id(s.interner, v)
+end
+
+## Gets the left structural child handle.
+def cst_get_left(s: CstStorage, h: Int): Int = s.lefts[h]
+
+## Sets the left structural child handle.
+def cst_set_left(s: CstStorage, h: Int, c: Int): Void
+  s.lefts[h] = c
+end
+
+## Gets the right structural child handle.
+def cst_get_right(s: CstStorage, h: Int): Int = s.rights[h]
+
+## Sets the right structural child handle.
+def cst_set_right(s: CstStorage, h: Int, c: Int): Void
+  s.rights[h] = c
+end
+
+## Gets the raw extras flag bag.
+def cst_get_extra(s: CstStorage, h: Int): Int = s.extras[h]
+
+## Sets the raw extras flag bag.
+def cst_set_extra(s: CstStorage, h: Int, v: Int): Void
+  s.extras[h] = v
+end
+
+## Gets the doc-comment text attached to a node (empty string if none).
+def cst_get_doc(s: CstStorage, h: Int): String = string_intern::intern_resolve_int(s.interner, s.docs[h])
+
+## Sets the doc-comment text attached to a node.
+def cst_set_doc(s: CstStorage, h: Int, doc: String): Void
+  s.docs[h] = string_intern::intern_id(s.interner, doc)
+end
+
+# ===========================================================================
+# N-ary children (Vec<Int> handle stored in `children` slot)
+# ===========================================================================
+
+## Sets the n-ary children of a node to the given Vec<Int> handle (insertion
+## order preserved). Pass a Vec built up by the caller.
+def cst_set_children(s: CstStorage, h: Int, children: Vec): Void
+  s.children[h] = children
+end
+
+## Gets the n-ary children Vec of a node. Returns an empty Vec if the node has
+## no children list (children slot == 0).
+def cst_get_children(s: CstStorage, h: Int): Vec
+  var raw = s.children[h]
+  if raw == 0
+    return vec_new()
+  end
+  return as_vec(raw)
+end
+
+## Number of n-ary children of a node (0 if none).
+def cst_child_count(s: CstStorage, h: Int): Int
+  var raw = s.children[h]
+  if raw == 0
+    return 0
+  end
+  return as_vec(raw).size
+end
+
+## Gets the i-th n-ary child handle (insertion order). Returns 0 (null) if out
+## of range or no children list.
+def cst_get_child(s: CstStorage, h: Int, i: Int): Int
+  var raw = s.children[h]
+  if raw == 0
+    return 0
+  end
+  var kids = as_vec(raw)
+  if i < 0 or i >= kids.size
+    return 0
+  end
+  return kids[i]
+end
+
+## Appends one child handle to a node's n-ary children list (insertion order),
+## creating the list lazily on first append. Returns nothing.
+def cst_push_child(s: CstStorage, h: Int, child: Int): Void
+  var raw = s.children[h]
+  if raw == 0
+    var fresh = vec_new()
+    fresh.push(child)
+    s.children[h] = fresh
+  else
+    as_vec(raw).push(child)
+  end
+end
+
+# ===========================================================================
+# Trailing-comma encoding (D4)
+# ===========================================================================
+
+## Marks/clears the "author wrote a trailing comma" signal on a delimited list
+## node (call args, collection, params, generic/type-arg, variant payload,
+## struct/map field list). Encoded as a flag bit in `extras` (CST_EXTRA_*).
+##
+## @param present 1 = author wrote a trailing comma; 0 = clear the flag
+def cst_set_trailing_comma(s: CstStorage, h: Int, present: Int): Void
+  var cur = s.extras[h]
+  if present == 1
+    # set the bit (or-in; idempotent)
+    if cur % 2 == 0
+      s.extras[h] = cur + 1
+    end
+  else
+    # clear the bit
+    if cur % 2 == 1
+      s.extras[h] = cur - 1
+    end
+  end
+end
+
+## Reads the trailing-comma author-signal (D4). Returns 1 if the author wrote a
+## trailing comma on this list node, 0 otherwise (the default).
+def cst_has_trailing_comma(s: CstStorage, h: Int): Int
+  if s.extras[h] % 2 == 1
+    return 1
+  end
+  return 0
+end
+
+# ===========================================================================
+# Trivia arena + attachment (Roslyn EOL rule)
+# ===========================================================================
+
+## Allocates a trivia record (kind + half-open byte span), returning its handle.
+## `source[byte_start..byte_end]` reproduces the trivia text verbatim.
+##
+## @param s    CstStorage
+## @param kind CstTriviaKind enum value
+## @param bs   byte_start (half-open span start)
+## @param be   byte_end   (half-open span end, exclusive)
+## @returns handle of the new trivia record (into the trivia arena)
+def cst_alloc_trivia(s: CstStorage, kind: Int, bs: Int, be: Int): Int
+  var h = s.triv_kinds.size
+  s.triv_kinds.push(kind)
+  s.triv_byte_starts.push(bs)
+  s.triv_byte_ends.push(be)
+  return h
+end
+
+## Gets the CstTriviaKind of a trivia record.
+def cst_trivia_kind(s: CstStorage, t: Int): Int = s.triv_kinds[t]
+
+## Gets the half-open span start of a trivia record.
+def cst_trivia_byte_start(s: CstStorage, t: Int): Int = s.triv_byte_starts[t]
+
+## Gets the half-open span end of a trivia record.
+def cst_trivia_byte_end(s: CstStorage, t: Int): Int = s.triv_byte_ends[t]
+
+## Attaches one trivia record to a node's LEADING trivia list (source order
+## preserved; list created lazily). Per the Roslyn rule, the parser (M1.3)
+## calls this for trivia on its own line before the token.
+def cst_attach_leading_trivia(s: CstStorage, h: Int, trivia: Int): Void
+  var raw = s.lead_trivia[h]
+  if raw == 0
+    var fresh = vec_new()
+    fresh.push(trivia)
+    s.lead_trivia[h] = fresh
+  else
+    as_vec(raw).push(trivia)
+  end
+end
+
+## Attaches one trivia record to a node's TRAILING trivia list (source order
+## preserved; list created lazily). Per the Roslyn rule, the parser (M1.3)
+## calls this for trivia up to and including the end of the token's line.
+def cst_attach_trailing_trivia(s: CstStorage, h: Int, trivia: Int): Void
+  var raw = s.trail_trivia[h]
+  if raw == 0
+    var fresh = vec_new()
+    fresh.push(trivia)
+    s.trail_trivia[h] = fresh
+  else
+    as_vec(raw).push(trivia)
+  end
+end
+
+## Gets the LEADING trivia Vec of a node (empty Vec if none).
+def cst_get_leading_trivia(s: CstStorage, h: Int): Vec
+  var raw = s.lead_trivia[h]
+  if raw == 0
+    return vec_new()
+  end
+  return as_vec(raw)
+end
+
+## Gets the TRAILING trivia Vec of a node (empty Vec if none).
+def cst_get_trailing_trivia(s: CstStorage, h: Int): Vec
+  var raw = s.trail_trivia[h]
+  if raw == 0
+    return vec_new()
+  end
+  return as_vec(raw)
+end
+
+## Count of leading trivia records on a node.
+def cst_leading_trivia_count(s: CstStorage, h: Int): Int
+  var raw = s.lead_trivia[h]
+  if raw == 0
+    return 0
+  end
+  return as_vec(raw).size
+end
+
+## Count of trailing trivia records on a node.
+def cst_trailing_trivia_count(s: CstStorage, h: Int): Int
+  var raw = s.trail_trivia[h]
+  if raw == 0
+    return 0
+  end
+  return as_vec(raw).size
+end

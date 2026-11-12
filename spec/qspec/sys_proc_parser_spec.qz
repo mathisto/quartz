@@ -1,0 +1,306 @@
+## Pure-parser spec for std/sys/proc — covers /proc/stat, meminfo,
+## loadavg, pressure, ps, and macOS top/vm_stat fixtures. Runs on
+## any platform.
+
+import * from qspec
+import std/sys/proc as sp
+
+def main(): Int
+  describe("proc /proc/stat parser") do ->
+    it("reads aggregate cpu line jiffies") do ->
+      var line = "cpu 12345 6789 23456 999999 1234 0 567 0 0 0"
+      var c = sp::proc_parse_proc_stat_line(line)
+      # total = sum of all 10 fields
+      assert_eq(c.total_jiffies, 12345 + 6789 + 23456 + 999999 + 1234 + 0 + 567)
+      # idle = idle (4th field after tag) + iowait (5th)
+      assert_eq(c.idle_jiffies, 999999 + 1234)
+      # pct stays 0 (delta computed by caller)
+      assert_eq(c.pct, 0)
+    end
+
+    it("reads per-core line same shape") do ->
+      var line = "cpu0 100 0 50 800 5 0 0 0 0 0"
+      var c = sp::proc_parse_proc_stat_line(line)
+      assert_eq(c.total_jiffies, 100 + 50 + 800 + 5)
+      assert_eq(c.idle_jiffies, 800 + 5)
+    end
+
+    it("malformed line yields zero stat") do ->
+      var c = sp::proc_parse_proc_stat_line("garbage")
+      assert_eq(c.total_jiffies, 0)
+      assert_eq(c.idle_jiffies, 0)
+    end
+  end
+
+  describe("proc cpu pct delta") do ->
+    it("returns 0 when no time has passed") do ->
+      var prev = sp::CpuStat { total_jiffies: 1000, idle_jiffies: 800, pct: 0 }
+      var curr = sp::CpuStat { total_jiffies: 1000, idle_jiffies: 800, pct: 0 }
+      assert_eq(sp::proc_compute_cpu_pct(prev, curr), 0)
+    end
+
+    it("computes busy fraction across delta") do ->
+      var prev = sp::CpuStat { total_jiffies: 1000, idle_jiffies: 800, pct: 0 }
+      # Δtotal = 100, Δidle = 20 → busy = 80, pct = 80
+      var curr = sp::CpuStat { total_jiffies: 1100, idle_jiffies: 820, pct: 0 }
+      assert_eq(sp::proc_compute_cpu_pct(prev, curr), 80)
+    end
+
+    it("handles 100% busy") do ->
+      var prev = sp::CpuStat { total_jiffies: 1000, idle_jiffies: 800, pct: 0 }
+      var curr = sp::CpuStat { total_jiffies: 1100, idle_jiffies: 800, pct: 0 }
+      assert_eq(sp::proc_compute_cpu_pct(prev, curr), 100)
+    end
+
+    it("handles 0% busy (all idle)") do ->
+      var prev = sp::CpuStat { total_jiffies: 1000, idle_jiffies: 800, pct: 0 }
+      var curr = sp::CpuStat { total_jiffies: 1100, idle_jiffies: 900, pct: 0 }
+      assert_eq(sp::proc_compute_cpu_pct(prev, curr), 0)
+    end
+  end
+
+  describe("proc /proc/meminfo parser") do ->
+    it("extracts canonical fields") do ->
+      var content = "MemTotal:       16384000 kB\n" +
+                    "MemFree:         1024000 kB\n" +
+                    "MemAvailable:    8192000 kB\n" +
+                    "Buffers:          512000 kB\n" +
+                    "Cached:          2048000 kB\n" +
+                    "SwapTotal:       4096000 kB\n" +
+                    "SwapFree:        4000000 kB\n"
+      var m = sp::proc_parse_meminfo(content)
+      assert_eq(m.total_kb, 16384000)
+      assert_eq(m.free_kb, 1024000)
+      assert_eq(m.available_kb, 8192000)
+      assert_eq(m.buffers_kb, 512000)
+      assert_eq(m.cached_kb, 2048000)
+      assert_eq(m.swap_total_kb, 4096000)
+      assert_eq(m.swap_used_kb, 96000)
+    end
+
+    it("falls back to free+buffers+cached when no MemAvailable") do ->
+      var content = "MemTotal: 1000 kB\nMemFree: 200 kB\nBuffers: 100 kB\nCached: 300 kB\n"
+      var m = sp::proc_parse_meminfo(content)
+      assert_eq(m.available_kb, 600)
+    end
+  end
+
+  describe("proc /proc/loadavg parser") do ->
+    it("parses three-decimal load values × 100") do ->
+      var loads = sp::proc_parse_loadavg("0.52 0.58 0.59 1/123 4567")
+      assert_eq(loads[0], 52)
+      assert_eq(loads[1], 58)
+      assert_eq(loads[2], 59)
+    end
+
+    it("handles whole-number loads") do ->
+      var loads = sp::proc_parse_loadavg("3.00 2.50 1.25")
+      assert_eq(loads[0], 300)
+      assert_eq(loads[1], 250)
+      assert_eq(loads[2], 125)
+    end
+  end
+
+  describe("proc /proc/pressure parser") do ->
+    it("reads avg10 some/full") do ->
+      var content = "some avg10=12.34 avg60=10.00 avg300=5.00 total=99999\n" +
+                    "full avg10=4.50 avg60=3.00 avg300=2.00 total=88888\n"
+      var psi = sp::proc_parse_pressure(content)
+      assert_eq(psi[0], 1234)   # some × 100
+      assert_eq(psi[1], 450)    # full × 100
+    end
+  end
+
+  describe("proc ps line parser") do ->
+    it("parses standard ps output line") do ->
+      var line = "  1234   1 root              5.4  12345  6789 R+   /sbin/launchd"
+      var p = sp::proc_parse_ps_line(line)
+      assert_eq(p.pid, 1234)
+      assert_eq(p.ppid, 1)
+      assert_eq_str(p.user, "root")
+      assert_eq(p.cpu_pct, 5)
+      assert_eq(p.rss_kb, 12345)
+      assert_eq_str(p.state, "R")
+      assert_eq_str(p.command, "/sbin/launchd")
+    end
+
+    it("re-glues space-containing commands") do ->
+      var line = "9876 1 mathisto  0.0  500 1000 S  /usr/bin/some thing here"
+      var p = sp::proc_parse_ps_line(line)
+      assert_eq(p.pid, 9876)
+      assert_eq_str(p.command, "/usr/bin/some thing here")
+    end
+
+    it("malformed line returns pid 0") do ->
+      var p = sp::proc_parse_ps_line("not a real ps line")
+      assert_eq(p.pid, 0)
+    end
+  end
+
+  describe("proc top CPU line parser (macOS)") do ->
+    it("extracts user+sys percent (truncated)") do ->
+      var line = "CPU usage: 8.59% user, 11.78% sys, 79.61% idle"
+      # Decimals truncate to int part: 8 + 11 = 19. Sub-percent
+      # precision arrives in Phase 2.
+      assert_eq(sp::proc_parse_top_cpu_line(line), 19)
+    end
+
+    it("handles whole-percent values") do ->
+      var line = "CPU usage: 25.00% user, 5.00% sys, 70.00% idle"
+      assert_eq(sp::proc_parse_top_cpu_line(line), 30)
+    end
+  end
+
+  describe("proc /proc/diskstats parser") do ->
+    it("parses a top-level device line") do ->
+      # major minor name reads merged sec_read ms_read writes merged sec_written ms_write ios_in_progress ms_doing_io weighted_ms
+      var line = "   8       0 sda 1234 5 99999 87 4321 23 88888 76 0 12345 18765"
+      var d = sp::proc_parse_diskstats_line(line)
+      assert_eq_str(d.name, "sda")
+      # sectors_read = 99999 → bytes = 99999 * 512
+      assert_eq(d.read_bytes_total, 99999 * 512)
+      # sectors_written = 88888 → bytes = 88888 * 512
+      assert_eq(d.write_bytes_total, 88888 * 512)
+    end
+
+    it("rejects too-short lines") do ->
+      var d = sp::proc_parse_diskstats_line("8 0 sda 1 2 3")
+      assert_eq(d.name.size, 0)
+    end
+  end
+
+  describe("proc disk top-level filter") do ->
+    it("keeps non-numeric-tail names") do ->
+      assert_eq(sp::proc_diskstats_is_top_level("sda"),    true)
+      assert_eq(sp::proc_diskstats_is_top_level("nvme0n1"), true)
+      assert_eq(sp::proc_diskstats_is_top_level("dm-0"),    true)
+    end
+
+    it("rejects partition names") do ->
+      assert_eq(sp::proc_diskstats_is_top_level("sda1"),       false)
+      assert_eq(sp::proc_diskstats_is_top_level("nvme0n1p1"),  false)
+    end
+  end
+
+  describe("proc iostat parser (macOS)") do ->
+    it("parses single-disk iostat output") do ->
+      var content =
+        "              disk0 \n" +
+        "    KB/t  tps  MB/s \n" +
+        "   12.26  167  2.00 \n"
+      var disks = sp::proc_parse_iostat(content)
+      assert_eq(disks.size, 1)
+      assert_eq_str(disks[0].name, "disk0")
+      # 2.00 MB/s = 200 (× 100), × 10486 = 2,097,200 bytes/sec
+      assert_eq(disks[0].read_bytes_per_sec, 2097200)
+    end
+
+    it("returns empty for too-short input") do ->
+      var disks = sp::proc_parse_iostat("")
+      assert_eq(disks.size, 0)
+    end
+  end
+
+  describe("proc OOM line parser (Linux dmesg / journalctl)") do ->
+    it("parses kernel-uptime form with anon-rss") do ->
+      var line = "[12345.678] Memory cgroup out of memory: Killed process 22344 (chrome) total-vm:4500000kB, anon-rss:200000kB, file-rss:0kB, shmem-rss:0kB, UID:1000 oom_score_adj:300"
+      var ev = sp::proc_parse_oom_line(line)
+      assert_eq(ev.victim_pid, 22344)
+      assert_eq_str(ev.victim_name, "chrome")
+      assert_eq(ev.rss_kb, 200000)
+    end
+
+    it("parses older form without cgroup prefix") do ->
+      var line = "Killed process 1234 (myapp), UID 1000, total-vm:1234kB, anon-rss:567kB, file-rss:0kB"
+      var ev = sp::proc_parse_oom_line(line)
+      assert_eq(ev.victim_pid, 1234)
+      assert_eq_str(ev.victim_name, "myapp")
+      assert_eq(ev.rss_kb, 567)
+    end
+
+    it("parses journalctl-prefixed form") do ->
+      var line = "Apr 12 03:44:21 host kernel: [86400.000] Killed process 22344 (chrome) total-vm:4500000kB, anon-rss:1000kB"
+      var ev = sp::proc_parse_oom_line(line)
+      assert_eq(ev.victim_pid, 22344)
+      assert_eq_str(ev.victim_name, "chrome")
+    end
+
+    it("victim_pid 0 on non-OOM line") do ->
+      var ev = sp::proc_parse_oom_line("kernel: [12345] random message")
+      assert_eq(ev.victim_pid, 0)
+    end
+
+    it("handles missing rss field") do ->
+      var line = "[1.0] Killed process 99 (foo)"
+      var ev = sp::proc_parse_oom_line(line)
+      assert_eq(ev.victim_pid, 99)
+      assert_eq(ev.rss_kb, 0)
+    end
+  end
+
+  describe("proc /proc/net/dev parser") do ->
+    it("parses an interface line") do ->
+      var line = "  eth0: 12345678  56789    0    0    0     0          0         0 87654321  43210    0    0    0     0       0          0"
+      var n = sp::proc_parse_net_dev_line(line)
+      assert_eq_str(n.name, "eth0")
+      assert_eq(n.rx_bytes_total, 12345678)
+      assert_eq(n.tx_bytes_total, 87654321)
+      assert_eq(n.rx_packets, 56789)
+      assert_eq(n.tx_packets, 43210)
+    end
+
+    it("strips trailing colon from interface name") do ->
+      var line = "wlan0: 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16"
+      var n = sp::proc_parse_net_dev_line(line)
+      assert_eq_str(n.name, "wlan0")
+    end
+
+    it("filters lo via proc_net_is_active") do ->
+      assert_eq(sp::proc_net_is_active("lo"),    false)
+      assert_eq(sp::proc_net_is_active("eth0"),  true)
+      assert_eq(sp::proc_net_is_active("wlan0"), true)
+    end
+  end
+
+  describe("proc netstat -ib parser (macOS)") do ->
+    it("parses Link line and returns canonical entry") do ->
+      var content =
+        "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n" +
+        "en0 1500 <Link#14> 8e:d4:64:16:d6:81 379529 0 325567294 236476 0 245903855 0\n" +
+        "en0 1500 hopper.loca fe80:e::4f3:f031: 379529 - 325567294 236476 - 245903855 -\n"
+      var nics = sp::proc_parse_netstat_ib(content)
+      # Dedupe by name → one entry for en0
+      assert_eq(nics.size, 1)
+      assert_eq_str(nics[0].name, "en0")
+      assert_eq(nics[0].rx_bytes_total, 325567294)
+      assert_eq(nics[0].tx_bytes_total, 245903855)
+    end
+
+    it("returns empty for content without data lines") do ->
+      var content = "Name Mtu Network Address\n"
+      var nics = sp::proc_parse_netstat_ib(content)
+      assert_eq(nics.size, 0)
+    end
+  end
+
+  describe("proc vm_stat parser (macOS)") do ->
+    it("converts pages to KiB using page_bytes") do ->
+      # 4096-byte pages → 4 KiB per page
+      var content =
+        "Mach Virtual Memory Statistics: (page size of 4096 bytes)\n" +
+        "Pages free:          1000.\n" +
+        "Pages active:         500.\n" +
+        "Pages inactive:       400.\n" +
+        "Pages speculative:    100.\n" +
+        "Pages wired down:     200.\n"
+      var m = sp::proc_parse_vm_stat(content, 4096)
+      # total = (1000+500+400+100+200+0) * 4 = 8800
+      assert_eq(m.total_kb, 8800)
+      assert_eq(m.free_kb, 4000)
+      # used = (active + wired + compressed) * kb_per_page = 700*4 = 2800
+      assert_eq(m.used_kb, 2800)
+    end
+  end
+
+  return qspec_main()
+end

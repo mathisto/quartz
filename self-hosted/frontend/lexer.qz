@@ -1,0 +1,2010 @@
+##! # Quartz Lexer
+##!
+##! The lexical analyzer (tokenizer) for the Quartz programming language.
+##! Transforms raw source code into a stream of tokens for parsing.
+##!
+##! This module produces four parallel vectors:
+##! - **types**: Token type constants (see token_constants module)
+##! - **lexemes**: Raw text of each token
+##! - **lines**: Line number where each token appears
+##! - **cols**: Column number where each token starts
+##!
+##! ## Token Categories
+##!
+##! | Category | Examples |
+##! |----------|----------|
+##! | Keywords | `def`, `if`, `while`, `struct`, `enum`, `match` |
+##! | Operators | `+`, `-`, `*`, `==`, `!=`, `&&`, `\|\|` |
+##! | Literals | `42`, `"hello"`, `:symbol`, `true`, `false` |
+##! | Delimiters | `(`, `)`, `{`, `}`, `[`, `]`, `,` |
+##! | Comments | `#` (regular), `##` (doc), `##!` (module doc) |
+##!
+##! ## Usage
+##!
+##! ```be
+##! tokens = lexer_tokenize(source)
+##! types = lexer_get_types(tokens)
+##! lexemes = lexer_get_lexemes(tokens)
+##! for i in 0..lexer_token_count(tokens)
+##!   puts(lexemes.vec_get(i))
+##! end
+##! ```
+##!
+##! @see token_constants Token type definitions
+##! @see parser Parser that consumes the token stream
+##! @since 1.0.0
+
+import token_constants
+import string_intern
+
+## When true, regular comments (#) are preserved as TOK_COMMENT tokens.
+## Set to 1 before lexing for formatter mode. Default: 0 (comments discarded).
+var _lexer_preserve_comments = 0
+
+## When true, the lexer emits ALL trivia needed to reconstruct source losslessly:
+## regular comments (#), doc-comments (already emitted), and newline tokens
+## (already emitted). This is the full-fidelity mode for the CST / formatter.
+## Setting it also forces comment preservation on. Default: 0 (off).
+##
+## Inter-token horizontal whitespace (spaces/tabs) is NOT emitted as tokens —
+## it is recoverable from the byte gaps between consecutive tokens' offsets
+## (see byte_starts / byte_ends on LexerResult).
+##
+## ADDITIVITY: when this flag is 0 the token stream is byte-identical to today.
+var _lexer_full_fidelity = 0
+
+## Enable/disable comment preservation for the formatter.
+def lexer_set_preserve_comments(v: Int): Void
+  _lexer_preserve_comments = v
+end
+
+## Enable/disable full-fidelity (lossless) trivia mode for the CST / formatter.
+##
+## When enabled, regular comments are preserved (implies preserve-comments) so
+## that the emitted tokens + their byte offsets cover the source such that
+## nothing between the first and last token is unrepresented except inter-token
+## horizontal whitespace (recoverable from byte gaps).
+##
+## @param v 1 to enable, 0 to disable.
+##
+## Symmetric: enabling implies comment-preservation; DISABLING also resets
+## comment-preservation to 0. Without the reset, a full-fidelity lex leaves
+## `_lexer_preserve_comments` stuck on, leaking comment tokens into a
+## subsequent default-mode lex in the same process (e.g. a CST parse followed
+## by a legacy parse) — which mis-parses the second source. Full-fidelity is
+## the only thing that turns comment-preservation on (no caller sets it
+## independently), so a symmetric reset is correct.
+def lexer_set_full_fidelity(v: Int): Void
+  _lexer_full_fidelity = v
+  if v == 1
+    _lexer_preserve_comments = 1
+  else
+    _lexer_preserve_comments = 0
+  end
+end
+
+## Result of tokenizing source code.
+##
+## Contains four parallel vectors indexed by token position:
+## - types: Token type constants (see token_constants module)
+## - lexemes: Raw text of each token
+## - lines: 1-based line numbers
+## - cols: 1-based column numbers
+##
+## @since 5.10.0
+struct LexerResult
+  types: Vec<Int>
+  lexemes: Vec<Int>
+  lines: Vec<Int>
+  cols: Vec<Int>
+  byte_starts: Vec<Int>
+  byte_ends: Vec<Int>
+  interner: StringInterner
+end
+
+## Processes escape sequences in a quoted string literal.
+##
+## Converts backslash escape sequences to their actual character values.
+## The input string must include its surrounding double-quotes.
+##
+## ## Escape Sequences
+##
+## | Sequence | Result | Code |
+## |----------|--------|------|
+## | `\n` | Newline | 10 |
+## | `\t` | Tab | 9 |
+## | `\r` | Carriage return | 13 |
+## | `\\` | Backslash | 92 |
+## | `\"` | Double quote | 34 |
+## | `\#` | Hash | 35 |
+##
+## Unknown escape sequences are preserved as-is.
+##
+## @param s The quoted string literal including surrounding quotes
+## @returns Unescaped string content (quotes stripped)
+## @example
+##   lex_unescape_string("\"hello\\nworld\"")  #=> "hello\nworld"
+## NOTE: Uses while loop because we need manual index control for escape sequences
+def lex_unescape_string(s: String): String
+  var len = str_byte_len(s)
+  if len < 2
+    return s
+  end
+
+  # Strip surrounding quotes
+  var content = str_byte_slice(s, 1, len - 1)
+  var clen = str_byte_len(content)
+  
+  var result = sb_new()
+  defer sb_free(result)
+  var i = 0
+  while i < clen
+    var c = str_byte_at(content, i)
+    if c == '\\'
+      # Backslash - check next char
+      if i + 1 < clen
+        var next = str_byte_at(content, i + 1)
+        if next == 'n'
+          # \n -> newline
+          sb_append_char(result, '\n')
+          i += 2
+        elsif next == 't'
+          # \t -> tab
+          sb_append_char(result, '\t')
+          i += 2
+        elsif next == 'r'
+          # \r -> CR
+          sb_append_char(result, '\r')
+          i += 2
+        elsif next == '\\'
+          # \\ -> backslash
+          sb_append_char(result, '\\')
+          i += 2
+        elsif next == '"'
+          # \" -> quote
+          sb_append_char(result, '"')
+          i += 2
+        elsif next == '#'
+          # \# -> hash (for interpolation escape)
+          sb_append_char(result, '#')
+          i += 2
+        elsif next == '0'
+          # \0 -> null byte
+          sb_append_char(result, 0)
+          i += 2
+        elsif next == 'x'
+          # \xNN -> hex escape (2 hex digits)
+          if i + 3 < clen
+            var h1 = str_byte_at(content, i + 2)
+            var h2 = str_byte_at(content, i + 3)
+            var val = 0
+            if h1 >= '0' and h1 <= '9'
+              val = (h1 - '0') * 16
+            elsif h1 >= 'a' and h1 <= 'f'
+              val = (h1 - 'a' + 10) * 16
+            elsif h1 >= 'A' and h1 <= 'F'
+              val = (h1 - 'A' + 10) * 16
+            end
+            if h2 >= '0' and h2 <= '9'
+              val += h2 - '0'
+            elsif h2 >= 'a' and h2 <= 'f'
+              val += h2 - 'a' + 10
+            elsif h2 >= 'A' and h2 <= 'F'
+              val += h2 - 'A' + 10
+            end
+            sb_append_byte(result, val)
+            i += 4
+          else
+            sb_append_char(result, c)
+            i += 1
+          end
+        elsif next == 'u'
+          # \u{NNNNNN} -> Unicode codepoint (1-6 hex digits)
+          if i + 2 < clen and str_byte_at(content, i + 2) == '{'
+            var j = i + 3
+            var cp = 0
+            while j < clen and str_byte_at(content, j) != '}'
+              var hd = str_byte_at(content, j)
+              cp *= 16
+              if hd >= '0' and hd <= '9'
+                cp += hd - '0'
+              elsif hd >= 'a' and hd <= 'f'
+                cp += hd - 'a' + 10
+              elsif hd >= 'A' and hd <= 'F'
+                cp += hd - 'A' + 10
+              end
+              j += 1
+            end
+            sb_append_char(result, cp)
+            i = j + 1
+          else
+            sb_append_char(result, c)
+            i += 1
+          end
+        else
+          # Unknown escape, keep as-is
+          sb_append_char(result, c)
+          i += 1
+        end
+      else
+        sb_append_char(result, c)
+        i += 1
+      end
+    else
+      # Raw byte — for multi-byte UTF-8, write individual bytes directly
+      # using sb_append_byte to avoid double-encoding
+      # (sb_append_char treats values as codepoints and re-encodes to UTF-8)
+      if c >= 0xF0 and i + 3 < clen
+        sb_append_byte(result, c)
+        sb_append_byte(result, str_byte_at(content, i + 1))
+        sb_append_byte(result, str_byte_at(content, i + 2))
+        sb_append_byte(result, str_byte_at(content, i + 3))
+        i += 4
+      elsif c >= 0xE0 and i + 2 < clen
+        sb_append_byte(result, c)
+        sb_append_byte(result, str_byte_at(content, i + 1))
+        sb_append_byte(result, str_byte_at(content, i + 2))
+        i += 3
+      elsif c >= 0xC0 and i + 1 < clen
+        sb_append_byte(result, c)
+        sb_append_byte(result, str_byte_at(content, i + 1))
+        i += 2
+      else
+        sb_append_char(result, c)
+        i += 1
+      end
+    end
+  end
+  
+  return result.to_string()
+end
+
+## Strips common leading indentation from a triple-quoted string.
+## Each line has up to `indent` leading space characters removed.
+## Used by the lexer to implement indentation-stripped heredocs.
+def lex_strip_indent(content: String, indent: Int): String
+  var result = sb_new()
+  defer sb_free(result)
+  var clen = str_byte_len(content)
+  var i = 0
+  var first = 1
+  while i < clen
+    # Find end of current line
+    var line_end = i
+    while line_end < clen and str_byte_at(content, line_end) != '\n'
+      line_end += 1
+    end
+    # Skip up to indent leading spaces
+    var skip = 0
+    var j = i
+    while j < line_end and skip < indent and str_byte_at(content, j) == ' '
+      skip += 1
+      j += 1
+    end
+    # Add newline separator between lines
+    if first == 0
+      sb_append_char(result, '\n')
+    end
+    first = 0
+    # Add stripped line content
+    if j < line_end
+      sb_append(result, str_byte_slice(content, j, line_end))
+    end
+    # Advance past the newline
+    i = line_end + 1
+  end
+  return result.to_string()
+end
+
+## Tokenizes Quartz source code into a stream of tokens.
+##
+## The lexer performs single-pass scanning with the following phases:
+## 1. Skip whitespace (spaces, tabs, carriage returns)
+## 2. Identify token type from first character
+## 3. Consume multi-character tokens (identifiers, numbers, strings)
+## 4. Map keywords to their specific token types
+## 5. Record position information (line, column)
+##
+## ## Token Types
+##
+## The lexer recognizes:
+## - **Single-char**: `(`, `)`, `{`, `}`, `[`, `]`, `,`, `.`
+## - **Multi-char operators**: `==`, `!=`, `<=`, `>=`, `&&`, `||`, `..`, `?.`, `??`
+## - **Compound assignment**: `+=`, `-=`, `*=`, `/=`, `%=`
+## - **Literals**: integers, strings (with escape processing), symbols (`:name`)
+## - **Keywords**: 27 reserved words (def, if, while, struct, enum, match, etc.)
+## - **Doc comments**: `##` (item), `##!` (module), `##^` (inline)
+##
+## ## Return Value
+##
+## Returns a result vector containing four parallel vectors:
+## - Index 0: token types (integers from token_constants)
+## - Index 1: lexemes (raw text as String pointers cast to Int)
+## - Index 2: line numbers
+## - Index 3: column numbers
+##
+## Use accessor functions to extract each component.
+##
+## @param source The complete source code to tokenize
+## @returns LexerResult struct containing types, lexemes, lines, and cols vectors
+## @example
+##   tokens = lexer_tokenize("def main()\n  return 42\nend")
+##   count = lexer_token_count(tokens)  #=> 8 (def, main, (, ), newline, return, 42, end, EOF)
+## @see lexer_get_types Extract token type vector
+## @see lexer_get_lexemes Extract lexeme vector
+def lexer_tokenize(source: String, interner: StringInterner): LexerResult
+  var line = 1
+  var col = 1
+  var len = str_byte_len(source)
+  
+  var types = vec_new()
+  var lexemes = vec_new()
+  var lines = vec_new()
+  var cols = vec_new()
+  var byte_starts = vec_new()
+  var byte_ends = vec_new()
+
+  var interp_stack = vec_new()
+  var interp_triple = vec_new()
+  var interp_indent = vec_new()
+
+  var pos = 0
+  while true
+    if pos >= len
+      # Push EOF when we reach end of input at start of iteration
+      types.push(token_constants::TOK_EOF)
+      lexemes.push(intern_id(interner, ""))
+      lines.push(line)
+      cols.push(col)
+      byte_starts.push(len)
+      byte_ends.push(len)
+      break
+    end
+
+    # Skip whitespace (space, tab, CR)
+    while pos < len
+      var wc = str_byte_at(source, pos)
+      if wc == ' ' or wc == '\t'
+        pos += 1
+        col += 1
+      elsif wc == '\r'
+        pos += 1
+      else
+        break
+      end
+    end
+    
+    if pos >= len
+      types.push(token_constants::TOK_EOF)
+      lexemes.push(intern_id(interner, ""))
+      lines.push(line)
+      cols.push(col)
+      byte_starts.push(len)
+      byte_ends.push(len)
+    else
+      var start = pos
+      var start_line = line
+      var start_col = col
+      var c = str_byte_at(source, pos)
+      pos += 1
+      col += 1
+      
+      var tt = -1
+      var error_lexeme = ""
+
+      if c == '\n'
+        tt = token_constants::TOK_NEWLINE
+        line += 1
+        col = 1
+      end
+      
+      if c == '#'
+        # Check for doc comment (##) vs regular comment (#)
+        var is_doc_comment = 0
+        var doc_type = 0  # 0=none, 1=regular ##, 2=module ##!, 3=inline ##^
+        if pos < len
+          if str_byte_at(source, pos) == '#'
+            is_doc_comment = 1
+            doc_type = 1  # Regular doc comment
+            pos += 1
+            col += 1
+            # Check for ##! (module) or ##^ (inline field)
+            if pos < len
+              var next_c = str_byte_at(source, pos)
+              if next_c == '!'
+                doc_type = 2  # Module doc
+                pos += 1
+                col += 1
+              end
+              if next_c == '^'
+                doc_type = 3  # Inline field doc
+                pos += 1
+                col += 1
+              end
+            end
+          end
+        end
+        
+        # Skip to end of comment line
+        while pos < len
+          break if str_byte_at(source, pos) == '\n'
+          pos += 1
+          col += 1
+        end
+        
+        if is_doc_comment == 1
+          if doc_type == 2
+            tt = token_constants::TOK_DOC_MODULE
+          elsif doc_type == 3
+            tt = token_constants::TOK_DOC_INLINE
+          else
+            tt = token_constants::TOK_DOC_COMMENT
+          end
+        else
+          if _lexer_preserve_comments == 1
+            tt = token_constants::TOK_COMMENT
+          else
+            tt = 0 - 2
+          end
+        end
+      end
+      
+      if c == '('
+        tt = token_constants::TOK_LPAREN
+      end
+      if c == ')'
+        tt = token_constants::TOK_RPAREN
+      end
+      if c == '{'
+        tt = token_constants::TOK_LBRACE
+        if interp_stack.size > 0
+          var brace_idx = interp_stack.size - 1
+          interp_stack[brace_idx] = interp_stack[brace_idx] + 1
+        end
+      end
+      if c == '}'
+        if interp_stack.size > 0 and interp_stack[interp_stack.size - 1] == 0
+          # Closing } of interpolation — emit INTERP_END, pop stack, scan continuation
+          types.push(token_constants::TOK_INTERP_END)
+          lexemes.push(intern_id(interner, "}"))
+          lines.push(start_line)
+          cols.push(start_col)
+          byte_starts.push(start)
+          byte_ends.push(pos)
+          var was_triple = interp_triple[interp_triple.size - 1]
+          var was_indent = interp_indent[interp_indent.size - 1]
+          interp_stack.pop()
+          interp_triple.pop()
+          interp_indent.pop()
+
+          # String continuation: scan remaining string content after interpolation
+          if was_triple == 0
+            # Regular string continuation — scan for " or #{
+            var cont_buf = sb_new()
+            var cont_len = 0
+            var cont_start_line = line
+            var cont_start_col = col
+            var cont_start_byte = pos
+            var cont_done = 0
+            while pos < len and cont_done == 0
+              var sc = str_byte_at(source, pos)
+              if sc == '"'
+                # End of interpolated string
+                if cont_len > 0
+                  var part_raw = sb_to_string(cont_buf)
+                  var part_text = lex_unescape_string("\"" + part_raw + "\"")
+                  types.push(token_constants::TOK_STRING_PART)
+                  lexemes.push(intern_id(interner, part_text))
+                  lines.push(cont_start_line)
+                  cols.push(cont_start_col)
+                  byte_starts.push(cont_start_byte)
+                  byte_ends.push(pos)
+                end
+                sb_free(cont_buf)
+                types.push(token_constants::TOK_STRING_END)
+                lexemes.push(intern_id(interner, "\""))
+                lines.push(line)
+                cols.push(col)
+                byte_starts.push(pos)
+                byte_ends.push(pos + 1)
+                pos += 1
+                col += 1
+                cont_done = 1
+              elsif sc == '#' and pos + 1 < len and str_byte_at(source, pos + 1) == '{'
+                # Another interpolation
+                if cont_len > 0
+                  var part_raw = sb_to_string(cont_buf)
+                  var part_text = lex_unescape_string("\"" + part_raw + "\"")
+                  types.push(token_constants::TOK_STRING_PART)
+                  lexemes.push(intern_id(interner, part_text))
+                  lines.push(cont_start_line)
+                  cols.push(cont_start_col)
+                  byte_starts.push(cont_start_byte)
+                  byte_ends.push(pos)
+                end
+                sb_free(cont_buf)
+                types.push(token_constants::TOK_INTERP_START)
+                lexemes.push(intern_id(interner, "\#{"))
+                lines.push(line)
+                cols.push(col)
+                byte_starts.push(pos)
+                byte_ends.push(pos + 2)
+                pos += 2
+                col += 2
+                interp_stack.push(0)
+                interp_triple.push(was_triple)
+                interp_indent.push(was_indent)
+                cont_done = 1
+              elsif sc == '\\'
+                # Escape sequence — keep raw bytes for lex_unescape_string
+                sb_append_byte(cont_buf, sc)
+                cont_len += 1
+                pos += 1
+                col += 1
+                if pos < len
+                  var esc_c = str_byte_at(source, pos)
+                  sb_append_byte(cont_buf, esc_c)
+                  cont_len += 1
+                  pos += 1
+                  if esc_c == '\n'
+                    line += 1
+                    col = 1
+                  else
+                    col += 1
+                  end
+                end
+              elsif sc == '\n'
+                sb_append_byte(cont_buf, sc)
+                cont_len += 1
+                pos += 1
+                line += 1
+                col = 1
+              else
+                if sc >= 0x80
+                  sb_append_byte(cont_buf, sc)
+                else
+                  sb_append_char(cont_buf, sc)
+                end
+                cont_len += 1
+                pos += 1
+                col += 1
+              end
+            end
+          else
+            # Triple-quoted string continuation — scan for """ or #{, with indent stripping
+            var cont_buf = sb_new()
+            var cont_len = 0
+            var cont_start_line = line
+            var cont_start_col = col
+            var cont_start_byte = pos
+            var cont_done = 0
+            var at_sol = 0
+            while pos < len and cont_done == 0
+              # Inline indent stripping at start of line
+              if at_sol == 1
+                var indent_skipped = 0
+                while pos < len and indent_skipped < was_indent and str_byte_at(source, pos) == ' '
+                  indent_skipped += 1
+                  pos += 1
+                  col += 1
+                end
+                at_sol = 0
+              end
+              if pos >= len
+                break
+              end
+              var sc = str_byte_at(source, pos)
+              if sc == '"' and pos + 2 < len and str_byte_at(source, pos + 1) == '"' and str_byte_at(source, pos + 2) == '"'
+                # End of triple-quoted string — strip trailing newline from buffer
+                var buf_str = sb_to_string(cont_buf)
+                var buf_len = str_byte_len(buf_str)
+                if buf_len > 0 and str_byte_at(buf_str, buf_len - 1) == '\n'
+                  buf_len -= 1
+                  if buf_len > 0 and str_byte_at(buf_str, buf_len - 1) == '\r'
+                    buf_len -= 1
+                  end
+                  buf_str = str_byte_slice(buf_str, 0, buf_len)
+                end
+                if str_byte_len(buf_str) > 0
+                  var part_text = lex_unescape_string("\"" + buf_str + "\"")
+                  types.push(token_constants::TOK_STRING_PART)
+                  lexemes.push(intern_id(interner, part_text))
+                  lines.push(cont_start_line)
+                  cols.push(cont_start_col)
+                  byte_starts.push(cont_start_byte)
+                  byte_ends.push(pos)
+                end
+                sb_free(cont_buf)
+                types.push(token_constants::TOK_STRING_END)
+                lexemes.push(intern_id(interner, "\"\"\""))
+                lines.push(line)
+                cols.push(col)
+                byte_starts.push(pos)
+                byte_ends.push(pos + 3)
+                pos += 3
+                col += 3
+                cont_done = 1
+              elsif sc == '#' and pos + 1 < len and str_byte_at(source, pos + 1) == '{'
+                # Another interpolation
+                if cont_len > 0
+                  var part_raw = sb_to_string(cont_buf)
+                  var part_text = lex_unescape_string("\"" + part_raw + "\"")
+                  types.push(token_constants::TOK_STRING_PART)
+                  lexemes.push(intern_id(interner, part_text))
+                  lines.push(cont_start_line)
+                  cols.push(cont_start_col)
+                  byte_starts.push(cont_start_byte)
+                  byte_ends.push(pos)
+                end
+                sb_free(cont_buf)
+                types.push(token_constants::TOK_INTERP_START)
+                lexemes.push(intern_id(interner, "\#{"))
+                lines.push(line)
+                cols.push(col)
+                byte_starts.push(pos)
+                byte_ends.push(pos + 2)
+                pos += 2
+                col += 2
+                interp_stack.push(0)
+                interp_triple.push(was_triple)
+                interp_indent.push(was_indent)
+                cont_done = 1
+              elsif sc == '\\'
+                sb_append_byte(cont_buf, sc)
+                cont_len += 1
+                pos += 1
+                col += 1
+                if pos < len
+                  var esc_c = str_byte_at(source, pos)
+                  sb_append_byte(cont_buf, esc_c)
+                  cont_len += 1
+                  pos += 1
+                  if esc_c == '\n'
+                    line += 1
+                    col = 1
+                    at_sol = 1
+                  else
+                    col += 1
+                  end
+                end
+              elsif sc == '\n'
+                sb_append_byte(cont_buf, sc)
+                cont_len += 1
+                pos += 1
+                line += 1
+                col = 1
+                at_sol = 1
+              else
+                if sc >= 0x80
+                  sb_append_byte(cont_buf, sc)
+                else
+                  sb_append_char(cont_buf, sc)
+                end
+                cont_len += 1
+                pos += 1
+                col += 1
+              end
+            end
+          end
+          tt = 0 - 2
+        elsif interp_stack.size > 0
+          # Normal } inside expression — decrement brace depth
+          var brace_idx = interp_stack.size - 1
+          interp_stack[brace_idx] = interp_stack[brace_idx] - 1
+          tt = token_constants::TOK_RBRACE
+        else
+          tt = token_constants::TOK_RBRACE
+        end
+      end
+      if c == '['
+        tt = token_constants::TOK_LBRACKET
+      end
+      if c == ']'
+        tt = token_constants::TOK_RBRACKET
+      end
+      if c == ','
+        tt = token_constants::TOK_COMMA
+      end
+      if c == '.'
+        tt = token_constants::TOK_DOT
+        if pos < len
+          if str_byte_at(source, pos) == '.'
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_DOTDOT
+            # Check for third dot: ...
+            if pos < len
+              if str_byte_at(source, pos) == '.'
+                pos += 1
+                col += 1
+                tt = token_constants::TOK_DOTDOTDOT
+              end
+            end
+          end
+        end
+      end
+      if c == ';'
+        tt = token_constants::TOK_NEWLINE
+      end
+      if c == '?'
+        if pos < len
+          var nc = str_byte_at(source, pos)
+          if nc == '?'
+            pos += 1
+            col += 1
+            # Validate spacing around ?? operator
+            var had_ws_before = 0
+            if start > 0
+              var prev_c = str_byte_at(source, start - 1)
+              if prev_c == ' ' or prev_c == '\t' or prev_c == '\n'
+                had_ws_before = 1
+              end
+            end
+            var has_ws_after = 0
+            if pos >= len
+              has_ws_after = 1
+            else
+              var after_c = str_byte_at(source, pos)
+              if after_c == ' ' or after_c == '\t' or after_c == '\n' or after_c == 0 or after_c == ')' or after_c == ']' or after_c == '}' or after_c == ',' or after_c == ';'
+                has_ws_after = 1
+              end
+            end
+            if had_ws_before == 0 or has_ws_after == 0
+              tt = token_constants::TOK_ERROR
+              error_lexeme = "spaces required around ?? operator"
+            else
+              tt = token_constants::TOK_QUESTION_QUESTION
+            end
+          elsif nc == '.'
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_QUESTION_DOT
+          else
+            tt = token_constants::TOK_QUESTION
+          end
+        else
+          tt = token_constants::TOK_QUESTION
+        end
+      end
+      if c == '+'
+        tt = token_constants::TOK_PLUS
+        if pos < len
+          if str_byte_at(source, pos) == '='
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_PLUS_EQ
+          end
+        end
+      end
+      if c == '*'
+        tt = token_constants::TOK_STAR
+        if pos < len
+          if str_byte_at(source, pos) == '='
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_STAR_EQ
+          end
+        end
+      end
+      if c == '/'
+        tt = token_constants::TOK_SLASH
+        if pos < len
+          if str_byte_at(source, pos) == '='
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_SLASH_EQ
+          end
+        end
+      end
+      if c == '%'
+        tt = token_constants::TOK_PERCENT
+        if pos < len
+          if str_byte_at(source, pos) == '='
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_PERCENT_EQ
+          end
+        end
+      end
+      if c == '~'
+        # Check for ~r"..." regex sigil
+        if pos < len
+          var nc = str_byte_at(source, pos)
+          if nc == 'r'
+            if pos + 1 < len
+              var qc = str_byte_at(source, pos + 1)
+              if qc == '"'
+                # Consume 'r' and opening '"'
+                pos += 2
+                col += 2
+                # Scan regex pattern until closing '"'
+                var regex_start = pos
+                var regex_len = 0
+                while pos < len
+                  var rc = str_byte_at(source, pos)
+                  break if rc == '"'
+                  if rc == '\\'  # backslash escape
+                    if pos + 1 < len
+                      pos += 1
+                      col += 1
+                      regex_len += 1
+                    end
+                  end
+                  pos += 1
+                  col += 1
+                  regex_len += 1
+                end
+                # Extract regex pattern
+                lexeme = str_byte_slice(source, regex_start, regex_start + regex_len)
+                if pos < len
+                  pos += 1  # consume closing '"'
+                  col += 1
+                end
+                tt = token_constants::TOK_REGEX
+              end
+            end
+          end
+        end
+        if tt < 0
+          tt = token_constants::TOK_TILDE
+        end
+      end
+      if c == '^'
+        tt = token_constants::TOK_CARET
+        if pos < len
+          if str_byte_at(source, pos) == '='
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_CARET_EQ
+          end
+        end
+      end
+      if c == '_'
+        # Check if _ is followed by an identifier character — if so, treat as identifier start
+        var is_underscore_ident = 0
+        if pos < len
+          var nc = str_byte_at(source, pos)
+          if nc >= 'a'
+            if nc <= 'z'
+              is_underscore_ident = 1
+            end
+          end
+          if nc >= 'A'
+            if nc <= 'Z'
+              is_underscore_ident = 1
+            end
+          end
+          if nc >= '0'
+            if nc <= '9'
+              is_underscore_ident = 1
+            end
+          end
+          if nc == '_'
+            is_underscore_ident = 1
+          end
+        end
+        if is_underscore_ident == 0
+          tt = token_constants::TOK_UNDERSCORE
+        end
+      end
+      # @ for inline C: @c("code")
+      if c == '@'
+        tt = token_constants::TOK_AT
+      end
+      
+      if c == ':'
+        tt = token_constants::TOK_COLON
+        if pos < len
+          var nc = str_byte_at(source, pos)
+          if nc == ':'
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_DOUBLE_COLON
+          else
+            # Check for symbol literal :identifier
+            var is_sym_start = 0
+            # a-z
+            if nc >= 'a'
+              if nc <= 'z'
+                is_sym_start = 1
+              end
+            end
+            # A-Z
+            if nc >= 'A'
+              if nc <= 'Z'
+                is_sym_start = 1
+              end
+            end
+            # underscore
+            if nc == '_'
+              is_sym_start = 1
+            end
+            
+            if is_sym_start == 1
+              # Consume the identifier part
+              while pos < len
+                var sc = str_byte_at(source, pos)
+                var is_sym_char = 0
+                # a-z
+                if sc >= 'a'
+                  if sc <= 'z'
+                    is_sym_char = 1
+                  end
+                end
+                # A-Z
+                if sc >= 'A'
+                  if sc <= 'Z'
+                    is_sym_char = 1
+                  end
+                end
+                # 0-9
+                if sc >= '0'
+                  if sc <= '9'
+                    is_sym_char = 1
+                  end
+                end
+                # underscore
+                if sc == '_'
+                  is_sym_char = 1
+                end
+
+                break if is_sym_char == 0
+                pos += 1
+                col += 1
+              end
+              tt = token_constants::TOK_SYMBOL
+            end
+          end
+        end
+      end
+      
+      if c == '-'
+        tt = token_constants::TOK_MINUS
+        if pos < len
+          var nc = str_byte_at(source, pos)
+          if nc == '>'
+            # -> arrow token
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_ARROW
+          elsif nc == '='
+            # -=
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_MINUS_EQ
+          end
+        end
+      end
+      
+      if c == '='
+        tt = token_constants::TOK_ASSIGN
+        if pos < len
+          var nc = str_byte_at(source, pos)
+          if nc == '='
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_EQ
+          end
+          if nc == '>'
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_FAT_ARROW
+          end
+          if nc == '~'
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_MATCH_OP
+            if pos < len
+              var nnc = str_byte_at(source, pos)
+              if nnc == '?'
+                pos += 1
+                col += 1
+                tt = token_constants::TOK_MATCH_CAPTURE
+              end
+            end
+          end
+        end
+      end
+      
+      if c == '!'
+        tt = token_constants::TOK_BANG
+        if pos < len
+          var nc = str_byte_at(source, pos)
+          if nc == '='
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_NE
+          end
+          if nc == '~'
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_NOMATCH_OP
+          end
+        end
+      end
+      
+      if c == '<'
+        tt = token_constants::TOK_LT
+        if pos < len
+          var nc = str_byte_at(source, pos)
+          if nc == '='
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_LE
+          elsif nc == '<'
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_LSHIFT
+            if pos < len and str_byte_at(source, pos) == '='
+              pos += 1
+              col += 1
+              tt = token_constants::TOK_SHL_EQ
+            end
+          end
+        end
+      end
+
+      if c == '>'
+        tt = token_constants::TOK_GT
+        if pos < len
+          var nc = str_byte_at(source, pos)
+          if nc == '='
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_GE
+          elsif nc == '>'
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_RSHIFT
+            if pos < len and str_byte_at(source, pos) == '='
+              pos += 1
+              col += 1
+              tt = token_constants::TOK_SHR_EQ
+            end
+          end
+        end
+      end
+      
+      if c == '&'
+        tt = token_constants::TOK_AMP
+        if pos < len
+          var nc_amp = str_byte_at(source, pos)
+          if nc_amp == '&'
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_AND
+          elsif nc_amp == '='
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_AMP_EQ
+          end
+        end
+      end
+      
+      if c == '|'
+        tt = token_constants::TOK_PIPE
+        if pos < len
+          var nc = str_byte_at(source, pos)
+          if nc == '|'
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_OR
+          elsif nc == '>'
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_PIPE_GT
+          elsif nc == '='
+            pos += 1
+            col += 1
+            tt = token_constants::TOK_PIPE_EQ
+          end
+        end
+      end
+      
+      if c == '"'
+        # Check for triple-quoted string """..."""
+        if pos + 1 < len and str_byte_at(source, pos) == '"' and str_byte_at(source, pos + 1) == '"'
+          # Skip the two extra opening quotes
+          pos += 2
+          col += 2
+          # Skip leading newline if present
+          if pos < len and str_byte_at(source, pos) == '\n'
+            pos += 1
+            line += 1
+            col = 1
+          elsif pos + 1 < len and str_byte_at(source, pos) == '\r' and str_byte_at(source, pos + 1) == '\n'
+            pos += 2
+            line += 1
+            col = 1
+          end
+          var content_start = pos
+          var save_pos = pos
+          var save_line = line
+          var save_col = col
+          var has_interp = 0
+          var found_end = 0
+          while pos + 2 <= len and found_end == 0
+            var tc = str_byte_at(source, pos)
+            if tc == '"' and str_byte_at(source, pos + 1) == '"' and str_byte_at(source, pos + 2) == '"'
+              found_end = 1
+            else
+              if tc == '\\' and pos + 1 < len
+                # Backslash escape — skip next char (prevents \# from triggering interp)
+                col += 1
+                pos += 1
+                var esc_c = str_byte_at(source, pos)
+                if esc_c == '\n'
+                  line += 1
+                  col = 1
+                else
+                  col += 1
+                end
+                pos += 1
+              else
+                if tc == '#' and pos + 1 < len and str_byte_at(source, pos + 1) == '{'
+                  has_interp = 1
+                end
+                if tc == '\n'
+                  line += 1
+                  col = 1
+                else
+                  col += 1
+                end
+                pos += 1
+              end
+            end
+          end
+          var content_end = pos
+          var closing_pos = pos
+          var closing_line = line
+          var closing_col = col
+          # Detect closing """ indentation level for indent stripping
+          var indent_level = 0
+          if found_end == 1 and content_end > content_start
+            var scan_back = content_end - 1
+            var all_spaces = 1
+            while scan_back >= content_start
+              var bc = str_byte_at(source, scan_back)
+              if bc == '\n'
+                # Found newline — indent is distance from newline to closing """
+                indent_level = content_end - scan_back - 1
+                scan_back = content_start - 1
+              elsif bc == ' '
+                scan_back -= 1
+              else
+                all_spaces = 0
+                scan_back = content_start - 1
+              end
+            end
+            if all_spaces == 0
+              indent_level = 0
+            end
+            # Remove trailing whitespace-only line before closing """
+            if indent_level > 0
+              content_end = content_end - indent_level - 1
+              # Also strip \r before \n (CRLF line endings)
+              if content_end > content_start and str_byte_at(source, content_end - 1) == '\r'
+                content_end -= 1
+              end
+            end
+          end
+          # Strip trailing newline (for non-indent case, or final content newline)
+          if content_end > content_start and str_byte_at(source, content_end - 1) == '\n'
+            content_end -= 1
+            if content_end > content_start and str_byte_at(source, content_end - 1) == '\r'
+              content_end -= 1
+            end
+          end
+          if has_interp == 0
+            # No interpolation — emit plain TOK_STRING (existing path)
+            var ml_content = str_byte_slice(source, content_start, content_end)
+            if indent_level > 0
+              ml_content = lex_strip_indent(ml_content, indent_level)
+            end
+            ml_content = lex_unescape_string("\"#{ml_content}\"")
+            if found_end == 1
+              pos += 3
+              col += 3
+            end
+            types.push(token_constants::TOK_STRING)
+            lexemes.push(intern_id(interner, ml_content))
+            lines.push(start_line)
+            cols.push(start_col)
+            byte_starts.push(start)
+            byte_ends.push(pos)
+            tt = 0 - 2
+          else
+            # Interpolation found — two-pass split token emission
+            var effective_end = content_end
+
+            # Reset pos/line/col for pass 2
+            pos = save_pos
+            line = save_line
+            col = save_col
+
+            # Emit STRING_START
+            types.push(token_constants::TOK_STRING_START)
+            lexemes.push(intern_id(interner, "\"\"\""))
+            lines.push(start_line)
+            cols.push(start_col)
+            byte_starts.push(start)
+            byte_ends.push(start + 3)
+
+            # Pass 2: scan content with inline indent stripping
+            var ml_buf = sb_new()
+            var ml_buf_len = 0
+            var ml_part_line = line
+            var ml_part_col = col
+            var ml_part_byte = pos
+            var at_sol = 1
+            var ml_done = 0
+
+            while pos < effective_end and ml_done == 0
+              # Indent stripping at start of line
+              if at_sol == 1
+                var indent_skipped = 0
+                while pos < effective_end and indent_skipped < indent_level and str_byte_at(source, pos) == ' '
+                  indent_skipped += 1
+                  pos += 1
+                  col += 1
+                end
+                at_sol = 0
+              end
+              if pos >= effective_end
+                break
+              end
+              var sc = str_byte_at(source, pos)
+              if sc == '#' and pos + 1 < effective_end and str_byte_at(source, pos + 1) == '{'
+                # Interpolation — emit STRING_PART + INTERP_START
+                if ml_buf_len > 0
+                  var part_raw = sb_to_string(ml_buf)
+                  var part_text = lex_unescape_string("\"" + part_raw + "\"")
+                  types.push(token_constants::TOK_STRING_PART)
+                  lexemes.push(intern_id(interner, part_text))
+                  lines.push(ml_part_line)
+                  cols.push(ml_part_col)
+                  byte_starts.push(ml_part_byte)
+                  byte_ends.push(pos)
+                end
+                sb_free(ml_buf)
+                types.push(token_constants::TOK_INTERP_START)
+                lexemes.push(intern_id(interner, "\#{"))
+                lines.push(line)
+                cols.push(col)
+                byte_starts.push(pos)
+                byte_ends.push(pos + 2)
+                pos += 2
+                col += 2
+                interp_stack.push(0)
+                interp_triple.push(1)
+                interp_indent.push(indent_level)
+                ml_done = 1
+              elsif sc == '\\'
+                sb_append_byte(ml_buf, sc)
+                ml_buf_len += 1
+                pos += 1
+                col += 1
+                if pos < effective_end
+                  var esc_c = str_byte_at(source, pos)
+                  sb_append_byte(ml_buf, esc_c)
+                  ml_buf_len += 1
+                  pos += 1
+                  if esc_c == '\n'
+                    line += 1
+                    col = 1
+                    at_sol = 1
+                  else
+                    col += 1
+                  end
+                end
+              elsif sc == '\n'
+                sb_append_byte(ml_buf, sc)
+                ml_buf_len += 1
+                pos += 1
+                line += 1
+                col = 1
+                at_sol = 1
+              else
+                if sc >= 0x80
+                  sb_append_byte(ml_buf, sc)
+                else
+                  sb_append_char(ml_buf, sc)
+                end
+                ml_buf_len += 1
+                pos += 1
+                col += 1
+              end
+            end
+
+            if ml_done == 0
+              # Reached effective_end without hitting #{  — emit remaining + STRING_END
+              if ml_buf_len > 0
+                var part_raw = sb_to_string(ml_buf)
+                var part_text = lex_unescape_string("\"" + part_raw + "\"")
+                types.push(token_constants::TOK_STRING_PART)
+                lexemes.push(intern_id(interner, part_text))
+                lines.push(ml_part_line)
+                cols.push(ml_part_col)
+                byte_starts.push(ml_part_byte)
+                byte_ends.push(pos)
+              end
+              sb_free(ml_buf)
+              types.push(token_constants::TOK_STRING_END)
+              lexemes.push(intern_id(interner, "\"\"\""))
+              lines.push(closing_line)
+              cols.push(closing_col)
+              byte_starts.push(closing_pos)
+              byte_ends.push(closing_pos + 3)
+              if found_end == 1
+                pos = closing_pos + 3
+                line = closing_line
+                col = closing_col + 3
+              end
+            end
+
+            tt = 0 - 2
+          end
+        else
+          # Normal string handling — single-pass scan with mode stack.
+          # Non-interpolated strings emit TOK_STRING (unchanged behavior).
+          # Interpolated strings emit split tokens: STRING_START, STRING_PART,
+          # INTERP_START, [expr tokens], INTERP_END, ..., STRING_END.
+          var str_buf = sb_new()
+          var str_buf_len = 0
+          var found_interp = 0
+          var str_done = 0
+          while pos < len and str_done == 0
+            var sc = str_byte_at(source, pos)
+            if sc == '"'
+              # Closing quote — string complete
+              pos += 1
+              col += 1
+              str_done = 1
+            elsif sc == '\\'
+              # Escape sequence — keep raw bytes for lex_unescape_string
+              sb_append_byte(str_buf, sc)
+              str_buf_len += 1
+              pos += 1
+              col += 1
+              if pos < len
+                var esc_c = str_byte_at(source, pos)
+                sb_append_byte(str_buf, esc_c)
+                str_buf_len += 1
+                pos += 1
+                if esc_c == '\n'
+                  line += 1
+                  col = 1
+                else
+                  col += 1
+                end
+              end
+            elsif sc == '#' and pos + 1 < len and str_byte_at(source, pos + 1) == '{'
+              # First interpolation found — switch to split token mode
+              found_interp = 1
+              str_done = 1
+            else
+              # Use sb_append_byte for high bytes (>= 0x80) to preserve raw UTF-8
+              # sb_append_char treats values as codepoints and re-encodes to UTF-8
+              if sc >= 0x80
+                sb_append_byte(str_buf, sc)
+              else
+                sb_append_char(str_buf, sc)
+              end
+              str_buf_len += 1
+              pos += 1
+              if sc == '\n'
+                line += 1
+                col = 1
+              else
+                col += 1
+              end
+            end
+          end
+
+          if found_interp == 0
+            # No interpolation — emit plain TOK_STRING (unchanged behavior)
+            var plain_raw = sb_to_string(str_buf)
+            sb_free(str_buf)
+            var plain_text = lex_unescape_string("\"" + plain_raw + "\"")
+            types.push(token_constants::TOK_STRING)
+            lexemes.push(intern_id(interner, plain_text))
+            lines.push(start_line)
+            cols.push(start_col)
+            byte_starts.push(start)
+            byte_ends.push(pos)
+            tt = 0 - 2
+          else
+            # Interpolation found — emit split tokens
+            # STRING_START for the opening "
+            types.push(token_constants::TOK_STRING_START)
+            lexemes.push(intern_id(interner, "\""))
+            lines.push(start_line)
+            cols.push(start_col)
+            byte_starts.push(start)
+            byte_ends.push(start + 1)
+
+            # STRING_PART for content before first #{
+            if str_buf_len > 0
+              var part_raw = sb_to_string(str_buf)
+              var part_text = lex_unescape_string("\"" + part_raw + "\"")
+              types.push(token_constants::TOK_STRING_PART)
+              lexemes.push(intern_id(interner, part_text))
+              lines.push(start_line)
+              cols.push(start_col + 1)
+              byte_starts.push(start + 1)
+              byte_ends.push(pos)
+            end
+            sb_free(str_buf)
+
+            # INTERP_START for the #{
+            types.push(token_constants::TOK_INTERP_START)
+            lexemes.push(intern_id(interner, "\#{"))
+            lines.push(line)
+            cols.push(col)
+            byte_starts.push(pos)
+            byte_ends.push(pos + 2)
+            pos += 2
+            col += 2
+            interp_stack.push(0)
+            interp_triple.push(0)
+            interp_indent.push(0)
+            tt = 0 - 2
+          end
+        end
+      end
+      
+      # Char literal: 'a' or '\n' — single character in single quotes
+      if c == '\''
+        if pos < len
+          var ch = str_byte_at(source, pos)
+          if ch == '\\'  # backslash escape
+            if pos + 2 < len
+              var esc = str_byte_at(source, pos + 1)
+              if str_byte_at(source, pos + 2) == '\''  # closing quote
+                pos += 3
+                col += 3
+                tt = token_constants::TOK_CHAR
+              end
+            end
+          elsif pos + 1 <= len
+            if str_byte_at(source, pos + 1) == '\''  # closing quote after single char
+              pos += 2
+              col += 2
+              tt = token_constants::TOK_CHAR
+            end
+          end
+        end
+      end
+      if tt == -1
+        if c >= '0'
+          if c <= '9'
+            # Check for hex literal: 0x... or binary literal: 0b...
+            var is_hex = 0
+            if c == '0'
+              if pos < len
+                var nx = str_byte_at(source, pos)
+                if nx == 'x' or nx == 'X'
+                  is_hex = 1
+                  pos += 1
+                  col += 1
+                  # Parse hex digits (0-9, a-f, A-F) and underscores
+                  while pos < len
+                    var hc = str_byte_at(source, pos)
+                    if (hc >= '0' and hc <= '9') or (hc >= 'a' and hc <= 'f') or (hc >= 'A' and hc <= 'F') or hc == '_'
+                      pos += 1
+                      col += 1
+                    else
+                      break
+                    end
+                  end
+                  tt = token_constants::TOK_INT
+                end
+                if nx == 'b' or nx == 'B'
+                  is_hex = 1
+                  pos += 1
+                  col += 1
+                  # Parse binary digits (0, 1) and underscores
+                  while pos < len
+                    var bc = str_byte_at(source, pos)
+                    if bc == '0' or bc == '1' or bc == '_'
+                      pos += 1
+                      col += 1
+                    else
+                      break
+                    end
+                  end
+                  tt = token_constants::TOK_INT
+                end
+                if nx == 'o' or nx == 'O'
+                  is_hex = 1
+                  pos += 1
+                  col += 1
+                  # Parse octal digits (0-7) and underscores
+                  while pos < len
+                    var oc = str_byte_at(source, pos)
+                    if (oc >= '0' and oc <= '7') or oc == '_'
+                      pos += 1
+                      col += 1
+                    else
+                      break
+                    end
+                  end
+                  tt = token_constants::TOK_INT
+                end
+              end
+            end
+            if is_hex == 0
+            while pos < len
+              var dc = str_byte_at(source, pos)
+              if (dc >= '0' and dc <= '9') or dc == '_'
+                pos += 1
+                col += 1
+              else
+                break
+              end
+            end
+            # Check for type suffix after digits (e.g., 42_u8, 100_i16)
+            if pos < len
+              var sc = str_byte_at(source, pos)
+              if sc == 'u' or sc == 'i'
+                var sf_start = pos
+                var sf_end = pos + 1
+                while sf_end < len
+                  var sd = str_byte_at(source, sf_end)
+                  if sd >= '0' and sd <= '9'
+                    sf_end += 1
+                  else
+                    break
+                  end
+                end
+                var sf = str_byte_slice(source, sf_start, sf_end)
+                if sf == "u8" or sf == "i8" or sf == "u16" or sf == "i16" or sf == "u32" or sf == "i32" or sf == "u64" or sf == "i64"
+                  col += sf_end - sf_start
+                  pos = sf_end
+                end
+              end
+            end
+            var is_float = 0
+            # Check for decimal point followed by digit
+            if pos < len
+              var dot_c = str_byte_at(source, pos)
+              if dot_c == '.'
+                # '.' found — check next char is a digit (not '..' range)
+                if pos + 1 < len
+                  var after_dot = str_byte_at(source, pos + 1)
+                  if after_dot >= '0'
+                    if after_dot <= '9'
+                      is_float = 1
+                      pos += 1
+                      col += 1
+                      # Consume fractional digits
+                      while pos < len
+                        var fc = str_byte_at(source, pos)
+                        if fc >= '0' and fc <= '9'
+                          pos += 1
+                          col += 1
+                        else
+                          break
+                        end
+                      end
+                    end
+                  end
+                end
+              end
+            end
+            # Check for exponent (e/E) — valid for both int-like 1e5 and float 1.5e3
+            if pos < len
+              var exp_c = str_byte_at(source, pos)
+              if exp_c == 'e' or exp_c == 'E'
+                is_float = 1
+                pos += 1
+                col += 1
+                # Optional sign
+                if pos < len
+                  var sign_c = str_byte_at(source, pos)
+                  if sign_c == '+' or sign_c == '-'
+                    pos += 1
+                    col += 1
+                  end
+                end
+                # Exponent digits
+                while pos < len
+                  var ec = str_byte_at(source, pos)
+                  if ec >= '0' and ec <= '9'
+                    pos += 1
+                    col += 1
+                  else
+                    break
+                  end
+                end
+              end
+            end
+            if is_float == 1
+              tt = token_constants::TOK_FLOAT_LIT
+            else
+              tt = token_constants::TOK_INT
+            end
+            end
+          end
+        end
+      end
+      
+      # $ for macro calls like $try(), $unwrap(), $assert(), $debug()
+      if tt == -1
+        if c == '$'
+          tt = token_constants::TOK_DOLLAR
+        end
+      end
+      
+      if tt == -1
+        var is_id_start = 0
+        if c >= 'A'
+          if c <= 'Z'
+            is_id_start = 1
+          end
+        end
+        if c >= 'a'
+          if c <= 'z'
+            is_id_start = 1
+          end
+        end
+        if c == '_'
+          is_id_start = 1
+        end
+        
+        if is_id_start == 1
+          while pos < len
+            var ic = str_byte_at(source, pos)
+            var is_idc = 0
+            if ic >= 'A'
+              if ic <= 'Z'
+                is_idc = 1
+              end
+            end
+            if ic >= 'a'
+              if ic <= 'z'
+                is_idc = 1
+              end
+            end
+            if ic >= '0'
+              if ic <= '9'
+                is_idc = 1
+              end
+            end
+            if ic == '_'
+              is_idc = 1
+            end
+            break if is_idc == 0
+            pos += 1
+            col += 1
+          end
+          
+          # v5.12.27: Allow trailing ? or ! for predicate/mutating method names
+          # Examples: empty?, valid?, push!, clear!
+          # Only ONE trailing suffix allowed, and it must be at the very end.
+          # ? is now allowed since postfix ? operator was replaced by $try() macro.
+          # v5.26+: Don't absorb ? for uppercase identifiers (Type?) — reserved for
+          # optional type shorthand (Int? → Option<Int>).
+          if pos < len
+            var final_c = str_byte_at(source, pos)
+            if final_c == '?'
+              # Only absorb ? for lowercase identifiers (method names like empty?)
+              # NOT for uppercase (type names like Int? → Option<Int> sugar)
+              var first_char = str_byte_at(source, start)
+              if first_char >= 'a' and first_char <= 'z'
+                # Don't consume ? if followed by . (that's the ?. safe-nav operator)
+                var after_q = 0
+                if pos + 1 < len
+                  after_q = str_byte_at(source, pos + 1)
+                end
+                if after_q != '.'
+                  pos += 1
+                  col += 1
+                end
+              end
+            end
+            # v5.28: ! suffix no longer consumed into identifiers.
+            # ! is reserved as the postfix force-unwrap operator (opt!).
+            # Mutating method naming convention (push!, clear!) is retired.
+          end
+          
+          var text = str_byte_slice(source, start, pos)
+          tt = match text
+            "def" => token_constants::TOK_DEF
+            "do" => token_constants::TOK_DO
+            "end" => token_constants::TOK_END
+            "if" => token_constants::TOK_IF
+            "else" => token_constants::TOK_ELSE
+            "elsif" => token_constants::TOK_ELSIF
+            "unless" => token_constants::TOK_UNLESS
+            "while" => token_constants::TOK_WHILE
+            "return" => token_constants::TOK_RETURN
+            "and" => token_constants::TOK_AND
+            "or" => token_constants::TOK_OR
+            "true" => token_constants::TOK_TRUE
+            "false" => token_constants::TOK_FALSE
+            "nil" => token_constants::TOK_NIL
+            "let" => token_constants::TOK_LET
+            "var" => token_constants::TOK_VAR
+            "const" => token_constants::TOK_CONST
+            "not" => token_constants::TOK_NOT
+            "break" => token_constants::TOK_BREAK
+            "continue" => token_constants::TOK_CONTINUE
+            "defer" => token_constants::TOK_DEFER
+            "for" => token_constants::TOK_FOR
+            "in" => token_constants::TOK_IN
+            "struct" => token_constants::TOK_STRUCT
+            "enum" => token_constants::TOK_ENUM
+            "match" => token_constants::TOK_MATCH
+            "when" => token_constants::TOK_WHEN
+            "then" => token_constants::TOK_THEN
+            "import" => token_constants::TOK_IMPORT
+            "from" => token_constants::TOK_FROM
+            "as" => token_constants::TOK_AS
+            "private" => token_constants::TOK_PRIVATE
+            "public" => token_constants::TOK_PUBLIC
+            "trait" => token_constants::TOK_TRAIT
+            "impl" => token_constants::TOK_IMPL
+            "extend" => token_constants::TOK_EXTEND
+            "where" => token_constants::TOK_WHERE
+            "extern" => token_constants::TOK_EXTERN
+            "await" => token_constants::TOK_AWAIT
+            "select" => token_constants::TOK_SELECT
+            "task_group" => token_constants::TOK_TASK_GROUP
+            "loop" => token_constants::TOK_LOOP
+            "try" => token_constants::TOK_TRY
+            "catch" => token_constants::TOK_CATCH
+            "type" => token_constants::TOK_TYPE
+            "newtype" => token_constants::TOK_NEWTYPE
+            # NOTE: "default" is now a contextual keyword, lexed as TOK_IDENT.
+            # The parser checks for ident "default" in select arms.
+
+            "actor" => token_constants::TOK_ACTOR
+            "macro" => token_constants::TOK_MACRO
+            "quote" => token_constants::TOK_QUOTE
+            "unquote" => token_constants::TOK_UNQUOTE
+            "unquote_each" => token_constants::TOK_UNQUOTE_EACH
+            "arena" => token_constants::TOK_ARENA
+            "cimport" => token_constants::TOK_CIMPORT
+            "yield" => token_constants::TOK_YIELD
+            "async" => token_constants::TOK_ASYNC
+            "go" => token_constants::TOK_GO
+            "is" => token_constants::TOK_IS
+            "can" => token_constants::TOK_CAN
+            "effect" => token_constants::TOK_EFFECT
+            "with" => token_constants::TOK_WITH
+            "without" => token_constants::TOK_WITHOUT
+            "reify" => token_constants::TOK_REIFY
+            # TOK_HANDLE, TOK_THROW, TOK_RESUME are reserved as token constants
+            # but NOT wired as keywords yet. Milestone A only parses the
+            # surface syntax that uses the first five new keywords. Wiring
+            # `throw`/`resume` requires letting them appear as method names
+            # inside `effect` bodies (`def throw(e: E): !`), which is a
+            # larger change deferred to the milestone that lowers operation
+            # bodies. `handle` is deferred for the same reason plus ~45
+            # identifier collision sites. See ROADMAP.
+            _ => token_constants::TOK_IDENT
+          end
+
+          # Raw string literal: r"..." — no escape processing
+          if text == "r"
+            if pos < len
+              if str_byte_at(source, pos) == '"'
+                pos += 1
+                col += 1
+                start = pos
+                var raw_done = 0
+                while pos < len and raw_done == 0
+                  if str_byte_at(source, pos) == '"'
+                    raw_done = 1
+                  else
+                    pos += 1
+                    col += 1
+                  end
+                end
+                # pos now points to closing quote
+                var raw_end = pos
+                if raw_done == 1
+                  pos += 1
+                  col += 1
+                end
+                # Push directly and skip normal lexeme extraction
+                types.push(token_constants::TOK_STRING)
+                lexemes.push(intern_id(interner, str_byte_slice(source, start, raw_end)))
+                lines.push(start_line)
+                cols.push(start_col)
+                byte_starts.push(start)
+                byte_ends.push(raw_end)
+                tt = 0 - 2
+              end
+            end
+          end
+        end
+      end
+      
+      if tt == -1
+        tt = token_constants::TOK_ERROR
+      end
+      
+      if tt >= 0
+        var lexeme = str_byte_slice(source, start, pos)
+        if str_byte_len(error_lexeme) > 0
+          lexeme = error_lexeme
+        end
+        # Process escape sequences for string literals
+        if tt == token_constants::TOK_STRING
+          lexeme = lex_unescape_string(lexeme)
+        end
+        # Strip ~r"..." wrapper from regex literals to extract just the pattern
+        if tt == token_constants::TOK_REGEX
+          lexeme = str_byte_slice(source, start + 3, pos - 1)
+        end
+        types.push(tt)
+        lexemes.push(intern_id(interner, lexeme))
+        lines.push(start_line)
+        cols.push(start_col)
+        byte_starts.push(start)
+        byte_ends.push(pos)
+      end
+    end
+  end
+
+  if types.size == 0
+    types.push(token_constants::TOK_EOF)
+    lexemes.push(intern_id(interner, ""))
+    lines.push(1)
+    cols.push(1)
+    byte_starts.push(len)
+    byte_ends.push(len)
+  else
+    if types[types.size - 1] != token_constants::TOK_EOF
+      types.push(token_constants::TOK_EOF)
+      lexemes.push(intern_id(interner, ""))
+      lines.push(line)
+      cols.push(col)
+      byte_starts.push(len)
+      byte_ends.push(len)
+    end
+  end
+
+  return LexerResult { types: types, lexemes: lexemes, lines: lines, cols: cols, byte_starts: byte_starts, byte_ends: byte_ends, interner: interner }
+end
+
+## Extend LexerResult with method-call syntax.
+##
+## Dogfooding: validates extend block compilation through the C bootstrap.
+## Converts free function accessors to methods: result.get_types(), etc.
+##
+## @since Phase 0 dogfooding
+extend LexerResult
+  ## Extracts the token types vector.
+  ## @returns Vector of token type integers
+  def get_types(): Vec<Int> = self.types
+
+  ## Extracts the lexemes vector (interned IDs).
+  ## @returns Vector of intern IDs (resolve via interner)
+  def get_lexemes(): Vec<Int> = self.lexemes
+
+  ## Extracts the line numbers vector.
+  ## @returns Vector of line numbers (1-based integers)
+  def get_lines(): Vec<Int> = self.lines
+
+  ## Extracts the column numbers vector.
+  ## @returns Vector of column numbers (1-based integers)
+  def get_cols(): Vec<Int> = self.cols
+
+  ## Extracts the per-token start byte offsets vector.
+  ## Each entry is the 0-based byte offset into the original source where the
+  ## token's span begins. Half-open with get_byte_ends: [start, end).
+  ## @returns Vector of start byte offsets
+  def get_byte_starts(): Vec<Int> = self.byte_starts
+
+  ## Extracts the per-token end byte offsets vector.
+  ## Each entry is the 0-based byte offset into the original source one past the
+  ## end of the token's span. Half-open with get_byte_starts: [start, end).
+  ## @returns Vector of end byte offsets
+  def get_byte_ends(): Vec<Int> = self.byte_ends
+
+  ## Returns the total number of tokens.
+  ## @returns Number of tokens (including EOF)
+  def token_count(): Int = self.types.size
+
+  ## Returns the string interner.
+  ## @returns StringInterner used during lexing
+  def get_interner(): StringInterner = self.interner
+end
+
+## Parse an integer literal lexeme into its value.
+##
+## Handles hex (`0x`), binary (`0b`), octal (`0o`) prefixes, underscore digit
+## separators, and a trailing type suffix (decimal path stops at the first
+## non-digit). A pure lexeme utility — no grammar or `ParserState` dependency.
+## Relocated here from the deleted `parser.qz` during the CST cutover (Phase B.2).
+def ps_parse_int_value(lex: String): Int
+  var value = 0
+  var is_hex_lit = 0
+  if str_byte_len(lex) > 2
+    if str_byte_at(lex, 0) == '0'
+      var x_char = str_byte_at(lex, 1)
+      if x_char == 'x' or x_char == 'X'
+        is_hex_lit = 1
+        # Parse hex digits after "0x", skip underscores
+        var hi = 2
+        while hi < str_byte_len(lex)
+          var hc = str_byte_at(lex, hi)
+          if hc == '_'
+            hi += 1
+          else
+            value *= 16
+            if hc >= '0' and hc <= '9'
+              value += hc - '0'
+            else
+              if hc >= 'a' and hc <= 'f'
+                value += hc - 'a' + 10
+              else
+                if hc >= 'A' and hc <= 'F'
+                  value += hc - 'A' + 10
+                end
+              end
+            end
+            hi += 1
+          end
+        end
+      end
+      if x_char == 'b' or x_char == 'B'
+        is_hex_lit = 1
+        # Parse binary digits after "0b", skip underscores
+        var bi = 2
+        while bi < str_byte_len(lex)
+          var bc = str_byte_at(lex, bi)
+          if bc == '_'
+            bi += 1
+          else
+            value *= 2
+            if bc == '1'
+              value += 1
+            end
+            bi += 1
+          end
+        end
+      end
+      if x_char == 'o' or x_char == 'O'
+        is_hex_lit = 1
+        # Parse octal digits after "0o", skip underscores
+        var oi = 2
+        while oi < str_byte_len(lex)
+          var oc = str_byte_at(lex, oi)
+          if oc == '_'
+            oi += 1
+          else
+            value *= 8
+            if oc >= '0' and oc <= '7'
+              value += oc - '0'
+            end
+            oi += 1
+          end
+        end
+      end
+    end
+  end
+  if is_hex_lit == 0
+    # Parse decimal digits, skip underscores, stop at type suffix
+    var di = 0
+    while di < str_byte_len(lex)
+      var dc = str_byte_at(lex, di)
+      if dc >= '0' and dc <= '9'
+        value = value * 10 + dc - '0'
+        di += 1
+      else
+        if dc == '_'
+          di += 1
+        else
+          break
+        end
+      end
+    end
+  end
+  return value
+end
+
+

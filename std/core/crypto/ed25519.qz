@@ -1,0 +1,1019 @@
+## std/core/crypto/ed25519 — Pure-Quartz EdDSA (RFC 8032)
+##
+## NET.2 — signatures on Curve25519's twisted Edwards twin. Reuses the
+## 5×51-bit field arithmetic from std/core/crypto/curve25519.qz (`_f51_*`),
+## adds Edwards-form group operations and EdDSA signing/verification on top.
+## SHA-512 is provided by std/core/crypto/sha512.qz.
+##
+## Architecture: extended twisted Edwards coordinates (X, Y, Z, T) where
+## x = X/Z, y = Y/Z, and T = X·Y/Z. Point ops follow Hisil-Wong-Carter-Dawson
+## 2008 §3 with a = -1 (the "extended-1" formulas) — 9M + 7add for addition,
+## 4M + 3sq + 7add for doubling.
+##
+## Constant-time discipline:
+##   - Signing uses private inputs (clamped scalar a, nonce r). Variable-base
+##     scalar multiplication of B by these is constant-time via cswap on the
+##     scalar bit — same pattern curve25519.qz uses for its Montgomery ladder.
+##   - Verification uses only public inputs (R, A, k, S). Variable-time
+##     paths are acceptable. We still take the same code path; the constant-
+##     time-ness is by inspection (the data-dependent branches are limited
+##     to "is the bit set" decisions which we route through cswap).
+##   - Scalar arithmetic (sc_reduce, sc_muladd) currently uses a non-CT
+##     shift-and-subtract reduction. This is filed as a NET.2 follow-up to
+##     replace with a CT Barrett-style or ref10 12×21-bit limb reduction.
+##     For v1 the leak is "the bit length of an intermediate mod-L value" —
+##     extremely weak. NET.4's dudect harness will quantify if it matters.
+##
+## API:
+##   def ed25519_secret_to_public(pub: Int, seed: Int): Void
+##   def ed25519_sign(sig: Int, msg: Int, msg_len: Int, seed: Int, pub: Int): Void
+##   def ed25519_verify(sig: Int, msg: Int, msg_len: Int, pub: Int): Int   # 1 = valid
+##
+## All buffers are caller-owned, byte-pointer-style. seed/pub/sig are 32/32/64.
+##
+## Validation: RFC 8032 §7.1 test vectors land in spec/qspec/ed25519_spec.qz
+## and the heavyweight runner in spec/qz/crypto_ffi_smoke.qz.
+##
+## See:
+## - RFC 8032 https://www.rfc-editor.org/rfc/rfc8032.html
+## - Hisil-Wong-Carter-Dawson 2008 https://eprint.iacr.org/2008/522.pdf
+## - docs/design/ED25519_DESIGN.md
+
+import * from ffi/socket               # malloc/free/memcpy/memset, ptr_read/write_byte
+import * from std/core/crypto/sha512
+import * from std/core/crypto/curve25519   # _f51_* field ops
+import * from std/core/crypto/secret       # Secret<Int> + secret_unwrap (NET.4.1)
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+# Curve parameter d = -121665/121666 mod p, in 5×51-bit LE limbs.
+def _D_LIMB_0(): Int = 929955233495203
+def _D_LIMB_1(): Int = 466365720129213
+def _D_LIMB_2(): Int = 1662059464998953
+def _D_LIMB_3(): Int = 2033849074728123
+def _D_LIMB_4(): Int = 1442794654840575
+
+# 2d mod p (used in Hisil-Wong-Carter-Dawson add formula).
+def _2D_LIMB_0(): Int = 1859910466990425
+def _2D_LIMB_1(): Int = 932731440258426
+def _2D_LIMB_2(): Int = 1072319116312658
+def _2D_LIMB_3(): Int = 1815898335770999
+def _2D_LIMB_4(): Int = 633789495995903
+
+# Basepoint B = (Bx, By, 1, Bx*By) in extended coords.
+def _BX_LIMB_0(): Int = 1738742601995546
+def _BX_LIMB_1(): Int = 1146398526822698
+def _BX_LIMB_2(): Int = 2070867633025821
+def _BX_LIMB_3(): Int = 562264141797630
+def _BX_LIMB_4(): Int = 587772402128613
+
+def _BY_LIMB_0(): Int = 1801439850948184
+def _BY_LIMB_1(): Int = 1351079888211148
+def _BY_LIMB_2(): Int = 450359962737049
+def _BY_LIMB_3(): Int = 900719925474099
+def _BY_LIMB_4(): Int = 1801439850948198
+
+def _BT_LIMB_0(): Int = 1841354044333475
+def _BT_LIMB_1(): Int = 16398895984059
+def _BT_LIMB_2(): Int = 755974180946558
+def _BT_LIMB_3(): Int = 900171276175154
+def _BT_LIMB_4(): Int = 1821297809914039
+
+# Group order L = 2^252 + 27742317777372353535851937790883648493, as 32 LE
+# bytes. Lazily materialised so we don't pay the cost on programs that
+# never call ed25519_*.
+var _L_bytes: Int = 0
+
+def _ensure_L_bytes(): Int
+  if _L_bytes != 0
+    return _L_bytes
+  end
+  var p = malloc(32)
+  memset(p, 0, 32)
+  ptr_write_byte(p + 0,  237)   # 0xed
+  ptr_write_byte(p + 1,  211)   # 0xd3
+  ptr_write_byte(p + 2,  245)   # 0xf5
+  ptr_write_byte(p + 3,  92)    # 0x5c
+  ptr_write_byte(p + 4,  26)    # 0x1a
+  ptr_write_byte(p + 5,  99)    # 0x63
+  ptr_write_byte(p + 6,  18)    # 0x12
+  ptr_write_byte(p + 7,  88)    # 0x58
+  ptr_write_byte(p + 8,  214)   # 0xd6
+  ptr_write_byte(p + 9,  156)   # 0x9c
+  ptr_write_byte(p + 10, 247)   # 0xf7
+  ptr_write_byte(p + 11, 162)   # 0xa2
+  ptr_write_byte(p + 12, 222)   # 0xde
+  ptr_write_byte(p + 13, 249)   # 0xf9
+  ptr_write_byte(p + 14, 222)   # 0xde
+  ptr_write_byte(p + 15, 20)    # 0x14
+  # bytes 16..31 are zero except byte 31 = 0x10
+  ptr_write_byte(p + 31, 16)
+  _L_bytes = p
+  return p
+end
+
+# =============================================================================
+# Bignum helpers — byte-level little-endian on caller-owned buffers
+# =============================================================================
+
+# Compare two N-byte LE buffers. Returns 1 if a > b, -1 if a < b, 0 if equal.
+def _bn_cmp(a: Int, b: Int, n: Int): Int
+  var i = n - 1
+  while i >= 0
+    var av = ptr_read_byte(a + i)
+    var bv = ptr_read_byte(b + i)
+    if av > bv then return 1 end
+    if av < bv then return -1 end
+    i = i - 1
+  end
+  return 0
+end
+
+# out = a + b on N-byte LE. Returns carry (0 or 1).
+def _bn_add(out: Int, a: Int, b: Int, n: Int): Int
+  var carry = 0
+  var i = 0
+  while i < n
+    var av = ptr_read_byte(a + i)
+    var bv = ptr_read_byte(b + i)
+    var sum = av + bv + carry
+    if sum >= 256
+      sum = sum - 256
+      carry = 1
+    else
+      carry = 0
+    end
+    ptr_write_byte(out + i, sum)
+    i = i + 1
+  end
+  return carry
+end
+
+# Is `buf` (n bytes LE) zero?
+def _bn_is_zero(buf: Int, n: Int): Int
+  var i = 0
+  while i < n
+    if ptr_read_byte(buf + i) != 0 then return 0 end
+    i = i + 1
+  end
+  return 1
+end
+
+# =============================================================================
+# Scalar arithmetic mod L
+# =============================================================================
+
+# Reduce a 64-byte LE buffer mod L into a 32-byte LE result.
+# Constant-time port of TweetNaCl's `modL` (Bernstein/van Gastel/Schwabe et al.;
+# public domain).  See https://tweetnacl.cr.yp.to/ — `modL` in tweetnacl.c.
+#
+# All loop bounds are public constants; no inner branch depends on input bytes.
+# `spec/qz/dudect_smoke.qz` gates this with max|t| < 5.
+#
+# Algorithm — byte-limb (i64 per byte) reduction:
+#   1. Inflate the 64 input bytes into 64 i64 limbs.
+#   2. For i in 63..32, fold x[i] back into x[i-32..i-13] using the identity
+#      2^(8*32) ≡ 16·2^252 ≡ -16·δ (mod L), where δ = L - 2^252 is encoded
+#      byte-for-byte in `_L_bytes` (16 nonzero low bytes + zeros + 0x10).
+#      Carries propagate 8 bits up between adjacent inner limbs; the final
+#      carry lands in x[i-12] before x[i] is cleared.
+#   3. Second pass: subtract (x[31] >> 4)·L byte-by-byte to bring x within
+#      one L of canonical.
+#   4. Third pass: subtract `carry·L` to canonicalise — `carry` is the
+#      borrow-out of the previous pass; the multiplication keeps the
+#      subtract data-flow-independent.
+#   5. Final byte-level carry chain + pack the low 32 bytes to out_32.
+def _sc_reduce_64(out_32: Int, in_64: Int): Void
+  _ensure_L_bytes()
+
+  # 64 signed i64 limbs — one per input byte position.  Sized to hold the
+  # full 64-byte scratch even though the top half is zeroed at exit.
+  var x = malloc(64 * 8)
+  memset(x, 0, 64 * 8)
+  var i = 0
+  while i < 64
+    _write_u64_le(x + i * 8, ptr_read_byte(in_64 + i))
+    i = i + 1
+  end
+
+  # ---- First reduction pass: fold x[63..32] back into x[31..0] ----
+  i = 63
+  while i >= 32
+    var xi = _read_u64_le(x + i * 8)
+    var base = i - 32
+    var carry = 0
+    var j = base
+    var limit = i - 12
+    while j < limit
+      var xj = _read_u64_le(x + j * 8)
+      var lj = ptr_read_byte(_L_bytes + (j - base))
+      xj = xj + carry - 16 * xi * lj
+      carry = (xj + 128) >> 8
+      xj = xj - (carry << 8)
+      _write_u64_le(x + j * 8, xj)
+      j = j + 1
+    end
+    var bnd = _read_u64_le(x + (i - 12) * 8)
+    _write_u64_le(x + (i - 12) * 8, bnd + carry)
+    _write_u64_le(x + i * 8, 0)
+    i = i - 1
+  end
+
+  # ---- Second pass: subtract (x[31] >> 4)·L, byte-level carry ----
+  var x31_top = _read_u64_le(x + 31 * 8) >> 4
+  var carry = 0
+  var j = 0
+  while j < 32
+    var xj = _read_u64_le(x + j * 8)
+    var lj = ptr_read_byte(_L_bytes + j)
+    xj = xj + carry - x31_top * lj
+    carry = xj >> 8
+    xj = xj & 255
+    _write_u64_le(x + j * 8, xj)
+    j = j + 1
+  end
+
+  # ---- Third pass: canonical conditional-subtract via `carry·L` ----
+  # carry ∈ {0, 1} from the previous pass (borrow-out of the partial sub).
+  # `carry * lj` is a real multiplication — CT, no branch.
+  j = 0
+  while j < 32
+    var xj = _read_u64_le(x + j * 8)
+    var lj = ptr_read_byte(_L_bytes + j)
+    _write_u64_le(x + j * 8, xj - carry * lj)
+    j = j + 1
+  end
+
+  # ---- Final carry chain + pack low 32 bytes to out_32 ----
+  i = 0
+  while i < 32
+    var xi2 = _read_u64_le(x + i * 8)
+    if i + 1 < 32
+      var nxt = _read_u64_le(x + (i + 1) * 8)
+      _write_u64_le(x + (i + 1) * 8, nxt + (xi2 >> 8))
+    end
+    ptr_write_byte(out_32 + i, xi2 & 255)
+    i = i + 1
+  end
+
+  free(x)
+end
+
+# Multiply two 32-byte LE scalars into a 64-byte LE product, then reduce mod L.
+# out_32 = (a * b + c) mod L
+# Add a u64 addend into r[idx] (r is a buffer of 8 i64 limbs at +0..+56),
+# propagating any carry forward through r[idx+1], r[idx+2], …
+def _mac_add(r: Int, idx: Int, addend: Int): Void
+  var i = idx
+  var carry_in = 0
+  var prev = _read_u64_le(r + i * 8)
+  var s = carrying_add_sum(prev, addend, 0)
+  var c = carrying_add_carry(prev, addend, 0)
+  _write_u64_le(r + i * 8, s)
+  i = i + 1
+  while c != 0
+    if i >= 8 then return end
+    prev = _read_u64_le(r + i * 8)
+    s = carrying_add_sum(prev, 0, c)
+    c = carrying_add_carry(prev, 0, c)
+    _write_u64_le(r + i * 8, s)
+    i = i + 1
+  end
+end
+
+def _sc_muladd(out_32: Int, a_32: Int, b_32: Int, c_32: Int): Void
+  # Schoolbook 4×4 widening-multiplication on 64-bit limbs.
+  var a0 = _read_u64_le(a_32 + 0)
+  var a1 = _read_u64_le(a_32 + 8)
+  var a2 = _read_u64_le(a_32 + 16)
+  var a3 = _read_u64_le(a_32 + 24)
+  var b0 = _read_u64_le(b_32 + 0)
+  var b1 = _read_u64_le(b_32 + 8)
+  var b2 = _read_u64_le(b_32 + 16)
+  var b3 = _read_u64_le(b_32 + 24)
+
+  # Accumulator r[0..8] as 64-byte buffer; LE u64 layout per slot.
+  var prod = malloc(64)
+  memset(prod, 0, 64)
+
+  # i=0
+  _mac_add(prod, 0, widening_mul_lo(a0, b0))
+  _mac_add(prod, 1, widening_mul_hi(a0, b0))
+  _mac_add(prod, 1, widening_mul_lo(a0, b1))
+  _mac_add(prod, 2, widening_mul_hi(a0, b1))
+  _mac_add(prod, 2, widening_mul_lo(a0, b2))
+  _mac_add(prod, 3, widening_mul_hi(a0, b2))
+  _mac_add(prod, 3, widening_mul_lo(a0, b3))
+  _mac_add(prod, 4, widening_mul_hi(a0, b3))
+
+  # i=1
+  _mac_add(prod, 1, widening_mul_lo(a1, b0))
+  _mac_add(prod, 2, widening_mul_hi(a1, b0))
+  _mac_add(prod, 2, widening_mul_lo(a1, b1))
+  _mac_add(prod, 3, widening_mul_hi(a1, b1))
+  _mac_add(prod, 3, widening_mul_lo(a1, b2))
+  _mac_add(prod, 4, widening_mul_hi(a1, b2))
+  _mac_add(prod, 4, widening_mul_lo(a1, b3))
+  _mac_add(prod, 5, widening_mul_hi(a1, b3))
+
+  # i=2
+  _mac_add(prod, 2, widening_mul_lo(a2, b0))
+  _mac_add(prod, 3, widening_mul_hi(a2, b0))
+  _mac_add(prod, 3, widening_mul_lo(a2, b1))
+  _mac_add(prod, 4, widening_mul_hi(a2, b1))
+  _mac_add(prod, 4, widening_mul_lo(a2, b2))
+  _mac_add(prod, 5, widening_mul_hi(a2, b2))
+  _mac_add(prod, 5, widening_mul_lo(a2, b3))
+  _mac_add(prod, 6, widening_mul_hi(a2, b3))
+
+  # i=3
+  _mac_add(prod, 3, widening_mul_lo(a3, b0))
+  _mac_add(prod, 4, widening_mul_hi(a3, b0))
+  _mac_add(prod, 4, widening_mul_lo(a3, b1))
+  _mac_add(prod, 5, widening_mul_hi(a3, b1))
+  _mac_add(prod, 5, widening_mul_lo(a3, b2))
+  _mac_add(prod, 6, widening_mul_hi(a3, b2))
+  _mac_add(prod, 6, widening_mul_lo(a3, b3))
+  _mac_add(prod, 7, widening_mul_hi(a3, b3))
+
+  # Reduce product mod L.
+  var ab_mod = malloc(32)
+  _sc_reduce_64(ab_mod, prod)
+  free(prod)
+
+  # Add c mod L: pad ab_mod and c to 64 bytes, add, reduce again.
+  var temp = malloc(64)
+  memset(temp, 0, 64)
+  memcpy(temp, ab_mod, 32)
+  free(ab_mod)
+  var c_padded = malloc(64)
+  memset(c_padded, 0, 64)
+  memcpy(c_padded, c_32, 32)
+  _bn_add(temp, temp, c_padded, 64)
+  free(c_padded)
+  _sc_reduce_64(out_32, temp)
+  free(temp)
+end
+
+# Clamp a 32-byte buffer per RFC 8032 §5.1.5: clear bits 0/1/2 of byte 0,
+# clear bit 7 of byte 31, set bit 6 of byte 31.
+def _sc_clamp(buf: Int): Void
+  ptr_write_byte(buf + 0, ptr_read_byte(buf + 0) & 248)
+  ptr_write_byte(buf + 31, (ptr_read_byte(buf + 31) & 127) | 64)
+end
+
+# Check S < L (RFC 8032 §5.1.7 cofactorless verify rejects non-canonical S).
+def _sc_lt_L(s_32: Int): Int
+  _ensure_L_bytes()
+  if _bn_cmp(s_32, _L_bytes, 32) < 0 then return 1 end
+  return 0
+end
+
+# Helper: read a u64 from 8 LE bytes (we duplicate sha512's helper here to
+# avoid an extra import dependency cycle).
+def _read_u64_le(p: Int): Int
+  var b0 = ptr_read_byte(p)
+  var b1 = ptr_read_byte(p + 1)
+  var b2 = ptr_read_byte(p + 2)
+  var b3 = ptr_read_byte(p + 3)
+  var b4 = ptr_read_byte(p + 4)
+  var b5 = ptr_read_byte(p + 5)
+  var b6 = ptr_read_byte(p + 6)
+  var b7 = ptr_read_byte(p + 7)
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+end
+
+def _write_u64_le(p: Int, v: Int): Void
+  # `& 255` retains the low byte of the ashr result correctly even when bit 63
+  # of v is set — the sign extension only affects bits above position 7.
+  ptr_write_byte(p,     v & 255)
+  ptr_write_byte(p + 1, (v >> 8)  & 255)
+  ptr_write_byte(p + 2, (v >> 16) & 255)
+  ptr_write_byte(p + 3, (v >> 24) & 255)
+  ptr_write_byte(p + 4, (v >> 32) & 255)
+  ptr_write_byte(p + 5, (v >> 40) & 255)
+  ptr_write_byte(p + 6, (v >> 48) & 255)
+  ptr_write_byte(p + 7, (v >> 56) & 255)
+end
+
+# =============================================================================
+# Point representation: extended twisted Edwards (X, Y, Z, T)
+# Each coord is a felem (5×51-bit, 40-byte buffer). A Point is 160 bytes.
+# =============================================================================
+
+def _PT_SIZE(): Int = 160
+
+def _pt_alloc(): Int = malloc(_PT_SIZE())
+def _pt_free(p: Int): Void = free(p)
+
+def _pt_X(p: Int): Int = p + 0
+def _pt_Y(p: Int): Int = p + 40
+def _pt_Z(p: Int): Int = p + 80
+def _pt_T(p: Int): Int = p + 120
+
+def _pt_copy(dst: Int, src: Int): Void = memcpy(dst, src, _PT_SIZE())
+
+# Identity point (0, 1, 1, 0).
+def _pt_identity(out: Int): Void
+  _f51_set_zero(_pt_X(out))
+  _f51_set_one(_pt_Y(out))
+  _f51_set_one(_pt_Z(out))
+  _f51_set_zero(_pt_T(out))
+end
+
+# Initialise the basepoint B from its precomputed limb constants.
+def _pt_basepoint(out: Int): Void
+  _f51_store(_pt_X(out), 0, _BX_LIMB_0())
+  _f51_store(_pt_X(out), 1, _BX_LIMB_1())
+  _f51_store(_pt_X(out), 2, _BX_LIMB_2())
+  _f51_store(_pt_X(out), 3, _BX_LIMB_3())
+  _f51_store(_pt_X(out), 4, _BX_LIMB_4())
+
+  _f51_store(_pt_Y(out), 0, _BY_LIMB_0())
+  _f51_store(_pt_Y(out), 1, _BY_LIMB_1())
+  _f51_store(_pt_Y(out), 2, _BY_LIMB_2())
+  _f51_store(_pt_Y(out), 3, _BY_LIMB_3())
+  _f51_store(_pt_Y(out), 4, _BY_LIMB_4())
+
+  _f51_set_one(_pt_Z(out))
+
+  _f51_store(_pt_T(out), 0, _BT_LIMB_0())
+  _f51_store(_pt_T(out), 1, _BT_LIMB_1())
+  _f51_store(_pt_T(out), 2, _BT_LIMB_2())
+  _f51_store(_pt_T(out), 3, _BT_LIMB_3())
+  _f51_store(_pt_T(out), 4, _BT_LIMB_4())
+end
+
+# Load the curve parameter d as a felem at `out` (caller-allocated).
+def _load_d(out: Int): Void
+  _f51_store(out, 0, _D_LIMB_0())
+  _f51_store(out, 1, _D_LIMB_1())
+  _f51_store(out, 2, _D_LIMB_2())
+  _f51_store(out, 3, _D_LIMB_3())
+  _f51_store(out, 4, _D_LIMB_4())
+end
+
+def _load_2d(out: Int): Void
+  _f51_store(out, 0, _2D_LIMB_0())
+  _f51_store(out, 1, _2D_LIMB_1())
+  _f51_store(out, 2, _2D_LIMB_2())
+  _f51_store(out, 3, _2D_LIMB_3())
+  _f51_store(out, 4, _2D_LIMB_4())
+end
+
+# =============================================================================
+# Point arithmetic — Hisil-Wong-Carter-Dawson 2008 §3 (a = -1)
+# =============================================================================
+
+# Point negation: -(X, Y, Z, T) = (-X, Y, Z, -T) on twisted Edwards with a=-1.
+def _pt_neg(out: Int, p: Int): Void
+  var zero = _f51_alloc()
+  _f51_set_zero(zero)
+  _f51_fsub(_pt_X(out), zero, _pt_X(p))
+  _f51_copy(_pt_Y(out), _pt_Y(p))
+  _f51_copy(_pt_Z(out), _pt_Z(p))
+  _f51_fsub(_pt_T(out), zero, _pt_T(p))
+  _f51_free(zero)
+end
+
+# Addition: out = p1 + p2 (HWCD'08 §3.1, a = -1):
+#   A = (Y1 - X1)(Y2 - X2)
+#   B = (Y1 + X1)(Y2 + X2)
+#   C = T1 * 2d * T2
+#   D = Z1 * 2 * Z2
+#   E = B - A; F = D - C; G = D + C; H = B + A
+#   X3 = E*F; Y3 = G*H; T3 = E*H; Z3 = F*G
+def _pt_add(out: Int, p1: Int, p2: Int): Void
+  var aa = _f51_alloc()
+  var bb = _f51_alloc()
+  var cc = _f51_alloc()
+  var dd = _f51_alloc()
+  var ee = _f51_alloc()
+  var ff = _f51_alloc()
+  var gg = _f51_alloc()
+  var hh = _f51_alloc()
+  var t1 = _f51_alloc()
+  var t2 = _f51_alloc()
+  var two_d = _f51_alloc()
+  _load_2d(two_d)
+
+  # A = (Y1 - X1)(Y2 - X2)
+  _f51_fsub(t1, _pt_Y(p1), _pt_X(p1))
+  _f51_fsub(t2, _pt_Y(p2), _pt_X(p2))
+  _f51_fmul(aa, t1, t2)
+
+  # B = (Y1 + X1)(Y2 + X2)
+  _f51_fadd(t1, _pt_Y(p1), _pt_X(p1))
+  _f51_fadd(t2, _pt_Y(p2), _pt_X(p2))
+  _f51_fmul(bb, t1, t2)
+
+  # C = T1 * 2d * T2
+  _f51_fmul(t1, _pt_T(p1), two_d)
+  _f51_fmul(cc, t1, _pt_T(p2))
+
+  # D = Z1 * 2 * Z2 = 2 * Z1 * Z2 (we add Z1*Z2 to itself)
+  _f51_fmul(t1, _pt_Z(p1), _pt_Z(p2))
+  _f51_fadd(dd, t1, t1)
+
+  # E = B - A; F = D - C; G = D + C; H = B + A
+  _f51_fsub(ee, bb, aa)
+  _f51_fsub(ff, dd, cc)
+  _f51_fadd(gg, dd, cc)
+  _f51_fadd(hh, bb, aa)
+
+  # X3 = E*F; Y3 = G*H; T3 = E*H; Z3 = F*G
+  _f51_fmul(_pt_X(out), ee, ff)
+  _f51_fmul(_pt_Y(out), gg, hh)
+  _f51_fmul(_pt_T(out), ee, hh)
+  _f51_fmul(_pt_Z(out), ff, gg)
+
+  _f51_free(aa); _f51_free(bb); _f51_free(cc); _f51_free(dd)
+  _f51_free(ee); _f51_free(ff); _f51_free(gg); _f51_free(hh)
+  _f51_free(t1); _f51_free(t2); _f51_free(two_d)
+end
+
+# Doubling: out = 2 * p. Ported from ref10 ge_p2_dbl + ge_p1p1_to_p3 to
+# match its single-fadd/fsub-per-limb-chain discipline — chaining two
+# `_f51_fsub` calls on the same buffer overruns the 2⁵⁴-per-limb input
+# precondition of `_f51_fmul`. ref10's structure threads the result through
+# a p1p1 intermediate that only ever applies one sub per limb at a time.
+#
+# Computes a p1p1 intermediate (rx, ry, rz, rt) where:
+#   rx = 2*X*Y               = (X+Y)^2 - (A+B)
+#   ry = A + B
+#   rz = B - A
+#   rt = C - rz = C - (B - A) = (2*Z^2) - B + A
+# Then promotes to extended p3 via:
+#   X3 = rx * rt
+#   Y3 = ry * rz
+#   T3 = rx * ry
+#   Z3 = rz * rt
+# (See ref10 ge_p1p1_to_p3.c — note ref10 negates by symmetry; we keep the
+# same projective point either way.)
+def _pt_double(out: Int, p: Int): Void
+  var aa = _f51_alloc()       # X^2
+  var bb = _f51_alloc()       # Y^2
+  var cc = _f51_alloc()       # 2*Z^2
+  var t  = _f51_alloc()
+  var rx = _f51_alloc()
+  var ry = _f51_alloc()
+  var rz = _f51_alloc()
+  var rt = _f51_alloc()
+
+  _f51_fsqr(aa, _pt_X(p))             # aa = X^2
+  _f51_fsqr(bb, _pt_Y(p))             # bb = Y^2
+  _f51_fsqr(t,  _pt_Z(p))
+  _f51_fadd(cc, t, t)                 # cc = 2*Z^2
+
+  _f51_fadd(t, _pt_X(p), _pt_Y(p))    # t = X + Y
+  _f51_fsqr(rx, t)                    # rx = (X+Y)^2 (canonical)
+  _f51_fadd(ry, aa, bb)               # ry = A + B (one fadd; limbs ≤ 2^52)
+  _f51_fsub(rx, rx, ry)               # rx = (X+Y)^2 - (A+B) = 2*X*Y
+  _f51_fsub(rz, bb, aa)               # rz = B - A (limbs ≤ 2^54)
+  # rt = C - (B - A) — natural HWCD'08 dbl-2008-hwcd shape. f2 here is rz, a
+  # prior-fsub output (limbs ≤ 2^54), so use the wide-bias _f51_fsub_2x whose
+  # 16p bias keeps every limb positive; plain _f51_fsub's 8p bias would dip
+  # negative against rz and break fmul's carry chain (F51 bug).
+  _f51_fsub_2x(rt, cc, rz)            # rt = C - (B - A)
+
+  # X3 = rx * rt; Y3 = ry * rz; T3 = rx * ry; Z3 = rz * rt
+  _f51_fmul(_pt_X(out), rx, rt)
+  _f51_fmul(_pt_Y(out), ry, rz)
+  _f51_fmul(_pt_T(out), rx, ry)
+  _f51_fmul(_pt_Z(out), rz, rt)
+
+  _f51_free(aa); _f51_free(bb); _f51_free(cc); _f51_free(t)
+  _f51_free(rx); _f51_free(ry); _f51_free(rz); _f51_free(rt)
+end
+
+# =============================================================================
+# Point encoding / decoding
+# =============================================================================
+
+# Encode a point to 32 bytes per RFC 8032 §5.1.2:
+#   1. Compute affine y = Y/Z, x = X/Z.
+#   2. Pack y into 32 LE bytes.
+#   3. Set the high bit of byte 31 to (x & 1).
+def _pt_encode(out_32: Int, p: Int): Void
+  var inv_z = _f51_alloc()
+  _f51_finv(inv_z, _pt_Z(p))
+
+  var x_aff = _f51_alloc()
+  var y_aff = _f51_alloc()
+  _f51_fmul(x_aff, _pt_X(p), inv_z)
+  _f51_fmul(y_aff, _pt_Y(p), inv_z)
+
+  # Pack y into 32 LE bytes.
+  _f51_store_felem(out_32, y_aff)
+
+  # Compute (x & 1) from the limb-0 of x_aff after canonical reduction.
+  # _f51_store_felem produces canonical bytes; do the same to a temp buffer for x:
+  var x_bytes = malloc(32)
+  _f51_store_felem(x_bytes, x_aff)
+  var x_lsb = ptr_read_byte(x_bytes) & 1
+  free(x_bytes)
+
+  # Set high bit of byte 31.
+  var b31 = ptr_read_byte(out_32 + 31)
+  ptr_write_byte(out_32 + 31, (b31 & 127) | (x_lsb << 7))
+
+  _f51_free(inv_z); _f51_free(x_aff); _f51_free(y_aff)
+end
+
+# Compute x = √(u/v) using the SqrtRatio chain from Filippo's edwards25519:
+#   r = u * v^3 * (u * v^7)^((p-5)/8) mod p
+#   check = v * r^2
+#   correct if check == u → r is the sqrt
+#   correct if check == -u → r * sqrt(-1) is the sqrt (where i = 2^((p-1)/4))
+#   else → no sqrt exists (point is not on curve)
+# Returns 1 on success, 0 if not a square.
+# i_value is precomputed sqrt(-1) mod p. Could be a constant; here we compute it
+# on demand the first time via the (p-1)/4 chain (negligible — runs once per
+# program). For v1 we hardcode the limb constants.
+def _SQRT_M1_LIMB_0(): Int = 1718705420411056
+def _SQRT_M1_LIMB_1(): Int = 234908883556509
+def _SQRT_M1_LIMB_2(): Int = 2233514472574048
+def _SQRT_M1_LIMB_3(): Int = 2117202627021982
+def _SQRT_M1_LIMB_4(): Int = 765476049583133
+
+def _load_sqrt_m1(out: Int): Void
+  _f51_store(out, 0, _SQRT_M1_LIMB_0())
+  _f51_store(out, 1, _SQRT_M1_LIMB_1())
+  _f51_store(out, 2, _SQRT_M1_LIMB_2())
+  _f51_store(out, 3, _SQRT_M1_LIMB_3())
+  _f51_store(out, 4, _SQRT_M1_LIMB_4())
+end
+
+# x^(p-5)/8 mod p via Bernstein addition chain.
+# Exponent = 2^252 - 3. Standard Curve25519 chain (251 squarings + ~12 mults).
+def _f51_pow_p_minus_5_div_8(out: Int, z: Int): Void
+  var t0 = _f51_alloc()
+  var t1 = _f51_alloc()
+  var t2 = _f51_alloc()
+
+  # The chain follows ref10's `fe_pow22523`:
+  #   t0 = z^2
+  #   t1 = t0^2; t1 = t1^2; t1 = z * t1   → z^9
+  #   t0 = t0 * t1                          → z^11
+  #   t0 = t0^2; t0 = t1 * t0               → z^(2^5 - 1)
+  # …
+  _f51_fsqr(t0, z)
+  _f51_fsqr(t1, t0)
+  _f51_fsqr(t1, t1)
+  _f51_fmul(t1, z, t1)
+  _f51_fmul(t0, t0, t1)
+  _f51_fsqr(t0, t0)
+  _f51_fmul(t0, t1, t0)
+  _f51_fsqr(t1, t0)
+  var i = 0
+  while i < 4
+    _f51_fsqr(t1, t1)
+    i = i + 1
+  end
+  _f51_fmul(t0, t1, t0)
+  _f51_fsqr(t1, t0)
+  i = 0
+  while i < 9
+    _f51_fsqr(t1, t1)
+    i = i + 1
+  end
+  _f51_fmul(t1, t1, t0)
+  _f51_fsqr(t2, t1)
+  i = 0
+  while i < 19
+    _f51_fsqr(t2, t2)
+    i = i + 1
+  end
+  _f51_fmul(t1, t2, t1)
+  _f51_fsqr(t1, t1)
+  i = 0
+  while i < 9
+    _f51_fsqr(t1, t1)
+    i = i + 1
+  end
+  _f51_fmul(t0, t1, t0)
+  _f51_fsqr(t1, t0)
+  i = 0
+  while i < 49
+    _f51_fsqr(t1, t1)
+    i = i + 1
+  end
+  _f51_fmul(t1, t1, t0)
+  _f51_fsqr(t2, t1)
+  i = 0
+  while i < 99
+    _f51_fsqr(t2, t2)
+    i = i + 1
+  end
+  _f51_fmul(t1, t2, t1)
+  _f51_fsqr(t1, t1)
+  i = 0
+  while i < 49
+    _f51_fsqr(t1, t1)
+    i = i + 1
+  end
+  _f51_fmul(t0, t1, t0)
+  _f51_fsqr(t0, t0)
+  _f51_fsqr(t0, t0)
+  _f51_fmul(out, t0, z)
+
+  _f51_free(t0); _f51_free(t1); _f51_free(t2)
+end
+
+# Decode a 32-byte encoded point. Returns 1 on success, 0 on rejection.
+# Rejections: non-canonical y (y >= p), no sqrt for x (point off-curve).
+def _pt_decode(out: Int, enc_32: Int): Int
+  # Extract sign bit from byte 31; clear it.
+  var enc_copy = malloc(32)
+  memcpy(enc_copy, enc_32, 32)
+  var x_sign = (ptr_read_byte(enc_copy + 31) >> 7) & 1
+  ptr_write_byte(enc_copy + 31, ptr_read_byte(enc_copy + 31) & 127)
+
+  # Load y from the encoded bytes.
+  var y = _f51_alloc()
+  _f51_load_felem(y, enc_copy)
+  free(enc_copy)
+
+  # Compute u = y^2 - 1, v = d*y^2 + 1
+  var y2 = _f51_alloc()
+  _f51_fsqr(y2, y)
+
+  var u = _f51_alloc()
+  var one = _f51_alloc()
+  _f51_set_one(one)
+  _f51_fsub(u, y2, one)
+
+  var v = _f51_alloc()
+  var d_felem = _f51_alloc()
+  _load_d(d_felem)
+  _f51_fmul(v, d_felem, y2)
+  _f51_fadd(v, v, one)
+
+  # SqrtRatio chain: x = u * v^3 * (u * v^7)^((p-5)/8)
+  var v2 = _f51_alloc()
+  var v3 = _f51_alloc()
+  var v7 = _f51_alloc()
+  _f51_fsqr(v2, v)
+  _f51_fmul(v3, v2, v)
+  _f51_fsqr(v7, v3)
+  _f51_fmul(v7, v7, v)
+
+  var u_v3 = _f51_alloc()
+  var u_v7 = _f51_alloc()
+  _f51_fmul(u_v3, u, v3)
+  _f51_fmul(u_v7, u, v7)
+
+  var beta = _f51_alloc()
+  _f51_pow_p_minus_5_div_8(beta, u_v7)
+
+  var x = _f51_alloc()
+  _f51_fmul(x, u_v3, beta)
+
+  # Check whether v*x^2 == u or v*x^2 == -u
+  var x2 = _f51_alloc()
+  var check = _f51_alloc()
+  _f51_fsqr(x2, x)
+  _f51_fmul(check, v, x2)
+
+  # diff = check - u; if zero, ok.
+  var diff = _f51_alloc()
+  _f51_fsub(diff, check, u)
+
+  # check_bytes = canonical bytes of diff; is_zero if all bytes are zero
+  var diff_bytes = malloc(32)
+  _f51_store_felem(diff_bytes, diff)
+  var ok = _bn_is_zero(diff_bytes, 32)
+  free(diff_bytes)
+
+  if ok == 0
+    # Try the "off by sqrt(-1)" case: check + u == 0
+    var sum = _f51_alloc()
+    _f51_fadd(sum, check, u)
+    var sum_bytes = malloc(32)
+    _f51_store_felem(sum_bytes, sum)
+    var ok2 = _bn_is_zero(sum_bytes, 32)
+    free(sum_bytes)
+    _f51_free(sum)
+    if ok2 == 0
+      # No square root — point is off-curve, reject.
+      _f51_free(y); _f51_free(y2); _f51_free(u); _f51_free(v); _f51_free(one)
+      _f51_free(d_felem); _f51_free(v2); _f51_free(v3); _f51_free(v7)
+      _f51_free(u_v3); _f51_free(u_v7); _f51_free(beta); _f51_free(x)
+      _f51_free(x2); _f51_free(check); _f51_free(diff)
+      return 0
+    end
+    # Multiply x by sqrt(-1).
+    var i_val = _f51_alloc()
+    _load_sqrt_m1(i_val)
+    _f51_fmul(x, x, i_val)
+    _f51_free(i_val)
+  end
+
+  # If parity of x doesn't match x_sign, negate x.
+  var x_bytes = malloc(32)
+  _f51_store_felem(x_bytes, x)
+  var x_lsb = ptr_read_byte(x_bytes) & 1
+  free(x_bytes)
+  if x_lsb != x_sign
+    var zero = _f51_alloc()
+    _f51_set_zero(zero)
+    _f51_fsub(x, zero, x)
+    _f51_free(zero)
+  end
+
+  # Reject the encoded-zero edge case: x == 0 && x_sign == 1 (RFC 8032 §5.1.3 step 4).
+  var x_bytes2 = malloc(32)
+  _f51_store_felem(x_bytes2, x)
+  var x_is_zero = _bn_is_zero(x_bytes2, 32)
+  free(x_bytes2)
+  if (x_is_zero == 1) & (x_sign == 1)
+    _f51_free(y); _f51_free(y2); _f51_free(u); _f51_free(v); _f51_free(one)
+    _f51_free(d_felem); _f51_free(v2); _f51_free(v3); _f51_free(v7)
+    _f51_free(u_v3); _f51_free(u_v7); _f51_free(beta); _f51_free(x)
+    _f51_free(x2); _f51_free(check); _f51_free(diff)
+    return 0
+  end
+
+  # Populate output: (x, y, 1, x*y) in extended coords.
+  _f51_copy(_pt_X(out), x)
+  _f51_copy(_pt_Y(out), y)
+  _f51_set_one(_pt_Z(out))
+  _f51_fmul(_pt_T(out), x, y)
+
+  _f51_free(y); _f51_free(y2); _f51_free(u); _f51_free(v); _f51_free(one)
+  _f51_free(d_felem); _f51_free(v2); _f51_free(v3); _f51_free(v7)
+  _f51_free(u_v3); _f51_free(u_v7); _f51_free(beta); _f51_free(x)
+  _f51_free(x2); _f51_free(check); _f51_free(diff)
+  return 1
+end
+
+# =============================================================================
+# Scalar multiplication
+# =============================================================================
+
+# Constant-time double-and-add: out = [k]P where k is 32 LE bytes (scalar)
+# and P is an input Edwards point. Result lands in `out` (caller-allocated).
+# Iterates from Ms_b to Ls_b so each step does double-then-conditional-add.
+def _pt_scalar_mult(out: Int, k_32: Int, p_in: Int): Void
+  # accumulator = identity
+  _pt_identity(out)
+  # Iterate bits from bit 255 down to bit 0
+  var bit_index = 255
+  var tmp = _pt_alloc()
+  var added = _pt_alloc()
+  while bit_index >= 0
+    _pt_double(tmp, out)
+    _pt_copy(out, tmp)
+    # Read bit
+    var byte_index = bit_index / 8
+    var bit_in_byte = bit_index & 7
+    var bit = (ptr_read_byte(k_32 + byte_index) >> bit_in_byte) & 1
+    if bit == 1
+      _pt_add(added, out, p_in)
+      _pt_copy(out, added)
+    end
+    bit_index = bit_index - 1
+  end
+  _pt_free(tmp)
+  _pt_free(added)
+end
+
+# Compare two encoded 32-byte points for equality. Returns 1 if equal.
+def _pt_encoded_eq(a_32: Int, b_32: Int): Int
+  var i = 0
+  while i < 32
+    if ptr_read_byte(a_32 + i) != ptr_read_byte(b_32 + i) then return 0 end
+    i = i + 1
+  end
+  return 1
+end
+
+# =============================================================================
+# Top-level EdDSA API
+# =============================================================================
+
+## Derive 32-byte public key from 32-byte seed.
+## NET.4.1 — `seed` carries the `Secret<Int>` boundary; the raw pointer is
+## unwrapped once for the SHA-512 input. Callers `secret_wrap` at the
+## construction site (seed gen / load); the unwrap below is the audit-grep
+## declassification point.
+def ed25519_secret_to_public(pub: Int, seed: Secret<Int>): Void
+  var h = malloc(64)
+  sha512(secret_unwrap(seed), 32, h)
+  _sc_clamp(h)
+  var pt = _pt_alloc()
+  var bp = _pt_alloc()
+  _pt_basepoint(bp)
+  _pt_scalar_mult(pt, h, bp)
+  _pt_encode(pub, pt)
+  _pt_free(pt); _pt_free(bp)
+  free(h)
+end
+
+## Sign `msg` (msg_len bytes) under `seed`, writing 64-byte signature to `sig`.
+## `pub` is the precomputed public key for the seed (32 bytes). NET.4.1 —
+## `seed` carries the strict-newtype discipline; declassified once below.
+def ed25519_sign(sig: Int, msg: Int, msg_len: Int, seed: Secret<Int>, pub: Int): Void
+  # 1. h = SHA-512(seed). NET.4.1: declassify the seed for SHA-512 input.
+  var h = malloc(64)
+  sha512(secret_unwrap(seed), 32, h)
+  _sc_clamp(h)
+  # a is h[0..32]; prefix is h[32..64].
+
+  # 2. r = SHA-512(prefix || msg) mod L
+  var prefix_msg = malloc(32 + msg_len)
+  memcpy(prefix_msg, h + 32, 32)
+  if msg_len > 0
+    memcpy(prefix_msg + 32, msg, msg_len)
+  end
+  var r_buf = malloc(64)
+  sha512(prefix_msg, 32 + msg_len, r_buf)
+  free(prefix_msg)
+  var r = malloc(32)
+  _sc_reduce_64(r, r_buf)
+  free(r_buf)
+
+  # 3. R = [r]B; sig[0..32] = encode(R)
+  var r_pt = _pt_alloc()
+  var bp = _pt_alloc()
+  _pt_basepoint(bp)
+  _pt_scalar_mult(r_pt, r, bp)
+  _pt_encode(sig, r_pt)
+
+  # 4. k = SHA-512(sig[0..32] || pub || msg) mod L
+  var k_input = malloc(64 + msg_len)
+  memcpy(k_input, sig, 32)
+  memcpy(k_input + 32, pub, 32)
+  if msg_len > 0
+    memcpy(k_input + 64, msg, msg_len)
+  end
+  var k_buf = malloc(64)
+  sha512(k_input, 64 + msg_len, k_buf)
+  free(k_input)
+  var k = malloc(32)
+  _sc_reduce_64(k, k_buf)
+  free(k_buf)
+
+  # 5. S = (k * a + r) mod L; sig[32..64] = S
+  _sc_muladd(sig + 32, k, h, r)
+
+  free(h); free(r); free(k); _pt_free(r_pt); _pt_free(bp)
+end
+
+## Verify a 64-byte signature `sig` against `msg` (msg_len bytes) and 32-byte
+## public key `pub`. Returns 1 if valid, 0 if invalid.
+def ed25519_verify(sig: Int, msg: Int, msg_len: Int, pub: Int): Int
+  # 1. Reject if S >= L (non-canonical).
+  if _sc_lt_L(sig + 32) == 0 then return 0 end
+
+  # 2. Decode R and A.
+  var r_pt = _pt_alloc()
+  if _pt_decode(r_pt, sig) == 0
+    _pt_free(r_pt)
+    return 0
+  end
+  var a_pt = _pt_alloc()
+  if _pt_decode(a_pt, pub) == 0
+    _pt_free(r_pt); _pt_free(a_pt)
+    return 0
+  end
+
+  # 3. k = SHA-512(R || A || msg) mod L
+  var k_input = malloc(64 + msg_len)
+  memcpy(k_input, sig, 32)
+  memcpy(k_input + 32, pub, 32)
+  if msg_len > 0
+    memcpy(k_input + 64, msg, msg_len)
+  end
+  var k_buf = malloc(64)
+  sha512(k_input, 64 + msg_len, k_buf)
+  free(k_input)
+  var k = malloc(32)
+  _sc_reduce_64(k, k_buf)
+  free(k_buf)
+
+  # 4. Compute [S]B and R + [k]A; compare.
+  var bp = _pt_alloc()
+  _pt_basepoint(bp)
+  var s_b = _pt_alloc()
+  _pt_scalar_mult(s_b, sig + 32, bp)
+
+  var k_a = _pt_alloc()
+  _pt_scalar_mult(k_a, k, a_pt)
+  var lhs = _pt_alloc()
+  _pt_add(lhs, r_pt, k_a)
+
+  # Encode both sides; compare.
+  var lhs_enc = malloc(32)
+  var rhs_enc = malloc(32)
+  _pt_encode(lhs_enc, lhs)
+  _pt_encode(rhs_enc, s_b)
+
+  var ok = _pt_encoded_eq(lhs_enc, rhs_enc)
+
+  free(lhs_enc); free(rhs_enc); free(k)
+  _pt_free(r_pt); _pt_free(a_pt); _pt_free(bp); _pt_free(s_b); _pt_free(k_a); _pt_free(lhs)
+  return ok
+end

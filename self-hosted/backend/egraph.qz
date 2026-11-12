@@ -1,0 +1,1247 @@
+##! # E-Graph: Equality Graph for MIR Optimization
+##!
+##! Cranelift-inspired e-graph with union-find, hashcons, smart constructors,
+##! bounded equality saturation, and cost-based extraction.
+##!
+##! Key data structures:
+##! - ENode  - a single expression (op + children)
+##! - EClass - equivalence class of ENodes
+##! - EGraph - the graph itself (union-find + hashcons)
+##!
+##! Key algorithms:
+##! - Smart constructors (eg_add_binary) — fold/identity/strength-reduce on insert
+##! - Rewrite rules — commutativity, reassociation, comparison flip, idempotence
+##! - Bounded saturation loop (eg_saturate) — apply rules until fixpoint or limit
+##! - Amortized congruence closure (eg_rebuild) — re-canonicalize after unions
+##! - Cost-based extraction (eg_extract) — pick cheapest form per e-class
+
+import mir
+import op_constants
+import * from str_compat
+
+# ============================================================================
+# ENode - a single expression in the e-graph
+# ============================================================================
+# Each ENode represents one way to compute a value.
+# kind: MIR instruction kind (MIR_BINARY, MIR_CONST_INT, etc.)
+# op: operator code (OP_ADD, etc.) for binary/unary, 0 otherwise
+# child1/child2: e-class IDs of operands (-1 if unused)
+# aux: extra data (int_val for constants, var_name hash, etc.)
+# aux_str: string data (var_name, func_name, etc.) as Int
+# dest_type: MIR type of the result
+
+## A single expression node in the e-graph.
+struct ENode
+  kind: Int
+  op: Int
+  child1: Int
+  child2: Int
+  aux: Int
+  aux_str: String
+  dest_type: Int
+  args: Vec<Int>
+end
+
+## Create a new ENode.
+def eg_node_new(kind: Int, op: Int, c1: Int, c2: Int, aux: Int, dest_type: Int): ENode = ENode { kind: kind, op: op, child1: c1, child2: c2, aux: aux, aux_str: "", dest_type: dest_type, args: vec_new() }
+
+def eg_node_new_str(kind: Int, op: Int, c1: Int, c2: Int, aux: Int, aux_str: String, dest_type: Int): ENode = ENode { kind: kind, op: op, child1: c1, child2: c2, aux: aux, aux_str: aux_str, dest_type: dest_type, args: vec_new() }
+
+def eg_node_get_kind(n: ENode): Int = n.kind
+def eg_node_get_op(n: ENode): Int = n.op
+def eg_node_get_child1(n: ENode): Int = n.child1
+def eg_node_get_child2(n: ENode): Int = n.child2
+def eg_node_get_aux(n: ENode): Int = n.aux
+def eg_node_get_aux_str(n: ENode): String = n.aux_str
+def eg_node_get_dest_type(n: ENode): Int = n.dest_type
+def eg_node_get_args(n: ENode): Vec<Int> = n.args
+
+def eg_node_set_child1(n: ENode, c: Int): Void
+  n.child1 = c
+end
+
+def eg_node_set_child2(n: ENode, c: Int): Void
+  n.child2 = c
+end
+
+# ============================================================================
+# EClass - equivalence class of ENodes
+# ============================================================================
+# Each e-class groups equivalent expressions. The "best" is chosen by cost.
+
+## Equivalence class grouping equivalent ENodes.
+struct EClass
+  id: Int
+  nodes: Vec<Int>
+  best_node: Int
+  best_cost: Int
+end
+
+def eg_class_new(id: Int): EClass = EClass { id: id, nodes: vec_new(), best_node: -1, best_cost: 999999 }
+
+def eg_class_get_id(c: EClass): Int = c.id
+def eg_class_get_nodes(c: EClass): Vec<Int> = c.nodes
+def eg_class_get_best_node(c: EClass): Int = c.best_node
+def eg_class_get_best_cost(c: EClass): Int = c.best_cost
+
+def eg_class_set_best(c: EClass, node_idx: Int, cost: Int): Void
+  c.best_node = node_idx
+  c.best_cost = cost
+end
+
+def eg_class_add_node(c: EClass, node_idx: Int): Void
+  c.nodes.push(node_idx)
+end
+
+# ============================================================================
+# EGraph - the main e-graph structure
+# ============================================================================
+# Union-find with path halving for canonical class lookup.
+# Hashcons for structural dedup of ENodes.
+
+## The E-Graph structure (Union-Find + Hashcons).
+##
+## Hashcons (R2): the structural dedup index is an *integer-keyed* map
+## `Map<Int, Int>`. The key is a 64-bit structural hash of a node's
+## `(kind, op, canonical child1, canonical child2, aux, aux_str)` tuple; the
+## value is the *head* node index of a collision chain. Chained buckets are
+## threaded through `hc_next` (node_idx → next node_idx in the same bucket, or
+## -1). Lookup walks the (short) chain and compares the *actual* node fields
+## (`eg_node_key_eq`) so hash collisions never falsely merge distinct nodes —
+## dedup stays exact, as it was with the old delimited String key, but without
+## allocating one String per node per rebuild. `node_class[node_idx]` recovers
+## the e-class a chain entry belongs to. (Int→Int + Int Vec are used
+## deliberately: `Map<Int, Vec<Int>>` erases its heap value under the
+## `--feature egraph` compile, so a chain-in-a-parallel-Vec is used instead.)
+struct EGraph
+  nodes: Vec<ENode>
+  classes: Vec<EClass>
+  parent: Vec<Int>
+  rank: Vec<Int>
+  hashcons: Map<Int, Int>
+  node_class: Vec<Int>
+  hc_next: Vec<Int>
+  next_class: Int
+  # When 1, suppress const-folding of overflow-checked ops (ADD/SUB/MUL) so the
+  # trapping llvm.s{add,sub,mul}.with.overflow survives to codegen. Mirrors the
+  # mir_opt.qz:203-219 precedent (overflow_spec "panics on addition overflow").
+  overflow_check: Int
+end
+
+## Create a new empty E-Graph.
+def eg_new(): EGraph
+  return EGraph {
+    nodes: vec_new<ENode>(),
+    classes: vec_new<EClass>(),
+    parent: vec_new(),
+    rank: vec_new(),
+    hashcons: map_new<Int, Int>(),
+    node_class: vec_new(),
+    hc_next: vec_new(),
+    next_class: 0,
+    overflow_check: 0
+  }
+end
+
+## Reset an E-Graph to empty, reusing its backing storage (R1: reuse one
+## EGraph across blocks instead of allocating a fresh one per block).
+## Clears every container in-place and resets next_class so the graph is
+## structurally identical to a freshly-created one. Must be COMPLETE: any
+## stale node/class/parent/rank/hashcons entry would leak across blocks and
+## corrupt canonicalization.
+def eg_reset(eg: EGraph): Void
+  vec_clear(eg.nodes)
+  vec_clear(eg.classes)
+  vec_clear(eg.parent)
+  vec_clear(eg.rank)
+  map_clear(eg.hashcons)
+  vec_clear(eg.node_class)
+  vec_clear(eg.hc_next)
+  eg.next_class = 0
+end
+
+# --- Union-Find with path halving ---
+
+## Find the canonical class ID for a given ID (Union-Find find with path halving).
+def eg_find(eg: EGraph, id: Int): Int
+  var current = id
+  # Path halving: point every other node to its grandparent
+  while eg.parent[current] != current
+    var gp = eg.parent[eg.parent[current]]
+    eg.parent.set_unchecked(current, gp)
+    current = gp
+  end
+  return current
+end
+
+## Union two e-classes. Returns the new canonical ID.
+def eg_union(eg: EGraph, a: Int, b: Int): Int
+  var ra = eg_find(eg, a)
+  var rb = eg_find(eg, b)
+  if ra == rb
+    return ra
+  end
+  # Union by rank
+  var rank_a = eg.rank[ra]
+  var rank_b = eg.rank[rb]
+  if rank_a < rank_b
+    # ra is loser, rb is winner — merge ra's nodes into rb
+    eg.parent.set_unchecked(ra, rb)
+    var loser_nodes = eg_class_get_nodes(eg.classes[ra])
+    var winner_cls = eg.classes[rb]
+    for ni in 0..loser_nodes.size
+      eg_class_add_node(winner_cls, loser_nodes[ni])
+    end
+    return rb
+  end
+  if rank_a > rank_b
+    # rb is loser, ra is winner — merge rb's nodes into ra
+    eg.parent.set_unchecked(rb, ra)
+    var loser_nodes = eg_class_get_nodes(eg.classes[rb])
+    var winner_cls = eg.classes[ra]
+    for ni in 0..loser_nodes.size
+      eg_class_add_node(winner_cls, loser_nodes[ni])
+    end
+    return ra
+  end
+  # Equal rank: rb is loser, ra is winner — merge rb's nodes into ra
+  eg.parent.set_unchecked(rb, ra)
+  eg.rank.set_unchecked(ra, rank_a + 1)
+  var loser_nodes = eg_class_get_nodes(eg.classes[rb])
+  var winner_cls = eg.classes[ra]
+  for ni in 0..loser_nodes.size
+    eg_class_add_node(winner_cls, loser_nodes[ni])
+  end
+  return ra
+end
+
+# --- Hashcons key construction (R2: integer structural hash) ---
+#
+# The old scheme built a delimited String key per node (5 interpolated
+# concatenations) and stored it in a `Map<String, Int>`, allocating one String
+# per `eg_add` and — crucially — per node per rebuild iteration (up to
+# 3×10×nodes String allocs per block). R2 replaces that with a 64-bit FNV-style
+# structural hash used as an integer bucket key. Hashes may collide, so the
+# bucket walk in `eg_add`/`eg_rebuild` verifies exact field equality
+# (`eg_node_key_eq`) before treating two nodes as the same — dedup remains
+# exact. The `aux_str` category is mixed with a distinct salt so a
+# string-carrying node never shares a key with an integer-`aux` node (the old
+# `:S:` marker), and equality also checks the category, so even a hash tie
+# between the two categories is rejected on compare.
+
+# Combine an integer into a running FNV-1a-style 64-bit hash.
+def eg_hash_mix(h: Int, x: Int): Int
+  var nh = h ^ x
+  nh *= 1099511628211
+  return nh
+end
+
+## 64-bit structural hash of a node's identity tuple. Integer-`aux` path.
+def eg_node_hash(kind: Int, op: Int, c1: Int, c2: Int, aux: Int): Int
+  var h = -3750763034362895579
+  h = eg_hash_mix(h, kind)
+  h = eg_hash_mix(h, op)
+  h = eg_hash_mix(h, c1)
+  h = eg_hash_mix(h, c2)
+  h = eg_hash_mix(h, aux)
+  return h
+end
+
+## 64-bit structural hash of a node's identity tuple. String-`aux` path.
+## Salted distinctly (the old `:S:` marker) so it cannot alias the integer path.
+def eg_node_hash_str(kind: Int, op: Int, c1: Int, c2: Int, aux_str: String): Int
+  var h = -3750763034362895579
+  h = eg_hash_mix(h, kind)
+  h = eg_hash_mix(h, op)
+  h = eg_hash_mix(h, c1)
+  h = eg_hash_mix(h, c2)
+  # Salt to separate the string category from the integer-aux category.
+  h = eg_hash_mix(h, 0x53535353)
+  h = eg_hash_mix(h, mir::fnv1a_hash(aux_str))
+  return h
+end
+
+## Compute a node's hashcons key given its (already-canonicalized) children.
+def eg_node_key(node: ENode, c1: Int, c2: Int): Int
+  if str_byte_len(node.aux_str) > 0
+    return eg_node_hash_str(node.kind, node.op, c1, c2, node.aux_str)
+  end
+  return eg_node_hash(node.kind, node.op, c1, c2, node.aux)
+end
+
+## Exact structural equality of a stored node vs. a query tuple. Guards against
+## hash collisions so distinct nodes are never falsely deduped/merged. The
+## aux_str category (string-carrying vs. integer-aux) must match, mirroring the
+## old `:S:`-vs-plain key separation.
+def eg_node_key_eq(node: ENode, kind: Int, op: Int, c1: Int, c2: Int, aux: Int, aux_str: String): Int
+  if node.kind != kind
+    return 0
+  end
+  if node.op != op
+    return 0
+  end
+  if node.child1 != c1
+    return 0
+  end
+  if node.child2 != c2
+    return 0
+  end
+  var has_str = 0
+  has_str = 1 if str_byte_len(aux_str) > 0
+  var node_has_str = 0
+  node_has_str = 1 if str_byte_len(node.aux_str) > 0
+  if has_str != node_has_str
+    return 0
+  end
+  if has_str == 1
+    return 1 if node.aux_str == aux_str
+    return 0
+  end
+  return 1 if node.aux == aux
+  return 0
+end
+
+## Look up an existing e-class for a node identity in the hashcons chain.
+## Returns the canonical e-class id, or -1 if no structurally-equal node exists.
+## `key` is the precomputed hash; `c1`/`c2` are the canonical children.
+def eg_hashcons_lookup(eg: EGraph, key: Int, kind: Int, op: Int, c1: Int, c2: Int, aux: Int, aux_str: String): Int
+  if eg.hashcons.has(key)
+    var nidx = __map_get_raw(eg.hashcons, key)
+    while nidx >= 0
+      var cand = eg.nodes[nidx]
+      if eg_node_key_eq(cand, kind, op, c1, c2, aux, aux_str) == 1
+        return eg_find(eg, eg.node_class[nidx])
+      end
+      nidx = eg.hc_next[nidx]
+    end
+  end
+  return -1
+end
+
+## Ensure `hc_next` is at least `n` long, padding with -1 (chain terminator).
+def eg_hc_next_ensure(eg: EGraph, n: Int): Void
+  while eg.hc_next.size < n
+    eg.hc_next.push(-1)
+  end
+end
+
+## Record a node index as the new head of `key`'s collision chain. Any prior
+## head becomes this node's `hc_next` successor, so the whole chain stays
+## reachable for exact-equality verification.
+def eg_hashcons_insert(eg: EGraph, key: Int, node_idx: Int): Void
+  eg_hc_next_ensure(eg, node_idx + 1)
+  var prev_head = -1
+  if eg.hashcons.has(key)
+    prev_head = __map_get_raw(eg.hashcons, key)
+  end
+  eg.hc_next.set_unchecked(node_idx, prev_head)
+  eg.hashcons.set(key, node_idx)
+end
+
+# --- Add a new e-class (returns class id) ---
+
+## Create a new unique e-class.
+def eg_new_class(eg: EGraph): Int
+  var id = eg.next_class
+  eg.next_class = id + 1
+  var cls = eg_class_new(id)
+  eg.classes.push(cls)
+  eg.parent.push(id)
+  eg.rank.push(0)
+  return id
+end
+
+# --- Add an ENode, return its e-class id (dedup via hashcons) ---
+
+## Add an ENode to the graph. Returns the e-class ID (existing or new).
+def eg_add(eg: EGraph, node: ENode): Int
+  # Canonicalize children
+  var c1 = node.child1
+  var c2 = node.child2
+  if c1 >= 0
+    c1 = eg_find(eg, c1)
+    node.child1 = c1
+  end
+  if c2 >= 0
+    c2 = eg_find(eg, c2)
+    node.child2 = c2
+  end
+
+  # Build hashcons key (integer structural hash; children already canonical)
+  var key = eg_node_key(node, c1, c2)
+
+  # Check hashcons for existing structurally-equal node (collision-verified)
+  var found = eg_hashcons_lookup(eg, key, node.kind, node.op, c1, c2, node.aux, node.aux_str)
+  if found >= 0
+    return found
+  end
+
+  # New node: create e-class, store node, register in hashcons
+  var class_id = eg_new_class(eg)
+  var node_idx = eg.nodes.size
+  eg.nodes.push(node)
+  eg.node_class.push(class_id)
+  var cls = eg.classes[class_id]
+  eg_class_add_node(cls, node_idx)
+  eg_hashcons_insert(eg, key, node_idx)
+  return class_id
+end
+
+# --- Get an ENode by index ---
+
+def eg_get_node(eg: EGraph, idx: Int): ENode = eg.nodes[idx]
+
+# --- Get an EClass by id ---
+
+def eg_get_class(eg: EGraph, id: Int): EClass
+  var canonical = eg_find(eg, id)
+  return eg.classes[canonical]
+end
+
+# --- Cost model for extraction ---
+# Lower cost = preferred. Constants are cheapest, then shifts, then add/sub, etc.
+
+## Calculate the cost of an ENode (for extraction).
+def eg_node_cost(node: ENode): Int
+  var kind = node.kind
+  if kind == mir::MIR_CONST_INT or kind == mir::MIR_CONST_BOOL or kind == mir::MIR_CONST_FLOAT
+    return 1
+  end
+  if kind == mir::MIR_CONST_STRING
+    return 1
+  end
+  if kind == mir::MIR_LOAD_VAR
+    return 2
+  end
+  if kind == mir::MIR_BINARY
+    var op = node.op
+    if op == op_constants::OP_SHL or op == op_constants::OP_SHR
+      return 2
+    end
+    if op == op_constants::OP_ADD or op == op_constants::OP_SUB or op == op_constants::OP_BIT_AND or op == op_constants::OP_BIT_OR or op == op_constants::OP_BIT_XOR
+      return 3
+    end
+    if op == op_constants::OP_MUL
+      return 4
+    end
+    if op == op_constants::OP_DIV or op == op_constants::OP_MOD
+      return 6
+    end
+    return 3
+  end
+  if kind == mir::MIR_UNARY
+    return 2
+  end
+  # Side-effecting / complex instructions
+  return 10
+end
+
+# --- Extract best node from each e-class (bottom-up) ---
+
+## Extract the best (lowest cost) expression for each e-class.
+def eg_extract(eg: EGraph): Void
+  var count = eg.classes.size
+  for i in 0..count
+    var cls = eg.classes[i]
+    var canonical = eg_find(eg, eg_class_get_id(cls))
+    if canonical != eg_class_get_id(cls)
+      # Skip non-canonical classes
+    else
+      var nodes = eg_class_get_nodes(cls)
+      var best_idx = -1
+      var best_cost = 999999
+      for j in 0..nodes.size
+        var node_idx = nodes[j]
+        var node = eg.nodes[node_idx]
+        var cost = eg_node_cost(node)
+        # Add children costs
+        var c1 = eg_node_get_child1(node)
+        var c2 = eg_node_get_child2(node)
+        if c1 >= 0
+          var c1_cls = eg_get_class(eg, c1)
+          var c1_cost = eg_class_get_best_cost(c1_cls)
+          if c1_cost < 999999
+            cost += c1_cost
+          end
+        end
+        if c2 >= 0
+          var c2_cls = eg_get_class(eg, c2)
+          var c2_cost = eg_class_get_best_cost(c2_cls)
+          if c2_cost < 999999
+            cost += c2_cost
+          end
+        end
+        if cost < best_cost
+          best_cost = cost
+          best_idx = node_idx
+        end
+      end
+      eg_class_set_best(cls, best_idx, best_cost)
+    end
+  end
+end
+
+# --- Purity check: can this MIR instruction kind be absorbed into the e-graph? ---
+
+## Check if a MIR instruction kind is pure (side-effect free) and safe for e-graph.
+def eg_is_pure(kind: Int): Int
+  if kind == mir::MIR_CONST_INT or kind == mir::MIR_CONST_BOOL or kind == mir::MIR_CONST_STRING or kind == mir::MIR_CONST_FLOAT
+    return 1
+  end
+  if kind == mir::MIR_BINARY or kind == mir::MIR_UNARY
+    return 1
+  end
+  if kind == mir::MIR_LOAD_VAR or kind == mir::MIR_FUNC_REF
+    return 1
+  end
+  if kind == mir::MIR_FIELD_ACCESS or kind == mir::MIR_INDEX or kind == mir::MIR_LOAD or kind == mir::MIR_LOAD_OFFSET
+    return 1
+  end
+  if kind == mir::MIR_SELECT or kind == mir::MIR_PHI
+    return 1
+  end
+  return 0
+end
+
+# ============================================================================
+# E-Graph Rebuild — Amortized Congruence Closure (egg insight)
+# ============================================================================
+# After eg_union, hashcons keys reference stale (non-canonical) class IDs.
+# eg_rebuild re-canonicalizes all entries and merges classes that are now
+# congruent. This makes saturation practical.
+
+## Rebuild the e-graph: re-canonicalize hashcons and merge congruent classes.
+def eg_rebuild(eg: EGraph): Int
+  var total_merges = 0
+  var iter = 0
+  var changed = 1
+  while changed == 1 and iter < 10
+    iter += 1
+    changed = 0
+    # Clear hashcons in place — reuse backing storage across rebuild iterations
+    # (R2a) instead of reallocating the whole map every iteration.
+    map_clear(eg.hashcons)
+    var count = eg.classes.size
+    for i in 0..count
+      var cls = eg.classes[i]
+      var cls_id = eg_class_get_id(cls)
+      var canonical = eg_find(eg, cls_id)
+      if canonical != cls_id
+        continue
+      end
+      var nodes = eg_class_get_nodes(cls)
+      for j in 0..nodes.size
+        var node_idx = nodes[j]
+        var node = eg.nodes[node_idx]
+        # Re-canonicalize children
+        var c1 = node.child1
+        var c2 = node.child2
+        if c1 >= 0
+          c1 = eg_find(eg, c1)
+          node.child1 = c1
+        end
+        if c2 >= 0
+          c2 = eg_find(eg, c2)
+          node.child2 = c2
+        end
+        # Recompute hashcons key (integer structural hash; children canonical)
+        var key = eg_node_key(node, c1, c2)
+        # Check for a structurally-equal node already registered — merge if it
+        # belongs to a different class (collision-verified via eg_node_key_eq).
+        var existing_canon = eg_hashcons_lookup(eg, key, node.kind, node.op, c1, c2, node.aux, node.aux_str)
+        if existing_canon >= 0
+          if existing_canon != canonical
+            eg_union(eg, canonical, existing_canon)
+            total_merges += 1
+            changed = 1
+          end
+          # else: this node's class is already the registered one — nothing to do
+        else
+          eg_hashcons_insert(eg, key, node_idx)
+        end
+      end
+    end
+  end
+  return total_merges
+end
+
+# ============================================================================
+# Add-and-Union helper
+# ============================================================================
+
+## Add a node to the e-graph and union it with a target class.
+def eg_add_and_union(eg: EGraph, node: ENode, target_class: Int): Int
+  var new_class = eg_add(eg, node)
+  return eg_union(eg, new_class, target_class)
+end
+
+# ============================================================================
+# Count accessors for resource limits
+# ============================================================================
+
+## Get the total number of nodes in the e-graph.
+def eg_node_count(eg: EGraph): Int = eg.nodes.size
+
+## Get the total number of e-classes (including non-canonical).
+def eg_class_count(eg: EGraph): Int = eg.next_class
+
+# ============================================================================
+# Constant detection helpers
+# ============================================================================
+
+## Check if an e-class contains a constant integer node. Returns 1 if yes, 0 if no.
+def eg_class_is_const_int(eg: EGraph, class_id: Int): Int
+  var canonical = eg_find(eg, class_id)
+  var cls = eg.classes[canonical]
+  var nodes = eg_class_get_nodes(cls)
+  for i in 0..nodes.size
+    var node = eg.nodes[nodes[i]]
+    if node.kind == mir::MIR_CONST_INT
+      return 1
+    end
+  end
+  return 0
+end
+
+## Get the integer value of a constant in an e-class. Returns -9999999 if not found.
+def eg_class_const_int_val(eg: EGraph, class_id: Int): Int
+  var canonical = eg_find(eg, class_id)
+  var cls = eg.classes[canonical]
+  var nodes = eg_class_get_nodes(cls)
+  for i in 0..nodes.size
+    var node = eg.nodes[nodes[i]]
+    if node.kind == mir::MIR_CONST_INT
+      return node.aux
+    end
+  end
+  return 0 - 9999999
+end
+
+# ============================================================================
+# Constant folding (shared with egraph_opt)
+# ============================================================================
+
+## Constant fold a binary operation. Returns folded value or -9999999 sentinel.
+def eg_fold(op: Int, lv: Int, rv: Int): Int
+  if op == op_constants::OP_ADD
+    return lv + rv
+  end
+  if op == op_constants::OP_SUB
+    return lv - rv
+  end
+  if op == op_constants::OP_MUL
+    return lv * rv
+  end
+  if op == op_constants::OP_DIV
+    if rv != 0
+      return lv / rv
+    end
+    return 0 - 9999999
+  end
+  if op == op_constants::OP_MOD
+    if rv != 0
+      return lv % rv
+    end
+    return 0 - 9999999
+  end
+  if op == op_constants::OP_SHL
+    return lv << rv
+  end
+  if op == op_constants::OP_SHR
+    return lv >> rv
+  end
+  if op == op_constants::OP_EQ
+    if lv == rv
+      return 1
+    end
+    return 0
+  end
+  if op == op_constants::OP_NE
+    if lv != rv
+      return 1
+    end
+    return 0
+  end
+  if op == op_constants::OP_LT
+    if lv < rv
+      return 1
+    end
+    return 0
+  end
+  if op == op_constants::OP_GT
+    if lv > rv
+      return 1
+    end
+    return 0
+  end
+  if op == op_constants::OP_LE
+    if lv <= rv
+      return 1
+    end
+    return 0
+  end
+  if op == op_constants::OP_GE
+    if lv >= rv
+      return 1
+    end
+    return 0
+  end
+  if op == op_constants::OP_BIT_AND
+    return band(lv, rv)
+  end
+  if op == op_constants::OP_BIT_OR
+    return bor(lv, rv)
+  end
+  if op == op_constants::OP_BIT_XOR
+    return bxor(lv, rv)
+  end
+  return 0 - 9999999
+end
+
+# ============================================================================
+# Algebraic identity/annihilator
+# Returns: >= 0 means identity (return that class)
+#          -2 means annihilator (result is constant 0)
+#          -1 means no optimization
+# ============================================================================
+
+## Check for algebraic identities or annihilators in e-graph context.
+## lid/rid are e-class IDs, lc/rc are 1 if const, lv/rv are values.
+def eg_identity(op: Int, lid: Int, rid: Int, lc: Int, rc: Int, lv: Int, rv: Int): Int
+  # x + 0, 0 + x
+  if op == op_constants::OP_ADD and rc == 1 and rv == 0
+    return lid
+  end
+  if op == op_constants::OP_ADD and lc == 1 and lv == 0
+    return rid
+  end
+  # x - 0
+  if op == op_constants::OP_SUB and rc == 1 and rv == 0
+    return lid
+  end
+  # x * 1, 1 * x
+  if op == op_constants::OP_MUL and rc == 1 and rv == 1
+    return lid
+  end
+  if op == op_constants::OP_MUL and lc == 1 and lv == 1
+    return rid
+  end
+  # x / 1
+  if op == op_constants::OP_DIV and rc == 1 and rv == 1
+    return lid
+  end
+  # x | 0, 0 | x
+  if op == op_constants::OP_BIT_OR and rc == 1 and rv == 0
+    return lid
+  end
+  if op == op_constants::OP_BIT_OR and lc == 1 and lv == 0
+    return rid
+  end
+  # x ^ 0, 0 ^ x
+  if op == op_constants::OP_BIT_XOR and rc == 1 and rv == 0
+    return lid
+  end
+  if op == op_constants::OP_BIT_XOR and lc == 1 and lv == 0
+    return rid
+  end
+  # x & -1
+  if op == op_constants::OP_BIT_AND and rc == 1 and rv == -1
+    return lid
+  end
+  # x << 0, x >> 0
+  if op == op_constants::OP_SHL and rc == 1 and rv == 0
+    return lid
+  end
+  if op == op_constants::OP_SHR and rc == 1 and rv == 0
+    return lid
+  end
+
+  # --- Annihilator (returns -2) ---
+  # x * 0, 0 * x
+  if op == op_constants::OP_MUL
+    if (rc == 1 and rv == 0) or (lc == 1 and lv == 0)
+      return 0 - 2
+    end
+  end
+  # x & 0, 0 & x
+  if op == op_constants::OP_BIT_AND
+    if (rc == 1 and rv == 0) or (lc == 1 and lv == 0)
+      return 0 - 2
+    end
+  end
+  # x - x
+  if op == op_constants::OP_SUB and lid == rid
+    return 0 - 2
+  end
+  # x ^ x
+  if op == op_constants::OP_BIT_XOR and lid == rid
+    return 0 - 2
+  end
+
+  return -1
+end
+
+# ============================================================================
+# Power-of-two check for strength reduction
+# ============================================================================
+
+## Calculate log2 of a power of two. Returns -1 if not a power of two.
+def eg_log2(val: Int): Int
+  if val <= 0
+    return -1
+  end
+  if val == 1
+    return 0
+  end
+  if val == 2
+    return 1
+  end
+  if val == 4
+    return 2
+  end
+  if val == 8
+    return 3
+  end
+  if val == 16
+    return 4
+  end
+  if val == 32
+    return 5
+  end
+  if val == 64
+    return 6
+  end
+  if val == 128
+    return 7
+  end
+  if val == 256
+    return 8
+  end
+  if val == 512
+    return 9
+  end
+  if val == 1024
+    return 10
+  end
+  if val == 2048
+    return 11
+  end
+  if val == 4096
+    return 12
+  end
+  if val == 8192
+    return 13
+  end
+  if val == 16384
+    return 14
+  end
+  if val == 32768
+    return 15
+  end
+  if val == 65536
+    return 16
+  end
+  return -1
+end
+
+# ============================================================================
+# Smart Constructors — apply optimizations eagerly during e-graph build
+# ============================================================================
+
+## Add a constant integer to the e-graph.
+def eg_add_const_int(eg: EGraph, val: Int, dest_type: Int): Int
+  var node = eg_node_new(mir::MIR_CONST_INT, 0, -1, -1, val, dest_type)
+  return eg_add(eg, node)
+end
+
+## Add a binary operation to the e-graph with smart optimizations.
+## Applies constant folding, algebraic identity, annihilators, and strength
+## reduction during construction. Both original and optimized forms coexist.
+def eg_add_binary(eg: EGraph, op: Int, c1: Int, c2: Int, dest_type: Int): Int
+  var lc1 = eg_find(eg, c1)
+  var lc2 = eg_find(eg, c2)
+
+  # Check if operands are constants
+  var l_is_const = eg_class_is_const_int(eg, lc1)
+  var r_is_const = eg_class_is_const_int(eg, lc2)
+  var lv = 0
+  var rv = 0
+  if l_is_const == 1
+    lv = eg_class_const_int_val(eg, lc1)
+  end
+  if r_is_const == 1
+    rv = eg_class_const_int_val(eg, lc2)
+  end
+
+  # --- Constant folding ---
+  # Suppress folding of the overflow-checked ops (ADD/SUB/MUL) under
+  # `--overflow-check` (mirror of mir_opt.qz:203-219; overflow_spec "panics on
+  # addition overflow"). eg_fold is shared with non-trapping ops, so guard here
+  # at the call site rather than inside eg_fold.
+  var is_ovf_op = op == op_constants::OP_ADD or op == op_constants::OP_SUB or op == op_constants::OP_MUL
+  if l_is_const == 1 and r_is_const == 1 and not (eg.overflow_check == 1 and is_ovf_op)
+    var folded = eg_fold(op, lv, rv)
+    if folded != 0 - 9999999
+      return eg_add_const_int(eg, folded, dest_type)
+    end
+  end
+
+  # --- Algebraic identity + annihilator ---
+  var id_result = eg_identity(op, lc1, lc2, l_is_const, r_is_const, lv, rv)
+  if id_result >= 0
+    return id_result
+  end
+  if id_result == 0 - 2
+    return eg_add_const_int(eg, 0, dest_type)
+  end
+
+  # --- Create the binary node (always) ---
+  var node = eg_node_new(mir::MIR_BINARY, op, lc1, lc2, 0, dest_type)
+  var bin_class = eg_add(eg, node)
+
+  # --- Strength reduction: x * 2^n — add BOTH mul and shl, union them ---
+  # Skip under --overflow-check: the shl is non-trapping, so extracting it drops
+  # the checked-mul overflow trap (overflow_spec "panics on multiplication overflow").
+  # Sibling of the const-fold guard above; mirrors mir_opt.qz overflow suppression.
+  if op == op_constants::OP_MUL and eg.overflow_check == 0
+    if r_is_const == 1
+      var shift = eg_log2(rv)
+      if shift >= 0
+        var shift_const = eg_add_const_int(eg, shift, dest_type)
+        var shl_node = eg_node_new(mir::MIR_BINARY, op_constants::OP_SHL, lc1, shift_const, 0, dest_type)
+        eg_add_and_union(eg, shl_node, bin_class)
+      end
+    end
+    if l_is_const == 1
+      var shift = eg_log2(lv)
+      if shift >= 0
+        var shift_const = eg_add_const_int(eg, shift, dest_type)
+        var shl_node = eg_node_new(mir::MIR_BINARY, op_constants::OP_SHL, lc2, shift_const, 0, dest_type)
+        eg_add_and_union(eg, shl_node, bin_class)
+      end
+    end
+  end
+
+  return eg_find(eg, bin_class)
+end
+
+## Add a unary operation to the e-graph with smart optimizations.
+def eg_add_unary(eg: EGraph, op: Int, child: Int, dest_type: Int): Int
+  var lc = eg_find(eg, child)
+  var node = eg_node_new(mir::MIR_UNARY, op, lc, -1, 0, dest_type)
+  return eg_add(eg, node)
+end
+
+# ============================================================================
+# Rewrite Rules for Equality Saturation
+# ============================================================================
+# Each rule scans canonical e-classes, adds equivalent nodes via union,
+# and returns the number of new unions performed.
+
+## Check if a binary op is commutative.
+def eg_is_commutative(op: Int): Int
+  if op == op_constants::OP_ADD or op == op_constants::OP_MUL
+    return 1
+  end
+  if op == op_constants::OP_BIT_AND or op == op_constants::OP_BIT_OR or op == op_constants::OP_BIT_XOR
+    return 1
+  end
+  if op == op_constants::OP_EQ or op == op_constants::OP_NE
+    return 1
+  end
+  return 0
+end
+
+## Commutativity: a + b ≡ b + a for commutative ops.
+def eg_rewrite_commutativity(eg: EGraph): Int
+  var changes = 0
+  var count = eg.classes.size
+  for i in 0..count
+    var cls = eg.classes[i]
+    var cls_id = eg_class_get_id(cls)
+    var canonical = eg_find(eg, cls_id)
+    if canonical != cls_id
+      continue
+    end
+    var nodes = eg_class_get_nodes(cls)
+    for j in 0..nodes.size
+      var node = eg.nodes[nodes[j]]
+      if node.kind == mir::MIR_BINARY and eg_is_commutative(node.op) == 1
+        var c1 = eg_find(eg, node.child1)
+        var c2 = eg_find(eg, node.child2)
+        if c1 != c2
+          # Add b + a and union with the same class
+          var swapped = eg_node_new(mir::MIR_BINARY, node.op, c2, c1, 0, node.dest_type)
+          var swapped_cls = eg_add(eg, swapped)
+          var sc = eg_find(eg, swapped_cls)
+          if sc != canonical
+            eg_union(eg, canonical, swapped_cls)
+            changes += 1
+          end
+        end
+      end
+    end
+  end
+  return changes
+end
+
+## Check if op is associative.
+def eg_is_associative(op: Int): Int
+  if op == op_constants::OP_ADD or op == op_constants::OP_MUL
+    return 1
+  end
+  if op == op_constants::OP_BIT_AND or op == op_constants::OP_BIT_OR or op == op_constants::OP_BIT_XOR
+    return 1
+  end
+  return 0
+end
+
+## Reassociation: (a ⊕ b) ⊕ c ≡ a ⊕ (b ⊕ c) for associative ops.
+## This is the key rule that enables multi-step constant folding.
+def eg_rewrite_reassociation(eg: EGraph): Int
+  var changes = 0
+  var count = eg.classes.size
+  for i in 0..count
+    var cls = eg.classes[i]
+    var cls_id = eg_class_get_id(cls)
+    var canonical = eg_find(eg, cls_id)
+    if canonical != cls_id
+      continue
+    end
+    var nodes = eg_class_get_nodes(cls)
+    for j in 0..nodes.size
+      var node = eg.nodes[nodes[j]]
+      if node.kind != mir::MIR_BINARY or eg_is_associative(node.op) == 0
+        continue
+      end
+      var op = node.op
+      var c1 = eg_find(eg, node.child1)
+      var c2 = eg_find(eg, node.child2)
+
+      # Pattern: (a ⊕ b) ⊕ c → a ⊕ (b ⊕ c)
+      var c1_cls = eg.classes[c1]
+      var c1_nodes = eg_class_get_nodes(c1_cls)
+      for k in 0..c1_nodes.size
+        var inner = eg.nodes[c1_nodes[k]]
+        if inner.kind == mir::MIR_BINARY and inner.op == op
+          var a = eg_find(eg, inner.child1)
+          var b = eg_find(eg, inner.child2)
+          # Create b ⊕ c
+          var bc = eg_add_binary(eg, op, b, c2, node.dest_type)
+          # Create a ⊕ (b ⊕ c)
+          var abc = eg_add_binary(eg, op, a, bc, node.dest_type)
+          var abc_canon = eg_find(eg, abc)
+          # Re-find canonical since eg_add_binary may have changed union-find
+          var cur_canon = eg_find(eg, canonical)
+          if abc_canon != cur_canon
+            eg_union(eg, cur_canon, abc_canon)
+            changes += 1
+          end
+        end
+      end
+    end
+  end
+  return changes
+end
+
+## Strength reduction via saturation: x * 2^n ≡ x << n.
+def eg_rewrite_strength_reduction(eg: EGraph): Int
+  var changes = 0
+  # Skip entirely under --overflow-check: x*2^n ≡ x<<n unions a checked mul with a
+  # non-trapping shl; extracting the shl drops the overflow trap (overflow_spec
+  # "panics on multiplication overflow"). Mirrors the eg_add_binary guard.
+  if eg.overflow_check == 1
+    return 0
+  end
+  var count = eg.classes.size
+  for i in 0..count
+    var cls = eg.classes[i]
+    var cls_id = eg_class_get_id(cls)
+    var canonical = eg_find(eg, cls_id)
+    if canonical != cls_id
+      continue
+    end
+    var nodes = eg_class_get_nodes(cls)
+    for j in 0..nodes.size
+      var node = eg.nodes[nodes[j]]
+      if node.kind == mir::MIR_BINARY and node.op == op_constants::OP_MUL
+        var c1 = eg_find(eg, node.child1)
+        var c2 = eg_find(eg, node.child2)
+        # Check right operand
+        if eg_class_is_const_int(eg, c2) == 1
+          var rv = eg_class_const_int_val(eg, c2)
+          var shift = eg_log2(rv)
+          if shift >= 0
+            var shift_cls = eg_add_const_int(eg, shift, node.dest_type)
+            var shl_node = eg_node_new(mir::MIR_BINARY, op_constants::OP_SHL, c1, shift_cls, 0, node.dest_type)
+            var shl_cls = eg_add(eg, shl_node)
+            var sc = eg_find(eg, shl_cls)
+            var cur_canon = eg_find(eg, canonical)
+            if sc != cur_canon
+              eg_union(eg, cur_canon, sc)
+              changes += 1
+            end
+          end
+        end
+        # Check left operand
+        if eg_class_is_const_int(eg, c1) == 1
+          var lv = eg_class_const_int_val(eg, c1)
+          var shift = eg_log2(lv)
+          if shift >= 0
+            var shift_cls = eg_add_const_int(eg, shift, node.dest_type)
+            var shl_node = eg_node_new(mir::MIR_BINARY, op_constants::OP_SHL, c2, shift_cls, 0, node.dest_type)
+            var shl_cls = eg_add(eg, shl_node)
+            var sc = eg_find(eg, shl_cls)
+            var cur_canon = eg_find(eg, canonical)
+            if sc != cur_canon
+              eg_union(eg, cur_canon, sc)
+              changes += 1
+            end
+          end
+        end
+      end
+    end
+  end
+  return changes
+end
+
+## Comparison flip: a < b ≡ b > a, a <= b ≡ b >= a.
+def eg_rewrite_comparison_flip(eg: EGraph): Int
+  var changes = 0
+  var count = eg.classes.size
+  for i in 0..count
+    var cls = eg.classes[i]
+    var cls_id = eg_class_get_id(cls)
+    var canonical = eg_find(eg, cls_id)
+    if canonical != cls_id
+      continue
+    end
+    var nodes = eg_class_get_nodes(cls)
+    for j in 0..nodes.size
+      var node = eg.nodes[nodes[j]]
+      if node.kind != mir::MIR_BINARY
+        continue
+      end
+      var flip_op = -1
+      if node.op == op_constants::OP_LT
+        flip_op = op_constants::OP_GT
+      end
+      if node.op == op_constants::OP_GT
+        flip_op = op_constants::OP_LT
+      end
+      if node.op == op_constants::OP_LE
+        flip_op = op_constants::OP_GE
+      end
+      if node.op == op_constants::OP_GE
+        flip_op = op_constants::OP_LE
+      end
+      if flip_op >= 0
+        var c1 = eg_find(eg, node.child1)
+        var c2 = eg_find(eg, node.child2)
+        var flipped = eg_node_new(mir::MIR_BINARY, flip_op, c2, c1, 0, node.dest_type)
+        var flipped_cls = eg_add(eg, flipped)
+        var fc = eg_find(eg, flipped_cls)
+        var cur_canon = eg_find(eg, canonical)
+        if fc != cur_canon
+          eg_union(eg, cur_canon, fc)
+          changes += 1
+        end
+      end
+    end
+  end
+  return changes
+end
+
+## Idempotence: a & a → a, a | a → a.
+def eg_rewrite_idempotence(eg: EGraph): Int
+  var changes = 0
+  var count = eg.classes.size
+  for i in 0..count
+    var cls = eg.classes[i]
+    var cls_id = eg_class_get_id(cls)
+    var canonical = eg_find(eg, cls_id)
+    if canonical != cls_id
+      continue
+    end
+    var nodes = eg_class_get_nodes(cls)
+    for j in 0..nodes.size
+      var node = eg.nodes[nodes[j]]
+      if node.kind == mir::MIR_BINARY
+        var c1 = eg_find(eg, node.child1)
+        var c2 = eg_find(eg, node.child2)
+        if c1 == c2
+          if node.op == op_constants::OP_BIT_AND or node.op == op_constants::OP_BIT_OR
+            var cur_canon = eg_find(eg, canonical)
+            if c1 != cur_canon
+              eg_union(eg, cur_canon, c1)
+              changes += 1
+            end
+          end
+        end
+      end
+    end
+  end
+  return changes
+end
+
+## Double negation: ~~x → x, --x → x (unary pairs).
+def eg_rewrite_double_negation(eg: EGraph): Int
+  var changes = 0
+  var count = eg.classes.size
+  for i in 0..count
+    var cls = eg.classes[i]
+    var cls_id = eg_class_get_id(cls)
+    var canonical = eg_find(eg, cls_id)
+    if canonical != cls_id
+      continue
+    end
+    var nodes = eg_class_get_nodes(cls)
+    for j in 0..nodes.size
+      var node = eg.nodes[nodes[j]]
+      if node.kind == mir::MIR_UNARY
+        var c1 = eg_find(eg, node.child1)
+        # Check if child also contains a unary with same op
+        var child_cls = eg.classes[c1]
+        var child_nodes = eg_class_get_nodes(child_cls)
+        for k in 0..child_nodes.size
+          var inner = eg.nodes[child_nodes[k]]
+          if inner.kind == mir::MIR_UNARY and inner.op == node.op
+            # ~~x or --x: union with the grandchild
+            var grandchild = eg_find(eg, inner.child1)
+            var cur_canon = eg_find(eg, canonical)
+            if grandchild != cur_canon
+              eg_union(eg, cur_canon, grandchild)
+              changes += 1
+            end
+          end
+        end
+      end
+    end
+  end
+  return changes
+end
+
+# ============================================================================
+# Saturation Loop
+# ============================================================================
+
+## Run equality saturation with bounded iterations and node count.
+## Returns the number of iterations performed.
+def eg_saturate(eg: EGraph, max_iters: Int, max_nodes: Int): Int
+  var iter = 0
+  while iter < max_iters and eg_node_count(eg) < max_nodes
+    var changes = 0
+    changes += eg_rewrite_commutativity(eg)
+    changes += eg_rewrite_reassociation(eg)
+    changes += eg_rewrite_strength_reduction(eg)
+    changes += eg_rewrite_comparison_flip(eg)
+    changes += eg_rewrite_idempotence(eg)
+    changes += eg_rewrite_double_negation(eg)
+    eg_rebuild(eg)
+    if changes == 0
+      break
+    end
+    iter += 1
+  end
+  return iter
+end

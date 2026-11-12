@@ -1,0 +1,432 @@
+##! # Map Intrinsics — Unified Dispatch Layer
+##!
+##! Routes map_* intrinsic calls to the correct key-type-specialized codegen:
+##!   - String keys → cg_intrinsic_data (string-key IR emission)
+##!   - Int keys    → cg_intrinsic_intmap (int-key IR emission)
+##!
+##! Key type is determined from the elem_type annotation (MIR slot2):
+##!   "Int,*" or "I" → integer key path
+##!   everything else → string key path (default)
+##!
+##! @see codegen_intrinsics Main intrinsic dispatcher
+##! @see cg_intrinsic_data String-key map codegen
+##! @see cg_intrinsic_intmap Integer-key map codegen
+
+import mir
+import codegen_util
+import cg_intrinsic_data
+import cg_intrinsic_intmap
+import cg_intrinsic_vec
+import * from str_compat
+
+## Determine if the key type annotation indicates integer keys.
+## Returns true for "Int", "Int,...", or "I" (shorthand from map literal lowering).
+def _map_is_int_key(elem_type: String): Bool
+  if str_byte_len(elem_type) == 0
+    return false
+  end
+  if elem_type == "Int"
+    return true
+  end
+  if str_byte_len(elem_type) >= 3
+    if elem_type.starts_with("Int")
+      return true
+    end
+  end
+  if str_byte_len(elem_type) == 1
+    if str_byte_at(elem_type, 0) == 'I'
+      return true
+    end
+  end
+  return false
+end
+
+## Map a unified map_* name to its string-key IR function name.
+def _map_to_hashmap_name(name: String): String
+  if name == "map_new"
+    return "hashmap_new"
+  end
+  if name == "map_get"
+    return "hashmap_get"
+  end
+  if name == "map_set"
+    return "hashmap_set"
+  end
+  if name == "map_has"
+    return "hashmap_has"
+  end
+  if name == "map_delete"
+    return "hashmap_delete"
+  end
+  if name == "map_size"
+    return "hashmap_size"
+  end
+  if name == "map_keys"
+    return "hashmap_keys"
+  end
+  if name == "map_values"
+    return "hashmap_values"
+  end
+  if name == "map_clear"
+    return "hashmap_clear"
+  end
+  if name == "map_free"
+    return "hashmap_free"
+  end
+  if name == "__map_get_raw"
+    return "__hashmap_get_sentinel"
+  end
+  if name == "map_fetch"
+    return "hashmap_fetch"
+  end
+  return name
+end
+
+## Map a unified map_* name to its int-key IR function name.
+def _map_to_intmap_name(name: String): String
+  if name == "map_new"
+    return "intmap_new"
+  end
+  if name == "map_get"
+    return "intmap_get"
+  end
+  if name == "map_set"
+    return "intmap_set"
+  end
+  if name == "map_has"
+    return "intmap_has"
+  end
+  if name == "map_delete"
+    return "intmap_delete"
+  end
+  if name == "map_size"
+    return "intmap_size"
+  end
+  if name == "map_keys"
+    return "intmap_keys"
+  end
+  if name == "map_values"
+    return "intmap_values"
+  end
+  if name == "map_clear"
+    return "intmap_clear"
+  end
+  if name == "map_free"
+    return "intmap_free"
+  end
+  if name == "__map_get_raw"
+    return "intmap_get_sentinel"
+  end
+  if name == "map_fetch"
+    return "intmap_fetch"
+  end
+  return name
+end
+
+## R1b — resolve a struct-key annotation to the struct name IFF it is a
+## value-layout, all-hashable user struct (the exact set for which codegen emits
+## `@qz_hash_<Name>` / `@qz_eq_<Name>` per item 51b). Returns "" for anything
+## else so the String / Int key paths lower to byte-identical IR.
+##
+## Predicate parity: this must agree with cg_emit_struct_hash_eq_functions'
+## emission gate (all fields Int/Bool/String/Symbol or narrow-fixed-width) AND
+## with mir_prog_is_value_layout_type (the prog-side value-layout verdict). If
+## the struct is not value-layout the key is a boxed reference whose existing
+## String-key behavior is preserved (R1b only fixes value-layout struct keys).
+def _map_struct_key_name(prog: mir::MirProgram, elem_type: String): String
+  if str_byte_len(elem_type) == 0
+    return ""
+  end
+  # Int/String annotations are never struct keys.
+  if elem_type == "Int" or elem_type == "String"
+    return ""
+  end
+  # Strip any generic args (registry keys are the bare struct name).
+  var name = elem_type
+  var lt = __char_index(name, '<')
+  if lt > 0
+    name = str_byte_slice(name, 0, lt)
+  end
+  if str_byte_len(name) == 0
+    return ""
+  end
+  # Must be value-layout on the prog side (@value unconditionally, OR an eligible
+  # plain struct once the F4 gate is live). INERT at gate 0 → returns "".
+  if mir::mir_prog_is_value_layout_type(prog, name) == 0
+    return ""
+  end
+  # Must be a known struct whose every field is hashable (mirror the emission
+  # gate in cg_emit_struct_hash_eq_functions EXACTLY, incl. narrow ints), else
+  # qz_hash_<Name>/qz_eq_<Name> are not emitted and the call would dangle.
+  var struct_defs = mir::mir_get_struct_defs(prog)
+  if as_int(struct_defs) == 0
+    return ""
+  end
+  var count = struct_defs.size
+  for i in 0..count
+    var entry = struct_defs[i]
+    if entry.name == name
+      var field_types = entry.field_types
+      var fc = vec_size(field_types)
+      if fc == 0
+        return ""
+      end
+      for j in 0..fc
+        var ft = as_string(field_types[j])
+        if ft != "Int" and ft != "Bool" and ft != "String" and ft != "Symbol" and mir::mir_is_narrow_fixed_width(ft) == 0
+          return ""
+        end
+      end
+      return name
+    end
+  end
+  return ""
+end
+
+## item 1a — emit `map_keys` for a value-layout struct-key map.
+##
+## The map header is [cap, size, keys_ptr, vals_ptr]; each keys_ptr slot holds a
+## KEY BOX POINTER (empty=0, tombstone=1, valid>=2 — the pointer to the caller's
+## inline struct value). The result is a value-layout `Vec<Struct>` whose elements
+## are the inline struct VALUES copied out of those box pointers (stride fc*8 wide,
+## sizeof(%struct.Name) narrow) — exactly the layout vec_get / for-in read back
+## (direct GEP into the Vec data, no indirection). The string-key emitter instead
+## stores the raw slot bits into an 8-byte-stride pointer Vec, which a value-layout
+## consumer decodes as inline fields → garbage. This path is only reached when the
+## key resolves to a value-layout hashable struct (_map_struct_key_name != "");
+## String/Int keys never enter here, so their map_keys IR is byte-identical.
+def _cg_emit_map_custom_keys(state: CodegenState, out: Int, prog: mir::MirProgram, instr: mir::MirInstr, dest: Int, args: Vec<Int>, d: String, key_name: String): Void can Emit
+  var hmap = args[0]
+  var lbl = codegen_util::cg_next_label(state).to_s()
+  # Per-element inline width. Wide struct => field_count*8; narrow-packed struct
+  # => sizeof(%struct.Name) (computed once via the LLVM sizeof idiom). fc>=1 is
+  # guaranteed here (value-layout hashable struct), but guard defensively.
+  var fc = cg_intrinsic_vec::cg_vec_inline_field_count(prog, key_name)
+  var pack = cg_intrinsic_vec::cg_vec_pack_narrow(prog, key_name)
+  var stride_lit = (fc * 8).to_s()
+  if fc < 1
+    # Defensive: should never happen for a resolved struct key. Fall back to the
+    # string path so we never emit a zero-stride Vec.
+    cg_intrinsic_data::cg_emit_map_str_key(state, out, prog, instr, dest, "hashmap_keys", args, args.size, d, key_name)
+    return
+  end
+  # Map header + keys array.
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.hdr = inttoptr i64 %v#{hmap} to ptr")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.cap = load i64, ptr %mk#{lbl}.hdr")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.keys.p = getelementptr i64, ptr %mk#{lbl}.hdr, i64 2")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.keys.i = load i64, ptr %mk#{lbl}.keys.p")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.keys = inttoptr i64 %mk#{lbl}.keys.i to ptr")
+  # Per-element stride (bytes). Narrow packs to sizeof(%struct.Name).
+  if pack == 1
+    codegen_util::cg_emit_line(out, "  %mk#{lbl}.szgep = getelementptr %struct.#{key_name}, ptr null, i64 1")
+    codegen_util::cg_emit_line(out, "  %mk#{lbl}.stride = ptrtoint ptr %mk#{lbl}.szgep to i64")
+  else
+    codegen_util::cg_emit_line(out, "  %mk#{lbl}.stride = add i64 0, #{stride_lit}")
+  end
+  # Result Vec: 32-byte header [cap, size, data_ptr, elem_width]. cap = map cap
+  # (over-allocated, matching the string path); size counted as we fill.
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.datasize = mul i64 %mk#{lbl}.cap, %mk#{lbl}.stride")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.vhdr = call ptr @__qz_alloc(i64 32)")
+  codegen_util::cg_emit_line(out, "  store i64 %mk#{lbl}.cap, ptr %mk#{lbl}.vhdr")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.vlen = getelementptr i64, ptr %mk#{lbl}.vhdr, i64 1")
+  codegen_util::cg_emit_line(out, "  store i64 0, ptr %mk#{lbl}.vlen")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.vdata = call ptr @__qz_alloc(i64 %mk#{lbl}.datasize)")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.vdata.i = ptrtoint ptr %mk#{lbl}.vdata to i64")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.dp = getelementptr i64, ptr %mk#{lbl}.vhdr, i64 2")
+  codegen_util::cg_emit_line(out, "  store i64 %mk#{lbl}.vdata.i, ptr %mk#{lbl}.dp")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.ewp = getelementptr i64, ptr %mk#{lbl}.vhdr, i64 3")
+  codegen_util::cg_emit_line(out, "  store i64 %mk#{lbl}.stride, ptr %mk#{lbl}.ewp")
+  # Scan cap slots; a valid key slot holds a box pointer (>=2). A dedicated
+  # preheader block names the phi's entry predecessor unambiguously.
+  codegen_util::cg_emit_line(out, "  br label %mk#{lbl}.pre")
+  codegen_util::cg_emit_line(out, "mk#{lbl}.pre:")
+  codegen_util::cg_emit_line(out, "  br label %mk#{lbl}.loop")
+  codegen_util::cg_emit_line(out, "mk#{lbl}.loop:")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.i = phi i64 [ 0, %mk#{lbl}.pre ], [ %mk#{lbl}.next, %mk#{lbl}.cont ]")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.done = icmp sge i64 %mk#{lbl}.i, %mk#{lbl}.cap")
+  codegen_util::cg_emit_line(out, "  br i1 %mk#{lbl}.done, label %mk#{lbl}.end, label %mk#{lbl}.check")
+  codegen_util::cg_emit_line(out, "mk#{lbl}.check:")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.slot.p = getelementptr i64, ptr %mk#{lbl}.keys, i64 %mk#{lbl}.i")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.slot = load i64, ptr %mk#{lbl}.slot.p")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.valid = icmp ugt i64 %mk#{lbl}.slot, 1")
+  codegen_util::cg_emit_line(out, "  br i1 %mk#{lbl}.valid, label %mk#{lbl}.add, label %mk#{lbl}.cont")
+  codegen_util::cg_emit_line(out, "mk#{lbl}.add:")
+  # Destination slot = vdata + curlen*stride (byte GEP). Source = key box pointer.
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.curlen = load i64, ptr %mk#{lbl}.vlen")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.byteoff = mul i64 %mk#{lbl}.curlen, %mk#{lbl}.stride")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.dst = getelementptr i8, ptr %mk#{lbl}.vdata, i64 %mk#{lbl}.byteoff")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.src = inttoptr i64 %mk#{lbl}.slot to ptr")
+  codegen_util::cg_emit_line(out, "  call void @llvm.memcpy.p0i8.p0i8.i64(ptr %mk#{lbl}.dst, ptr %mk#{lbl}.src, i64 %mk#{lbl}.stride, i1 false)")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.newlen = add i64 %mk#{lbl}.curlen, 1")
+  codegen_util::cg_emit_line(out, "  store i64 %mk#{lbl}.newlen, ptr %mk#{lbl}.vlen")
+  codegen_util::cg_emit_line(out, "  br label %mk#{lbl}.cont")
+  codegen_util::cg_emit_line(out, "mk#{lbl}.cont:")
+  codegen_util::cg_emit_line(out, "  %mk#{lbl}.next = add i64 %mk#{lbl}.i, 1")
+  codegen_util::cg_emit_line(out, "  br label %mk#{lbl}.loop")
+  codegen_util::cg_emit_line(out, "mk#{lbl}.end:")
+  codegen_util::cg_emit_line(out, "  %v#{d} = ptrtoint ptr %mk#{lbl}.vhdr to i64")
+end
+
+## item-20 Phase 6 — heap-copy a value-layout struct key into map-owned storage
+## and return an SSA operand string ("%okN.i") holding the owned pointer as i64,
+## OR the original `%v<key>` operand when no copy is needed.
+##
+## Two struct-key regimes, distinguished by layout:
+##   - FLAT (≤16B, non-CoW): the key VALUE is a pointer into the CALLER's frame — a
+##     stack alloca for a `Point{..}` literal, or a local var's slot. Storing that
+##     raw pointer makes the map ALIAS caller memory: if the map OUTLIVES the key's
+##     scope (built in a helper, returned), the stored key dangles -> get()/keys()
+##     read freed stack -> wrong result / garbage. FIX: __qz_alloc a struct-sized
+##     buffer here and memcpy the fields in, so the map OWNS its keys ("own, don't
+##     alias" — design BORROW_RECEIVER_CONVENTION.md §5 Phase 6 / §7 Q3, the `sink`
+##     convention for values that escape into a container).
+##   - COW (>16B): the key VALUE is already a pointer to a HEAP refcount buffer
+##     ([rc@0, fields@1..N]) — NOT a stack alloca. It already outlives the caller
+##     frame, so it is safe to store as-is; copying it (or freeing it) would corrupt
+##     the CoW refcount discipline. Pass through unchanged.
+##
+## `cg_vec_inline_field_count` returns 0 for a CoW struct (it deliberately routes
+## CoW elements through the boxed-pointer path), which is exactly the CoW signal.
+def _emit_own_key_copy(state: CodegenState, out: Int, prog: mir::MirProgram, key_slot: Int, sname: String): String
+  var orig = "%v#{key_slot.to_s()}"
+  # CoW keys (fc==0 here) are already heap-owned buffer pointers — do not copy.
+  var fc = cg_intrinsic_vec::cg_vec_inline_field_count(prog, sname)
+  if fc < 1
+    return orig
+  end
+  var lbl = codegen_util::cg_next_label(state).to_s()
+  var pack = cg_intrinsic_vec::cg_vec_pack_narrow(prog, sname)
+  # Flat struct byte size: narrow-packed => sizeof(%struct.Name); wide => fc*8.
+  if pack == 1
+    codegen_util::cg_emit_line(out, "  %ok#{lbl}.szgep = getelementptr %struct.#{sname}, ptr null, i64 1")
+    codegen_util::cg_emit_line(out, "  %ok#{lbl}.sz = ptrtoint ptr %ok#{lbl}.szgep to i64")
+  else
+    var bytes = (fc * 8).to_s()
+    codegen_util::cg_emit_line(out, "  %ok#{lbl}.sz = add i64 0, #{bytes}")
+  end
+  codegen_util::cg_emit_line(out, "  %ok#{lbl}.dst = call ptr @__qz_alloc(i64 %ok#{lbl}.sz)")
+  codegen_util::cg_emit_line(out, "  %ok#{lbl}.src = inttoptr i64 #{orig} to ptr")
+  codegen_util::cg_emit_line(out, "  call void @llvm.memcpy.p0i8.p0i8.i64(ptr %ok#{lbl}.dst, ptr %ok#{lbl}.src, i64 %ok#{lbl}.sz, i1 false)")
+  codegen_util::cg_emit_line(out, "  %ok#{lbl}.i = ptrtoint ptr %ok#{lbl}.dst to i64")
+  return "%ok#{lbl}.i"
+end
+
+## R1b — emit a struct-key map op via the field-deep custom-map runtime
+## (`@qz_map_custom_*` in codegen_runtime.qz), threading the struct's
+## `@qz_hash_<Name>` / `@qz_eq_<Name>` fn-pointers. Allocation / iteration /
+## size / free are key-agnostic (the header layout is byte-identical to the
+## string hashmap: [cap, size, keys_ptr, vals_ptr]) so they delegate to the
+## string-key emitter; only the key-HASHING ops (get/has/set/delete/fetch/raw)
+## route to the custom runtime.
+def _cg_emit_map_custom_key(state: CodegenState, out: Int, prog: mir::MirProgram, instr: mir::MirInstr, dest: Int, name: String, args: Vec<Int>, argc: Int, d: String, _elem_type: String, sname: String): Void can Emit
+  # Key-agnostic ops share the string hashmap layout exactly — delegate so
+  # new/size/free/clear/values produce identical IR to the string path.
+  # (map_keys is NOT key-agnostic: for a value-layout struct key the stored key
+  # slot is a BOX POINTER, and the result Vec<Struct> is value-layout — each
+  # element must be the inline struct COPIED OUT of that pointer, not the raw
+  # pointer bits. The string emitter stores the raw slot bits (correct for
+  # String char* keys, garbage for struct-by-value keys), so map_keys gets a
+  # dedicated struct-key emitter below.)
+  if name == "map_new" or name == "map_size" or name == "map_free" or name == "map_clear" or name == "map_values"
+    var hm_name = _map_to_hashmap_name(name)
+    cg_intrinsic_data::cg_emit_map_str_key(state, out, prog, instr, dest, hm_name, args, argc, d, _elem_type)
+    return
+  end
+
+  if name == "map_keys"
+    _cg_emit_map_custom_keys(state, out, prog, instr, dest, args, d, sname)
+    return
+  end
+
+  if name == "map_set"
+    # item-20 Phase 6 — OWN-ON-INSERT. The value-layout struct key arrives as a
+    # pointer into the CALLER's frame (a stack alloca for a `Point{..}` literal, or
+    # a local var's slot). Storing that raw pointer makes the map alias caller
+    # memory: if the map OUTLIVES the key's scope (built in a helper, returned), the
+    # stored key dangles -> get()/keys() read freed stack -> wrong result / garbage.
+    # Design BORROW_RECEIVER_CONVENTION.md §5 Phase 6 / §7 Q3: a value struct that
+    # escapes into a container is OWNED (sink), never borrowed. So heap-copy the key
+    # struct here and hand the map the owned copy. The map frees it on delete/rehash
+    # is pointer-relocation only (no free). custom_set is struct-key-ONLY, so the
+    # stored pointer is always this owned copy -> the runtime may free it safely.
+    var ok_key = _emit_own_key_copy(state, out, prog, args[1], sname)
+    codegen_util::cg_emit(out, "  call void @qz_map_custom_set(i64 %v")
+    codegen_util::cg_emit_int(out, args[0])
+    codegen_util::cg_emit(out, ", i64 ")
+    codegen_util::cg_emit(out, ok_key)
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_int(out, args[2])
+    codegen_util::cg_emit(out, ", ptr @qz_hash_#{sname}, ptr @qz_eq_#{sname})")
+    codegen_util::cg_emit_line(out, "")
+    # map_set has an i64 dest slot in MIR; give it a defined value like intmap_set.
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, " = add i64 0, 0")
+    return
+  end
+
+  if name == "map_get" or name == "__map_get_raw" or name == "map_fetch"
+    # @qz_map_custom_get returns an Option box (Some(v)/None) directly.
+    # map_get wants exactly that Option. map_fetch/__map_get_raw is rare on
+    # struct keys; route it through the same Option-returning path (callers
+    # that unwrap will still see Some on hit).
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, " = call i64 @qz_map_custom_get(i64 %v")
+    codegen_util::cg_emit_int(out, args[0])
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_int(out, args[1])
+    codegen_util::cg_emit(out, ", ptr @qz_hash_#{sname}, ptr @qz_eq_#{sname})")
+    codegen_util::cg_emit_line(out, "")
+    return
+  end
+
+  if name == "map_has"
+    # @qz_map_custom_has(i64 %map, i64 %key, ptr %hash, ptr %eq) -> i64 (0/1)
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, " = call i64 @qz_map_custom_has(i64 %v")
+    codegen_util::cg_emit_int(out, args[0])
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_int(out, args[1])
+    codegen_util::cg_emit(out, ", ptr @qz_hash_#{sname}, ptr @qz_eq_#{sname})")
+    codegen_util::cg_emit_line(out, "")
+    return
+  end
+
+  if name == "map_delete"
+    # @qz_map_custom_delete(i64 %map, i64 %key, ptr %hash, ptr %eq) -> void
+    codegen_util::cg_emit(out, "  call void @qz_map_custom_delete(i64 %v")
+    codegen_util::cg_emit_int(out, args[0])
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_int(out, args[1])
+    codegen_util::cg_emit(out, ", ptr @qz_hash_#{sname}, ptr @qz_eq_#{sname})")
+    codegen_util::cg_emit_line(out, "")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, " = add i64 0, 0")
+    return
+  end
+
+  # Any other map_* op falls back to the string path (key-agnostic residuals).
+  var hm_fallback = _map_to_hashmap_name(name)
+  cg_intrinsic_data::cg_emit_map_str_key(state, out, prog, instr, dest, hm_fallback, args, argc, d, _elem_type)
+end
+
+## Dispatch a map_* intrinsic call to the appropriate key-type-specialized handler.
+def cg_emit_intrinsic_map(state: CodegenState, out: Int, prog: mir::MirProgram, instr: mir::MirInstr, dest: Int, name: String, args: Vec<Int>, argc: Int, d: String, _elem_type: String): Void can Emit
+  if _map_is_int_key(_elem_type)
+    var im_name = _map_to_intmap_name(name)
+    cg_intrinsic_intmap::cg_emit_map_int_key(state, out, prog, instr, dest, im_name, args, argc, d, _elem_type)
+  else
+    # R1b — value-layout hashable struct key → field-deep custom-map runtime.
+    # Empty result ⇒ not a struct key ⇒ byte-identical String-key path.
+    var sk_name = _map_struct_key_name(prog, _elem_type)
+    if str_byte_len(sk_name) > 0
+      _cg_emit_map_custom_key(state, out, prog, instr, dest, name, args, argc, d, _elem_type, sk_name)
+    else
+      var hm_name = _map_to_hashmap_name(name)
+      cg_intrinsic_data::cg_emit_map_str_key(state, out, prog, instr, dest, hm_name, args, argc, d, _elem_type)
+    end
+  end
+end

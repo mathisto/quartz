@@ -1,0 +1,214 @@
+## QSpec coverage for Phase E.1.b — auto-arena via `go` keyword.
+##
+## Phase E.1.a (2026-04-28) shipped `go_arena(f)` as an opt-in stdlib API.
+## Phase E.1.b (this spec): `go fn(args)` (named function, value-typed
+## return) automatically wraps the goroutine body in
+## `with Alloc.in_arena(arena_new(8192)) do -> fn(args) end +
+## arena_destroy` at MIR-lowering time. Conservative gate: skips
+## reference-typed returns (would dangle after arena_destroy until E.4
+## lands escape mechanism), lambda forms (avoid double-wrap with
+## go_arena's internal `go (-> _go_arena_body(f))`), unknown callees
+## (extern/intrinsic/local fn-typed bindings), and programs that don't
+## import std/alloc (avoids dangling `@arena_alloc_handler_e` link refs
+## until those handlers move into runtime IR).
+##
+## What these tests prove:
+##
+##   E1b.a — `go fn()` (named, value-typed return) auto-arenas:
+##           outer Alloc tracking handler observes FEWER allocations
+##           than the same fn called directly (per-task arena absorbs
+##           the bulk).
+##   E1b.b — Reference-typed return (`go fn_returning_string()`):
+##           returned string remains valid after await, no dangle.
+##           Pre-E.4.a: gate skipped String, body allocs went to libc.
+##           Post-E.4.a slice 1: gate accepts String, body absorbed
+##           by per-task arena, returned String deep-copied via
+##           `arena_promote_string` before `arena_destroy`. The
+##           user-observable behavior (string survives await) is
+##           unchanged across the implementation flip.
+##   E1b.c — Lambda form (`go (-> body)()`) skips the auto-arena gate:
+##           use `go_arena(f)` for opt-in lambda arenas. Avoids the
+##           double-wrap that would otherwise happen inside
+##           `go_arena`'s implementation.
+##   E1b.d — Multi-worker scheduler (sched_init(0)) — auto-arena fires
+##           safely under parallel goroutines on different worker
+##           threads. Cross-thread arena lifetime is per-task.
+
+import * from qspec
+import * from qspec/subprocess
+
+# -----------------------------------------------------------------------------
+# E1b.a — basic auto-arena: `go fn()` (named, Int return) absorbs body's
+# allocations into a per-task arena. Outer Alloc tracking handler observes
+# only the spawn-time allocations (frame setup), not the body's vec.push
+# allocations. Compare against direct-call baseline.
+# -----------------------------------------------------------------------------
+
+var _BASIC_AUTO: String = """import * from std/sync/composition/go
+import * from std/alloc
+
+def heavy_alloc(): Int
+  var v = vec_new<Int>()
+  for i in 0..200
+    v.push(i)
+  end
+  return v.size
+end
+
+def main(): Int
+  sched_init(1)
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    # Direct call — handler sees all 200-push allocations.
+    alloc_reset_tracking()
+    var direct_size = heavy_alloc()
+    var direct_count = alloc_tracking_alloc_count()
+
+    # `go fn()` — auto-arena absorbs the body's allocations. Outer
+    # handler sees only spawn-time + a few overhead allocs.
+    alloc_reset_tracking()
+    var fut = go heavy_alloc()
+    var go_size = await fut
+    var go_count = alloc_tracking_alloc_count()
+
+    # The exact counts vary by allocator behavior, but go_count must be
+    # strictly less than direct_count (auto-arena absorbs the bulk).
+    if go_count < direct_count
+      puts(\"absorbed\")
+    else
+      puts(\"missed:direct=\" + str_from_int(direct_count) + \",go=\" + str_from_int(go_count))
+    end
+    0
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E1b.b — reference-typed return: `go fn_returning_string()` does NOT
+# auto-arena (would dangle after arena_destroy until E.4 lands). Falls
+# through to libc heap; the returned String survives await.
+# -----------------------------------------------------------------------------
+
+var _STRING_RETURN: String = """import * from std/sync/composition/go
+import * from std/alloc
+
+def make_greeting(): String
+  return \"hello-from-goroutine\"
+end
+
+def main(): Int
+  sched_init(1)
+  var fut = go make_greeting()
+  var s = await fut
+  # Phase E.4.a slice 1: auto-arena now accepts String returns; the
+  # promote-string deep-copy at task-end gives the parent a libc-heap
+  # copy. Pre-E.4.a the gate skipped String returns and the body's
+  # allocations went directly to libc — same observable result.
+  if s == \"hello-from-goroutine\"
+    puts(\"survives\")
+  else
+    puts(\"dangle\")
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E1b.c — lambda form skip: `go (-> body)()` does NOT trigger auto-arena.
+# This is what makes go_arena(f)'s internal `go (-> _go_arena_body(f))`
+# work without infinite re-wrapping. Users who want arenas in lambda
+# form opt in via `go_arena(f)`.
+# -----------------------------------------------------------------------------
+
+var _LAMBDA_SKIP: String = """import * from std/sync/composition/go
+import * from std/alloc
+
+def main(): Int
+  sched_init(1)
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    alloc_reset_tracking()
+    var fut = go (-> {
+      var v = vec_new<Int>()
+      for i in 0..50
+        v.push(i)
+      end
+      v.size
+    })()
+    var r = await fut
+    var n = alloc_tracking_alloc_count()
+    # Lambda form falls through to libc heap → tracking handler observes
+    # ALL of the body's allocations (no per-task arena).
+    # The body does ~7 allocs (vec_new + 50-push growth) + spawn overhead.
+    # Concrete threshold: should be > 5 (vs E1b.a's go form which is < 5).
+    if n > 5
+      puts(\"unwrapped\")
+    else
+      puts(\"unexpected:\" + str_from_int(n))
+    end
+    0
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E1b.d — multi-worker safety: parallel goroutines under sched_init(0)
+# each get their own per-task arena, no cross-thread leakage. Per-worker
+# TLS effect stack (Phase E.1.c) means each worker's `with Alloc.in_arena`
+# install lives in its own TLS, so concurrent arenas don't race.
+# -----------------------------------------------------------------------------
+
+var _PARALLEL_AUTO: String = """import * from std/sync/composition/go
+import * from std/alloc
+
+def burst(): Int
+  var v = vec_new<Int>()
+  for i in 0..100
+    v.push(i * 2)
+  end
+  return v.size
+end
+
+def main(): Int
+  sched_init(0)
+  var f1 = go burst()
+  var f2 = go burst()
+  var f3 = go burst()
+  var f4 = go burst()
+  var r1 = await f1
+  var r2 = await f2
+  var r3 = await f3
+  var r4 = await f4
+  if r1 == 100 and r2 == 100 and r3 == 100 and r4 == 100
+    puts(\"parallel-ok\")
+  else
+    puts(\"failed:\" + str_from_int(r1) + \",\" + str_from_int(r2) + \",\" + str_from_int(r3) + \",\" + str_from_int(r4))
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+def main(): Int
+  describe("Phase E.1.b — auto-arena via `go` keyword for value-typed-return goroutines") do ->
+    it("`go fn()` (named, value-typed return) auto-arenas: outer Alloc handler observes fewer allocations than direct call") do ->
+      assert_run_stdout_eq(_BASIC_AUTO, "absorbed\n")
+    end
+
+    it("reference-typed returns (`go fn(): String`) skip auto-arena, return survives await") do ->
+      assert_run_stdout_eq(_STRING_RETURN, "survives\n")
+    end
+
+    it("lambda form (`go (-> body)()`) skips auto-arena gate; outer handler observes the body's allocations") do ->
+      assert_run_stdout_eq(_LAMBDA_SKIP, "unwrapped\n")
+    end
+
+    it("parallel auto-arena under multi-worker scheduler (sched_init(0))") do ->
+      assert_run_stdout_eq(_PARALLEL_AUTO, "parallel-ok\n")
+    end
+  end
+  return qspec_main()
+end

@@ -1,0 +1,190 @@
+## http_dynamic_goroutine_sup standalone smoke — D.11 Phase 2 chunk 2b.
+##
+## Standalone `def main()` so real worker threads spawn (qspec lambda
+## bodies inline-poll goroutines per the project caveat in CLAUDE.md;
+## completion-count assertions there would be flaky). Mirrors the
+## structure of `spec/qz/dynamic_supervisor_smoke.qz` — print
+## "OK: <test>" / "FAIL: <test>" per case, return 0 on full pass.
+##
+## Covers:
+##   1. Spawn N=5 short-running bodies → completion_count reaches 5
+##      within a bounded watch window (watcher GCs slots)
+##   2. Spawn a body that throws → wrapper swallows + slot still
+##      completes (no crash, completion_count increments)
+##   3. Mixed normal + throwing bodies → all complete
+##   4. stop() drains in-flight goroutines (alive == 0 after stop)
+##
+## Build + run:
+##   ./self-hosted/bin/quartz spec/qz/http_dyn_gsup_smoke.qz \
+##     | llc -filetype=obj -o /tmp/hdgs.o
+##   clang /tmp/hdgs.o -o /tmp/hdgs -lm -lpthread
+##   /tmp/hdgs
+
+import * from std/net/http_dynamic_goroutine_sup
+import * from std/throws
+
+extern "C" def usleep(us: Int): Int
+
+# Short body: returns immediately. Used for normal-completion paths.
+def smoke_noop_body(): Int
+  return 0
+end
+
+# Throwing body: the wrapper's Throws-swallow handler catches this so
+# the task still reaches state == -1 (done).
+def smoke_throwing_body(): Int
+  throw("smoke-test-throw")
+  return 0
+end
+
+# Wait up to `max_ms` for `completion_count` to reach `target`. Returns
+# 1 on success, 0 on timeout. Uses 10ms increments — same idiom as
+# spec/qz/dynamic_supervisor_smoke.qz's _wait_for_restart.
+def _wait_for_completion(sup: HttpDynamicGoroutineSup, target: Int, max_ms: Int): Int
+  var attempts = 0
+  var max = max_ms / 10
+  while attempts < max
+    if http_dyn_gsup_completion_count(sup) >= target
+      return 1
+    end
+    usleep(10000)
+    attempts = attempts + 1
+  end
+  return 0
+end
+
+def main(): Int
+  # Test 1: N=5 noop bodies → completion_count == 5
+  var sup = http_dyn_gsup_new()
+  var i = 0
+  while i < 5
+    var t = http_dyn_gsup_spawn_one(sup, smoke_noop_body)
+    if t == 0
+      puts("FAIL: spawn_one returned 0 in test 1 at i=#{str_from_int(i)}")
+      return 1
+    end
+    i = i + 1
+  end
+  if http_dyn_gsup_spawn_count(sup) != 5
+    puts("FAIL: spawn_count != 5 after 5 spawns (got #{str_from_int(http_dyn_gsup_spawn_count(sup))})")
+    return 2
+  end
+  # Watcher's park budget is 100ms; give it up to 2s for completion.
+  if _wait_for_completion(sup, 5, 2000) == 0
+    puts("FAIL: completion_count never reached 5 (got #{str_from_int(http_dyn_gsup_completion_count(sup))})")
+    return 3
+  end
+  if http_dyn_gsup_alive(sup) != 0
+    puts("FAIL: alive != 0 after all completed (got #{str_from_int(http_dyn_gsup_alive(sup))})")
+    return 4
+  end
+  http_dyn_gsup_stop(sup)
+  puts("OK: 5 noop bodies completed; watcher GC'd all slots")
+
+  # Test 2: throwing body — wrapper swallows, slot still completes
+  var sup2 = http_dyn_gsup_new()
+  http_dyn_gsup_spawn_one(sup2, smoke_throwing_body)
+  if _wait_for_completion(sup2, 1, 2000) == 0
+    puts("FAIL: throwing body never reached completion (wrapper failed to swallow?)")
+    return 5
+  end
+  if http_dyn_gsup_alive(sup2) != 0
+    puts("FAIL: alive != 0 after throwing body completed (got #{str_from_int(http_dyn_gsup_alive(sup2))})")
+    return 6
+  end
+  http_dyn_gsup_stop(sup2)
+  puts("OK: throwing body completed cleanly (Throws wrapper swallowed)")
+
+  # Test 3: mixed normal + throwing bodies — all complete
+  var sup3 = http_dyn_gsup_new()
+  var j = 0
+  while j < 10
+    if j % 2 == 0
+      http_dyn_gsup_spawn_one(sup3, smoke_noop_body)
+    else
+      http_dyn_gsup_spawn_one(sup3, smoke_throwing_body)
+    end
+    j = j + 1
+  end
+  if _wait_for_completion(sup3, 10, 3000) == 0
+    puts("FAIL: 10 mixed bodies — completion stuck at #{str_from_int(http_dyn_gsup_completion_count(sup3))}")
+    return 7
+  end
+  if http_dyn_gsup_alive(sup3) != 0
+    puts("FAIL: alive != 0 after 10 mixed completed (got #{str_from_int(http_dyn_gsup_alive(sup3))})")
+    return 8
+  end
+  http_dyn_gsup_stop(sup3)
+  puts("OK: 10 mixed (5 noop + 5 throwing) all completed")
+
+  # Test 4: stop() drains in-flight goroutines. Spawn N then immediately
+  # stop — stop's await loop should wait for completion before returning.
+  var sup4 = http_dyn_gsup_new()
+  var k = 0
+  while k < 3
+    http_dyn_gsup_spawn_one(sup4, smoke_noop_body)
+    k = k + 1
+  end
+  http_dyn_gsup_stop(sup4)
+  # After stop returns, alive must be 0 (drain complete).
+  if http_dyn_gsup_alive(sup4) != 0
+    puts("FAIL: alive != 0 after stop drained (got #{str_from_int(http_dyn_gsup_alive(sup4))})")
+    return 9
+  end
+  puts("OK: stop() drained in-flight goroutines")
+
+  # Test 5: explicit reservation after stop fails before task construction.
+  # The compatibility spawn_one API cannot make claims about effects incurred
+  # while callers evaluate its arguments, so admission-sensitive code reserves.
+  var sup5 = http_dyn_gsup_new()
+  http_dyn_gsup_stop(sup5)
+  var reservation5 = http_dyn_gsup_reserve(sup5)
+  if reservation5 != 0
+    puts("FAIL: reserve after stop returned non-zero (got #{str_from_int(reservation5)})")
+    return 10
+  end
+  if http_dyn_gsup_spawn_count(sup5) != 0
+    puts("FAIL: spawn_count incremented after closed-gate spawn (got #{str_from_int(http_dyn_gsup_spawn_count(sup5))})")
+    return 11
+  end
+  puts("OK: stopped supervisor refuses reservation before construction")
+
+  # Test 6: bounded drain deadline — stop() must NOT hang on a child that
+  # never reaches the done state. Regression guard for the
+  # http_serve_supervised SIGTERM-restart hang
+  # (docs/bugs/HOSTED_SUPERVISED_SHUTDOWN_DRAIN_HANGS.md §A): the original
+  # stop() did an unconditional `await` per child, so an idle keep-alive
+  # connection parked in a long read that never observed shutdown wedged
+  # stop() forever, and `systemctl restart` could not rebind the socket.
+  #
+  # This is tested DETERMINISTICALLY rather than with a real parked
+  # goroutine: on the local hosted build `async fn()` inline-polls a body
+  # to its first *direct* suspend point, so a spawn_one'd body (whose
+  # suspends are nested inside the `body()` closure call) always runs to
+  # completion before stop() — a real-goroutine test would pass vacuously.
+  # Instead we fabricate a child whose state slot (slot 0) never reaches
+  # the done sentinel (-1) and push it straight into the children Vec, then
+  # assert stop() returns within ~the 300ms deadline (not 0ms — it genuinely
+  # engaged the never-completing child — and not forever). Pre-fix, the
+  # `await` would block here indefinitely.
+  var sup6 = http_dyn_gsup_new()
+  http_dyn_gsup_set_drain_timeout(sup6, 300)
+  var fake = mem_alloc(16)
+  store(fake, 0, 0) # slot 0 = 0 (pending), never -1 (done)
+  sup6.children.push(fake)
+  var t_start = time_mono_ns()
+  http_dyn_gsup_stop(sup6)
+  var elapsed_ms = (time_mono_ns() - t_start) / 1000000
+  if elapsed_ms < 200
+    puts("FAIL: stop() returned too fast (#{str_from_int(elapsed_ms)}ms) — did not wait on the never-completing child")
+    return 12
+  end
+  if elapsed_ms > 1500
+    puts("FAIL: stop() exceeded the 300ms drain deadline (took #{str_from_int(elapsed_ms)}ms) — drain not bounded")
+    return 13
+  end
+  puts("OK: stop() bounded by drain deadline (returned in #{str_from_int(elapsed_ms)}ms on a never-completing child)")
+
+  puts("ALL OK")
+  return 0
+end

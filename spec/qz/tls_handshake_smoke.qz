@@ -1,0 +1,468 @@
+# NET.5c.1 — TLS 1.3 handshake message codec smoke.
+#
+# Standalone smoke driven from `quake tls_handshake:smoke`. Verifies:
+#
+#   1. Wire codec primitives (uXX BE roundtrip, length open/close, vector
+#      open with err propagation).
+#   2. Extension encoders (server_name, supported_versions CH+SH,
+#      supported_groups, signature_algorithms, key_share CH+SH, ALPN) —
+#      encode then decode (via _decode_ch_extensions in-place).
+#   3. Handshake message encode → decode round-trip for every supported
+#      message type:
+#         - ClientHello
+#         - ServerHello
+#         - EncryptedExtensions
+#         - Certificate (1 + 3 entry)
+#         - CertificateVerify
+#         - Finished
+#   4. Selected RFC-cited wire layouts (cipher suite IDs, named groups,
+#      sig schemes, Handshake header byte order).
+#   5. Alert encode / decode (level + description round-trip + is_fatal).
+#
+# Format mirrors spec/qz/x509_smoke.qz so the smoke runners share idiom.
+
+import * from ffi/socket
+import * from std/net/tls13/handshake
+import * from std/net/tls13/alert
+
+# =============================================================================
+# Pass/fail trackers
+# =============================================================================
+
+var g_total: Int = 0
+var g_passed: Int = 0
+
+def check_eq_int(label: String, got: Int, want: Int): Void
+  g_total = g_total + 1
+  if got == want
+    g_passed = g_passed + 1
+    puts("OK   " + label)
+    return
+  end
+  puts("FAIL " + label)
+  puts("       got:  " + got.to_s())
+  puts("       want: " + want.to_s())
+end
+
+def check_eq_str(label: String, got: String, want: String): Void
+  g_total = g_total + 1
+  if got == want
+    g_passed = g_passed + 1
+    puts("OK   " + label)
+    return
+  end
+  puts("FAIL " + label)
+  puts("       got:  " + got)
+  puts("       want: " + want)
+end
+
+def check_bytes_eq(label: String, p1: Int, p2: Int, len: Int): Void
+  g_total = g_total + 1
+  var i = 0
+  while i < len
+    if ptr_read_byte(p1 + i) != ptr_read_byte(p2 + i)
+      puts("FAIL " + label + " byte " + i.to_s())
+      return
+    end
+    i = i + 1
+  end
+  g_passed = g_passed + 1
+  puts("OK   " + label)
+end
+
+# Allocate a deterministic byte pattern at `buf` (length `n`).
+def fill_pattern(buf: Int, n: Int, b: Int): Void
+  var i = 0
+  while i < n
+    ptr_write_byte(buf + i, (i + b) & 0xff)
+    i = i + 1
+  end
+end
+
+# =============================================================================
+# 1. Wire codec primitives
+# =============================================================================
+
+def test_wire_primitives(): Void
+  puts("--- wire primitives ---")
+
+  var w = cw_new(64)
+  cw_u8(w, 0xAB)
+  cw_u16(w, 0x1234)
+  cw_u24(w, 0x123456)
+  cw_u32(w, 0xDEADBEEF)
+
+  check_eq_int("u8 wrote 1 byte",  w.pos,                          10)
+  check_eq_int("u8 byte value",    ptr_read_byte(w.buf + 0),       0xab)
+  # u16 BE: high byte first.
+  check_eq_int("u16 BE hi",        ptr_read_byte(w.buf + 1),       0x12)
+  check_eq_int("u16 BE lo",        ptr_read_byte(w.buf + 2),       0x34)
+  # u24 BE: 3 bytes.
+  check_eq_int("u24 BE byte 0",    ptr_read_byte(w.buf + 3),       0x12)
+  check_eq_int("u24 BE byte 1",    ptr_read_byte(w.buf + 4),       0x34)
+  check_eq_int("u24 BE byte 2",    ptr_read_byte(w.buf + 5),       0x56)
+  # u32 BE: 4 bytes.
+  check_eq_int("u32 BE byte 0",    ptr_read_byte(w.buf + 6),       0xde)
+  check_eq_int("u32 BE byte 3",    ptr_read_byte(w.buf + 9),       0xef)
+
+  # Read it back.
+  var r = cr_new(w.buf, w.pos)
+  check_eq_int("rd u8",            cr_u8(r),                       0xab)
+  check_eq_int("rd u16",           cr_u16(r),                      0x1234)
+  check_eq_int("rd u24",           cr_u24(r),                      0x123456)
+  check_eq_int("rd u32",           cr_u32(r),                      0xdeadbeef)
+  check_eq_int("rd at end",        cr_at_end(r),                   1)
+  check_eq_int("rd err clean",     r.err,                          0)
+  cw_free(w)
+
+  # Length open/close round-trip.
+  var w2 = cw_new(32)
+  var saved = cw_open_u16_len(w2)
+  cw_u8(w2, 0xaa)
+  cw_u8(w2, 0xbb)
+  cw_u8(w2, 0xcc)
+  cw_close_u16_len(w2, saved)
+
+  check_eq_int("u16-len prefix hi", ptr_read_byte(w2.buf + 0), 0x00)
+  check_eq_int("u16-len prefix lo", ptr_read_byte(w2.buf + 1), 0x03)
+  check_eq_int("u16-len content 0", ptr_read_byte(w2.buf + 2), 0xaa)
+
+  # Re-read via cr_open_u16_len.
+  var r2 = cr_new(w2.buf, w2.pos)
+  var child = cr_open_u16_len(r2)
+  check_eq_int("child len",         child.end_pos - child.pos, 3)
+  check_eq_int("child byte 0",      cr_u8(child),              0xaa)
+  check_eq_int("child byte 1",      cr_u8(child),              0xbb)
+  check_eq_int("child byte 2",      cr_u8(child),              0xcc)
+  check_eq_int("child close ok",    cr_close(child, r2),       0)
+  cw_free(w2)
+
+  # u24-len open/close (used by Certificate).
+  var w3 = cw_new(64)
+  var s24 = cw_open_u24_len(w3)
+  var i = 0
+  while i < 257
+    cw_u8(w3, i & 0xff)
+    i = i + 1
+  end
+  cw_close_u24_len(w3, s24)
+  check_eq_int("u24-len byte 0", ptr_read_byte(w3.buf + 0), 0x00)
+  check_eq_int("u24-len byte 1", ptr_read_byte(w3.buf + 1), 0x01)
+  check_eq_int("u24-len byte 2", ptr_read_byte(w3.buf + 2), 0x01)
+  cw_free(w3)
+end
+
+# =============================================================================
+# 2. ClientHello round-trip
+# =============================================================================
+
+def test_client_hello_roundtrip(): Void
+  puts("--- ClientHello round-trip ---")
+
+  # Build deterministic ClientHello.
+  var random = malloc(32)
+  fill_pattern(random, 32, 1)
+  var sid = malloc(32)
+  fill_pattern(sid, 32, 200)
+
+  # Key share: a single X25519 entry (32-byte pubkey).
+  var kex_pub = malloc(32)
+  fill_pattern(kex_pub, 32, 50)
+  var ks_entries = vec_new<KeyShareEntry>()
+  ks_entries.push(KeyShareEntry { group: GROUP_X25519(), key_ptr: kex_pub, key_len: 32, })
+
+  var cipher_suites = vec_new<Int>()
+  cipher_suites.push(CIPHER_AES_128_GCM_SHA256())
+  cipher_suites.push(CIPHER_CHACHA20_POLY1305_SHA256())
+
+  var named_groups = vec_new<Int>()
+  named_groups.push(GROUP_X25519_MLKEM768())
+  named_groups.push(GROUP_X25519())
+
+  var sig_algs = vec_new<Int>()
+  sig_algs.push(SIG_ED25519())
+
+  var alpn = vec_new<String>()
+  alpn.push("http/1.1")
+
+  var ch_out = ClientHelloOut {
+    random: random,
+    session_id_ptr: sid, session_id_len: 32,
+    cipher_suites: cipher_suites,
+    named_groups: named_groups,
+    key_shares: ks_entries,
+    sig_algs: sig_algs,
+    alpn: alpn,
+    hostname: "test.example.com",
+  }
+  var w = cw_new(512)
+  hs_encode_client_hello(w, ch_out)
+
+  # First byte must be HS_CLIENT_HELLO.
+  check_eq_int("CH msg type",     ptr_read_byte(w.buf),           HS_CLIENT_HELLO())
+  # legacy_version = 0x0303 at offset 4.
+  check_eq_int("CH legacy_ver hi", ptr_read_byte(w.buf + 4),       0x03)
+  check_eq_int("CH legacy_ver lo", ptr_read_byte(w.buf + 5),       0x03)
+  # random at offset 6.
+  check_bytes_eq("CH random",      w.buf + 6, random, 32)
+
+  # Decode round-trip.
+  var ch = hs_decode_client_hello(w.buf, w.pos)
+  check_eq_int("CH decode ok (random alloc)", if ch.random == 0 then 0 else 1 end, 1)
+  check_bytes_eq("CH random round-trip",      ch.random, random, 32)
+  check_eq_int("CH session_id len",           ch.legacy_session_id_len, 32)
+  check_bytes_eq("CH session_id bytes",       ch.legacy_session_id_ptr, sid, 32)
+  check_eq_int("CH cipher_suites count",      ch.cipher_suites.size(), 2)
+  check_eq_int("CH cipher_suites[0]",         ch.cipher_suites[0], CIPHER_AES_128_GCM_SHA256())
+  check_eq_int("CH cipher_suites[1]",         ch.cipher_suites[1], CIPHER_CHACHA20_POLY1305_SHA256())
+  check_eq_int("CH supported_versions count", ch.supported_versions.size(), 1)
+  check_eq_int("CH supported_versions[0]",    ch.supported_versions[0], TLS_VERSION_1_3())
+  check_eq_int("CH named_groups count",       ch.named_groups.size(), 2)
+  check_eq_int("CH named_groups[0]",          ch.named_groups[0], GROUP_X25519_MLKEM768())
+  check_eq_int("CH named_groups[1]",          ch.named_groups[1], GROUP_X25519())
+  check_eq_int("CH sig_algs count",           ch.sig_algs.size(), 1)
+  check_eq_int("CH sig_algs[0]",              ch.sig_algs[0], SIG_ED25519())
+  check_eq_int("CH key_shares count",         ch.key_shares.size(), 1)
+  check_eq_int("CH key_share group",          ch.key_shares[0].group, GROUP_X25519())
+  check_eq_int("CH key_share key_len",        ch.key_shares[0].key_len, 32)
+  check_bytes_eq("CH key_share bytes",        ch.key_shares[0].key_ptr, kex_pub, 32)
+  check_eq_str("CH server_name",              ch.server_name, "test.example.com")
+  check_eq_int("CH alpn count",               ch.alpn.size(), 1)
+  if ch.alpn.size() >= 1
+    check_eq_str("CH alpn[0]",                ch.alpn[0], "http/1.1")
+  end
+
+  ch_msg_free(ch)
+  cw_free(w)
+  free(random); free(sid); free(kex_pub)
+end
+
+# =============================================================================
+# 3. ServerHello round-trip
+# =============================================================================
+
+def test_server_hello_roundtrip(): Void
+  puts("--- ServerHello round-trip ---")
+
+  var random = malloc(32)
+  fill_pattern(random, 32, 100)
+  var sid = malloc(32)
+  fill_pattern(sid, 32, 200)
+  var kex_pub = malloc(32)
+  fill_pattern(kex_pub, 32, 7)
+
+  var sh_out = ServerHelloOut {
+    random: random,
+    session_id_echo_ptr: sid, session_id_echo_len: 32,
+    cipher_suite: CIPHER_AES_128_GCM_SHA256(),
+    selected_group: GROUP_X25519(),
+    server_key_share_ptr: kex_pub, server_key_share_len: 32,
+  }
+  var w = cw_new(256)
+  hs_encode_server_hello(w, sh_out)
+
+  check_eq_int("SH msg type", ptr_read_byte(w.buf), HS_SERVER_HELLO())
+
+  var sh = hs_decode_server_hello(w.buf, w.pos)
+  check_bytes_eq("SH random",                sh.random, random, 32)
+  check_eq_int("SH cipher_suite",            sh.cipher_suite, CIPHER_AES_128_GCM_SHA256())
+  check_eq_int("SH selected_version",        sh.selected_version, TLS_VERSION_1_3())
+  check_eq_int("SH selected_group",          sh.selected_group, GROUP_X25519())
+  check_eq_int("SH key_share_len",           sh.key_share_len, 32)
+  check_bytes_eq("SH key_share bytes",       sh.key_share_ptr, kex_pub, 32)
+  check_eq_int("SH session_id echo len",     sh.legacy_session_id_echo_len, 32)
+  check_bytes_eq("SH session_id echo bytes", sh.legacy_session_id_echo_ptr, sid, 32)
+
+  sh_msg_free(sh)
+  cw_free(w)
+  free(random); free(sid); free(kex_pub)
+end
+
+# =============================================================================
+# 4. EncryptedExtensions round-trip
+# =============================================================================
+
+def test_ee_roundtrip(): Void
+  puts("--- EncryptedExtensions round-trip ---")
+
+  # ALPN selection only.
+  var w = cw_new(64)
+  hs_encode_encrypted_extensions(w, "http/1.1")
+  check_eq_int("EE msg type", ptr_read_byte(w.buf), HS_ENCRYPTED_EXTENSIONS())
+
+  var ee = hs_decode_encrypted_extensions(w.buf, w.pos)
+  check_eq_int("EE alpn count",  ee.alpn.size(),    1)
+  if ee.alpn.size() >= 1
+    check_eq_str("EE alpn[0]",   ee.alpn[0],        "http/1.1")
+  end
+  cw_free(w)
+
+  # Empty ALPN.
+  var w2 = cw_new(32)
+  hs_encode_encrypted_extensions(w2, "")
+  var ee2 = hs_decode_encrypted_extensions(w2.buf, w2.pos)
+  check_eq_int("EE empty alpn count", ee2.alpn.size(), 0)
+  cw_free(w2)
+end
+
+# =============================================================================
+# 5. Certificate (1-entry and 3-entry chain)
+# =============================================================================
+
+def test_certificate_roundtrip(): Void
+  puts("--- Certificate round-trip ---")
+
+  # 1-entry: a single 200-byte fake cert.
+  var fake1 = malloc(200)
+  fill_pattern(fake1, 200, 11)
+  var es1 = vec_new<CertEntry>()
+  es1.push(CertEntry { cert_data_ptr: fake1, cert_data_len: 200, })
+  var w1 = cw_new(512)
+  hs_encode_certificate(w1, es1)
+
+  check_eq_int("Cert msg type", ptr_read_byte(w1.buf), HS_CERTIFICATE())
+  var c1 = hs_decode_certificate(w1.buf, w1.pos)
+  check_eq_int("Cert request_context len", c1.request_context_len, 0)
+  check_eq_int("Cert 1-entry count",       c1.entries.size(),     1)
+  check_eq_int("Cert 1-entry data len",    c1.entries[0].cert_data_len, 200)
+  check_bytes_eq("Cert 1-entry data",      c1.entries[0].cert_data_ptr, fake1, 200)
+  cw_free(w1); free(fake1)
+
+  # 3-entry chain: leaf + 2 intermediates.
+  var fake_a = malloc(150)
+  var fake_b = malloc(220)
+  var fake_c = malloc(180)
+  fill_pattern(fake_a, 150, 21)
+  fill_pattern(fake_b, 220, 22)
+  fill_pattern(fake_c, 180, 23)
+
+  var es3 = vec_new<CertEntry>()
+  es3.push(CertEntry { cert_data_ptr: fake_a, cert_data_len: 150, })
+  es3.push(CertEntry { cert_data_ptr: fake_b, cert_data_len: 220, })
+  es3.push(CertEntry { cert_data_ptr: fake_c, cert_data_len: 180, })
+
+  var w3 = cw_new(1024)
+  hs_encode_certificate(w3, es3)
+
+  var c3 = hs_decode_certificate(w3.buf, w3.pos)
+  check_eq_int("Cert 3-entry count",   c3.entries.size(),         3)
+  check_eq_int("Cert 3-entry[0] len",  c3.entries[0].cert_data_len, 150)
+  check_eq_int("Cert 3-entry[1] len",  c3.entries[1].cert_data_len, 220)
+  check_eq_int("Cert 3-entry[2] len",  c3.entries[2].cert_data_len, 180)
+  check_bytes_eq("Cert 3-entry[0]",    c3.entries[0].cert_data_ptr, fake_a, 150)
+  check_bytes_eq("Cert 3-entry[1]",    c3.entries[1].cert_data_ptr, fake_b, 220)
+  check_bytes_eq("Cert 3-entry[2]",    c3.entries[2].cert_data_ptr, fake_c, 180)
+  cw_free(w3); free(fake_a); free(fake_b); free(fake_c)
+end
+
+# =============================================================================
+# 6. CertificateVerify
+# =============================================================================
+
+def test_certificate_verify_roundtrip(): Void
+  puts("--- CertificateVerify round-trip ---")
+
+  var sig = malloc(64)
+  fill_pattern(sig, 64, 30)
+  var w = cw_new(128)
+  hs_encode_certificate_verify(w, SIG_ED25519(), sig, 64)
+
+  check_eq_int("CV msg type",   ptr_read_byte(w.buf), HS_CERTIFICATE_VERIFY())
+  var cv = hs_decode_certificate_verify(w.buf, w.pos)
+  check_eq_int("CV algorithm",  cv.algorithm,         SIG_ED25519())
+  check_eq_int("CV sig len",    cv.signature_len,     64)
+  check_bytes_eq("CV sig bytes", cv.signature_ptr,    sig, 64)
+  cw_free(w); free(sig)
+end
+
+# =============================================================================
+# 7. Finished
+# =============================================================================
+
+def test_finished_roundtrip(): Void
+  puts("--- Finished round-trip ---")
+
+  # SHA-256 hash size = 32 bytes.
+  var vd = malloc(32)
+  fill_pattern(vd, 32, 40)
+  var w = cw_new(64)
+  hs_encode_finished(w, vd, 32)
+
+  check_eq_int("Fin msg type",     ptr_read_byte(w.buf), HS_FINISHED())
+  var f = hs_decode_finished(w.buf, w.pos)
+  check_eq_int("Fin verify_data len", f.verify_data_len, 32)
+  check_bytes_eq("Fin verify_data",   f.verify_data_ptr, vd, 32)
+  cw_free(w); free(vd)
+end
+
+# =============================================================================
+# 8. Alert encode / decode
+# =============================================================================
+
+def test_alert(): Void
+  puts("--- Alert ---")
+  var buf = malloc(2)
+  alert_encode(buf, ALERT_LEVEL_FATAL(), ALERT_HANDSHAKE_FAILURE())
+  check_eq_int("alert level byte",  ptr_read_byte(buf),     ALERT_LEVEL_FATAL())
+  check_eq_int("alert desc byte",   ptr_read_byte(buf + 1), ALERT_HANDSHAKE_FAILURE())
+
+  var lvl_out = malloc(1)
+  var desc = alert_decode(buf, 2, lvl_out)
+  check_eq_int("alert decode lvl",  ptr_read_byte(lvl_out), ALERT_LEVEL_FATAL())
+  check_eq_int("alert decode desc", desc,                   ALERT_HANDSHAKE_FAILURE())
+  check_eq_int("alert fatal?",      alert_is_fatal(ALERT_LEVEL_FATAL(), ALERT_HANDSHAKE_FAILURE()), 1)
+
+  # close_notify is fatal regardless of level.
+  check_eq_int("close_notify fatal", alert_is_fatal(ALERT_LEVEL_WARNING(), ALERT_CLOSE_NOTIFY()), 1)
+  # warning user_canceled NOT fatal.
+  check_eq_int("warning user_canceled non-fatal",
+               alert_is_fatal(ALERT_LEVEL_WARNING(), ALERT_USER_CANCELED()), 0)
+
+  free(lvl_out); free(buf)
+end
+
+# =============================================================================
+# 9. RFC-cited constant sanity
+# =============================================================================
+
+def test_constants(): Void
+  puts("--- RFC constant sanity ---")
+  check_eq_int("HS_CLIENT_HELLO=1",     HS_CLIENT_HELLO(),     1)
+  check_eq_int("HS_SERVER_HELLO=2",     HS_SERVER_HELLO(),     2)
+  check_eq_int("HS_FINISHED=20",        HS_FINISHED(),         20)
+  check_eq_int("CIPHER_AES_128_GCM_SHA256=0x1301",
+               CIPHER_AES_128_GCM_SHA256(), 0x1301)
+  check_eq_int("CIPHER_AES_256_GCM_SHA384=0x1302",
+               CIPHER_AES_256_GCM_SHA384(), 0x1302)
+  check_eq_int("CIPHER_CHACHA20_POLY1305_SHA256=0x1303",
+               CIPHER_CHACHA20_POLY1305_SHA256(), 0x1303)
+  check_eq_int("GROUP_X25519=0x001d",     GROUP_X25519(),     0x001d)
+  check_eq_int("GROUP_X25519_MLKEM768=0x11ec",
+               GROUP_X25519_MLKEM768(), 0x11ec)
+  check_eq_int("SIG_ED25519=0x0807",      SIG_ED25519(),      0x0807)
+  check_eq_int("EXT_SUPPORTED_VERSIONS=43", EXT_SUPPORTED_VERSIONS(), 43)
+  check_eq_int("EXT_KEY_SHARE=51",        EXT_KEY_SHARE(),    51)
+  check_eq_int("TLS_VERSION_1_3=0x0304",  TLS_VERSION_1_3(),  0x0304)
+  check_eq_int("TLS_LEGACY_VERSION=0x0303", TLS_LEGACY_VERSION(), 0x0303)
+end
+
+# =============================================================================
+# Entry point
+# =============================================================================
+
+def main(): Int
+  test_wire_primitives()
+  test_client_hello_roundtrip()
+  test_server_hello_roundtrip()
+  test_ee_roundtrip()
+  test_certificate_roundtrip()
+  test_certificate_verify_roundtrip()
+  test_finished_roundtrip()
+  test_alert()
+  test_constants()
+
+  puts("")
+  puts(g_passed.to_s() + "/" + g_total.to_s() + " checks green")
+  if g_passed == g_total then return 0 end
+  return 1
+end

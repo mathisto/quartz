@@ -1,0 +1,324 @@
+## Fix-specific lifecycle smoke for the HTTP dynamic goroutine supervisor.
+## Exercises real scheduler workers, concurrent spawn/stop, repeated churn,
+## immediate completion, task draining, and scheduler shutdown.
+
+import * from std/net/http_dynamic_goroutine_sup
+import time
+
+extern "C" def usleep(us: Int): Int
+
+def lifecycle_noop(): Int = 0
+
+def lifecycle_producer(sup: HttpDynamicGoroutineSup, attempts: Int): Int
+  var accepted = 0
+  var i = 0
+  while i < attempts
+    if http_dyn_gsup_spawn_one(sup, lifecycle_noop) != 0
+      accepted = accepted + 1
+    end
+    sched_yield()
+    i = i + 1
+  end
+  return accepted
+end
+
+def lifecycle_exact_producer(sup: HttpDynamicGoroutineSup, target: Int): Int
+  var accepted = 0
+  while accepted < target
+    if http_dyn_gsup_spawn_one(sup, lifecycle_noop) != 0
+      accepted = accepted + 1
+    else
+      sched_yield()
+    end
+  end
+  return accepted
+end
+
+def lifecycle_claimed_publisher(sup: HttpDynamicGoroutineSup, reservation: Int, task: Int): Int
+  # Ensure all worker-count publishers start only after the main thread enters
+  # stop, while their claims remain valid across admission close.
+  sched_sleep(10)
+  if http_dyn_gsup_publish(sup, reservation, task) != 0
+    return 1
+  end
+  return 0
+end
+
+def lifecycle_delayed_probe(sup: HttpDynamicGoroutineSup): Int
+  sched_sleep(200)
+  return http_dyn_gsup_spawn_count(sup)
+end
+
+def lifecycle_delayed_stop(sup: HttpDynamicGoroutineSup): Int
+  sched_sleep(50)
+  http_dyn_gsup_stop(sup)
+  return 1
+end
+
+def lifecycle_slow(): Int
+  sched_sleep(100)
+  return 0
+end
+
+var _lifecycle_effects = atomic_new(0)
+
+def lifecycle_side_effect(): Int
+  atomic_add(_lifecycle_effects, 1)
+  return 0
+end
+
+def lifecycle_fail(message: String, code: Int): Int
+  puts("FAIL: " + message)
+  sched_shutdown()
+  return code
+end
+
+def main(): Int
+  sched_init(4)
+
+  # Immediate completion must not beat child publication or waiter setup.
+  var sup = http_dyn_gsup_new()
+  var i = 0
+  while i < 256
+    if http_dyn_gsup_spawn_one(sup, lifecycle_noop) == 0
+      http_dyn_gsup_stop(sup)
+      return lifecycle_fail("immediate-completion spawn was refused", 1)
+    end
+    i = i + 1
+  end
+  http_dyn_gsup_stop(sup)
+  if http_dyn_gsup_spawn_count(sup) != 256 or http_dyn_gsup_completion_count(sup) != 256
+    return lifecycle_fail("immediate completions were not fully accounted", 2)
+  end
+
+  # The scheduler may block publication at capacity. A completing task that
+  # re-enters supervisor telemetry must never need a lock held by the spawner.
+  var backpressure = http_dyn_gsup_new()
+  sched_set_max_tasks(2)
+  var blocker = async lifecycle_delayed_probe(backpressure)
+  sched_spawn(blocker)
+  if http_dyn_gsup_spawn_one(backpressure, lifecycle_noop) == 0
+    sched_set_max_tasks(0)
+    http_dyn_gsup_stop(backpressure)
+    return lifecycle_fail("backpressured spawn was refused", 8)
+  end
+  http_dyn_gsup_stop(backpressure)
+  sched_set_max_tasks(0)
+  if http_dyn_gsup_spawn_count(backpressure) != 1 or http_dyn_gsup_completion_count(backpressure) != 1
+    return lifecycle_fail("backpressured child accounting was not exact", 9)
+  end
+
+  # Stop closes new admission but cannot invalidate a claimed constructor.
+  var reserved = http_dyn_gsup_new()
+  http_dyn_gsup_set_drain_timeout(reserved, 100)
+  var reservation = http_dyn_gsup_reserve(reserved)
+  if reservation == 0
+    return lifecycle_fail("reservation was refused before stop", 11)
+  end
+  if http_dyn_gsup_claim(reserved, reservation) == 0
+    return lifecycle_fail("reservation claim was refused before stop", 11)
+  end
+  var stopper = async lifecycle_delayed_stop(reserved)
+  sched_spawn(stopper)
+  usleep(100000)
+  var stopped = await stopper
+  if stopped != 1 or http_dyn_gsup_pending_constructors(reserved) != 1
+    return lifecycle_fail("stop invalidated or failed to bound a claimed constructor", 11)
+  end
+  atomic_store(_lifecycle_effects, 0)
+  var claimed_task = http_dyn_gsup_task(lifecycle_side_effect)
+  var published = http_dyn_gsup_publish(reserved, reservation, claimed_task)
+  http_dyn_gsup_set_drain_timeout(reserved, 500)
+  http_dyn_gsup_stop(reserved)
+  if published == 0 or atomic_load(_lifecycle_effects) != 1
+    return lifecycle_fail("claimed constructor did not publish after stop", 12)
+  end
+  if http_dyn_gsup_pending_constructors(reserved) != 0
+    return lifecycle_fail("claimed constructor accounting did not reconcile", 12)
+  end
+
+  # A bounded stop may return before a child finishes. The watcher retains
+  # ownership and eventually accounts the child before terminating.
+  var timed = http_dyn_gsup_new()
+  http_dyn_gsup_set_drain_timeout(timed, 10)
+  if http_dyn_gsup_spawn_one(timed, lifecycle_slow) == 0
+    http_dyn_gsup_stop(timed)
+    return lifecycle_fail("timed child spawn was refused", 13)
+  end
+  http_dyn_gsup_stop(timed)
+  usleep(250000)
+  http_dyn_gsup_stop(timed)
+  if http_dyn_gsup_spawn_count(timed) != 1 or http_dyn_gsup_completion_count(timed) != 1
+    return lifecycle_fail("timed stop lost completion accounting", 14)
+  end
+
+  # A producer racing stop may be partially accepted, but every accepted child
+  # must be published, drained, and accounted exactly once.
+  var racing = http_dyn_gsup_new()
+  var producer = async lifecycle_producer(racing, 512)
+  sched_spawn(producer)
+  sched_yield()
+  http_dyn_gsup_stop(racing)
+  var accepted = await producer
+  http_dyn_gsup_stop(racing)
+  if http_dyn_gsup_spawn_count(racing) != accepted
+    return lifecycle_fail("concurrent spawn/stop lost an accepted child", 15)
+  end
+  if http_dyn_gsup_completion_count(racing) != accepted or http_dyn_gsup_alive(racing) != 0
+    return lifecycle_fail("concurrent spawn/stop did not drain cleanly", 16)
+  end
+
+  # Repeated construction and teardown catches stale watcher/waiter ownership.
+  var cycle = 0
+  while cycle < 128
+    var churn = http_dyn_gsup_new()
+    var j = 0
+    while j < 8
+      http_dyn_gsup_spawn_one(churn, lifecycle_noop)
+      j = j + 1
+    end
+    http_dyn_gsup_stop(churn)
+    if http_dyn_gsup_spawn_count(churn) != 8 or http_dyn_gsup_completion_count(churn) != 8
+      return lifecycle_fail("lifecycle churn left an unaccounted child", 17)
+    end
+    cycle = cycle + 1
+  end
+
+  # Immediate lifetime traffic is intentionally unbatched: publication must
+  # reclaim already-done children without waiting for the 100ms watcher. With a
+  # one-live-child admission cap, storage is that peak plus the one currently
+  # published slot awaiting its next publication/watcher reconciliation.
+  var bounded = http_dyn_gsup_new()
+  http_dyn_gsup_set_max_children(bounded, 1)
+  var served = 0
+  while served < 10000
+    if http_dyn_gsup_spawn_one(bounded, lifecycle_noop) == 0
+      return lifecycle_fail("tight bounded-storage spawn was refused", 20)
+    end
+    served = served + 1
+  end
+  var tight_child_storage = http_dyn_gsup_child_storage(bounded)
+  http_dyn_gsup_stop(bounded)
+  if http_dyn_gsup_spawn_count(bounded) != 10000 or http_dyn_gsup_completion_count(bounded) != 10000
+    return lifecycle_fail("tight churn did not complete exactly 10000 tasks", 21)
+  end
+  if tight_child_storage > 2 or http_dyn_gsup_reservation_storage(bounded) > 1
+    return lifecycle_fail("tight churn storage exceeded live peak plus one", 22)
+  end
+  if http_dyn_gsup_alive(bounded) != 0 or http_dyn_gsup_active_task_count() != 0
+    return lifecycle_fail("tight churn leaked child task ownership", 23)
+  end
+
+  # Four publishers race the watcher while the admission cap supplies a known
+  # non-done/publishing peak. Retry transient cap rejection until all 10,000
+  # publications succeed; storage may retain only that cap plus one done slot.
+  var concurrent = http_dyn_gsup_new()
+  http_dyn_gsup_set_max_children(concurrent, 16)
+  var producer_a = async lifecycle_exact_producer(concurrent, 2500)
+  var producer_b = async lifecycle_exact_producer(concurrent, 2500)
+  var producer_c = async lifecycle_exact_producer(concurrent, 2500)
+  var producer_d = async lifecycle_exact_producer(concurrent, 2500)
+  sched_spawn(producer_a)
+  sched_spawn(producer_b)
+  sched_spawn(producer_c)
+  sched_spawn(producer_d)
+  var concurrent_accepted = await producer_a
+  concurrent_accepted = concurrent_accepted + (await producer_b)
+  concurrent_accepted = concurrent_accepted + (await producer_c)
+  concurrent_accepted = concurrent_accepted + (await producer_d)
+  var concurrent_storage = http_dyn_gsup_child_storage(concurrent)
+  http_dyn_gsup_stop(concurrent)
+  if concurrent_accepted != 10000 or http_dyn_gsup_spawn_count(concurrent) != 10000 or http_dyn_gsup_completion_count(concurrent) != 10000
+    return lifecycle_fail("watcher/publisher race lost exact completion", 24)
+  end
+  if concurrent_storage > 17 or http_dyn_gsup_reservation_storage(concurrent) > 4
+    return lifecycle_fail("watcher/publisher race exceeded bounded storage", 25)
+  end
+  if http_dyn_gsup_alive(concurrent) != 0 or http_dyn_gsup_active_task_count() != 0
+    return lifecycle_fail("watcher/publisher race leaked child task ownership", 26)
+  end
+
+  # Four claimed publishers (exactly the scheduler worker count), watcher, and
+  # stop race deterministically. Stop may close admission but cannot invalidate
+  # these claims or strand children_lock while callbacks reconcile completion.
+  var stop_race = http_dyn_gsup_new()
+  http_dyn_gsup_set_max_children(stop_race, 4)
+  var stop_res_a = http_dyn_gsup_reserve(stop_race)
+  var stop_res_b = http_dyn_gsup_reserve(stop_race)
+  var stop_res_c = http_dyn_gsup_reserve(stop_race)
+  var stop_res_d = http_dyn_gsup_reserve(stop_race)
+  if stop_res_a == 0 or stop_res_b == 0 or stop_res_c == 0 or stop_res_d == 0
+    return lifecycle_fail("stop-race reservation was refused", 27)
+  end
+  if http_dyn_gsup_claim(stop_race, stop_res_a) == 0 or http_dyn_gsup_claim(stop_race, stop_res_b) == 0 or http_dyn_gsup_claim(stop_race, stop_res_c) == 0 or http_dyn_gsup_claim(stop_race, stop_res_d) == 0
+    return lifecycle_fail("stop-race claim was refused", 28)
+  end
+  var stop_pub_a = async lifecycle_claimed_publisher(stop_race, stop_res_a, http_dyn_gsup_task(lifecycle_noop))
+  var stop_pub_b = async lifecycle_claimed_publisher(stop_race, stop_res_b, http_dyn_gsup_task(lifecycle_noop))
+  var stop_pub_c = async lifecycle_claimed_publisher(stop_race, stop_res_c, http_dyn_gsup_task(lifecycle_noop))
+  var stop_pub_d = async lifecycle_claimed_publisher(stop_race, stop_res_d, http_dyn_gsup_task(lifecycle_noop))
+  sched_spawn(stop_pub_a)
+  sched_spawn(stop_pub_b)
+  sched_spawn(stop_pub_c)
+  sched_spawn(stop_pub_d)
+  http_dyn_gsup_stop(stop_race)
+  var stop_published = await stop_pub_a
+  stop_published = stop_published + (await stop_pub_b)
+  stop_published = stop_published + (await stop_pub_c)
+  stop_published = stop_published + (await stop_pub_d)
+  http_dyn_gsup_stop(stop_race)
+  if stop_published != 4 or http_dyn_gsup_spawn_count(stop_race) != 4 or http_dyn_gsup_completion_count(stop_race) != 4
+    return lifecycle_fail("concurrent publisher/watcher/stop accounting was not exact", 29)
+  end
+  if http_dyn_gsup_child_storage(stop_race) > 5 or http_dyn_gsup_reservation_storage(stop_race) > 4
+    return lifecycle_fail("concurrent publisher/watcher/stop exceeded bounded storage", 30)
+  end
+  if http_dyn_gsup_alive(stop_race) != 0 or http_dyn_gsup_active_task_count() != 0
+    return lifecycle_fail("concurrent publisher/watcher/stop leaked ownership", 31)
+  end
+
+  # Keep a larger tight-churn tripwire in the checked-in regression. The same
+  # cap-plus-one storage contract must hold across lifetime traffic, not batches.
+  var pressure = http_dyn_gsup_new()
+  http_dyn_gsup_set_max_children(pressure, 1)
+  var pressured = 0
+  while pressured < 100000
+    if http_dyn_gsup_spawn_one(pressure, lifecycle_noop) == 0
+      return lifecycle_fail("100000 tight-churn spawn was refused", 32)
+    end
+    pressured = pressured + 1
+  end
+  var pressure_storage = http_dyn_gsup_child_storage(pressure)
+  http_dyn_gsup_stop(pressure)
+  if http_dyn_gsup_spawn_count(pressure) != 100000 or http_dyn_gsup_completion_count(pressure) != 100000
+    return lifecycle_fail("100000 tight churn was not exact", 33)
+  end
+  if pressure_storage > 2 or http_dyn_gsup_reservation_storage(pressure) > 1
+    return lifecycle_fail("100000 tight churn exceeded live peak plus one", 34)
+  end
+  if http_dyn_gsup_alive(pressure) != 0 or http_dyn_gsup_active_task_count() != 0
+    return lifecycle_fail("100000 tight churn leaked ownership", 35)
+  end
+
+  puts("tight_child_storage=#{tight_child_storage} concurrent_child_storage=#{concurrent_storage} pressure_child_storage=#{pressure_storage} completed=#{http_dyn_gsup_completion_count(bounded) + http_dyn_gsup_completion_count(concurrent) + http_dyn_gsup_completion_count(stop_race) + http_dyn_gsup_completion_count(pressure)} active=#{http_dyn_gsup_active_task_count()}")
+
+  # A Future may be done before publication, but sched_spawn still owns one
+  # scheduler accounting turn for it. Require eventual drain while retaining a
+  # finite in-process deadline beneath the external hard watchdog.
+  var scheduler_drain_started = time_mono_ms()
+  var scheduler_drain_deadline = scheduler_drain_started + 15000
+  while sched_task_count() != 0 and time_mono_ms() < scheduler_drain_deadline
+    sched_sleep(1)
+  end
+  var scheduler_drain_ms = time_mono_ms() - scheduler_drain_started
+  if sched_task_count() != 0
+    return lifecycle_fail("scheduler task queue did not drain before deadline", 18)
+  end
+  puts("scheduler_drain_ms=#{scheduler_drain_ms}")
+  sched_shutdown()
+  if sched_is_active() != 0
+    return 19
+  end
+  puts("ALL OK")
+  return 0
+end

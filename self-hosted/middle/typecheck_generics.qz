@@ -1,0 +1,996 @@
+##! # Type Checker Generics & Struct Support
+##!
+##! Type parameter inference, substitution, struct initialization,
+##! and enum access checking.
+##!
+##! @see typecheck_walk Main AST walking module
+
+import typecheck
+import typecheck_util
+import typecheck_registry
+import typecheck_helpers
+import ast
+import diagnostic
+import node_constants
+import type_constants
+import std/diag
+import * from str_compat
+
+# ============================================================================
+# Type Argument Extraction and Substitution
+# ============================================================================
+
+## Extract the Nth type argument from a comma-separated type args string.
+## Uses depth-aware comma splitting to handle nested generics.
+## e.g., tc_extract_nth_type_arg("Int, Vec<String>", 1) returns "Vec<String>"
+def tc_extract_nth_type_arg(type_args: String, n: Int): String
+  var depth = 0
+  var index = 0
+  var start = 0
+  var len = str_byte_len(type_args)
+  for i in 0..len
+    var ch = str_byte_at(type_args, i)
+    if ch == '<'
+      depth += 1
+    end
+    if ch == '>'
+      depth -= 1
+    end
+    if ch == ',' and depth == 0
+      if index == n
+        return str_byte_slice(type_args, start, i).trim()
+      end
+      index += 1
+      start = i + 1
+    end
+  end
+  return str_byte_slice(type_args, start, len).trim() if index == n
+  return ""
+end
+
+## Substitute type parameters in a field annotation with concrete type args.
+## Given field_annotation "T", type_params "T, U", type_args "Int, String"
+## returns typecheck$tc_parse_type(tc, "Int").
+def tc_substitute_field_type(tc: TypecheckState, field_annotation: String, type_params: String, type_args: String): Int
+  return typecheck::tc_parse_type(tc, field_annotation) if str_byte_len(type_params) == 0
+  return typecheck::tc_parse_type(tc, field_annotation) if str_byte_len(type_args) == 0
+
+  var param_index = 0
+  var start = 0
+  var len = str_byte_len(type_params)
+  for i in 0..len
+    var ch = str_byte_at(type_params, i)
+    if ch == ','
+      var param_raw = str_byte_slice(type_params, start, i).trim()
+      # Struct type params may carry trait bounds after a colon (`C: Counter`).
+      # Strip before name-matching — the field annotation uses the bare name.
+      var colon = __char_index(param_raw, ':')
+      var param = param_raw
+      if colon > 0
+        param = str_byte_slice(param_raw, 0, colon).trim()
+      end
+      if param == field_annotation
+        var arg = tc_extract_nth_type_arg(type_args, param_index)
+        return typecheck::tc_parse_type(tc, arg)
+      end
+      param_index += 1
+      start = i + 1
+    end
+  end
+
+  var last_param_raw = str_byte_slice(type_params, start, len).trim()
+  var last_colon = __char_index(last_param_raw, ':')
+  var last_param = last_param_raw
+  if last_colon > 0
+    last_param = str_byte_slice(last_param_raw, 0, last_colon).trim()
+  end
+  if last_param == field_annotation
+    var arg = tc_extract_nth_type_arg(type_args, param_index)
+    return typecheck::tc_parse_type(tc, arg)
+  end
+
+  return typecheck::tc_parse_type(tc, field_annotation)
+end
+
+## Map a type annotation string to the corresponding container type constant.
+## E.g., "Vec<Int>" -> TYPE_VEC, "String" -> TYPE_STRING, "HashMap<K,V>" -> TYPE_HASHMAP.
+## Returns TYPE_INT if the annotation doesn't match any known container type.
+def tc_annotation_to_container_type(ann: String): Int
+  if str_starts_with(ann, "Vec")
+    return type_constants::TYPE_VEC
+  elsif ann == "String"
+    return type_constants::TYPE_STRING
+  elsif str_starts_with(ann, "HashMap")
+    return type_constants::TYPE_HASHMAP
+  elsif str_starts_with(ann, "Set")
+    return type_constants::TYPE_SET
+  elsif str_starts_with(ann, "StringBuilder")
+    return type_constants::TYPE_STRINGBUILDER
+  elsif str_starts_with(ann, "SliceMut")
+    return type_constants::TYPE_SLICE_MUT
+  elsif str_starts_with(ann, "Slice")
+    return type_constants::TYPE_SLICE
+  end
+  return type_constants::TYPE_INT
+end
+
+## Phase 7: infer the source-level DISPLAY annotation for an expression.
+## Mirrors `tc_infer_expr_type_annotation` but prefers the opaque marker
+## ("impl <Trait>@<func>") for `impl Trait`-returning calls and reads the
+## display_type slot for IDENT bindings. Falls back to
+## `tc_infer_expr_type_annotation` for everything else.
+def tc_infer_expr_display_annotation(tc: TypecheckState, ast_storage: ast::AstStorage, node: AstNodeId): String
+  return "" if node < 0
+  var node_kind = ast::ast_get_kind(ast_storage, node)
+
+  # Unwrap a NODE_BLOCK to its last expression — `if c then make() ... end`
+  # parses the then-branch as a block whose last child is the produced value.
+  if node_kind == node_constants::NODE_BLOCK
+    var children = ast::ast_get_children(ast_storage, node)
+    if children != 0
+      var sz = vec_size(children)
+      if sz > 0
+        var last_child = children[sz - 1]
+        # NODE_EXPR_STMT (29) wraps an expression statement — peek inside.
+        if ast::ast_get_kind(ast_storage, last_child) == node_constants::NODE_EXPR_STMT
+          last_child = ast::ast_get_left(ast_storage, last_child)
+        end
+        return tc_infer_expr_display_annotation(tc, ast_storage, last_child)
+      end
+    end
+    return ""
+  end
+
+  if node_kind == node_constants::NODE_IDENT
+    var var_name = ast::ast_get_str1(ast_storage, node)
+    var disp = typecheck_util::tc_scope_lookup_display_type(tc, var_name)
+    return disp if str_byte_len(disp) > 0
+    return tc_infer_expr_type_annotation(tc, ast_storage, node)
+  end
+
+  if node_kind == node_constants::NODE_CALL
+    var callee = ast::ast_get_left(ast_storage, node)
+    if ast::ast_get_kind(ast_storage, callee) == node_constants::NODE_IDENT
+      var callee_name = ast::ast_get_str1(ast_storage, callee)
+      var opaque = typecheck_registry::tc_lookup_impl_return_opaque(tc, callee_name)
+      return opaque if str_byte_len(opaque) > 0
+    end
+    return tc_infer_expr_type_annotation(tc, ast_storage, node)
+  end
+
+  return tc_infer_expr_type_annotation(tc, ast_storage, node)
+end
+
+## Infer the concrete type annotation string for an expression.
+## Unlike tc_resolve_expr_struct_name (which returns just the struct base name),
+## this returns the FULL annotation with generic type args resolved.
+## E.g., for wrap(wrap(42)) where wrap<T>(x:T):GBox<T>, returns "GBox<GBox<Int>>".
+def tc_infer_expr_type_annotation(tc: TypecheckState, ast_storage: ast::AstStorage, node: AstNodeId): String
+  var node_kind = ast::ast_get_kind(ast_storage, node)
+
+  if node_kind == node_constants::NODE_IDENT
+    var var_name = ast::ast_get_str1(ast_storage, node)
+    var ann = typecheck_util::tc_scope_lookup_annotation(tc, var_name)
+    return ann if str_byte_len(ann) > 0
+    # Fall back to struct_name (no generic info)
+    return typecheck_util::tc_scope_lookup_struct_name(tc, var_name)
+  end
+
+  if node_kind == node_constants::NODE_INT_LIT
+    return "Int"
+  end
+
+  if node_kind == node_constants::NODE_STRING_LIT
+    return "String"
+  end
+
+  if node_kind == node_constants::NODE_BOOL_LIT
+    return "Bool"
+  end
+
+  if node_kind == node_constants::NODE_CALL
+    var callee = ast::ast_get_left(ast_storage, node)
+    if ast::ast_get_kind(ast_storage, callee) == node_constants::NODE_IDENT
+      var callee_name = ast::ast_get_str1(ast_storage, callee)
+      var ret_ann = typecheck_registry::tc_lookup_function_return_annotation(tc, callee_name)
+      if str_byte_len(ret_ann) == 0
+        return ""
+      end
+      # Resolve impl Trait return annotations to concrete types for UFCS dispatch
+      if str_byte_len(ret_ann) > 5 and ret_ann.starts_with("impl ")
+        var impl_concrete = typecheck_registry::tc_lookup_impl_return(tc, callee_name)
+        if str_byte_len(impl_concrete) > 0
+          return impl_concrete
+        end
+      end
+      # If the return annotation has no type params, return as-is
+      var func_idx = typecheck_registry::tc_lookup_function_index(tc, callee_name)
+      if func_idx < 0
+        return ret_ann
+      end
+      var func_tp = typecheck_registry::tc_function_type_params_str(tc, func_idx)
+      if str_byte_len(func_tp) == 0
+        return ret_ann
+      end
+      # Function has type params — infer concrete types from call arguments
+      var param_anns = typecheck_registry::tc_function_param_annotations(tc, func_idx)
+      var args = ast::ast_get_children(ast_storage, node)
+      if args == 0
+        return ret_ann
+      end
+      var concrete_args = tc_infer_type_param_mapping(tc, ast_storage, func_tp, param_anns, args)
+      return tc_substitute_annotation(ret_ann, func_tp, concrete_args) if str_byte_len(concrete_args) > 0
+      # Inference failed and the function has type params — return empty
+      # rather than leaking ret_ann with its type-param names still in it.
+      # A literal `List<Item>` returned here would be misread by an outer
+      # call-site unifier as a real annotation and silently bind the
+      # OUTER call's `Item` type-param to the string "Item", clobbering a
+      # correct binding from another arg. (Discovered via cards example
+      # dogfood, 2026-05-04: list_new<Item>(items: Vec<Item>, delegate:
+      # ItemDelegate<Item>) was binding Item := "Item" because the
+      # delegate arg's inference returned `ItemDelegate<Item>` literally
+      # and the outer unifier treated `Item` as a concrete type.)
+      return ""
+    end
+    return ""
+  end
+
+  if node_kind == node_constants::NODE_FIELD_ACCESS
+    var parent_node = ast::ast_get_left(ast_storage, node)
+    var field_name = ast::ast_get_str1(ast_storage, node)
+    var parent_ann = tc_infer_expr_type_annotation(tc, ast_storage, parent_node)
+    return "" if str_byte_len(parent_ann) == 0
+    # Record type annotation — look up field type directly
+    if parent_ann.starts_with("{ ")
+      var clean_ann = parent_ann
+      if clean_ann.ends_with("| .. }")
+        clean_ann = str_byte_slice(clean_ann, 0, str_byte_len(clean_ann) - 6)
+        clean_ann = "#{str_trim(clean_ann)} }"
+      end
+      var rec_parsed = typecheck_registry::tc_parse_record_fields(clean_ann)
+      var rec_field_names = rec_parsed.names
+      var rec_field_types = rec_parsed.types
+      for rec_i in 0..vec_size(rec_field_names)
+        if rec_field_names[rec_i].eq(field_name)
+          return rec_field_types[rec_i]
+        end
+      end
+      return ""
+    end
+    # Get struct base name and type args from parent annotation
+    var lt_pos = __char_index(parent_ann, '<')
+    var parent_struct = parent_ann
+    var parent_type_args = ""
+    if lt_pos > 0
+      parent_struct = str_byte_slice(parent_ann, 0, lt_pos)
+      parent_type_args = str_byte_slice(parent_ann, lt_pos + 1, str_byte_len(parent_ann) - 1)
+    end
+    var struct_result = typecheck_registry::tc_lookup_struct(tc, parent_struct)
+    var struct_idx = match struct_result
+      LookupResult::Found(v) => v
+      LookupResult::NotFound => return ""
+    end
+    var field_ann = typecheck::tc_struct_field_annotation(tc, struct_idx, field_name)
+    return "" if str_byte_len(field_ann) == 0
+    # Substitute type params in the field annotation
+    if str_byte_len(parent_type_args) > 0
+      var params = typecheck::tc_struct_type_params(tc, struct_idx)
+      if str_byte_len(params) > 0
+        return tc_substitute_annotation(field_ann, params, parent_type_args)
+      end
+    end
+    return field_ann
+  end
+
+  if node_kind == node_constants::NODE_STRUCT_INIT
+    var sname = ast::ast_get_str1(ast_storage, node)
+    var stype_args = ast::ast_get_str2(ast_storage, node)
+    if str_byte_len(stype_args) > 0
+      return "#{sname}<#{stype_args}>"
+    end
+    return sname
+  end
+
+  if node_kind == node_constants::NODE_INDEX
+    var index_array = ast::ast_get_left(ast_storage, node)
+    var arr_ann = tc_infer_expr_type_annotation(tc, ast_storage, index_array)
+    if str_byte_len(arr_ann) > 0
+      if str_starts_with(arr_ann, "Vec<")
+        return str_byte_slice(arr_ann, 4, str_byte_len(arr_ann) - 1)
+      end
+      if arr_ann == "String"
+        return "Int"
+      end
+    end
+    return ""
+  end
+
+  if node_kind == node_constants::NODE_ARRAY
+    var elements = ast::ast_get_children(ast_storage, node)
+    if elements != 0 and vec_size(elements) > 0
+      var first_elem = elements[0]
+      # Unwrap spread to get inner expression for type inference
+      if ast::ast_get_kind(ast_storage, first_elem) == node_constants::NODE_SPREAD
+        var inner = ast::ast_get_left(ast_storage, first_elem)
+        var inner_ann = tc_infer_expr_type_annotation(tc, ast_storage, inner)
+        if str_byte_len(inner_ann) > 0
+          return inner_ann
+        end
+      else
+        var first_ann = tc_infer_expr_type_annotation(tc, ast_storage, first_elem)
+        if str_byte_len(first_ann) > 0
+          return "Vec<#{first_ann}>"
+        end
+      end
+    end
+    return "Vec<Int>"
+  end
+
+  if node_kind == node_constants::NODE_ENUM_ACCESS
+    # Enum variant expressions like `FocusId::A` infer to the enum's base
+    # name. This lets tc_infer_type_param_mapping match a no-payload arg
+    # against a type-param-shaped param annotation (e.g. `initial: Id`
+    # paired with `FocusId::A` resolves Id := FocusId).
+    return ast::ast_get_str1(ast_storage, node)
+  end
+
+  if node_kind == node_constants::NODE_LIST_COMP
+    # FIX.6 Phase 4: Infer element type from list comprehension body expression
+    var lc_body = ast::ast_get_left(ast_storage, node)
+    if lc_body > 0
+      var lc_body_ann = tc_infer_expr_type_annotation(tc, ast_storage, lc_body)
+      if str_byte_len(lc_body_ann) > 0
+        return "Vec<#{lc_body_ann}>"
+      end
+    end
+    return "Vec<Int>"
+  end
+
+  return ""
+end
+
+## Strip a module qualifier (`a::b::Name`, `a$b$Name`, or `ls$List` →
+## `Name`/`List`). Bases compared after stripping so cross-module use
+## sites unify even when the resolver has rewritten `::` to `$` for
+## cache-mangling.
+def tc_strip_module_qualifier(name: String): String
+  var len = str_byte_len(name)
+  var i = len - 1
+  while i > 0
+    var ch = str_byte_at(name, i)
+    if ch == '$'
+      return str_byte_slice(name, i + 1, len)
+    end
+    if ch == ':' and str_byte_at(name, i - 1) == ':'
+      return str_byte_slice(name, i + 1, len)
+    end
+    i -= 1
+  end
+  return name
+end
+
+## True if two type-base names refer to the same type, ignoring module
+## qualifier differences (`List` vs `ls::List` vs `std::tui::widgets::list::List`).
+def tc_base_names_match(a: String, b: String): Bool
+  return true if a == b
+  return tc_strip_module_qualifier(a) == tc_strip_module_qualifier(b)
+end
+
+## Recursively unify a parameter annotation with an argument's inferred annotation,
+## binding any type params encountered into tp_concrete by the index they occupy
+## in tp_names. Handles three shapes:
+##   - bare type param:   pa_name == "T"           → bind T := arg_ann
+##   - wrapped type:      pa_name == "Vec<T>"      vs arg_ann == "Vec<Int>"  → recurse on inner
+##   - nested:            pa_name == "Vec<Map<K,V>>" vs arg_ann == "Vec<Map<String,Int>>" → recurse twice
+## Bases compared via tc_base_names_match so that module-qualifier
+## differences across call sites don't block unification.
+def tc_unify_param_ann(pa_name: String, arg_ann: String, tp_names: Vec<String>, tp_concrete: Vec<String>): Void
+  return if str_byte_len(arg_ann) == 0
+  # Bare type-param match.
+  var tp_count = tp_names.size
+  for tpi in 0..tp_count
+    if tp_names[tpi] == pa_name
+      tp_concrete[tpi] = arg_ann
+      return
+    end
+  end
+  # Wrapped match: Base<P1, ..., Pk> vs Base<A1, ..., Ak>.
+  var pa_lt = __char_index(pa_name, '<')
+  return if pa_lt <= 0
+  var arg_lt = __char_index(arg_ann, '<')
+  return if arg_lt <= 0
+  var pa_last = str_byte_len(pa_name) - 1
+  var arg_last = str_byte_len(arg_ann) - 1
+  return if str_byte_at(pa_name, pa_last) != '>'
+  return if str_byte_at(arg_ann, arg_last) != '>'
+  var pa_base = str_byte_slice(pa_name, 0, pa_lt).trim()
+  var arg_base = str_byte_slice(arg_ann, 0, arg_lt).trim()
+  return if not tc_base_names_match(pa_base, arg_base)
+  var pa_inner = str_byte_slice(pa_name, pa_lt + 1, pa_last)
+  var arg_inner = str_byte_slice(arg_ann, arg_lt + 1, arg_last)
+  # Walk both inner arg lists in parallel; tc_extract_nth_type_arg is depth-aware.
+  var n = 0
+  while true
+    var pi = tc_extract_nth_type_arg(pa_inner, n)
+    var ai = tc_extract_nth_type_arg(arg_inner, n)
+    break if str_byte_len(pi) == 0
+    break if str_byte_len(ai) == 0
+    tc_unify_param_ann(pi, ai, tp_names, tp_concrete)
+    n += 1
+  end
+end
+
+## Infer concrete types for type params from call arguments.
+## func_tp: "T" or "A,B" — the function's type param names.
+## param_anns: "T,Int,Vec<T>" — the function's param type annotations (comma-separated,
+##             with depth-aware split since wrapped annotations like "HashMap<K, V>"
+##             carry their own commas at depth >0).
+## args: the AST arg nodes.
+## Returns concrete type args as comma-separated string (e.g., "GBox<Int>").
+def tc_infer_type_param_mapping(tc: TypecheckState, ast_storage: ast::AstStorage, func_tp: String, param_anns: String, args: Vec<Int>): String
+  var arg_count = vec_size(args)
+  # Parse type param names (top-level comma; type-param lists have no nested generics).
+  var tp_names = vec_new<String>()
+  var tp_concrete = vec_new<String>()
+  var tp_start = 0
+  var tp_i = 0
+  while tp_i <= str_byte_len(func_tp)
+    var is_sep = 0
+    if tp_i == str_byte_len(func_tp)
+      is_sep = 1
+    elsif str_byte_at(func_tp, tp_i) == ','
+      is_sep = 1
+    end
+    if is_sep == 1
+      var tp_name = str_byte_slice(func_tp, tp_start, tp_i).trim()
+      if str_byte_len(tp_name) > 0
+        tp_names.push(tp_name)
+        tp_concrete.push("")
+      end
+      tp_start = tp_i + 1
+    end
+    tp_i += 1
+  end
+  # Parse param annotations with depth-aware comma splitting and unify each
+  # against the corresponding arg's inferred annotation.
+  var pa_start = 0
+  var pa_i = 0
+  var pa_idx = 0
+  var pa_depth = 0
+  var pa_len = str_byte_len(param_anns)
+  while pa_i <= pa_len
+    var is_sep2 = 0
+    if pa_i == pa_len
+      is_sep2 = 1
+    else
+      var pa_ch = str_byte_at(param_anns, pa_i)
+      if pa_ch == '<'
+        pa_depth += 1
+      elsif pa_ch == '>'
+        pa_depth -= 1
+      elsif pa_ch == ',' and pa_depth == 0
+        is_sep2 = 1
+      end
+    end
+    if is_sep2 == 1
+      var pa_name = str_byte_slice(param_anns, pa_start, pa_i).trim()
+      if pa_idx < arg_count
+        var arg_ann = tc_infer_expr_type_annotation(tc, ast_storage, args[pa_idx])
+        tc_unify_param_ann(pa_name, arg_ann, tp_names, tp_concrete)
+      end
+      pa_idx += 1
+      pa_start = pa_i + 1
+    end
+    pa_i += 1
+  end
+  # Build result string: "Int, String" etc.
+  var result = ""
+  var ri = 0
+  var tp_total = tp_names.size
+  while ri < tp_total
+    if ri > 0
+      result += ", "
+    end
+    var c = tp_concrete[ri]
+    if str_byte_len(c) == 0
+      return ""
+    end
+    result += c
+    ri += 1
+  end
+  return result
+end
+
+## Substitute type params in an annotation string.
+## annotation: "GBox<T>" or "T" or "Pair<A, B>".
+## type_params: "T" or "A,B" (comma-separated type param names).
+## type_args: "Int" or "GBox<Int>, String" (comma-separated concrete types).
+## Returns the annotation with type params replaced by concrete types.
+def tc_substitute_annotation(annotation: String, type_params: String, type_args: String): String
+  # If annotation is exactly a type param, return the corresponding concrete type
+  var tp_start = 0
+  var tp_i = 0
+  var tp_idx = 0
+  while tp_i <= str_byte_len(type_params)
+    var is_sep = 0
+    if tp_i == str_byte_len(type_params)
+      is_sep = 1
+    elsif str_byte_at(type_params, tp_i) == ','
+      is_sep = 1
+    end
+    if is_sep == 1
+      var tp_name = str_byte_slice(type_params, tp_start, tp_i).trim()
+      if tp_name == annotation
+        return tc_extract_nth_type_arg(type_args, tp_idx)
+      end
+      tp_idx += 1
+      tp_start = tp_i + 1
+    end
+    tp_i += 1
+  end
+  # Tuple types: (A, B, ...) — substitute each element type, preserve parens.
+  # Without this, the generic-args branch below mis-slices `(Int, Ev<T>)` as
+  # `base="(Int, Ev"`, `inner="T>"` (because the trailing `)` wasn't peeled),
+  # producing garbage like `(Int, Ev<T>>` and breaking call-site substitution
+  # for any function with a tuple-wrapped generic return.
+  if str_byte_len(annotation) >= 2 and str_byte_at(annotation, 0) == '('
+    var _ts_last = str_byte_len(annotation) - 1
+    if str_byte_at(annotation, _ts_last) == ')'
+      var _ts_inner = str_byte_slice(annotation, 1, _ts_last)
+      var _ts_new_inner = tc_substitute_inner_type_args(_ts_inner, type_params, type_args)
+      return "(#{_ts_new_inner})"
+    end
+  end
+  # If annotation contains generic args (e.g., "GBox<T>"), substitute within them
+  var lt_pos = __char_index(annotation, '<')
+  if lt_pos > 0
+    var base = str_byte_slice(annotation, 0, lt_pos)
+    var inner = str_byte_slice(annotation, lt_pos + 1, str_byte_len(annotation) - 1)
+    # Substitute each type arg within the inner part
+    var new_inner = tc_substitute_inner_type_args(inner, type_params, type_args)
+    return "#{base}<#{new_inner}>"
+  end
+  return annotation
+end
+
+## Substitute type params within a comma-separated type args string.
+## Handles nesting: "GBox<T>, T" with T->Int -> "GBox<Int>, Int"
+def tc_substitute_inner_type_args(inner: String, type_params: String, type_args: String): String
+  var result = ""
+  var depth = 0
+  var start = 0
+  var i = 0
+  var len = str_byte_len(inner)
+  while i <= len
+    var is_sep = 0
+    if i == len
+      is_sep = 1
+    else
+      var ch = str_byte_at(inner, i)
+      if ch == '<'
+        depth += 1
+      elsif ch == '>'
+        depth -= 1
+      elsif ch == ',' and depth == 0
+        is_sep = 1
+      end
+    end
+    if is_sep == 1
+      var segment = str_byte_slice(inner, start, i).trim()
+      var substituted = tc_substitute_annotation(segment, type_params, type_args)
+      if str_byte_len(result) > 0
+        result += ", "
+      end
+      result += substituted
+      start = i + 1
+    end
+    i += 1
+  end
+  return result
+end
+
+## Resolve the struct name for an arbitrary expression node.
+## For node_constants$NODE_IDENT, looks up the binding's struct_name.
+## For node_constants$NODE_FIELD_ACCESS, recursively resolves the parent struct and
+## looks up the field's type annotation to find the resulting struct name.
+## Returns "" if the struct name cannot be determined.
+def tc_resolve_expr_struct_name(tc: TypecheckState, ast_storage: ast::AstStorage, node: AstNodeId): String
+  var ann = tc_infer_expr_type_annotation(tc, ast_storage, node)
+  if str_byte_len(ann) > 0
+    var base_name = ann
+    var lt_pos = __char_index(ann, '<')
+    if lt_pos > 0
+      base_name = str_byte_slice(ann, 0, lt_pos)
+    end
+    # Filter out builtin container types — they are not structs.
+    # Map and HashMap are both listed because the unified Map<K,V> migration
+    # is in flight; both names resolve to TYPE_MAP at runtime.
+    if base_name == "Vec" or base_name == "Map" or base_name == "HashMap" or base_name == "IntMap" or base_name == "Set" or base_name == "Option" or base_name == "Result" or base_name == "String" or base_name == "StringBuilder" or base_name == "Fn" or base_name == "Tuple" or base_name == "Int" or base_name == "Bool" or base_name == "F64" or base_name == "F32" or base_name == "Symbol"
+      return ""
+    end
+    return base_name
+  end
+  # Fallback: original logic for unsupported node types
+  var node_kind = ast::ast_get_kind(ast_storage, node)
+  if node_kind == node_constants::NODE_IDENT
+    return typecheck_util::tc_scope_lookup_struct_name(tc, ast::ast_get_str1(ast_storage, node))
+  end
+  return ""
+end
+
+## Check field access on a struct, with generic type substitution.
+## type_args is the concrete type arguments string (e.g., "Int, String")
+## or "" for non-generic structs.
+def tc_check_field_access(tc: TypecheckState, struct_name: String, field_name: String, line: Int, col: Int, type_args: String): Int can Diag
+  # Strip leading & or &mut for borrow types
+  struct_name = typecheck::strip_borrow_prefix(struct_name)
+  var struct_result = typecheck_registry::tc_lookup_struct(tc, struct_name)
+  var struct_idx = match struct_result
+    LookupResult::Found(v) => v
+    LookupResult::NotFound => {
+      suggestion = typecheck_registry::tc_suggest(struct_name, typecheck_registry::tc_all_struct_names(tc))
+      error("Unknown struct: #{struct_name}#{suggestion}", line, col)
+      return type_constants::TYPE_ERROR
+    }
+  end
+
+  ## Generic substitution: try annotation-based resolution FIRST when type_args
+  ## are present. This must come before the type_constants$TYPE_ERROR check because generic
+  ## fields (e.g. value: T) resolve to type_constants$TYPE_ERROR via tc_parse_type, which is
+  ## ambiguous with "field not found" (also type_constants$TYPE_ERROR).
+  if str_byte_len(type_args) > 0
+    var field_ann = typecheck::tc_struct_field_annotation(tc, struct_idx, field_name)
+    if str_byte_len(field_ann) > 0
+      var params = typecheck::tc_struct_type_params(tc, struct_idx)
+      if str_byte_len(params) > 0
+        return tc_substitute_field_type(tc, field_ann, params, type_args)
+      end
+    end
+  end
+
+  var field_type = typecheck_registry::tc_struct_field_type(tc, struct_idx, field_name)
+  if field_type == type_constants::TYPE_ERROR
+    suggestion = typecheck_registry::tc_suggest(field_name, typecheck_registry::tc_struct_field_names(tc, struct_idx))
+    error("Struct '#{struct_name}' has no field '#{field_name}'#{suggestion}", line, col)
+    return type_constants::TYPE_ERROR
+  end
+
+  return field_type
+end
+
+# ============================================================================
+# Struct Type Arg Inference
+# ============================================================================
+
+## Infer type arguments for a generic struct from field value types.
+## For each type param, find a field whose annotation matches and use the value type.
+## Strip a trait bound from a struct type parameter entry.
+## "C: Counter" → "C" (and "T" stays "T"). Used when matching the struct's
+## type param name against a field annotation, which uses the bare name.
+def tc_strip_struct_tp_bound(entry: String): String
+  var colon_pos = __char_index(entry, ':')
+  if colon_pos > 0
+    return str_byte_slice(entry, 0, colon_pos).trim()
+  end
+  return entry
+end
+
+## Extract the trait bound from a struct type parameter entry.
+## "C: Counter+Ord" → "Counter+Ord" (empty string for unbounded `T`).
+def tc_extract_struct_tp_bound(entry: String): String
+  var colon_pos = __char_index(entry, ':')
+  if colon_pos > 0
+    return str_byte_slice(entry, colon_pos + 1, str_byte_len(entry)).trim()
+  end
+  return ""
+end
+
+## Validate that each type argument passed to a generic struct satisfies any
+## trait bound declared on the corresponding type parameter.
+## Emits a type error for each unsatisfied bound.
+def tc_check_struct_type_param_bounds(tc: TypecheckState, struct_name: String, type_params: String, type_args: String, line: Int, col: Int): Void can Diag
+  return if str_byte_len(type_params) == 0
+  return if str_byte_len(type_args) == 0
+
+  # Walk type_params as "T1[:B1],T2[:B2],..." matched against type_args
+  var tp_start = 0
+  var tp_i = 0
+  var tp_idx = 0
+  var tp_len = str_byte_len(type_params)
+  while tp_i <= tp_len
+    var tp_sep = 0
+    if tp_i == tp_len
+      tp_sep = 1
+    elsif str_byte_at(type_params, tp_i) == ','
+      tp_sep = 1
+    end
+    if tp_sep == 1 and tp_i > tp_start
+      var entry = str_byte_slice(type_params, tp_start, tp_i).trim()
+      var bound_str = tc_extract_struct_tp_bound(entry)
+      if str_byte_len(bound_str) > 0
+        var concrete = tc_extract_nth_type_arg(type_args, tp_idx)
+        if str_byte_len(concrete) > 0
+          # Strip any generic args off the concrete type for impl lookup
+          var concrete_lt = __char_index(concrete, '<')
+          var concrete_base = concrete
+          if concrete_lt > 0
+            concrete_base = str_byte_slice(concrete, 0, concrete_lt)
+          end
+          # Skip bound checks when the concrete type is itself a type parameter
+          # of the enclosing function (e.g. inside `def wrap<I: Iterator<Int>>`).
+          # Those are caught at monomorphization time. A heuristic: type parameter
+          # names are single-letter or underscore-prefixed in practice.
+          # Skip bound checks when the concrete type isn't a known struct or
+          # enum — most commonly that means it's a type parameter of the
+          # enclosing function (e.g. inside `def iter_map<I: Iterator<Int>>`)
+          # or a primitive. The outer monomorphization site is responsible
+          # for validating the real concrete type, and primitives don't carry
+          # user-declared trait impls today. When the concrete IS a known
+          # struct/enum, we enforce the bound normally.
+          var is_known = 0
+          if typecheck_registry::tc_lookup_struct(tc, concrete_base).is_found()
+            is_known = 1
+          end
+          if is_known == 0
+            if typecheck_registry::tc_lookup_enum(tc, concrete_base).is_found()
+              is_known = 1
+            end
+          end
+          if is_known == 1 and concrete_base != "ERROR" and concrete_base != ""
+            # Split bound_str on '+' for multi-trait bounds
+            var b_start = 0
+            var b_i = 0
+            while b_i <= str_byte_len(bound_str)
+              var b_sep = 0
+              if b_i == str_byte_len(bound_str)
+                b_sep = 1
+              elsif str_byte_at(bound_str, b_i) == '+'
+                b_sep = 1
+              end
+              if b_sep == 1 and b_i > b_start
+                var trait_name = str_byte_slice(bound_str, b_start, b_i).trim()
+                # Strip generic args from trait name for impl lookup
+                var trait_lt = __char_index(trait_name, '<')
+                var trait_base = trait_name
+                if trait_lt > 0
+                  trait_base = str_byte_slice(trait_name, 0, trait_lt)
+                end
+                if typecheck_registry::tc_check_trait_bound(tc, trait_base, concrete_base) == 0
+                  error("Type '#{concrete}' does not implement trait '#{trait_name}' required by struct '#{struct_name}'", line, col)
+                end
+                b_start = b_i + 1
+              end
+              b_i += 1
+            end
+          end
+        end
+      end
+      tp_idx += 1
+      tp_start = tp_i + 1
+    end
+    tp_i += 1
+  end
+end
+
+def tc_infer_struct_type_args(tc: TypecheckState, ast_storage: ast::AstStorage, struct_idx: Int, type_params: String, field_names_vec: Vec, field_types_vec: Vec, field_inits_vec: Vec): String
+  var inferred = ""
+  var param_index = 0
+  var start = 0
+  var len = str_byte_len(type_params)
+  for i in 0..len
+    var ch = str_byte_at(type_params, i)
+    if ch == ','
+      var param_raw = str_byte_slice(type_params, start, i).trim()
+      var param = tc_strip_struct_tp_bound(param_raw)
+      var arg_name = tc_find_field_type_name_for_param(tc, ast_storage, struct_idx, param, field_names_vec, field_types_vec, field_inits_vec)
+      if param_index > 0
+        inferred = "#{inferred}, "
+      end
+      inferred = "#{inferred}#{arg_name}"
+      param_index += 1
+      start = i + 1
+    end
+  end
+  var last_param_raw = str_byte_slice(type_params, start, len).trim()
+  var last_param = tc_strip_struct_tp_bound(last_param_raw)
+  var last_name = tc_find_field_type_name_for_param(tc, ast_storage, struct_idx, last_param, field_names_vec, field_types_vec, field_inits_vec)
+  if param_index > 0
+    inferred = "#{inferred}, "
+  end
+  inferred = "#{inferred}#{last_name}"
+  return inferred
+end
+
+## Find the field value type *name* (source-level) that corresponds to a given
+## type parameter name. Returns the actual struct/type name (e.g. "Cell"),
+## not the generic kind name (e.g. "Struct"). For non-struct fields, falls back
+## to `tc_type_name` on the field's runtime type ID.
+##
+## STRUCT-GENERIC-ARG-INFERENCE fix: previously this returned only the integer
+## type ID, which `tc_infer_struct_type_args` then ran through `tc_type_name`,
+## producing the generic string "Struct" for any struct field — losing the
+## concrete name and breaking downstream `w.inner.val` field access with
+## `QZ0301: Unknown struct: Struct`. Now we extract the concrete name from
+## the field initializer AST node via `tc_infer_expr_type_annotation`.
+def tc_find_field_type_name_for_param(tc: TypecheckState, ast_storage: ast::AstStorage, struct_idx: Int, param_name: String, field_names_vec: Vec, field_types_vec: Vec, field_inits_vec: Vec): String
+  var count = field_names_vec.size
+  for i in 0..count
+    var annotation = typecheck::tc_struct_field_annotation(tc, struct_idx, as_string(field_names_vec[i]))
+    if annotation == param_name
+      # Try to recover the source-level type name from the AST first
+      if field_inits_vec != 0 and i < field_inits_vec.size
+        var init_node = field_inits_vec[i]
+        var ann = tc_infer_expr_type_annotation(tc, ast_storage, init_node)
+        if str_byte_len(ann) > 0
+          return ann
+        end
+      end
+      # Fallback: use the runtime type ID's printed name. This still loses
+      # struct identity (returns "Struct"), but covers cases where the AST
+      # walker can't infer an annotation (e.g. unusual literal forms).
+      return typecheck::tc_type_name(field_types_vec[i])
+    end
+  end
+  return typecheck::tc_type_name(type_constants::TYPE_ERROR)
+end
+
+# ============================================================================
+# Struct Initialization
+# ============================================================================
+
+## Check struct initialization.
+## Verifies all fields are provided with correct types.
+##
+## Parameters:
+##   tc          - Type checker context
+##   struct_name - Name of struct being initialized
+##   field_count - Number of fields provided
+##   line        - Source line for errors
+##   col         - Source column for errors
+##
+## Returns: Struct type kind if valid, type_constants$TYPE_ERROR otherwise
+def tc_check_struct_init(tc: TypecheckState, struct_name: String, field_count: Int, line: Int, col: Int): Int can Diag
+  var struct_result = typecheck_registry::tc_lookup_struct(tc, struct_name)
+  var struct_idx = match struct_result
+    LookupResult::Found(v) => v
+    LookupResult::NotFound => {
+      suggestion = typecheck_registry::tc_suggest(struct_name, typecheck_registry::tc_all_struct_names(tc))
+      error("Unknown struct: #{struct_name}#{suggestion}", line, col)
+      return type_constants::TYPE_ERROR
+    }
+  end
+
+  var expected_count = typecheck::tc_struct_field_count(tc, struct_idx)
+  var required_count = typecheck::tc_struct_required_field_count(tc, struct_idx)
+  if field_count > expected_count
+    error("Struct '#{struct_name}' has #{expected_count} fields but got #{field_count}", line, col)
+    return type_constants::TYPE_ERROR
+  end
+  if field_count < required_count
+    error("Struct '#{struct_name}' requires at least #{required_count} fields but got #{field_count}", line, col)
+    return type_constants::TYPE_ERROR
+  end
+
+  return type_constants::TYPE_STRUCT
+end
+
+## Check field initializer types in struct construction.
+## For generic structs, substitutes type params with concrete type args.
+## For non-generic structs, checks against stored field types.
+##
+## Parameters:
+##   tc              - Type checker context
+##   struct_name     - Name of struct being initialized
+##   type_args       - Type arguments string (e.g., "Int, String") or "" for non-generic
+##   field_names_vec - Vec of field name strings from AST extras slot
+##   field_types_vec - Vec of actual field types from tc_expr
+##   line            - Source line for errors
+##   col             - Source column for errors
+##
+## Returns: 0 (errors reported via tc_error)
+def tc_check_struct_init_field_types(tc: TypecheckState, struct_name: String, type_args: String, field_names_vec: Vec, field_types_vec: Vec, line: Int, col: Int): Int can Diag
+  return 0 if field_names_vec == 0
+
+  var struct_result = typecheck_registry::tc_lookup_struct(tc, struct_name)
+  var struct_idx = match struct_result
+    LookupResult::Found(v) => v
+    LookupResult::NotFound => return 0
+  end
+
+  var type_params = typecheck::tc_struct_type_params(tc, struct_idx)
+  var field_count = field_types_vec.size
+
+  for i in 0..field_count
+    var actual_type = field_types_vec[i]
+    var field_name = as_string(field_names_vec[i])
+    # Get expected type via substitution or direct lookup
+    var expected_type = 0
+    var field_annotation = ""
+    if str_byte_len(type_args) > 0
+      field_annotation = typecheck::tc_struct_field_annotation(tc, struct_idx, field_name)
+      if str_byte_len(field_annotation) > 0
+        expected_type = tc_substitute_field_type(tc, field_annotation, type_params, type_args)
+      else
+        # Field annotation not found — field doesn't exist on this struct
+        expected_type = type_constants::TYPE_ERROR
+      end
+      else
+        expected_type = typecheck_registry::tc_struct_field_type(tc, struct_idx, field_name)
+      end
+
+    # Check if field exists
+    if expected_type == type_constants::TYPE_ERROR
+      # For generic structs with type params in type_args, TYPE_ERROR means
+      # the type parameter couldn't be resolved (e.g., T inside a generic fn).
+      # Only report error if the field genuinely doesn't exist (empty annotation).
+      if str_byte_len(type_args) == 0 or str_byte_len(field_annotation) == 0
+        var suggestion = typecheck_registry::tc_suggest(field_name, typecheck_registry::tc_struct_field_names(tc, struct_idx))
+        error("Struct #{struct_name} has no field #{field_name}#{suggestion}", line, col)
+      end
+    elsif expected_type != type_constants::TYPE_ERROR
+      if actual_type != type_constants::TYPE_ERROR
+        if typecheck::tc_types_match(tc, expected_type, actual_type) == false
+          error("Field #{field_name}: expected #{typecheck::tc_type_name_full(tc, expected_type)}, got #{typecheck::tc_type_name_full(tc, actual_type)}", line, col)
+        end
+        # QZ0215 (N3.1 step-4 structural audit) — struct-field-init case.
+        # A bare Int (literal or Int-var; tc_expr returns TYPE_INT for both) in a
+        # field declared as a boxed/heap slot is the existential 0-sentinel.
+        # Routes through tc_nil_forbidden_type so sanctioned IR/arena handle
+        # fields (MirFunc{entry}, AstStorage) stay exempt. Warn-only (the
+        # structural flip switch is off); std/+shared/ files suppressed.
+        if typecheck_helpers::tc_nil_forbidden_type(tc, expected_type) == 1 and typecheck_registry::tc_union_contains_nil(tc, expected_type) == 0
+          if typecheck_helpers::tc_n3_wall_warn_enabled() and typecheck_helpers::tc_n3_file_exempt(tc) == false
+            if actual_type == type_constants::TYPE_INT
+              typecheck_helpers::tc_n3_wall_emit_struct_int_into_boxed(tc, field_name, line, col)
+            end
+          end
+        end
+      end
+    end
+
+  end
+
+  return 0
+end
+
+# ============================================================================
+# Enum Access
+# ============================================================================
+
+## Check enum variant access.
+## Verifies enum has the named variant.
+##
+## Parameters:
+##   tc           - Type checker context
+##   enum_name    - Name of the enum type
+##   variant_name - Name of the variant being accessed
+##   line         - Source line for errors
+##   col          - Source column for errors
+##
+## Returns: Enum type kind if valid, type_constants$TYPE_ERROR otherwise
+def tc_check_enum_access(tc: TypecheckState, enum_name: String, variant_name: String, line: Int, col: Int): Int can Diag
+  var enum_result = typecheck_registry::tc_lookup_enum(tc, enum_name)
+  var enum_idx = match enum_result
+    LookupResult::Found(v) => v
+    LookupResult::NotFound => {
+      suggestion = typecheck_registry::tc_suggest(enum_name, typecheck_registry::tc_all_enum_names(tc))
+      error("Unknown enum: #{enum_name}#{suggestion}", line, col)
+      return type_constants::TYPE_ERROR
+    }
+  end
+
+  var has_variant = typecheck_registry::tc_enum_has_variant(tc, enum_idx, variant_name)
+  if has_variant == 0
+    suggestion = typecheck_registry::tc_suggest(variant_name, typecheck_registry::tc_enum_variant_names(tc, enum_idx))
+    error("Enum '#{enum_name}' has no variant '#{variant_name}'#{suggestion}", line, col)
+    return type_constants::TYPE_ERROR
+  end
+
+  if enum_name == "Option"
+    return type_constants::TYPE_OPTION
+  end
+  if enum_name == "Result"
+    return type_constants::TYPE_RESULT
+  end
+  return type_constants::TYPE_ENUM
+end

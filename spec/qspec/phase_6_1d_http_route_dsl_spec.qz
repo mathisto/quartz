@@ -1,0 +1,216 @@
+## Phase 6.1.d — HttpRoute effect + block-DSL routing acceptance spec.
+##
+## Operation Piezoelectric Effects, Phase 6 (user-tool dogfooding),
+## subphase 6.1.d.
+##
+## Validates the `HttpRoute` effect declared in std/net/http_route.qz
+## and the verb performers (`route_get`/`route_post`/`route_put`/
+## `route_delete`/`route_patch`) + block-DSL `http_serve(port, body)`
+## overload added in std/net/http_server.qz. The block DSL is the v1
+## user-facing surface:
+##
+##   http_serve(8080) do ->
+##     route_get("/", req: Request -> text_response("hi"))
+##     route_post("/echo", req: Request -> text_response(req.body))
+##   end
+##
+## Internally, `http_serve(port, body)` opens a `with HttpRoute {
+## register: _http_route_register_handler } do -> body() end` install
+## around body, captures every verb-performer call into a fresh
+## `Router`, then forwards to `http_serve_supervised(http_server_config(port),
+## router_handler(router))`. Custom user installs around the call
+## shadow the framework's default — the verb-performers' registrations
+## route to the user's handler instead, which is the test-isolation /
+## describe-routes-without-binding hook the design memo (R4) called
+## out.
+##
+## The verbs use the `route_<method>` prefix instead of bare Sinatra-
+## shape `get`/`post` because Quartz's open-UFCS feature registers
+## every impl method as free-callable (`JsonValue.get` becomes a
+## `get/2` candidate); the resolver's name+arity dedup silently drops
+## whichever copy was registered second. Phase 6.1.f filed as the
+## follow-on for freeing up bare verb names via either a typed Routes
+## receiver or a resolver disambiguation pass.
+##
+## Coverage:
+## - Compile-time: block-DSL form typechecks; user installs of custom
+##   `with HttpRoute { register: cap }` handlers compile against the
+##   verb performers' `can HttpRoute` rows.
+## - Runtime: each verb performer dispatches `register(method, pattern,
+##   raw_handler_int)` — argv[0] = method, argv[1] = pattern (decoded
+##   via as_string), argv[2] = handler raw fn ptr (Int — invoked via
+##   call_fn at request time).
+##
+## What this spec does NOT cover (filed for follow-on):
+## - Live HTTP server with concurrent curl clients hitting the routes
+##   collected through the DSL — port allocation in qspec subprocesses
+##   is fragile across CI environments. Filed as a Tier 4 integration
+##   spec alongside the 6.1.c live-server filing.
+## - 6.1.e middleware migration (with_logging/with_cors/with_static
+##   to use effect installs internally).
+## - 6.1.f-k follow-ons (named pipelines, typed extractors,
+##   WebSocket-as-Stream, first-class Endpoint values).
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("HttpRoute effect + block-DSL routing (Phase 6.1.d)") do ->
+
+    it("block-DSL form typechecks: http_serve(port) do -> route_get(...) end") do ->
+      # The R4 risk in the design memo: `do ... end` lambda inference
+      # must propagate `can HttpRoute` to the body. This compile-only
+      # assertion confirms the lambda's row inference works through the
+      # http_serve(port, body) parameter typing without explicit
+      # `Fn(): Void can HttpRoute` annotation. (We do NOT run the
+      # binary — the kqueue loop blocks; the typecheck is what's
+      # load-bearing.)
+      assert_compile_succeeds("""
+import std/net/http_server
+
+def hello(req: Request): Response
+  return text_response("hi")
+end
+
+def main(): Int
+  http_serve(8080) do ->
+    route_get("/", hello)
+  end
+  return 0
+end
+""")
+    end
+
+    it("verb performer (route_get) dispatches register('GET', pattern, fn_int)") do ->
+      # Custom HttpRoute install captures each register call. The
+      # framework's default never fires because the user install is on
+      # top of the H-delegate scan stack. argv[0] = method, argv[1] =
+      # pattern (both Strings); argv[2] is the raw fn pointer (Int) —
+      # we don't introspect it here, just confirm the args round-trip
+      # under as_string decoding.
+      assert_run_stdout_eq("""
+import std/net/http_server
+import std/net/http_route
+
+def cap(op_name: Int, argc: Int, argv: Int): Int
+  var method = as_string(load(argv, 0))
+  var pattern = as_string(load(argv, 1))
+  puts("registered " + method + " " + pattern)
+  return 0
+end
+
+def serve(req: Request): Response
+  return text_response("ok")
+end
+
+def main(): Int
+  with HttpRoute { register: cap } do ->
+    route_get("/users/:id", serve)
+  end
+  return 0
+end
+""", "registered GET /users/:id\n")
+    end
+
+    it("all five verbs dispatch via HttpRoute with correct method tag") do ->
+      # Verifies each verb performer's method-string constant is
+      # threaded through register. Order preserved because the verbs
+      # are called in source order and dispatch is synchronous.
+      assert_run_stdout_eq("""
+import std/net/http_server
+import std/net/http_route
+
+def cap(op_name: Int, argc: Int, argv: Int): Int
+  var method = as_string(load(argv, 0))
+  var pattern = as_string(load(argv, 1))
+  puts(method + " " + pattern)
+  return 0
+end
+
+def h(req: Request): Response
+  return text_response("ok")
+end
+
+def main(): Int
+  with HttpRoute { register: cap } do ->
+    route_get("/g", h)
+    route_post("/p", h)
+    route_put("/u", h)
+    route_delete("/d", h)
+    route_patch("/x", h)
+  end
+  return 0
+end
+""", "GET /g\nPOST /p\nPUT /u\nDELETE /d\nPATCH /x\n")
+    end
+
+    it("custom handler can suppress registrations entirely (DI shape)") do ->
+      # Returning 0 from the custom handler without doing anything is
+      # the "describe routes silently" pattern. Verifies the routing is
+      # genuinely effect-mediated — under a no-op handler, nothing is
+      # observed downstream, even though the verb performers ran.
+      # Counter-test: if our verb performers had a side-channel that
+      # bypassed the effect, this assertion would still see output.
+      assert_run_stdout_eq("""
+import std/net/http_server
+import std/net/http_route
+
+def silent(op_name: Int, argc: Int, argv: Int): Int = 0
+
+def h(req: Request): Response
+  return text_response("ok")
+end
+
+def main(): Int
+  with HttpRoute { register: silent } do ->
+    route_get("/never", h)
+    route_post("/seen", h)
+  end
+  puts("done")
+  return 0
+end
+""", "done\n")
+    end
+
+    it("multiple registrations preserved in order under capturing handler") do ->
+      # The capture-into-Vec pattern is what test code wants when
+      # asserting on the routing table without binding a port. Verifies
+      # that 6 registrations across mixed verbs round-trip cleanly.
+      assert_run_stdout_eq("""
+import std/net/http_server
+import std/net/http_route
+
+var captured_methods: Vec<String> = vec_new<String>()
+var captured_patterns: Vec<String> = vec_new<String>()
+
+def collect(op_name: Int, argc: Int, argv: Int): Int
+  captured_methods.push(as_string(load(argv, 0)))
+  captured_patterns.push(as_string(load(argv, 1)))
+  return 0
+end
+
+def h(req: Request): Response
+  return text_response("ok")
+end
+
+def main(): Int
+  with HttpRoute { register: collect } do ->
+    route_get("/", h)
+    route_get("/about", h)
+    route_post("/users", h)
+    route_get("/users/:id", h)
+    route_put("/users/:id", h)
+    route_delete("/users/:id", h)
+  end
+  puts("count=" + str_from_int(captured_methods.size))
+  for i in 0..captured_methods.size
+    puts(captured_methods[i] + " " + captured_patterns[i])
+  end
+  return 0
+end
+""", "count=6\nGET /\nGET /about\nPOST /users\nGET /users/:id\nPUT /users/:id\nDELETE /users/:id\n")
+    end
+
+  end
+  return qspec_main()
+end

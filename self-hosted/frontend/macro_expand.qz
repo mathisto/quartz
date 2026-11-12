@@ -1,0 +1,2095 @@
+##! # Macro Expander
+##!
+##! Built-in and user-defined macro expansion pass.
+##!
+##! @see macro
+##! @since 1.0.0
+
+# macro_expand.qz - Macro expansion for the self-hosted Quartz compiler
+#
+# Expands built-in macros ($unwrap, $assert, $debug, $caller) and
+# user-defined macros (quote/unquote and string templates) by walking the
+# AST and replacing NODE_MACRO_CALL nodes with their expansions.
+# `$try` used to live here; it was promoted to the `try` prefix keyword
+# during Piezo Milestone A (`86e0f906`). The dispatch is gone — `$try`
+# now falls through to the "unknown macro" path with a hint.
+#
+# Called between parsing and import resolution in the compilation pipeline.
+#
+# Reference: quartz-bootstrap/src/macro.c
+
+import ast
+import lexer
+import cst_parser
+import cst_lower
+import string_intern
+import compiler_types
+import diagnostic
+
+# ============================================================================
+# Macro Registry — parallel Vecs for user-defined macros
+# ============================================================================
+
+var _macro_names = vec_new<String>()
+var _macro_params: Vec<Vec<Int>> = vec_new<Vec<Int>>()  # children vecs (ident handles), one per macro
+var _macro_bodies = vec_new()        # body AST handles
+var _macro_is_variadic = vec_new()   # 0 or 1
+var _macro_var_param = vec_new<String>()  # variadic param name
+var _macro_is_template = vec_new()   # 1 if string template, 0 if quote
+var _macro_ast_store = vec_new()     # AST storage handles
+# Def-site source position per macro (NODE_MACRO_DEF's line/col).
+# Populated by macro_registry_register. Read by expand_macro_call to
+# populate the def_line/def_col of the expansion record stored in
+# ast.qz's `_ast_exp_*` tables — so P2's diagnostic renderer can say
+# `note: in expansion of macro X (defined at Y:L:C)`.
+var _macro_def_lines = vec_new<Int>()
+var _macro_def_cols = vec_new<Int>()
+
+def macro_registry_reset(): Void
+  _macro_names = vec_new<String>()
+  _macro_params = vec_new<Vec<Int>>()
+  _macro_bodies = vec_new()
+  _macro_is_variadic = vec_new()
+  _macro_var_param = vec_new<String>()
+  _macro_is_template = vec_new()
+  _macro_ast_store = vec_new()
+  _macro_def_lines = vec_new<Int>()
+  _macro_def_cols = vec_new<Int>()
+end
+
+# Index of the currently-expanding macro invocation. 0 means "not expanding"
+# (or top-level expansion is about to start). Stack discipline: saved into
+# a local before every push, restored after.
+var _cur_expansion_idx = 0
+
+# Scope-set idx for the currently-expanding macro — the set of fresh scopes
+# that identify which macro definitions the nodes born here belong to.
+# Nested expansions union on top of the parent's set, so a body node from
+# an inner `$B(...)` inside `$A(...)` carries both `s_def_A` and `s_def_B`.
+# 0 means "empty set" / "not inside any expansion". Stack discipline mirrors
+# `_cur_expansion_idx` — saved/restored around each `expand_macro_call`.
+# Macro hygiene retrofit · Phase 3 (P3.b).
+var _cur_scope_set_idx = 0
+
+# The *caller's* scope set for the currently-expanding macro — i.e., the
+# scope set that identifiers would carry if written at the call site, one
+# level outside this expansion. Read by the `$caller(name)` builtin (P3.d)
+# to stamp its result with the caller-scope view rather than the body-scope
+# view. Set by `expand_macro_call` before dispatching to the body expander;
+# restored on exit with the same save/restore discipline as the other
+# expansion-scoped module vars.
+var _caller_scope_set_idx = 0
+
+# ============================================================================
+# Diagnostic context for structured error output
+# ============================================================================
+
+var _macro_diag_filename = ""
+var _macro_diag_src_lines = vec_new<String>()
+
+def macro_set_diag_context(filename: String, src_lines: Vec<String>): Void
+  _macro_diag_filename = filename
+  _macro_diag_src_lines = src_lines
+end
+
+# Attach the current macro-expansion chain to a diagnostic. P2's chain
+# walker (`ast_expansion_notes`) lives in `ast.qz` because it needs the
+# `_ast_exp_*` store; A.16.1 lifted `diagnostic.qz` to `std/` and stripped
+# its AST-dependent renderer, so the producer side owns the walk and pushes
+# the result as plain `diag_add_note` lines that the std formatters render.
+# When the error fires OUTSIDE an expansion (e.g. QZ0503 for a top-level
+# unknown macro call), `_cur_expansion_idx` is 0 and the chain is empty.
+def _macro_attach_expansion_chain(d: diagnostic::Diagnostic): Void
+  diagnostic::diag_set_expansion(d, _cur_expansion_idx)
+  if _cur_expansion_idx > 0
+    var chain = ast::ast_expansion_notes(_cur_expansion_idx)
+    for ci in 0..chain.size
+      diagnostic::diag_add_note(d, "note: #{chain[ci]}")
+    end
+  end
+end
+
+def _macro_emit_error(code: String, msg: String, line: Int, col: Int): Void
+  var d = diagnostic::diag_new(diagnostic::DIAG_ERROR, code, msg, _macro_diag_filename, line, col)
+  diagnostic::diag_set_source(d, _macro_diag_src_lines)
+  _macro_attach_expansion_chain(d)
+  diagnostic::diag_emit(d)
+end
+
+def _macro_emit_warning(code: String, msg: String, line: Int, col: Int): Void
+  var d = diagnostic::diag_new(diagnostic::DIAG_WARNING, code, msg, _macro_diag_filename, line, col)
+  diagnostic::diag_set_source(d, _macro_diag_src_lines)
+  _macro_attach_expansion_chain(d)
+  diagnostic::diag_emit(d)
+end
+
+def macro_registry_register(s: ast::AstStorage, h: AstNodeId): Void
+  var name = ast::ast_get_str1(s, h)
+  var body = ast::ast_get_left(s, h)
+  var params: Vec<Int> = ast::ast_get_children(s, h)
+  var is_variadic = ast::ast_get_int_val(s, h)
+  var variadic_param = ast::ast_get_str2(s, h)
+
+  # Determine macro type: string template or quote block
+  var body_kind = ast::ast_get_kind(s, body)
+  var is_template = 0
+  if body_kind == 3  # NODE_STRING_LIT
+    is_template = 1
+  end
+
+  _macro_names.push(name)
+  _macro_params.push(params)
+  _macro_bodies.push(body)
+  _macro_is_variadic.push(is_variadic)
+  _macro_var_param.push(variadic_param)
+  _macro_is_template.push(is_template)
+  _macro_ast_store.push(s)
+  _macro_def_lines.push(ast::ast_get_line(s, h))
+  _macro_def_cols.push(ast::ast_get_col(s, h))
+end
+
+def macro_registry_lookup(name: String): Int
+  var count = _macro_names.size
+  for idx in 0..count
+    if _macro_names[idx] == name
+      return idx
+    end
+  end
+  return -1
+end
+
+# ============================================================================
+# Gensym
+# ============================================================================
+
+## gensym() - Generate a unique identifier for macro hygiene
+def gensym(s: ast::AstStorage): String
+  var n = ast::ast_node_count(s)
+  return "__macro_#{n}__"
+end
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+## expand_macros() - Main entry point for macro expansion
+##
+## Two-phase approach:
+## 1. Collect all macro definitions from top-level
+## 2. Expand macro calls + remove macro defs from AST
+def expand_macros(s: ast::AstStorage, root: AstNodeId): Int
+  # Reset registry for each compilation unit
+  macro_registry_reset()
+
+  # Phase 1: Collect all macro definitions from top-level
+  collect_macro_defs(s, root)
+
+  # Phase 2: Expand macro calls + remove macro defs from AST
+  return expand_node(s, root)
+end
+
+## collect_macro_defs() - Walk top-level children to register macros
+def collect_macro_defs(s: ast::AstStorage, root: AstNodeId): Void
+  var kind = ast::ast_get_kind(s, root)
+  if kind == 35  # NODE_PROGRAM
+    var children = ast::ast_get_children(s, root)
+    if children != 0
+      var count = children.size
+      for i in 0..count
+        var child = children[i]
+        var ck = ast::ast_get_kind(s, child)
+        if ck == 72  # NODE_MACRO_DEF
+          macro_registry_register(s, child)
+        end
+      end
+    end
+  end
+end
+
+# ============================================================================
+# AST Walker
+# ============================================================================
+
+## expand_node() - Recursively expand macros in an AST node
+def expand_node(s: ast::AstStorage, h: AstNodeId): Int
+  # Guard: invalid node handles (-1 or negative) pass through unchanged
+  if h < 0
+    return h
+  end
+  var kind = ast::ast_get_kind(s, h)
+
+  # MacroCall: the main target for expansion
+  if kind == 67  # NodeMacroCall
+    return expand_macro_call(s, h, 0)
+  end
+
+  # NODE_MACRO_DEF — skip (handled by collect phase, removed by expand_in_block)
+  if kind == 72
+    return h
+  end
+
+  # NODE_QUOTE — no expansion needed (quotes are data)
+  if kind == 73
+    return h
+  end
+
+  # NODE_UNQUOTE — error if found outside quote
+  if kind == 74
+    _macro_emit_error("QZ0501", "unquote outside of quote block", 0, 0)
+    return h
+  end
+
+  # Program / Block: expand in children (and remove macro defs)
+  if kind == 35 or kind == 32  # NodeProgram, NodeBlock
+    return expand_in_block(s, h)
+  end
+
+  # Function: expand in body
+  if kind == 34  # NodeFunction
+    var body = ast::ast_get_right(s, h)
+    if body != 0
+      ast::ast_set_right(s, h, expand_node(s, body))
+    end
+    return h
+  end
+
+  # TraitDef / ImplBlock: expand in children (method bodies may contain macro calls)
+  if kind == 50 or kind == 51  # NODE_TRAIT_DEF, NODE_IMPL_BLOCK
+    var children = ast::ast_get_children(s, h)
+    if children != 0
+      for __mi in 0..children.size
+        children[__mi] = expand_node(s, children[__mi])
+      end
+    end
+    return h
+  end
+
+  # Let: expand initializer
+  if kind == 25  # NodeLet
+    var init = ast::ast_get_left(s, h)
+    if init != 0
+      ast::ast_set_left(s, h, expand_node(s, init))
+    end
+    return h
+  end
+
+  # Assign / IndexAssign / FieldAssign: expand value
+  # Slot layout diverges across the three:
+  #   NODE_ASSIGN (26):        str1=target, left=value
+  #   NODE_INDEX_ASSIGN (27):  left=array, right=index, extra=value
+  #   NODE_FIELD_ASSIGN (28):  str1=field, left=obj, extra=value
+  # The previous implementation always read `right` — which was empty
+  # for NODE_ASSIGN and NODE_FIELD_ASSIGN, and held the INDEX (not the
+  # value) for NODE_INDEX_ASSIGN. Result: macros inside a compound
+  # assignment's RHS (e.g. `sum += step!` desugared to `sum = sum +
+  # step!`) were silently dropped on the floor, leaving raw
+  # NODE_MACRO_CALL nodes to propagate into typecheck/MIR where they
+  # were treated as literal 0. Root cause of B4-UNWRAP-IN-LOOP.
+  if kind == 26  # NODE_ASSIGN
+    var value = ast::ast_get_left(s, h)
+    if value != 0
+      ast::ast_set_left(s, h, expand_node(s, value))
+    end
+    return h
+  end
+  if kind == 27  # NODE_INDEX_ASSIGN
+    var arr = ast::ast_get_left(s, h)
+    if arr != 0
+      ast::ast_set_left(s, h, expand_node(s, arr))
+    end
+    var idx = ast::ast_get_right(s, h)
+    if idx != 0
+      ast::ast_set_right(s, h, expand_node(s, idx))
+    end
+    var ia_val = ast::ast_get_extra(s, h)
+    if ia_val != 0
+      ast::ast_set_extra(s, h, expand_node(s, ia_val))
+    end
+    return h
+  end
+  if kind == 28  # NODE_FIELD_ASSIGN
+    var obj = ast::ast_get_left(s, h)
+    if obj != 0
+      ast::ast_set_left(s, h, expand_node(s, obj))
+    end
+    var fa_val = ast::ast_get_extra(s, h)
+    if fa_val != 0
+      ast::ast_set_extra(s, h, expand_node(s, fa_val))
+    end
+    return h
+  end
+
+  # If: expand cond, then, else
+  if kind == 23  # NodeIf
+    ast::ast_set_left(s, h, expand_node(s, ast::ast_get_left(s, h)))
+    ast::ast_set_right(s, h, expand_node(s, ast::ast_get_right(s, h)))
+    var else_branch = ast::ast_get_extra(s, h)
+    if else_branch != 0
+      ast::ast_set_extra(s, h, expand_node(s, else_branch))
+    end
+    return h
+  end
+
+  # While: expand cond, body
+  if kind == 24  # NodeWhile
+    ast::ast_set_left(s, h, expand_node(s, ast::ast_get_left(s, h)))
+    ast::ast_set_right(s, h, expand_node(s, ast::ast_get_right(s, h)))
+    return h
+  end
+
+  # For: expand iterable (left) and body (right)
+  if kind == 44  # NodeFor
+    var iter = ast::ast_get_left(s, h)
+    if iter != 0
+      ast::ast_set_left(s, h, expand_node(s, iter))
+    end
+    var body = ast::ast_get_right(s, h)
+    if body != 0
+      ast::ast_set_right(s, h, expand_node(s, body))
+    end
+    return h
+  end
+
+  # For-await: expand channel (left) and body (right)
+  if kind == 86  # NODE_FOR_AWAIT
+    var fa_channel = ast::ast_get_left(s, h)
+    if fa_channel != 0
+      ast::ast_set_left(s, h, expand_node(s, fa_channel))
+    end
+    var fa_body = ast::ast_get_right(s, h)
+    if fa_body != 0
+      ast::ast_set_right(s, h, expand_node(s, fa_body))
+    end
+    return h
+  end
+
+  # Return: expand value
+  if kind == 22  # NodeReturn
+    var value = ast::ast_get_left(s, h)
+    if value != 0
+      ast::ast_set_left(s, h, expand_node(s, value))
+    end
+    return h
+  end
+
+  # Binary: expand left and right
+  if kind == 8  # NodeBinary
+    ast::ast_set_left(s, h, expand_node(s, ast::ast_get_left(s, h)))
+    ast::ast_set_right(s, h, expand_node(s, ast::ast_get_right(s, h)))
+    return h
+  end
+
+  # Unary: expand operand (stored in left slot per ast_unary constructor)
+  if kind == 7  # NodeUnary
+    var un_op = ast::ast_get_left(s, h)
+    if un_op != 0
+      ast::ast_set_left(s, h, expand_node(s, un_op))
+    end
+    return h
+  end
+
+  # Call: expand callee and args
+  if kind == 9  # NodeCall
+    ast::ast_set_left(s, h, expand_node(s, ast::ast_get_left(s, h)))
+    var args = ast::ast_get_children(s, h)
+    if args != 0
+      expand_children(s, args)
+    end
+    # SURF.FLOW Phase 1 additivity fix (UFCS twin of the `$unwrap` operand
+    # stamp): `opt.unwrap()` / `opt.expect(...)` parses via UFCS to a plain
+    # NODE_CALL with callee ident "unwrap"/"expect" and the receiver as args[0].
+    # If the receiver is a bare narrowed `opt`, that read would narrow to inner T
+    # and the stdlib method would (mis)apply to an already-extracted value. Stamp
+    # op = 1 on the receiver ident so the identifier handler skips narrowing
+    # there, exactly as for postfix `!`. Keeps `opt.unwrap()`-after-guard working
+    # unchanged. (Result `.unwrap()` doesn't narrow in Phase 1, so this is a
+    # harmless no-op there.)
+    var mc_callee = ast::ast_get_left(s, h)
+    if mc_callee >= 0 and ast::ast_get_kind(s, mc_callee) == 6  # NODE_IDENT callee
+      var mc_fn = ast::ast_get_str1(s, mc_callee)
+      if mc_fn == "unwrap" or mc_fn == "expect"
+        if args != 0 and args.size >= 1
+          var mc_recv = args[0]
+          if mc_recv >= 0 and ast::ast_get_kind(s, mc_recv) == 6  # NODE_IDENT receiver
+            ast::ast_set_op(s, mc_recv, 1)
+          end
+        end
+      end
+    end
+    return h
+  end
+
+  # Index: expand target and index expr
+  if kind == 13  # NodeIndex
+    ast::ast_set_left(s, h, expand_node(s, ast::ast_get_left(s, h)))
+    ast::ast_set_right(s, h, expand_node(s, ast::ast_get_right(s, h)))
+    return h
+  end
+
+  # FieldAccess: expand target
+  if kind == 15 or kind == 16  # NodeFieldAccess, NodeSafeFieldAccess
+    ast::ast_set_left(s, h, expand_node(s, ast::ast_get_left(s, h)))
+    return h
+  end
+
+  # Match: expand expr and arms
+  if kind == 40  # NodeMatch
+    ast::ast_set_left(s, h, expand_node(s, ast::ast_get_left(s, h)))
+    var arms = ast::ast_get_children(s, h)
+    if arms != 0
+      var arm_count = arms.size
+      for i in 0..arm_count
+        var arm = arms[i]
+        # Expand arm body
+        var body = ast::ast_get_right(s, arm)
+        if body != 0
+          ast::ast_set_right(s, arm, expand_node(s, body))
+        end
+        # Expand arm guard
+        var guard = ast::ast_get_extra(s, arm)
+        if guard != 0
+          ast::ast_set_extra(s, arm, expand_node(s, guard))
+        end
+      end
+    end
+    return h
+  end
+
+  # ExprStmt: expand inner expression
+  if kind == 29  # NodeExprStmt
+    ast::ast_set_left(s, h, expand_node(s, ast::ast_get_left(s, h)))
+    return h
+  end
+
+  # Lambda: expand body
+  if kind == 19  # NodeLambda
+    var body = ast::ast_get_right(s, h)
+    if body != 0
+      ast::ast_set_right(s, h, expand_node(s, body))
+    end
+    return h
+  end
+
+  # Spread: expand inner expression
+  if kind == 82  # NODE_SPREAD
+    var inner = ast::ast_get_left(s, h)
+    if inner > 0
+      ast::ast_set_left(s, h, expand_node(s, inner))
+    end
+    return h
+  end
+
+  # Array / SetLiteral / MapLit: expand elements
+  if kind == 10 or kind == 11 or kind == 12
+    var elems = ast::ast_get_children(s, h)
+    if elems != 0
+      expand_children(s, elems)
+    end
+    return h
+  end
+
+  # StructInit: expand field values
+  if kind == 14  # NodeStructInit
+    var fields = ast::ast_get_children(s, h)
+    if fields != 0
+      expand_children(s, fields)
+    end
+    return h
+  end
+
+  # TryCatch: expand body (left), handler (right), and catch pattern (extra)
+  if kind == 63  # NodeTryCatch
+    ast::ast_set_left(s, h, expand_node(s, ast::ast_get_left(s, h)))
+    ast::ast_set_right(s, h, expand_node(s, ast::ast_get_right(s, h)))
+    var tc_pat = ast::ast_get_extra(s, h)
+    if tc_pat != 0
+      ast::ast_set_extra(s, h, expand_node(s, tc_pat))
+    end
+    return h
+  end
+
+  # AllocExpr: expand inner
+  if kind == 20  # NodeAllocExpr
+    var inner = ast::ast_get_left(s, h)
+    if inner != 0
+      ast::ast_set_left(s, h, expand_node(s, inner))
+    end
+    return h
+  end
+
+  # CompoundAssign: expand value
+  if kind == 45  # NodeCompoundAssign
+    ast::ast_set_right(s, h, expand_node(s, ast::ast_get_right(s, h)))
+    return h
+  end
+
+  # Await
+  if kind == 58  # NodeAwait
+    ast::ast_set_left(s, h, expand_node(s, ast::ast_get_left(s, h)))
+    return h
+  end
+
+  # InterpString: expand macros in children
+  if kind == 43  # NODE_INTERP_STRING
+    var parts = ast::ast_get_children(s, h)
+    if parts != 0
+      expand_children(s, parts)
+    end
+    return h
+  end
+
+  # TryExpr / Defer / Yield / AsyncCall / Go / IsCheck: single inner in left slot
+  if kind == 17 or kind == 61 or kind == 83 or kind == 84 or kind == 85 or kind == 92
+    var inner = ast::ast_get_left(s, h)
+    if inner != 0
+      ast::ast_set_left(s, h, expand_node(s, inner))
+    end
+    return h
+  end
+
+  # Leaf nodes (IntLit, BoolLit, NilLit, StringLit, Ident, etc.) - no expansion needed
+  return h
+end
+
+## expand_children() - Expand macros in all children of a vec
+def expand_children(s: ast::AstStorage, children: Vec<Int>): Int
+  var count = children.size
+  for i in 0..count
+    children[i] = expand_node(s, children[i])
+  end
+  return 0
+end
+
+## expand_in_block() - Expand macros in Program/Block children
+## Also removes NODE_MACRO_DEF entries (already registered)
+def expand_in_block(s: ast::AstStorage, h: AstNodeId): Int
+  var children = ast::ast_get_children(s, h)
+  if children != 0
+    var count = vec_size(children)
+    var write_idx = 0
+    for i in 0..count
+      var child = children[i]
+      var ck = ast::ast_get_kind(s, child)
+      if ck == 72  # NODE_MACRO_DEF — skip, already registered
+        # Do not increment write_idx — effectively removes this node
+      else
+        children[write_idx] = expand_node(s, child)
+        write_idx += 1
+      end
+    end
+    # Truncate dangling entries
+    while vec_size(children) > write_idx
+      vec_pop(children)
+    end
+  end
+  return h
+end
+
+# ============================================================================
+# Macro Call Dispatch
+# ============================================================================
+
+## expand_macro_call() - Expand a single macro call node
+## Also stamps every new AST node born during this expansion with a
+## provenance record in `ast.qz`'s expansion store, so diagnostics (P2)
+## and scope-set hygiene (P3) can walk back to the macro that produced
+## each node. Nested $outer → $inner expansions form a parent chain via
+## `_cur_expansion_idx` save/restore; the `ast_get_expansion == 0`
+## guard during post-stamp preserves inner's stamps from being
+## overwritten by outer's.
+def expand_macro_call(s: ast::AstStorage, h: AstNodeId, depth: Int): Int
+  if depth > 64
+    _macro_emit_error("QZ0502", "macro expansion depth exceeded (possible infinite recursion)", ast::ast_get_line(s, h), ast::ast_get_col(s, h))
+    return ast::ast_int_lit(s, 0, ast::ast_get_line(s, h), ast::ast_get_col(s, h))
+  end
+
+  var name = ast::ast_get_str1(s, h)
+  var args = ast::ast_get_children(s, h)
+  var line = ast::ast_get_line(s, h)
+  var col = ast::ast_get_col(s, h)
+
+  var idx = -1
+  var is_builtin = 0
+  if name == "unwrap" or name == "assert" or name == "debug" or name == "caller"
+    is_builtin = 1
+  else
+    idx = macro_registry_lookup(name)
+  end
+
+  # Unknown macro — emit QZ0503 and bail with a placeholder. No expansion
+  # record; the silent-accept guard in compile() fails the build on
+  # diag_error_count() > 0, so this return value never ships.
+  if is_builtin == 0 and idx < 0
+    var msg = "unknown macro '$#{name}'"
+    # Special-case the migration hint for pre-Piezo `$try(...)` usage.
+    # `$try` was retired in Piezo Milestone A (`86e0f906`) and is now the
+    # `try` prefix keyword form.
+    if name == "try"
+      msg = "unknown macro '$try' — `$try(expr)` was retired; use the prefix keyword: `try expr`"
+    end
+    _macro_emit_error("QZ0503", msg, line, col)
+    return ast::ast_int_lit(s, 0, line, col)
+  end
+
+  # Push provenance record for this invocation. Builtins have no user
+  # def-site; use 0/0 (P2's renderer distinguishes "built-in" from
+  # user-defined by the zero def_line).
+  var def_line = 0
+  var def_col = 0
+  if is_builtin == 0
+    def_line = _macro_def_lines[idx]
+    def_col = _macro_def_cols[idx]
+  end
+  var parent_idx = _cur_expansion_idx
+  var new_idx = ast::ast_expansion_push(name, def_line, def_col, line, col, parent_idx)
+
+  var pre_count = ast::ast_node_count(s)
+
+  var saved_cur = _cur_expansion_idx
+  _cur_expansion_idx = new_idx
+
+  # Allocate a fresh def-site scope for this expansion and add it to the
+  # enclosing scope set. Every node cloned from the macro body (handle
+  # >= pre_count) will be stamped with the resulting set in the post-stamp
+  # loop below; unquoted-argument nodes keep their handles < pre_count and
+  # so retain the caller's scope set. The net effect is the "macro
+  # introduction scope" construction of Flatt (POPL 2016): inside-the-body
+  # `tmp` ends up in a scope set that the caller's `tmp` is NOT in, so the
+  # resolver (P3.c) disambiguates them without alpha-renaming.
+  var saved_scope_set = _cur_scope_set_idx
+  var fresh_scope = ast::ast_scope_fresh()
+  _cur_scope_set_idx = ast::ast_scope_set_add(saved_scope_set, fresh_scope)
+
+  # Publish the caller's scope set for `$caller(name)` (P3.d). This is the
+  # scope set idents live in at the call site — one level up from this
+  # expansion. At top level this is 0 (empty); at `$outer($caller(x))` it
+  # is `{s_def_outer}`. The builtin reads this module var to stamp its
+  # returned NODE_IDENT with the caller's view, reaching past this
+  # expansion's def-site scope.
+  var saved_caller_scope_set = _caller_scope_set_idx
+  _caller_scope_set_idx = saved_scope_set
+
+  var result = 0
+  if is_builtin == 1
+    if name == "unwrap"
+      result = expand_builtin_unwrap(s, args, line, col)
+    elsif name == "assert"
+      result = expand_builtin_assert(s, args, line, col)
+    elsif name == "caller"
+      result = expand_builtin_caller(s, args, line, col)
+    else
+      result = expand_builtin_debug(s, args, line, col)
+    end
+  else
+    var raw = expand_user_macro(s, idx, args, line, col, depth)
+    # Recursively expand nested macro calls in the result. Nested
+    # expansions push their own records (parent = new_idx) and stamp
+    # their own nodes — our post-stamp below skips stamped nodes.
+    result = expand_node(s, raw)
+  end
+
+  # Post-stamp every newly-created node in this expansion's range.
+  # Skip nodes already stamped by nested expansions (their `!= 0`).
+  # User-argument nodes from the caller have ids < pre_count and are
+  # naturally out of range, preserving their source provenance.
+  #
+  # Two parallel stamps: (a) the expansion-record idx (`new_idx`) — feeds
+  # P2's expansion-chain diagnostic rendering. (b) the scope-set idx
+  # (`_cur_scope_set_idx`) — feeds P3.c's resolver. Both use the same
+  # guard (`== 0` = "not yet stamped") so nested expansions win: their
+  # inner scope set is a SUPERSET of ours (it's ours ∪ {their fresh
+  # scope}), so the resolver still sees every enclosing scope.
+  var post_count = ast::ast_node_count(s)
+  var scope_set_to_stamp = _cur_scope_set_idx
+  var stamp_i = pre_count
+  while stamp_i < post_count
+    if ast::ast_get_expansion(s, stamp_i) == 0
+      ast::ast_set_expansion(s, stamp_i, new_idx)
+    end
+    # Scope-set stamp guard: (a) don't overwrite a scope set written by a
+    # nested expansion (`!= 0`), and (b) don't overwrite the caller's view
+    # stamped by `$caller(name)` (which is legitimately 0 at top level).
+    # The `ast_get_caller_flag` check is the only reason we need a side
+    # table — without it, 0 would be ambiguous between "unstamped" and
+    # "intentionally empty set for the caller-escape case."
+    if ast::ast_get_caller_flag(stamp_i) == 0 and ast::ast_get_scope_set(s, stamp_i) == 0
+      ast::ast_set_scope_set(s, stamp_i, scope_set_to_stamp)
+    end
+    stamp_i = stamp_i + 1
+  end
+
+  _cur_expansion_idx = saved_cur
+  _cur_scope_set_idx = saved_scope_set
+  _caller_scope_set_idx = saved_caller_scope_set
+  return result
+end
+
+# ============================================================================
+# User Macro Expansion
+# ============================================================================
+
+def expand_user_macro(s: ast::AstStorage, idx: Int, args: Vec<Int>, line: Int, col: Int, depth: Int): Int
+  # Validate fragment specifiers on arguments
+  var macro_s: ast::AstStorage = _macro_ast_store[idx]
+  var frag_err = validate_macro_fragments(s, macro_s, _macro_params[idx], args, _macro_names[idx], line, col)
+  if frag_err > 0
+    return ast::ast_int_lit(s, 0, line, col)
+  end
+
+  var is_template = _macro_is_template[idx]
+  if is_template == 1
+    return expand_string_template(s, idx, args, line, col)
+  else
+    return expand_quote_block(s, idx, args, line, col)
+  end
+end
+
+# Fragment specifier constants:
+# 0 = FRAG_EXPR (any expression, default)
+# 1 = FRAG_IDENT (NODE_IDENT only)
+# 2 = FRAG_TYPE (any node, validated semantically)
+# 3 = FRAG_BLOCK (NODE_BLOCK or NODE_LAMBDA)
+# 4 = FRAG_TT (any single token/node, transparent)
+
+def validate_macro_fragments(s: ast::AstStorage, macro_s: ast::AstStorage, params: Vec<Int>, args: Vec<Int>, macro_name: String, line: Int, col: Int): Int
+  var param_count = params.size
+  var arg_idx = 0
+  while arg_idx < param_count and arg_idx < args.size
+    var param_h = params[arg_idx]
+    var frag_type = ast::ast_get_op(macro_s, param_h)
+    if frag_type > 0
+      var arg_h = args[arg_idx]
+      var arg_kind = ast::ast_get_kind(s, arg_h)
+      var param_name = ast::ast_get_str1(macro_s, param_h)
+      if frag_type == 1
+        # FRAG_IDENT: must be NODE_IDENT
+        if arg_kind != node_constants::NODE_IDENT
+          _macro_emit_error("QZ0504", "macro '#{macro_name}' expects ident for parameter '#{param_name}'", line, col)
+          exit(1)
+        end
+      end
+      if frag_type == 3
+        # FRAG_BLOCK: must be NODE_BLOCK or NODE_LAMBDA
+        if arg_kind != node_constants::NODE_BLOCK and arg_kind != node_constants::NODE_LAMBDA
+          _macro_emit_error("QZ0505", "macro '#{macro_name}' expects block for parameter '#{param_name}'", line, col)
+          exit(1)
+        end
+      end
+      # FRAG_TYPE (2) and FRAG_TT (4) accept any node
+    end
+    arg_idx += 1
+  end
+  return 0
+end
+
+# ============================================================================
+# Quote/Unquote Expansion
+# ============================================================================
+
+## expand_quote_block() - Expand a quote/unquote macro
+def expand_quote_block(s: ast::AstStorage, idx: Int, args: Vec<Int>, line: Int, col: Int): Int
+  var body = _macro_bodies[idx]
+  var params = _macro_params[idx]
+  var macro_s: ast::AstStorage = _macro_ast_store[idx]
+
+  # The body is a NODE_QUOTE — get the quoted body (left child)
+  var quote_body = ast::ast_get_left(macro_s, body)
+
+  # Macro hygiene (P3.d): scan the body for the set of `var`-bound names
+  # so `clone_with_unquote` can alpha-rename them + their references during
+  # the clone. Without this renaming, a body-local `var tmp = 99` would
+  # collide with a caller-scope `var tmp` at codegen time — Quartz's
+  # MIR/codegen resolves bindings by name, not by scope set, so P3.c's
+  # typecheck-level subset rule isn't enough on its own. Renaming to
+  # `tmp__hyg_N__` (N = current scope-set idx, unique per expansion)
+  # makes the two bindings distinct at every level of the pipeline.
+  var saved_body_vars = _cur_body_var_names
+  _cur_body_var_names = vec_new<String>()
+  _collect_body_var_names(macro_s, quote_body, _cur_body_var_names)
+
+  # Clone the quote body, substituting unquote(param) with corresponding args
+  var cloned = clone_with_unquote(macro_s, s, quote_body, params, args, line, col)
+
+  _cur_body_var_names = saved_body_vars
+  return cloned
+end
+
+# Names of `var`/`let` bindings declared inside the currently-expanding
+# macro body. `clone_with_unquote` consults this set to decide whether a
+# NODE_IDENT should be hygiene-renamed. Stack discipline via save/restore
+# in `expand_quote_block`; each expansion computes its own set.
+var _cur_body_var_names = vec_new<String>()
+
+## Walk a macro body AST and collect the names of all body-local bindings.
+## The collected names drive hygienic alpha-renaming (P3.d/f/g/h) — every
+## appearance of one of these names inside the body, whether as a binder
+## or a reference, is rewritten to `name__hyg_N__` during clone so the
+## caller's scope can never see (or be shadowed by) the body's locals.
+##
+## Covers every binder category that can appear inside a macro body:
+##   - NODE_LET (str1)
+##   - NODE_FOR / NODE_FOR_AWAIT (str1 = loop var)
+##   - NODE_ARENA_BLOCK / NODE_TASK_GROUP (str1 = group/arena name)
+##   - NODE_LAMBDA (param nodes' str1s)
+##   - NODE_LET_DESTRUCTURE (str1 comma-joined)
+##   - NODE_STRUCT_DESTRUCTURE (str2 field specs, alias-aware)
+##   - NODE_VEC_DESTRUCTURE (str1 positional + str2 rest)
+##   - NODE_IS_CHECK (extras Vec<Int-as-String> of bound names)
+def _collect_body_var_names(src_s: ast::AstStorage, h: AstNodeId, out: Vec<String>): Void
+  if h < 0
+    return
+  end
+  var kind = ast::ast_get_kind(src_s, h)
+  if kind == node_constants::NODE_LET
+    out.push(ast::ast_get_str1(src_s, h))
+  end
+  # For-loop binding (`for i in 0..n`). Rename `i` so a caller's `i` isn't
+  # shadowed / captured by the body's loop variable.
+  if kind == 44  # NODE_FOR
+    out.push(ast::ast_get_str1(src_s, h))
+  end
+  if kind == 86  # NODE_FOR_AWAIT
+    out.push(ast::ast_get_str1(src_s, h))
+  end
+  # Arena blocks and task groups both introduce a binding in str1.
+  if kind == 62  # NODE_ARENA_BLOCK
+    out.push(ast::ast_get_str1(src_s, h))
+  end
+  if kind == 71  # NODE_TASK_GROUP
+    out.push(ast::ast_get_str1(src_s, h))
+  end
+  # Lambda params: each NODE_PARAM child's str1 is a binding name.
+  if kind == 19  # NODE_LAMBDA
+    var lam_params = ast::ast_get_children(src_s, h)
+    if lam_params != 0
+      var pc = lam_params.size
+      for pi in 0..pc
+        var pn = lam_params[pi]
+        if ast::ast_get_kind(src_s, pn) == 33  # NODE_PARAM
+          out.push(ast::ast_get_str1(src_s, pn))
+        end
+      end
+    end
+  end
+  # Destructure binders. Each stores comma-separated names in a str slot;
+  # struct destructure's field specs can carry `:alias` to rename the
+  # bound name (`x:px` → binds `px`).
+  if kind == 78  # NODE_LET_DESTRUCTURE
+    _push_csv_names(ast::ast_get_str1(src_s, h), out)
+  end
+  if kind == 79  # NODE_STRUCT_DESTRUCTURE
+    _push_struct_field_binders(ast::ast_get_str2(src_s, h), out)
+  end
+  if kind == 80  # NODE_VEC_DESTRUCTURE
+    _push_csv_names(ast::ast_get_str1(src_s, h), out)
+    var rest_nm = ast::ast_get_str2(src_s, h)
+    if str_byte_len(rest_nm) > 0
+      out.push(rest_nm)
+    end
+  end
+  # is-check pattern binders: `if x is Some(v)` binds `v` inside the
+  # then-branch. The bound-name vec lives on `extras`; entries are
+  # String values stored via `as_int` and read back with `as_string`.
+  # Critically, `extras` here is a Vec<Int>-of-string-handles, NOT an
+  # AST node — falling through to the generic recursion would treat
+  # it as one and walk off into arbitrary memory (~infinite loop,
+  # 100% CPU). Collect the names, recurse into the subject (left),
+  # and return explicitly.
+  if kind == 92  # NODE_IS_CHECK
+    var bn = ast::ast_get_bound_names(src_s, h)
+    if bn > 0
+      var nc = vec_size(bn)
+      for ni in 0..nc
+        out.push(as_string(bn[ni]))
+      end
+    end
+    var is_subj = ast::ast_get_left(src_s, h)
+    if is_subj > 0
+      _collect_body_var_names(src_s, is_subj, out)
+    end
+    return
+  end
+  # Recurse through all structural children
+  if kind == node_constants::NODE_BLOCK or kind == node_constants::NODE_PROGRAM
+    var children = ast::ast_get_children(src_s, h)
+    if children != 0
+      var count = children.size
+      for i in 0..count
+        _collect_body_var_names(src_s, children[i], out)
+      end
+    end
+    return
+  end
+  # For all other nodes, recurse into left/right/children. NOT extras —
+  # `extras` is overloaded per-kind (flag, index, vec-of-strings, or AST
+  # handle depending on the node) and there's no generic way to tell
+  # from here which it is. Missing a binder inside an extras-stored AST
+  # slot (e.g. a condition on a list comprehension) is acceptable for
+  # hygiene coverage; walking a non-AST extras as if it were an AST
+  # handle wanders into arbitrary memory and hangs.
+  var left = ast::ast_get_left(src_s, h)
+  if left > 0
+    _collect_body_var_names(src_s, left, out)
+  end
+  var right = ast::ast_get_right(src_s, h)
+  if right > 0
+    _collect_body_var_names(src_s, right, out)
+  end
+  var ch = ast::ast_get_children(src_s, h)
+  if ch != 0
+    var c = ch.size
+    for i in 0..c
+      _collect_body_var_names(src_s, ch[i], out)
+    end
+  end
+end
+
+## Split a comma-separated name list and push each name into `out`.
+## Uses `str_split` + `str_trim` from the stdlib; empty entries dropped.
+def _push_csv_names(csv: String, out: Vec<String>): Void
+  if str_byte_len(csv) == 0
+    return
+  end
+  var parts = str_split(csv, ",")
+  var n = parts.size
+  for i in 0..n
+    var piece = str_trim(parts[i])
+    if str_byte_len(piece) > 0
+      out.push(piece)
+    end
+  end
+end
+
+## Split struct-destructure field specs and push the BOUND names. Each
+## spec is either `name` (binds `name`) or `name:alias` (binds `alias`).
+def _push_struct_field_binders(specs: String, out: Vec<String>): Void
+  if str_byte_len(specs) == 0
+    return
+  end
+  var pieces = str_split(specs, ",")
+  var pc = pieces.size
+  for pi in 0..pc
+    var piece = str_trim(pieces[pi])
+    if str_byte_len(piece) == 0
+      continue
+    end
+    var halves = str_split(piece, ":")
+    if halves.size >= 2
+      out.push(str_trim(halves[1]))
+    else
+      out.push(piece)
+    end
+  end
+end
+
+## Apply hygiene rename to each entry of a comma-separated name list.
+## Preserves order; callers pass back through ast_let_destructure etc.
+def _rename_csv_names(csv: String): String
+  if str_byte_len(csv) == 0
+    return csv
+  end
+  var pieces = str_split(csv, ",")
+  var renamed = vec_new<String>()
+  var pc = pieces.size
+  for pi in 0..pc
+    var piece = str_trim(pieces[pi])
+    if str_byte_len(piece) > 0
+      renamed.push(_hygiene_rename(piece))
+    end
+  end
+  return str_join(renamed, ",")
+end
+
+## Rename struct-destructure field specs. Preserves `name:` prefixes and
+## renames only the alias half (or the bare field when there's no alias).
+def _rename_struct_field_binders(specs: String): String
+  if str_byte_len(specs) == 0
+    return specs
+  end
+  var pieces = str_split(specs, ",")
+  var out_pieces = vec_new<String>()
+  var pc = pieces.size
+  for pi in 0..pc
+    var piece = str_trim(pieces[pi])
+    if str_byte_len(piece) == 0
+      continue
+    end
+    var halves = str_split(piece, ":")
+    if halves.size >= 2
+      out_pieces.push("#{str_trim(halves[0])}:#{_hygiene_rename(str_trim(halves[1]))}")
+    else
+      out_pieces.push(_hygiene_rename(piece))
+    end
+  end
+  return str_join(out_pieces, ",")
+end
+
+## Test if a name is in the current body's var-binding set.
+def _is_body_var(name: String): Bool
+  var n = _cur_body_var_names.size
+  var i = 0
+  while i < n
+    return true if _cur_body_var_names[i] == name
+    i += 1
+  end
+  return false
+end
+
+## Alpha-rename hook for hygienic expansion. Appends the current scope-set
+## idx as a suffix so body-local bindings become distinct names at every
+## downstream stage (typecheck, MIR, codegen). Returns the original name
+## unchanged when we're not inside an expansion or when `_cur_scope_set_idx`
+## is 0 — matches the "outside any macro" fast path.
+def _hygiene_rename(name: String): String
+  if _cur_scope_set_idx <= 0
+    return name
+  end
+  return "#{name}__hyg_#{_cur_scope_set_idx}__"
+end
+
+## clone_with_unquote() - Deep-clone an AST, replacing unquote with args
+## src_s: source AST storage (macro definition's storage)
+## dst_s: destination AST storage (caller's storage)
+
+## separator_to_op() - Map a separator string to an operator code
+## Supports: " + ", " - ", " * ", " / ", " % ", " and ", " or "
+def separator_to_op(sep: String): Int
+  if sep == " + "
+    return 0  # OP_ADD
+  end
+  if sep == " - "
+    return 1  # OP_SUB
+  end
+  if sep == " * "
+    return 2  # OP_MUL
+  end
+  if sep == " / "
+    return 3  # OP_DIV
+  end
+  if sep == " % "
+    return 4  # OP_MOD
+  end
+  if sep == " and "
+    return 14  # OP_AND
+  end
+  if sep == " or "
+    return 15  # OP_OR
+  end
+  if sep == " == "
+    return 7  # OP_EQ
+  end
+  # Default to OP_ADD for unknown separators
+  _macro_emit_warning("QZ0506", "unknown unquote_each separator '#{sep}', defaulting to +", 0, 0)
+  return 0  # OP_ADD
+end
+
+def clone_with_unquote(src_s: ast::AstStorage, dst_s: ast::AstStorage, h: AstNodeId, params: Vec<Int>, args: Vec<Int>, line: Int, col: Int): Int
+  # Guard: pass through -1 and other negative sentinels unchanged.
+  # The parser uses -1 for "no else" (ast_if) and "no guard" (ast_match_arm).
+  if h < 0
+    return h
+  end
+  var kind = ast::ast_get_kind(src_s, h)
+
+  # NODE_UNQUOTE: substitute with the corresponding argument
+  if kind == 74  # NODE_UNQUOTE
+    var expr = ast::ast_get_left(src_s, h)
+    var expr_kind = ast::ast_get_kind(src_s, expr)
+    if expr_kind == 6  # NODE_IDENT
+      var param_name = ast::ast_get_str1(src_s, expr)
+      var pidx = find_param_index(src_s, params, param_name)
+      if pidx >= 0 and pidx < args.size
+        # Return the user's argument AST directly (same storage)
+        return args[pidx]
+      end
+      _macro_emit_error("QZ0507", "unquote references unknown parameter '#{param_name}'", line, col)
+      return ast::ast_int_lit(dst_s, 0, line, col)
+    else
+      # Complex unquote expression — just clone it
+      return clone_with_unquote(src_s, dst_s, expr, params, args, line, col)
+    end
+  end
+
+  # NODE_UNQUOTE_EACH: expand variadic args joined by separator
+  # unquote_each(args, " + ") with $sum(1, 2, 3) => (1 + 2) + 3
+  if kind == 75  # NODE_UNQUOTE_EACH
+    var separator = ast::ast_get_str1(src_s, h)
+    var op = separator_to_op(separator)
+    # All call-site args are variadic args
+    if args.size == 0
+      return ast::ast_int_lit(dst_s, 0, line, col)
+    end
+    if args.size == 1
+      return args[0]
+    end
+    # Build left-associative binary tree: ((a + b) + c) + d
+    var result = args[0]
+    for i in 1..args.size
+      result = ast::ast_binary(dst_s, result, op, args[i], line, col)
+    end
+    return result
+  end
+
+  # NODE_BLOCK: clone all children
+  if kind == 32  # NodeBlock
+    var children = ast::ast_get_children(src_s, h)
+    var new_children = vec_new()
+    if children != 0
+      var count = children.size
+      for i in 0..count
+        new_children.push(clone_with_unquote(src_s, dst_s, children[i], params, args, line, col))
+      end
+    end
+    return ast::ast_block(dst_s, new_children, line, col)
+  end
+
+  # NODE_BINARY: clone left and right
+  if kind == 8  # NodeBinary
+    var op = ast::ast_get_op(src_s, h)
+    var left = clone_with_unquote(src_s, dst_s, ast::ast_get_left(src_s, h), params, args, line, col)
+    var right = clone_with_unquote(src_s, dst_s, ast::ast_get_right(src_s, h), params, args, line, col)
+    return ast::ast_binary(dst_s, left, op, right, line, col)
+  end
+
+  # NODE_UNARY: clone operand
+  if kind == 7  # NodeUnary
+    var op = ast::ast_get_op(src_s, h)
+    var operand = clone_with_unquote(src_s, dst_s, ast::ast_get_right(src_s, h), params, args, line, col)
+    return ast::ast_unary(dst_s, op, operand, line, col)
+  end
+
+  # NODE_CALL: clone callee and args
+  if kind == 9  # NodeCall
+    var callee = clone_with_unquote(src_s, dst_s, ast::ast_get_left(src_s, h), params, args, line, col)
+    var call_args = ast::ast_get_children(src_s, h)
+    var new_args = vec_new()
+    if call_args != 0
+      var count = call_args.size
+      for i in 0..count
+        new_args.push(clone_with_unquote(src_s, dst_s, call_args[i], params, args, line, col))
+      end
+    end
+    var cloned_call = ast::ast_call(dst_s, callee, new_args, line, col)
+    # Preserve named arg names if present
+    var src_arg_names = ast::ast_call_get_arg_names(src_s, h)
+    if src_arg_names != 0
+      ast::ast_call_set_arg_names(dst_s, cloned_call, src_arg_names)
+    end
+    return cloned_call
+  end
+
+  # NODE_IF: clone cond, then, else
+  if kind == 23  # NodeIf
+    var cond = clone_with_unquote(src_s, dst_s, ast::ast_get_left(src_s, h), params, args, line, col)
+    var then_b = clone_with_unquote(src_s, dst_s, ast::ast_get_right(src_s, h), params, args, line, col)
+    var else_b = ast::ast_get_extra(src_s, h)
+    var new_else = 0
+    if else_b != 0
+      new_else = clone_with_unquote(src_s, dst_s, else_b, params, args, line, col)
+    end
+    return ast::ast_if(dst_s, cond, then_b, new_else, line, col)
+  end
+
+  # NODE_WHILE: clone cond and body
+  if kind == 24  # NodeWhile
+    var cond = clone_with_unquote(src_s, dst_s, ast::ast_get_left(src_s, h), params, args, line, col)
+    var body = clone_with_unquote(src_s, dst_s, ast::ast_get_right(src_s, h), params, args, line, col)
+    return ast::ast_while(dst_s, cond, body, "", line, col)
+  end
+
+  # NODE_RETURN: clone value
+  if kind == 22  # NodeReturn
+    var value = ast::ast_get_left(src_s, h)
+    if value != 0
+      return ast::ast_return(dst_s, clone_with_unquote(src_s, dst_s, value, params, args, line, col), line, col)
+    end
+    return ast::ast_return(dst_s, 0, line, col)
+  end
+
+  # NODE_LET: clone init, hygiene-rename the binder (P3.d)
+  if kind == 25  # NodeLet
+    var name = ast::ast_get_str1(src_s, h)
+    var type_ann = ast::ast_get_str2(src_s, h)
+    var is_mut = ast::ast_get_int_val(src_s, h)
+    var init = ast::ast_get_left(src_s, h)
+    var new_init = 0
+    if init != 0
+      new_init = clone_with_unquote(src_s, dst_s, init, params, args, line, col)
+    end
+    # All body-local `var`s get alpha-renamed so the caller's same-named
+    # binding isn't shadowed. `_collect_body_var_names` pre-populated the
+    # set, so this site simply applies the rename unconditionally for
+    # NODE_LET (every NODE_LET in a macro body IS a body-local, by
+    # definition — the name was collected when we saw it in the body AST).
+    var renamed = _hygiene_rename(name)
+    return ast::ast_let(dst_s, renamed, type_ann, new_init, is_mut, line, col)
+  end
+
+  # NODE_ASSIGN: clone value, hygiene-rename if the LHS name is body-local
+  if kind == 26  # NodeAssign
+    var name = ast::ast_get_str1(src_s, h)
+    var value = clone_with_unquote(src_s, dst_s, ast::ast_get_right(src_s, h), params, args, line, col)
+    if _is_body_var(name)
+      return ast::ast_assign(dst_s, _hygiene_rename(name), value, line, col)
+    end
+    return ast::ast_assign(dst_s, name, value, line, col)
+  end
+
+  # NODE_EXPR_STMT: clone inner expression
+  if kind == 29  # NodeExprStmt
+    var expr = clone_with_unquote(src_s, dst_s, ast::ast_get_left(src_s, h), params, args, line, col)
+    return ast::ast_expr_stmt(dst_s, expr, line, col)
+  end
+
+  # NODE_LAMBDA: clone body
+  if kind == 19  # NodeLambda
+    var body = ast::ast_get_right(src_s, h)
+    var new_body = 0
+    if body != 0
+      new_body = clone_with_unquote(src_s, dst_s, body, params, args, line, col)
+    end
+    # For lambdas, clone params list too
+    var lam_params = ast::ast_get_children(src_s, h)
+    var new_lam_params = vec_new()
+    if lam_params != 0
+      var count = lam_params.size
+      for i in 0..count
+        new_lam_params.push(clone_with_unquote(src_s, dst_s, lam_params[i], params, args, line, col))
+      end
+    end
+    return ast::ast_lambda(dst_s, new_lam_params, "", new_body, line, col)
+  end
+
+  # NODE_FOR: hygiene-rename the loop var; recurse into iter + body.
+  # (P3.f coverage.)
+  if kind == 44  # NODE_FOR
+    var for_name = ast::ast_get_str1(src_s, h)
+    var for_label = ast::ast_get_str2(src_s, h)
+    var iter = ast::ast_get_left(src_s, h)
+    var fbody = ast::ast_get_right(src_s, h)
+    var new_iter = 0
+    if iter != 0
+      new_iter = clone_with_unquote(src_s, dst_s, iter, params, args, line, col)
+    end
+    var new_fbody = 0
+    if fbody != 0
+      new_fbody = clone_with_unquote(src_s, dst_s, fbody, params, args, line, col)
+    end
+    var renamed_nm = for_name
+    if _is_body_var(for_name)
+      renamed_nm = _hygiene_rename(for_name)
+    end
+    return ast::ast_for(dst_s, renamed_nm, new_iter, new_fbody, for_label, line, col)
+  end
+
+  # NODE_FOR_AWAIT: same shape as NODE_FOR; left=channel, right=body.
+  if kind == 86  # NODE_FOR_AWAIT
+    var faw_name = ast::ast_get_str1(src_s, h)
+    var chan = ast::ast_get_left(src_s, h)
+    var fabody = ast::ast_get_right(src_s, h)
+    var new_chan = 0
+    if chan != 0
+      new_chan = clone_with_unquote(src_s, dst_s, chan, params, args, line, col)
+    end
+    var new_fabody = 0
+    if fabody != 0
+      new_fabody = clone_with_unquote(src_s, dst_s, fabody, params, args, line, col)
+    end
+    var faw_renamed = faw_name
+    if _is_body_var(faw_name)
+      faw_renamed = _hygiene_rename(faw_name)
+    end
+    return ast::ast_for_await(dst_s, faw_renamed, new_chan, new_fabody, line, col)
+  end
+
+  # NODE_ARENA_BLOCK: rename arena name; clone stmt children.
+  if kind == 62  # NODE_ARENA_BLOCK
+    var arena_nm = ast::ast_get_str1(src_s, h)
+    var a_children = ast::ast_get_children(src_s, h)
+    var new_a_children = vec_new()
+    if a_children != 0
+      var acc = a_children.size
+      for ai in 0..acc
+        new_a_children.push(clone_with_unquote(src_s, dst_s, a_children[ai], params, args, line, col))
+      end
+    end
+    var arena_renamed = arena_nm
+    if _is_body_var(arena_nm)
+      arena_renamed = _hygiene_rename(arena_nm)
+    end
+    return ast::ast_arena_block(dst_s, arena_renamed, as_int(new_a_children), line, col)
+  end
+
+  # NODE_TASK_GROUP: rename group name; clone body (left).
+  if kind == 71  # NODE_TASK_GROUP
+    var tg_nm = ast::ast_get_str1(src_s, h)
+    var tg_body = ast::ast_get_left(src_s, h)
+    var new_tg_body = 0
+    if tg_body != 0
+      new_tg_body = clone_with_unquote(src_s, dst_s, tg_body, params, args, line, col)
+    end
+    var tg_renamed = tg_nm
+    if _is_body_var(tg_nm)
+      tg_renamed = _hygiene_rename(tg_nm)
+    end
+    return ast::ast_task_group(dst_s, tg_renamed, new_tg_body, line, col)
+  end
+
+  # NODE_TUPLE_LITERAL: clone element list. Orthogonal to hygiene but
+  # needed so tuple destructure initializers actually survive clone
+  # (pre-P3 the catch-all lowered them to int-literal 0, which is fine
+  # for non-destructured uses but crashes the destructure path).
+  if kind == 77  # NODE_TUPLE_LITERAL
+    var tl_children = ast::ast_get_children(src_s, h)
+    var tl_new = vec_new()
+    if tl_children != 0
+      var tlc = tl_children.size
+      for ti in 0..tlc
+        tl_new.push(clone_with_unquote(src_s, dst_s, tl_children[ti], params, args, line, col))
+      end
+    end
+    return ast::ast_tuple_literal(dst_s, as_int(tl_new), line, col)
+  end
+
+  # NODE_LET_DESTRUCTURE: rename each comma-joined bound name; clone init.
+  # (P3.g: destructure coverage.)
+  if kind == 78  # NODE_LET_DESTRUCTURE
+    var ld_names = ast::ast_get_str1(src_s, h)
+    var ld_is_mut = ast::ast_get_int_val(src_s, h)
+    var ld_init_n = ast::ast_get_left(src_s, h)
+    var ld_new_init = 0
+    if ld_init_n != 0
+      ld_new_init = clone_with_unquote(src_s, dst_s, ld_init_n, params, args, line, col)
+    end
+    return ast::ast_let_destructure(dst_s, _rename_csv_names(ld_names), ld_new_init, ld_is_mut, line, col)
+  end
+
+  # NODE_STRUCT_DESTRUCTURE: rename the alias half of each field spec
+  # (or the bare field when there's no alias). Type name is preserved
+  # — it's a struct name, not a binding.
+  if kind == 79  # NODE_STRUCT_DESTRUCTURE
+    var sd_type = ast::ast_get_str1(src_s, h)
+    var sd_specs = ast::ast_get_str2(src_s, h)
+    var sd_is_mut = ast::ast_get_int_val(src_s, h)
+    var sd_has_rest = ast::ast_get_op(src_s, h)
+    var sd_init_n = ast::ast_get_left(src_s, h)
+    var sd_new_init = 0
+    if sd_init_n != 0
+      sd_new_init = clone_with_unquote(src_s, dst_s, sd_init_n, params, args, line, col)
+    end
+    return ast::ast_struct_destructure(dst_s, sd_type, _rename_struct_field_binders(sd_specs), sd_new_init, sd_is_mut, sd_has_rest, line, col)
+  end
+
+  # NODE_VEC_DESTRUCTURE: rename each positional name AND the rest name.
+  if kind == 80  # NODE_VEC_DESTRUCTURE
+    var vd_names = ast::ast_get_str1(src_s, h)
+    var vd_rest = ast::ast_get_str2(src_s, h)
+    var vd_is_mut = ast::ast_get_int_val(src_s, h)
+    var vd_has_rest = ast::ast_get_op(src_s, h)
+    var vd_init_n = ast::ast_get_left(src_s, h)
+    var vd_new_init = 0
+    if vd_init_n != 0
+      vd_new_init = clone_with_unquote(src_s, dst_s, vd_init_n, params, args, line, col)
+    end
+    var renamed_rest = vd_rest
+    if str_byte_len(vd_rest) > 0
+      renamed_rest = _hygiene_rename(vd_rest)
+    end
+    return ast::ast_vec_destructure(dst_s, _rename_csv_names(vd_names), renamed_rest, vd_new_init, vd_is_mut, vd_has_rest, line, col)
+  end
+
+  # NODE_IS_CHECK: rename each bound-name string in `extras`; clone subject.
+  # (P3.h: match-pattern coverage.) A bound name here becomes a local
+  # inside the then-branch — body refs to it must match the renamed
+  # binder, so we rewrite both the extras vec AND any NODE_IDENT refs
+  # that fall in `_cur_body_var_names` via the generic NODE_IDENT path.
+  if kind == 92  # NODE_IS_CHECK
+    var is_subject = ast::ast_get_left(src_s, h)
+    var is_variant = ast::ast_get_str1(src_s, h)
+    var new_subject = 0
+    if is_subject != 0
+      new_subject = clone_with_unquote(src_s, dst_s, is_subject, params, args, line, col)
+    end
+    var old_bn = ast::ast_get_bound_names(src_s, h)
+    var new_bn = vec_new<Int>()
+    if old_bn > 0
+      var bc = vec_size(old_bn)
+      for bi in 0..bc
+        var bnm = as_string(old_bn[bi])
+        if _is_body_var(bnm)
+          new_bn.push(as_int(_hygiene_rename(bnm)))
+        else
+          new_bn.push(as_int(bnm))
+        end
+      end
+    end
+    return ast::ast_is_check(dst_s, new_subject, is_variant, as_int(new_bn), line, col)
+  end
+
+  # NODE_INDEX: clone target and index
+  if kind == 13  # NodeIndex
+    var target = clone_with_unquote(src_s, dst_s, ast::ast_get_left(src_s, h), params, args, line, col)
+    var index_expr = clone_with_unquote(src_s, dst_s, ast::ast_get_right(src_s, h), params, args, line, col)
+    return ast::ast_index(dst_s, target, index_expr, line, col)
+  end
+
+  # NODE_FIELD_ACCESS: clone target
+  if kind == 15  # NodeFieldAccess
+    var target = clone_with_unquote(src_s, dst_s, ast::ast_get_left(src_s, h), params, args, line, col)
+    var field = ast::ast_get_str1(src_s, h)
+    return ast::ast_field_access(dst_s, target, field, line, col)
+  end
+
+  # NODE_MATCH: clone subject and arms
+  if kind == 40  # NodeMatch
+    var subject = clone_with_unquote(src_s, dst_s, ast::ast_get_left(src_s, h), params, args, line, col)
+    var arms = ast::ast_get_children(src_s, h)
+    var new_arms = vec_new()
+    if arms != 0
+      var count = arms.size
+      for i in 0..count
+        new_arms.push(clone_with_unquote(src_s, dst_s, arms[i], params, args, line, col))
+      end
+    end
+    return ast::ast_match(dst_s, subject, new_arms, line, col)
+  end
+
+  # NODE_MATCH_ARM: clone pattern, guard, body
+  if kind == 41  # NodeMatchArm
+    var pattern = clone_with_unquote(src_s, dst_s, ast::ast_get_left(src_s, h), params, args, line, col)
+    var guard = ast::ast_get_extra(src_s, h)
+    var new_guard = 0
+    if guard != 0
+      new_guard = clone_with_unquote(src_s, dst_s, guard, params, args, line, col)
+    end
+    var body = clone_with_unquote(src_s, dst_s, ast::ast_get_right(src_s, h), params, args, line, col)
+    return ast::ast_match_arm(dst_s, pattern, new_guard, body, line, col)
+  end
+
+  # NODE_SPREAD: clone inner expression
+  if kind == 82  # NODE_SPREAD
+    var inner = clone_with_unquote(src_s, dst_s, ast::ast_get_left(src_s, h), params, args, line, col)
+    return ast::ast_spread(dst_s, inner, line, col)
+  end
+
+  # NODE_ARRAY: clone elements
+  if kind == 10  # NodeArray
+    var elems = ast::ast_get_children(src_s, h)
+    var new_elems = vec_new()
+    if elems != 0
+      var count = elems.size
+      for i in 0..count
+        new_elems.push(clone_with_unquote(src_s, dst_s, elems[i], params, args, line, col))
+      end
+    end
+    return ast::ast_array(dst_s, new_elems, line, col)
+  end
+
+  # NODE_STRUCT_INIT: clone field values and copy field names
+  if kind == 14  # NodeStructInit
+    var si_name = ast::ast_get_str1(src_s, h)
+    var si_fields = ast::ast_get_children(src_s, h)
+    var si_names = ast::ast_get_struct_init_field_names(src_s, h)
+    var new_si_fields = vec_new()
+    if si_fields != 0
+      var count = si_fields.size
+      for i in 0..count
+        new_si_fields.push(clone_with_unquote(src_s, dst_s, si_fields[i], params, args, line, col))
+      end
+    end
+    var new_si_names = vec_new()
+    if si_names != 0
+      var ncount = si_names.size
+      for i in 0..ncount
+        new_si_names.push(si_names[i])
+      end
+    end
+    var new_si_node = ast::ast_struct_init(dst_s, si_name, new_si_fields, new_si_names, line, col)
+    # C.1 spread base lives in `lefts` until tc desugar; clone if present.
+    var si_base = ast::ast_get_left(src_s, h)
+    if si_base != 0
+      var new_si_base = clone_with_unquote(src_s, dst_s, si_base, params, args, line, col)
+      ast::ast_set_left(dst_s, new_si_node, new_si_base)
+    end
+    return new_si_node
+  end
+
+  # Leaf nodes — create identical copies in destination storage
+  if kind == 0  # NODE_INT_LIT
+    return ast::ast_int_lit(dst_s, ast::ast_get_int_val(src_s, h), line, col)
+  end
+  if kind == 1  # NODE_BOOL_LIT
+    return ast::ast_bool_lit(dst_s, ast::ast_get_int_val(src_s, h), line, col)
+  end
+  if kind == 2  # NODE_NIL_LIT
+    return ast::ast_nil_lit(dst_s, line, col)
+  end
+  if kind == 3  # NODE_STRING_LIT
+    return ast::ast_string_lit(dst_s, ast::ast_get_str1(src_s, h), line, col)
+  end
+  if kind == 4  # NODE_SYMBOL_LIT
+    return ast::ast_symbol_lit(dst_s, ast::ast_get_str1(src_s, h), line, col)
+  end
+  if kind == 6  # NODE_IDENT
+    var nm = ast::ast_get_str1(src_s, h)
+    if _is_body_var(nm)
+      return ast::ast_ident(dst_s, _hygiene_rename(nm), line, col)
+    end
+    return ast::ast_ident(dst_s, nm, line, col)
+  end
+  if kind == 42  # NODE_WILDCARD
+    return ast::ast_wildcard(dst_s, line, col)
+  end
+  if kind == 81  # NODE_OR_PATTERN
+    var src_pats = ast::ast_get_children(src_s, h)
+    var dst_pats = vec_new()
+    if src_pats != 0
+      var cnt = vec_size(src_pats)
+      for oi in 0..cnt
+        dst_pats.push(clone_with_unquote(src_s, dst_s, src_pats[oi], params, args, line, col))
+      end
+    end
+    return ast::ast_or_pattern(dst_s, dst_pats, line, col)
+  end
+  if kind == 33  # NODE_PARAM
+    # Hygiene: lambda params bind names into the body; rename if the param
+    # name is in the body-var set so body-local refs match the renamed
+    # binder. (P3.f: lambda param coverage.)
+    var pname = ast::ast_get_str1(src_s, h)
+    if _is_body_var(pname)
+      pname = _hygiene_rename(pname)
+    end
+    return ast::ast_param(dst_s, pname, ast::ast_get_str2(src_s, h), 0, 0, line, col)
+  end
+
+  # NODE_MACRO_CALL: a macro call nested inside a quote body. Clone the
+  # callee name + args so `expand_node` can re-expand the cloned node in
+  # the destination storage. Before this branch, the enclosing macro's
+  # quote body silently lowered nested `$name(...)` calls to int-literal 0
+  # — the catch-all at the bottom. Fixing this is load-bearing for P3.d
+  # (the `$caller(name)` escape hatch IS a nested macro call). Also
+  # unblocks user macros that legitimately compose over other macros.
+  #
+  # Special case for `$caller(name)`: we must NOT hygiene-rename its
+  # argument, because the escape hatch's whole point is "leave this name
+  # alone so it resolves against the caller." Temporarily swap the
+  # body-var set to empty while cloning the args of a `caller` call.
+  if kind == 67  # NODE_MACRO_CALL
+    var mc_name = ast::ast_get_str1(src_s, h)
+    var mc_args = ast::ast_get_children(src_s, h)
+    var new_args = vec_new()
+    var save_body_vars = _cur_body_var_names
+    var swapped = false
+    if mc_name == "caller"
+      _cur_body_var_names = vec_new<String>()
+      swapped = true
+    end
+    if mc_args != 0
+      var cnt = mc_args.size
+      for mi in 0..cnt
+        new_args.push(clone_with_unquote(src_s, dst_s, mc_args[mi], params, args, line, col))
+      end
+    end
+    if swapped
+      _cur_body_var_names = save_body_vars
+    end
+    return ast::ast_macro_call(dst_s, mc_name, as_int(new_args), line, col)
+  end
+
+  # For unhandled kinds, emit a best-effort copy as int literal 0
+  return ast::ast_int_lit(dst_s, 0, line, col)
+end
+
+## find_param_index() - Find a parameter name in the params vec
+def find_param_index(s: ast::AstStorage, params: Vec<Int>, name: String): Int
+  var count = params.size
+  for i in 0..count
+    var param_h = params[i]
+    var param_name = ast::ast_get_str1(s, param_h)
+    if param_name == name
+      return i
+    end
+  end
+  return -1
+end
+
+# ============================================================================
+# String Template Expansion
+# ============================================================================
+
+## expand_string_template() - Expand a string template macro
+def expand_string_template(s: ast::AstStorage, idx: Int, args: Vec<Int>, line: Int, col: Int): Int
+  var body = _macro_bodies[idx]
+  var macro_s: ast::AstStorage = _macro_ast_store[idx]
+  var template = ast::ast_get_str1(macro_s, body)
+  var params = _macro_params[idx]
+
+  # Process escape sequences
+  var processed = process_template_escapes(template)
+
+  # Substitute #{param} with stringified arguments
+  var expanded = substitute_params(macro_s, processed, params, args)
+
+  # Re-parse the expanded string as Quartz source
+  return re_parse_expr(s, expanded, line, col)
+end
+
+## process_template_escapes() - Convert \n, \t, \\ in template strings
+def process_template_escapes(s: String): String
+  var len = str_byte_len(s)
+  var result = ""
+  var i = 0
+  while i < len
+    var ch = str_byte_at(s, i)
+    if ch == '\\' and i + 1 < len  # backslash
+      var next = str_byte_at(s, i + 1)
+      if next == 110  # 'n'
+        result = "#{result}\n"
+        i += 2
+      elsif next == 116  # 't'
+        result = "#{result}\t"
+        i += 2
+      elsif next == 114  # 'r'
+        result = "#{result}\r"
+        i += 2
+      elsif next == 92  # '\\'
+        result = "#{result}\\"
+        i += 2
+      elsif next == 34  # '"'
+        result = "#{result}\""
+        i += 2
+      else
+        result = "#{result}#{str_from_char(ch)}"
+        i += 1
+      end
+    else
+      result = "#{result}#{str_from_char(ch)}"
+      i += 1
+    end
+  end
+  return result
+end
+
+## ast_to_source() - Convert an AST node back to source code string
+def ast_to_source(s: ast::AstStorage, h: AstNodeId): String
+  var kind = ast::ast_get_kind(s, h)
+  if kind == 0  # NODE_INT_LIT
+    return "#{ast::ast_get_int_val(s, h)}"
+  end
+  if kind == 1  # NODE_BOOL_LIT
+    if ast::ast_get_int_val(s, h) == 1
+      return "true"
+    end
+    return "false"
+  end
+  if kind == 3  # NODE_STRING_LIT
+    return "\"#{ast::ast_get_str1(s, h)}\""
+  end
+  if kind == 6  # NODE_IDENT
+    return ast::ast_get_str1(s, h)
+  end
+  if kind == 8  # NODE_BINARY
+    var left = ast_to_source(s, ast::ast_get_left(s, h))
+    var op = op_to_source(ast::ast_get_op(s, h))
+    var right = ast_to_source(s, ast::ast_get_right(s, h))
+    return "(#{left} #{op} #{right})"
+  end
+  if kind == 7  # NODE_UNARY
+    var op = op_to_source(ast::ast_get_op(s, h))
+    var operand = ast_to_source(s, ast::ast_get_right(s, h))
+    return "#{op}#{operand}"
+  end
+  if kind == 9  # NODE_CALL
+    var callee = ast_to_source(s, ast::ast_get_left(s, h))
+    var call_args = ast::ast_get_children(s, h)
+    var arg_str = ""
+    if call_args != 0
+      var count = call_args.size
+      for i in 0..count
+        if i > 0
+          arg_str = "#{arg_str}, "
+        end
+        arg_str = "#{arg_str}#{ast_to_source(s, call_args[i])}"
+      end
+    end
+    return "#{callee}(#{arg_str})"
+  end
+  if kind == 15  # NODE_FIELD_ACCESS
+    var target = ast_to_source(s, ast::ast_get_left(s, h))
+    var field = ast::ast_get_str1(s, h)
+    return "#{target}.#{field}"
+  end
+  if kind == 13  # NODE_INDEX
+    var target = ast_to_source(s, ast::ast_get_left(s, h))
+    var idx_expr = ast_to_source(s, ast::ast_get_right(s, h))
+    return "#{target}[#{idx_expr}]"
+  end
+  # Fallback: emit "0" for complex nodes
+  return "0"
+end
+
+## op_to_source() - Convert operator enum to source string
+def op_to_source(op: Int): String
+  if op == 0
+    return "+"
+  end
+  if op == 1
+    return "-"
+  end
+  if op == 2
+    return "*"
+  end
+  if op == 3
+    return "/"
+  end
+  if op == 4
+    return "%"
+  end
+  if op == 5
+    return "=="
+  end
+  if op == 6
+    return "!="
+  end
+  if op == 7
+    return "<"
+  end
+  if op == 8
+    return ">"
+  end
+  if op == 9
+    return "<="
+  end
+  if op == 10
+    return ">="
+  end
+  if op == 11
+    return "and"
+  end
+  if op == 12
+    return "or"
+  end
+  if op == 13
+    return "not "
+  end
+  if op == 14
+    return "&"
+  end
+  if op == 15
+    return "|"
+  end
+  if op == 16
+    return "^"
+  end
+  if op == 17
+    return "~"
+  end
+  if op == 18
+    return "<<"
+  end
+  if op == 19
+    return ">>"
+  end
+  return "?"
+end
+
+## substitute_params() - Replace ${param} with stringified arg
+def substitute_params(s: ast::AstStorage, template: String, params: Vec<Int>, args: Vec<Int>): String
+  var len = str_byte_len(template)
+  var result = ""
+  var i = 0
+  while i < len
+    var ch = str_byte_at(template, i)
+    # Look for ${...} pattern
+    if ch == '$' and i + 1 < len  # '$'
+      if str_byte_at(template, i + 1) == '{'  # '{'
+        i += 2  # Skip ${
+        # Extract parameter name
+        var pname = ""
+        while i < len and str_byte_at(template, i) != '}'  # '}'
+          pname = "#{pname}#{str_from_char(str_byte_at(template, i))}"
+          i += 1
+        end
+        if i < len
+          i += 1  # Skip }
+        end
+        # Find matching parameter
+        var found = find_param_index(s, params, pname)
+        if found >= 0 and found < args.size
+          result = "#{result}#{ast_to_source(s, args[found])}"
+        else
+          # Unknown param — leave as-is
+          var dollar_brace = str_concat(str_from_char(36), str_from_char(123))
+          result = str_concat(result, str_concat(dollar_brace, str_concat(pname, "}")))
+        end
+      else
+        result = "#{result}#{str_from_char(ch)}"
+        i += 1
+      end
+    else
+      result = "#{result}#{str_from_char(ch)}"
+      i += 1
+    end
+  end
+  return result
+end
+
+## re_parse_expr() - Re-parse a string as Quartz source, producing AST in storage s
+def re_parse_expr(s: ast::AstStorage, source: String, line: Int, col: Int): Int
+  # Wrap in a minimal program so the parser can handle it
+  var wrapped = "def __macro_reparse__(): Int\n  return #{source}\nend\n"
+
+  # Tokenize
+  var macro_interner = string_intern::intern_global()
+  var lex_result = lexer::lexer_tokenize(wrapped, macro_interner)
+  var types = lex_result.get_types()
+  var lexemes = lex_result.get_lexemes()
+  var lines = lex_result.get_lines()
+  var cols = lex_result.get_cols()
+  var count = lex_result.token_count()
+
+  # Re-parse the macro expansion via cst_parser -> cst_lower (matching the
+  # resolver / main-module routing), including macro-generated source.
+  var cst_res = cst_parser::cst_parse_source(wrapped)
+  if cst_res.parser.had_error == 1
+    _macro_emit_error("QZ0508", "failed to re-parse macro expansion", line, col)
+    return ast::ast_int_lit(s, 0, line, col)
+  end
+  var ctmp_s = ast::ast_new_storage()
+  var ctmp_root = cst_lower::cst_lower(cst_res.parser.store, cst_res.root, ctmp_s)
+  var ckids = ast::ast_get_children(ctmp_s, ctmp_root)
+  if ckids == 0 or ckids.size == 0
+    return ast::ast_int_lit(s, 0, line, col)
+  end
+  var cfunc = ckids[0]
+  var cbody = ast::ast_get_right(ctmp_s, cfunc)
+  if cbody == 0
+    return ast::ast_int_lit(s, 0, line, col)
+  end
+  var cexpr = cbody
+  if ast::ast_get_kind(ctmp_s, cbody) == 32  # NODE_BLOCK
+    var cbkids = ast::ast_get_children(ctmp_s, cbody)
+    if cbkids != 0 and cbkids.size > 0
+      var cfirst = cbkids[0]
+      var ck = ast::ast_get_kind(ctmp_s, cfirst)
+      if ck == 22  # NODE_RETURN
+        var crv = ast::ast_get_left(ctmp_s, cfirst)
+        if crv != 0
+          cexpr = crv
+        end
+      elsif ck == 29  # NODE_EXPR_STMT
+        cexpr = ast::ast_get_left(ctmp_s, cfirst)
+      else
+        cexpr = cfirst
+      end
+    end
+  end
+  var cep = vec_new()
+  var cea = vec_new()
+  return clone_with_unquote(ctmp_s, s, cexpr, cep, cea, line, col)
+end
+
+# ============================================================================
+# Built-in Macros
+# ============================================================================
+
+## expand_builtin_unwrap() - Expand $unwrap(expr)
+##
+## Desugars to a block using `is Some(v)` narrowing:
+##   {
+##     var __unwrap_subj = expr
+##     var __unwrap_val = 0
+##     if __unwrap_subj is Some(__unwrap_payload)
+##       __unwrap_val = __unwrap_payload
+##     else
+##       panic("unwrap failed at line N")
+##     end
+##     __unwrap_val
+##   }
+##
+## Why not a match: the prior 3-arm match shape (Some / None / wildcard)
+## hit a MIR lowering bug (B4-UNWRAP-IN-LOOP) where macro-generated match
+## subjects inside a `while` body with reassignment silently miscompiled
+## to a cached constant, even though hand-written match in the same
+## shape worked. The `is` + bind narrowing path uses a different MIR
+## lowering pipeline (`mir_lower_stmt_if` + `is_check` bind narrowing)
+## that is battle-tested and does the right thing under reassignment.
+## expand_builtin_caller() — `$caller(name)` escape hatch.
+##
+## Inside a macro body, `$caller(name)` resolves `name` against the
+## caller's scope instead of the body's scope. Equivalent to Elixir's
+## `var!(name)` or the effect of Racket's `datum->syntax` with the
+## caller's context as the template. Mostly needed when a macro wants
+## to deliberately reach into caller-visible state — e.g. a `log!`
+## macro that references the enclosing function's `logger` binding.
+##
+## Semantics:
+## - Accepts exactly one argument; must be a NODE_IDENT (not an
+##   arbitrary expression — the escape hatch is specifically about
+##   identifier resolution).
+## - Emits a fresh NODE_IDENT with the same name, stamped with the
+##   *caller's* scope set (published in `_caller_scope_set_idx` by
+##   `expand_macro_call` before this builtin runs).
+## - Marks the ident with `ast_set_caller_flag` so the post-stamp loop
+##   in `expand_macro_call` leaves its scope_set_idx alone — required
+##   because when the caller is at top level the stamped value is 0,
+##   which the post-stamp's "== 0" guard would otherwise overwrite.
+def expand_builtin_caller(s: ast::AstStorage, args: Vec<Int>, line: Int, col: Int): Int
+  if args.size != 1
+    _macro_emit_error("QZ0510", "$caller expects exactly 1 argument", line, col)
+    return ast::ast_int_lit(s, 0, line, col)
+  end
+  var arg = args[0]
+  var arg_kind = ast::ast_get_kind(s, arg)
+  if arg_kind != 6  # NODE_IDENT
+    _macro_emit_error("QZ0510", "$caller expects an identifier argument", line, col)
+    return ast::ast_int_lit(s, 0, line, col)
+  end
+  var arg_name = ast::ast_get_str1(s, arg)
+  var ident = ast::ast_ident(s, arg_name, line, col)
+  ast::ast_set_scope_set(s, ident, _caller_scope_set_idx)
+  ast::ast_set_caller_flag(ident, 1)
+  return ident
+end
+
+def expand_builtin_unwrap(s: ast::AstStorage, args: Vec<Int>, line: Int, col: Int): Int
+  if args.size != 1
+    _macro_emit_error("QZ0510", "$unwrap expects exactly 1 argument", line, col)
+    return ast::ast_int_lit(s, 0, line, col)
+  end
+
+  var expr = expand_node(s, args[0])
+
+  # SURF.FLOW Phase 1 additivity fix: if the unwrap operand is a bare
+  # identifier, suppress flow-narrowing at THIS read. Inside `if opt is Some`,
+  # a bare `opt` read narrows to inner T and MIR extracts the payload there.
+  # But `opt!` expands to a `__subj is Some(__pl)` match over the operand —
+  # if the operand also narrowed, MIR would extract twice (double-extract on an
+  # already-unwrapped Int → SIGSEGV). Stamping op = 1 tells the identifier
+  # handler to skip the narrow consult here, restoring the pre-Phase-1 single
+  # extract. The unwrap then behaves as the proven-safe identity it should.
+  # FLOW_NARROWING §3.3 rule 5 (narrowing is additive — never breaks accepted
+  # programs). We use the `op` field (not int_val): the operand node is
+  # typechecked more than once, and the narrow consult mutates int_val to 1 on a
+  # firing read — so int_val can't double as a stable suppress sentinel. The
+  # `op` field is unused on a plain NODE_IDENT and survives every pass.
+  if ast::ast_get_kind(s, expr) == 6  # NODE_IDENT
+    ast::ast_set_op(s, expr, 1)
+  end
+
+  # Fresh gensyms per expansion so nested $unwrap doesn't collide. Note:
+  # gensym() uses ast_node_count which doesn't advance between calls in
+  # the same function scope, so we call it once and append suffixes to
+  # produce three distinct names.
+  var base_name = gensym(s)
+  var subj_name = "#{base_name}_subj"
+  var val_name = "#{base_name}_val"
+  var payload_name = "#{base_name}_pl"
+
+  # var __unwrap_subj = expr
+  var subj_let = ast::ast_let(s, subj_name, "", expr, 1, line, col)
+
+  # var __unwrap_val = 0
+  var zero = ast::ast_int_lit(s, 0, line, col)
+  var val_let = ast::ast_let(s, val_name, "", zero, 1, line, col)
+
+  # Build condition: __unwrap_subj is Some(__unwrap_payload)
+  var subj_ref = ast::ast_ident(s, subj_name, line, col)
+  var bound_names = [as_int(payload_name)]
+  var cond = ast::ast_is_check(s, subj_ref, "Some", bound_names, line, col)
+
+  # Then body: __unwrap_val = __unwrap_payload
+  var payload_ref = ast::ast_ident(s, payload_name, line, col)
+  var assign = ast::ast_assign(s, val_name, payload_ref, line, col)
+  var then_block = ast::ast_block(s, [assign], line, col)
+
+  # Else body: panic("unwrap failed at line N")
+  var panic_msg = "unwrap failed at line #{line}"
+  var panic_args = [ast::ast_string_lit(s, panic_msg, line, col)]
+  var panic_callee = ast::ast_ident(s, "panic", line, col)
+  var panic_call = ast::ast_call(s, panic_callee, panic_args, line, col)
+  var else_block = ast::ast_block(s, [ast::ast_expr_stmt(s, panic_call, line, col)], line, col)
+  # The if-else as a statement wraps both bodies — the else payload body
+  # carries an expr_stmt because panic doesn't return normally.
+
+  var if_stmt = ast::ast_if(s, cond, then_block, else_block, line, col)
+
+  # Block: subj_let; val_let; if_stmt; __unwrap_val
+  var val_result = ast::ast_ident(s, val_name, line, col)
+  var block_stmts = [subj_let, val_let, if_stmt, val_result]
+  return ast::ast_block(s, block_stmts, line, col)
+end
+
+## expand_builtin_assert() - Expand $assert(cond)
+def expand_builtin_assert(s: ast::AstStorage, args: Vec<Int>, line: Int, col: Int): Int
+  if args.size < 1
+    _macro_emit_error("QZ0511", "$assert expects at least 1 argument", line, col)
+    return ast::ast_int_lit(s, 0, line, col)
+  end
+
+  var cond = expand_node(s, args[0])
+
+  # Build: !(cond)  (OpNot = 13)
+  var negated = ast::ast_unary(s, 13, cond, line, col)
+
+  # Build: panic("Assertion failed at line N")
+  var panic_msg = "Assertion failed at line " + line.to_s()
+  if args.size >= 2
+    # Custom message provided as second arg (must be a string literal)
+    var msg_node = args[1]
+    if ast::ast_get_kind(s, msg_node) == 3  # StringLit
+      panic_msg = ast::ast_get_str1(s, msg_node)
+    end
+  end
+  var panic_args = [ast::ast_string_lit(s, panic_msg, line, col)]
+  var panic_callee = ast::ast_ident(s, "panic", line, col)
+  var panic_call = ast::ast_call(s, panic_callee, panic_args, line, col)
+  var panic_stmt = ast::ast_expr_stmt(s, panic_call, line, col)
+
+  # Build: if !cond then panic_stmt end; 0
+  var then_stmts = [panic_stmt]
+  var then_block = ast::ast_block(s, then_stmts, line, col)
+  var if_node = ast::ast_if(s, negated, then_block, 0, line, col)
+
+  # Wrap in a block that returns 0 (for expression context)
+  var block_stmts = [if_node, ast::ast_int_lit(s, 0, line, col)]
+  return ast::ast_block(s, block_stmts, line, col)
+end
+
+## expand_builtin_debug() - Expand $debug(expr)
+def expand_builtin_debug(s: ast::AstStorage, args: Vec<Int>, line: Int, col: Int): Int
+  if args.size != 1
+    _macro_emit_error("QZ0512", "$debug expects exactly 1 argument", line, col)
+    return ast::ast_int_lit(s, 0, line, col)
+  end
+
+  var expr = expand_node(s, args[0])
+  var tmp_name = gensym(s)
+
+  # let tmp = expr
+  var let_node = ast::ast_let(s, tmp_name, "", expr, 0, line, col)
+
+  # eputs("[debug] line N: ")
+  var prefix = "[debug] line #{line}: "
+  var eputs_args1 = [ast::ast_string_lit(s, prefix, line, col)]
+  var eputs1_callee = ast::ast_ident(s, "eputs", line, col)
+  var eputs1 = ast::ast_expr_stmt(s, ast::ast_call(s, eputs1_callee, eputs_args1, line, col), line, col)
+
+  # eprint_int(tmp) — print value to stderr
+  var print_args = [ast::ast_ident(s, tmp_name, line, col)]
+  var print_callee = ast::ast_ident(s, "eprint_int", line, col)
+  var print_call = ast::ast_expr_stmt(s, ast::ast_call(s, print_callee, print_args, line, col), line, col)
+
+  # eputs("\n")
+  var eputs_args2 = [ast::ast_string_lit(s, "\n", line, col)]
+  var eputs2_callee = ast::ast_ident(s, "eputs", line, col)
+  var eputs2 = ast::ast_expr_stmt(s, ast::ast_call(s, eputs2_callee, eputs_args2, line, col), line, col)
+
+  # tmp (final expression - block value)
+  var result = ast::ast_ident(s, tmp_name, line, col)
+
+  # Assemble block
+  var stmts = [let_node, eputs1, print_call, eputs2, result]
+
+  return ast::ast_block(s, stmts, line, col)
+end

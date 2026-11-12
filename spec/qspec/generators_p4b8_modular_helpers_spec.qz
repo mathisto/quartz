@@ -1,0 +1,319 @@
+## Phase 4.B.8 — modular yield helpers (colorless lift).
+##
+## Operation Piezoelectric Effects, Phase 4 Path B, Milestone 4.B.8.
+##
+## A function declared with `can Yield<T>` is now first-class anywhere
+## a generator body lives. The compiler lifts it to a `__Future_<name>$
+## poll` state machine on demand and routes calls from inside a
+## generator's `$poll` body through `mir_emit_colorless_call` — the
+## same await-style frame-driving used for async/await — so each yield
+## inside the helper propagates back to the enclosing consumer drive
+## (`Stream.next()` for sync, `for x in async_gen()` for async) one
+## value at a time.
+##
+## Three pieces had to land for this:
+##
+##   * 4.B.7.b unified all `yield v` (sync impl Iterator, async impl
+##     AsyncIterator, modular `can Yield` helpers) onto a kind=3
+##     `perform Yield.yield(v)`.
+##   * 4.B.8.a made kind=3 perform suspend cooperatively when the
+##     handler explicitly suspends (park_rv != 1) — propagate normally
+##     up the call chain instead of longjmping past intermediate
+##     `$poll` frames.
+##   * 4.B.8.b extended `mir_propagate_suspend_ast` (PASS 0.99) with
+##     NODE_YIELD detection (synthetic edge to `__qz_yield_marker__`),
+##     so any function whose body contains `yield` gets registered as
+##     an async target with EFFECT_SUSPEND BEFORE PASS 1.2a synthesizes
+##     parent generators' `$poll` bodies. The colorless-dispatch gate
+##     in `mir_lower_call` then fires at the helper's call site and
+##     routes through `mir_emit_colorless_call` — but skips when the
+##     callee is itself a user-facing generator (constructors return
+##     `Stream<T>`, must be evaluated directly so for-in can iterate).
+##
+## What this spec pins down:
+##
+##   * Single-yield helper called from a generator round-trips.
+##   * Multi-yield helper called twice from a generator yields all
+##     values in order.
+##   * Helper with conditional yield in a while loop preserves loop
+##     state across each suspension.
+##   * Helper-calls-helper composition: A calls B, B yields; values
+##     observed by the consumer.
+##   * Helper-calls-helper with multiple intermediate yields.
+##   * Mixed direct yield + helper call in the same generator body.
+##   * Parameterized helpers — params survive across suspends.
+##
+## NOT in this spec (filed as Phase 4.B.9):
+##   * Effect composition — `can Yield, Throws` helpers.
+##   * Row polymorphism — `def map<ε, A, B>(...)`.
+##   * Async generator + `can Yield` helper interleaving.
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("4.B.8 — modular yield helpers (colorless lift)") do ->
+    it("single-yield helper called from generator yields the value") do ->
+      assert_run_stdout_eq("""
+def emit_one(v: Int): Void can Yield<Int>
+  yield v
+end
+
+def gen_one(): impl Iterator<Int>
+  emit_one(42)
+end
+
+def main(): Int
+  var s = gen_one()
+  for x in s
+    puts(x.to_s())
+  end
+  return 0
+end
+""", "42\n")
+    end
+
+    it("multi-yield helper called twice from generator yields all values in order") do ->
+      assert_run_stdout_eq("""
+def emit_pair(a: Int, b: Int): Void can Yield<Int>
+  yield a
+  yield b
+end
+
+def two_pairs(): impl Iterator<Int>
+  emit_pair(1, 2)
+  emit_pair(3, 4)
+end
+
+def main(): Int
+  for x in two_pairs()
+    puts(x.to_s())
+  end
+  return 0
+end
+""", "1\n2\n3\n4\n")
+    end
+
+    it("helper with conditional yield in while loop preserves loop state") do ->
+      assert_run_stdout_eq("""
+def emit_evens(lo: Int, hi: Int): Void can Yield<Int>
+  var x = lo
+  while x <= hi
+    if x % 2 == 0
+      yield x
+    end
+    x = x + 1
+  end
+end
+
+def evens_gen(): impl Iterator<Int>
+  emit_evens(1, 10)
+end
+
+def main(): Int
+  var sum = 0
+  for x in evens_gen()
+    sum = sum + x
+  end
+  puts(sum.to_s())
+  return 0
+end
+""", "30\n")
+    end
+
+    it("helper-calls-helper: emit_three calls emit_one three times") do ->
+      assert_run_stdout_eq("""
+def emit_one(v: Int): Void can Yield<Int>
+  yield v
+end
+
+def emit_three(a: Int, b: Int, c: Int): Void can Yield<Int>
+  emit_one(a)
+  emit_one(b)
+  emit_one(c)
+end
+
+def gen_three(): impl Iterator<Int>
+  emit_three(100, 200, 300)
+end
+
+def main(): Int
+  var sum = 0
+  for x in gen_three()
+    sum = sum + x
+  end
+  puts(sum.to_s())
+  return 0
+end
+""", "600\n")
+    end
+
+    it("helper with intermediate yield + call to second helper composes") do ->
+      assert_run_stdout_eq("""
+def emit_one(v: Int): Void can Yield<Int>
+  yield v
+end
+
+def emit_pair(a: Int, b: Int): Void can Yield<Int>
+  yield a
+  emit_one(b)
+end
+
+def gen_mixed(): impl Iterator<Int>
+  emit_pair(1, 2)
+  emit_pair(3, 4)
+end
+
+def main(): Int
+  for x in gen_mixed()
+    puts(x.to_s())
+  end
+  return 0
+end
+""", "1\n2\n3\n4\n")
+    end
+
+    it("mixed direct yield + helper call in same generator body") do ->
+      assert_run_stdout_eq("""
+def emit_one(v: Int): Void can Yield<Int>
+  yield v
+end
+
+def emit_pair(a: Int, b: Int): Void can Yield<Int>
+  yield a
+  yield b
+end
+
+def mixed(): impl Iterator<Int>
+  yield 1
+  emit_one(2)
+  yield 3
+  emit_pair(4, 5)
+end
+
+def main(): Int
+  var sum = 0
+  for x in mixed()
+    sum = sum + x
+  end
+  puts(sum.to_s())
+  return 0
+end
+""", "15\n")
+    end
+
+    it("parameterized helper survives suspension — params restored on each resume") do ->
+      assert_run_stdout_eq("""
+def emit_range(lo: Int, hi: Int): Void can Yield<Int>
+  var i = lo
+  while i <= hi
+    yield i
+    i = i + 1
+  end
+end
+
+def gen_range(): impl Iterator<Int>
+  emit_range(5, 8)
+end
+
+def main(): Int
+  for x in gen_range()
+    puts(x.to_s())
+  end
+  return 0
+end
+""", "5\n6\n7\n8\n")
+    end
+
+    it("Stream.next() drives helper-yielded values one at a time") do ->
+      assert_run_stdout_eq("""
+def emit_pair(a: Int, b: Int): Void can Yield<Int>
+  yield a
+  yield b
+end
+
+def two_pairs(): impl Iterator<Int>
+  emit_pair(10, 20)
+  emit_pair(30, 40)
+end
+
+def main(): Int
+  var s = two_pairs()
+  var i = 0
+  while i < 5
+    var r = s.next()
+    if r is Some
+      puts(r.unwrap().to_s())
+    else
+      puts("done")
+    end
+    i = i + 1
+  end
+  return 0
+end
+""", "10\n20\n30\n40\ndone\n")
+    end
+
+    it("zero-yield helper called from generator produces empty iteration") do ->
+      assert_run_stdout_eq("""
+def emit_zero(): Void can Yield<Int>
+  return
+end
+
+def gen_zero(): impl Iterator<Int>
+  emit_zero()
+end
+
+def main(): Int
+  var count = 0
+  for x in gen_zero()
+    count = count + 1
+  end
+  puts(count.to_s())
+  return 0
+end
+""", "0\n")
+    end
+
+    it("helper IR includes __Future_<helper>\$poll (lifted to state machine)") do ->
+      assert_ir_contains("""
+def emit_one(v: Int): Void can Yield<Int>
+  yield v
+end
+
+def gen(): impl Iterator<Int>
+  emit_one(7)
+end
+
+def main(): Int
+  var s = gen()
+  for x in s
+    puts(x.to_s())
+  end
+  return 0
+end
+""", "__Future_emit_one$poll")
+    end
+
+    it("generator's \$poll uses colorless dispatch (allocates helper frame)") do ->
+      assert_ir_contains("""
+def emit_one(v: Int): Void can Yield<Int>
+  yield v
+end
+
+def gen(): impl Iterator<Int>
+  emit_one(7)
+end
+
+def main(): Int
+  var s = gen()
+  for x in s
+    puts(x.to_s())
+  end
+  return 0
+end
+""", "__colorless_frame_emit_one")
+    end
+  end
+  return qspec_main()
+end

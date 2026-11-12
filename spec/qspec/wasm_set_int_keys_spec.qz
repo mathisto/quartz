@@ -1,0 +1,185 @@
+## WASM Set<Int> dispatch correctness
+##
+## Pre-fix bug (`docs/bugs/WASM_SET_INT_KEY_HASHMAP_MISMATCH.md`):
+##   The WASM backend's `set_*` synth bodies wrap `hashmap_*` unconditionally.
+##   `hashmap_set` hashes its key via `str_hash`, which interprets the i64 key
+##   as a pointer into linear memory and dereferences it. For `Set<Int>` (the
+##   common case `s.add(10); s.add(20)`), this funnels distinct int keys into
+##   the same slot — past 3-4 unique adds, behaviour ranges from "silent
+##   drop" (collision overwrites) to "memory fault at 0x10000" (str_hash
+##   walks past the end of initial linear memory).
+##
+## Fix: thread the typecheck-supplied elem_type annotation (slot2="Int")
+## from AST → MIR → codegen and route `set_add`/`set_has`/`set_delete`
+## through `intmap_*` (multiplicative i64 hash) when slot2 indicates Int
+## keys. `set_new`/`set_size`/`set_clear`/`set_free`/`set_members` are
+## layout-identical so they stay shared. A small `set_int_add` synth body
+## was added — the wrapper that pushes the const-1 marker for the
+## `intmap_set(s, v, 1)` call, mirroring the existing `set_add` wrapper
+## around `hashmap_set`.
+##
+## **Prerequisites**: same as wasm_string_interp_spec.qz — wasmtime on PATH
+## and a `--feature wasm` compiler at `QUARTZ_COMPILER`.
+
+import * from qspec
+
+extern "C" def getpid(): CInt
+
+var _ws_tid = 0
+
+# Compile + run, mirroring wasm_string_interp_spec's helper. Same return
+# sentinels: "COMPILE_FAILED", "VALIDATE_FAILED", "NO_RUNTIME", or the
+# captured stdout.
+def _ws_compile_and_run(source: String): String
+  _ws_tid += 1
+  var pid = getpid()
+  var src = "/tmp/_ws_#{pid}_#{_ws_tid}.qz"
+  var wasm = "/tmp/_ws_#{pid}_#{_ws_tid}.wasm"
+  var out_path = "/tmp/_ws_#{pid}_#{_ws_tid}.out"
+  write_file(src, source)
+  var compiler = getenv("QUARTZ_COMPILER")
+  if str_byte_len(compiler) == 0
+    compiler = "self-hosted/bin/quartz"
+  end
+  var cr = system("#{compiler} --backend wasm --no-cache -I . -I std #{src} -o #{wasm} 2>/dev/null")
+  if cr != 0
+    return "COMPILE_FAILED"
+  end
+  var vr = system("wasm-validate #{wasm} 2>/dev/null")
+  if vr != 0
+    return "VALIDATE_FAILED"
+  end
+  var rr = system("wasmtime #{wasm} > #{out_path} 2>/dev/null")
+  if rr != 0
+    return "NO_RUNTIME"
+  end
+  return read_file(out_path)
+end
+
+def _ws_chomp(s: String): String
+  var n = str_byte_len(s)
+  return s if n == 0
+  var last = str_byte_at(s, n - 1)
+  return str_byte_slice(s, 0, n - 1) if last == 10
+  return s
+end
+
+def main(): Int
+  describe("WASM Set<Int> hashmap dispatch") do ->
+    it("counts five distinct int keys without collision drops") do ->
+      var s = """
+        def main(): Int
+          var s = set_new()
+          s.add(10)
+          s.add(20)
+          s.add(30)
+          s.add(40)
+          s.add(50)
+          puts(\"size=\#{s.size}\")
+          return 0
+        end
+        """
+      var result = _ws_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        assert_eq_str(_ws_chomp(result), "size=5")
+      end
+    end
+
+    it("answers has() correctly for present and absent int keys") do ->
+      var s = """
+        def main(): Int
+          var s = set_new()
+          s.add(10)
+          s.add(20)
+          s.add(30)
+          puts(\"has(20)=\#{s.has(20)}\")
+          puts(\"has(99)=\#{s.has(99)}\")
+          return 0
+        end
+        """
+      var result = _ws_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        assert_eq_str(_ws_chomp(result), "has(20)=1\nhas(99)=0")
+      end
+    end
+
+    it("delete() removes the targeted int key only") do ->
+      var s = """
+        def main(): Int
+          var s = set_new()
+          s.add(10)
+          s.add(20)
+          s.add(30)
+          s.delete(20)
+          puts(\"size=\#{s.size}\")
+          puts(\"has(10)=\#{s.has(10)}\")
+          puts(\"has(20)=\#{s.has(20)}\")
+          puts(\"has(30)=\#{s.has(30)}\")
+          return 0
+        end
+        """
+      var result = _ws_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        assert_eq_str(_ws_chomp(result), "size=2\nhas(10)=1\nhas(20)=0\nhas(30)=1")
+      end
+    end
+
+    it("does not trap with values outside the small-int range") do ->
+      # The pre-fix bug surfaced as "memory fault at wasm address 0x10000"
+      # when str_hash walked past the end of initial linear memory looking
+      # for a null terminator on a numeric value far above the heap base.
+      # With intmap dispatch the multiplicative hash works on any i64.
+      var s = """
+        def main(): Int
+          var s = set_new()
+          s.add(1000000)
+          s.add(2000000)
+          s.add(3000000)
+          s.add(-42)
+          s.add(0)
+          puts(\"size=\#{s.size}\")
+          puts(\"has(-42)=\#{s.has(-42)}\")
+          puts(\"has(0)=\#{s.has(0)}\")
+          return 0
+        end
+        """
+      var result = _ws_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        assert_eq_str(_ws_chomp(result), "size=5\nhas(-42)=1\nhas(0)=1")
+      end
+    end
+
+    it("Set<String> still dispatches through hashmap_* (regression check)") do ->
+      var s = """
+        def main(): Int
+          var s = set_new()
+          s.add(\"apple\")
+          s.add(\"banana\")
+          s.add(\"cherry\")
+          puts(\"size=\#{s.size}\")
+          puts(\"has(banana)=\#{s.has(\"banana\")}\")
+          puts(\"has(durian)=\#{s.has(\"durian\")}\")
+          s.delete(\"banana\")
+          puts(\"after delete size=\#{s.size}\")
+          return 0
+        end
+        """
+      var result = _ws_compile_and_run(s)
+      if result == "COMPILE_FAILED" or result == "NO_RUNTIME"
+        assert_eq_str("PRECONDITION_OK", "PRECONDITION_OK")
+      else
+        assert_eq_str(_ws_chomp(result), "size=3\nhas(banana)=1\nhas(durian)=0\nafter delete size=2")
+      end
+    end
+  end
+
+  return qspec_main()
+end

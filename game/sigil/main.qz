@@ -1,0 +1,2076 @@
+## SIGIL v0.4 — D.4.5 final polish. Closes the SIGIL D.4.x phase:
+## VICTORY / DEFEAT overlays render as centered Dark-Souls-style
+## banners (mirroring brogue-tribute's `build_outcome_plane`), input
+## locks to SPACE / q on overlay, and SPACE advances through three
+## encounters (Goblin → Orc → Boss). Player HP carries over with a
+## small heal between fights; mana refills, log clears, hand resets.
+## Top-of-hand row displays Deck / Discard counters that tick up as
+## cards are played — visual element only, no shuffling sim. A small
+## one-tick "(played)" annotation dims the card slot when its card
+## fires, then resolves on the next tick. Defeating the boss shows a
+## "You complete the dungeon" final overlay; SPACE quits.
+##
+## Earlier phases preserved: D.4.3 octant runes, D.4.4 dynamic glow
+## (selected card's rune + border breathe between base02 and the
+## card's glow color via a triangle wave on the 100ms tick pump,
+## cycle ≈ 1.6s).
+
+import std/tui/cell as cl
+import std/tui/plane as pl
+import std/tui/render as rd
+import std/tui/blend as bl
+import std/tui/theme as th
+import std/tui/runtime as tui
+import std/tui/octant as oct
+import std/terminal
+import string
+import * from std/vec
+import random
+import time
+
+# =============================================================================
+# Layout constants
+# =============================================================================
+
+def W():        Int = 80
+def H():        Int = 24
+def CARD_W():   Int = 14
+def CARD_H():   Int = 7
+def NUM_CARDS(): Int = 5
+def HAND_OY():  Int = 17
+def HAND_OX():  Int = 4
+def CARD_GAP(): Int = 1
+
+# Top region (rows 0-15) — mostly the dungeon room.
+def TOP_H():    Int = 17
+
+# Dungeon room geometry — centered horizontally in the top region.
+def ROOM_W():   Int = 30
+def ROOM_H():   Int = 10
+def ROOM_OX():  Int = 6      # (W - ROOM_W) / 2 plus a left bias
+def ROOM_OY():  Int = 2      # under the player-status row
+
+# Combat log: last N entries kept; render last 3.
+def LOG_CAP():     Int = 8
+def LOG_RENDER():  Int = 3
+def LOG_OY():      Int = 13   # rows 13/14/15
+
+# =============================================================================
+# Card data
+# =============================================================================
+
+struct Card
+  name:        String
+  cost:        Int
+  damage:      Int
+  block:       Int
+  heal:        Int
+  rune_pixels: Vec<Bool>
+  glow_color:  Int
+end
+
+# Each rune is a 6×6 row-major Vec<Bool> (36 pixels). Built from a
+# 6-character-per-row String literal where '.' = off and any other
+# char = on. Lets us write the sigils as readable ASCII art and avoid
+# 36-line push chains.
+def rune_from_strs(rows: Vec<String>): Vec<Bool>
+  var v = vec_new<Bool>()
+  var ry = 0
+  while ry < 6
+    var row = rows[ry]
+    var rx = 0
+    while rx < 6
+      var ch = str_byte_at(row, rx)
+      if ch == '.'
+        v.push(false)
+      else
+        v.push(true)
+      end
+      rx += 1
+    end
+    ry += 1
+  end
+  return v
+end
+
+# Strike — chevron pointing right. Horizontal arrow with a clear tip.
+def rune_strike(): Vec<Bool>
+  var rows = vec_new<String>()
+  rows.push("...X..")
+  rows.push("....X.")
+  rows.push("XXXXXX")
+  rows.push("XXXXXX")
+  rows.push("....X.")
+  rows.push("...X..")
+  return rune_from_strs(rows)
+end
+
+# Defend — shield outline with vertical bar + rounded bottom.
+def rune_defend(): Vec<Bool>
+  var rows = vec_new<String>()
+  rows.push(".XXXX.")
+  rows.push("X.XX.X")
+  rows.push("X.XX.X")
+  rows.push("X.XX.X")
+  rows.push(".XXXX.")
+  rows.push("..XX..")
+  return rune_from_strs(rows)
+end
+
+# Bash — solid hammerhead block with handle protrusion on the right.
+def rune_bash(): Vec<Bool>
+  var rows = vec_new<String>()
+  rows.push("XXXXX.")
+  rows.push("XXXXX.")
+  rows.push("XXXXXX")
+  rows.push("XXXXXX")
+  rows.push("XXXXX.")
+  rows.push("XXXXX.")
+  return rune_from_strs(rows)
+end
+
+# Mend — cross / plus sign, the heal sigil.
+def rune_mend(): Vec<Bool>
+  var rows = vec_new<String>()
+  rows.push("..XX..")
+  rows.push("..XX..")
+  rows.push("XXXXXX")
+  rows.push("XXXXXX")
+  rows.push("..XX..")
+  rows.push("..XX..")
+  return rune_from_strs(rows)
+end
+
+# Rune of Power — 4-point diamond (filled).
+def rune_power(): Vec<Bool>
+  var rows = vec_new<String>()
+  rows.push("..XX..")
+  rows.push(".XXXX.")
+  rows.push("XXXXXX")
+  rows.push("XXXXXX")
+  rows.push(".XXXX.")
+  rows.push("..XX..")
+  return rune_from_strs(rows)
+end
+
+# Iron Wave — zigzag, water + iron motif.
+def rune_iron_wave(): Vec<Bool>
+  var rows = vec_new<String>()
+  rows.push("X..X..")
+  rows.push("XX.XX.")
+  rows.push(".XX.XX")
+  rows.push("XX.XX.")
+  rows.push(".XX.XX")
+  rows.push("..X..X")
+  return rune_from_strs(rows)
+end
+
+# Twin Strike — two parallel right-pointing chevrons.
+def rune_twin_strike(): Vec<Bool>
+  var rows = vec_new<String>()
+  rows.push(".X..X.")
+  rows.push("..X..X")
+  rows.push("XXXXXX")
+  rows.push("XXXXXX")
+  rows.push("..X..X")
+  rows.push(".X..X.")
+  return rune_from_strs(rows)
+end
+
+# Anger — rising flames.
+def rune_anger(): Vec<Bool>
+  var rows = vec_new<String>()
+  rows.push("..X...")
+  rows.push(".X.X.X")
+  rows.push(".X.XX.")
+  rows.push(".XXXXX")
+  rows.push("XXXXXX")
+  rows.push(".XXXX.")
+  return rune_from_strs(rows)
+end
+
+# Power Through — heavy fortress with battlements.
+def rune_power_through(): Vec<Bool>
+  var rows = vec_new<String>()
+  rows.push("X.X.X.")
+  rows.push("XXXXXX")
+  rows.push("XXXXXX")
+  rows.push("X.XX.X")
+  rows.push("XXXXXX")
+  rows.push("XXXXXX")
+  return rune_from_strs(rows)
+end
+
+# Shrug It Off — angled / offset shield.
+def rune_shrug(): Vec<Bool>
+  var rows = vec_new<String>()
+  rows.push("XXXX..")
+  rows.push("X..X..")
+  rows.push("X.XXX.")
+  rows.push(".X.X.X")
+  rows.push(".XXXXX")
+  rows.push("...XX.")
+  return rune_from_strs(rows)
+end
+
+# Bandage — wrapped strip with a small cross.
+def rune_bandage(): Vec<Bool>
+  var rows = vec_new<String>()
+  rows.push("..X...")
+  rows.push(".XXX..")
+  rows.push("XXXXXX")
+  rows.push("XXXXXX")
+  rows.push(".X..X.")
+  rows.push("X..X.X")
+  return rune_from_strs(rows)
+end
+
+def card_strike(): Card
+  return Card {
+    name:        "Strike",
+    cost:        1,
+    damage:      6,
+    block:       0,
+    heal:        0,
+    rune_pixels: rune_strike(),
+    glow_color:  8
+  }
+end
+
+def card_defend(): Card
+  return Card {
+    name:        "Defend",
+    cost:        1,
+    damage:      0,
+    block:       5,
+    heal:        0,
+    rune_pixels: rune_defend(),
+    glow_color:  13
+  }
+end
+
+def card_bash(): Card
+  return Card {
+    name:        "Bash",
+    cost:        2,
+    damage:      8,
+    block:       2,
+    heal:        0,
+    rune_pixels: rune_bash(),
+    glow_color:  9
+  }
+end
+
+def card_mend(): Card
+  return Card {
+    name:        "Mend",
+    cost:        1,
+    damage:      0,
+    block:       0,
+    heal:        4,
+    rune_pixels: rune_mend(),
+    glow_color:  11
+  }
+end
+
+def card_rune_of_power(): Card
+  return Card {
+    name:        "Rune Power",
+    cost:        3,
+    damage:      12,
+    block:       0,
+    heal:        0,
+    rune_pixels: rune_power(),
+    glow_color:  14
+  }
+end
+
+def card_iron_wave(): Card
+  return Card {
+    name:        "Iron Wave",
+    cost:        1,
+    damage:      4,
+    block:       4,
+    heal:        0,
+    rune_pixels: rune_iron_wave(),
+    glow_color:  9
+  }
+end
+
+def card_twin_strike(): Card
+  return Card {
+    name:        "Twin Strike",
+    cost:        1,
+    damage:      10,
+    block:       0,
+    heal:        0,
+    rune_pixels: rune_twin_strike(),
+    glow_color:  8
+  }
+end
+
+def card_anger(): Card
+  return Card {
+    name:        "Anger",
+    cost:        0,
+    damage:      5,
+    block:       0,
+    heal:        0,
+    rune_pixels: rune_anger(),
+    glow_color:  8
+  }
+end
+
+def card_power_through(): Card
+  return Card {
+    name:        "Pwr Through",
+    cost:        2,
+    damage:      4,
+    block:       12,
+    heal:        0,
+    rune_pixels: rune_power_through(),
+    glow_color:  13
+  }
+end
+
+def card_shrug(): Card
+  return Card {
+    name:        "Shrug Off",
+    cost:        1,
+    damage:      0,
+    block:       8,
+    heal:        0,
+    rune_pixels: rune_shrug(),
+    glow_color:  13
+  }
+end
+
+def card_bandage(): Card
+  return Card {
+    name:        "Bandage",
+    cost:        0,
+    damage:      0,
+    block:       0,
+    heal:        3,
+    rune_pixels: rune_bandage(),
+    glow_color:  11
+  }
+end
+
+def initial_cards(): Vec<Card>
+  var v = vec_new<Card>()
+  v.push(card_strike())
+  v.push(card_defend())
+  v.push(card_bash())
+  v.push(card_mend())
+  v.push(card_rune_of_power())
+  v.push(card_iron_wave())
+  v.push(card_twin_strike())
+  v.push(card_anger())
+  v.push(card_power_through())
+  v.push(card_shrug())
+  v.push(card_bandage())
+  return v
+end
+
+# Card library indices (positions in initial_cards()).
+def CARD_STRIKE():        Int = 0
+def CARD_DEFEND():        Int = 1
+def CARD_BASH():          Int = 2
+def CARD_MEND():          Int = 3
+def CARD_RUNE_OF_POWER(): Int = 4
+def CARD_IRON_WAVE():     Int = 5
+def CARD_TWIN_STRIKE():   Int = 6
+def CARD_ANGER():         Int = 7
+def CARD_POWER_THROUGH(): Int = 8
+def CARD_SHRUG():         Int = 9
+def CARD_BANDAGE():       Int = 10
+def CARD_LIB_SIZE():      Int = 11
+
+def starter_deck_indices(): Vec<Int>
+  var v = vec_new<Int>()
+  var i = 0
+  while i < 5
+    v.push(CARD_STRIKE())
+    i += 1
+  end
+  i = 0
+  while i < 4
+    v.push(CARD_DEFEND())
+    i += 1
+  end
+  i = 0
+  while i < 2
+    v.push(CARD_BASH())
+    i += 1
+  end
+  i = 0
+  while i < 3
+    v.push(CARD_MEND())
+    i += 1
+  end
+  v.push(CARD_RUNE_OF_POWER())
+  return v
+end
+
+def HAND_SIZE(): Int = 5
+
+# Map a Card.glow_color slot id (8..15 = base08..base0F) to a theme RGB.
+def card_glow_rgb(card: Card, t: th::Theme): Int
+  var i = card.glow_color
+  if i == 8
+    return t.base08
+  end
+  if i == 9
+    return t.base09
+  end
+  if i == 10
+    return t.base0A
+  end
+  if i == 11
+    return t.base0B
+  end
+  if i == 12
+    return t.base0C
+  end
+  if i == 13
+    return t.base0D
+  end
+  if i == 14
+    return t.base0E
+  end
+  if i == 15
+    return t.base0F
+  end
+  return t.base05
+end
+
+# Compose a one-line "ATK n" / "DEF n" / "HEAL n" effect tag based on
+# the dominant card stat. Multi-stat cards (Bash) take their primary.
+def card_effect_label(c: Card): String
+  if c.damage > 0
+    return "ATK " + c.damage.to_s()
+  end
+  if c.block > 0
+    return "DEF " + c.block.to_s()
+  end
+  if c.heal > 0
+    return "HEAL " + c.heal.to_s()
+  end
+  return ""
+end
+
+# =============================================================================
+# Combat — enemies + intents
+# =============================================================================
+
+# Enemy archetypes.
+def ENEMY_GOBLIN(): Int = 0
+def ENEMY_ORC():    Int = 1
+def ENEMY_BOSS():   Int = 2
+
+# Intent kinds. Modelled as parallel ints (kind + value) on the Enemy
+# struct rather than a generic enum payload — keeps the type system
+# happy across struct fields and avoids known generic-enum-in-field
+# erasure hazards.
+def INTENT_ATTACK(): Int = 0
+def INTENT_DEFEND(): Int = 1
+def INTENT_BUFF():   Int = 2
+
+def enemy_glyph(kind: Int): String
+  if kind == ENEMY_GOBLIN()
+    return "g"
+  end
+  if kind == ENEMY_ORC()
+    return "G"
+  end
+  return "B"
+end
+
+def enemy_name(kind: Int): String
+  if kind == ENEMY_GOBLIN()
+    return "Goblin"
+  end
+  if kind == ENEMY_ORC()
+    return "Orc"
+  end
+  return "Boss"
+end
+
+def enemy_max_hp(kind: Int): Int
+  if kind == ENEMY_GOBLIN()
+    return 8
+  end
+  if kind == ENEMY_ORC()
+    return 14
+  end
+  return 25
+end
+
+# Per-kind intent rotation length.
+def enemy_rotation_len(kind: Int): Int
+  if kind == ENEMY_GOBLIN()
+    return 3
+  end
+  if kind == ENEMY_ORC()
+    return 3
+  end
+  return 4
+end
+
+# Per-kind intent at rotation index i (mod rotation_len).
+# Returns (intent_kind, intent_value).
+def enemy_intent_at(kind: Int, i: Int): (Int, Int)
+  var n = enemy_rotation_len(kind)
+  var slot = i
+  while slot >= n
+    slot = slot - n
+  end
+  while slot < 0
+    slot = slot + n
+  end
+  if kind == ENEMY_GOBLIN()
+    if slot == 0
+      return (INTENT_ATTACK(), 3)
+    end
+    if slot == 1
+      return (INTENT_ATTACK(), 3)
+    end
+    return (INTENT_DEFEND(), 0)
+  end
+  if kind == ENEMY_ORC()
+    if slot == 0
+      return (INTENT_ATTACK(), 5)
+    end
+    if slot == 1
+      return (INTENT_ATTACK(), 5)
+    end
+    return (INTENT_BUFF(), 2)
+  end
+  # Boss
+  if slot == 0
+    return (INTENT_ATTACK(), 6)
+  end
+  if slot == 1
+    return (INTENT_ATTACK(), 4)
+  end
+  if slot == 2
+    return (INTENT_BUFF(), 2)
+  end
+  return (INTENT_ATTACK(), 8)
+end
+
+def intent_label(kind: Int, value: Int): String
+  if kind == INTENT_ATTACK()
+    return "ATK " + value.to_s()
+  end
+  if kind == INTENT_DEFEND()
+    return "DEFEND"
+  end
+  return "BUFF +" + value.to_s()
+end
+
+struct Enemy
+  kind:         Int
+  hp:           Int
+  max_hp:       Int
+  rotation_idx: Int     # advances each end-turn
+  intent_kind:  Int     # cached snapshot of current intent
+  intent_value: Int
+  buff:         Int     # accumulated next-attack bonus from BUFF intents
+  block:        Int     # cosmetic — gained via DEFEND intent, decays each turn
+  room_x:       Int     # position inside the room (1..ROOM_W-2)
+  room_y:       Int     # position inside the room (1..ROOM_H-2)
+end
+
+def enemy_make(kind: Int, rx: Int, ry: Int): Enemy
+  var pair = enemy_intent_at(kind, 0)
+  return Enemy {
+    kind:         kind,
+    hp:           enemy_max_hp(kind),
+    max_hp:       enemy_max_hp(kind),
+    rotation_idx: 0,
+    intent_kind:  pair.0,
+    intent_value: pair.1,
+    buff:         0,
+    block:        0,
+    room_x:       rx,
+    room_y:       ry
+  }
+end
+
+# Enemy color for glyph + HP bar — red accent for goblin/orc, mauve
+# for boss to match brogue-tribute conventions.
+def enemy_color(kind: Int, t: th::Theme): Int
+  if kind == ENEMY_BOSS()
+    return t.base0E
+  end
+  return t.base08
+end
+
+# =============================================================================
+# Combat state
+# =============================================================================
+
+struct Combat
+  player_hp:    Int
+  player_max:   Int
+  player_block: Int
+  mana:         Int
+  mana_max:     Int
+  enemies:      Vec<Enemy>
+  log:          Vec<String>
+  done:         Int       # 0 = active, 1 = victory, 2 = defeat
+end
+
+# Append a log entry; cap at LOG_CAP() entries (drop oldest).
+def combat_log_push(c: Combat, msg: String): Combat
+  var src: Vec<String> = c.log
+  var new_log: Vec<String> = vec_clone(src)
+  new_log.push(msg)
+  while new_log.size > LOG_CAP()
+    new_log = vec_remove_at(new_log, 0)
+  end
+  return Combat { ...c, log: new_log }
+end
+
+# Find the first living enemy index in c.enemies, or -1 if none.
+def combat_first_living(c: Combat): Int
+  var enemies: Vec<Enemy> = c.enemies
+  var i = 0
+  while i < enemies.size
+    var e = enemies[i]
+    if e.hp > 0
+      return i
+    end
+    i += 1
+  end
+  return -1
+end
+
+def combat_all_dead(c: Combat): Bool
+  return combat_first_living(c) < 0
+end
+
+# Replace enemy at index `i` in `c.enemies` with `ne`. Returns a new
+# Combat with the patched Vec.
+def combat_set_enemy(c: Combat, i: Int, ne: Enemy): Combat
+  var enemies: Vec<Enemy> = c.enemies
+  var out = vec_new<Enemy>()
+  var j = 0
+  while j < enemies.size
+    if j == i
+      out.push(ne)
+    else
+      out.push(enemies[j])
+    end
+    j += 1
+  end
+  return Combat { ...c, enemies: out }
+end
+
+# =============================================================================
+# Card play — apply selected card's effect against the first living enemy.
+# =============================================================================
+
+def combat_play_card(c: Combat, card: Card): Combat
+  if c.done != 0
+    return c
+  end
+  if card.cost > c.mana
+    return combat_log_push(c, "Not enough mana for " + card.name + ".")
+  end
+  # Deduct mana up front.
+  var c1 = Combat { ...c, mana: c.mana - card.cost }
+  # Apply block (player_block carries to next-turn-only — reset on end_turn).
+  if card.block > 0
+    c1 = Combat { ...c1, player_block: c1.player_block + card.block }
+    c1 = combat_log_push(c1,
+      card.name + ": +" + card.block.to_s() + " block.")
+  end
+  # Apply heal.
+  if card.heal > 0
+    var new_hp = c1.player_hp + card.heal
+    if new_hp > c1.player_max
+      new_hp = c1.player_max
+    end
+    var actual = new_hp - c1.player_hp
+    c1 = Combat { ...c1, player_hp: new_hp }
+    c1 = combat_log_push(c1,
+      card.name + ": heal " + actual.to_s() + ".")
+  end
+  # Apply damage to first living enemy.
+  if card.damage > 0
+    var idx = combat_first_living(c1)
+    if idx < 0
+      return c1
+    end
+    var enemies: Vec<Enemy> = c1.enemies
+    var target = enemies[idx]
+    var new_hp = target.hp - card.damage
+    if new_hp < 0
+      new_hp = 0
+    end
+    var ne = Enemy { ...target, hp: new_hp }
+    c1 = combat_set_enemy(c1, idx, ne)
+    c1 = combat_log_push(c1,
+      card.name + ": " + card.damage.to_s() +
+      " damage to " + enemy_name(target.kind) + ".")
+    if new_hp == 0
+      c1 = combat_log_push(c1,
+        enemy_name(target.kind) + " falls.")
+    end
+  end
+  # Victory check.
+  if combat_all_dead(c1)
+    c1 = combat_log_push(c1, "VICTORY")
+    c1 = Combat { ...c1, done: 1 }
+  end
+  return c1
+end
+
+# =============================================================================
+# End turn — each enemy resolves its intent, intents advance, mana resets.
+# =============================================================================
+
+def combat_end_turn(c: Combat): Combat
+  if c.done != 0
+    return c
+  end
+  var c1 = c
+  var enemies: Vec<Enemy> = c1.enemies
+  var i = 0
+  while i < enemies.size
+    var e = enemies[i]
+    if e.hp <= 0
+      i += 1
+    else
+      var kind = e.intent_kind
+      if kind == INTENT_ATTACK()
+        var raw = e.intent_value + e.buff
+        var absorbed = raw
+        if absorbed > c1.player_block
+          absorbed = c1.player_block
+        end
+        var taken = raw - absorbed
+        var new_player_hp = c1.player_hp - taken
+        if new_player_hp < 0
+          new_player_hp = 0
+        end
+        var msg = enemy_name(e.kind) + " attacks for " + raw.to_s() + " ("
+        msg = msg + absorbed.to_s() + " blocked, " + taken.to_s() + " through)."
+        c1 = Combat {
+          ...c1,
+          player_hp: new_player_hp,
+          player_block: c1.player_block - absorbed
+        }
+        c1 = combat_log_push(c1, msg)
+        # Buff is consumed on the attack that uses it.
+        var ne = Enemy { ...e, buff: 0 }
+        c1 = combat_set_enemy(c1, i, ne)
+      end
+      if kind == INTENT_DEFEND()
+        var ne = Enemy { ...e, block: e.block + 4 }
+        c1 = combat_set_enemy(c1, i, ne)
+        c1 = combat_log_push(c1,
+          enemy_name(e.kind) + " braces (+4 block).")
+      end
+      if kind == INTENT_BUFF()
+        var ne = Enemy { ...e, buff: e.buff + e.intent_value }
+        c1 = combat_set_enemy(c1, i, ne)
+        c1 = combat_log_push(c1,
+          enemy_name(e.kind) + " grows strong (+" +
+          e.intent_value.to_s() + " next atk).")
+      end
+      i += 1
+    end
+  end
+  # Defeat check.
+  if c1.player_hp <= 0
+    c1 = combat_log_push(c1, "DEFEAT")
+    return Combat { ...c1, done: 2 }
+  end
+  # Reset player_block, refill mana, advance enemy rotations + decay enemy block.
+  var advanced = vec_new<Enemy>()
+  var enemies2: Vec<Enemy> = c1.enemies
+  var j = 0
+  while j < enemies2.size
+    var e2 = enemies2[j]
+    if e2.hp <= 0
+      advanced.push(e2)
+    else
+      var next_idx = e2.rotation_idx + 1
+      var pair = enemy_intent_at(e2.kind, next_idx)
+      var ne = Enemy {
+        ...e2,
+        rotation_idx: next_idx,
+        intent_kind:  pair.0,
+        intent_value: pair.1,
+        block:        0
+      }
+      advanced.push(ne)
+    end
+    j += 1
+  end
+  c1 = Combat {
+    ...c1,
+    player_block: 0,
+    mana:         c1.mana_max,
+    enemies:      advanced
+  }
+  return c1
+end
+
+# =============================================================================
+# Game state
+# =============================================================================
+
+struct Game
+  card_lib:          Vec<Card>     # immutable master library; index = CARD_*
+  deck:              Vec<Int>      # draw pile; top = last element
+  hand:              Vec<Int>      # current hand (≤ HAND_SIZE)
+  discard:           Vec<Int>      # played-this-encounter pile
+  selected_idx:      Int           # cursor into hand (clamped to hand.size-1)
+  theme:             th::Theme
+  combat:            Combat
+  frame:             Int           # advances on every Tick — drives the pulse
+  encounter_idx:     Int           # 1-based; advances on victory + SPACE
+  cards_played:      Int           # per-run total (reported on overlay)
+  damage_dealt:      Int           # per-run total
+  enemies_defeated:  Int           # per-run total
+  turns_survived:    Int           # per-run total (counts end_turn calls)
+  flip_frames:       Int           # ticks remaining on card-flip dim
+  flip_idx:          Int           # hand slot showing the flip dim
+  reward_pending:    Bool          # true between non-final encounter wins; UI
+                                   #   shows the 3-card reward picker.
+  reward_offer:      Vec<Int>      # 3 card-lib indices; cleared on advance
+  reward_idx:        Int           # cursor into reward_offer (0..2)
+  done_quit:         Bool          # set once the dungeon outcome is final
+end
+
+# Spawn the encounter for `idx` (1-based). 1 = goblin, 2 = orc, 3 = boss.
+def encounter_combat(idx: Int): Combat
+  var enemies = vec_new<Enemy>()
+  var kind = ENEMY_GOBLIN()
+  if idx == 2
+    kind = ENEMY_ORC()
+  end
+  if idx >= 3
+    kind = ENEMY_BOSS()
+  end
+  var rx = ROOM_W() - 6
+  var ry = ROOM_H() / 2
+  enemies.push(enemy_make(kind, rx, ry))
+  var log = vec_new<String>()
+  if idx == 1
+    log.push("A " + enemy_name(kind) + " blocks your path.")
+  end
+  if idx == 2
+    log.push("Deeper now — an " + enemy_name(kind) + " bars the way.")
+  end
+  if idx >= 3
+    log.push("The final chamber. The " + enemy_name(kind) + " awakens.")
+  end
+  return Combat {
+    player_hp:    20,
+    player_max:   20,
+    player_block: 0,
+    mana:         3,
+    mana_max:     3,
+    enemies:      enemies,
+    log:          log,
+    done:         0
+  }
+end
+
+# Draw `n` cards from g.deck into g.hand. If the deck runs dry mid-draw,
+# move discard into deck, shuffle, and continue. If both are empty, stop
+# (caller may end up with fewer than `n` cards — that's fine; user just
+# has a smaller hand that turn).
+def game_draw(g: Game, n: Int): Game
+  var deck: Vec<Int> = vec_clone(g.deck)
+  var hand: Vec<Int> = vec_clone(g.hand)
+  var discard: Vec<Int> = vec_clone(g.discard)
+  var i = 0
+  while i < n
+    if deck.size == 0
+      if discard.size == 0
+        i = n
+      else
+        var j = 0
+        while j < discard.size
+          deck.push(discard[j])
+          j += 1
+        end
+        random_shuffle(deck)
+        discard = vec_new<Int>()
+      end
+    end
+    if deck.size > 0
+      var top = deck[deck.size - 1]
+      vec_delete(deck, deck.size - 1)
+      hand.push(top)
+      i += 1
+    end
+  end
+  return Game { ...g, deck: deck, hand: hand, discard: discard }
+end
+
+def game_init(): Game
+  rand_seed_op(time_epoch_ms())
+  var deck = starter_deck_indices()
+  random_shuffle(deck)
+  var hand = vec_new<Int>()
+  var discard = vec_new<Int>()
+  var g0 = Game {
+    card_lib:          initial_cards(),
+    deck:              deck,
+    hand:              hand,
+    discard:           discard,
+    selected_idx:      0,
+    theme:             th::theme_catppuccin_mocha(),
+    combat:            encounter_combat(1),
+    frame:             0,
+    encounter_idx:     1,
+    cards_played:      0,
+    damage_dealt:      0,
+    enemies_defeated:  0,
+    turns_survived:    0,
+    flip_frames:       0,
+    flip_idx:          -1,
+    reward_pending:    false,
+    reward_offer:      vec_new<Int>(),
+    reward_idx:        0,
+    done_quit:         false
+  }
+  return game_draw(g0, HAND_SIZE())
+end
+
+# Advance to the next encounter on victory + SPACE. Carries player HP
+# (with a +5 long-rest heal capped at max), refills mana, clears log,
+# resets per-encounter counters. Encounter 3 (boss) is the last —
+# defeating it sets done_quit so SPACE quits.
+def game_next_encounter(g: Game): Game
+  var carry_hp = g.combat.player_hp + 5
+  if carry_hp > g.combat.player_max
+    carry_hp = g.combat.player_max
+  end
+  var next_idx = g.encounter_idx + 1
+  var fresh = encounter_combat(next_idx)
+  fresh = Combat { ...fresh, player_hp: carry_hp }
+  # Recycle hand + discard back into the deck for the new fight, then
+  # reshuffle and draw a fresh hand.
+  var deck = vec_clone(g.deck)
+  var hand: Vec<Int> = g.hand
+  var discard: Vec<Int> = g.discard
+  var i = 0
+  while i < hand.size
+    deck.push(hand[i])
+    i += 1
+  end
+  i = 0
+  while i < discard.size
+    deck.push(discard[i])
+    i += 1
+  end
+  random_shuffle(deck)
+  var g1 = Game {
+    ...g,
+    combat:        fresh,
+    deck:          deck,
+    hand:          vec_new<Int>(),
+    discard:       vec_new<Int>(),
+    selected_idx:  0,
+    encounter_idx: next_idx,
+    flip_frames:   0,
+    flip_idx:      -1
+  }
+  return game_draw(g1, HAND_SIZE())
+end
+
+# Whether the just-won fight closes the run (last encounter cleared).
+def game_run_complete(g: Game): Bool
+  return g.combat.done == 1 and g.encounter_idx >= 3
+end
+
+def clamp_idx(i: Int, n: Int): Int
+  if i < 0
+    return 0
+  end
+  if i >= n
+    return n - 1
+  end
+  return i
+end
+
+# =============================================================================
+# Pulse + color helpers — D.4.4 dynamic glow
+# =============================================================================
+
+def abs_int(x: Int): Int
+  if x < 0
+    return -x
+  end
+  return x
+end
+
+# Triangle wave on `frame % PULSE_PERIOD()`. Returns 0..PULSE_MAX(),
+# bright at the half-period mark. With tick_ms = 100 and PULSE_PERIOD =
+# 16, one full cycle is 1.6s.
+def PULSE_PERIOD(): Int = 16
+def PULSE_MAX():    Int = 256
+
+def pulse_value(frame: Int): Int
+  var p = frame
+  while p < 0
+    p = p + PULSE_PERIOD()
+  end
+  var phase = p - (p / PULSE_PERIOD()) * PULSE_PERIOD()    # frame % 16
+  var half = PULSE_PERIOD() / 2
+  var tri = half - abs_int(phase - half)                   # 0..8
+  return (tri * PULSE_MAX()) / half                        # 0..256
+end
+
+# Linear-interpolate two packed RGB ints by t/256. Channels are
+# extracted, mixed, and repacked. t == 0 returns `a`, t == 256 returns
+# `b`. Result has cl::RGB_FLAG() OR'd in so the cell engine recognises
+# it as truecolor (otherwise small RGB ints get interpreted as ANSI16
+# / 256-palette indices and fg renders as terminal default).
+def lerp_rgb(a: Int, b: Int, t: Int): Int
+  var ar = (a >> 16) & 0xFF
+  var ag = (a >> 8)  & 0xFF
+  var ab = a & 0xFF
+  var br = (b >> 16) & 0xFF
+  var bg = (b >> 8)  & 0xFF
+  var bb = b & 0xFF
+  var rr = ar + ((br - ar) * t) / PULSE_MAX()
+  var gg = ag + ((bg - ag) * t) / PULSE_MAX()
+  var bb2 = ab + ((bb - ab) * t) / PULSE_MAX()
+  return cl::RGB_FLAG() | (rr << 16) | (gg << 8) | bb2
+end
+
+# =============================================================================
+# Cell-construction helpers
+# =============================================================================
+
+def make_cell(egc: String, fg: cl::Channel, bg: cl::Channel, attrs: Int): cl::Cell
+  return cl::Cell { egc: egc, fg: fg, bg: bg, attrs: attrs }
+end
+
+# Write each codepoint of `s` left-to-right starting at (col, row) on
+# `p`. ASCII-only — every byte becomes one cell. Used for card name,
+# cost digits, effect label, log entries, intent text.
+def put_ascii(p: pl::Plane, s: String, col: Int, row: Int,
+              fg: cl::Channel, bg: cl::Channel, attrs: Int): pl::Plane
+  var out = p
+  var n = str_byte_len(s)
+  var i = 0
+  while i < n
+    var c = str_byte_at(s, i)
+    out = pl::plane_putc(out, col + i, row,
+                          make_cell(str_from_char(c), fg, bg, attrs))
+    i += 1
+  end
+  return out
+end
+
+# Render a brogue-tribute-style HP bar:
+#   "<label>: ████░░░░░░ <cur>/<max>"
+# bar is rendered with `bar_fg` for filled, theme.base03 for empty.
+def render_hp_bar(p: pl::Plane, label: String, cur: Int, max: Int,
+                  col: Int, row: Int, bar_fg: cl::Channel,
+                  bg: cl::Channel, dim: cl::Channel,
+                  text_fg: cl::Channel): pl::Plane
+  var out = p
+  var width = 10
+  var filled = 0
+  if max > 0
+    filled = (cur * width) / max
+  end
+  if filled < 0
+    filled = 0
+  end
+  if filled > width
+    filled = width
+  end
+  out = put_ascii(out, label, col, row, text_fg, bg, cl::CELL_ATTR_BOLD())
+  var lab_n = str_byte_len(label)
+  out = put_ascii(out, " ", col + lab_n, row, text_fg, bg, 0)
+  var bar_x = col + lab_n + 1
+  var i = 0
+  while i < width
+    var glyph = "█"
+    var glyph_fg = bar_fg
+    if i >= filled
+      glyph = "░"
+      glyph_fg = dim
+    end
+    out = pl::plane_putc(out, bar_x + i, row,
+                          make_cell(glyph, glyph_fg, bg, 0))
+    i += 1
+  end
+  var num_x = bar_x + width + 1
+  var num_str = cur.to_s() + "/" + max.to_s()
+  out = put_ascii(out, num_str, num_x, row, text_fg, bg, 0)
+  return out
+end
+
+# =============================================================================
+# Card rendering — single 14x7 panel
+# =============================================================================
+
+# Build a 6×8-pixel OctantBlitter from a 6×6 rune. The rune is centered
+# vertically in the 8 rows (1 blank row top, 6 rune rows, 1 blank row
+# bottom) so the resulting cell footprint is exactly 3 cells × 2 cells.
+def build_rune_blitter(pixels: Vec<Bool>): oct::OctantBlitter
+  var b = oct::octant_blitter_new(6, 8)
+  var ry = 0
+  while ry < 6
+    var rx = 0
+    while rx < 6
+      var idx = ry * 6 + rx
+      if pixels[idx]
+        b = oct::octant_set(b, rx, ry + 1, true)
+      end
+      rx += 1
+    end
+    ry += 1
+  end
+  return b
+end
+
+# Selected cards get a heavier double-line border in the card's glow
+# colour. Idle cards use a normal single-line border in the dim fg.
+# When `flipped` is true the card renders as a "(played)" tile —
+# dim-grey border, no glow, no rune, just a centered annotation.
+def build_card_plane(card: Card, selected: Bool, t: th::Theme,
+                     frame: Int, flipped: Bool): pl::Plane
+  var p = pl::plane_create(CARD_W(), CARD_H())
+  var bg = cl::channel_rgb(t.base01)
+  var fg = cl::channel_rgb(t.base05)
+  var dim = cl::channel_rgb(t.base04)
+  var num_fg = cl::channel_rgb(t.base0A)
+  var glow_rgb = card_glow_rgb(card, t)
+  var glow = cl::channel_rgb(glow_rgb)
+
+  var blank = make_cell(" ", fg, bg, 0)
+  p = pl::plane_fill(p, blank)
+
+  # Card-flip animation: when the slot is currently mid-discard, render
+  # the "back" — a dim border in base02 and a centered "(played)" tag
+  # in base04. Two-tick lifetime via Game.flip_frames; on the third
+  # tick the slot resolves back to its full card render.
+  if flipped
+    var back_color = cl::channel_rgb(t.base02)
+    var bx0 = 1
+    while bx0 < CARD_W() - 1
+      p = pl::plane_putc(p, bx0, 0,
+                          make_cell("─", back_color, bg, 0))
+      p = pl::plane_putc(p, bx0, CARD_H() - 1,
+                          make_cell("─", back_color, bg, 0))
+      bx0 += 1
+    end
+    var by0 = 1
+    while by0 < CARD_H() - 1
+      p = pl::plane_putc(p, 0, by0,
+                          make_cell("│", back_color, bg, 0))
+      p = pl::plane_putc(p, CARD_W() - 1, by0,
+                          make_cell("│", back_color, bg, 0))
+      by0 += 1
+    end
+    p = pl::plane_putc(p, 0, 0,
+                        make_cell("┌", back_color, bg, 0))
+    p = pl::plane_putc(p, CARD_W() - 1, 0,
+                        make_cell("┐", back_color, bg, 0))
+    p = pl::plane_putc(p, 0, CARD_H() - 1,
+                        make_cell("└", back_color, bg, 0))
+    p = pl::plane_putc(p, CARD_W() - 1, CARD_H() - 1,
+                        make_cell("┘", back_color, bg, 0))
+    var tag = "(played)"
+    var tx = (CARD_W() - str_byte_len(tag)) / 2
+    p = put_ascii(p, tag, tx, CARD_H() / 2, dim, bg, 0)
+    return p
+  end
+
+  # Border characters & color.
+  var b_tl = "┌"
+  var b_tr = "┐"
+  var b_bl = "└"
+  var b_br = "┘"
+  var b_h  = "─"
+  var b_v  = "│"
+  var border_color = dim
+  var border_attrs = 0
+  # Pulse value for the selected card. Border breathes from a 50%-blend
+  # of base02→glow at the trough up to full glow at the peak — a more
+  # subtle modulation than the rune so the eye doesn't fatigue.
+  var pulse = pulse_value(frame)
+  if selected
+    b_tl = "╔"
+    b_tr = "╗"
+    b_bl = "╚"
+    b_br = "╝"
+    b_h  = "═"
+    b_v  = "║"
+    var border_t = 128 + (pulse / 2)                    # 128..256
+    var border_rgb = lerp_rgb(t.base02, glow_rgb, border_t)
+    border_color = cl::channel_rgb(border_rgb)
+    border_attrs = cl::CELL_ATTR_BOLD()
+  end
+
+  # Top + bottom borders.
+  var bx = 1
+  while bx < CARD_W() - 1
+    p = pl::plane_putc(p, bx, 0,
+                        make_cell(b_h, border_color, bg, border_attrs))
+    p = pl::plane_putc(p, bx, CARD_H() - 1,
+                        make_cell(b_h, border_color, bg, border_attrs))
+    bx += 1
+  end
+  # Left + right borders.
+  var by = 1
+  while by < CARD_H() - 1
+    p = pl::plane_putc(p, 0, by,
+                        make_cell(b_v, border_color, bg, border_attrs))
+    p = pl::plane_putc(p, CARD_W() - 1, by,
+                        make_cell(b_v, border_color, bg, border_attrs))
+    by += 1
+  end
+  # Corners.
+  p = pl::plane_putc(p, 0, 0,
+                      make_cell(b_tl, border_color, bg, border_attrs))
+  p = pl::plane_putc(p, CARD_W() - 1, 0,
+                      make_cell(b_tr, border_color, bg, border_attrs))
+  p = pl::plane_putc(p, 0, CARD_H() - 1,
+                      make_cell(b_bl, border_color, bg, border_attrs))
+  p = pl::plane_putc(p, CARD_W() - 1, CARD_H() - 1,
+                      make_cell(b_br, border_color, bg, border_attrs))
+
+  # Row 1: " <name padded to 9>  <cost>●"
+  # Card layout (14 cols total): col 0 = border, cols 1..9 = name (9
+  # chars max), cols 10 = spacer, col 11 = cost digit, col 12 = bullet,
+  # col 13 = border.
+  var name = card.name
+  var name_attrs = 0
+  if selected
+    name_attrs = cl::CELL_ATTR_BOLD()
+  end
+  var max_name = 9
+  var nlen = str_byte_len(name)
+  if nlen > max_name
+    nlen = max_name
+  end
+  var ni = 0
+  while ni < nlen
+    var ch = str_byte_at(name, ni)
+    p = pl::plane_putc(p, 1 + ni, 1,
+                        make_cell(str_from_char(ch), fg, bg, name_attrs))
+    ni += 1
+  end
+
+  # Cost digit at col 11, bullet at col 12.
+  p = pl::plane_putc(p, 11, 1,
+                      make_cell(card.cost.to_s(), num_fg, bg,
+                                 cl::CELL_ATTR_BOLD()))
+  p = pl::plane_putc(p, 12, 1,
+                      make_cell("●", glow, bg, 0))
+
+  # Row 5: effect label (e.g. "ATK 6") in glow color, left-padded 1.
+  var label = card_effect_label(card)
+  p = put_ascii(p, label, 1, 5, glow, bg, cl::CELL_ATTR_BOLD())
+
+  # Rune box: 3 cells wide × 2 cells tall, centered horizontally
+  # (cols 5,6,7) at rows 2-3. Selected cards pulse the rune fg from
+  # base02 (dim, almost vanished) up to full glow_color over the
+  # PULSE_PERIOD; idle cards render the rune in a faint base04 so it's
+  # visible but understated.
+  var rune_blitter = build_rune_blitter(card.rune_pixels)
+  var rune_fg_rgb = t.base04
+  if selected
+    rune_fg_rgb = lerp_rgb(t.base02, glow_rgb, pulse)
+  end
+  var rune_fg = cl::channel_rgb(rune_fg_rgb)
+  p = oct::octant_blit_to_plane(rune_blitter, p, 5, 2,
+                                 oct::OctantQuality::Octant,
+                                 rune_fg, bg)
+
+  return p
+end
+
+# =============================================================================
+# Hand rendering — 5 cards in a row across rows HAND_OY..HAND_OY+CARD_H
+# =============================================================================
+
+def build_hand_plane(g: Game): pl::Plane
+  var t = g.theme
+  var bg = cl::channel_rgb(t.base00)
+  var blank = make_cell(" ", cl::channel_rgb(t.base05), bg, 0)
+  var p = pl::plane_create(W(), CARD_H())
+  p = pl::plane_fill(p, blank)
+  var lib: Vec<Card> = g.card_lib
+  var hand: Vec<Int> = g.hand
+  var n = hand.size
+  var i = 0
+  while i < n
+    var card_idx = hand[i]
+    var card = lib[card_idx]
+    var selected = i == g.selected_idx
+    var flipped = g.flip_frames > 0 and i == g.flip_idx
+    var card_plane = build_card_plane(card, selected, t, g.frame, flipped)
+    var dx = HAND_OX() + i * (CARD_W() + CARD_GAP())
+    p = pl::plane_blit(card_plane, p,
+                       0, 0, CARD_W(), CARD_H(),
+                       dx, 0,
+                       bl::BlendMode::None)
+    i += 1
+  end
+  # Empty hand slots: dim placeholder borders so the hand region keeps
+  # its 5-slot footprint and the player can see "you'll get more cards
+  # when you end the turn".
+  while i < HAND_SIZE()
+    var dx = HAND_OX() + i * (CARD_W() + CARD_GAP())
+    var border_fg = cl::channel_rgb(t.base03)
+    var ey = 0
+    while ey < CARD_H()
+      var ch = " "
+      if ey == 0 or ey == CARD_H() - 1
+        ch = "─"
+      end
+      var ex = 0
+      while ex < CARD_W()
+        var glyph = ch
+        if ex == 0 or ex == CARD_W() - 1
+          if ey == 0 and ex == 0
+            glyph = "┌"
+          end
+          if ey == 0 and ex == CARD_W() - 1
+            glyph = "┐"
+          end
+          if ey == CARD_H() - 1 and ex == 0
+            glyph = "└"
+          end
+          if ey == CARD_H() - 1 and ex == CARD_W() - 1
+            glyph = "┘"
+          end
+          if ey != 0 and ey != CARD_H() - 1
+            glyph = "│"
+          end
+        end
+        p = pl::plane_putc(p, dx + ex, ey,
+                           make_cell(glyph, border_fg, bg, 0))
+        ex += 1
+      end
+      ey += 1
+    end
+    i += 1
+  end
+  return p
+end
+
+# =============================================================================
+# Combat scene — top region (rows 0-15)
+# =============================================================================
+
+# Draw the dungeon room border (single line) and fill the floor with
+# `.` glyphs in dim fg. Returns the updated plane.
+def draw_room(p: pl::Plane, ox: Int, oy: Int,
+              fg_wall: cl::Channel, fg_floor: cl::Channel,
+              bg: cl::Channel): pl::Plane
+  var out = p
+  var w = ROOM_W()
+  var h = ROOM_H()
+  # Floor first.
+  var ry = 1
+  while ry < h - 1
+    var rx = 1
+    while rx < w - 1
+      out = pl::plane_putc(out, ox + rx, oy + ry,
+                            make_cell("·", fg_floor, bg, 0))
+      rx += 1
+    end
+    ry += 1
+  end
+  # Top + bottom walls.
+  var bx = 1
+  while bx < w - 1
+    out = pl::plane_putc(out, ox + bx, oy,
+                          make_cell("─", fg_wall, bg, 0))
+    out = pl::plane_putc(out, ox + bx, oy + h - 1,
+                          make_cell("─", fg_wall, bg, 0))
+    bx += 1
+  end
+  # Left + right walls.
+  var by = 1
+  while by < h - 1
+    out = pl::plane_putc(out, ox, oy + by,
+                          make_cell("│", fg_wall, bg, 0))
+    out = pl::plane_putc(out, ox + w - 1, oy + by,
+                          make_cell("│", fg_wall, bg, 0))
+    by += 1
+  end
+  # Corners.
+  out = pl::plane_putc(out, ox, oy,
+                        make_cell("┌", fg_wall, bg, 0))
+  out = pl::plane_putc(out, ox + w - 1, oy,
+                        make_cell("┐", fg_wall, bg, 0))
+  out = pl::plane_putc(out, ox, oy + h - 1,
+                        make_cell("└", fg_wall, bg, 0))
+  out = pl::plane_putc(out, ox + w - 1, oy + h - 1,
+                        make_cell("┘", fg_wall, bg, 0))
+  return out
+end
+
+def build_top_plane(g: Game): pl::Plane
+  var t = g.theme
+  var bg = cl::channel_rgb(t.base00)
+  var fg = cl::channel_rgb(t.base05)
+  var dim = cl::channel_rgb(t.base03)
+  var wall_fg = cl::channel_rgb(t.base04)
+  var floor_fg = cl::channel_rgb(t.base02)
+  var mauve = cl::channel_rgb(t.base0E)
+  var mana_fg = cl::channel_rgb(t.base0D)
+  var p = pl::plane_create(W(), TOP_H())
+  var blank = make_cell(" ", fg, bg, 0)
+  p = pl::plane_fill(p, blank)
+
+  var c = g.combat
+
+  # Row 0: player HP bar (left) + mana (mid) + selected card preview (right).
+  p = render_hp_bar(p, "HP", c.player_hp, c.player_max,
+                     1, 0,
+                     mauve, bg, dim, fg)
+  # Player block indicator just past the HP bar.
+  if c.player_block > 0
+    var blk_str = "[Blk " + c.player_block.to_s() + "]"
+    p = put_ascii(p, blk_str, 22, 0,
+                   cl::channel_rgb(t.base0C), bg,
+                   cl::CELL_ATTR_BOLD())
+  end
+  # Mana centred-ish.
+  var mana_str = "Mana " + c.mana.to_s() + "/" + c.mana_max.to_s()
+  p = put_ascii(p, mana_str, 36, 0, mana_fg, bg, cl::CELL_ATTR_BOLD())
+  # Selected card preview right. Empty hand → show a dash.
+  var lib: Vec<Card> = g.card_lib
+  var hand: Vec<Int> = g.hand
+  var preview = "Sel: -"
+  if hand.size > 0
+    var sel_card_idx = hand[g.selected_idx]
+    var sel_card = lib[sel_card_idx]
+    preview = "Sel: " + sel_card.name + " (" + sel_card.cost.to_s() + ")"
+  end
+  p = put_ascii(p, preview, 52, 0, fg, bg, 0)
+
+  # Encounter pip + Deck/Discard counters on row 1 (just above the
+  # room). Encounter pip on the left ("Floor 2/3"); deck/discard
+  # bookkeeping on the right ("Deck: N  |  Discard: M").
+  var floor_str = "Floor " + g.encounter_idx.to_s() + "/3"
+  p = put_ascii(p, floor_str, 1, 1,
+                 cl::channel_rgb(t.base0E), bg, cl::CELL_ATTR_BOLD())
+  var deck: Vec<Int> = g.deck
+  var discard: Vec<Int> = g.discard
+  var dd_str = "Deck: " + deck.size.to_s() +
+               "  |  Discard: " + discard.size.to_s()
+  var dd_x = W() - 1 - str_byte_len(dd_str)
+  p = put_ascii(p, dd_str, dd_x, 1,
+                 cl::channel_rgb(t.base0D), bg, 0)
+
+  # Draw the room.
+  p = draw_room(p, ROOM_OX(), ROOM_OY(), wall_fg, floor_fg, bg)
+
+  # Player glyph at left side of room.
+  var px = ROOM_OX() + 4
+  var py = ROOM_OY() + ROOM_H() / 2
+  p = pl::plane_putc(p, px, py,
+                      make_cell("@", mauve, bg, cl::CELL_ATTR_BOLD()))
+
+  # Enemies + their HP/intent panels to the right of the room.
+  var enemies: Vec<Enemy> = c.enemies
+  var ei = 0
+  var panel_x = ROOM_OX() + ROOM_W() + 2
+  while ei < enemies.size
+    var e = enemies[ei]
+    var ex = ROOM_OX() + e.room_x
+    var ey = ROOM_OY() + e.room_y
+    var ec = cl::channel_rgb(enemy_color(e.kind, t))
+    if e.hp > 0
+      p = pl::plane_putc(p, ex, ey,
+                          make_cell(enemy_glyph(e.kind), ec, bg,
+                                     cl::CELL_ATTR_BOLD()))
+    end
+    # HP bar + intent line for this enemy at the right panel.
+    var prow = ROOM_OY() + ei * 3
+    p = render_hp_bar(p, enemy_name(e.kind), e.hp, e.max_hp,
+                       panel_x, prow,
+                       ec, bg, dim, fg)
+    var intent_attrs = cl::CELL_ATTR_BOLD()
+    var intent_fg = cl::channel_rgb(t.base09)
+    if e.intent_kind == INTENT_DEFEND()
+      intent_fg = cl::channel_rgb(t.base0C)
+    end
+    if e.intent_kind == INTENT_BUFF()
+      intent_fg = cl::channel_rgb(t.base0A)
+    end
+    var label = intent_label(e.intent_kind, e.intent_value)
+    if e.hp <= 0
+      label = "(dead)"
+      intent_fg = dim
+      intent_attrs = 0
+    else
+      # Arrow glyph as a single multibyte cell, then ASCII label after.
+      p = pl::plane_putc(p, panel_x, prow + 1,
+                          make_cell("→", intent_fg, bg, intent_attrs))
+      p = pl::plane_putc(p, panel_x + 1, prow + 1,
+                          make_cell(" ", intent_fg, bg, 0))
+    end
+    var label_x = panel_x
+    if e.hp > 0
+      label_x = panel_x + 2
+    end
+    p = put_ascii(p, label, label_x, prow + 1,
+                   intent_fg, bg, intent_attrs)
+    ei += 1
+  end
+
+  # Combat log: render the last LOG_RENDER() entries on rows LOG_OY..+2.
+  var logs: Vec<String> = c.log
+  var total = logs.size
+  var first = total - LOG_RENDER()
+  if first < 0
+    first = 0
+  end
+  var li = first
+  var row = LOG_OY()
+  while li < total
+    var entry = logs[li]
+    var cps: Vec<Int> = str_chars(entry)
+    var max_w = W() - 2
+    var write_n = cps.size
+    if write_n > max_w
+      write_n = max_w
+    end
+    var entry_fg = dim
+    if li == total - 1
+      entry_fg = fg
+    end
+    var k = 0
+    while k < write_n
+      var cp = cps[k]
+      p = pl::plane_putc(p, 1 + k, row,
+                          make_cell(str_from_char(cp), entry_fg, bg, 0))
+      k += 1
+    end
+    li += 1
+    row += 1
+  end
+
+  # The centered overlay handles the end-state banner — no inline
+  # text in the top plane.
+  return p
+end
+
+# =============================================================================
+# Root composer
+# =============================================================================
+
+# Overlay dimensions — kept as constants because both the builder and
+# the root composer need them for the blit math.
+def OVERLAY_W(): Int = 38
+def OVERLAY_H(): Int = 11
+
+# Reward picker: title row + 7 card rows + footer row + borders. Wide
+# enough for 3 cards (14*3 + 2 gaps = 44) plus 3 padding either side.
+def REWARD_W(): Int = 50
+def REWARD_H(): Int = 13
+
+# Centered banner shown when combat resolves. Mirrors brogue-tribute's
+# `build_outcome_plane` — bordered title, stats column, "press SPACE"
+# hint at the bottom. Title and border take the accent color (green
+# on victory, red on defeat); on the final-run-clear, the title swaps
+# to "DUNGEON CLEARED" and the SPACE hint becomes "press SPACE to
+# quit".
+def build_overlay_plane(g: Game): pl::Plane
+  var t = g.theme
+  var pw = OVERLAY_W()
+  var ph = OVERLAY_H()
+  var p = pl::plane_create(pw, ph)
+  var bg = cl::channel_rgb(t.base01)
+  var fg = cl::channel_rgb(t.base05)
+  var label_fg = cl::channel_rgb(t.base04)
+  var num_color = cl::channel_rgb(t.base0A)
+  var c = g.combat
+  var victory = c.done == 1
+  var run_done = game_run_complete(g)
+  var accent_rgb = t.base08
+  if victory
+    accent_rgb = t.base0B
+  end
+  var accent = cl::channel_rgb(accent_rgb)
+  var blank = make_cell(" ", fg, bg, 0)
+  p = pl::plane_fill(p, blank)
+  # Top + bottom border
+  var bx = 0
+  while bx < pw
+    p = pl::plane_putc(p, bx, 0,
+                        make_cell("-", accent, bg, cl::CELL_ATTR_BOLD()))
+    p = pl::plane_putc(p, bx, ph - 1,
+                        make_cell("-", accent, bg, cl::CELL_ATTR_BOLD()))
+    bx += 1
+  end
+  # Left + right border
+  var by = 0
+  while by < ph
+    p = pl::plane_putc(p, 0, by,
+                        make_cell("|", accent, bg, cl::CELL_ATTR_BOLD()))
+    p = pl::plane_putc(p, pw - 1, by,
+                        make_cell("|", accent, bg, cl::CELL_ATTR_BOLD()))
+    by += 1
+  end
+  # Title — VICTORY / DEFEAT (or DUNGEON CLEARED on the final win).
+  var title = "  DEFEAT  "
+  if victory
+    title = "  VICTORY  "
+    if run_done
+      title = "  DUNGEON CLEARED  "
+    end
+  end
+  var title_col = (pw - str_byte_len(title)) / 2
+  p = put_ascii(p, title, title_col, 1, accent, bg, cl::CELL_ATTR_BOLD())
+  # Subtitle under the title.
+  var enemies: Vec<Enemy> = c.enemies
+  var enemy0 = enemies[0]
+  var subtitle = "your tale ends here"
+  if victory
+    subtitle = "you slay the " + enemy_name(enemy0.kind)
+    if run_done
+      subtitle = "you complete the dungeon"
+    end
+  end
+  var sub_col = (pw - str_byte_len(subtitle)) / 2
+  p = put_ascii(p, subtitle, sub_col, 2, fg, bg, 0)
+  # Stats column. Labels left, values right-aligned at col 22.
+  p = put_ascii(p, "Turns",   4, 4, label_fg, bg, 0)
+  p = put_ascii(p, g.turns_survived.to_s(), 22, 4, num_color, bg,
+                 cl::CELL_ATTR_BOLD())
+  p = put_ascii(p, "Cards",   4, 5, label_fg, bg, 0)
+  p = put_ascii(p, g.cards_played.to_s(), 22, 5, num_color, bg,
+                 cl::CELL_ATTR_BOLD())
+  p = put_ascii(p, "Damage",  4, 6, label_fg, bg, 0)
+  p = put_ascii(p, g.damage_dealt.to_s(), 22, 6, num_color, bg,
+                 cl::CELL_ATTR_BOLD())
+  p = put_ascii(p, "Slain",   4, 7, label_fg, bg, 0)
+  p = put_ascii(p, g.enemies_defeated.to_s(), 22, 7, num_color, bg,
+                 cl::CELL_ATTR_BOLD())
+  # SPACE hint at the bottom — "to continue" on intermediate victory,
+  # "to quit" on defeat or final-run cleared.
+  var hint = "press SPACE to quit"
+  if victory and not run_done
+    hint = "press SPACE to continue"
+  end
+  var hint_col = (pw - str_byte_len(hint)) / 2
+  p = put_ascii(p, hint, hint_col, 9, fg, bg, 0)
+  return p
+end
+
+# Reward picker — shown after a non-final encounter win. Three cards
+# centered above a footer hint. Selected card uses the same double-line
+# treatment build_card_plane gives a hand-selected card.
+def build_reward_plane(g: Game): pl::Plane
+  var t = g.theme
+  var pw = REWARD_W()
+  var ph = REWARD_H()
+  var p = pl::plane_create(pw, ph)
+  var bg = cl::channel_rgb(t.base01)
+  var fg = cl::channel_rgb(t.base05)
+  var dim = cl::channel_rgb(t.base04)
+  var accent = cl::channel_rgb(t.base0A)
+  var blank = make_cell(" ", fg, bg, 0)
+  p = pl::plane_fill(p, blank)
+  # Top + bottom border using the same dashed accent style as the
+  # outcome overlay so the two read as siblings.
+  var bx = 0
+  while bx < pw
+    p = pl::plane_putc(p, bx, 0,
+                        make_cell("-", accent, bg, cl::CELL_ATTR_BOLD()))
+    p = pl::plane_putc(p, bx, ph - 1,
+                        make_cell("-", accent, bg, cl::CELL_ATTR_BOLD()))
+    bx += 1
+  end
+  var by = 0
+  while by < ph
+    p = pl::plane_putc(p, 0, by,
+                        make_cell("|", accent, bg, cl::CELL_ATTR_BOLD()))
+    p = pl::plane_putc(p, pw - 1, by,
+                        make_cell("|", accent, bg, cl::CELL_ATTR_BOLD()))
+    by += 1
+  end
+  # Title.
+  var title = "PICK A CARD"
+  var title_col = (pw - str_byte_len(title)) / 2
+  p = put_ascii(p, title, title_col, 1, accent, bg, cl::CELL_ATTR_BOLD())
+  # 3 cards laid out at rows 3..9. Card width 14, 1-cell gaps, total 44.
+  # Center horizontally inside the 50-wide plane → start at col 3.
+  var lib: Vec<Card> = g.card_lib
+  var offer: Vec<Int> = g.reward_offer
+  var i = 0
+  while i < 3
+    var card_idx = offer[i]
+    var card = lib[card_idx]
+    var selected = i == g.reward_idx
+    var card_plane = build_card_plane(card, selected, t, g.frame, false)
+    var dx = 3 + i * (CARD_W() + 1)
+    p = pl::plane_blit(card_plane, p,
+                       0, 0, CARD_W(), CARD_H(),
+                       dx, 3,
+                       bl::BlendMode::None)
+    i += 1
+  end
+  # Footer.
+  var hint = "h/l cycle  ENTER take  s skip"
+  var hint_col = (pw - str_byte_len(hint)) / 2
+  p = put_ascii(p, hint, hint_col, ph - 2, dim, bg, 0)
+  return p
+end
+
+def build_back(g: Game): pl::Plane
+  var t = g.theme
+  var bg = cl::channel_rgb(t.base00)
+  var fg = cl::channel_rgb(t.base05)
+  var blank = make_cell(" ", fg, bg, 0)
+  var root = pl::plane_create(W(), H())
+  root = pl::plane_fill(root, blank)
+  var top = build_top_plane(g)
+  root = pl::plane_blit(top, root,
+                        0, 0, W(), TOP_H(),
+                        0, 0,
+                        bl::BlendMode::None)
+  var hand = build_hand_plane(g)
+  root = pl::plane_blit(hand, root,
+                        0, 0, W(), CARD_H(),
+                        0, HAND_OY(),
+                        bl::BlendMode::None)
+  # Reward picker takes priority over the victory overlay — once the
+  # player presses SPACE on a non-final win, combat.done stays 1 but
+  # reward_pending flips on, swapping the centered banner for the
+  # 3-card picker.
+  if g.reward_pending
+    var rp = build_reward_plane(g)
+    var rp_x = (W() - REWARD_W()) / 2
+    var rp_y = (H() - REWARD_H()) / 2
+    root = pl::plane_blit(rp, root,
+                          0, 0, REWARD_W(), REWARD_H(),
+                          rp_x, rp_y,
+                          bl::BlendMode::None)
+  else
+    if g.combat.done != 0
+      var op = build_overlay_plane(g)
+      var op_x = (W() - OVERLAY_W()) / 2
+      var op_y = (H() - OVERLAY_H()) / 2
+      root = pl::plane_blit(op, root,
+                            0, 0, OVERLAY_W(), OVERLAY_H(),
+                            op_x, op_y,
+                            bl::BlendMode::None)
+    end
+  end
+  return root
+end
+
+# =============================================================================
+# Update — pure state transitions via C.1 struct update syntax
+# =============================================================================
+
+def game_select_prev(g: Game): Game
+  var hand: Vec<Int> = g.hand
+  if hand.size == 0
+    return g
+  end
+  return Game { ...g, selected_idx: clamp_idx(g.selected_idx - 1, hand.size) }
+end
+
+def game_select_next(g: Game): Game
+  var hand: Vec<Int> = g.hand
+  if hand.size == 0
+    return g
+  end
+  return Game { ...g, selected_idx: clamp_idx(g.selected_idx + 1, hand.size) }
+end
+
+def game_play_selected(g: Game): Game
+  var hand: Vec<Int> = g.hand
+  if hand.size == 0
+    return g
+  end
+  var lib: Vec<Card> = g.card_lib
+  var card_idx = hand[g.selected_idx]
+  var card = lib[card_idx]
+  # Pre-check: the card-flip dim + hand removal + damage tally should
+  # only fire when the card is actually played, not when the mana check
+  # rejects it. Mirror combat_play_card's mana gate here.
+  if card.cost > g.combat.mana
+    return Game { ...g, combat: combat_play_card(g.combat, card) }
+  end
+  var pre_alive = combat_first_living(g.combat)
+  var pre_hp = 0
+  if pre_alive >= 0
+    var enemies_pre: Vec<Enemy> = g.combat.enemies
+    pre_hp = enemies_pre[pre_alive].hp
+  end
+  var new_combat = combat_play_card(g.combat, card)
+  var dmg_delta = 0
+  var kill_delta = 0
+  if pre_alive >= 0
+    var enemies_post: Vec<Enemy> = new_combat.enemies
+    var post_hp = enemies_post[pre_alive].hp
+    dmg_delta = pre_hp - post_hp
+    if dmg_delta < 0
+      dmg_delta = 0
+    end
+    if pre_hp > 0 and post_hp == 0
+      kill_delta = 1
+    end
+  end
+  # Move the played card from hand to discard. Cards behind it slide
+  # left; cursor stays at the same slot index but clamped to the new
+  # hand size so it doesn't point past the end.
+  var new_hand = vec_remove_at(hand, g.selected_idx)
+  var new_discard = vec_clone(g.discard)
+  new_discard.push(card_idx)
+  var new_sel = g.selected_idx
+  if new_sel >= new_hand.size
+    new_sel = new_hand.size - 1
+  end
+  if new_sel < 0
+    new_sel = 0
+  end
+  return Game {
+    ...g,
+    combat:           new_combat,
+    hand:             new_hand,
+    discard:          new_discard,
+    selected_idx:     new_sel,
+    cards_played:     g.cards_played + 1,
+    damage_dealt:     g.damage_dealt + dmg_delta,
+    enemies_defeated: g.enemies_defeated + kill_delta,
+    flip_frames:      2,
+    flip_idx:         g.selected_idx
+  }
+end
+
+def game_end_turn(g: Game): Game
+  # Move remaining hand cards to discard, then draw a fresh hand. If
+  # the deck runs dry, game_draw reshuffles the discard back in.
+  var hand: Vec<Int> = g.hand
+  var discard = vec_clone(g.discard)
+  var i = 0
+  while i < hand.size
+    discard.push(hand[i])
+    i += 1
+  end
+  var g1 = Game {
+    ...g,
+    combat:         combat_end_turn(g.combat),
+    hand:           vec_new<Int>(),
+    discard:        discard,
+    selected_idx:   0,
+    turns_survived: g.turns_survived + 1
+  }
+  return game_draw(g1, HAND_SIZE())
+end
+
+# Build a 3-card reward offer from the full library. Allows duplicates
+# in principle (small lib), but rerolls if all 3 picks land on the same
+# index — that's just visual cruft.
+def build_reward_offer(): Vec<Int>
+  var v = vec_new<Int>()
+  v.push(rand_range_op(0, CARD_LIB_SIZE()))
+  var second = rand_range_op(0, CARD_LIB_SIZE())
+  while second == v[0]
+    second = rand_range_op(0, CARD_LIB_SIZE())
+  end
+  v.push(second)
+  var third = rand_range_op(0, CARD_LIB_SIZE())
+  while third == v[0] or third == v[1]
+    third = rand_range_op(0, CARD_LIB_SIZE())
+  end
+  v.push(third)
+  return v
+end
+
+# Enter reward mode after a non-final encounter win.
+def game_enter_reward(g: Game): Game
+  return Game {
+    ...g,
+    reward_pending: true,
+    reward_offer:   build_reward_offer(),
+    reward_idx:     0
+  }
+end
+
+def reward_select_prev(g: Game): Game
+  if not g.reward_pending
+    return g
+  end
+  var ri = g.reward_idx - 1
+  if ri < 0
+    ri = 2
+  end
+  return Game { ...g, reward_idx: ri }
+end
+
+def reward_select_next(g: Game): Game
+  if not g.reward_pending
+    return g
+  end
+  var ri = g.reward_idx + 1
+  if ri > 2
+    ri = 0
+  end
+  return Game { ...g, reward_idx: ri }
+end
+
+# Pick the highlighted reward card: append it to discard so it shuffles
+# into the deck on next encounter, then proceed.
+def game_take_reward(g: Game): Game
+  if not g.reward_pending
+    return g
+  end
+  var offer: Vec<Int> = g.reward_offer
+  var pick_idx = offer[g.reward_idx]
+  var new_discard = vec_clone(g.discard)
+  new_discard.push(pick_idx)
+  var g1 = Game {
+    ...g,
+    discard:        new_discard,
+    reward_pending: false,
+    reward_offer:   vec_new<Int>(),
+    reward_idx:     0
+  }
+  return game_next_encounter(g1)
+end
+
+# Skip the reward: no card added; advance encounter.
+def game_skip_reward(g: Game): Game
+  if not g.reward_pending
+    return g
+  end
+  var g1 = Game {
+    ...g,
+    reward_pending: false,
+    reward_offer:   vec_new<Int>(),
+    reward_idx:     0
+  }
+  return game_next_encounter(g1)
+end
+
+# SPACE on a victory overlay advances. For non-final encounters we
+# enter reward mode first; for the final run-clear or a defeat overlay
+# we set the quit flag and the main loop reads done_quit next iter.
+def game_advance_or_quit(g: Game): Game
+  if g.combat.done == 1
+    if game_run_complete(g)
+      return Game { ...g, done_quit: true }
+    end
+    return game_enter_reward(g)
+  end
+  if g.combat.done == 2
+    return Game { ...g, done_quit: true }
+  end
+  return g
+end
+
+def game_handle_key(g: Game, code: Int): Game
+  # Reward picker — input is locked here until the player picks or skips.
+  if g.reward_pending
+    if code == KEY_LEFT() or code == 'h' or code == 'H'
+      return reward_select_prev(g)
+    end
+    if code == KEY_RIGHT() or code == 'l' or code == 'L'
+      return reward_select_next(g)
+    end
+    if code == KEY_ENTER() or code == ' '
+      return game_take_reward(g)
+    end
+    if code == 's' or code == 'S'
+      return game_skip_reward(g)
+    end
+    return g
+  end
+  # Overlay lock — combat is over. SPACE advances or quits; q quits;
+  # everything else is consumed without effect.
+  if g.combat.done != 0
+    if code == ' ' or code == KEY_ENTER()
+      return game_advance_or_quit(g)
+    end
+    return g
+  end
+  if code == KEY_LEFT() or code == 'h' or code == 'H'
+    return game_select_prev(g)
+  end
+  if code == KEY_RIGHT() or code == 'l' or code == 'L'
+    return game_select_next(g)
+  end
+  if code == KEY_ENTER() or code == ' '
+    return game_play_selected(g)
+  end
+  if code == 'e' or code == 'E' or code == KEY_TAB()
+    return game_end_turn(g)
+  end
+  return g
+end
+
+# =============================================================================
+# Main loop body — passed to program_run_raw
+# =============================================================================
+
+def sigil_body(msg_ch: Int, scope: Int): Int
+  var game = game_init()
+  var renderer = rd::renderer_new(W(), H())
+  renderer = rd::renderer_with_back(renderer, build_back(game))
+  term_write(rd::renderer_diff(renderer, true))
+  renderer = rd::renderer_swap(renderer)
+
+  var running = true
+  while running
+    var raw = recv(msg_ch)
+    var msg: tui::FrameMsg<Void> = as_type<tui::FrameMsg<Void>>(raw)
+    var redraw = false
+    var quit = false
+    match msg
+      tui::FrameMsg::Quit => quit = true
+      tui::FrameMsg::Key(ev) => do
+        var c = ev.code
+        if c == 'q' or c == 'Q' or c == 3
+          quit = true
+        else
+          game = game_handle_key(game, c)
+          if game.done_quit
+            quit = true
+          end
+          redraw = true
+        end
+        end
+      tui::FrameMsg::Tick(_) => do
+        var next_flip = game.flip_frames
+        if next_flip > 0
+          next_flip -= 1
+        end
+        game = Game { ...game, frame: game.frame + 1, flip_frames: next_flip }
+        redraw = true
+        end
+      tui::FrameMsg::Resize(_, _) => redraw = true
+      _ => redraw = false
+    end
+    if quit
+      running = false
+    end
+    if running and redraw
+      renderer = rd::renderer_with_back(renderer, build_back(game))
+      term_write(rd::renderer_diff(renderer, true))
+      renderer = rd::renderer_swap(renderer)
+    end
+  end
+  return 0
+end
+
+def main(): Int
+  return tui::program_run_raw<Void>(100, sigil_body)
+end

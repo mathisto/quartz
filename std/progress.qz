@@ -1,0 +1,2597 @@
+## std/progress.qz — Composable progress bars and spinners.
+##
+## Design philosophy:
+##   * Columns are first-class typechecked values, not strings.
+##   * A small template grammar parses to the same column vector, so users
+##     who want a one-liner can have one — both paths converge to one engine.
+##   * The template grammar is OPEN: callers can register custom column keys.
+##   * Three output modes auto-selected: tty (ANSI), dumb (CI), json (NDJSON).
+##   * Spring-damper smoothing makes percent jumps feel buttery.
+##   * Ticking is driven by the M:N scheduler, not a background OS thread.
+##
+## Inspired by:
+##   - lipgloss / bubbles (Charm, Go) — column composition + spring smoothing
+##   - rich.progress (Python) — columns-as-renderables
+##   - Rust's mainstream progress-bar crate — pioneered the {key:width.fg} grammar
+##   - cli-spinners (npm) — canonical named frame data, vendored verbatim
+##
+## Usage:
+##   import * from progress
+##
+##   # One-liner spinner
+##   sp = Spinner_start("Fetching data")
+##   do_work()
+##   sp.success("Done")
+##
+##   # Builder
+##   pb = Progress.new(1024).label("Downloading").template("{spinner} [{bar:40.cyan}] {pos}/{len} ({eta})")
+##   pb.start()
+##   for i in 0..1024
+##     pb.inc(1)
+##   end
+##   pb.finish()
+##
+##   # Preset
+##   pb = Progress.download(file_size).label(url).start()
+##
+## @since 5.28.0
+
+import style
+import terminal
+import time
+import * from std/sync/exclusion/mutex
+
+# =============================================================================
+# Constants — column kinds, statuses, output modes
+# =============================================================================
+
+def COL_TEXT(): Int = 0
+def COL_SPINNER(): Int = 1
+def COL_BAR(): Int = 2
+def COL_POS(): Int = 3
+def COL_LEN(): Int = 4
+def COL_POS_LEN(): Int = 5
+def COL_PERCENT(): Int = 6
+def COL_ETA(): Int = 7
+def COL_RATE(): Int = 8
+def COL_ELAPSED(): Int = 9
+def COL_MSG(): Int = 10
+def COL_BYTES(): Int = 11
+def COL_LABEL(): Int = 12
+def COL_CUSTOM(): Int = 100
+
+def STATUS_RUNNING(): Int = 0
+def STATUS_OK(): Int = 1
+def STATUS_FAIL(): Int = 2
+def STATUS_WARN(): Int = 3
+def STATUS_INFO(): Int = 4
+def STATUS_CANCEL(): Int = 5
+
+def PROGRESS_MODE_AUTO(): Int = -1
+def PROGRESS_MODE_TTY(): Int = 0
+def PROGRESS_MODE_DUMB(): Int = 1
+def PROGRESS_MODE_JSON(): Int = 2
+def PROGRESS_MODE_OFF(): Int = 3
+
+# =============================================================================
+# Spinner Frame Registry — vendored from cli-spinners (npm)
+# =============================================================================
+# Frame data is canonical across the CLI animation ecosystem; cli-spinners
+# is the de-facto source. Quartz vendors a curated subset; the full set
+# (~80 styles) is in the next patch.
+
+def SPIN_DOTS(): Int = 0
+def SPIN_DOTS2(): Int = 1
+def SPIN_LINE(): Int = 2
+def SPIN_PIPE(): Int = 3
+def SPIN_ARROW(): Int = 4
+def SPIN_ARROW2(): Int = 5
+def SPIN_BOUNCING_BAR(): Int = 6
+def SPIN_BOUNCING_BALL(): Int = 7
+def SPIN_BOX(): Int = 8
+def SPIN_CIRCLE(): Int = 9
+def SPIN_CIRCLE_HALVES(): Int = 10
+def SPIN_MOON(): Int = 11
+def SPIN_EARTH(): Int = 12
+def SPIN_AESTHETIC(): Int = 13
+def SPIN_TRIANGLE(): Int = 14
+def SPIN_PONG(): Int = 15
+def SPIN_GROW_VERTICAL(): Int = 16
+def SPIN_GROW_HORIZONTAL(): Int = 17
+def SPIN_BALLOON(): Int = 18
+def SPIN_NOISE(): Int = 19
+def SPIN_BOUNCE(): Int = 20
+def SPIN_BOX_BOUNCE(): Int = 21
+def SPIN_SIMPLE_DOTS(): Int = 22
+def SPIN_SIMPLE_DOTS_SCROLLING(): Int = 23
+def SPIN_STAR(): Int = 24
+def SPIN_FLIP(): Int = 25
+def SPIN_HAMBURGER(): Int = 26
+def SPIN_BETA_WAVE(): Int = 27
+def SPIN_RUNNER(): Int = 28
+def SPIN_WEATHER(): Int = 29
+def SPIN_CHRISTMAS(): Int = 30
+def SPIN_GRENADE(): Int = 31
+def SPIN_POINT(): Int = 32
+def SPIN_LAYER(): Int = 33
+def SPIN_FINGER_DANCE(): Int = 34
+def SPIN_FIST_BUMP(): Int = 35
+
+var _spin_frames_registry: Vec<Vec<String>> = vec_new()
+var _spin_interval_registry: Vec<Int> = vec_new()
+var _spin_initialized = 0
+
+def _spin_register(frames: Vec<String>, interval_ms: Int): Void
+  _spin_frames_registry.push(frames)
+  _spin_interval_registry.push(interval_ms)
+end
+
+def _spin_init(): Void
+  if _spin_initialized == 1
+    return
+  end
+  _spin_initialized = 1
+
+  # SPIN_DOTS — 0 — Braille rotation, the canonical spinner
+  var dots = vec_new<String>()
+  dots.push("⠋")
+  dots.push("⠙")
+  dots.push("⠹")
+  dots.push("⠸")
+  dots.push("⠼")
+  dots.push("⠴")
+  dots.push("⠦")
+  dots.push("⠧")
+  dots.push("⠇")
+  dots.push("⠏")
+  _spin_register(dots, 80)
+
+  # SPIN_DOTS2 — 1
+  var dots2 = vec_new<String>()
+  dots2.push("⣾")
+  dots2.push("⣽")
+  dots2.push("⣻")
+  dots2.push("⢿")
+  dots2.push("⡿")
+  dots2.push("⣟")
+  dots2.push("⣯")
+  dots2.push("⣷")
+  _spin_register(dots2, 80)
+
+  # SPIN_LINE — 2 — ASCII fallback
+  var line = vec_new<String>()
+  line.push("-")
+  line.push("\\")
+  line.push("|")
+  line.push("/")
+  _spin_register(line, 130)
+
+  # SPIN_PIPE — 3
+  var pipe = vec_new<String>()
+  pipe.push("┤")
+  pipe.push("┘")
+  pipe.push("┴")
+  pipe.push("└")
+  pipe.push("├")
+  pipe.push("┌")
+  pipe.push("┬")
+  pipe.push("┐")
+  _spin_register(pipe, 100)
+
+  # SPIN_ARROW — 4
+  var arrow = vec_new<String>()
+  arrow.push("←")
+  arrow.push("↖")
+  arrow.push("↑")
+  arrow.push("↗")
+  arrow.push("→")
+  arrow.push("↘")
+  arrow.push("↓")
+  arrow.push("↙")
+  _spin_register(arrow, 100)
+
+  # SPIN_ARROW2 — 5
+  var arrow2 = vec_new<String>()
+  arrow2.push("▹▹▹▹▹")
+  arrow2.push("▸▹▹▹▹")
+  arrow2.push("▹▸▹▹▹")
+  arrow2.push("▹▹▸▹▹")
+  arrow2.push("▹▹▹▸▹")
+  arrow2.push("▹▹▹▹▸")
+  _spin_register(arrow2, 120)
+
+  # SPIN_BOUNCING_BAR — 6
+  var bbar = vec_new<String>()
+  bbar.push("[    ]")
+  bbar.push("[=   ]")
+  bbar.push("[==  ]")
+  bbar.push("[=== ]")
+  bbar.push("[ ===]")
+  bbar.push("[  ==]")
+  bbar.push("[   =]")
+  bbar.push("[    ]")
+  bbar.push("[   =]")
+  bbar.push("[  ==]")
+  bbar.push("[ ===]")
+  bbar.push("[====]")
+  bbar.push("[=== ]")
+  bbar.push("[==  ]")
+  bbar.push("[=   ]")
+  _spin_register(bbar, 80)
+
+  # SPIN_BOUNCING_BALL — 7
+  var bball = vec_new<String>()
+  bball.push("( ●    )")
+  bball.push("(  ●   )")
+  bball.push("(   ●  )")
+  bball.push("(    ● )")
+  bball.push("(     ●)")
+  bball.push("(    ● )")
+  bball.push("(   ●  )")
+  bball.push("(  ●   )")
+  bball.push("( ●    )")
+  bball.push("(●     )")
+  _spin_register(bball, 80)
+
+  # SPIN_BOX — 8
+  var box = vec_new<String>()
+  box.push("▖")
+  box.push("▘")
+  box.push("▝")
+  box.push("▗")
+  _spin_register(box, 120)
+
+  # SPIN_CIRCLE — 9
+  var circle = vec_new<String>()
+  circle.push("◐")
+  circle.push("◓")
+  circle.push("◑")
+  circle.push("◒")
+  _spin_register(circle, 120)
+
+  # SPIN_CIRCLE_HALVES — 10
+  var ch = vec_new<String>()
+  ch.push("◐")
+  ch.push("◓")
+  ch.push("◑")
+  ch.push("◒")
+  _spin_register(ch, 50)
+
+  # SPIN_MOON — 11
+  var moon = vec_new<String>()
+  moon.push("🌑 ")
+  moon.push("🌒 ")
+  moon.push("🌓 ")
+  moon.push("🌔 ")
+  moon.push("🌕 ")
+  moon.push("🌖 ")
+  moon.push("🌗 ")
+  moon.push("🌘 ")
+  _spin_register(moon, 80)
+
+  # SPIN_EARTH — 12
+  var earth = vec_new<String>()
+  earth.push("🌍 ")
+  earth.push("🌎 ")
+  earth.push("🌏 ")
+  _spin_register(earth, 180)
+
+  # SPIN_AESTHETIC — 13
+  var aes = vec_new<String>()
+  aes.push("▰▱▱▱▱▱▱")
+  aes.push("▰▰▱▱▱▱▱")
+  aes.push("▰▰▰▱▱▱▱")
+  aes.push("▰▰▰▰▱▱▱")
+  aes.push("▰▰▰▰▰▱▱")
+  aes.push("▰▰▰▰▰▰▱")
+  aes.push("▰▰▰▰▰▰▰")
+  aes.push("▱▱▱▱▱▱▱")
+  _spin_register(aes, 80)
+
+  # SPIN_TRIANGLE — 14
+  var tri = vec_new<String>()
+  tri.push("◢")
+  tri.push("◣")
+  tri.push("◤")
+  tri.push("◥")
+  _spin_register(tri, 50)
+
+  # SPIN_PONG — 15
+  var pong = vec_new<String>()
+  pong.push("▐⠂       ▌")
+  pong.push("▐⠈       ▌")
+  pong.push("▐ ⠂      ▌")
+  pong.push("▐ ⠠      ▌")
+  pong.push("▐  ⡀     ▌")
+  pong.push("▐  ⠠     ▌")
+  pong.push("▐   ⠂    ▌")
+  pong.push("▐   ⠈    ▌")
+  pong.push("▐    ⠂   ▌")
+  pong.push("▐    ⠠   ▌")
+  pong.push("▐     ⡀  ▌")
+  pong.push("▐     ⠠  ▌")
+  pong.push("▐      ⠂ ▌")
+  pong.push("▐      ⠈ ▌")
+  pong.push("▐       ⠂▌")
+  pong.push("▐       ⠠▌")
+  _spin_register(pong, 80)
+
+  # SPIN_GROW_VERTICAL — 16
+  var grow = vec_new<String>()
+  grow.push("▁")
+  grow.push("▃")
+  grow.push("▄")
+  grow.push("▅")
+  grow.push("▆")
+  grow.push("▇")
+  grow.push("▆")
+  grow.push("▅")
+  grow.push("▄")
+  grow.push("▃")
+  _spin_register(grow, 120)
+
+  # SPIN_GROW_HORIZONTAL — 17
+  var growh = vec_new<String>()
+  growh.push("▏")
+  growh.push("▎")
+  growh.push("▍")
+  growh.push("▌")
+  growh.push("▋")
+  growh.push("▊")
+  growh.push("▉")
+  growh.push("▊")
+  growh.push("▋")
+  growh.push("▌")
+  growh.push("▍")
+  growh.push("▎")
+  _spin_register(growh, 120)
+
+  # SPIN_BALLOON — 18
+  var balloon = vec_new<String>()
+  balloon.push(" ")
+  balloon.push(".")
+  balloon.push("o")
+  balloon.push("O")
+  balloon.push("@")
+  balloon.push("*")
+  balloon.push(" ")
+  _spin_register(balloon, 140)
+
+  # SPIN_NOISE — 19
+  var noise = vec_new<String>()
+  noise.push("▓")
+  noise.push("▒")
+  noise.push("░")
+  _spin_register(noise, 100)
+
+  # SPIN_BOUNCE — 20
+  var bounce = vec_new<String>()
+  bounce.push("⠁")
+  bounce.push("⠂")
+  bounce.push("⠄")
+  bounce.push("⠂")
+  _spin_register(bounce, 120)
+
+  # SPIN_BOX_BOUNCE — 21
+  var bxb = vec_new<String>()
+  bxb.push("▌")
+  bxb.push("▀")
+  bxb.push("▐")
+  bxb.push("▄")
+  _spin_register(bxb, 120)
+
+  # SPIN_SIMPLE_DOTS — 22
+  var sd = vec_new<String>()
+  sd.push(".  ")
+  sd.push(".. ")
+  sd.push("...")
+  sd.push("   ")
+  _spin_register(sd, 400)
+
+  # SPIN_SIMPLE_DOTS_SCROLLING — 23
+  var sds = vec_new<String>()
+  sds.push(".  ")
+  sds.push(".. ")
+  sds.push("...")
+  sds.push(" ..")
+  sds.push("  .")
+  sds.push("   ")
+  _spin_register(sds, 200)
+
+  # SPIN_STAR — 24
+  var star = vec_new<String>()
+  star.push("✶")
+  star.push("✸")
+  star.push("✹")
+  star.push("✺")
+  star.push("✹")
+  star.push("✷")
+  _spin_register(star, 70)
+
+  # SPIN_FLIP — 25
+  var flip = vec_new<String>()
+  flip.push("_")
+  flip.push("_")
+  flip.push("_")
+  flip.push("-")
+  flip.push("`")
+  flip.push("`")
+  flip.push("'")
+  flip.push("´")
+  flip.push("-")
+  flip.push("_")
+  flip.push("_")
+  flip.push("_")
+  _spin_register(flip, 70)
+
+  # SPIN_HAMBURGER — 26
+  var burger = vec_new<String>()
+  burger.push("☱")
+  burger.push("☲")
+  burger.push("☴")
+  _spin_register(burger, 100)
+
+  # SPIN_BETA_WAVE — 27
+  var beta = vec_new<String>()
+  beta.push("ρββββββ")
+  beta.push("βρβββββ")
+  beta.push("ββρββββ")
+  beta.push("βββρβββ")
+  beta.push("ββββρββ")
+  beta.push("βββββρβ")
+  beta.push("ββββββρ")
+  _spin_register(beta, 80)
+
+  # SPIN_RUNNER — 28
+  var runner = vec_new<String>()
+  runner.push("🚶 ")
+  runner.push("🏃 ")
+  _spin_register(runner, 140)
+
+  # SPIN_WEATHER — 29
+  var weather = vec_new<String>()
+  weather.push("☀️ ")
+  weather.push("☀️ ")
+  weather.push("☀️ ")
+  weather.push("🌤 ")
+  weather.push("⛅️ ")
+  weather.push("🌥 ")
+  weather.push("☁️ ")
+  weather.push("🌧 ")
+  weather.push("🌨 ")
+  weather.push("🌧 ")
+  weather.push("🌨 ")
+  weather.push("🌧 ")
+  weather.push("🌨 ")
+  weather.push("⛈ ")
+  weather.push("🌨 ")
+  weather.push("🌧 ")
+  weather.push("🌨 ")
+  weather.push("☁️ ")
+  weather.push("🌥 ")
+  weather.push("⛅️ ")
+  weather.push("🌤 ")
+  weather.push("☀️ ")
+  weather.push("☀️ ")
+  _spin_register(weather, 100)
+
+  # SPIN_CHRISTMAS — 30
+  var xmas = vec_new<String>()
+  xmas.push("🌲")
+  xmas.push("🎄")
+  _spin_register(xmas, 400)
+
+  # SPIN_GRENADE — 31
+  var grenade = vec_new<String>()
+  grenade.push("،  ")
+  grenade.push("′  ")
+  grenade.push(" ´ ")
+  grenade.push(" ‾ ")
+  grenade.push("  ⸌")
+  grenade.push("  ⸊")
+  grenade.push("  |")
+  grenade.push("  ⁎")
+  grenade.push("  ⁕")
+  grenade.push(" ෴ ")
+  grenade.push("  ⁓")
+  grenade.push("   ")
+  grenade.push("   ")
+  grenade.push("   ")
+  _spin_register(grenade, 80)
+
+  # SPIN_POINT — 32
+  var point = vec_new<String>()
+  point.push("∙∙∙")
+  point.push("●∙∙")
+  point.push("∙●∙")
+  point.push("∙∙●")
+  point.push("∙∙∙")
+  _spin_register(point, 125)
+
+  # SPIN_LAYER — 33
+  var layer = vec_new<String>()
+  layer.push("-")
+  layer.push("=")
+  layer.push("≡")
+  _spin_register(layer, 150)
+
+  # SPIN_FINGER_DANCE — 34
+  var finger = vec_new<String>()
+  finger.push("🤘 ")
+  finger.push("🤟 ")
+  finger.push("🖖 ")
+  finger.push("✋ ")
+  finger.push("🤚 ")
+  finger.push("👆 ")
+  _spin_register(finger, 160)
+
+  # SPIN_FIST_BUMP — 35
+  var fist = vec_new<String>()
+  fist.push("🤜　　　　🤛 ")
+  fist.push("🤜　　　　🤛 ")
+  fist.push("🤜　　　　🤛 ")
+  fist.push("　🤜　　🤛　 ")
+  fist.push("　　🤜🤛　　 ")
+  fist.push("　🤜✨🤛　　 ")
+  fist.push("🤜　✨　🤛　 ")
+  _spin_register(fist, 80)
+end
+
+def _spin_frames(id: Int): Vec<String>
+  _spin_init()
+  return vec_get(_spin_frames_registry, id)
+end
+
+def _spin_interval(id: Int): Int
+  _spin_init()
+  return vec_get(_spin_interval_registry, id)
+end
+
+# Map a name to a spinner id. Returns SPIN_DOTS as fallback.
+def _spin_id_from_name(name: String): Int
+  if name == "dots"
+    return SPIN_DOTS()
+  end
+  if name == "dots2"
+    return SPIN_DOTS2()
+  end
+  if name == "line"
+    return SPIN_LINE()
+  end
+  if name == "pipe"
+    return SPIN_PIPE()
+  end
+  if name == "arrow"
+    return SPIN_ARROW()
+  end
+  if name == "arrow2"
+    return SPIN_ARROW2()
+  end
+  if name == "bouncing_bar" or name == "bouncingBar"
+    return SPIN_BOUNCING_BAR()
+  end
+  if name == "bouncing_ball" or name == "bouncingBall"
+    return SPIN_BOUNCING_BALL()
+  end
+  if name == "box"
+    return SPIN_BOX()
+  end
+  if name == "circle"
+    return SPIN_CIRCLE()
+  end
+  if name == "circle_halves" or name == "circleHalves"
+    return SPIN_CIRCLE_HALVES()
+  end
+  if name == "moon"
+    return SPIN_MOON()
+  end
+  if name == "earth"
+    return SPIN_EARTH()
+  end
+  if name == "aesthetic"
+    return SPIN_AESTHETIC()
+  end
+  if name == "triangle"
+    return SPIN_TRIANGLE()
+  end
+  if name == "pong"
+    return SPIN_PONG()
+  end
+  if name == "grow_vertical" or name == "growVertical"
+    return SPIN_GROW_VERTICAL()
+  end
+  if name == "grow_horizontal" or name == "growHorizontal"
+    return SPIN_GROW_HORIZONTAL()
+  end
+  if name == "balloon"
+    return SPIN_BALLOON()
+  end
+  if name == "noise"
+    return SPIN_NOISE()
+  end
+  if name == "bounce"
+    return SPIN_BOUNCE()
+  end
+  if name == "box_bounce" or name == "boxBounce"
+    return SPIN_BOX_BOUNCE()
+  end
+  if name == "simple_dots" or name == "simpleDots"
+    return SPIN_SIMPLE_DOTS()
+  end
+  if name == "simple_dots_scrolling" or name == "simpleDotsScrolling"
+    return SPIN_SIMPLE_DOTS_SCROLLING()
+  end
+  if name == "star"
+    return SPIN_STAR()
+  end
+  if name == "flip"
+    return SPIN_FLIP()
+  end
+  if name == "hamburger"
+    return SPIN_HAMBURGER()
+  end
+  if name == "beta_wave" or name == "betaWave"
+    return SPIN_BETA_WAVE()
+  end
+  if name == "runner"
+    return SPIN_RUNNER()
+  end
+  if name == "weather"
+    return SPIN_WEATHER()
+  end
+  if name == "christmas"
+    return SPIN_CHRISTMAS()
+  end
+  if name == "grenade"
+    return SPIN_GRENADE()
+  end
+  if name == "point"
+    return SPIN_POINT()
+  end
+  if name == "layer"
+    return SPIN_LAYER()
+  end
+  if name == "finger_dance" or name == "fingerDance"
+    return SPIN_FINGER_DANCE()
+  end
+  if name == "fist_bump" or name == "fistBump"
+    return SPIN_FIST_BUMP()
+  end
+  return SPIN_DOTS()
+end
+
+# =============================================================================
+# Col — single tagged-union column type
+# =============================================================================
+# All columns share one struct with a kind tag. Render dispatches via the
+# kind. This avoids needing trait-object storage and lets a Vec<Col> hold
+# heterogeneous columns trivially.
+
+struct Col
+  kind: Int
+  width: Int
+  fg_color: Int
+  bg_color: Int
+  attrs: Int
+  text: String
+  spinner_id: Int
+  custom_id: Int
+end
+
+def _col_blank(kind: Int): Col
+  return Col {
+    kind: kind,
+    width: 0,
+    fg_color: COLOR_NONE(),
+    bg_color: COLOR_NONE(),
+    attrs: 0,
+    text: "",
+    spinner_id: 0,
+    custom_id: -1,
+  }
+end
+
+# -----------------------------------------------------------------------------
+# Column constructors — Col.spinner(), Col.bar(40), Col.pos(), ...
+# -----------------------------------------------------------------------------
+
+def Col.spinner(): Col
+  var c = _col_blank(COL_SPINNER())
+  c.spinner_id = SPIN_DOTS()
+  return c
+end
+
+def Col.spinner_named(name: String): Col
+  var c = _col_blank(COL_SPINNER())
+  c.spinner_id = _spin_id_from_name(name)
+  return c
+end
+
+def Col.spinner_id(id: Int): Col
+  var c = _col_blank(COL_SPINNER())
+  c.spinner_id = id
+  return c
+end
+
+def Col.bar(width: Int): Col
+  var c = _col_blank(COL_BAR())
+  c.width = width
+  return c
+end
+
+def Col.pos(): Col = _col_blank(COL_POS())
+def Col.len(): Col = _col_blank(COL_LEN())
+def Col.pos_len(): Col = _col_blank(COL_POS_LEN())
+def Col.percent(): Col = _col_blank(COL_PERCENT())
+def Col.eta(): Col = _col_blank(COL_ETA())
+def Col.rate(): Col = _col_blank(COL_RATE())
+def Col.elapsed(): Col = _col_blank(COL_ELAPSED())
+def Col.msg(): Col = _col_blank(COL_MSG())
+def Col.label(): Col = _col_blank(COL_LABEL())
+def Col.bytes(): Col = _col_blank(COL_BYTES())
+
+def Col.text(s: String): Col
+  var c = _col_blank(COL_TEXT())
+  c.text = s
+  return c
+end
+
+def Col.custom(id: Int): Col
+  var c = _col_blank(COL_CUSTOM())
+  c.custom_id = id
+  return c
+end
+
+# -----------------------------------------------------------------------------
+# Column builders — chainable styling
+# -----------------------------------------------------------------------------
+
+extend Col
+  def fg(color: Int): Col
+    return Col {
+      kind: @kind, width: @width,
+      fg_color: color, bg_color: @bg_color, attrs: @attrs,
+      text: @text, spinner_id: @spinner_id, custom_id: @custom_id,
+    }
+  end
+
+  def bg(color: Int): Col
+    return Col {
+      kind: @kind, width: @width,
+      fg_color: @fg_color, bg_color: color, attrs: @attrs,
+      text: @text, spinner_id: @spinner_id, custom_id: @custom_id,
+    }
+  end
+
+  def bold(): Col
+    return Col {
+      kind: @kind, width: @width,
+      fg_color: @fg_color, bg_color: @bg_color, attrs: @attrs | 1,
+      text: @text, spinner_id: @spinner_id, custom_id: @custom_id,
+    }
+  end
+
+  def dim(): Col
+    return Col {
+      kind: @kind, width: @width,
+      fg_color: @fg_color, bg_color: @bg_color, attrs: @attrs | 2,
+      text: @text, spinner_id: @spinner_id, custom_id: @custom_id,
+    }
+  end
+
+  def width_set(w: Int): Col
+    return Col {
+      kind: @kind, width: w,
+      fg_color: @fg_color, bg_color: @bg_color, attrs: @attrs,
+      text: @text, spinner_id: @spinner_id, custom_id: @custom_id,
+    }
+  end
+
+  def red(): Col = self.fg(Red())
+  def green(): Col = self.fg(Green())
+  def yellow(): Col = self.fg(Yellow())
+  def blue(): Col = self.fg(Blue())
+  def magenta(): Col = self.fg(Magenta())
+  def cyan(): Col = self.fg(Cyan())
+  def white(): Col = self.fg(White())
+  def gray(): Col = self.fg(BrightBlack())
+end
+
+# =============================================================================
+# Task — per-progress state
+# =============================================================================
+
+struct Task
+  id: Int
+  label: String
+  total: Int
+  pos: Int
+  msg: String
+  status: Int
+  start_ms: Int
+  last_update_ms: Int
+  last_pos: Int
+  rate_x100: Int  # smoothed rate (units per second), x100 fixed-point
+  smoothed_pos: Int  # spring-smoothed display position (toward pos)
+  frame_idx: Int  # spinner frame counter
+  last_frame_ms: Int
+end
+
+var _task_id_counter = 0
+
+def _task_new(total: Int, label: String): Task
+  _task_id_counter += 1
+  var now = time_mono_ms()
+  return Task {
+    id: _task_id_counter,
+    label: label,
+    total: total,
+    pos: 0,
+    msg: "",
+    status: STATUS_RUNNING(),
+    start_ms: now,
+    last_update_ms: now,
+    last_pos: 0,
+    rate_x100: 0,
+    smoothed_pos: 0,
+    frame_idx: 0,
+    last_frame_ms: now,
+  }
+end
+
+# -----------------------------------------------------------------------------
+# Spring-damper smoothing — inspired by Bubble Tea's Harmonica library.
+# Uses integer math: smoothed += (target - smoothed) * stiffness / 100.
+# Stiffness 18 = ~snappy but smooth; per-tick exponential decay toward target.
+# -----------------------------------------------------------------------------
+
+def _STIFFNESS_PCT(): Int = 18
+
+def _task_tick_smoothing(t: Task): Void
+  var delta = t.pos - t.smoothed_pos
+  if delta == 0
+    return
+  end
+  var step = (delta * _STIFFNESS_PCT()) / 100
+  if step == 0
+    # Always advance at least 1 unit so we don't stall on small deltas
+    if delta > 0
+      step = 1
+    else
+      step = -1
+    end
+  end
+  t.smoothed_pos = t.smoothed_pos + step
+end
+
+# -----------------------------------------------------------------------------
+# Rate / ETA — exponentially weighted moving average over a 1s window
+# -----------------------------------------------------------------------------
+
+def _RATE_ALPHA_PCT(): Int = 30  # weight for new sample
+
+def _task_update_rate(t: Task, now: Int): Void
+  var dt_ms = now - t.last_update_ms
+  if dt_ms < 50
+    return  # ignore very short intervals to avoid noise
+  end
+  var dpos = t.pos - t.last_pos
+  if dpos < 0
+    dpos = 0
+  end
+  # instantaneous rate (units/sec) x100 fixed-point
+  var inst = (dpos * 100000) / dt_ms
+  if t.rate_x100 == 0
+    t.rate_x100 = inst
+  else
+    t.rate_x100 = (t.rate_x100 * (100 - _RATE_ALPHA_PCT()) + inst * _RATE_ALPHA_PCT()) / 100
+  end
+  t.last_pos = t.pos
+  t.last_update_ms = now
+end
+
+def _task_eta_ms(t: Task): Int
+  if t.total <= 0
+    return -1
+  end
+  if t.rate_x100 <= 0
+    return -1
+  end
+  var remaining = t.total - t.pos
+  if remaining <= 0
+    return 0
+  end
+  # rate is units/sec x100 → ms = remaining * 1000 / (rate/100) = remaining * 100000 / rate
+  return (remaining * 100000) / t.rate_x100
+end
+
+# =============================================================================
+# Time formatting helpers
+# =============================================================================
+
+def _fmt_duration_ms(ms: Int): String
+  if ms < 0
+    return "?"
+  end
+  var s = ms / 1000
+  if s < 60
+    return s.to_s() + "s"
+  end
+  var m = s / 60
+  var rs = s % 60
+  if m < 60
+    return m.to_s() + "m" + rs.to_s() + "s"
+  end
+  var h = m / 60
+  var rm = m % 60
+  return h.to_s() + "h" + rm.to_s() + "m"
+end
+
+def _fmt_bytes(n: Int): String
+  if n < 1024
+    return n.to_s() + "B"
+  end
+  if n < 1048576
+    return (n / 1024).to_s() + "KB"
+  end
+  if n < 1073741824
+    return (n / 1048576).to_s() + "MB"
+  end
+  return (n / 1073741824).to_s() + "GB"
+end
+
+def _fmt_rate(rate_x100: Int): String
+  var per_sec = rate_x100 / 100
+  if per_sec < 1024
+    return per_sec.to_s() + "/s"
+  end
+  return _fmt_bytes(per_sec) + "/s"
+end
+
+def _fmt_pos_len(pos: Int, total: Int): String
+  if total <= 0
+    return pos.to_s()
+  end
+  return pos.to_s() + "/" + total.to_s()
+end
+
+def _fmt_percent(pos: Int, total: Int): String
+  if total <= 0
+    return "?%"
+  end
+  var pct = (pos * 100) / total
+  return pct.to_s() + "%"
+end
+
+# =============================================================================
+# Bar rendering — uses smoothed_pos so spring physics are visible
+# =============================================================================
+
+# Eighth-block sub-cell bar geometry. Returns total fill in eighths
+# of a cell (range [0, width*8]). Caller divides into full_cells
+# (eighths/8) and partial (eighths%8) to build the fill + track
+# strings. Eighth-block leading-edge glyphs (U+258F..U+2588: ▏▎▍▌▋▊▉█)
+# give 8× horizontal sub-cell resolution.
+#
+# Why not return the bar parts directly: returning Vec<String> from a
+# function and then indexing it interacts badly with Quartz's generic
+# erasure on element types (project memory: silent wrong-struct field
+# resolution on Vec<T> across function returns). Each caller computes
+# eighths once and builds fill/track inline, avoiding the hazard.
+def _bar_eighths(width: Int, pos: Int, total: Int): Int
+  if width <= 0
+    return 0
+  end
+  var p = pos
+  if p < 0
+    p = 0
+  end
+  if total > 0 and p > total
+    p = total
+  end
+  var e = 0
+  if total > 0
+    e = (p * width * 8) / total
+  end
+  var max_e = width * 8
+  if e > max_e
+    e = max_e
+  end
+  if e < 0
+    e = 0
+  end
+  return e
+end
+
+# Eighth-block leading-edge glyph for `eighths` ∈ [1, 7]. Returns ""
+# for 0 (no partial) and "█" for ≥ 8 (saturated). Callers normally
+# pass a value already constrained to [0, 7] via `eighths % 8`.
+def _eighth_glyph(eighths: Int): String
+  if eighths <= 0
+    return ""
+  end
+  if eighths >= 8
+    return "█"
+  end
+  # U+258F (1/8) … U+2589 (7/8). Codepoint reversed from fill order,
+  # so codepoint = 0x2590 - eighths.
+  var sb = sb_new()
+  sb.append_char(0x2590 - eighths)
+  return sb.to_string()
+end
+
+def _render_bar(width: Int, t: Task): String
+  if width <= 0
+    return ""
+  end
+  var eighths = _bar_eighths(width, t.smoothed_pos, t.total)
+  var full = eighths / 8
+  var partial = eighths - full * 8
+  var track = width - full
+  if partial > 0
+    track -= 1
+  end
+  if track < 0
+    track = 0
+  end
+  var sb = sb_new()
+  var i = 0
+  while i < full
+    sb.append("█")
+    i += 1
+  end
+  if partial > 0
+    sb.append_char(0x2590 - partial)
+  end
+  var k = 0
+  while k < track
+    sb.append("░")
+    k += 1
+  end
+  return sb.to_string()
+end
+
+# Spinner frame for the current tick.
+def _render_spinner(t: Task, sid: Int): String
+  var frames = _spin_frames(sid)
+  var idx = t.frame_idx % vec_size(frames)
+  return vec_get(frames, idx)
+end
+
+# =============================================================================
+# Open registry — user-defined columns by template key
+# =============================================================================
+
+var _registry_names: Vec<String> = vec_new()
+var _registry_render: Vec<Fn(Task, Int): String> = vec_new()
+
+## Register a custom column under a template key.
+## Render fn receives the live Task and the column width hint.
+## After registration, "{my_key}" in templates resolves to this column.
+def progress_register_column(name: String, render_fn: Fn(Task, Int): String): Int
+  _registry_names.push(name)
+  _registry_render.push(render_fn)
+  return _registry_names.size - 1
+end
+
+def _registry_lookup(name: String): Int
+  var i = 0
+  while i < _registry_names.size
+    if _registry_names[i] == name
+      return i
+    end
+    i += 1
+  end
+  return -1
+end
+
+def _registry_render_call(id: Int, t: Task, width: Int): String
+  var f = vec_get(_registry_render, id)
+  return f(t, width)
+end
+
+# =============================================================================
+# Column render dispatch
+# =============================================================================
+
+def _col_render_raw(c: Col, t: Task): String
+  if c.kind == COL_TEXT()
+    return c.text
+  end
+  if c.kind == COL_SPINNER()
+    return _render_spinner(t, c.spinner_id)
+  end
+  if c.kind == COL_BAR()
+    return _render_bar(c.width, t)
+  end
+  if c.kind == COL_POS()
+    return t.pos.to_s()
+  end
+  if c.kind == COL_LEN()
+    return t.total.to_s()
+  end
+  if c.kind == COL_POS_LEN()
+    return _fmt_pos_len(t.pos, t.total)
+  end
+  if c.kind == COL_PERCENT()
+    return _fmt_percent(t.pos, t.total)
+  end
+  if c.kind == COL_ETA()
+    return _fmt_duration_ms(_task_eta_ms(t))
+  end
+  if c.kind == COL_RATE()
+    return _fmt_rate(t.rate_x100)
+  end
+  if c.kind == COL_ELAPSED()
+    return _fmt_duration_ms(time_mono_ms() - t.start_ms)
+  end
+  if c.kind == COL_MSG()
+    return t.msg
+  end
+  if c.kind == COL_LABEL()
+    return t.label
+  end
+  if c.kind == COL_BYTES()
+    return _fmt_bytes(t.pos)
+  end
+  if c.kind == COL_CUSTOM()
+    return _registry_render_call(c.custom_id, t, c.width)
+  end
+  return ""
+end
+
+# Apply this column's styling to its rendered text.
+def _col_render(c: Col, t: Task, depth: Int): String
+  var raw = _col_render_raw(c, t)
+  if c.fg_color == COLOR_NONE() and c.bg_color == COLOR_NONE() and c.attrs == 0
+    return raw
+  end
+  if depth == 0
+    return raw
+  end
+  var s = Style.new()
+  if c.fg_color != COLOR_NONE()
+    s = s.fg(c.fg_color)
+  end
+  if c.bg_color != COLOR_NONE()
+    s = s.bg(c.bg_color)
+  end
+  if (c.attrs & 1) != 0
+    s = s.bold()
+  end
+  if (c.attrs & 2) != 0
+    s = s.dim()
+  end
+  return s.render_at(raw, depth)
+end
+
+def _columns_render(cols: Vec<Col>, t: Task, depth: Int): String
+  var sb = sb_new()
+  var i = 0
+  while i < cols.size
+    sb.append(_col_render(cols[i], t, depth))
+    i += 1
+  end
+  return sb.to_string()
+end
+
+# =============================================================================
+# Template parser — {key:width.fg/bg}
+# =============================================================================
+# Grammar:
+#   template := (literal | placeholder)*
+#   literal := any char that is not '{'
+#   placeholder := '{' key (':' width)? ('.' fg ('/' bg)?)? '}'
+#   key := identifier (alphanumeric + underscore)
+#   width := digits
+#   fg/bg := identifier (color name)
+# Examples:
+#   "{spinner} [{bar:40.cyan}] {pos}/{len} ({eta})"
+#   "{spinner:.green} {label} {percent}"
+
+def _is_alpha_us(c: Int): Bool
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_'
+end
+
+def _is_alnum_us(c: Int): Bool
+  return _is_alpha_us(c) or (c >= '0' and c <= '9')
+end
+
+def _color_from_name(name: String): Int
+  if name == "black"
+    return Black()
+  end
+  if name == "red"
+    return Red()
+  end
+  if name == "green"
+    return Green()
+  end
+  if name == "yellow"
+    return Yellow()
+  end
+  if name == "blue"
+    return Blue()
+  end
+  if name == "magenta"
+    return Magenta()
+  end
+  if name == "cyan"
+    return Cyan()
+  end
+  if name == "white"
+    return White()
+  end
+  if name == "gray" or name == "grey"
+    return BrightBlack()
+  end
+  if name == "bright_red"
+    return BrightRed()
+  end
+  if name == "bright_green"
+    return BrightGreen()
+  end
+  if name == "bright_yellow"
+    return BrightYellow()
+  end
+  if name == "bright_blue"
+    return BrightBlue()
+  end
+  if name == "bright_magenta"
+    return BrightMagenta()
+  end
+  if name == "bright_cyan"
+    return BrightCyan()
+  end
+  if name == "bright_white"
+    return BrightWhite()
+  end
+  return COLOR_NONE()
+end
+
+# Build a column from a parsed key, optional width, optional fg/bg.
+def _col_from_key(key: String, width: Int): Col
+  if key == "spinner"
+    return Col.spinner()
+  end
+  if key == "bar" or key == "wide_bar"
+    var w = width
+    if w == 0
+      w = 30
+    end
+    return Col.bar(w)
+  end
+  if key == "pos"
+    return Col.pos()
+  end
+  if key == "len" or key == "total"
+    return Col.len()
+  end
+  if key == "pos_len"
+    return Col.pos_len()
+  end
+  if key == "percent" or key == "pct"
+    return Col.percent()
+  end
+  if key == "eta"
+    return Col.eta()
+  end
+  if key == "rate"
+    return Col.rate()
+  end
+  if key == "elapsed"
+    return Col.elapsed()
+  end
+  if key == "msg"
+    return Col.msg()
+  end
+  if key == "label"
+    return Col.label()
+  end
+  if key == "bytes"
+    return Col.bytes()
+  end
+  # Try the open registry — user-defined column?
+  var rid = _registry_lookup(key)
+  if rid >= 0
+    var c = Col.custom(rid)
+    if width > 0
+      c.width = width
+    end
+    return c
+  end
+  # Unknown key — render as literal
+  return Col.text("{" + key + "}")
+end
+
+## Parse a template string into a Vec<Col>.
+## See module docstring for grammar.
+def progress_parse_template(s: String): Vec<Col>
+  var cols = vec_new<Col>()
+  var len = str_byte_len(s)
+  var i = 0
+  var lit = sb_new()
+  while i < len
+    var c = str_byte_at(s, i)
+    if c != '{'
+      lit.append_char(c)
+      i += 1
+    else
+      # flush literal
+      var lit_str = lit.to_string()
+      if str_byte_len(lit_str) > 0
+        cols.push(Col.text(lit_str))
+        lit = sb_new()
+      end
+      # parse key
+      i += 1
+      var key_sb = sb_new()
+      while i < len and _is_alnum_us(str_byte_at(s, i))
+        key_sb.append_char(str_byte_at(s, i))
+        i += 1
+      end
+      var key = key_sb.to_string()
+      # optional :width
+      var width = 0
+      if i < len and str_byte_at(s, i) == ':'
+        i += 1
+        while i < len and str_byte_at(s, i) >= '0' and str_byte_at(s, i) <= '9'
+          width = width * 10 + (str_byte_at(s, i) - '0')
+          i += 1
+        end
+      end
+      # optional .fg/bg
+      var fg_name = ""
+      var bg_name = ""
+      if i < len and str_byte_at(s, i) == '.'
+        i += 1
+        var fg_sb = sb_new()
+        while i < len and (_is_alnum_us(str_byte_at(s, i)))
+          fg_sb.append_char(str_byte_at(s, i))
+          i += 1
+        end
+        fg_name = fg_sb.to_string()
+        if i < len and str_byte_at(s, i) == '/'
+          i += 1
+          var bg_sb = sb_new()
+          while i < len and _is_alnum_us(str_byte_at(s, i))
+            bg_sb.append_char(str_byte_at(s, i))
+            i += 1
+          end
+          bg_name = bg_sb.to_string()
+        end
+      end
+      # consume closing }
+      if i < len and str_byte_at(s, i) == '}'
+        i += 1
+      end
+      # Build column
+      var col = _col_from_key(key, width)
+      if str_byte_len(fg_name) > 0
+        var fg = _color_from_name(fg_name)
+        if fg != COLOR_NONE()
+          col = col.fg(fg)
+        end
+      end
+      if str_byte_len(bg_name) > 0
+        var bg = _color_from_name(bg_name)
+        if bg != COLOR_NONE()
+          col = col.bg(bg)
+        end
+      end
+      cols.push(col)
+    end
+  end
+  # Flush trailing literal
+  var tail = lit.to_string()
+  if str_byte_len(tail) > 0
+    cols.push(Col.text(tail))
+  end
+  return cols
+end
+
+# =============================================================================
+# Output mode detection
+# =============================================================================
+
+def progress_auto_mode(): Int
+  # QZ_PROGRESS env var override: tty / dumb / json / off
+  var ev = getenv("QZ_PROGRESS")
+  if ev == "tty"
+    return PROGRESS_MODE_TTY()
+  end
+  if ev == "dumb"
+    return PROGRESS_MODE_DUMB()
+  end
+  if ev == "json"
+    return PROGRESS_MODE_JSON()
+  end
+  if ev == "off" or ev == "none"
+    return PROGRESS_MODE_OFF()
+  end
+  # Auto: tty if stderr is a terminal, dumb otherwise
+  if terminal::term_is_tty_stderr()
+    return PROGRESS_MODE_TTY()
+  end
+  return PROGRESS_MODE_DUMB()
+end
+
+# =============================================================================
+# Stderr writing helpers
+# =============================================================================
+
+extern "C" def write(fd: CInt, buf: CPtr, count: CInt): CInt
+
+def _stderr_write(s: String): Void
+  var n = str_byte_len(s)
+  if n == 0
+    return
+  end
+  var _written = write(2, s, n)
+end
+
+# =============================================================================
+# JSON event emission — NDJSON, schema v1, on stderr
+# =============================================================================
+
+def _json_escape(s: String): String
+  var sb = sb_new()
+  var i = 0
+  var n = str_byte_len(s)
+  while i < n
+    var c = str_byte_at(s, i)
+    if c == '"'
+      sb.append("\\\"")
+    elsif c == '\\'
+      sb.append("\\\\")
+    elsif c == '\n'
+      sb.append("\\n")
+    elsif c == '\r'
+      sb.append("\\r")
+    elsif c == '\t'
+      sb.append("\\t")
+    elsif c < 32
+      sb.append("\\u00")
+      sb.append((c / 16).to_s())
+      sb.append((c % 16).to_s())
+    else
+      sb.append_char(c)
+    end
+    i += 1
+  end
+  return sb.to_string()
+end
+
+def _emit_json_start(t: Task): Void
+  var sb = sb_new()
+  sb.append("{\"v\":1,\"event\":\"start\",\"id\":")
+  sb.append(t.id.to_s())
+  sb.append(",\"label\":\"")
+  sb.append(_json_escape(t.label))
+  sb.append("\",\"total\":")
+  sb.append(t.total.to_s())
+  sb.append(",\"ts_ms\":")
+  sb.append(t.start_ms.to_s())
+  sb.append("}\n")
+  _stderr_write(sb.to_string())
+end
+
+def _emit_json_tick(t: Task): Void
+  var sb = sb_new()
+  sb.append("{\"v\":1,\"event\":\"tick\",\"id\":")
+  sb.append(t.id.to_s())
+  sb.append(",\"pos\":")
+  sb.append(t.pos.to_s())
+  sb.append(",\"rate\":")
+  sb.append((t.rate_x100 / 100).to_s())
+  var eta = _task_eta_ms(t)
+  sb.append(",\"eta_ms\":")
+  sb.append(eta.to_s())
+  sb.append("}\n")
+  _stderr_write(sb.to_string())
+end
+
+def _emit_json_msg(t: Task): Void
+  var sb = sb_new()
+  sb.append("{\"v\":1,\"event\":\"msg\",\"id\":")
+  sb.append(t.id.to_s())
+  sb.append(",\"msg\":\"")
+  sb.append(_json_escape(t.msg))
+  sb.append("\"}\n")
+  _stderr_write(sb.to_string())
+end
+
+def _emit_json_done(t: Task): Void
+  var sb = sb_new()
+  sb.append("{\"v\":1,\"event\":\"done\",\"id\":")
+  sb.append(t.id.to_s())
+  sb.append(",\"status\":\"")
+  if t.status == STATUS_OK()
+    sb.append("ok")
+  elsif t.status == STATUS_FAIL()
+    sb.append("fail")
+  elsif t.status == STATUS_WARN()
+    sb.append("warn")
+  elsif t.status == STATUS_CANCEL()
+    sb.append("cancel")
+  else
+    sb.append("ok")
+  end
+  sb.append("\",\"elapsed_ms\":")
+  sb.append((time_mono_ms() - t.start_ms).to_s())
+  sb.append(",\"pos\":")
+  sb.append(t.pos.to_s())
+  sb.append("}\n")
+  _stderr_write(sb.to_string())
+end
+
+# =============================================================================
+# Progress — the public builder type
+# =============================================================================
+
+struct Progress
+  cols: Vec<Col>
+  task: Task
+  mode: Int
+  resolved_mode: Int  # mode after auto-detection
+  depth: Int  # color depth, cached
+  _started: Bool
+  _ended: Bool
+  _last_render_ms: Int
+  _min_render_interval_ms: Int
+end
+
+# Default columns when none specified: spinner + label + bar + pos/len + eta
+def _default_cols(): Vec<Col>
+  var v = vec_new<Col>()
+  v.push(Col.spinner().cyan())
+  v.push(Col.text(" "))
+  v.push(Col.label())
+  v.push(Col.text(" "))
+  v.push(Col.bar(30).cyan())
+  v.push(Col.text(" "))
+  v.push(Col.pos_len())
+  v.push(Col.text(" "))
+  v.push(Col.eta().dim())
+  return v
+end
+
+## Create a new Progress with the given total. total <= 0 means indeterminate.
+def Progress.new(total: Int): Progress
+  return Progress {
+    cols: _default_cols(),
+    task: _task_new(total, ""),
+    mode: PROGRESS_MODE_AUTO(),
+    resolved_mode: PROGRESS_MODE_TTY(),
+    depth: 0,
+    _started: false,
+    _ended: false,
+    _last_render_ms: 0,
+    _min_render_interval_ms: 50,
+  }
+end
+
+## Indeterminate spinner — no total.
+def Progress.spinner_only(): Progress
+  var p = Progress.new(0)
+  var v = vec_new<Col>()
+  v.push(Col.spinner().cyan())
+  v.push(Col.text(" "))
+  v.push(Col.label())
+  v.push(Col.text(" "))
+  v.push(Col.msg().dim())
+  p.cols = v
+  return p
+end
+
+# -----------------------------------------------------------------------------
+# Builder methods
+# -----------------------------------------------------------------------------
+
+extend Progress
+  def label(s: String): Progress
+    @task.label = s
+    return self
+  end
+
+  def columns(&mut self, cols: Vec<Col>): Progress
+    @cols = cols
+    return self
+  end
+
+  def template(&mut self, s: String): Progress
+    @cols = progress_parse_template(s)
+    return self
+  end
+
+  def mode_set(&mut self, m: Int): Progress
+    @mode = m
+    return self
+  end
+
+  def total(n: Int): Progress
+    @task.total = n
+    return self
+  end
+
+  def fps(&mut self, f: Int): Progress
+    if f > 0
+      @_min_render_interval_ms = 1000 / f
+    end
+    return self
+  end
+
+  # ---------------------------------------------------------------------------
+  # Lifecycle
+  # ---------------------------------------------------------------------------
+
+  def start(&mut self): Progress
+    if @_started
+      return self
+    end
+    @_started = true
+    @_ended = false
+    if @mode == PROGRESS_MODE_AUTO()
+      @resolved_mode = progress_auto_mode()
+    else
+      @resolved_mode = @mode
+    end
+    @depth = terminal::term_color_depth()
+    if @resolved_mode == PROGRESS_MODE_TTY()
+      _stderr_write("\x1b[?25l")  # hide cursor
+    end
+    if @resolved_mode == PROGRESS_MODE_JSON()
+      _emit_json_start(@task)
+    end
+    self.render()
+    return self
+  end
+
+  def inc(n: Int): Void
+    if @_ended
+      return
+    end
+    if not @_started
+      self.start()
+    end
+    @task.pos = @task.pos + n
+    self.render()
+  end
+
+  def set(n: Int): Void
+    if @_ended
+      return
+    end
+    if not @_started
+      self.start()
+    end
+    @task.pos = n
+    self.render()
+  end
+
+  def msg(s: String): Void
+    if @_ended
+      return
+    end
+    @task.msg = s
+    if @resolved_mode == PROGRESS_MODE_JSON()
+      _emit_json_msg(@task)
+    end
+    self.render()
+  end
+
+  def done(): Bool
+    return @_ended
+  end
+
+  def percent(): Int
+    if @task.total <= 0
+      return 0
+    end
+    return (@task.pos * 100) / @task.total
+  end
+
+  def finish(): Void
+    self._end_with(STATUS_OK(), "")
+  end
+
+  def finish_with(s: String): Void
+    @task.msg = s
+    self._end_with(STATUS_OK(), s)
+  end
+
+  ## Mark this Progress as failed with a reason. Renamed from .fail() to
+  ## avoid colliding with quake::fail (free function) when both are imported.
+  def fail(s: String): Void
+    @task.msg = s
+    self._end_with(STATUS_FAIL(), s)
+  end
+
+  def warn(s: String): Void
+    @task.msg = s
+    self._end_with(STATUS_WARN(), s)
+  end
+
+  def cancel(): Void
+    self._end_with(STATUS_CANCEL(), "cancelled")
+  end
+
+  def _end_with(&mut self, status: Int, _final_msg: String): Void
+    if @_ended
+      return
+    end
+    @_ended = true
+    @task.status = status
+    if @task.total > 0 and status == STATUS_OK()
+      @task.pos = @task.total
+      @task.smoothed_pos = @task.total
+    end
+    self._render_force()
+    if @resolved_mode == PROGRESS_MODE_TTY()
+      # Move to fresh line, restore cursor, append status glyph
+      _stderr_write("\n")
+      _stderr_write(_status_glyph(status, @depth))
+      _stderr_write("\x1b[?25h")  # show cursor
+    end
+    if @resolved_mode == PROGRESS_MODE_DUMB()
+      _stderr_write(" ")
+      _stderr_write(_status_word(status))
+      _stderr_write("\n")
+    end
+    if @resolved_mode == PROGRESS_MODE_JSON()
+      _emit_json_done(@task)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Rendering — FPS-throttled
+  # ---------------------------------------------------------------------------
+
+  def render(&mut self): Void
+    if @_ended
+      return
+    end
+    var now = time_mono_ms()
+    if now - @_last_render_ms < @_min_render_interval_ms
+      return
+    end
+    @_last_render_ms = now
+    self._render_force()
+  end
+
+  def _render_force(): Void
+    var now = time_mono_ms()
+    _task_update_rate(@task, now)
+    _task_tick_smoothing(@task)
+    # Advance spinner frame based on its own interval
+    var sid = _spinner_id_in_cols(@cols)
+    if sid >= 0
+      var ival = _spin_interval(sid)
+      if now - @task.last_frame_ms >= ival
+        @task.frame_idx += 1
+        @task.last_frame_ms = now
+      end
+    end
+    if @resolved_mode == PROGRESS_MODE_OFF()
+      return
+    end
+    if @resolved_mode == PROGRESS_MODE_TTY()
+      _stderr_write("\r\x1b[2K")  # CR + clear line
+      _stderr_write(_columns_render(@cols, @task, @depth))
+    elsif @resolved_mode == PROGRESS_MODE_DUMB()
+      # Dumb mode: only emit on whole-percent transitions
+      var pct = self.percent()
+      if pct != @task.frame_idx
+        @task.frame_idx = pct
+        _stderr_write(_columns_render(@cols, @task, 0))
+        _stderr_write("\n")
+      end
+    elsif @resolved_mode == PROGRESS_MODE_JSON()
+      _emit_json_tick(@task)
+    end
+  end
+end
+
+# Find first spinner column in cols (for tick interval calc).
+def _spinner_id_in_cols(cols: Vec<Col>): Int
+  var i = 0
+  while i < cols.size
+    if cols[i].kind == COL_SPINNER()
+      return cols[i].spinner_id
+    end
+    i += 1
+  end
+  return -1
+end
+
+def _status_glyph(status: Int, depth: Int): String
+  var glyph = ""
+  var color = Green()
+  if status == STATUS_OK()
+    glyph = "✓"
+    color = Green()
+  elsif status == STATUS_FAIL()
+    glyph = "✗"
+    color = Red()
+  elsif status == STATUS_WARN()
+    glyph = "⚠"
+    color = Yellow()
+  elsif status == STATUS_CANCEL()
+    glyph = "⊘"
+    color = BrightBlack()
+  else
+    glyph = "ℹ"
+    color = Blue()
+  end
+  if depth == 0
+    return glyph
+  end
+  return Style.new().fg(color).bold().render_at(glyph, depth)
+end
+
+def _status_word(status: Int): String
+  if status == STATUS_OK()
+    return "OK"
+  end
+  if status == STATUS_FAIL()
+    return "FAIL"
+  end
+  if status == STATUS_WARN()
+    return "WARN"
+  end
+  if status == STATUS_CANCEL()
+    return "CANCEL"
+  end
+  return "INFO"
+end
+
+# =============================================================================
+# Live — multi-progress surface
+# =============================================================================
+# A Live owns a region of the terminal and renders many Progress instances
+# at once. It diff-redraws via cursor-up rewrites and can show only the
+# top N most relevant rows when there are more bars than terminal lines.
+#
+# The "double presentation" model:
+#   - One global header bar showing aggregate state (done/total, elapsed)
+#   - Top N active rows underneath, each a full Progress render
+#   - One summary footer line (counts + ETA)
+#
+# Bars added to a Live have their own mode set to OFF — the Live drives
+# all rendering. Calling .inc/.set/.finish on a hosted bar updates its
+# state silently; the Live's tick() picks up changes on the next frame.
+
+struct Live
+  bars: Vec<Progress>
+  global_label: String
+  global_total: Int
+  has_global: Bool
+  max_rows: Int
+  last_lines: Int
+  log_queue: Vec<String>
+  mode: Int
+  resolved_mode: Int
+  depth: Int
+  _started: Bool
+  _ended: Bool
+  start_ms: Int
+  _last_render_ms: Int
+  _min_render_interval_ms: Int
+  # Serializes _render_force calls across the main task and the scheduler's
+  # I/O poller thread (idle hook). Without this, both threads can write ANSI
+  # escape sequences to stderr simultaneously and produce interleaved garbage.
+  # Allocated at Live.new() via mutex_new.
+  _render_mtx: Int
+end
+
+def Live.new(): Live
+  return Live {
+    bars: vec_new<Progress>(),
+    global_label: "",
+    global_total: 0,
+    has_global: false,
+    max_rows: 10,
+    last_lines: 0,
+    log_queue: vec_new<String>(),
+    mode: PROGRESS_MODE_AUTO(),
+    resolved_mode: PROGRESS_MODE_TTY(),
+    depth: 0,
+    _started: false,
+    _ended: false,
+    start_ms: 0,
+    _last_render_ms: 0,
+    _min_render_interval_ms: 80,
+    _render_mtx: mutex_new(0),
+  }
+end
+
+# Background animation hook: drives spinner frames between explicit tick()
+# calls. Implemented via the M:N scheduler's idle hook — the I/O poller thread
+# fires _live_idle_render() once per ~1ms poll iteration, FPS-throttled by
+# Live's _min_render_interval_ms (default 80ms). Multiple Lives can be active
+# concurrently; the registry below tracks them so finish() can deregister.
+# PSQ-6 (closed by sched-effect Phase C+D, 2026-04-30): the Live registry
+# is a `Mutex<Vec<Live>>` shape — `_g_live_actives_mtx` holds the lock and
+# the protected Int slot stores `as_int(Vec<Live>)`. Each accessor locks,
+# operates on a fresh local Vec via `as_type`, and unlocks with the
+# possibly-rotated `as_int(...)` written back. This keeps the Vec read
+# from `_live_idle_render`'s `can Sched` body local (exempt from Sync).
+# Sentinel: 0 = no Vec yet; lazily initialized on first push so programs
+# that never spawn a Live pay zero allocation.
+var _g_live_actives_mtx: Int = mutex_new(0)
+
+# Construct a transient MutexGuard for the global handle — the guard is
+# a thin wrapper (just `{ handle: Int }`) so this is effectively zero-
+# cost; the Scoped impl on MutexGuard drives acquire/release. Centralized
+# here so the three accessors share the same shape.
+def _live_actives_lock(): MutexGuard = MutexGuard { handle: _g_live_actives_mtx }
+
+# Phase 6.5: bound `v` is implicitly mutable. Reassigning v inside the
+# body propagates to release(self, v) — the natural-exit path, the
+# wrap_stack drain on early-return, and the runtime throw handler all
+# load v from its slot before calling release. This is exactly the
+# Mutex<heap-pointer-as-int> pattern these three accessors need:
+# acquire returns the current Vec-as-Int (or 0 sentinel), the body
+# mutates / replaces / lazily allocates, and the final value is
+# written back at release.
+def _live_idle_render(): Void can Sched
+  with _live_actives_lock() do raw ->
+    if raw == 0
+      return  # wrap_stack drain fires release(self, 0) — sentinel preserved.
+    end
+    var actives: Vec<Live> = as_type<Vec<Live>>(raw)
+    var sz = actives.size
+    var i = 0
+    while i < sz
+      var live: Live = actives[i]
+      live.tick()
+      i += 1
+    end
+    raw = as_int(actives)  # Vec may have re-allocated during tick; re-pin.
+  end
+end
+
+def _live_register(live: Live): Void
+  var sz = 0
+  with _live_actives_lock() do raw ->
+    var actives: Vec<Live> = vec_new<Live>()
+    if raw != 0
+      actives = as_type<Vec<Live>>(raw)
+    end
+    actives.push(live)
+    sz = actives.size
+    raw = as_int(actives)
+  end
+  if sz == 1
+    sched_idle_hook_set(_live_idle_render)
+  end
+end
+
+def _live_unregister(live: Live): Void
+  var final_size = -1
+  with _live_actives_lock() do raw ->
+    if raw == 0
+      return  # nothing to unregister; release writes back 0 unchanged.
+    end
+    var actives: Vec<Live> = as_type<Vec<Live>>(raw)
+    var i = 0
+    var found = -1
+    while i < actives.size
+      if actives[i] == live
+        found = i
+      end
+      i += 1
+    end
+    if found >= 0
+      var rebuilt = vec_new<Live>()
+      var j = 0
+      while j < actives.size
+        if j != found
+          rebuilt.push(actives[j])
+        end
+        j += 1
+      end
+      actives = rebuilt
+    end
+    final_size = actives.size
+    raw = as_int(actives)
+  end
+  if final_size == 0
+    sched_idle_hook_clear()
+  end
+end
+
+extend Live
+  ## Add a Progress to the Live surface. The bar's own rendering is silenced
+  ## (mode = OFF); the Live drives all output. Returns the bar for chaining.
+  def add(p: Progress): Progress
+    p.mode = PROGRESS_MODE_OFF()
+    p.resolved_mode = PROGRESS_MODE_OFF()
+    p._started = true  # skip individual hide-cursor / start hooks
+    @bars.push(p)
+    return p
+  end
+
+  ## Set a global header label + expected total for the aggregate bar.
+  def with_global(&mut self, label: String, total: Int): Live
+    @global_label = label
+    @global_total = total
+    @has_global = true
+    return self
+  end
+
+  ## Maximum number of active rows to display (default 10).
+  def max_active(&mut self, n: Int): Live
+    @max_rows = n
+    return self
+  end
+
+  ## Set rendering FPS (default ~12fps via 80ms interval).
+  def fps(&mut self, f: Int): Live
+    if f > 0
+      @_min_render_interval_ms = 1000 / f
+    end
+    return self
+  end
+
+  def mode_set(&mut self, m: Int): Live
+    @mode = m
+    return self
+  end
+
+  ## Queue a line to be flushed ABOVE the live region on the next render.
+  ## Use this for per-task completion glyphs that should scroll up out of
+  ## the live region as the run proceeds. Empty in dumb/json modes.
+  def log(line: String): Void
+    # In TTY mode, log entries accumulate in @log_queue and render inline
+    # inside the tracked region, below the global bar and below any active
+    # task rows. The queue is never flushed — it grows monotonically so the
+    # cursor-up rewrite on each frame redraws the full completed-task list.
+    #
+    # In dumb / off mode, write the line directly to stderr and don't queue it
+    # (there's no tracked region to attach it to).
+    if @resolved_mode == PROGRESS_MODE_DUMB() or @resolved_mode == PROGRESS_MODE_OFF()
+      _stderr_write(line)
+      _stderr_write("\n")
+      return
+    end
+    @log_queue.push(line)
+  end
+
+  def start(&mut self): Live
+    if @_started
+      return self
+    end
+    @_started = true
+    @start_ms = time_mono_ms()
+    if @mode == PROGRESS_MODE_AUTO()
+      @resolved_mode = progress_auto_mode()
+    else
+      @resolved_mode = @mode
+    end
+    @depth = terminal::term_color_depth()
+    if @resolved_mode == PROGRESS_MODE_TTY()
+      _stderr_write("\x1b[?25l")
+    end
+    self._render_force()
+    if @resolved_mode == PROGRESS_MODE_TTY()
+      _live_register(self)
+    end
+    return self
+  end
+
+  ## Throttled render — call from your hot loop. Cheap when within FPS budget.
+  def tick(&mut self): Void
+    if @_ended
+      return
+    end
+    if not @_started
+      self.start()
+      return
+    end
+    var now = time_mono_ms()
+    if now - @_last_render_ms < @_min_render_interval_ms
+      return
+    end
+    @_last_render_ms = now
+    self._render_force()
+  end
+
+  ## Aggregate counts across all bars.
+  def stats(): Vec<Int>
+    var done = 0
+    var failed = 0
+    var running = 0
+    var i = 0
+    while i < @bars.size
+      var p: Progress = @bars[i]
+      if p._ended
+        if p.task.status == STATUS_FAIL()
+          failed += 1
+        else
+          done += 1
+        end
+      else
+        running += 1
+      end
+      i += 1
+    end
+    var v = vec_new<Int>()
+    v.push(done)
+    v.push(failed)
+    v.push(running)
+    v.push(@bars.size)
+    return v
+  end
+
+  def total_count(): Int
+    if @global_total > 0
+      return @global_total
+    end
+    return @bars.size
+  end
+
+  def done_count(): Int
+    var s = self.stats()
+    return s[0] + s[1]
+  end
+
+  def all_done(): Bool
+    return self.done_count() >= self.total_count()
+  end
+
+  def finish(&mut self): Void
+    if @_ended
+      return
+    end
+    @_ended = true
+    if @resolved_mode == PROGRESS_MODE_TTY()
+      _live_unregister(self)
+    end
+    self._render_force()
+    if @resolved_mode == PROGRESS_MODE_TTY()
+      _stderr_write("\x1b[?25h")  # show cursor
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Render — inner pieces
+  # ---------------------------------------------------------------------------
+
+  def _top_active(): Vec<Progress>
+    var top = vec_new<Progress>()
+    var i = 0
+    while i < @bars.size and top.size < @max_rows
+      var p: Progress = @bars[i]
+      if not p._ended
+        top.push(p)
+      end
+      i += 1
+    end
+    return top
+  end
+
+  def _tick_one_bar(p: Progress, now: Int): Void
+    _task_update_rate(p.task, now)
+    _task_tick_smoothing(p.task)
+    var sid = _spinner_id_in_cols(p.cols)
+    if sid >= 0
+      var ival = _spin_interval(sid)
+      if now - p.task.last_frame_ms >= ival
+        p.task.frame_idx += 1
+        p.task.last_frame_ms = now
+      end
+    end
+  end
+
+  def _render_global_header(): String
+    var stats = self.stats()
+    var done = stats[0]
+    var failed = stats[1]
+    var running = stats[2]
+    var total = self.total_count()
+    var pct = 0
+    if total > 0
+      pct = ((done + failed) * 100) / total
+    end
+    var elapsed_ms = time_mono_ms() - @start_ms
+
+    var sb = sb_new()
+    sb.append("  ")
+    sb.append(Style.new().bold().fg(Cyan()).render_at(@global_label, @depth))
+    sb.append("  ")
+    # Synthetic bar: width 30, fill = (done+failed)/total
+    var bar_str = _global_bar_string(done + failed, total, 30, failed > 0, @depth)
+    sb.append(bar_str)
+    sb.append("  ")
+    var pos_str = (done + failed).to_s() + "/" + total.to_s()
+    sb.append(Style.new().bold().render_at(pos_str, @depth))
+    sb.append("  ")
+    sb.append(Style.muted().render_at(_fmt_duration_ms(elapsed_ms), @depth))
+    return sb.to_string()
+  end
+
+  def _render_summary(): String
+    var stats = self.stats()
+    var done = stats[0]
+    var failed = stats[1]
+    var running = stats[2]
+    var total = self.total_count()
+    var queued = total - done - failed - running
+    if queued < 0
+      queued = 0
+    end
+    var sb = sb_new()
+    sb.append("  ")
+    sb.append(Style.new().fg(Green()).render_at(done.to_s() + " done", @depth))
+    if failed > 0
+      sb.append(Style.muted().render_at(" · ", @depth))
+      sb.append(Style.new().fg(Red()).bold().render_at(failed.to_s() + " failed", @depth))
+    end
+    sb.append(Style.muted().render_at(" · ", @depth))
+    sb.append(Style.new().fg(Cyan()).render_at(running.to_s() + " running", @depth))
+    if queued > 0
+      sb.append(Style.muted().render_at(" · ", @depth))
+      sb.append(Style.muted().render_at(queued.to_s() + " queued", @depth))
+    end
+    return sb.to_string()
+  end
+
+  def _render_force(): Void
+    # Serialize concurrent renders from main task + I/O poller thread.
+    # Without this, ANSI escape sequences from the two writers can
+    # interleave on stderr and produce visual glitches. Quartz's mutex
+    # primitive wraps a protected value cell; we don't use the cell, so
+    # the bound `_` is ignored and the implicit release writes 0 back.
+    # Migrated to `with`-block (B.8 Phase 6) — early `return` inside the
+    # body still fires the release via wrap_stack drain at NODE_RETURN,
+    # so the four manual `mutex_unlock` calls collapse into one implicit
+    # release.
+    var m = Mutex { handle: @_render_mtx }
+    with m.lock do _unused ->
+      var now = time_mono_ms()
+      var i = 0
+      while i < @bars.size
+        self._tick_one_bar(@bars[i], now)
+        i += 1
+      end
+
+      if @resolved_mode == PROGRESS_MODE_OFF()
+        # Skip rendering — no output mode active.
+      elsif @resolved_mode == PROGRESS_MODE_JSON()
+        # JSON mode: each bar already emits its own events when state
+        # changes. The Live surface emits an aggregate snapshot.
+        self._emit_json_snapshot()
+      elsif @resolved_mode == PROGRESS_MODE_DUMB()
+        # Dumb mode: only emit aggregate counts on completion (no-op here).
+      else
+        # TTY mode
+        self._render_tty()
+      end
+      0
+    end
+  end
+
+  def _render_tty(&mut self): Void
+    var sb = sb_new()
+    # Move cursor up to the top of the previously-drawn region
+    if @last_lines > 0
+      sb.append("\x1b[")
+      sb.append(@last_lines.to_s())
+      sb.append("A")
+    end
+    var lines = 0
+
+    # Layout (top-to-bottom) — hierarchical, so the currently-running task
+    # stays pinned at the top and the completed-task log grows downward:
+    #
+    #   [ ⠸ Building compiler ]       <- active rows (pinned)
+    #
+    #   [ quake guard ████░ 3/7 17s ] <- global progress bar
+    #
+    #   [ ✓ completed task 1  ]       <- completed log (grows monotonically)
+    #   [ ✓ completed task 2  ]
+    #   ...
+    #
+    #   [ 3 done · 1 running · 3 queued ]  <- aggregate summary footer
+
+    # 1) Top N active rows (pinned at top)
+    var top = self._top_active()
+    var i = 0
+    while i < top.size
+      var p: Progress = top[i]
+      sb.append("\r\x1b[2K")
+      sb.append("  ")
+      sb.append(_columns_render(p.cols, p.task, @depth))
+      sb.append("\n")
+      lines += 1
+      i += 1
+    end
+
+    # 2) Global header (if any) — with a spacer above it when we have
+    #    active rows, so the bar feels separated from the spinner above.
+    if @has_global
+      if top.size > 0
+        sb.append("\r\x1b[2K\n")
+        lines += 1
+      end
+      sb.append("\r\x1b[2K")
+      sb.append(self._render_global_header())
+      sb.append("\n")
+      lines += 1
+    end
+
+    # 3) Completed-task log lines — render inline below the global bar.
+    #    log_queue accumulates monotonically (log() pushes, never clears)
+    #    so this renders the full completed-task history every frame.
+    if @log_queue.size > 0
+      sb.append("\r\x1b[2K\n")  # spacer above log block
+      lines += 1
+      var li = 0
+      while li < @log_queue.size
+        sb.append("\r\x1b[2K")
+        sb.append(@log_queue[li])
+        sb.append("\n")
+        lines += 1
+        li += 1
+      end
+    end
+
+    # 4) Spacer + summary footer
+    sb.append("\r\x1b[2K\n")
+    lines += 1
+    sb.append("\r\x1b[2K")
+    sb.append(self._render_summary())
+    sb.append("\n")
+    lines += 1
+
+    # Pad — if the previous frame rendered more lines than we do now
+    # (e.g. an active row just finished and moved into the log but the
+    # row count changed), clear the trailing orphan rows.
+    while lines < @last_lines
+      sb.append("\r\x1b[2K\n")
+      lines += 1
+    end
+
+    @last_lines = lines
+    _stderr_write(sb.to_string())
+  end
+
+  def _emit_json_snapshot(): Void
+    var stats = self.stats()
+    var sb = sb_new()
+    sb.append("{\"v\":1,\"event\":\"live_tick\",\"done\":")
+    sb.append(stats[0].to_s())
+    sb.append(",\"failed\":")
+    sb.append(stats[1].to_s())
+    sb.append(",\"running\":")
+    sb.append(stats[2].to_s())
+    sb.append(",\"total\":")
+    sb.append(self.total_count().to_s())
+    sb.append(",\"elapsed_ms\":")
+    sb.append((time_mono_ms() - @start_ms).to_s())
+    sb.append("}\n")
+    _stderr_write(sb.to_string())
+  end
+end
+
+# Render a global aggregate bar of the given width.
+# If failed > 0, paint the failed slice red and the success slice green.
+def _global_bar_string(done: Int, total: Int, width: Int, has_failed: Bool, depth: Int): String
+  if width <= 0
+    return ""
+  end
+  var eighths = _bar_eighths(width, done, total)
+  var full = eighths / 8
+  var partial = eighths - full * 8
+  var track = width - full
+  if partial > 0
+    track -= 1
+  end
+  if track < 0
+    track = 0
+  end
+  var fill_sb = sb_new()
+  var i = 0
+  while i < full
+    fill_sb.append("█")
+    i += 1
+  end
+  if partial > 0
+    fill_sb.append_char(0x2590 - partial)
+  end
+  var fill_str = fill_sb.to_string()
+  var empty_str = str_repeat("░", track)
+  var color = Green()
+  if has_failed
+    color = Red()
+  end
+  var sb = sb_new()
+  sb.append(Style.new().fg(color).render_at(fill_str, depth))
+  sb.append(Style.muted().render_at(empty_str, depth))
+  return sb.to_string()
+end
+
+# =============================================================================
+# Spinner — minimal one-liner API for indeterminate work
+# =============================================================================
+# Wraps Progress.spinner_only() with the success/fail/warn/info finishers
+# from the ora/yaspin tradition.
+
+## Start a spinner with the given label. Caller must call .success/.fail/.stop.
+def Spinner_start(label: String): Progress
+  return Progress.spinner_only().label(label).start()
+end
+
+# =============================================================================
+# One-shot string helpers — render a bar without a Progress lifecycle
+# =============================================================================
+# These let callers slot a progress bar into existing string-pipeline code
+# without taking on the Progress builder. Useful for legacy migration and
+# for code that wants a pure string representation.
+
+## Render a static progress bar to a string. No animation, no terminal write.
+## Width = total characters in the bar (excluding any caller-supplied frame).
+## Fill uses eighth-block sub-cell precision; output looks like
+## "[██████▍░░░░░] 51%" rather than snapping to whole-cell boundaries.
+def progress_bar_string(done: Int, total: Int, width: Int): String
+  if width <= 0
+    return ""
+  end
+  var pct = 0
+  if total > 0
+    pct = (done * 100) / total
+  end
+  var eighths = _bar_eighths(width, done, total)
+  var full = eighths / 8
+  var partial = eighths - full * 8
+  var track = width - full
+  if partial > 0
+    track -= 1
+  end
+  if track < 0
+    track = 0
+  end
+  var sb = sb_new()
+  sb.append("[")
+  var i = 0
+  while i < full
+    sb.append("█")
+    i += 1
+  end
+  if partial > 0
+    sb.append_char(0x2590 - partial)
+  end
+  var k = 0
+  while k < track
+    sb.append("░")
+    k += 1
+  end
+  sb.append("] ")
+  sb.append(pct.to_s())
+  sb.append("%")
+  return sb.to_string()
+end
+
+## Render a styled progress bar string. Uses the project's color semantics:
+## green fill on success, red fill if has_failed. Empty cells are dim.
+def progress_bar_styled(done: Int, total: Int, width: Int, has_failed: Bool): String
+  return _global_bar_string(done, total, width, has_failed, terminal::term_color_depth())
+end
+
+## Get a single spinner frame string by id and frame index.
+## frame_idx wraps modulo the spinner's frame count.
+def progress_spinner_frame(spinner_id: Int, frame_idx: Int): String
+  var frames = _spin_frames(spinner_id)
+  var idx = frame_idx
+  if idx < 0
+    idx = 0 - idx
+  end
+  return vec_get(frames, idx % vec_size(frames))
+end
+
+# =============================================================================
+# Presets — pre-composed column vectors for common tasks
+# =============================================================================
+# These return ready-to-use Progress builders. The user can still .label(),
+# .total(), .columns() to override.
+
+def _cols_download(): Vec<Col>
+  var v = vec_new<Col>()
+  v.push(Col.spinner().cyan())
+  v.push(Col.text(" "))
+  v.push(Col.label())
+  v.push(Col.text(" "))
+  v.push(Col.bar(30).cyan())
+  v.push(Col.text(" "))
+  v.push(Col.bytes())
+  v.push(Col.text(" "))
+  v.push(Col.rate().dim())
+  v.push(Col.text(" "))
+  v.push(Col.eta().dim())
+  return v
+end
+
+def _cols_build(): Vec<Col>
+  var v = vec_new<Col>()
+  v.push(Col.spinner_named("dots").green())
+  v.push(Col.text(" "))
+  v.push(Col.label().bold())
+  v.push(Col.text(" "))
+  v.push(Col.bar(30).green())
+  v.push(Col.text(" "))
+  v.push(Col.percent())
+  return v
+end
+
+def _cols_install(): Vec<Col>
+  var v = vec_new<Col>()
+  v.push(Col.spinner_named("dots").magenta())
+  v.push(Col.text(" "))
+  v.push(Col.label().bold())
+  v.push(Col.text(" "))
+  v.push(Col.msg().dim())
+  return v
+end
+
+def _cols_test(): Vec<Col>
+  var v = vec_new<Col>()
+  v.push(Col.spinner_named("dots").cyan())
+  v.push(Col.text(" "))
+  v.push(Col.label())
+  v.push(Col.text(" "))
+  v.push(Col.pos_len())
+  v.push(Col.text(" tests "))
+  v.push(Col.bar(20).cyan())
+  v.push(Col.text(" "))
+  v.push(Col.elapsed().dim())
+  return v
+end
+
+def _cols_scan(): Vec<Col>
+  var v = vec_new<Col>()
+  v.push(Col.spinner_named("dots").yellow())
+  v.push(Col.text(" "))
+  v.push(Col.label())
+  v.push(Col.text(" "))
+  v.push(Col.pos())
+  v.push(Col.text(" items "))
+  v.push(Col.rate().dim())
+  return v
+end
+
+def Progress.download(total: Int): Progress
+  var p = Progress.new(total)
+  p.cols = _cols_download()
+  return p
+end
+
+def Progress.upload(total: Int): Progress
+  var p = Progress.new(total)
+  p.cols = _cols_download()
+  return p
+end
+
+def Progress.build_preset(): Progress
+  var p = Progress.new(100)
+  p.cols = _cols_build()
+  return p
+end
+
+def Progress.install(): Progress
+  var p = Progress.new(0)
+  p.cols = _cols_install()
+  return p
+end
+
+def Progress.test_preset(total: Int): Progress
+  var p = Progress.new(total)
+  p.cols = _cols_test()
+  return p
+end
+
+def Progress.scan(): Progress
+  var p = Progress.new(0)
+  p.cols = _cols_scan()
+  return p
+end

@@ -1,0 +1,373 @@
+## Advanced Arena & Pool Allocator Tests
+##
+## Contract:
+##   1-3.   @heap: array on heap, return from function, survive scope exit.
+##   4-6.   Pool: create, alloc different blocks, free returns block for reuse.
+##   7.     Pool exhaustion: pool_alloc returns 0 when full.
+##   8-9.   Arena capacity and bytes_used tracking.
+##   10-11. Pool capacity and free_count tracking.
+##   12-13. Arena chaining: overflow to new block, large multi-block allocation.
+##   14-15. Arena reset/destroy lifecycle.
+##   16.    Single allocation larger than default block size (65536 bytes).
+##   17-19. Safety errors: QZ1401 (use after reset/destroy), QZ1402 (escape scope).
+##   20.    Pool safety: QZ1401 after pool_destroy.
+##   21.    arena_pool_new: create, acquire, release, destroy.
+##   22.    @arena_name array placement allocation.
+##   23.    Caller controls allocation lifetime via arena handle.
+##
+## NOTE: Arena safety checker tracks variable names globally within a function.
+## Each test closure must use UNIQUE variable names to avoid cross-closure
+## false positives from the safety analysis.
+import * from qspec
+import * from qspec/subprocess
+
+@value
+struct Point
+  x: Int
+  y: Int
+end
+
+struct HeapPoint
+  x: Int
+  y: Int
+end
+
+def make_heap_point(): Point
+  var p = @heap Point { x: 42, y: 99 }
+  return p
+end
+
+def make_heap_array(): Vec<Int>
+  return @heap [10, 20, 30]
+end
+
+def alloc_in_fn(a: Int): Int
+  return arena_alloc(a, 64)
+end
+
+def main(): Int
+  # ===========================================================================
+  # @heap tests
+  # ===========================================================================
+  describe("@heap allocation") do ->
+    it("@heap array on heap") do ->
+      var arr = @heap [1, 2, 3]
+      assert_eq(arr[0], 1)
+      assert_eq(arr[1], 2)
+      assert_eq(arr[2], 3)
+    end
+
+    it("heap allocations can be returned") do ->
+      var arr2 = make_heap_array()
+      assert_eq(arr2[0], 10)
+      assert_eq(arr2[1], 20)
+      assert_eq(arr2[2], 30)
+      var pt = make_heap_point()
+      assert_eq(pt.x, 42)
+      assert_eq(pt.y, 99)
+    end
+
+    it("heap allocations survive scope exit") do ->
+      var pt2 = make_heap_point()
+      # Access fields after the allocating function has returned
+      assert_eq(pt2.x, 42)
+      assert_eq(pt2.y, 99)
+    end
+  end
+
+  # ===========================================================================
+  # Pool tests
+  # ===========================================================================
+  describe("pool allocator") do ->
+    it("pool_new creates a pool") do ->
+      var pool1 = pool_new(64, 8)
+      assert_eq(pool_capacity(pool1), 8)
+      pool_destroy(pool1)
+    end
+
+    it("pool_alloc returns different blocks") do ->
+      var pool2 = pool_new(64, 4)
+      var blk2a = pool_alloc(pool2)
+      var blk2b = pool_alloc(pool2)
+      assert_ne(blk2a, 0)
+      assert_ne(blk2b, 0)
+      assert_ne(blk2a, blk2b)
+      pool_destroy(pool2)
+    end
+
+    it("pool_free returns block for reuse") do ->
+      var pool3 = pool_new(64, 2)
+      var blk3a = pool_alloc(pool3)
+      pool_free(pool3, blk3a)
+      var blk3b = pool_alloc(pool3)
+      # Freed block is returned on next alloc (LIFO free list)
+      assert_eq(blk3a, blk3b)
+      pool_destroy(pool3)
+    end
+
+    it("pool_alloc returns 0 when exhausted") do ->
+      var pool4 = pool_new(64, 2)
+      var blk4a = pool_alloc(pool4)
+      var blk4b = pool_alloc(pool4)
+      var blk4c = pool_alloc(pool4)
+      assert_ne(blk4a, 0)
+      assert_ne(blk4b, 0)
+      assert_eq(blk4c, 0)
+      pool_destroy(pool4)
+    end
+
+    it("pool_capacity returns block count") do ->
+      var pool5 = pool_new(128, 16)
+      assert_eq(pool_capacity(pool5), 16)
+      pool_destroy(pool5)
+    end
+
+    it("pool_free_count tracks available blocks") do ->
+      var pool6 = pool_new(64, 4)
+      # Initially all blocks are free
+      assert_eq(pool_free_count(pool6), 4)
+      var blk6a = pool_alloc(pool6)
+      assert_eq(pool_free_count(pool6), 3)
+      var blk6b = pool_alloc(pool6)
+      assert_eq(pool_free_count(pool6), 2)
+      pool_free(pool6, blk6a)
+      assert_eq(pool_free_count(pool6), 3)
+      pool_free(pool6, blk6b)
+      assert_eq(pool_free_count(pool6), 4)
+      pool_destroy(pool6)
+    end
+
+    it("pool_alloc_count tracks allocated blocks") do ->
+      var pool7 = pool_new(64, 4)
+      assert_eq(pool_alloc_count(pool7), 0)
+      var blk7a = pool_alloc(pool7)
+      assert_eq(pool_alloc_count(pool7), 1)
+      var blk7b = pool_alloc(pool7)
+      assert_eq(pool_alloc_count(pool7), 2)
+      pool_free(pool7, blk7a)
+      assert_eq(pool_alloc_count(pool7), 1)
+      pool_destroy(pool7)
+    end
+  end
+
+  # ===========================================================================
+  # Arena advanced tests
+  # ===========================================================================
+  describe("arena advanced") do ->
+    it("arena_capacity returns total size") do ->
+      var ar1 = arena_new()
+      assert_eq(arena_capacity(ar1), 65536)
+      arena_destroy(ar1)
+    end
+
+    it("arena_bytes_used tracks allocation") do ->
+      var ar2 = arena_new()
+      assert_eq(arena_bytes_used(ar2), 0)
+      arena_alloc(ar2, 64)
+      assert_eq(arena_bytes_used(ar2), 64)
+      arena_alloc(ar2, 128)
+      assert_eq(arena_bytes_used(ar2), 192)
+      arena_destroy(ar2)
+    end
+
+    it("arena chaining on overflow") do ->
+      var ar3 = arena_new()
+      assert_eq(arena_block_count(ar3), 1)
+      # First block is 65536 bytes; filling it forces a second block
+      arena_alloc(ar3, 65536)
+      arena_alloc(ar3, 64)
+      assert_eq(arena_block_count(ar3), 2)
+      arena_destroy(ar3)
+    end
+
+    it("large allocation across many blocks") do ->
+      var ar4 = arena_new()
+      # 80 * 1024 = 81920 bytes, larger than one 65536-byte block
+      arena_alloc(ar4, 81920)
+      assert_gt(arena_block_count(ar4), 1)
+      assert_gt(arena_bytes_used(ar4), 81919)
+      arena_destroy(ar4)
+    end
+
+    it("reset clears all blocks") do ->
+      var ar5 = arena_new()
+      arena_alloc(ar5, 2048)
+      arena_alloc(ar5, 2048)
+      assert_gt(arena_bytes_used(ar5), 0)
+      arena_reset(ar5)
+      assert_eq(arena_bytes_used(ar5), 0)
+      arena_destroy(ar5)
+    end
+
+    it("destroy frees all blocks (no crash)") do ->
+      var ar6 = arena_new()
+      arena_alloc(ar6, 1024)
+      arena_alloc(ar6, 4096)
+      arena_alloc(ar6, 512)
+      arena_destroy(ar6)
+      # Reaching here without SIGSEGV means destroy succeeded
+      assert_eq(0, 0)
+    end
+
+    it("single allocation larger than block") do ->
+      var ar7 = arena_new()
+      var ar7_ptr = arena_alloc(ar7, 131072)
+      assert_ne(ar7_ptr, 0)
+      # 131072 > 65536 default block, so chaining must occur
+      assert_eq(arena_block_count(ar7), 2)
+      assert_eq(arena_bytes_used(ar7), 131072)
+      arena_destroy(ar7)
+    end
+
+    it("caller controls allocation lifetime via arena") do ->
+      var ar8 = arena_new()
+      # Allocate inside a different function, using caller's arena
+      var ar8_ptr = alloc_in_fn(ar8)
+      assert_ne(ar8_ptr, 0)
+      assert_eq(arena_bytes_used(ar8), 64)
+      arena_destroy(ar8)
+    end
+  end
+
+  # ===========================================================================
+  # Arena pool tests
+  # ===========================================================================
+  describe("arena pool") do ->
+    it("arena_pool_new creates pool of arenas") do ->
+      var ap1 = arena_pool_new(4096, 4)
+      assert_eq(arena_pool_capacity(ap1), 4)
+      arena_pool_destroy(ap1)
+    end
+
+    it("arena_pool_acquire and release cycle") do ->
+      var ap2 = arena_pool_new(4096, 3)
+      assert_eq(arena_pool_available(ap2), 3)
+      var acq1 = arena_pool_acquire(ap2)
+      assert_ne(acq1, 0)
+      assert_eq(arena_pool_available(ap2), 2)
+      arena_pool_release(ap2, acq1)
+      assert_eq(arena_pool_available(ap2), 3)
+      arena_pool_destroy(ap2)
+    end
+  end
+
+  # ===========================================================================
+  # @arena_name placement allocation
+  # ===========================================================================
+  describe("@arena_name placement") do ->
+    it("@arena_name array allocates from arena") do ->
+      var place_ar = arena_new()
+      var used_before = arena_bytes_used(place_ar)
+      var place_arr = @place_ar [10, 20, 30]
+      var used_after = arena_bytes_used(place_ar)
+      # Array header (32 bytes) + data (3 * 8 = 24 bytes) = 56 bytes
+      assert_gt(used_after, used_before)
+      assert_eq(place_arr[0], 10)
+      assert_eq(place_arr[1], 20)
+      assert_eq(place_arr[2], 30)
+      arena_destroy(place_ar)
+    end
+
+    it("@arena_name struct allocates from arena") do ->
+      var sar = arena_new()
+      var used_b = arena_bytes_used(sar)
+      var sp = @sar HeapPoint { x: 42, y: 99 }
+      var used_a = arena_bytes_used(sar)
+      # HeapPoint has 2 fields × 8 bytes = 16 bytes from arena
+      assert_gt(used_a, used_b)
+      assert_eq(sp.x, 42)
+      assert_eq(sp.y, 99)
+      arena_destroy(sar)
+    end
+  end
+
+  # ===========================================================================
+  # Safety error tests (subprocess)
+  # ===========================================================================
+  describe("arena safety errors") do ->
+    it("use after reset is QZ1401") do ->
+      assert_compile_error("""
+        def main(): Int
+          var a = arena_new()
+          var p = arena_alloc(a, 64)
+          arena_reset(a)
+          puts(str_from_int(p))
+          return 0
+        end
+        """, "QZ1401")
+    end
+
+    it("use after destroy is QZ1401") do ->
+      assert_compile_error("""
+        def main(): Int
+          var a = arena_new()
+          var p = arena_alloc(a, 64)
+          arena_destroy(a)
+          puts(str_from_int(p))
+          return 0
+        end
+        """, "QZ1401")
+    end
+
+    it("allocation escapes scoped arena is QZ1402") do ->
+      assert_compile_error("""
+        def alloc_scoped(): Int
+          arena my_arena do
+            var p = arena_alloc(my_arena, 64)
+            return p
+          end
+          return 0
+        end
+        def main(): Int
+          var x = alloc_scoped()
+          return 0
+        end
+        """, "QZ1402")
+    end
+
+    it("pool use after destroy is QZ1401") do ->
+      assert_compile_error("""
+        def main(): Int
+          var p = pool_new(64, 4)
+          var b = pool_alloc(p)
+          pool_destroy(p)
+          puts(str_from_int(b))
+          return 0
+        end
+        """, "QZ1401")
+    end
+  end
+
+  # ===========================================================================
+  # Pending — genuinely not working
+  # ===========================================================================
+  describe("blocked features") do ->
+    it("Arena$drop called automatically on scope exit") do ->
+      assert_run_exits("""
+        import memory
+        def use_arena(): Int
+          var a = arena_create()
+          var p = a.allocate(64)
+          return 0
+        end
+        def main(): Int
+          use_arena()
+          return 0
+        end
+        """, 0)
+    end
+
+    it("arena_alloc<Point> typed allocator") do ->
+      var a = arena_new()
+      var p = arena_alloc<Point>(a)
+      ptr_write(p, 10)
+      ptr_write(p + 8, 20)
+      var x = ptr_read(p)
+      var y = ptr_read(p + 8)
+      arena_destroy(a)
+      assert_eq(x + y, 30)
+    end
+  end
+
+  return qspec_main()
+end

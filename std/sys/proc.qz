@@ -1,0 +1,1615 @@
+## std/sys/proc.qz — system info reader.
+##
+## Gives the caller a `Snapshot` describing current CPU, memory, and
+## process state. The data layer for VIGIL and any other dashboard /
+## ops tool that needs system metrics.
+##
+## ### Platforms
+##
+## **Linux**: reads `/proc/stat`, `/proc/meminfo`, `/proc/loadavg`,
+## `/proc/[pid]/{stat,status,cmdline}`, and (when available)
+## `/proc/pressure/{cpu,memory,io}`. Sub-millisecond per snapshot.
+##
+## **macOS (Darwin)**: shells out to `ps`, `vm_stat`, `sysctl`, and
+## `top -l 1 -n 0` for aggregate CPU%. The `top` call is the slow
+## path (~1s/sample); callers wanting fast snapshots can disable it
+## via `proc_take_snapshot_options` (Phase 2 — for now `top` runs
+## every snapshot). Per-core CPU% on macOS is filed for Phase 2 — it
+## requires `host_processor_info` FFI which is out of Phase 1 scope.
+##
+## **Other Unix-likes** fall through the macOS path on a best-effort
+## basis (`ps` is POSIX); CPU% will be 0 if `top -l 1` syntax differs.
+##
+## ### Snapshot semantics
+##
+## A `Snapshot` is a self-contained value object — no handles, no
+## file descriptors held open. CPU%-style numbers are absolute and
+## valid in the moment; comparing two snapshots gives reliable
+## deltas. Pass the previous snapshot to `proc_take_snapshot(prev)`
+## so the new snapshot's `cpu_aggregate_pct` and `cpu_per_core_pct`
+## can be computed as deltas (Linux); the first call (prev = None)
+## reports 0% as a baseline.
+##
+## ### Why integers
+##
+## Same rationale as the spark widget — Phase 1 ships Int, scaled
+## semantically (CPU% in 0..100, memory in KiB). Sub-percent
+## precision lives in Phase 2 if a consumer needs it.
+##
+## @since 5.28.x
+
+import std/io/file
+import std/shell
+
+# ============================================================
+# Public types
+# ============================================================
+
+## Per-CPU stat. On Linux these carry real jiffies counters so two
+## snapshots yield a precise %; on macOS the jiffies fields are 0
+## and `pct` is parsed directly from `top`'s aggregate line.
+##
+## `pct` is in 0..100. Aggregated per-core values do not necessarily
+## sum to the aggregate — schedulers count idle ticks per-core and
+## the per-core / aggregate scales are independent.
+struct CpuStat
+  total_jiffies: Int
+  idle_jiffies:  Int
+  pct:           Int
+end
+
+## Memory stat. Sizes in KiB. `available_kb` is Linux's
+## `MemAvailable` (kernel-computed estimate of usable memory without
+## swapping); on macOS it's approximated as `free + inactive`.
+struct MemStat
+  total_kb:      Int
+  used_kb:       Int
+  free_kb:       Int
+  available_kb:  Int
+  buffers_kb:    Int
+  cached_kb:     Int
+  swap_total_kb: Int
+  swap_used_kb:  Int
+end
+
+## Per-process stat. `cpu_pct` is the platform's reported %CPU at
+## the time of the snapshot (top-line parse on macOS, computed delta
+## on Linux). `state` is one character: `R` running, `S` sleeping,
+## `D` uninterruptible, `Z` zombie, `T` stopped.
+struct ProcStat
+  pid:      Int
+  ppid:     Int
+  user:     String
+  command:  String
+  cpu_pct:  Int
+  rss_kb:   Int
+  state:    String
+end
+
+## Pressure-stall info (Linux only). Each is a percent in 0..100
+## representing the fraction of recent time at least one task
+## (`some`) or all tasks (`full`) were stalled waiting for the
+## resource. macOS sets all fields to 0 and `available = false`.
+struct PressureStat
+  available:    Bool
+  cpu_some:     Int
+  cpu_full:     Int
+  mem_some:     Int
+  mem_full:     Int
+  io_some:      Int
+  io_full:      Int
+end
+
+## Per-device disk stats. `read_bytes_total` / `write_bytes_total`
+## are cumulative counters (Linux: sectors × 512; macOS: best-effort
+## from iostat). `read_bytes_per_sec` / `write_bytes_per_sec` are
+## computed deltas vs the previous snapshot. `util_pct` is the
+## fraction of time the device was busy (Linux only — derived from
+## the ms_doing_io counter delta; macOS sets to 0).
+struct DiskStat
+  name:                String
+  read_bytes_total:    Int
+  write_bytes_total:   Int
+  read_bytes_per_sec:  Int
+  write_bytes_per_sec: Int
+  util_pct:            Int
+end
+
+## Kernel OOM-kill event. Parsed from `dmesg` / `journalctl -k` on
+## Linux. `timestamp` is the verbatim text leading the line (the
+## journalctl date or the dmesg uptime — we don't normalise; the
+## shape varies and the user can read either form). `victim_pid` /
+## `victim_name` come from "Killed process N (NAME)". `rss_kb` is
+## the anon-rss portion at kill time. macOS produces no events.
+struct OomEvent
+  timestamp:   String
+  victim_pid:  Int
+  victim_name: String
+  rss_kb:      Int
+end
+
+## Per-interface network stats. Counters are cumulative; per-second
+## rates are deltas vs prior snapshot.
+struct NetStat
+  name:                String
+  rx_bytes_total:      Int
+  tx_bytes_total:      Int
+  rx_bytes_per_sec:    Int
+  tx_bytes_per_sec:    Int
+  rx_packets:          Int
+  tx_packets:          Int
+  rx_errors:           Int
+  tx_errors:           Int
+end
+
+## Platform tag. Useful for consumers that want to suppress
+## Linux-only UI affordances on macOS.
+def PLATFORM_UNKNOWN(): Int = 0
+def PLATFORM_LINUX():   Int = 1
+def PLATFORM_DARWIN():  Int = 2
+
+## Top-level snapshot. Fields are named to match the `Snapshot`
+## struct in the VIGIL design doc.
+struct Snapshot
+  timestamp_ns:        Int
+  platform:            Int
+  cpu_aggregate:       CpuStat
+  cpu_per_core:        Vec<CpuStat>
+  mem:                 MemStat
+  processes:           Vec<ProcStat>
+  pressure:            PressureStat
+  disks:               Vec<DiskStat>
+  nics:                Vec<NetStat>
+  oom_events:          Vec<OomEvent>     # rolling window — Linux only
+  load_1:              Int   # load average × 100, so 1.23 → 123
+  load_5:              Int
+  load_15:             Int
+end
+
+# ============================================================
+# Platform detection
+# ============================================================
+
+## Detect the host platform once. Cheap (one stat call); callers can
+## cache the result if they care.
+def proc_platform(): Int
+  if file_exists("/proc/stat")
+    return PLATFORM_LINUX()
+  end
+  # Cheap macOS fingerprint — `sw_vers` is on every Darwin install.
+  if file_exists("/System/Library/CoreServices/SystemVersion.plist")
+    return PLATFORM_DARWIN()
+  end
+  # POSIX fallback. Anything that responds to `uname -s` we treat as
+  # darwin-shaped (ps + vm_stat usually present).
+  return PLATFORM_DARWIN()
+end
+
+# ============================================================
+# Empty snapshot
+# ============================================================
+
+## A baseline Snapshot with all fields zeroed. Use this as the seed
+## "previous snapshot" on the first tick of a sampler.
+def proc_empty_snapshot(): Snapshot
+  return Snapshot {
+    timestamp_ns:  0,
+    platform:      proc_platform(),
+    cpu_aggregate: _proc_zero_cpu(),
+    cpu_per_core:  vec_new<CpuStat>(),
+    mem:           _proc_zero_mem(),
+    processes:     vec_new<ProcStat>(),
+    pressure:      _proc_zero_pressure(),
+    disks:         vec_new<DiskStat>(),
+    nics:          vec_new<NetStat>(),
+    oom_events:    vec_new<OomEvent>(),
+    load_1:        0,
+    load_5:        0,
+    load_15:       0
+  }
+end
+
+def _proc_zero_cpu(): CpuStat
+  return CpuStat {
+    total_jiffies: 0,
+    idle_jiffies:  0,
+    pct:           0
+  }
+end
+
+def _proc_zero_mem(): MemStat
+  return MemStat {
+    total_kb:      0,
+    used_kb:       0,
+    free_kb:       0,
+    available_kb:  0,
+    buffers_kb:    0,
+    cached_kb:     0,
+    swap_total_kb: 0,
+    swap_used_kb:  0
+  }
+end
+
+def _proc_zero_pressure(): PressureStat
+  return PressureStat {
+    available: false,
+    cpu_some:  0,
+    cpu_full:  0,
+    mem_some:  0,
+    mem_full:  0,
+    io_some:   0,
+    io_full:   0
+  }
+end
+
+# ============================================================
+# Public API
+# ============================================================
+
+## Take a fresh snapshot. Pass the previous snapshot so CPU%-style
+## counters can be computed as deltas (on Linux); pass
+## `proc_empty_snapshot()` on the first tick.
+##
+## Returns a fully-populated Snapshot. Errors during reads (missing
+## /proc files, ps EOF, etc) silently degrade to zero values for the
+## affected fields — a Snapshot is always returned.
+def proc_take_snapshot(prev: Snapshot): Snapshot
+  var p = proc_platform()
+  if p == PLATFORM_LINUX()
+    return _proc_linux_take_snapshot(prev)
+  end
+  return _proc_darwin_take_snapshot(prev)
+end
+
+# ============================================================
+# Pure parsers (unit-testable on any platform)
+# ============================================================
+
+## Parse a single integer out of `s` (no leading whitespace). Returns
+## (value, bytes_consumed). A non-digit start returns (0, 0).
+def _proc_parse_int(s: String): Vec<Int>
+  var out = vec_new<Int>()
+  var n = s.size
+  var i = 0
+  var negative = false
+  if i < n
+    var c0 = s[i]
+    if c0 == 45                     # '-'
+      negative = true
+      i += 1
+    end
+  end
+  var start = i
+  var acc = 0
+  while i < n
+    var c = s[i]
+    if c < 48 or c > 57             # not '0'..'9'
+      out.push(0)
+      out.push(0)
+      return out
+    end
+    acc = acc * 10 + (c - 48)
+    i += 1
+    # Stop on the first non-digit. This branch is unreachable here
+    # because we already returned above; the early break happens on
+    # the surrounding caller (which passes us a tokenised digit run).
+  end
+  if i == start
+    out.push(0)
+    out.push(0)
+    return out
+  end
+  if negative
+    acc = -acc
+  end
+  out.push(acc)
+  out.push(i)
+  return out
+end
+
+## Strip leading whitespace; return the trimmed string.
+def _proc_ltrim(s: String): String
+  var n = s.size
+  var i = 0
+  while i < n
+    var c = s[i]
+    if c == 32 or c == 9 or c == 10 or c == 13
+      i += 1
+    else
+      return _proc_substring(s, i, n)
+    end
+  end
+  return ""
+end
+
+## Substring helper — Quartz `str_substring` is the canonical name
+## but takes (start, end) inclusive/exclusive; bind to whichever is
+## actually shipped.
+def _proc_substring(s: String, start: Int, finish: Int): String
+  var n = s.size
+  var lo = start
+  var hi = finish
+  if lo < 0
+    lo = 0
+  end
+  if hi > n
+    hi = n
+  end
+  if lo >= hi
+    return ""
+  end
+  var sb = sb_new()
+  var i = lo
+  while i < hi
+    sb_append_byte(sb, s[i])
+    i += 1
+  end
+  return sb_to_string(sb)
+end
+
+## Tokenise on whitespace. Returns each non-empty run.
+def _proc_tokens(s: String): Vec<String>
+  var out = vec_new<String>()
+  var n = s.size
+  var i = 0
+  while i < n
+    var c = s[i]
+    while i < n and (c == 32 or c == 9 or c == 10 or c == 13)
+      i += 1
+      if i < n
+        c = s[i]
+      end
+    end
+    if i >= n
+      break
+    end
+    var start = i
+    while i < n and s[i] != 32 and s[i] != 9 and s[i] != 10 and s[i] != 13
+      i += 1
+    end
+    out.push(_proc_substring(s, start, i))
+  end
+  return out
+end
+
+## Token → integer. Non-numeric tokens become 0. Used for /proc/stat,
+## /proc/meminfo, ps fields where the token is known to be a digit
+## run.
+def _proc_token_to_int(tok: String): Int
+  var n = tok.size
+  if n == 0
+    return 0
+  end
+  var i = 0
+  var negative = false
+  var c0 = tok[0]
+  if c0 == 45
+    negative = true
+    i = 1
+  end
+  if c0 == 43
+    i = 1
+  end
+  if i >= n
+    return 0
+  end
+  var acc = 0
+  while i < n
+    var c = tok[i]
+    if c < 48 or c > 57
+      return 0
+    end
+    acc = acc * 10 + (c - 48)
+    i += 1
+  end
+  if negative
+    return -acc
+  end
+  return acc
+end
+
+## "12.34" or "12.3" → 1234 (i.e. value × 100). Truncates extras,
+## pads short fractions. Non-numeric returns 0. Used for parsing
+## load average and macOS `top` decimal CPU%.
+def _proc_decimal_x100(tok: String): Int
+  var n = tok.size
+  if n == 0
+    return 0
+  end
+  var i = 0
+  var negative = false
+  var c0 = tok[0]
+  if c0 == 45
+    negative = true
+    i = 1
+  end
+  var int_part = 0
+  while i < n
+    var c = tok[i]
+    if c == 46                     # '.'
+      break
+    end
+    if c < 48 or c > 57
+      return 0
+    end
+    int_part = int_part * 10 + (c - 48)
+    i += 1
+  end
+  var frac = 0
+  var frac_digits = 0
+  if i < n and tok[i] == 46
+    i += 1
+    while i < n and frac_digits < 2
+      var c = tok[i]
+      if c < 48 or c > 57
+        break
+      end
+      frac = frac * 10 + (c - 48)
+      frac_digits += 1
+      i += 1
+    end
+    while frac_digits < 2
+      frac = frac * 10
+      frac_digits += 1
+    end
+  end
+  var v = int_part * 100 + frac
+  if negative
+    return -v
+  end
+  return v
+end
+
+## Parse one line of /proc/stat. Each line begins with a tag like
+## `cpu`, `cpu0`, `cpu1`, ... followed by jiffy counters in fixed
+## order: user nice system idle iowait irq softirq steal guest
+## guest_nice. Returns a CpuStat with `total = sum of all` and
+## `idle = idle + iowait`. `pct` stays 0 — caller computes deltas.
+def proc_parse_proc_stat_line(line: String): CpuStat
+  var toks = _proc_tokens(line)
+  if toks.size < 5
+    return _proc_zero_cpu()
+  end
+  # toks[0] is the tag (e.g. "cpu" or "cpu0"); skip.
+  var i = 1
+  var total = 0
+  var idle = 0
+  while i < toks.size
+    var v = _proc_token_to_int(toks[i])
+    total += v
+    # Linux convention: idle is field index 4, iowait is 5
+    # (1-indexed in /proc/stat columns). With our skip, i==4 is idle,
+    # i==5 is iowait.
+    if i == 4 or i == 5
+      idle += v
+    end
+    i += 1
+  end
+  return CpuStat {
+    total_jiffies: total,
+    idle_jiffies:  idle,
+    pct:           0
+  }
+end
+
+## Compute CPU% delta from prev/curr jiffies. Returns 0 when total
+## hasn't advanced (first sample, or sub-tick re-sample).
+def proc_compute_cpu_pct(prev: CpuStat, curr: CpuStat): Int
+  var dt = curr.total_jiffies - prev.total_jiffies
+  if dt <= 0
+    return 0
+  end
+  var di = curr.idle_jiffies - prev.idle_jiffies
+  if di < 0
+    di = 0
+  end
+  if di > dt
+    di = dt
+  end
+  var busy = dt - di
+  return busy * 100 / dt
+end
+
+## Parse the /proc/meminfo body (newline-separated `Key: NNN kB`).
+def proc_parse_meminfo(content: String): MemStat
+  var lines = str_split(content, "\n")
+  var total = 0
+  var free = 0
+  var avail = 0
+  var buffers = 0
+  var cached = 0
+  var swap_total = 0
+  var swap_free = 0
+  var i = 0
+  while i < lines.size
+    var line = lines[i]
+    var toks = _proc_tokens(line)
+    if toks.size >= 2
+      var key = toks[0]
+      var val = _proc_token_to_int(toks[1])
+      if key == "MemTotal:"
+        total = val
+      end
+      if key == "MemFree:"
+        free = val
+      end
+      if key == "MemAvailable:"
+        avail = val
+      end
+      if key == "Buffers:"
+        buffers = val
+      end
+      if key == "Cached:"
+        cached = val
+      end
+      if key == "SwapTotal:"
+        swap_total = val
+      end
+      if key == "SwapFree:"
+        swap_free = val
+      end
+    end
+    i += 1
+  end
+  if avail == 0
+    avail = free + buffers + cached
+  end
+  var used = total - free - buffers - cached
+  if used < 0
+    used = 0
+  end
+  return MemStat {
+    total_kb:      total,
+    used_kb:       used,
+    free_kb:       free,
+    available_kb:  avail,
+    buffers_kb:    buffers,
+    cached_kb:     cached,
+    swap_total_kb: swap_total,
+    swap_used_kb:  swap_total - swap_free
+  }
+end
+
+## Parse a /proc/loadavg line: "0.52 0.58 0.59 1/123 4567"
+## Returns Vec<Int> of three load×100 values.
+def proc_parse_loadavg(content: String): Vec<Int>
+  var out = vec_new<Int>()
+  var toks = _proc_tokens(content)
+  var i = 0
+  while i < 3
+    var v = 0
+    if i < toks.size
+      v = _proc_decimal_x100(toks[i])
+    end
+    out.push(v)
+    i += 1
+  end
+  return out
+end
+
+## Parse a /proc/pressure/<resource> file:
+##
+##   some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+##   full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+##
+## Returns Vec<Int> (some_pct_x100, full_pct_x100). Uses the avg10
+## value as the "live" pressure estimate.
+def proc_parse_pressure(content: String): Vec<Int>
+  var out = vec_new<Int>()
+  var lines = str_split(content, "\n")
+  var some = 0
+  var full = 0
+  var i = 0
+  while i < lines.size
+    var line = lines[i]
+    var toks = _proc_tokens(line)
+    if toks.size >= 2
+      # toks[1] is "avg10=0.34"
+      var head = toks[0]
+      var avg10 = toks[1]
+      # Strip "avg10=" prefix (6 chars).
+      if avg10.size > 6
+        var val = _proc_decimal_x100(_proc_substring(avg10, 6, avg10.size))
+        if head == "some"
+          some = val
+        end
+        if head == "full"
+          full = val
+        end
+      end
+    end
+    i += 1
+  end
+  out.push(some)
+  out.push(full)
+  return out
+end
+
+## Parse a `ps -axo pid,ppid,user,pcpu,rss,vsz,stat,comm` line.
+## Returns ProcStat; pid==0 indicates a parse failure (caller
+## filters).
+def proc_parse_ps_line(line: String): ProcStat
+  var toks = _proc_tokens(line)
+  if toks.size < 8
+    return ProcStat {
+      pid:     0,
+      ppid:    0,
+      user:    "",
+      command: "",
+      cpu_pct: 0,
+      rss_kb:  0,
+      state:   ""
+    }
+  end
+  var pid = _proc_token_to_int(toks[0])
+  var ppid = _proc_token_to_int(toks[1])
+  var user = toks[2]
+  var pcpu = _proc_decimal_x100(toks[3]) / 100   # back to integer percent
+  var rss = _proc_token_to_int(toks[4])
+  # vsz toks[5] ignored
+  var stat = toks[6]
+  # COMM may have spaces — re-glue tokens 7..end.
+  var sb = sb_new()
+  var i = 7
+  while i < toks.size
+    if i > 7
+      sb_append(sb, " ")
+    end
+    sb_append(sb, toks[i])
+    i += 1
+  end
+  var state = ""
+  if stat.size > 0
+    state = _proc_substring(stat, 0, 1)
+  end
+  return ProcStat {
+    pid:     pid,
+    ppid:    ppid,
+    user:    user,
+    command: sb_to_string(sb),
+    cpu_pct: pcpu,
+    rss_kb:  rss,
+    state:   state
+  }
+end
+
+## Parse macOS `top -l 1` aggregate CPU line:
+##   "CPU usage: 8.59% user, 11.78% sys, 79.61% idle"
+## Returns the busy % (user + sys) as Int 0..100.
+def proc_parse_top_cpu_line(line: String): Int
+  var toks = _proc_tokens(line)
+  var i = 0
+  var user = 0
+  var sys_pct = 0
+  while i < toks.size
+    var t = toks[i]
+    # Look for "<n>%" tokens. Strip trailing "%" if present.
+    var has_pct = false
+    if t.size > 0 and t[t.size - 1] == 37     # '%'
+      has_pct = true
+      t = _proc_substring(t, 0, t.size - 1)
+    end
+    if has_pct
+      var v = _proc_decimal_x100(t) / 100
+      if i + 1 < toks.size
+        var label = toks[i + 1]
+        if str_starts_with(label, "user")
+          user = v
+        end
+        if str_starts_with(label, "sys")
+          sys_pct = v
+        end
+      end
+    end
+    i += 1
+  end
+  return user + sys_pct
+end
+
+## Parse `vm_stat` output (macOS). Returns a partial MemStat using
+## the page-size-based conversion. Missing fields default to 0.
+def proc_parse_vm_stat(content: String, page_bytes: Int): MemStat
+  var lines = str_split(content, "\n")
+  var pages_free = 0
+  var pages_active = 0
+  var pages_inactive = 0
+  var pages_speculative = 0
+  var pages_wired = 0
+  var pages_compressed = 0
+  var i = 0
+  while i < lines.size
+    var line = lines[i]
+    if str_starts_with(line, "Pages free:")
+      pages_free = _proc_token_to_int(_proc_last_int_token(line))
+    end
+    if str_starts_with(line, "Pages active:")
+      pages_active = _proc_token_to_int(_proc_last_int_token(line))
+    end
+    if str_starts_with(line, "Pages inactive:")
+      pages_inactive = _proc_token_to_int(_proc_last_int_token(line))
+    end
+    if str_starts_with(line, "Pages speculative:")
+      pages_speculative = _proc_token_to_int(_proc_last_int_token(line))
+    end
+    if str_starts_with(line, "Pages wired down:")
+      pages_wired = _proc_token_to_int(_proc_last_int_token(line))
+    end
+    if str_starts_with(line, "Pages occupied by compressor:")
+      pages_compressed = _proc_token_to_int(_proc_last_int_token(line))
+    end
+    i += 1
+  end
+  var pb = page_bytes
+  if pb <= 0
+    pb = 16384       # Apple Silicon default
+  end
+  var kb_per_page = pb / 1024
+  var total = (pages_free + pages_active + pages_inactive +
+               pages_speculative + pages_wired + pages_compressed) * kb_per_page
+  var used = (pages_active + pages_wired + pages_compressed) * kb_per_page
+  var free = pages_free * kb_per_page
+  var avail = (pages_free + pages_inactive + pages_speculative) * kb_per_page
+  return MemStat {
+    total_kb:      total,
+    used_kb:       used,
+    free_kb:       free,
+    available_kb:  avail,
+    buffers_kb:    0,
+    cached_kb:     pages_inactive * kb_per_page,
+    swap_total_kb: 0,
+    swap_used_kb:  0
+  }
+end
+
+## Parse a single /proc/diskstats line. Format (Linux 2.6+):
+##   major minor name reads_completed reads_merged sectors_read
+##   ms_reading writes_completed writes_merged sectors_written
+##   ms_writing ios_in_progress ms_doing_io weighted_ms_io [...]
+## Returns a DiskStat with raw counters (sectors × 512 = bytes); the
+## per-second rates are computed by the caller against a prior snapshot.
+def proc_parse_diskstats_line(line: String): DiskStat
+  var toks = _proc_tokens(line)
+  if toks.size < 14
+    return DiskStat {
+      name:                "",
+      read_bytes_total:    0,
+      write_bytes_total:   0,
+      read_bytes_per_sec:  0,
+      write_bytes_per_sec: 0,
+      util_pct:            0
+    }
+  end
+  var name = toks[2]
+  # toks[3]=reads, toks[5]=sectors_read, toks[7]=writes, toks[9]=sectors_written
+  var sectors_read = _proc_token_to_int(toks[5])
+  var sectors_written = _proc_token_to_int(toks[9])
+  return DiskStat {
+    name:                name,
+    read_bytes_total:    sectors_read * 512,
+    write_bytes_total:   sectors_written * 512,
+    read_bytes_per_sec:  0,
+    write_bytes_per_sec: 0,
+    util_pct:            0
+  }
+end
+
+## Filter a parsed list to "real" disks — drop loop devices and
+## per-partition entries that share a parent device. We keep entries
+## whose name doesn't have a numeric suffix (e.g. "sda" yes, "sda1"
+## no; "nvme0n1" yes, "nvme0n1p1" no). loop/dm/ram devices are
+## kept because some users do care about their dm-X mounts; they
+## just stay at zero traffic and sort to the bottom.
+def proc_diskstats_is_top_level(name: String): Bool
+  if name.size == 0
+    return false
+  end
+  var last = name[name.size - 1]
+  # Non-digit tail → top-level. sda/sdb/dm-0(no — '0' is digit!)/etc.
+  # 'dm-0' falls through to the digit-tail branch below.
+  if last < 48
+    return true
+  end
+  if last > 57
+    return true
+  end
+  # Trailing digit. Two partition shapes to drop:
+  #
+  #   1. sdaN, sdbN, etc — `sd` prefix + non-digit middle + trailing
+  #      digits. Walk back through trailing digits; the char before
+  #      the digit run is a letter (not '-' or digit). If the name
+  #      starts with `sd`, it's a partition.
+  #
+  #   2. *pN where 'p' is immediately before the trailing digits.
+  #      nvme0n1p1, mmcblk0p1.
+  #
+  # Everything else with a trailing digit (dm-0, loop0, ram0,
+  # nvme0n1, mmcblk0) is kept as top-level.
+  var i = name.size - 1
+  while i >= 0
+    if name[i] < 48
+      break
+    end
+    if name[i] > 57
+      break
+    end
+    i -= 1
+  end
+  # i now points at the char before the trailing digits, or -1 if
+  # the whole name was digits.
+  if i >= 0 and name[i] == 112                       # 'p' partition (nvme0n1p1)
+    return false
+  end
+  # sd-prefix partition check: name starts with 'sd' and the tail
+  # follows the sd[a-z]+[0-9]+ shape (no '-' or digits between sd
+  # and the trailing digit run).
+  if name.size >= 3 and name[0] == 115 and name[1] == 100   # "sd"
+    var k = 2
+    var ok = true
+    while k <= i
+      var c = name[k]
+      # Allow a-z only between "sd" and the trailing digits.
+      if c < 97
+        ok = false
+      end
+      if c > 122
+        ok = false
+      end
+      k += 1
+    end
+    if ok
+      return false
+    end
+  end
+  return true
+end
+
+## Parse macOS `iostat -d 1 1` output. The shape is:
+##   <space><name1>           <name2>...
+##       KB/t  tps  MB/s     KB/t  tps  MB/s
+##      12.26  167  2.00    ...
+## Returns Vec<DiskStat>. Without prior-snapshot context, the bytes
+## counters are 0; we populate read_bytes_per_sec from the MB/s
+## column directly (already a per-second rate, not a counter).
+def proc_parse_iostat(content: String): Vec<DiskStat>
+  var out = vec_new<DiskStat>()
+  var lines = str_split(content, "\n")
+  if lines.size < 3
+    return out
+  end
+  # Line 0: device names, whitespace-separated.
+  var names = _proc_tokens(lines[0])
+  if names.size == 0
+    return out
+  end
+  # Line 2: numeric values, three per device (KB/t, tps, MB/s).
+  var values = _proc_tokens(lines[2])
+  var per_dev = 3
+  if values.size < names.size * per_dev
+    return out
+  end
+  var i = 0
+  while i < names.size
+    var name = names[i]
+    var mbs_tok = values[i * per_dev + 2]      # MB/s column
+    var mbs = _proc_decimal_x100(mbs_tok)      # × 100
+    # MB/s × 100 → bytes/sec: × 1024 × 1024 / 100 = × 10485.76. We
+    # use × 10486 (close enough; values < 1MB/s lose precision).
+    var bytes_per_sec = mbs * 10486
+    out.push(DiskStat {
+      name:                name,
+      read_bytes_total:    0,
+      write_bytes_total:   0,
+      # iostat reports combined, no R/W split — bias to read for
+      # display since reads dominate most workloads. Phase 2 will
+      # use IOReg / fsusage for per-direction split.
+      read_bytes_per_sec:  bytes_per_sec,
+      write_bytes_per_sec: 0,
+      util_pct:            0
+    })
+    i += 1
+  end
+  return out
+end
+
+## Parse a single /proc/net/dev line. Format:
+##   "  iface: rx_bytes rx_pkts rx_errs rx_drop rx_fifo rx_frame
+##           rx_compressed rx_multicast tx_bytes tx_pkts tx_errs
+##           tx_drop tx_fifo tx_colls tx_carrier tx_compressed"
+##
+## The interface name has a trailing colon — strip it. Returns a
+## NetStat with raw counters; per-second rates are 0 (caller computes
+## delta).
+def proc_parse_net_dev_line(line: String): NetStat
+  var toks = _proc_tokens(line)
+  if toks.size < 17
+    return _proc_zero_net()
+  end
+  var name = toks[0]
+  if name.size > 0 and name[name.size - 1] == 58            # ':'
+    name = _proc_substring(name, 0, name.size - 1)
+  end
+  return NetStat {
+    name:             name,
+    rx_bytes_total:   _proc_token_to_int(toks[1]),
+    tx_bytes_total:   _proc_token_to_int(toks[9]),
+    rx_bytes_per_sec: 0,
+    tx_bytes_per_sec: 0,
+    rx_packets:       _proc_token_to_int(toks[2]),
+    tx_packets:       _proc_token_to_int(toks[10]),
+    rx_errors:        _proc_token_to_int(toks[3]),
+    tx_errors:        _proc_token_to_int(toks[11])
+  }
+end
+
+def _proc_zero_net(): NetStat
+  return NetStat {
+    name:             "",
+    rx_bytes_total:   0,
+    tx_bytes_total:   0,
+    rx_bytes_per_sec: 0,
+    tx_bytes_per_sec: 0,
+    rx_packets:       0,
+    tx_packets:       0,
+    rx_errors:        0,
+    tx_errors:        0
+  }
+end
+
+## Filter to "real" interfaces — skip lo (loopback) and any
+## downed-by-default tunnels. Caller picks; for monitoring we
+## generally want the interface(s) carrying actual traffic.
+def proc_net_is_active(name: String): Bool
+  if name == "lo"
+    return false
+  end
+  return true
+end
+
+## Parse macOS `netstat -ib` output. Each interface may have
+## multiple lines (Link / inet / inet6); we take the first matching
+## line per interface name, which carries the canonical byte
+## counters. Skip the header line.
+##
+## Column shape:
+##   Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll
+def proc_parse_netstat_ib(content: String): Vec<NetStat>
+  var out = vec_new<NetStat>()
+  var seen = vec_new<String>()
+  var lines = str_split(content, "\n")
+  var i = 0
+  while i < lines.size
+    var line = lines[i]
+    if i > 0 and line.size > 0
+      var toks = _proc_tokens(line)
+      if toks.size >= 10
+        var name = toks[0]
+        # Dedupe — the IPv4/IPv6 lines repeat the byte counters.
+        var dup = false
+        var s = 0
+        while s < seen.size
+          if seen[s] == name
+            dup = true
+          end
+          s += 1
+        end
+        if not dup
+          seen.push(name)
+          out.push(NetStat {
+            name:             name,
+            rx_bytes_total:   _proc_token_to_int(toks[6]),
+            tx_bytes_total:   _proc_token_to_int(toks[9]),
+            rx_bytes_per_sec: 0,
+            tx_bytes_per_sec: 0,
+            rx_packets:       _proc_token_to_int(toks[4]),
+            tx_packets:       _proc_token_to_int(toks[7]),
+            rx_errors:        _proc_token_to_int(toks[5]),
+            tx_errors:        _proc_token_to_int(toks[8])
+          })
+        end
+      end
+    end
+    i += 1
+  end
+  return out
+end
+
+## Find substring `needle` in `s`, returning its starting index, or
+## -1 if absent. Naive byte scan; OK for our short lines.
+def _proc_index_of(s: String, needle: String): Int
+  var n = s.size
+  var m = needle.size
+  if m == 0 or m > n
+    return -1
+  end
+  var i = 0
+  while i <= n - m
+    var hit = true
+    var j = 0
+    while j < m
+      if s[i + j] != needle[j]
+        hit = false
+        j = m
+      end
+      j += 1
+    end
+    if hit
+      return i
+    end
+    i += 1
+  end
+  return -1
+end
+
+## Read the integer starting at `s[start]` (decimal digits). Returns
+## (value, end_index) — end_index is the position immediately after
+## the last digit. (-1, start) if no digits at start.
+def _proc_read_int_at(s: String, start: Int): Vec<Int>
+  var out = vec_new<Int>()
+  var n = s.size
+  var i = start
+  var any = false
+  var acc = 0
+  while i < n
+    var c = s[i]
+    if c < 48 or c > 57
+      break
+    end
+    acc = acc * 10 + (c - 48)
+    any = true
+    i += 1
+  end
+  if any
+    out.push(acc)
+    out.push(i)
+  else
+    out.push(-1)
+    out.push(start)
+  end
+  return out
+end
+
+## Parse a single OOM line. Returns OomEvent with victim_pid > 0 on
+## success, 0 on parse failure. Handles both kernel-uptime format
+## (`[12345.678] ... Killed process 1234 (chrome) ...`) and
+## journalctl format (`Apr 12 03:44:21 host kernel: ...`). Captures
+## anon-rss when present.
+def proc_parse_oom_line(line: String): OomEvent
+  var marker = "Killed process "
+  var idx = _proc_index_of(line, marker)
+  if idx < 0
+    return OomEvent {
+      timestamp:   "",
+      victim_pid:  0,
+      victim_name: "",
+      rss_kb:      0
+    }
+  end
+  # PID after the marker.
+  var pid_start = idx + marker.size
+  var pid_pair = _proc_read_int_at(line, pid_start)
+  if pid_pair[0] <= 0
+    return OomEvent {
+      timestamp:   "",
+      victim_pid:  0,
+      victim_name: "",
+      rss_kb:      0
+    }
+  end
+  var pid = pid_pair[0]
+  var after_pid = pid_pair[1]
+  # Skip whitespace, expect '('.
+  while after_pid < line.size and (line[after_pid] == 32 or line[after_pid] == 9)
+    after_pid += 1
+  end
+  var name = ""
+  if after_pid < line.size and line[after_pid] == 40   # '('
+    var name_start = after_pid + 1
+    var name_end = name_start
+    while name_end < line.size and line[name_end] != 41   # ')'
+      name_end += 1
+    end
+    name = _proc_substring(line, name_start, name_end)
+  end
+  # Look for "anon-rss:" optionally with leading space and trailing kB.
+  var rss_kb = 0
+  var rss_idx = _proc_index_of(line, "anon-rss:")
+  if rss_idx >= 0
+    var rss_pair = _proc_read_int_at(line, rss_idx + 9)
+    if rss_pair[0] > 0
+      rss_kb = rss_pair[0]
+    end
+  end
+  # Timestamp: take everything up to "Killed process". For Linux
+  # kernel-uptime lines this is "[12345.678] Memory cgroup out of
+  # memory: " (caller can trim further); for journalctl it's the
+  # "Apr 12 03:44:21 host kernel:" prefix.
+  var ts_raw = _proc_substring(line, 0, idx)
+  var ts = str_trim(ts_raw)
+  return OomEvent {
+    timestamp:   ts,
+    victim_pid:  pid,
+    victim_name: name,
+    rss_kb:      rss_kb
+  }
+end
+
+## Last whitespace-separated token of a line, with trailing dot
+## stripped (vm_stat appends a `.` to its number tokens).
+def _proc_last_int_token(line: String): String
+  var toks = _proc_tokens(line)
+  if toks.size == 0
+    return ""
+  end
+  var last = toks[toks.size - 1]
+  if last.size > 0 and last[last.size - 1] == 46     # '.'
+    return _proc_substring(last, 0, last.size - 1)
+  end
+  return last
+end
+
+# ============================================================
+# Linux implementation
+# ============================================================
+
+def _proc_linux_take_snapshot(prev: Snapshot): Snapshot
+  var stat_content = _proc_safe_read("/proc/stat")
+  var meminfo_content = _proc_safe_read("/proc/meminfo")
+  var loadavg_content = _proc_safe_read("/proc/loadavg")
+
+  var aggregate = _proc_zero_cpu()
+  var per_core = vec_new<CpuStat>()
+  var stat_lines = str_split(stat_content, "\n")
+  var i = 0
+  while i < stat_lines.size
+    var line = stat_lines[i]
+    if str_starts_with(line, "cpu ")
+      aggregate = proc_parse_proc_stat_line(line)
+    end
+    if str_starts_with(line, "cpu") and not str_starts_with(line, "cpu ") and i < 64
+      # cpu0, cpu1, ... lines (cap at 64 cores for sanity)
+      var c = proc_parse_proc_stat_line(line)
+      per_core.push(c)
+    end
+    i += 1
+  end
+
+  # Compute pcts vs prev
+  aggregate = CpuStat {
+    total_jiffies: aggregate.total_jiffies,
+    idle_jiffies:  aggregate.idle_jiffies,
+    pct:           proc_compute_cpu_pct(prev.cpu_aggregate, aggregate)
+  }
+  var pc_with_pct = vec_new<CpuStat>()
+  var k = 0
+  while k < per_core.size
+    var prev_core = _proc_zero_cpu()
+    if k < prev.cpu_per_core.size
+      prev_core = prev.cpu_per_core[k]
+    end
+    var c = per_core[k]
+    pc_with_pct.push(CpuStat {
+      total_jiffies: c.total_jiffies,
+      idle_jiffies:  c.idle_jiffies,
+      pct:           proc_compute_cpu_pct(prev_core, c)
+    })
+    k += 1
+  end
+
+  var mem = proc_parse_meminfo(meminfo_content)
+  var loads = proc_parse_loadavg(loadavg_content)
+  var pressure = _proc_linux_read_pressure()
+  var processes = _proc_linux_list_processes()
+  var disks = _proc_linux_read_disks(prev)
+  var nics = _proc_linux_read_nics(prev)
+  var oom_events = _proc_linux_read_oom_events()
+
+  return Snapshot {
+    timestamp_ns:  time_mono_ns(),
+    platform:      PLATFORM_LINUX(),
+    cpu_aggregate: aggregate,
+    cpu_per_core:  pc_with_pct,
+    mem:           mem,
+    processes:     processes,
+    pressure:      pressure,
+    disks:         disks,
+    nics:          nics,
+    oom_events:    oom_events,
+    load_1:        _proc_at_or_zero(loads, 0),
+    load_5:        _proc_at_or_zero(loads, 1),
+    load_15:       _proc_at_or_zero(loads, 2)
+  }
+end
+
+## Read recent OOM-kill events. Tries `journalctl -k` first (works on
+## systemd hosts including most modern distros) then falls back to
+## `dmesg` (works without root if dmesg_restrict is 0). Both shells
+## are best-effort — empty result is a normal "no events recorded"
+## state, not an error.
+def _proc_linux_read_oom_events(): Vec<OomEvent>
+  var out = vec_new<OomEvent>()
+  # Try journalctl first; the --no-pager flag is essential.
+  var journ = shell::shell_capture(
+    "journalctl -k --since=-24h --no-pager 2>/dev/null | grep -F 'Killed process' | tail -20"
+  )
+  var content = journ
+  if content.size == 0
+    # Fallback: dmesg directly.
+    content = shell::shell_capture(
+      "dmesg -T 2>/dev/null | grep -F 'Killed process' | tail -20"
+    )
+  end
+  if content.size == 0
+    return out
+  end
+  var lines = str_split(content, "\n")
+  var i = 0
+  while i < lines.size
+    var line = lines[i]
+    if line.size > 0
+      var ev = proc_parse_oom_line(line)
+      if ev.victim_pid > 0
+        out.push(ev)
+      end
+    end
+    i += 1
+  end
+  return out
+end
+
+## Build the NIC list from /proc/net/dev. Filters out 'lo'. Per-second
+## rates are computed against the prior snapshot.
+def _proc_linux_read_nics(prev: Snapshot): Vec<NetStat>
+  var content = _proc_safe_read("/proc/net/dev")
+  if content.size == 0
+    return vec_new<NetStat>()
+  end
+  var lines = str_split(content, "\n")
+  var raw = vec_new<NetStat>()
+  var i = 2          # skip 2 header lines
+  while i < lines.size
+    var line = lines[i]
+    if line.size > 0
+      var n = proc_parse_net_dev_line(line)
+      if n.name.size > 0 and proc_net_is_active(n.name)
+        raw.push(n)
+      end
+    end
+    i += 1
+  end
+  return _proc_compute_nic_rates(raw, prev)
+end
+
+def _proc_compute_nic_rates(raw: Vec<NetStat>, prev: Snapshot): Vec<NetStat>
+  var dt_s = 2
+  if prev.timestamp_ns > 0
+    var elapsed_ns = time_mono_ns() - prev.timestamp_ns
+    if elapsed_ns > 1_000_000_000
+      dt_s = elapsed_ns / 1_000_000_000
+    else
+      dt_s = 1
+    end
+  end
+  var out = vec_new<NetStat>()
+  var k = 0
+  while k < raw.size
+    var n = raw[k]
+    # Drop interfaces with zero cumulative traffic — virtual / down
+    # interfaces (utun*, awdl0, llw0, etc) clutter the display
+    # without adding signal. Keep loopback skipped earlier.
+    if n.rx_bytes_total == 0 and n.tx_bytes_total == 0
+      k += 1
+      continue
+    end
+    var prev_n = _proc_find_nic_by_name(prev.nics, n.name)
+    var rps = 0
+    var tps = 0
+    if prev_n.rx_bytes_total > 0 or prev_n.tx_bytes_total > 0
+      var dr = n.rx_bytes_total - prev_n.rx_bytes_total
+      var dt = n.tx_bytes_total - prev_n.tx_bytes_total
+      if dr < 0
+        dr = 0
+      end
+      if dt < 0
+        dt = 0
+      end
+      rps = dr / dt_s
+      tps = dt / dt_s
+    end
+    out.push(NetStat {
+      name:             n.name,
+      rx_bytes_total:   n.rx_bytes_total,
+      tx_bytes_total:   n.tx_bytes_total,
+      rx_bytes_per_sec: rps,
+      tx_bytes_per_sec: tps,
+      rx_packets:       n.rx_packets,
+      tx_packets:       n.tx_packets,
+      rx_errors:        n.rx_errors,
+      tx_errors:        n.tx_errors
+    })
+    k += 1
+  end
+  return out
+end
+
+def _proc_find_nic_by_name(nics: Vec<NetStat>, name: String): NetStat
+  var i = 0
+  while i < nics.size
+    if nics[i].name == name
+      return nics[i]
+    end
+    i += 1
+  end
+  return _proc_zero_net()
+end
+
+## Build the disk list from /proc/diskstats. Filters to top-level
+## devices (no partitions). Per-second rates computed from the prior
+## snapshot — first sample shows 0 rates.
+def _proc_linux_read_disks(prev: Snapshot): Vec<DiskStat>
+  var content = _proc_safe_read("/proc/diskstats")
+  if content.size == 0
+    return vec_new<DiskStat>()
+  end
+  var lines = str_split(content, "\n")
+  var raw = vec_new<DiskStat>()
+  var i = 0
+  while i < lines.size
+    var line = lines[i]
+    if line.size > 0
+      var d = proc_parse_diskstats_line(line)
+      if d.name.size > 0 and proc_diskstats_is_top_level(d.name)
+        raw.push(d)
+      end
+    end
+    i += 1
+  end
+  # Compute deltas. Time delta in seconds via timestamp_ns prev/curr;
+  # since we don't have curr ts yet, approximate using TICK_MS-ish
+  # cadence — caller-supplied if needed. For Phase 1.5 we use a
+  # nominal 2s window matching VIGIL's tick; real per-second rates
+  # should normalize against curr_ts - prev_ts in ns. Approximation
+  # is fine within the variance of a 2s sampling cadence.
+  var dt_s = 2
+  if prev.timestamp_ns > 0
+    # Use elapsed seconds; clamp to 1 to avoid div-by-zero.
+    var elapsed_ns = time_mono_ns() - prev.timestamp_ns
+    if elapsed_ns > 1_000_000_000
+      dt_s = elapsed_ns / 1_000_000_000
+    else
+      dt_s = 1
+    end
+  end
+  var out = vec_new<DiskStat>()
+  var k = 0
+  while k < raw.size
+    var d = raw[k]
+    var prev_d = _proc_find_disk_by_name(prev.disks, d.name)
+    var rps = 0
+    var wps = 0
+    if prev_d.read_bytes_total > 0 or prev_d.write_bytes_total > 0
+      var dr = d.read_bytes_total - prev_d.read_bytes_total
+      var dw = d.write_bytes_total - prev_d.write_bytes_total
+      if dr < 0
+        dr = 0
+      end
+      if dw < 0
+        dw = 0
+      end
+      rps = dr / dt_s
+      wps = dw / dt_s
+    end
+    out.push(DiskStat {
+      name:                d.name,
+      read_bytes_total:    d.read_bytes_total,
+      write_bytes_total:   d.write_bytes_total,
+      read_bytes_per_sec:  rps,
+      write_bytes_per_sec: wps,
+      util_pct:            0
+    })
+    k += 1
+  end
+  return out
+end
+
+def _proc_find_disk_by_name(disks: Vec<DiskStat>, name: String): DiskStat
+  var i = 0
+  while i < disks.size
+    if disks[i].name == name
+      return disks[i]
+    end
+    i += 1
+  end
+  return DiskStat {
+    name:                "",
+    read_bytes_total:    0,
+    write_bytes_total:   0,
+    read_bytes_per_sec:  0,
+    write_bytes_per_sec: 0,
+    util_pct:            0
+  }
+end
+
+def _proc_at_or_zero(v: Vec<Int>, idx: Int): Int
+  if idx < 0 or idx >= v.size
+    return 0
+  end
+  return v[idx]
+end
+
+def _proc_safe_read(path: String): String
+  if not file_exists(path)
+    return ""
+  end
+  return read_file(path)
+end
+
+def _proc_linux_read_pressure(): PressureStat
+  var cpu_path = "/proc/pressure/cpu"
+  var mem_path = "/proc/pressure/memory"
+  var io_path = "/proc/pressure/io"
+  if not file_exists(cpu_path)
+    return _proc_zero_pressure()
+  end
+  var cpu = proc_parse_pressure(_proc_safe_read(cpu_path))
+  var mem = proc_parse_pressure(_proc_safe_read(mem_path))
+  var io = proc_parse_pressure(_proc_safe_read(io_path))
+  return PressureStat {
+    available: true,
+    cpu_some:  _proc_at_or_zero(cpu, 0) / 100,    # x100 → percent
+    cpu_full:  _proc_at_or_zero(cpu, 1) / 100,
+    mem_some:  _proc_at_or_zero(mem, 0) / 100,
+    mem_full:  _proc_at_or_zero(mem, 1) / 100,
+    io_some:   _proc_at_or_zero(io, 0) / 100,
+    io_full:   _proc_at_or_zero(io, 1) / 100
+  }
+end
+
+def _proc_linux_list_processes(): Vec<ProcStat>
+  # On Linux, we use `ps` for the fast path. Reading every
+  # /proc/[pid]/stat individually works but is more code; ps is
+  # universally available and produces the right shape.
+  var out = shell::shell_capture(
+    "ps -eo pid,ppid,user,pcpu,rss,vsz,stat,comm --no-headers 2>/dev/null"
+  )
+  return _proc_parse_ps_block(out)
+end
+
+def _proc_parse_ps_block(content: String): Vec<ProcStat>
+  var lines = str_split(content, "\n")
+  var out = vec_new<ProcStat>()
+  var i = 0
+  while i < lines.size
+    var line = lines[i]
+    if line.size > 0
+      var p = proc_parse_ps_line(line)
+      if p.pid > 0
+        out.push(p)
+      end
+    end
+    i += 1
+  end
+  return out
+end
+
+# ============================================================
+# Darwin (macOS) implementation
+# ============================================================
+
+def _proc_darwin_take_snapshot(prev: Snapshot): Snapshot
+  # Aggregate CPU%: shell `top -l 1 -n 0` and parse the "CPU usage:" line.
+  # `top` is slow (~1s/sample). Phase 2 will replace this with
+  # host_processor_info FFI for speed + per-core breakdown.
+  var top_out = shell::shell_capture(
+    "top -l 1 -n 0 -F 2>/dev/null | grep 'CPU usage'"
+  )
+  var aggregate_pct = proc_parse_top_cpu_line(top_out)
+  var aggregate = CpuStat {
+    total_jiffies: 0,
+    idle_jiffies:  0,
+    pct:           aggregate_pct
+  }
+
+  # Memory: vm_stat for page counts + sysctl hw.pagesize for page size.
+  var page_size_str = shell::shell_capture("sysctl -n hw.pagesize 2>/dev/null")
+  var page_size = _proc_token_to_int(_proc_first_token(page_size_str))
+  var vm_out = shell::shell_capture("vm_stat 2>/dev/null")
+  var mem = proc_parse_vm_stat(vm_out, page_size)
+
+  # sysctl hw.memsize is the canonical total, vm_stat sum is approximate.
+  var total_str = shell::shell_capture("sysctl -n hw.memsize 2>/dev/null")
+  var total_bytes = _proc_token_to_int(_proc_first_token(total_str))
+  if total_bytes > 0
+    mem = MemStat {
+      total_kb:      total_bytes / 1024,
+      used_kb:       mem.used_kb,
+      free_kb:       mem.free_kb,
+      available_kb:  mem.available_kb,
+      buffers_kb:    mem.buffers_kb,
+      cached_kb:     mem.cached_kb,
+      swap_total_kb: mem.swap_total_kb,
+      swap_used_kb:  mem.swap_used_kb
+    }
+  end
+
+  # Load average: `sysctl -n vm.loadavg` → "{ 2.60 2.09 1.92 }"
+  var load_str = shell::shell_capture("sysctl -n vm.loadavg 2>/dev/null")
+  var load_toks = _proc_tokens(load_str)
+  var load_1 = 0
+  var load_5 = 0
+  var load_15 = 0
+  if load_toks.size >= 4
+    # toks[0]="{", toks[1..3]=loads, toks[4]="}"
+    load_1 = _proc_decimal_x100(load_toks[1])
+    load_5 = _proc_decimal_x100(load_toks[2])
+    load_15 = _proc_decimal_x100(load_toks[3])
+  end
+
+  # Process list: ps shells fast.
+  var ps_out = shell::shell_capture(
+    "ps -axo pid,ppid,user,pcpu,rss,vsz,stat,comm 2>/dev/null"
+  )
+  var processes = _proc_parse_ps_block_skip_header(ps_out)
+
+  # Disk: iostat 1-second sample. Reports per-disk MB/s combined R/W;
+  # we bias to the read column. Linux's per-direction split arrives
+  # for free via /proc/diskstats.
+  var iostat_out = shell::shell_capture("iostat -d 1 1 2>/dev/null")
+  var disks = proc_parse_iostat(iostat_out)
+
+  # Net: netstat -ib reports cumulative byte counters per interface.
+  # Compute per-second rates from prev snapshot.
+  var netstat_out = shell::shell_capture("netstat -ib 2>/dev/null")
+  var raw_nics = proc_parse_netstat_ib(netstat_out)
+  # Filter 'lo0' and reuse the same delta machinery as the Linux path.
+  var filtered = vec_new<NetStat>()
+  var ni = 0
+  while ni < raw_nics.size
+    var n = raw_nics[ni]
+    if n.name != "lo0" and proc_net_is_active(n.name)
+      filtered.push(n)
+    end
+    ni += 1
+  end
+  var nics = _proc_compute_nic_rates(filtered, prev)
+
+  return Snapshot {
+    timestamp_ns:  time_mono_ns(),
+    platform:      PLATFORM_DARWIN(),
+    cpu_aggregate: aggregate,
+    cpu_per_core:  vec_new<CpuStat>(),    # Phase 2: host_processor_info FFI
+    mem:           mem,
+    processes:     processes,
+    pressure:      _proc_zero_pressure(),  # Linux-only metric
+    disks:         disks,
+    nics:          nics,
+    oom_events:    vec_new<OomEvent>(),   # Linux-only kernel event stream
+    load_1:        load_1,
+    load_5:        load_5,
+    load_15:       load_15
+  }
+end
+
+def _proc_first_token(s: String): String
+  var toks = _proc_tokens(s)
+  if toks.size == 0
+    return ""
+  end
+  return toks[0]
+end
+
+def _proc_parse_ps_block_skip_header(content: String): Vec<ProcStat>
+  var lines = str_split(content, "\n")
+  var out = vec_new<ProcStat>()
+  var i = 0
+  while i < lines.size
+    var line = lines[i]
+    if i > 0 and line.size > 0
+      var p = proc_parse_ps_line(line)
+      if p.pid > 0
+        out.push(p)
+      end
+    end
+    i += 1
+  end
+  return out
+end

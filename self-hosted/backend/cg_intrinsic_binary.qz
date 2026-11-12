@@ -1,0 +1,2028 @@
+##! # Binary DSL codegen — Phase 1.4 STEP 4: real emitters.
+##!
+##! Walks the MIR binary-layout registry and emits inline LLVM IR for:
+##!   MIR_PACKED_BITCAST  — shift/mask/or packing between struct fields
+##!                         and the backing integer (both directions).
+##!   MIR_BINARY_PACK     — self struct  → Bytes handle (allocates a
+##!                         Vec<Int> of total_bytes zeroed bytes, writes
+##!                         each field at its bit offset, wraps in Bytes).
+##!   MIR_BINARY_UNPACK   — Bytes handle → Result<struct, ParseError>
+##!                         (allocates an N-field struct, decodes each
+##!                         field from the byte stream, wraps in Ok).
+##!
+##! STEP 4 scope (worked examples):
+##!   • byte-aligned u8/u16/u32/u64 in LE or BE order
+##!   • sub-byte fields whose entire width fits within one byte
+##!   • pad fields ("_") contribute zero bits on encode, skip on decode
+##!
+##! Out of scope (future STEP 4 follow-ups, filed in handoff):
+##!   • sub-byte fields that straddle byte boundaries (IPv4 frag_off)
+##!   • variable-width fields: bytes / bytes(n) / cstring / pstring / arrays
+##!   • floats (no current worked example uses them)
+##!
+##! Conventions per docs/design/BINARY_DSL.md decision #6: MSB-first bit
+##! order within each byte and within each packed-struct backing integer
+##! (no per-field `lsb` annotation yet).
+
+import mir
+import codegen_util
+
+## Parse a numeric width spec like "u16be", "i32le", "u4" into a struct
+## describing its runtime-relevant bits.
+##   width     — bit width, 1..64 (0 means unparseable)
+##   is_float  — 1 for f32 / f64
+##   is_signed — 1 for i-prefixed integers
+##   is_le     — 1 for little-endian suffix, else big-endian (default BE)
+##   has_endian — 1 if the spec carried an explicit le/be suffix
+def _cg_bin_parse_width_info(spec: String): Vec<Int>
+  var info = vec_new<Int>()
+  info.push(0)  # width
+  info.push(0)  # is_float
+  info.push(0)  # is_signed
+  info.push(0)  # is_le
+  info.push(0)  # has_endian
+  var n = str_byte_len(spec)
+  return info if n < 2
+  var head = str_byte_at(spec, 0)
+  # u=117, i=105, f=102
+  if head == 117
+    # unsigned
+  elsif head == 105
+    info[2] = 1
+  elsif head == 102
+    info[1] = 1
+  else
+    return info
+  end
+  var i = 1
+  var w = 0
+  var saw_digit = 0
+  while i < n
+    var d = str_byte_at(spec, i)
+    if d < 48 or d > 57
+      break
+    end
+    w = (w * 10) + (d - 48)
+    saw_digit = 1
+    i = i + 1
+  end
+  return info if saw_digit == 0
+  info[0] = w
+  if i == n
+    return info
+  end
+  if i + 2 != n
+    info[0] = 0
+    return info
+  end
+  var s1 = str_byte_at(spec, i)
+  var s2 = str_byte_at(spec, i + 1)
+  # l=108 e=101 b=98
+  if s1 == 108 and s2 == 101
+    info[3] = 1
+    info[4] = 1
+  elsif s1 == 98 and s2 == 101
+    info[3] = 0
+    info[4] = 1
+  else
+    info[0] = 0
+  end
+  return info
+end
+
+## Emit MIR_PACKED_BITCAST: pack struct fields into the backing integer
+## (direction 0), or distribute an integer back into struct fields
+## (direction 1). For STEP 4, both directions go through a straight-line
+## shift/mask/or sequence on i64. The `src_is_int` variant allocates an
+## N-field struct; otherwise writes an accumulated integer.
+def cg_emit_packed_bitcast(out: Int, prog: mir::MirProgram, dest: Int, layout_id: Int, src_val: Int, direction: Int): Void
+  var d = dest.to_s()
+  var src = src_val.to_s()
+  var field_count = mir::mir_binary_layout_field_count(prog, layout_id)
+  var backing = mir::mir_binary_layout_backing(prog, layout_id)
+  if backing == 0
+    # Binary block bitcast has no backing — treat as no-op passthrough.
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, " = add i64 %v")
+    codegen_util::cg_emit(out, src)
+    codegen_util::cg_emit_line(out, ", 0  ; bitcast passthrough (no backing)")
+    return
+  end
+
+  if direction == 0
+    # struct → integer: load each non-pad field, mask + shift + OR.
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".src = inttoptr i64 %v")
+    codegen_util::cg_emit(out, src)
+    codegen_util::cg_emit_line(out, " to ptr")
+    var bit_offset = 0
+    var struct_fi = 0
+    var accum_idx = 0
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".a0 = add i64 0, 0")
+    for fi in 0..field_count
+      var fname = mir::mir_binary_layout_field_name(prog, layout_id, fi)
+      var width = mir::mir_binary_layout_field_width(prog, layout_id, fi)
+      var is_pad = 0
+      if str_byte_len(fname) == 0 or fname.eq("_")
+        is_pad = 1
+      end
+      if is_pad == 0 and width > 0
+        var shift_amt = backing - bit_offset - width
+        # %fld_ptr = getelementptr i64, ptr %src, i64 struct_fi
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".f")
+        codegen_util::cg_emit_int(out, fi)
+        codegen_util::cg_emit(out, ".p = getelementptr i64, ptr %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".src, i64 ")
+        codegen_util::cg_emit_int(out, struct_fi)
+        codegen_util::cg_emit_line(out, "")
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".f")
+        codegen_util::cg_emit_int(out, fi)
+        codegen_util::cg_emit(out, ".v = load i64, ptr %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".f")
+        codegen_util::cg_emit_int(out, fi)
+        codegen_util::cg_emit_line(out, ".p")
+        # Mask to field width
+        var mask = 0
+        if width >= 64
+          mask = -1
+        else
+          mask = (1 << width) - 1
+        end
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".f")
+        codegen_util::cg_emit_int(out, fi)
+        codegen_util::cg_emit(out, ".m = and i64 %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".f")
+        codegen_util::cg_emit_int(out, fi)
+        codegen_util::cg_emit(out, ".v, ")
+        codegen_util::cg_emit_int(out, mask)
+        codegen_util::cg_emit_line(out, "")
+        # Shift left to bit position
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".f")
+        codegen_util::cg_emit_int(out, fi)
+        codegen_util::cg_emit(out, ".s = shl i64 %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".f")
+        codegen_util::cg_emit_int(out, fi)
+        codegen_util::cg_emit(out, ".m, ")
+        codegen_util::cg_emit_int(out, shift_amt)
+        codegen_util::cg_emit_line(out, "")
+        # OR into accumulator
+        var next_accum = accum_idx + 1
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".a")
+        codegen_util::cg_emit_int(out, next_accum)
+        codegen_util::cg_emit(out, " = or i64 %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".a")
+        codegen_util::cg_emit_int(out, accum_idx)
+        codegen_util::cg_emit(out, ", %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".f")
+        codegen_util::cg_emit_int(out, fi)
+        codegen_util::cg_emit_line(out, ".s")
+        accum_idx = next_accum
+        struct_fi = struct_fi + 1
+      end
+      bit_offset = bit_offset + width
+    end
+    # Final result = last accumulator value.
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, " = add i64 %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".a")
+    codegen_util::cg_emit_int(out, accum_idx)
+    codegen_util::cg_emit_line(out, ", 0")
+  else
+    # integer → struct: allocate malloc, for each non-pad field shift/mask,
+    # store into the slot.
+    var non_pad_count = 0
+    for cfi in 0..field_count
+      var cfn = mir::mir_binary_layout_field_name(prog, layout_id, cfi)
+      if str_byte_len(cfn) > 0 and not cfn.eq("_")
+        non_pad_count = non_pad_count + 1
+      end
+    end
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".sp = call ptr @__qz_alloc(i64 ")
+    codegen_util::cg_emit_int(out, non_pad_count * 8)
+    codegen_util::cg_emit_line(out, ")")
+    var bit_offset = 0
+    var struct_fi = 0
+    for fi in 0..field_count
+      var fname = mir::mir_binary_layout_field_name(prog, layout_id, fi)
+      var width = mir::mir_binary_layout_field_width(prog, layout_id, fi)
+      var is_pad = 0
+      if str_byte_len(fname) == 0 or fname.eq("_")
+        is_pad = 1
+      end
+      if is_pad == 0 and width > 0
+        var shift_amt = backing - bit_offset - width
+        var mask = 0
+        if width >= 64
+          mask = -1
+        else
+          mask = (1 << width) - 1
+        end
+        # Shift source right, mask
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".f")
+        codegen_util::cg_emit_int(out, fi)
+        codegen_util::cg_emit(out, ".sh = lshr i64 %v")
+        codegen_util::cg_emit(out, src)
+        codegen_util::cg_emit(out, ", ")
+        codegen_util::cg_emit_int(out, shift_amt)
+        codegen_util::cg_emit_line(out, "")
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".f")
+        codegen_util::cg_emit_int(out, fi)
+        codegen_util::cg_emit(out, ".m = and i64 %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".f")
+        codegen_util::cg_emit_int(out, fi)
+        codegen_util::cg_emit(out, ".sh, ")
+        codegen_util::cg_emit_int(out, mask)
+        codegen_util::cg_emit_line(out, "")
+        # Store into struct slot
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".f")
+        codegen_util::cg_emit_int(out, fi)
+        codegen_util::cg_emit(out, ".sp = getelementptr i64, ptr %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".sp, i64 ")
+        codegen_util::cg_emit_int(out, struct_fi)
+        codegen_util::cg_emit_line(out, "")
+        codegen_util::cg_emit(out, "  store i64 %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".f")
+        codegen_util::cg_emit_int(out, fi)
+        codegen_util::cg_emit(out, ".m, ptr %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".f")
+        codegen_util::cg_emit_int(out, fi)
+        codegen_util::cg_emit_line(out, ".sp")
+        struct_fi = struct_fi + 1
+      end
+      bit_offset = bit_offset + width
+    end
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, " = ptrtoint ptr %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".sp to i64")
+  end
+end
+
+## Classify a variable-width field spec. Returns an Int encoding the
+## variant and any embedded size:
+##   -3  not variable (width parses via _cg_bin_parse_width_info)
+##    0  `bytes` rest-of-stream
+##    N>0   `bytes(N)` fixed-length blob
+##   -1  `cstring` null-terminated
+##   -2  `pstring(u8)`  — 1-byte LE length prefix
+##   -4  `pstring(u16le)` — 2-byte LE length prefix
+##   -5  `pstring(u32le)` — 4-byte LE length prefix
+##   -6  `pstring(u16be)` — 2-byte BE length prefix (reserved; rare)
+##   -7  `pstring(u32be)` — 4-byte BE length prefix (reserved; rare)
+##  -10  array form `[T]`, `[T; N]`, or `[T; field]` (primitive elements)
+##  -99  unsupported variable form
+def _cg_bin_var_spec_class(spec: String): Int
+  var info = _cg_bin_parse_width_info(spec)
+  if info[0] > 0
+    return -3
+  end
+  if spec == "bytes"
+    return 0
+  end
+  if spec == "cstring"
+    return -1
+  end
+  var n = str_byte_len(spec)
+  if n >= 6 and str_byte_slice(spec, 0, 6).eq("bytes(") and str_byte_at(spec, n - 1) == 41
+    # bytes(N): parse digits between `(` and `)`.
+    var i = 6
+    var val = 0
+    var saw = 0
+    while i < n - 1
+      var ch = str_byte_at(spec, i)
+      if ch < 48 or ch > 57
+        return -99
+      end
+      val = val * 10 + (ch - 48)
+      saw = 1
+      i = i + 1
+    end
+    if saw == 1 and val > 0
+      return val
+    end
+    return -99
+  end
+  if n >= 8 and str_byte_slice(spec, 0, 8).eq("pstring(") and str_byte_at(spec, n - 1) == 41
+    var inner = str_byte_slice(spec, 8, n - 1)
+    if inner == "u8"
+      return -2
+    end
+    if inner == "u16le"
+      return -4
+    end
+    if inner == "u32le"
+      return -5
+    end
+    if inner == "u16be"
+      return -6
+    end
+    if inner == "u32be"
+      return -7
+    end
+    return -99
+  end
+  # Array forms [T], [T;N], [T;field]. Accept iff element is a numeric
+  # primitive width spec we can decode; everything else stays -99.
+  if n >= 3 and str_byte_at(spec, 0) == 91 and str_byte_at(spec, n - 1) == 93
+    var end_idx = 1
+    while end_idx < n
+      var ch = str_byte_at(spec, end_idx)
+      if ch == 59 or ch == 93
+        break
+      end
+      end_idx = end_idx + 1
+    end
+    if end_idx > 1
+      var elem = str_byte_slice(spec, 1, end_idx)
+      var elem_info = _cg_bin_parse_width_info(elem)
+      if elem_info[0] > 0 and elem_info[1] == 0
+        return -10
+      end
+    end
+    return -99
+  end
+  return -99
+end
+
+## Parse an array spec "[T]" / "[T;N]" / "[T;field]" into a 5-slot
+## Vec<Int>: [variant, elem_bit_width, is_le, is_signed, count_literal].
+##   variant: 0 = rest-of-stream `[T]`,
+##            1 = fixed literal `[T; N]`,
+##            2 = field-ref `[T; field]`
+## Element type is always integer primitive in the first pass; `is_float`
+## from _cg_bin_parse_width_info is discarded (arrays of floats fall
+## through to the -99 class above).
+def _cg_bin_parse_array_info(spec: String): Vec<Int>
+  var info = vec_new<Int>()
+  info.push(0)  # variant
+  info.push(0)  # elem_bit_width
+  info.push(0)  # is_le
+  info.push(0)  # is_signed
+  info.push(0)  # count_literal
+  var n = str_byte_len(spec)
+  return info if n < 3
+  return info if str_byte_at(spec, 0) != 91 or str_byte_at(spec, n - 1) != 93
+  # Find element/count split.
+  var elem_end = 1
+  while elem_end < n
+    var ch = str_byte_at(spec, elem_end)
+    if ch == 59 or ch == 93
+      break
+    end
+    elem_end = elem_end + 1
+  end
+  return info if elem_end <= 1
+  var elem = str_byte_slice(spec, 1, elem_end)
+  var elem_info = _cg_bin_parse_width_info(elem)
+  return info if elem_info[0] <= 0
+  info[1] = elem_info[0]
+  info[2] = elem_info[3]
+  info[3] = elem_info[2]
+  if str_byte_at(spec, elem_end) == 93
+    # `[T]` — rest-of-stream.
+    info[0] = 0
+    return info
+  end
+  # `[T; ...]` — either literal int or field identifier.
+  var tail_start = elem_end + 1
+  var tail_end = n - 1
+  return info if tail_start >= tail_end
+  var first = str_byte_at(spec, tail_start)
+  if first >= 48 and first <= 57
+    # Decimal literal.
+    var val = 0
+    var i = tail_start
+    while i < tail_end
+      var d = str_byte_at(spec, i)
+      if d < 48 or d > 57
+        return info
+      end
+      val = val * 10 + (d - 48)
+      i = i + 1
+    end
+    info[0] = 1
+    info[4] = val
+    return info
+  end
+  # Field identifier — stored separately (caller uses _cg_bin_array_count_field_name).
+  info[0] = 2
+  return info
+end
+
+## Extract the count-field identifier from "[T; field]". Returns "" for
+## spec variants that don't carry a field name.
+def _cg_bin_array_count_field_name(spec: String): String
+  var n = str_byte_len(spec)
+  return "" if n < 3
+  var elem_end = 1
+  while elem_end < n
+    var ch = str_byte_at(spec, elem_end)
+    if ch == 59 or ch == 93
+      break
+    end
+    elem_end = elem_end + 1
+  end
+  return "" if elem_end >= n - 1
+  return "" if str_byte_at(spec, elem_end) != 59
+  var tail_start = elem_end + 1
+  var tail_end = n - 1
+  return "" if tail_start >= tail_end
+  var first = str_byte_at(spec, tail_start)
+  return "" if first >= 48 and first <= 57
+  return str_byte_slice(spec, tail_start, tail_end)
+end
+
+## Find the non-pad struct slot index of a prior field named `name` in
+## [0..upto_fi). Returns -1 if no such field exists (error reported at
+## emission site — spec validation is a later polish pass).
+def _cg_bin_find_prior_field_slot(prog: mir::MirProgram, layout_id: Int, name: String, upto_fi: Int): Int
+  var slot = 0
+  for fi in 0..upto_fi
+    var fname = mir::mir_binary_layout_field_name(prog, layout_id, fi)
+    var is_pad = 0
+    if str_byte_len(fname) == 0 or fname.eq("_")
+      is_pad = 1
+    end
+    if is_pad == 0
+      if fname.eq(name)
+        return slot
+      end
+      slot = slot + 1
+    end
+  end
+  return -1
+end
+
+## Return the prefix byte width for a pstring class id, or 0 if not pstring.
+def _cg_bin_pstring_prefix_bytes(klass: Int): Int
+  return 1 if klass == -2
+  return 2 if klass == -4
+  return 4 if klass == -5
+  return 2 if klass == -6
+  return 4 if klass == -7
+  return 0
+end
+
+## Return 1 if the pstring prefix is little-endian (u8 is single-byte, treat as LE).
+def _cg_bin_pstring_is_le(klass: Int): Int
+  return 1 if klass == -2
+  return 1 if klass == -4
+  return 1 if klass == -5
+  return 0 if klass == -6
+  return 0 if klass == -7
+  return 1
+end
+
+## Find the index of the first variable-width (non-primitive) field, or
+## field_count if there are none. Sub-byte fields with width 0 should not
+## exist — the parser assigns 0 only to variable specs.
+def _cg_bin_find_var_split(prog: mir::MirProgram, layout_id: Int): Int
+  var n = mir::mir_binary_layout_field_count(prog, layout_id)
+  for fi in 0..n
+    var w = mir::mir_binary_layout_field_width(prog, layout_id, fi)
+    if w == 0
+      return fi
+    end
+  end
+  return n
+end
+
+## Count the total fixed bit width for fields [0..split). Used to derive
+## the fixed prefix's byte size when the layout has a variable tail.
+def _cg_bin_fixed_prefix_bits(prog: mir::MirProgram, layout_id: Int, split: Int): Int
+  var total = 0
+  for fi in 0..split
+    total = total + mir::mir_binary_layout_field_width(prog, layout_id, fi)
+  end
+  return total
+end
+
+## Count non-pad fields in [0..limit) to compute the struct slot index at
+## which the variable tail begins.
+def _cg_bin_count_non_pad(prog: mir::MirProgram, layout_id: Int, limit: Int): Int
+  var c = 0
+  for fi in 0..limit
+    var fname = mir::mir_binary_layout_field_name(prog, layout_id, fi)
+    if str_byte_len(fname) > 0 and not fname.eq("_")
+      c = c + 1
+    end
+  end
+  return c
+end
+
+## Emit a byte-store: data_ptr[byte_idx] = (byte_val & 0xff)
+## data_ptr points to the Vec<Int> data region where each element is
+## an i64-wide slot. Byte-level bytes are stored as i64 values in the
+## slot (wasteful but matches std/bytes.qz representation).
+def _cg_bin_emit_byte_store(out: Int, d: String, uniq: String, data_ptr: String, byte_idx: Int, val_reg: String): Void
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".bs")
+  codegen_util::cg_emit(out, uniq)
+  codegen_util::cg_emit(out, ".p = getelementptr i64, ptr ")
+  codegen_util::cg_emit(out, data_ptr)
+  codegen_util::cg_emit(out, ", i64 ")
+  codegen_util::cg_emit_int(out, byte_idx)
+  codegen_util::cg_emit_line(out, "")
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".bs")
+  codegen_util::cg_emit(out, uniq)
+  codegen_util::cg_emit(out, ".clamp = and i64 ")
+  codegen_util::cg_emit(out, val_reg)
+  codegen_util::cg_emit_line(out, ", 255")
+  codegen_util::cg_emit(out, "  store i64 %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".bs")
+  codegen_util::cg_emit(out, uniq)
+  codegen_util::cg_emit(out, ".clamp, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".bs")
+  codegen_util::cg_emit(out, uniq)
+  codegen_util::cg_emit_line(out, ".p")
+end
+
+## Emit a byte-store with bitwise OR into an existing slot — for sub-byte
+## fields packing into a byte that may already hold other field bits.
+def _cg_bin_emit_byte_or(out: Int, d: String, uniq: String, data_ptr: String, byte_idx: Int, val_reg: String): Void
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".bo")
+  codegen_util::cg_emit(out, uniq)
+  codegen_util::cg_emit(out, ".p = getelementptr i64, ptr ")
+  codegen_util::cg_emit(out, data_ptr)
+  codegen_util::cg_emit(out, ", i64 ")
+  codegen_util::cg_emit_int(out, byte_idx)
+  codegen_util::cg_emit_line(out, "")
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".bo")
+  codegen_util::cg_emit(out, uniq)
+  codegen_util::cg_emit(out, ".cur = load i64, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".bo")
+  codegen_util::cg_emit(out, uniq)
+  codegen_util::cg_emit_line(out, ".p")
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".bo")
+  codegen_util::cg_emit(out, uniq)
+  codegen_util::cg_emit(out, ".new = or i64 %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".bo")
+  codegen_util::cg_emit(out, uniq)
+  codegen_util::cg_emit(out, ".cur, ")
+  codegen_util::cg_emit(out, val_reg)
+  codegen_util::cg_emit_line(out, "")
+  codegen_util::cg_emit(out, "  store i64 %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".bo")
+  codegen_util::cg_emit(out, uniq)
+  codegen_util::cg_emit(out, ".new, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".bo")
+  codegen_util::cg_emit(out, uniq)
+  codegen_util::cg_emit_line(out, ".p")
+end
+
+## Emit a byte-to-slot copy loop: dst_data[dst_off+i] = zext src_ptr[i]
+## for i in 0..n. Unique label suffix derived from `uniq`. The alloca is
+## fine mid-function (LLVM verifier accepts it; optimization loses vs.
+## entry-block alloca but is inconsequential here).
+def _cg_bin_emit_str_to_slots_loop(out: Int, uniq: String, src_ptr: String, n_ref: String, dst_data: String, dst_off: String): Void
+  codegen_util::cg_emit_line(out, "  %bin_s2s_i_#{uniq} = alloca i64")
+  codegen_util::cg_emit_line(out, "  store i64 0, ptr %bin_s2s_i_#{uniq}")
+  codegen_util::cg_emit_line(out, "  br label %bin_s2s_hdr_#{uniq}")
+  codegen_util::cg_emit_line(out, "bin_s2s_hdr_#{uniq}:")
+  codegen_util::cg_emit_line(out, "  %bin_s2s_iv_#{uniq} = load i64, ptr %bin_s2s_i_#{uniq}")
+  codegen_util::cg_emit_line(out, "  %bin_s2s_cmp_#{uniq} = icmp uge i64 %bin_s2s_iv_#{uniq}, #{n_ref}")
+  codegen_util::cg_emit_line(out, "  br i1 %bin_s2s_cmp_#{uniq}, label %bin_s2s_end_#{uniq}, label %bin_s2s_body_#{uniq}")
+  codegen_util::cg_emit_line(out, "bin_s2s_body_#{uniq}:")
+  codegen_util::cg_emit_line(out, "  %bin_s2s_sp_#{uniq} = getelementptr i8, ptr #{src_ptr}, i64 %bin_s2s_iv_#{uniq}")
+  codegen_util::cg_emit_line(out, "  %bin_s2s_b_#{uniq} = load i8, ptr %bin_s2s_sp_#{uniq}")
+  codegen_util::cg_emit_line(out, "  %bin_s2s_bz_#{uniq} = zext i8 %bin_s2s_b_#{uniq} to i64")
+  codegen_util::cg_emit_line(out, "  %bin_s2s_di_#{uniq} = add i64 #{dst_off}, %bin_s2s_iv_#{uniq}")
+  codegen_util::cg_emit_line(out, "  %bin_s2s_dp_#{uniq} = getelementptr i64, ptr #{dst_data}, i64 %bin_s2s_di_#{uniq}")
+  codegen_util::cg_emit_line(out, "  store i64 %bin_s2s_bz_#{uniq}, ptr %bin_s2s_dp_#{uniq}")
+  codegen_util::cg_emit_line(out, "  %bin_s2s_nx_#{uniq} = add i64 %bin_s2s_iv_#{uniq}, 1")
+  codegen_util::cg_emit_line(out, "  store i64 %bin_s2s_nx_#{uniq}, ptr %bin_s2s_i_#{uniq}")
+  codegen_util::cg_emit_line(out, "  br label %bin_s2s_hdr_#{uniq}")
+  codegen_util::cg_emit_line(out, "bin_s2s_end_#{uniq}:")
+end
+
+## Emit a slot-to-byte copy loop: dst_ptr[i] = trunc src_data[src_off+i]
+## for i in 0..n. Used by UNPACK for cstring / pstring reading.
+def _cg_bin_emit_slots_to_str_loop(out: Int, uniq: String, src_data: String, src_off: String, dst_ptr: String, n_ref: String): Void
+  codegen_util::cg_emit_line(out, "  %bin_s2b_i_#{uniq} = alloca i64")
+  codegen_util::cg_emit_line(out, "  store i64 0, ptr %bin_s2b_i_#{uniq}")
+  codegen_util::cg_emit_line(out, "  br label %bin_s2b_hdr_#{uniq}")
+  codegen_util::cg_emit_line(out, "bin_s2b_hdr_#{uniq}:")
+  codegen_util::cg_emit_line(out, "  %bin_s2b_iv_#{uniq} = load i64, ptr %bin_s2b_i_#{uniq}")
+  codegen_util::cg_emit_line(out, "  %bin_s2b_cmp_#{uniq} = icmp uge i64 %bin_s2b_iv_#{uniq}, #{n_ref}")
+  codegen_util::cg_emit_line(out, "  br i1 %bin_s2b_cmp_#{uniq}, label %bin_s2b_end_#{uniq}, label %bin_s2b_body_#{uniq}")
+  codegen_util::cg_emit_line(out, "bin_s2b_body_#{uniq}:")
+  codegen_util::cg_emit_line(out, "  %bin_s2b_si_#{uniq} = add i64 #{src_off}, %bin_s2b_iv_#{uniq}")
+  codegen_util::cg_emit_line(out, "  %bin_s2b_sp_#{uniq} = getelementptr i64, ptr #{src_data}, i64 %bin_s2b_si_#{uniq}")
+  codegen_util::cg_emit_line(out, "  %bin_s2b_v_#{uniq} = load i64, ptr %bin_s2b_sp_#{uniq}")
+  codegen_util::cg_emit_line(out, "  %bin_s2b_vt_#{uniq} = trunc i64 %bin_s2b_v_#{uniq} to i8")
+  codegen_util::cg_emit_line(out, "  %bin_s2b_dp_#{uniq} = getelementptr i8, ptr #{dst_ptr}, i64 %bin_s2b_iv_#{uniq}")
+  codegen_util::cg_emit_line(out, "  store i8 %bin_s2b_vt_#{uniq}, ptr %bin_s2b_dp_#{uniq}")
+  codegen_util::cg_emit_line(out, "  %bin_s2b_nx_#{uniq} = add i64 %bin_s2b_iv_#{uniq}, 1")
+  codegen_util::cg_emit_line(out, "  store i64 %bin_s2b_nx_#{uniq}, ptr %bin_s2b_i_#{uniq}")
+  codegen_util::cg_emit_line(out, "  br label %bin_s2b_hdr_#{uniq}")
+  codegen_util::cg_emit_line(out, "bin_s2b_end_#{uniq}:")
+end
+
+## Emit a cstring null-scan loop: scan src_data starting at src_off for
+## the first slot whose low byte is zero. Stores the length (bytes before
+## the null) to `len_slot` (an alloca ptr). Used by UNPACK for cstring.
+def _cg_bin_emit_cstring_scan(out: Int, uniq: String, src_data: String, src_off: String, len_slot: String): Void
+  codegen_util::cg_emit_line(out, "  %bin_cs_i_#{uniq} = alloca i64")
+  codegen_util::cg_emit_line(out, "  store i64 0, ptr %bin_cs_i_#{uniq}")
+  codegen_util::cg_emit_line(out, "  br label %bin_cs_hdr_#{uniq}")
+  codegen_util::cg_emit_line(out, "bin_cs_hdr_#{uniq}:")
+  codegen_util::cg_emit_line(out, "  %bin_cs_iv_#{uniq} = load i64, ptr %bin_cs_i_#{uniq}")
+  codegen_util::cg_emit_line(out, "  %bin_cs_si_#{uniq} = add i64 #{src_off}, %bin_cs_iv_#{uniq}")
+  codegen_util::cg_emit_line(out, "  %bin_cs_sp_#{uniq} = getelementptr i64, ptr #{src_data}, i64 %bin_cs_si_#{uniq}")
+  codegen_util::cg_emit_line(out, "  %bin_cs_v_#{uniq} = load i64, ptr %bin_cs_sp_#{uniq}")
+  codegen_util::cg_emit_line(out, "  %bin_cs_vm_#{uniq} = and i64 %bin_cs_v_#{uniq}, 255")
+  codegen_util::cg_emit_line(out, "  %bin_cs_iz_#{uniq} = icmp eq i64 %bin_cs_vm_#{uniq}, 0")
+  codegen_util::cg_emit_line(out, "  br i1 %bin_cs_iz_#{uniq}, label %bin_cs_done_#{uniq}, label %bin_cs_cont_#{uniq}")
+  codegen_util::cg_emit_line(out, "bin_cs_cont_#{uniq}:")
+  codegen_util::cg_emit_line(out, "  %bin_cs_nx_#{uniq} = add i64 %bin_cs_iv_#{uniq}, 1")
+  codegen_util::cg_emit_line(out, "  store i64 %bin_cs_nx_#{uniq}, ptr %bin_cs_i_#{uniq}")
+  codegen_util::cg_emit_line(out, "  br label %bin_cs_hdr_#{uniq}")
+  codegen_util::cg_emit_line(out, "bin_cs_done_#{uniq}:")
+  codegen_util::cg_emit_line(out, "  store i64 %bin_cs_iv_#{uniq}, ptr #{len_slot}")
+end
+
+## Emit the fixed-prefix field-store loop for PACK: walks fields
+## [0..end_idx), loading each from `%v<d>.src` and writing bytes to
+## `%v<d>.vd`. Uses compile-time bit offsets within the prefix.
+## Layout is exactly what the original inline loop emitted — extracted
+## so the variable-path dispatcher can call it for the fixed prefix.
+def _cg_bin_emit_pack_prefix_stores(out: Int, prog: mir::MirProgram, dest: Int, layout_id: Int, end_idx: Int): Void
+  var d = dest.to_s()
+  var data_reg = "%v#{d}.vd"
+  var bit_offset = 0
+  var struct_fi = 0
+  for fi in 0..end_idx
+    var fname = mir::mir_binary_layout_field_name(prog, layout_id, fi)
+    var spec = mir::mir_binary_layout_field_spec(prog, layout_id, fi)
+    var width = mir::mir_binary_layout_field_width(prog, layout_id, fi)
+    var is_pad = 0
+    if str_byte_len(fname) == 0 or fname.eq("_")
+      is_pad = 1
+    end
+    var info = _cg_bin_parse_width_info(spec)
+    var is_le = info[3]
+    var is_byte_aligned = 0
+    if (bit_offset % 8) == 0 and (width == 8 or width == 16 or width == 32 or width == 64)
+      is_byte_aligned = 1
+    end
+    if is_pad == 0
+      codegen_util::cg_emit_line(out, "  %v#{d}.p#{fi.to_s()}.gp = getelementptr i64, ptr %v#{d}.src, i64 #{struct_fi.to_s()}")
+      codegen_util::cg_emit_line(out, "  %v#{d}.p#{fi.to_s()} = load i64, ptr %v#{d}.p#{fi.to_s()}.gp")
+      if is_byte_aligned == 1
+        var byte_start = bit_offset / 8
+        var byte_count = width / 8
+        for bi in 0..byte_count
+          var byte_shift = 0
+          if is_le == 0
+            byte_shift = (byte_count - 1 - bi) * 8
+          else
+            byte_shift = bi * 8
+          end
+          var byte_reg = "%v#{d}.p#{fi.to_s()}.b#{bi.to_s()}"
+          codegen_util::cg_emit_line(out, "  %v#{d}.p#{fi.to_s()}.b#{bi.to_s()} = lshr i64 %v#{d}.p#{fi.to_s()}, #{byte_shift.to_s()}")
+          _cg_bin_emit_byte_store(out, d, "#{fi.to_s()}_#{bi.to_s()}", data_reg, byte_start + bi, byte_reg)
+        end
+      else
+        var byte_idx = bit_offset / 8
+        var bit_in_byte = bit_offset % 8
+        if (bit_in_byte + width) > 8
+          # MSB-first straddle: distribute field bits across multiple bytes,
+          # first byte gets the high bits (shifted down), last byte gets the
+          # low bits. LE variants (rare) deferred to STEP 1 follow-up.
+          var first_byte = byte_idx
+          var last_byte = (bit_offset + width - 1) / 8
+          var span = last_byte - first_byte + 1
+          var remaining = width
+          for bi in 0..span
+            var bit_in_byte_k = 0
+            if bi == 0
+              bit_in_byte_k = bit_in_byte
+            end
+            var bits_this = 0
+            if bi == 0
+              bits_this = 8 - bit_in_byte
+            elsif bi == span - 1
+              bits_this = remaining
+            else
+              bits_this = 8
+            end
+            var remaining_after = remaining - bits_this
+            var mask_this = (1 << bits_this) - 1
+            var shift_left = 8 - bit_in_byte_k - bits_this
+            # field_part = (field >> remaining_after) & mask_this
+            codegen_util::cg_emit_line(out, "  %v#{d}.p#{fi.to_s()}.sr#{bi.to_s()} = lshr i64 %v#{d}.p#{fi.to_s()}, #{remaining_after.to_s()}")
+            codegen_util::cg_emit_line(out, "  %v#{d}.p#{fi.to_s()}.mk#{bi.to_s()} = and i64 %v#{d}.p#{fi.to_s()}.sr#{bi.to_s()}, #{mask_this.to_s()}")
+            codegen_util::cg_emit_line(out, "  %v#{d}.p#{fi.to_s()}.sl#{bi.to_s()} = shl i64 %v#{d}.p#{fi.to_s()}.mk#{bi.to_s()}, #{shift_left.to_s()}")
+            _cg_bin_emit_byte_or(out, d, "_st#{fi.to_s()}_#{bi.to_s()}", data_reg, first_byte + bi, "%v#{d}.p#{fi.to_s()}.sl#{bi.to_s()}")
+            remaining = remaining_after
+          end
+        else
+          var shift_in = 8 - bit_in_byte - width
+          var mask = (1 << width) - 1
+          codegen_util::cg_emit_line(out, "  %v#{d}.p#{fi.to_s()}.m = and i64 %v#{d}.p#{fi.to_s()}, #{mask.to_s()}")
+          codegen_util::cg_emit_line(out, "  %v#{d}.p#{fi.to_s()}.s = shl i64 %v#{d}.p#{fi.to_s()}.m, #{shift_in.to_s()}")
+          _cg_bin_emit_byte_or(out, d, "_sb#{fi.to_s()}", data_reg, byte_idx, "%v#{d}.p#{fi.to_s()}.s")
+        end
+      end
+      struct_fi = struct_fi + 1
+    end
+    bit_offset = bit_offset + width
+  end
+end
+
+## Emit the fixed-prefix field-read loop for UNPACK: walks fields
+## [0..end_idx), reading bytes from `%v<d>.dp` and storing decoded
+## values to `%v<d>.out`. Uses compile-time bit offsets within prefix.
+def _cg_bin_emit_unpack_prefix_reads(out: Int, prog: mir::MirProgram, dest: Int, layout_id: Int, end_idx: Int): Void
+  var d = dest.to_s()
+  var data_reg = "%v#{d}.dp"
+  var bit_offset = 0
+  var struct_fi = 0
+  for fi in 0..end_idx
+    var fname = mir::mir_binary_layout_field_name(prog, layout_id, fi)
+    var spec = mir::mir_binary_layout_field_spec(prog, layout_id, fi)
+    var width = mir::mir_binary_layout_field_width(prog, layout_id, fi)
+    var is_pad = 0
+    if str_byte_len(fname) == 0 or fname.eq("_")
+      is_pad = 1
+    end
+    var info = _cg_bin_parse_width_info(spec)
+    var is_le = info[3]
+    var is_byte_aligned = 0
+    if (bit_offset % 8) == 0 and (width == 8 or width == 16 or width == 32 or width == 64)
+      is_byte_aligned = 1
+    end
+    if is_pad == 0
+      codegen_util::cg_emit_line(out, "  %v#{d}.a#{fi.to_s()}.0 = add i64 0, 0")
+      if is_byte_aligned == 1
+        var byte_start = bit_offset / 8
+        var byte_count = width / 8
+        var prev_accum = 0
+        for bi in 0..byte_count
+          codegen_util::cg_emit_line(out, "  %v#{d}.u#{fi.to_s()}.b#{bi.to_s()}.p = getelementptr i64, ptr #{data_reg}, i64 #{(byte_start + bi).to_s()}")
+          codegen_util::cg_emit_line(out, "  %v#{d}.u#{fi.to_s()}.b#{bi.to_s()} = load i64, ptr %v#{d}.u#{fi.to_s()}.b#{bi.to_s()}.p")
+          codegen_util::cg_emit_line(out, "  %v#{d}.u#{fi.to_s()}.b#{bi.to_s()}.m = and i64 %v#{d}.u#{fi.to_s()}.b#{bi.to_s()}, 255")
+          var shift_amt = 0
+          if is_le == 0
+            shift_amt = (byte_count - 1 - bi) * 8
+          else
+            shift_amt = bi * 8
+          end
+          codegen_util::cg_emit_line(out, "  %v#{d}.u#{fi.to_s()}.b#{bi.to_s()}.s = shl i64 %v#{d}.u#{fi.to_s()}.b#{bi.to_s()}.m, #{shift_amt.to_s()}")
+          var next_accum = prev_accum + 1
+          codegen_util::cg_emit_line(out, "  %v#{d}.a#{fi.to_s()}.#{next_accum.to_s()} = or i64 %v#{d}.a#{fi.to_s()}.#{prev_accum.to_s()}, %v#{d}.u#{fi.to_s()}.b#{bi.to_s()}.s")
+          prev_accum = next_accum
+        end
+        codegen_util::cg_emit_line(out, "  %v#{d}.sp#{fi.to_s()} = getelementptr i64, ptr %v#{d}.out, i64 #{struct_fi.to_s()}")
+        codegen_util::cg_emit_line(out, "  store i64 %v#{d}.a#{fi.to_s()}.#{prev_accum.to_s()}, ptr %v#{d}.sp#{fi.to_s()}")
+      else
+        var byte_idx = bit_offset / 8
+        var bit_in_byte = bit_offset % 8
+        if (bit_in_byte + width) > 8
+          # MSB-first straddle: reassemble field from multiple bytes.
+          var first_byte = byte_idx
+          var last_byte = (bit_offset + width - 1) / 8
+          var span = last_byte - first_byte + 1
+          var remaining = width
+          codegen_util::cg_emit_line(out, "  %v#{d}.str#{fi.to_s()}.0 = add i64 0, 0")
+          var prev_accum = 0
+          for bi in 0..span
+            var bit_in_byte_k = 0
+            if bi == 0
+              bit_in_byte_k = bit_in_byte
+            end
+            var bits_this = 0
+            if bi == 0
+              bits_this = 8 - bit_in_byte
+            elsif bi == span - 1
+              bits_this = remaining
+            else
+              bits_this = 8
+            end
+            var remaining_after = remaining - bits_this
+            var byte_shift_right = 8 - bit_in_byte_k - bits_this
+            var mask_this = (1 << bits_this) - 1
+            codegen_util::cg_emit_line(out, "  %v#{d}.str#{fi.to_s()}.b#{bi.to_s()}.p = getelementptr i64, ptr #{data_reg}, i64 #{(first_byte + bi).to_s()}")
+            codegen_util::cg_emit_line(out, "  %v#{d}.str#{fi.to_s()}.b#{bi.to_s()}.v = load i64, ptr %v#{d}.str#{fi.to_s()}.b#{bi.to_s()}.p")
+            codegen_util::cg_emit_line(out, "  %v#{d}.str#{fi.to_s()}.b#{bi.to_s()}.sr = lshr i64 %v#{d}.str#{fi.to_s()}.b#{bi.to_s()}.v, #{byte_shift_right.to_s()}")
+            codegen_util::cg_emit_line(out, "  %v#{d}.str#{fi.to_s()}.b#{bi.to_s()}.mk = and i64 %v#{d}.str#{fi.to_s()}.b#{bi.to_s()}.sr, #{mask_this.to_s()}")
+            codegen_util::cg_emit_line(out, "  %v#{d}.str#{fi.to_s()}.b#{bi.to_s()}.sl = shl i64 %v#{d}.str#{fi.to_s()}.b#{bi.to_s()}.mk, #{remaining_after.to_s()}")
+            var next_accum = prev_accum + 1
+            codegen_util::cg_emit_line(out, "  %v#{d}.str#{fi.to_s()}.#{next_accum.to_s()} = or i64 %v#{d}.str#{fi.to_s()}.#{prev_accum.to_s()}, %v#{d}.str#{fi.to_s()}.b#{bi.to_s()}.sl")
+            prev_accum = next_accum
+            remaining = remaining_after
+          end
+          codegen_util::cg_emit_line(out, "  %v#{d}.sp#{fi.to_s()} = getelementptr i64, ptr %v#{d}.out, i64 #{struct_fi.to_s()}")
+          codegen_util::cg_emit_line(out, "  store i64 %v#{d}.str#{fi.to_s()}.#{prev_accum.to_s()}, ptr %v#{d}.sp#{fi.to_s()}")
+        else
+          codegen_util::cg_emit_line(out, "  %v#{d}.sbp#{fi.to_s()} = getelementptr i64, ptr #{data_reg}, i64 #{byte_idx.to_s()}")
+          codegen_util::cg_emit_line(out, "  %v#{d}.sbv#{fi.to_s()} = load i64, ptr %v#{d}.sbp#{fi.to_s()}")
+          var shift_in = 8 - bit_in_byte - width
+          codegen_util::cg_emit_line(out, "  %v#{d}.sbs#{fi.to_s()} = lshr i64 %v#{d}.sbv#{fi.to_s()}, #{shift_in.to_s()}")
+          var mask = (1 << width) - 1
+          codegen_util::cg_emit_line(out, "  %v#{d}.sbm#{fi.to_s()} = and i64 %v#{d}.sbs#{fi.to_s()}, #{mask.to_s()}")
+          codegen_util::cg_emit_line(out, "  %v#{d}.sp#{fi.to_s()} = getelementptr i64, ptr %v#{d}.out, i64 #{struct_fi.to_s()}")
+          codegen_util::cg_emit_line(out, "  store i64 %v#{d}.sbm#{fi.to_s()}, ptr %v#{d}.sp#{fi.to_s()}")
+        end
+      end
+      struct_fi = struct_fi + 1
+    end
+    bit_offset = bit_offset + width
+  end
+end
+
+## Emit MIR_BINARY_PACK for a layout with variable-width fields. Fixed
+## prefix [0..split) uses compile-time byte offsets. Variable tail
+## [split..field_count) uses a runtime cursor. Caller ensures at least
+## one field has width==0 (i.e. split < field_count). Sub-byte fields
+## in the tail, pad fields in the tail, and array forms are not yet
+## supported (emit diagnostics; filed as STEP 1b).
+def _cg_bin_emit_pack_variable(out: Int, prog: mir::MirProgram, dest: Int, layout_id: Int, self_val: Int, split: Int): Void
+  var d = dest.to_s()
+  var src = self_val.to_s()
+  var field_count = mir::mir_binary_layout_field_count(prog, layout_id)
+  var lname = mir::mir_binary_layout_name(prog, layout_id)
+  var prefix_bits = _cg_bin_fixed_prefix_bits(prog, layout_id, split)
+  var prefix_bytes = prefix_bits / 8
+  var prefix_non_pad = _cg_bin_count_non_pad(prog, layout_id, split)
+
+  codegen_util::cg_emit_line(out, "  %v#{d}.src = inttoptr i64 %v#{src} to ptr")
+
+  # Phase 1: load each tail field's value + compute per-field runtime size.
+  # Accumulate total size into .sz<k> chain, starting at prefix_bytes.
+  codegen_util::cg_emit_line(out, "  %v#{d}.sz0 = add i64 0, #{prefix_bytes.to_s()}")
+  var acc = 0
+  var struct_fi = prefix_non_pad
+  for fi in split..field_count
+    var fname = mir::mir_binary_layout_field_name(prog, layout_id, fi)
+    var spec = mir::mir_binary_layout_field_spec(prog, layout_id, fi)
+    var width = mir::mir_binary_layout_field_width(prog, layout_id, fi)
+    var fi_s = fi.to_s()
+    if str_byte_len(fname) == 0 or fname.eq("_")
+      codegen_util::cg_emit_line(out, "  ; BINARY DSL pack: pad field after variable not yet supported (#{lname}.#{fname})")
+      continue
+    end
+    codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.gp = getelementptr i64, ptr %v#{d}.src, i64 #{struct_fi.to_s()}")
+    codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s} = load i64, ptr %v#{d}.f#{fi_s}.gp")
+    if width > 0
+      var info = _cg_bin_parse_width_info(spec)
+      var is_byte_aligned = 0
+      if (width == 8 or width == 16 or width == 32 or width == 64)
+        is_byte_aligned = 1
+      end
+      if is_byte_aligned == 0
+        codegen_util::cg_emit_line(out, "  ; BINARY DSL pack: sub-byte field '#{fname}' after variable tail not yet supported")
+      end
+      var fbytes = width / 8
+      var next_acc = acc + 1
+      codegen_util::cg_emit_line(out, "  %v#{d}.sz#{next_acc.to_s()} = add i64 %v#{d}.sz#{acc.to_s()}, #{fbytes.to_s()}")
+      acc = next_acc
+    else
+      var klass = _cg_bin_var_spec_class(spec)
+      if klass == 0
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.bs = inttoptr i64 %v#{d}.f#{fi_s} to ptr")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.vhi = load i64, ptr %v#{d}.f#{fi_s}.bs")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.vh = inttoptr i64 %v#{d}.f#{fi_s}.vhi to ptr")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.szp = getelementptr i64, ptr %v#{d}.f#{fi_s}.vh, i64 1")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.sz = load i64, ptr %v#{d}.f#{fi_s}.szp")
+        var next_acc = acc + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.sz#{next_acc.to_s()} = add i64 %v#{d}.sz#{acc.to_s()}, %v#{d}.f#{fi_s}.sz")
+        acc = next_acc
+      elsif klass > 0
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.bs = inttoptr i64 %v#{d}.f#{fi_s} to ptr")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.vhi = load i64, ptr %v#{d}.f#{fi_s}.bs")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.vh = inttoptr i64 %v#{d}.f#{fi_s}.vhi to ptr")
+        var next_acc = acc + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.sz#{next_acc.to_s()} = add i64 %v#{d}.sz#{acc.to_s()}, #{klass.to_s()}")
+        acc = next_acc
+      elsif klass == -1
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.sp = inttoptr i64 %v#{d}.f#{fi_s} to ptr")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.sl = call i64 @qz_str_get_len(ptr %v#{d}.f#{fi_s}.sp)")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.sl1 = add i64 %v#{d}.f#{fi_s}.sl, 1")
+        var next_acc = acc + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.sz#{next_acc.to_s()} = add i64 %v#{d}.sz#{acc.to_s()}, %v#{d}.f#{fi_s}.sl1")
+        acc = next_acc
+      elsif klass == -2 or klass == -4 or klass == -5 or klass == -6 or klass == -7
+        var pw = _cg_bin_pstring_prefix_bytes(klass)
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.sp = inttoptr i64 %v#{d}.f#{fi_s} to ptr")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.sl = call i64 @qz_str_get_len(ptr %v#{d}.f#{fi_s}.sp)")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.slp = add i64 %v#{d}.f#{fi_s}.sl, #{pw.to_s()}")
+        var next_acc = acc + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.sz#{next_acc.to_s()} = add i64 %v#{d}.sz#{acc.to_s()}, %v#{d}.f#{fi_s}.slp")
+        acc = next_acc
+      elsif klass == -10
+        # Array `[T]` / `[T;N]` / `[T;field]` — encode uses the user's
+        # Vec size regardless of variant. The struct slot holds the Vec
+        # handle directly (no Bytes wrapper indirection).
+        var arr_info = _cg_bin_parse_array_info(spec)
+        var elem_bits = arr_info[1]
+        var elem_bytes = elem_bits / 8
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.vh = inttoptr i64 %v#{d}.f#{fi_s} to ptr")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.szp = getelementptr i64, ptr %v#{d}.f#{fi_s}.vh, i64 1")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.sz = load i64, ptr %v#{d}.f#{fi_s}.szp")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.bcnt = mul i64 %v#{d}.f#{fi_s}.sz, #{elem_bytes.to_s()}")
+        var next_acc = acc + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.sz#{next_acc.to_s()} = add i64 %v#{d}.sz#{acc.to_s()}, %v#{d}.f#{fi_s}.bcnt")
+        acc = next_acc
+      else
+        codegen_util::cg_emit_line(out, "  ; BINARY DSL pack: unsupported variable spec '#{spec}' in #{lname}")
+        var next_acc = acc + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.sz#{next_acc.to_s()} = add i64 %v#{d}.sz#{acc.to_s()}, 0")
+        acc = next_acc
+      end
+    end
+    struct_fi = struct_fi + 1
+  end
+
+  # Phase 2: allocate Vec<Int> header + data region with runtime size.
+  codegen_util::cg_emit_line(out, "  %v#{d}.vh = call ptr @__qz_alloc(i64 32)")
+  codegen_util::cg_emit_line(out, "  %v#{d}.dbytes = mul i64 %v#{d}.sz#{acc.to_s()}, 8")
+  codegen_util::cg_emit_line(out, "  %v#{d}.vd = call ptr @__qz_alloc(i64 %v#{d}.dbytes)")
+  codegen_util::cg_emit_line(out, "  call ptr @memset(ptr %v#{d}.vd, i32 0, i64 %v#{d}.dbytes)")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.sz#{acc.to_s()}, ptr %v#{d}.vh")
+  codegen_util::cg_emit_line(out, "  %v#{d}.szp = getelementptr i64, ptr %v#{d}.vh, i64 1")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.sz#{acc.to_s()}, ptr %v#{d}.szp")
+  codegen_util::cg_emit_line(out, "  %v#{d}.dpp = getelementptr i64, ptr %v#{d}.vh, i64 2")
+  codegen_util::cg_emit_line(out, "  %v#{d}.dpi = ptrtoint ptr %v#{d}.vd to i64")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.dpi, ptr %v#{d}.dpp")
+  codegen_util::cg_emit_line(out, "  %v#{d}.ewp = getelementptr i64, ptr %v#{d}.vh, i64 3")
+  codegen_util::cg_emit_line(out, "  store i64 8, ptr %v#{d}.ewp")
+
+  # Phase 3: fixed prefix stores.
+  _cg_bin_emit_pack_prefix_stores(out, prog, dest, layout_id, split)
+
+  # Phase 4: variable tail stores — runtime cursor starts at prefix_bytes.
+  codegen_util::cg_emit_line(out, "  %v#{d}.c0 = add i64 0, #{prefix_bytes.to_s()}")
+  var cur = 0
+  struct_fi = prefix_non_pad
+  for fi in split..field_count
+    var fname = mir::mir_binary_layout_field_name(prog, layout_id, fi)
+    var spec = mir::mir_binary_layout_field_spec(prog, layout_id, fi)
+    var width = mir::mir_binary_layout_field_width(prog, layout_id, fi)
+    var fi_s = fi.to_s()
+    if str_byte_len(fname) == 0 or fname.eq("_")
+      continue
+    end
+    if width > 0
+      var info = _cg_bin_parse_width_info(spec)
+      var is_le = info[3]
+      var fbytes = width / 8
+      if fbytes > 0
+        for bi in 0..fbytes
+          var byte_shift = 0
+          if is_le == 0
+            byte_shift = (fbytes - 1 - bi) * 8
+          else
+            byte_shift = bi * 8
+          end
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.s#{bi.to_s()} = lshr i64 %v#{d}.f#{fi_s}, #{byte_shift.to_s()}")
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.m#{bi.to_s()} = and i64 %v#{d}.f#{fi_s}.s#{bi.to_s()}, 255")
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.o#{bi.to_s()} = add i64 %v#{d}.c#{cur.to_s()}, #{bi.to_s()}")
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.dp#{bi.to_s()} = getelementptr i64, ptr %v#{d}.vd, i64 %v#{d}.f#{fi_s}.o#{bi.to_s()}")
+          codegen_util::cg_emit_line(out, "  store i64 %v#{d}.f#{fi_s}.m#{bi.to_s()}, ptr %v#{d}.f#{fi_s}.dp#{bi.to_s()}")
+        end
+        var next_cur = cur + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.c#{next_cur.to_s()} = add i64 %v#{d}.c#{cur.to_s()}, #{fbytes.to_s()}")
+        cur = next_cur
+      end
+    else
+      var klass = _cg_bin_var_spec_class(spec)
+      if klass == 0 or klass > 0
+        # Both bytes rest and bytes(N): load src data ptr (vh already bound in Phase 1), memcpy N*8 bytes.
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.srcdpp = getelementptr i64, ptr %v#{d}.f#{fi_s}.vh, i64 2")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.srcdpi = load i64, ptr %v#{d}.f#{fi_s}.srcdpp")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.srcdp = inttoptr i64 %v#{d}.f#{fi_s}.srcdpi to ptr")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.dst = getelementptr i64, ptr %v#{d}.vd, i64 %v#{d}.c#{cur.to_s()}")
+        var sz_ref = ""
+        if klass == 0
+          sz_ref = "%v#{d}.f#{fi_s}.sz"
+        else
+          sz_ref = klass.to_s()
+        end
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.cbs = mul i64 #{sz_ref}, 8")
+        codegen_util::cg_emit_line(out, "  call ptr @memcpy(ptr %v#{d}.f#{fi_s}.dst, ptr %v#{d}.f#{fi_s}.srcdp, i64 %v#{d}.f#{fi_s}.cbs)")
+        var next_cur = cur + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.c#{next_cur.to_s()} = add i64 %v#{d}.c#{cur.to_s()}, #{sz_ref}")
+        cur = next_cur
+      elsif klass == -1
+        # cstring: byte-to-slot loop + null terminator.
+        _cg_bin_emit_str_to_slots_loop(out, "p#{d}_#{fi_s}", "%v#{d}.f#{fi_s}.sp", "%v#{d}.f#{fi_s}.sl", "%v#{d}.vd", "%v#{d}.c#{cur.to_s()}")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.nlp = add i64 %v#{d}.c#{cur.to_s()}, %v#{d}.f#{fi_s}.sl")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.nldp = getelementptr i64, ptr %v#{d}.vd, i64 %v#{d}.f#{fi_s}.nlp")
+        codegen_util::cg_emit_line(out, "  store i64 0, ptr %v#{d}.f#{fi_s}.nldp")
+        var next_cur = cur + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.c#{next_cur.to_s()} = add i64 %v#{d}.c#{cur.to_s()}, %v#{d}.f#{fi_s}.sl1")
+        cur = next_cur
+      elsif klass == -2 or klass == -4 or klass == -5 or klass == -6 or klass == -7
+        var pw = _cg_bin_pstring_prefix_bytes(klass)
+        var is_le = _cg_bin_pstring_is_le(klass)
+        for bi in 0..pw
+          var byte_shift = 0
+          if is_le == 1
+            byte_shift = bi * 8
+          else
+            byte_shift = (pw - 1 - bi) * 8
+          end
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.ps#{bi.to_s()} = lshr i64 %v#{d}.f#{fi_s}.sl, #{byte_shift.to_s()}")
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.pm#{bi.to_s()} = and i64 %v#{d}.f#{fi_s}.ps#{bi.to_s()}, 255")
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.po#{bi.to_s()} = add i64 %v#{d}.c#{cur.to_s()}, #{bi.to_s()}")
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.pdp#{bi.to_s()} = getelementptr i64, ptr %v#{d}.vd, i64 %v#{d}.f#{fi_s}.po#{bi.to_s()}")
+          codegen_util::cg_emit_line(out, "  store i64 %v#{d}.f#{fi_s}.pm#{bi.to_s()}, ptr %v#{d}.f#{fi_s}.pdp#{bi.to_s()}")
+        end
+        var mid_cur = cur + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.c#{mid_cur.to_s()} = add i64 %v#{d}.c#{cur.to_s()}, #{pw.to_s()}")
+        cur = mid_cur
+        _cg_bin_emit_str_to_slots_loop(out, "p#{d}_#{fi_s}", "%v#{d}.f#{fi_s}.sp", "%v#{d}.f#{fi_s}.sl", "%v#{d}.vd", "%v#{d}.c#{cur.to_s()}")
+        var next_cur = cur + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.c#{next_cur.to_s()} = add i64 %v#{d}.c#{cur.to_s()}, %v#{d}.f#{fi_s}.sl")
+        cur = next_cur
+      elsif klass == -10
+        # Array tail: loop over Vec elements, shift/mask/store per-byte
+        # with the element type's endianness. Phase 1 already bound
+        # %v<d>.f<fi>.vh and %v<d>.f<fi>.sz; load data ptr here.
+        var arr_info = _cg_bin_parse_array_info(spec)
+        var elem_bits = arr_info[1]
+        var is_le = arr_info[2]
+        var elem_bytes = elem_bits / 8
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.dpp = getelementptr i64, ptr %v#{d}.f#{fi_s}.vh, i64 2")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.dpi = load i64, ptr %v#{d}.f#{fi_s}.dpp")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.srcdp = inttoptr i64 %v#{d}.f#{fi_s}.dpi to ptr")
+        # Emit element loop. Unique label suffix prevents collisions.
+        var lbl = "parr_#{d}_#{fi_s}"
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.ic = alloca i64")
+        codegen_util::cg_emit_line(out, "  store i64 0, ptr %v#{d}.f#{fi_s}.ic")
+        codegen_util::cg_emit_line(out, "  br label %#{lbl}_cond")
+        codegen_util::cg_emit_line(out, "#{lbl}_cond:")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.i = load i64, ptr %v#{d}.f#{fi_s}.ic")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.cmp = icmp ult i64 %v#{d}.f#{fi_s}.i, %v#{d}.f#{fi_s}.sz")
+        codegen_util::cg_emit_line(out, "  br i1 %v#{d}.f#{fi_s}.cmp, label %#{lbl}_body, label %#{lbl}_end")
+        codegen_util::cg_emit_line(out, "#{lbl}_body:")
+        # Load the element value from the src Vec (each slot is i64).
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.ep = getelementptr i64, ptr %v#{d}.f#{fi_s}.srcdp, i64 %v#{d}.f#{fi_s}.i")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.ev = load i64, ptr %v#{d}.f#{fi_s}.ep")
+        # Byte offset within the destination data: cursor + i * elem_bytes.
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.ibytes = mul i64 %v#{d}.f#{fi_s}.i, #{elem_bytes.to_s()}")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.bstart = add i64 %v#{d}.c#{cur.to_s()}, %v#{d}.f#{fi_s}.ibytes")
+        # Unroll the per-byte split: elem_bytes is small (1/2/4/8).
+        for bi in 0..elem_bytes
+          var byte_shift = 0
+          if is_le == 0
+            byte_shift = (elem_bytes - 1 - bi) * 8
+          else
+            byte_shift = bi * 8
+          end
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.b#{bi.to_s()}.s = lshr i64 %v#{d}.f#{fi_s}.ev, #{byte_shift.to_s()}")
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.b#{bi.to_s()}.m = and i64 %v#{d}.f#{fi_s}.b#{bi.to_s()}.s, 255")
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.b#{bi.to_s()}.o = add i64 %v#{d}.f#{fi_s}.bstart, #{bi.to_s()}")
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.b#{bi.to_s()}.dp = getelementptr i64, ptr %v#{d}.vd, i64 %v#{d}.f#{fi_s}.b#{bi.to_s()}.o")
+          codegen_util::cg_emit_line(out, "  store i64 %v#{d}.f#{fi_s}.b#{bi.to_s()}.m, ptr %v#{d}.f#{fi_s}.b#{bi.to_s()}.dp")
+        end
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.i1 = add i64 %v#{d}.f#{fi_s}.i, 1")
+        codegen_util::cg_emit_line(out, "  store i64 %v#{d}.f#{fi_s}.i1, ptr %v#{d}.f#{fi_s}.ic")
+        codegen_util::cg_emit_line(out, "  br label %#{lbl}_cond")
+        codegen_util::cg_emit_line(out, "#{lbl}_end:")
+        var next_cur = cur + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.c#{next_cur.to_s()} = add i64 %v#{d}.c#{cur.to_s()}, %v#{d}.f#{fi_s}.bcnt")
+        cur = next_cur
+      else
+        codegen_util::cg_emit_line(out, "  ; BINARY DSL pack: tail emit skipped for '#{spec}'")
+      end
+    end
+    struct_fi = struct_fi + 1
+  end
+
+  # Phase 5: wrap Vec<Int> handle in Bytes struct.
+  codegen_util::cg_emit_line(out, "  %v#{d}.bs = call ptr @__qz_alloc(i64 8)")
+  codegen_util::cg_emit_line(out, "  %v#{d}.vh.i = ptrtoint ptr %v#{d}.vh to i64")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.vh.i, ptr %v#{d}.bs")
+  codegen_util::cg_emit_line(out, "  %v#{d} = ptrtoint ptr %v#{d}.bs to i64")
+end
+
+## Emit the EOF-error branch body: allocate a ParseError::UnexpectedEof
+## unit-variant + wrap in Result::Err, store the Err handle in `ret_a`,
+## branch to the join label. Caller provides the label suffix `uniq`.
+def _cg_bin_emit_eof_err_branch(out: Int, d: String, uniq: String): Void
+  codegen_util::cg_emit_line(out, "bin_eof_err_#{uniq}:")
+  codegen_util::cg_emit_line(out, "  %v#{d}.eperr = call ptr @__qz_alloc(i64 16)")
+  codegen_util::cg_emit_line(out, "  store i64 0, ptr %v#{d}.eperr")
+  codegen_util::cg_emit_line(out, "  %v#{d}.eres = call ptr @__qz_alloc(i64 16)")
+  codegen_util::cg_emit_line(out, "  store i64 1, ptr %v#{d}.eres")
+  codegen_util::cg_emit_line(out, "  %v#{d}.erespp = getelementptr i64, ptr %v#{d}.eres, i64 1")
+  codegen_util::cg_emit_line(out, "  %v#{d}.eperri = ptrtoint ptr %v#{d}.eperr to i64")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.eperri, ptr %v#{d}.erespp")
+  codegen_util::cg_emit_line(out, "  %v#{d}.retE = ptrtoint ptr %v#{d}.eres to i64")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.retE, ptr %v#{d}.ret_a")
+  codegen_util::cg_emit_line(out, "  br label %bin_eof_join_#{uniq}")
+end
+
+## Allocate a Bytes struct wrapping a given Vec<Int> header ptr and
+## materialize as an i64 handle in `%v<d>.<suffix>`. Used by
+## UNPACK for variable-width String / Bytes fields.
+def _cg_bin_emit_wrap_bytes(out: Int, d: String, suffix: String, vh_int_reg: String): Void
+  codegen_util::cg_emit_line(out, "  %v#{d}.#{suffix}.bs = call ptr @__qz_alloc(i64 8)")
+  codegen_util::cg_emit_line(out, "  store i64 #{vh_int_reg}, ptr %v#{d}.#{suffix}.bs")
+  codegen_util::cg_emit_line(out, "  %v#{d}.#{suffix} = ptrtoint ptr %v#{d}.#{suffix}.bs to i64")
+end
+
+## Emit MIR_BINARY_UNPACK for a layout with variable-width fields. Mirror
+## image of pack — fixed prefix reads use compile-time offsets; variable
+## tail uses a runtime cursor. Caller ensures split < field_count.
+def _cg_bin_emit_unpack_variable(out: Int, prog: mir::MirProgram, dest: Int, layout_id: Int, bytes_val: Int, split: Int): Void
+  var d = dest.to_s()
+  var src = bytes_val.to_s()
+  var field_count = mir::mir_binary_layout_field_count(prog, layout_id)
+  var lname = mir::mir_binary_layout_name(prog, layout_id)
+  var prefix_bits = _cg_bin_fixed_prefix_bits(prog, layout_id, split)
+  var prefix_bytes = prefix_bits / 8
+  var prefix_non_pad = _cg_bin_count_non_pad(prog, layout_id, split)
+  var total_non_pad = _cg_bin_count_non_pad(prog, layout_id, field_count)
+
+  # Load input Bytes → Vec → size + data ptr.
+  codegen_util::cg_emit_line(out, "  %v#{d}.bs = inttoptr i64 %v#{src} to ptr")
+  codegen_util::cg_emit_line(out, "  %v#{d}.vhi = load i64, ptr %v#{d}.bs")
+  codegen_util::cg_emit_line(out, "  %v#{d}.vh = inttoptr i64 %v#{d}.vhi to ptr")
+  codegen_util::cg_emit_line(out, "  %v#{d}.szp = getelementptr i64, ptr %v#{d}.vh, i64 1")
+  codegen_util::cg_emit_line(out, "  %v#{d}.sz = load i64, ptr %v#{d}.szp")
+  codegen_util::cg_emit_line(out, "  %v#{d}.dpp = getelementptr i64, ptr %v#{d}.vh, i64 2")
+  codegen_util::cg_emit_line(out, "  %v#{d}.dpi = load i64, ptr %v#{d}.dpp")
+  codegen_util::cg_emit_line(out, "  %v#{d}.dp = inttoptr i64 %v#{d}.dpi to ptr")
+
+  # Phase 1.5 STEP 3: EOF check — require at least prefix_bytes in the
+  # input for the fixed prefix. Variable tail fields contribute zero
+  # or more bytes, so the tight minimum is the prefix.
+  codegen_util::cg_emit_line(out, "  %v#{d}.ret_a = alloca i64")
+  codegen_util::cg_emit_line(out, "  %v#{d}.eof_cmp = icmp ult i64 %v#{d}.sz, #{prefix_bytes.to_s()}")
+  codegen_util::cg_emit_line(out, "  br i1 %v#{d}.eof_cmp, label %bin_eof_err_#{d}, label %bin_eof_ok_#{d}")
+  _cg_bin_emit_eof_err_branch(out, d, d)
+  codegen_util::cg_emit_line(out, "bin_eof_ok_#{d}:")
+
+  # Allocate output struct.
+  codegen_util::cg_emit_line(out, "  %v#{d}.out = call ptr @__qz_alloc(i64 #{(total_non_pad * 8).to_s()})")
+  codegen_util::cg_emit_line(out, "  call ptr @memset(ptr %v#{d}.out, i32 0, i64 #{(total_non_pad * 8).to_s()})")
+
+  # Phase 1: fixed prefix reads.
+  _cg_bin_emit_unpack_prefix_reads(out, prog, dest, layout_id, split)
+
+  # Phase 2: variable tail reads — runtime cursor starts at prefix_bytes.
+  codegen_util::cg_emit_line(out, "  %v#{d}.c0 = add i64 0, #{prefix_bytes.to_s()}")
+  var cur = 0
+  var struct_fi = prefix_non_pad
+  for fi in split..field_count
+    var fname = mir::mir_binary_layout_field_name(prog, layout_id, fi)
+    var spec = mir::mir_binary_layout_field_spec(prog, layout_id, fi)
+    var width = mir::mir_binary_layout_field_width(prog, layout_id, fi)
+    var fi_s = fi.to_s()
+    if str_byte_len(fname) == 0 or fname.eq("_")
+      codegen_util::cg_emit_line(out, "  ; BINARY DSL unpack: pad field after variable not yet supported (#{lname}.#{fname})")
+      continue
+    end
+    if width > 0
+      # Fixed byte-aligned u/i at runtime cursor.
+      var info = _cg_bin_parse_width_info(spec)
+      var is_le = info[3]
+      var is_byte_aligned = 0
+      if (width == 8 or width == 16 or width == 32 or width == 64)
+        is_byte_aligned = 1
+      end
+      if is_byte_aligned == 0
+        codegen_util::cg_emit_line(out, "  ; BINARY DSL unpack: sub-byte field '#{fname}' after variable tail not yet supported")
+      end
+      var fbytes = width / 8
+      codegen_util::cg_emit_line(out, "  %v#{d}.ta#{fi_s}.0 = add i64 0, 0")
+      var prev_accum = 0
+      for bi in 0..fbytes
+        codegen_util::cg_emit_line(out, "  %v#{d}.tb#{fi_s}.#{bi.to_s()}.o = add i64 %v#{d}.c#{cur.to_s()}, #{bi.to_s()}")
+        codegen_util::cg_emit_line(out, "  %v#{d}.tb#{fi_s}.#{bi.to_s()}.p = getelementptr i64, ptr %v#{d}.dp, i64 %v#{d}.tb#{fi_s}.#{bi.to_s()}.o")
+        codegen_util::cg_emit_line(out, "  %v#{d}.tb#{fi_s}.#{bi.to_s()}.v = load i64, ptr %v#{d}.tb#{fi_s}.#{bi.to_s()}.p")
+        codegen_util::cg_emit_line(out, "  %v#{d}.tb#{fi_s}.#{bi.to_s()}.m = and i64 %v#{d}.tb#{fi_s}.#{bi.to_s()}.v, 255")
+        var shift_amt = 0
+        if is_le == 0
+          shift_amt = (fbytes - 1 - bi) * 8
+        else
+          shift_amt = bi * 8
+        end
+        codegen_util::cg_emit_line(out, "  %v#{d}.tb#{fi_s}.#{bi.to_s()}.s = shl i64 %v#{d}.tb#{fi_s}.#{bi.to_s()}.m, #{shift_amt.to_s()}")
+        var next_accum = prev_accum + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.ta#{fi_s}.#{next_accum.to_s()} = or i64 %v#{d}.ta#{fi_s}.#{prev_accum.to_s()}, %v#{d}.tb#{fi_s}.#{bi.to_s()}.s")
+        prev_accum = next_accum
+      end
+      codegen_util::cg_emit_line(out, "  %v#{d}.tsp#{fi_s} = getelementptr i64, ptr %v#{d}.out, i64 #{struct_fi.to_s()}")
+      codegen_util::cg_emit_line(out, "  store i64 %v#{d}.ta#{fi_s}.#{prev_accum.to_s()}, ptr %v#{d}.tsp#{fi_s}")
+      var next_cur = cur + 1
+      codegen_util::cg_emit_line(out, "  %v#{d}.c#{next_cur.to_s()} = add i64 %v#{d}.c#{cur.to_s()}, #{fbytes.to_s()}")
+      cur = next_cur
+    else
+      var klass = _cg_bin_var_spec_class(spec)
+      if klass == 0 or klass > 0
+        # Allocate a new Bytes wrapper with its own Vec<Int>.
+        # size: klass==0 → input_size - cursor; klass>0 → klass.
+        var sz_ref = ""
+        if klass == 0
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.sz = sub i64 %v#{d}.sz, %v#{d}.c#{cur.to_s()}")
+          sz_ref = "%v#{d}.f#{fi_s}.sz"
+        else
+          sz_ref = klass.to_s()
+        end
+        # Allocate new Vec<Int>.
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.nvh = call ptr @__qz_alloc(i64 32)")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.ndbytes = mul i64 #{sz_ref}, 8")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.nvd = call ptr @__qz_alloc(i64 %v#{d}.f#{fi_s}.ndbytes)")
+        # Source offset into input data region.
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.srcp = getelementptr i64, ptr %v#{d}.dp, i64 %v#{d}.c#{cur.to_s()}")
+        codegen_util::cg_emit_line(out, "  call ptr @memcpy(ptr %v#{d}.f#{fi_s}.nvd, ptr %v#{d}.f#{fi_s}.srcp, i64 %v#{d}.f#{fi_s}.ndbytes)")
+        # Fill Vec header.
+        codegen_util::cg_emit_line(out, "  store i64 #{sz_ref}, ptr %v#{d}.f#{fi_s}.nvh")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.nszp = getelementptr i64, ptr %v#{d}.f#{fi_s}.nvh, i64 1")
+        codegen_util::cg_emit_line(out, "  store i64 #{sz_ref}, ptr %v#{d}.f#{fi_s}.nszp")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.ndpp = getelementptr i64, ptr %v#{d}.f#{fi_s}.nvh, i64 2")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.ndpi = ptrtoint ptr %v#{d}.f#{fi_s}.nvd to i64")
+        codegen_util::cg_emit_line(out, "  store i64 %v#{d}.f#{fi_s}.ndpi, ptr %v#{d}.f#{fi_s}.ndpp")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.newp = getelementptr i64, ptr %v#{d}.f#{fi_s}.nvh, i64 3")
+        codegen_util::cg_emit_line(out, "  store i64 8, ptr %v#{d}.f#{fi_s}.newp")
+        # Wrap in Bytes struct, store to output slot.
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.nvhi = ptrtoint ptr %v#{d}.f#{fi_s}.nvh to i64")
+        _cg_bin_emit_wrap_bytes(out, d, "f#{fi_s}.wb", "%v#{d}.f#{fi_s}.nvhi")
+        codegen_util::cg_emit_line(out, "  %v#{d}.tsp#{fi_s} = getelementptr i64, ptr %v#{d}.out, i64 #{struct_fi.to_s()}")
+        codegen_util::cg_emit_line(out, "  store i64 %v#{d}.f#{fi_s}.wb, ptr %v#{d}.tsp#{fi_s}")
+        var next_cur = cur + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.c#{next_cur.to_s()} = add i64 %v#{d}.c#{cur.to_s()}, #{sz_ref}")
+        cur = next_cur
+      elsif klass == -1
+        # cstring: scan for null to get length, allocate String, slot-to-byte copy.
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.len_a = alloca i64")
+        codegen_util::cg_emit_line(out, "  store i64 0, ptr %v#{d}.f#{fi_s}.len_a")
+        _cg_bin_emit_cstring_scan(out, "u#{d}_#{fi_s}", "%v#{d}.dp", "%v#{d}.c#{cur.to_s()}", "%v#{d}.f#{fi_s}.len_a")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.len = load i64, ptr %v#{d}.f#{fi_s}.len_a")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.sptr = call ptr @qz_alloc_str(i64 %v#{d}.f#{fi_s}.len)")
+        _cg_bin_emit_slots_to_str_loop(out, "u#{d}_#{fi_s}", "%v#{d}.dp", "%v#{d}.c#{cur.to_s()}", "%v#{d}.f#{fi_s}.sptr", "%v#{d}.f#{fi_s}.len")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.sti = ptrtoint ptr %v#{d}.f#{fi_s}.sptr to i64")
+        codegen_util::cg_emit_line(out, "  %v#{d}.tsp#{fi_s} = getelementptr i64, ptr %v#{d}.out, i64 #{struct_fi.to_s()}")
+        codegen_util::cg_emit_line(out, "  store i64 %v#{d}.f#{fi_s}.sti, ptr %v#{d}.tsp#{fi_s}")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.len1 = add i64 %v#{d}.f#{fi_s}.len, 1")
+        var next_cur = cur + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.c#{next_cur.to_s()} = add i64 %v#{d}.c#{cur.to_s()}, %v#{d}.f#{fi_s}.len1")
+        cur = next_cur
+      elsif klass == -2 or klass == -4 or klass == -5 or klass == -6 or klass == -7
+        var pw = _cg_bin_pstring_prefix_bytes(klass)
+        var is_le = _cg_bin_pstring_is_le(klass)
+        # Read prefix length from cursor.
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.pa.0 = add i64 0, 0")
+        var prev_accum = 0
+        for bi in 0..pw
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.pb#{bi.to_s()}.o = add i64 %v#{d}.c#{cur.to_s()}, #{bi.to_s()}")
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.pb#{bi.to_s()}.p = getelementptr i64, ptr %v#{d}.dp, i64 %v#{d}.f#{fi_s}.pb#{bi.to_s()}.o")
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.pb#{bi.to_s()}.v = load i64, ptr %v#{d}.f#{fi_s}.pb#{bi.to_s()}.p")
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.pb#{bi.to_s()}.m = and i64 %v#{d}.f#{fi_s}.pb#{bi.to_s()}.v, 255")
+          var shift_amt = 0
+          if is_le == 1
+            shift_amt = bi * 8
+          else
+            shift_amt = (pw - 1 - bi) * 8
+          end
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.pb#{bi.to_s()}.s = shl i64 %v#{d}.f#{fi_s}.pb#{bi.to_s()}.m, #{shift_amt.to_s()}")
+          var next_accum = prev_accum + 1
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.pa.#{next_accum.to_s()} = or i64 %v#{d}.f#{fi_s}.pa.#{prev_accum.to_s()}, %v#{d}.f#{fi_s}.pb#{bi.to_s()}.s")
+          prev_accum = next_accum
+        end
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.len = add i64 %v#{d}.f#{fi_s}.pa.#{prev_accum.to_s()}, 0")
+        # Advance cursor past prefix.
+        var mid_cur = cur + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.c#{mid_cur.to_s()} = add i64 %v#{d}.c#{cur.to_s()}, #{pw.to_s()}")
+        cur = mid_cur
+        # Allocate + fill string.
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.sptr = call ptr @qz_alloc_str(i64 %v#{d}.f#{fi_s}.len)")
+        _cg_bin_emit_slots_to_str_loop(out, "u#{d}_#{fi_s}", "%v#{d}.dp", "%v#{d}.c#{cur.to_s()}", "%v#{d}.f#{fi_s}.sptr", "%v#{d}.f#{fi_s}.len")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.sti = ptrtoint ptr %v#{d}.f#{fi_s}.sptr to i64")
+        codegen_util::cg_emit_line(out, "  %v#{d}.tsp#{fi_s} = getelementptr i64, ptr %v#{d}.out, i64 #{struct_fi.to_s()}")
+        codegen_util::cg_emit_line(out, "  store i64 %v#{d}.f#{fi_s}.sti, ptr %v#{d}.tsp#{fi_s}")
+        var next_cur = cur + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.c#{next_cur.to_s()} = add i64 %v#{d}.c#{cur.to_s()}, %v#{d}.f#{fi_s}.len")
+        cur = next_cur
+      elsif klass == -10
+        # Array decode: determine count N from spec variant, allocate a
+        # Vec<Int>, read N elements with the element type's endianness.
+        var arr_info = _cg_bin_parse_array_info(spec)
+        var variant = arr_info[0]
+        var elem_bits = arr_info[1]
+        var is_le = arr_info[2]
+        var count_literal = arr_info[4]
+        var elem_bytes = elem_bits / 8
+        if variant == 0
+          # Rest-of-stream: N = (input_sz - cursor) / elem_bytes.
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.rem = sub i64 %v#{d}.sz, %v#{d}.c#{cur.to_s()}")
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.n = udiv i64 %v#{d}.f#{fi_s}.rem, #{elem_bytes.to_s()}")
+        elsif variant == 1
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.n = add i64 0, #{count_literal.to_s()}")
+        else
+          var ref_name = _cg_bin_array_count_field_name(spec)
+          var ref_slot = _cg_bin_find_prior_field_slot(prog, layout_id, ref_name, fi)
+          if ref_slot < 0
+            codegen_util::cg_emit_line(out, "  ; BINARY DSL unpack: array '#{fname}' references unknown prior field '#{ref_name}'")
+            codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.n = add i64 0, 0")
+          else
+            codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.np = getelementptr i64, ptr %v#{d}.out, i64 #{ref_slot.to_s()}")
+            codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.n = load i64, ptr %v#{d}.f#{fi_s}.np")
+          end
+        end
+        # Allocate fresh Vec<Int>: 32-byte header + N*8-byte data region.
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.nvh = call ptr @__qz_alloc(i64 32)")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.nbytes = mul i64 %v#{d}.f#{fi_s}.n, 8")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.nvd = call ptr @__qz_alloc(i64 %v#{d}.f#{fi_s}.nbytes)")
+        codegen_util::cg_emit_line(out, "  call ptr @memset(ptr %v#{d}.f#{fi_s}.nvd, i32 0, i64 %v#{d}.f#{fi_s}.nbytes)")
+        codegen_util::cg_emit_line(out, "  store i64 %v#{d}.f#{fi_s}.n, ptr %v#{d}.f#{fi_s}.nvh")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.nszp = getelementptr i64, ptr %v#{d}.f#{fi_s}.nvh, i64 1")
+        codegen_util::cg_emit_line(out, "  store i64 %v#{d}.f#{fi_s}.n, ptr %v#{d}.f#{fi_s}.nszp")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.ndpp = getelementptr i64, ptr %v#{d}.f#{fi_s}.nvh, i64 2")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.ndpi = ptrtoint ptr %v#{d}.f#{fi_s}.nvd to i64")
+        codegen_util::cg_emit_line(out, "  store i64 %v#{d}.f#{fi_s}.ndpi, ptr %v#{d}.f#{fi_s}.ndpp")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.newp = getelementptr i64, ptr %v#{d}.f#{fi_s}.nvh, i64 3")
+        codegen_util::cg_emit_line(out, "  store i64 8, ptr %v#{d}.f#{fi_s}.newp")
+        # Element loop.
+        var lbl = "uarr_#{d}_#{fi_s}"
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.ic = alloca i64")
+        codegen_util::cg_emit_line(out, "  store i64 0, ptr %v#{d}.f#{fi_s}.ic")
+        codegen_util::cg_emit_line(out, "  br label %#{lbl}_cond")
+        codegen_util::cg_emit_line(out, "#{lbl}_cond:")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.i = load i64, ptr %v#{d}.f#{fi_s}.ic")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.cmp = icmp ult i64 %v#{d}.f#{fi_s}.i, %v#{d}.f#{fi_s}.n")
+        codegen_util::cg_emit_line(out, "  br i1 %v#{d}.f#{fi_s}.cmp, label %#{lbl}_body, label %#{lbl}_end")
+        codegen_util::cg_emit_line(out, "#{lbl}_body:")
+        # Byte offset within input data: cursor + i * elem_bytes.
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.ibytes = mul i64 %v#{d}.f#{fi_s}.i, #{elem_bytes.to_s()}")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.bstart = add i64 %v#{d}.c#{cur.to_s()}, %v#{d}.f#{fi_s}.ibytes")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.acc0 = add i64 0, 0")
+        var prev_accum = 0
+        for bi in 0..elem_bytes
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.b#{bi.to_s()}.o = add i64 %v#{d}.f#{fi_s}.bstart, #{bi.to_s()}")
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.b#{bi.to_s()}.p = getelementptr i64, ptr %v#{d}.dp, i64 %v#{d}.f#{fi_s}.b#{bi.to_s()}.o")
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.b#{bi.to_s()}.v = load i64, ptr %v#{d}.f#{fi_s}.b#{bi.to_s()}.p")
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.b#{bi.to_s()}.m = and i64 %v#{d}.f#{fi_s}.b#{bi.to_s()}.v, 255")
+          var shift_amt = 0
+          if is_le == 0
+            shift_amt = (elem_bytes - 1 - bi) * 8
+          else
+            shift_amt = bi * 8
+          end
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.b#{bi.to_s()}.s = shl i64 %v#{d}.f#{fi_s}.b#{bi.to_s()}.m, #{shift_amt.to_s()}")
+          var next_accum = prev_accum + 1
+          codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.acc#{next_accum.to_s()} = or i64 %v#{d}.f#{fi_s}.acc#{prev_accum.to_s()}, %v#{d}.f#{fi_s}.b#{bi.to_s()}.s")
+          prev_accum = next_accum
+        end
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.elemp = getelementptr i64, ptr %v#{d}.f#{fi_s}.nvd, i64 %v#{d}.f#{fi_s}.i")
+        codegen_util::cg_emit_line(out, "  store i64 %v#{d}.f#{fi_s}.acc#{prev_accum.to_s()}, ptr %v#{d}.f#{fi_s}.elemp")
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.i1 = add i64 %v#{d}.f#{fi_s}.i, 1")
+        codegen_util::cg_emit_line(out, "  store i64 %v#{d}.f#{fi_s}.i1, ptr %v#{d}.f#{fi_s}.ic")
+        codegen_util::cg_emit_line(out, "  br label %#{lbl}_cond")
+        codegen_util::cg_emit_line(out, "#{lbl}_end:")
+        # Write Vec handle to output struct slot (no Bytes wrapper).
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.nvhi = ptrtoint ptr %v#{d}.f#{fi_s}.nvh to i64")
+        codegen_util::cg_emit_line(out, "  %v#{d}.tsp#{fi_s} = getelementptr i64, ptr %v#{d}.out, i64 #{struct_fi.to_s()}")
+        codegen_util::cg_emit_line(out, "  store i64 %v#{d}.f#{fi_s}.nvhi, ptr %v#{d}.tsp#{fi_s}")
+        # Advance cursor by N * elem_bytes.
+        codegen_util::cg_emit_line(out, "  %v#{d}.f#{fi_s}.adv = mul i64 %v#{d}.f#{fi_s}.n, #{elem_bytes.to_s()}")
+        var next_cur = cur + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.c#{next_cur.to_s()} = add i64 %v#{d}.c#{cur.to_s()}, %v#{d}.f#{fi_s}.adv")
+        cur = next_cur
+      else
+        codegen_util::cg_emit_line(out, "  ; BINARY DSL unpack: unsupported variable spec '#{spec}'")
+      end
+    end
+    struct_fi = struct_fi + 1
+  end
+
+  # Phase 3: wrap struct in Result::Ok.
+  codegen_util::cg_emit_line(out, "  %v#{d}.rp = call ptr @__qz_alloc(i64 16)")
+  codegen_util::cg_emit_line(out, "  store i64 0, ptr %v#{d}.rp")
+  codegen_util::cg_emit_line(out, "  %v#{d}.rpp = getelementptr i64, ptr %v#{d}.rp, i64 1")
+  codegen_util::cg_emit_line(out, "  %v#{d}.outi = ptrtoint ptr %v#{d}.out to i64")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.outi, ptr %v#{d}.rpp")
+  codegen_util::cg_emit_line(out, "  %v#{d}.retO = ptrtoint ptr %v#{d}.rp to i64")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.retO, ptr %v#{d}.ret_a")
+  codegen_util::cg_emit_line(out, "  br label %bin_eof_join_#{d}")
+  codegen_util::cg_emit_line(out, "bin_eof_join_#{d}:")
+  codegen_util::cg_emit_line(out, "  %v#{d} = load i64, ptr %v#{d}.ret_a")
+end
+
+## Compute the outer struct slot index for an arm field name. Arm fields
+## flatten into the outer struct after the fixed prefix's non-pad fields,
+## deduped by name in arm-first-seen order. Mirrors mir_collect_structs'
+## registration walk.
+def _cg_bin_arm_field_struct_slot(prog: mir::MirProgram, layout_id: Int, target: String, prefix_np: Int): Int
+  var arm_count = mir::mir_binary_layout_union_arm_count(prog, layout_id)
+  var seen = vec_new<String>()
+  for ai in 0..arm_count
+    var fc = mir::mir_binary_union_arm_field_count(prog, layout_id, ai)
+    for fi in 0..fc
+      var fname = mir::mir_binary_union_arm_field_name(prog, layout_id, ai, fi)
+      var found = 0
+      var ns = seen.size
+      for si in 0..ns
+        if seen[si].eq(fname)
+          found = 1
+        end
+      end
+      if found == 0
+        if fname.eq(target)
+          return prefix_np + seen.size
+        end
+        seen.push(fname)
+      end
+    end
+  end
+  return -1
+end
+
+## Compute the maximum byte length across all arms. Arm-field specs are
+## restricted to byte-aligned integer primitives in v1 Track B; sub-byte
+## and variable-width inside arms are filed as follow-ups.
+def _cg_bin_union_max_arm_bytes(prog: mir::MirProgram, layout_id: Int): Int
+  var arm_count = mir::mir_binary_layout_union_arm_count(prog, layout_id)
+  var max_bytes = 0
+  for ai in 0..arm_count
+  	var fc = mir::mir_binary_union_arm_field_count(prog, layout_id, ai)
+    var arm_bytes = 0
+    for fi in 0..fc
+      var w = mir::mir_binary_union_arm_field_width(prog, layout_id, ai, fi)
+      arm_bytes = arm_bytes + (w / 8)
+    end
+    if arm_bytes > max_bytes
+      max_bytes = arm_bytes
+    end
+  end
+  return max_bytes
+end
+
+## Emit MIR_BINARY_PACK for a layout with a discriminated union. The fixed
+## prefix (fields before the union) encodes just as in the non-union fast
+## path; afterward we switch on the discriminator value and emit the
+## matched arm's byte-aligned integer stores.
+##
+## v1 scope: prefix is fixed-width (no variable-width pre-union fields),
+## arm fields are byte-aligned integer primitives (u8/u16/u32/u64 with
+## explicit endianness suffix). Out of scope for now: sub-byte arm fields,
+## pstring/cstring/bytes/arrays inside arms. Those can land in Track B v2.
+def _cg_bin_emit_pack_union(out: Int, prog: mir::MirProgram, dest: Int, layout_id: Int, self_val: Int): Void
+  var d = dest.to_s()
+  var src = self_val.to_s()
+  var field_count = mir::mir_binary_layout_field_count(prog, layout_id)
+  var prefix_bits = _cg_bin_fixed_prefix_bits(prog, layout_id, field_count)
+  var prefix_bytes = prefix_bits / 8
+  var prefix_np = _cg_bin_count_non_pad(prog, layout_id, field_count)
+  var max_arm_bytes = _cg_bin_union_max_arm_bytes(prog, layout_id)
+  var cap_bytes = prefix_bytes + max_arm_bytes
+
+  # Cast struct handle to ptr.
+  codegen_util::cg_emit_line(out, "  %v#{d}.src = inttoptr i64 %v#{src} to ptr")
+
+  # Allocate Vec<Int> header + data (cap-byte scaled by i64 slots).
+  codegen_util::cg_emit_line(out, "  %v#{d}.vh = call ptr @__qz_alloc(i64 32)")
+  codegen_util::cg_emit_line(out, "  %v#{d}.vd = call ptr @__qz_alloc(i64 #{(cap_bytes * 8).to_s()})")
+  codegen_util::cg_emit_line(out, "  call ptr @memset(ptr %v#{d}.vd, i32 0, i64 #{(cap_bytes * 8).to_s()})")
+  codegen_util::cg_emit_line(out, "  store i64 #{cap_bytes.to_s()}, ptr %v#{d}.vh")
+  # Vec header[2] = data ptr, header[3] = elem_width (8).
+  codegen_util::cg_emit_line(out, "  %v#{d}.dpp = getelementptr i64, ptr %v#{d}.vh, i64 2")
+  codegen_util::cg_emit_line(out, "  %v#{d}.dpi = ptrtoint ptr %v#{d}.vd to i64")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.dpi, ptr %v#{d}.dpp")
+  codegen_util::cg_emit_line(out, "  %v#{d}.ewp = getelementptr i64, ptr %v#{d}.vh, i64 3")
+  codegen_util::cg_emit_line(out, "  store i64 8, ptr %v#{d}.ewp")
+
+  # Emit fixed prefix stores (reuses the existing prefix-stores helper).
+  _cg_bin_emit_pack_prefix_stores(out, prog, dest, layout_id, field_count)
+
+  # Load discriminator into a register for branching. The discriminator
+  # lives at struct slot = its non-pad position in the prefix.
+  var disc_idx = mir::mir_binary_layout_union_disc_idx(prog, layout_id)
+  var disc_slot = _cg_bin_count_non_pad(prog, layout_id, disc_idx)
+  codegen_util::cg_emit_line(out, "  %v#{d}.disc_gp = getelementptr i64, ptr %v#{d}.src, i64 #{disc_slot.to_s()}")
+  codegen_util::cg_emit_line(out, "  %v#{d}.disc = load i64, ptr %v#{d}.disc_gp")
+
+  # Per-arm dispatch chain. Each arm checks the discriminator and falls
+  # through to the next if no match. Final fallthrough = no arm fields
+  # (size stays at prefix_bytes). The final size is tracked in an alloca
+  # so it can be re-loaded at the join block.
+  codegen_util::cg_emit_line(out, "  %v#{d}.sz_a = alloca i64")
+  codegen_util::cg_emit_line(out, "  store i64 #{prefix_bytes.to_s()}, ptr %v#{d}.sz_a")
+  var arm_count = mir::mir_binary_layout_union_arm_count(prog, layout_id)
+  var join_lbl = "bin_pack_u_join_#{d}"
+  for ai in 0..arm_count
+    var tag = mir::mir_binary_union_arm_tag(prog, layout_id, ai)
+    var ai_s = ai.to_s()
+    codegen_util::cg_emit_line(out, "  %v#{d}.a#{ai_s}.cmp = icmp eq i64 %v#{d}.disc, #{tag.to_s()}")
+    codegen_util::cg_emit_line(out, "  br i1 %v#{d}.a#{ai_s}.cmp, label %bin_pack_u_arm#{ai_s}_#{d}, label %bin_pack_u_next#{ai_s}_#{d}")
+    codegen_util::cg_emit_line(out, "bin_pack_u_arm#{ai_s}_#{d}:")
+    # Emit per-field stores for this arm. Byte-aligned int primitives only.
+    var byte_off = prefix_bytes
+    var fc = mir::mir_binary_union_arm_field_count(prog, layout_id, ai)
+    for fi in 0..fc
+      var fname = mir::mir_binary_union_arm_field_name(prog, layout_id, ai, fi)
+      var fspec = mir::mir_binary_union_arm_field_spec(prog, layout_id, ai, fi)
+      var fwidth = mir::mir_binary_union_arm_field_width(prog, layout_id, ai, fi)
+      var info = _cg_bin_parse_width_info(fspec)
+      var is_le = info[3]
+      var slot = _cg_bin_arm_field_struct_slot(prog, layout_id, fname, prefix_np)
+      var fbytes = fwidth / 8
+      var tag_s = "#{ai_s}_#{fi.to_s()}"
+      codegen_util::cg_emit_line(out, "  %v#{d}.u#{tag_s}.gp = getelementptr i64, ptr %v#{d}.src, i64 #{slot.to_s()}")
+      codegen_util::cg_emit_line(out, "  %v#{d}.u#{tag_s} = load i64, ptr %v#{d}.u#{tag_s}.gp")
+      for bi in 0..fbytes
+        var byte_shift = 0
+        if is_le == 0
+          byte_shift = (fbytes - 1 - bi) * 8
+        else
+          byte_shift = bi * 8
+        end
+        codegen_util::cg_emit_line(out, "  %v#{d}.u#{tag_s}.s#{bi.to_s()} = lshr i64 %v#{d}.u#{tag_s}, #{byte_shift.to_s()}")
+        codegen_util::cg_emit_line(out, "  %v#{d}.u#{tag_s}.m#{bi.to_s()} = and i64 %v#{d}.u#{tag_s}.s#{bi.to_s()}, 255")
+        codegen_util::cg_emit_line(out, "  %v#{d}.u#{tag_s}.dp#{bi.to_s()} = getelementptr i64, ptr %v#{d}.vd, i64 #{(byte_off + bi).to_s()}")
+        codegen_util::cg_emit_line(out, "  store i64 %v#{d}.u#{tag_s}.m#{bi.to_s()}, ptr %v#{d}.u#{tag_s}.dp#{bi.to_s()}")
+      end
+      byte_off = byte_off + fbytes
+    end
+    codegen_util::cg_emit_line(out, "  store i64 #{byte_off.to_s()}, ptr %v#{d}.sz_a")
+    codegen_util::cg_emit_line(out, "  br label %#{join_lbl}")
+    codegen_util::cg_emit_line(out, "bin_pack_u_next#{ai_s}_#{d}:")
+  end
+  # No arm matched — for encode we accept an unknown discriminator and
+  # emit just the prefix. (decode will still error via InvalidDiscriminant
+  # — encode is a separate, user-driven action.)
+  codegen_util::cg_emit_line(out, "  br label %#{join_lbl}")
+  codegen_util::cg_emit_line(out, "#{join_lbl}:")
+  codegen_util::cg_emit_line(out, "  %v#{d}.sz = load i64, ptr %v#{d}.sz_a")
+  # Vec header[1] = actual size.
+  codegen_util::cg_emit_line(out, "  %v#{d}.szp = getelementptr i64, ptr %v#{d}.vh, i64 1")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.sz, ptr %v#{d}.szp")
+  # Wrap in Bytes.
+  codegen_util::cg_emit_line(out, "  %v#{d}.bs = call ptr @__qz_alloc(i64 8)")
+  codegen_util::cg_emit_line(out, "  %v#{d}.vh.i = ptrtoint ptr %v#{d}.vh to i64")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.vh.i, ptr %v#{d}.bs")
+  codegen_util::cg_emit_line(out, "  %v#{d} = ptrtoint ptr %v#{d}.bs to i64")
+end
+
+## Emit MIR_BINARY_PACK: encode a binary-block struct value into Bytes.
+## STEP 4 supports byte-aligned scalars and sub-byte fields that fit
+## inside a single byte. Straddling fields are STEP 2. Variable-width
+## fields (bytes / cstring / pstring / arrays) go through the Phase 1.5
+## STEP 1 variable emit path above.
+def cg_emit_binary_pack(out: Int, prog: mir::MirProgram, dest: Int, layout_id: Int, self_val: Int): Void
+  var d = dest.to_s()
+  var src = self_val.to_s()
+  var field_count = mir::mir_binary_layout_field_count(prog, layout_id)
+  var lname = mir::mir_binary_layout_name(prog, layout_id)
+  # Phase 2 Track B: discriminated unions take the union path regardless
+  # of whether the fixed prefix also has variable-width fields (v1 rejects
+  # that combination at typecheck time — Phase 2 v2 can lift it).
+  if mir::mir_binary_layout_union_disc_idx(prog, layout_id) >= 0
+    _cg_bin_emit_pack_union(out, prog, dest, layout_id, self_val)
+    return
+  end
+  # Phase 1.5 STEP 1: dispatch to variable-aware path if any field is
+  # variable-width (bytes / bytes(N) / cstring / pstring). Fixed-only
+  # layouts continue through the original fast path below.
+  var split = _cg_bin_find_var_split(prog, layout_id)
+  if split < field_count
+    _cg_bin_emit_pack_variable(out, prog, dest, layout_id, self_val, split)
+    return
+  end
+  var total_bits = 0
+  for fi in 0..field_count
+    total_bits = total_bits + mir::mir_binary_layout_field_width(prog, layout_id, fi)
+  end
+  var total_bytes = total_bits / 8
+
+  # Cast src (i64 struct handle) to ptr for field loads.
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".src = inttoptr i64 %v")
+  codegen_util::cg_emit(out, src)
+  codegen_util::cg_emit_line(out, " to ptr")
+
+  # Allocate Vec<Int> header (32 bytes) + data (total_bytes * 8 bytes).
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".vh = call ptr @__qz_alloc(i64 32)")
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".vd = call ptr @__qz_alloc(i64 ")
+  codegen_util::cg_emit_int(out, total_bytes * 8)
+  codegen_util::cg_emit_line(out, ")")
+  codegen_util::cg_emit(out, "  call ptr @memset(ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".vd, i32 0, i64 ")
+  codegen_util::cg_emit_int(out, total_bytes * 8)
+  codegen_util::cg_emit_line(out, ")")
+  # header[0] = cap
+  codegen_util::cg_emit(out, "  store i64 ")
+  codegen_util::cg_emit_int(out, total_bytes)
+  codegen_util::cg_emit(out, ", ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".vh")
+  # header[1] = size
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".szp = getelementptr i64, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".vh, i64 1")
+  codegen_util::cg_emit(out, "  store i64 ")
+  codegen_util::cg_emit_int(out, total_bytes)
+  codegen_util::cg_emit(out, ", ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".szp")
+  # header[2] = data_ptr
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".dpp = getelementptr i64, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".vh, i64 2")
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".dp.i = ptrtoint ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".vd to i64")
+  codegen_util::cg_emit(out, "  store i64 %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".dp.i, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".dpp")
+  # header[3] = elem_width (8)
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".ewp = getelementptr i64, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".vh, i64 3")
+  codegen_util::cg_emit(out, "  store i64 8, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".ewp")
+
+  # Walk fields and emit byte-level stores via the extracted helper.
+  # Variable-path (_cg_bin_emit_pack_variable) calls the same helper
+  # with end_idx = split so both codepaths share straddle handling.
+  _cg_bin_emit_pack_prefix_stores(out, prog, dest, layout_id, field_count)
+
+  # Allocate the Bytes struct wrapper: single i64 field (_data = Vec handle).
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".bs = call ptr @__qz_alloc(i64 8)")
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".vh.i = ptrtoint ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".vh to i64")
+  codegen_util::cg_emit(out, "  store i64 %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".vh.i, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".bs")
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, " = ptrtoint ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".bs to i64")
+end
+
+## Phase 2 Track B helper — emit a Result::Err(ParseError::InvalidDiscriminant)
+## branch with label `bin_unpack_u_bad_#{d}` that stores the error value in
+## `%v<d>.ret_a` and branches to `bin_unpack_u_join_#{d}`.
+def _cg_bin_emit_invalid_disc_branch(out: Int, d: String): Void
+  codegen_util::cg_emit_line(out, "bin_unpack_u_bad_#{d}:")
+  # ParseError::InvalidDiscriminant = tag 3, unit (no payload).
+  codegen_util::cg_emit_line(out, "  %v#{d}.iderr = call ptr @__qz_alloc(i64 16)")
+  codegen_util::cg_emit_line(out, "  store i64 3, ptr %v#{d}.iderr")
+  codegen_util::cg_emit_line(out, "  %v#{d}.idres = call ptr @__qz_alloc(i64 16)")
+  codegen_util::cg_emit_line(out, "  store i64 1, ptr %v#{d}.idres")
+  codegen_util::cg_emit_line(out, "  %v#{d}.idresp = getelementptr i64, ptr %v#{d}.idres, i64 1")
+  codegen_util::cg_emit_line(out, "  %v#{d}.iderri = ptrtoint ptr %v#{d}.iderr to i64")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.iderri, ptr %v#{d}.idresp")
+  codegen_util::cg_emit_line(out, "  %v#{d}.idretE = ptrtoint ptr %v#{d}.idres to i64")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.idretE, ptr %v#{d}.ret_a")
+  codegen_util::cg_emit_line(out, "  br label %bin_unpack_u_join_#{d}")
+end
+
+## Phase 2 Track B — emit a Result::Err(ParseError::UnexpectedEof) branch
+## with label `bin_unpack_u_eof_#{d}`.
+def _cg_bin_emit_union_eof_branch(out: Int, d: String): Void
+  codegen_util::cg_emit_line(out, "bin_unpack_u_eof_#{d}:")
+  codegen_util::cg_emit_line(out, "  %v#{d}.eferr = call ptr @__qz_alloc(i64 16)")
+  codegen_util::cg_emit_line(out, "  store i64 0, ptr %v#{d}.eferr")
+  codegen_util::cg_emit_line(out, "  %v#{d}.efres = call ptr @__qz_alloc(i64 16)")
+  codegen_util::cg_emit_line(out, "  store i64 1, ptr %v#{d}.efres")
+  codegen_util::cg_emit_line(out, "  %v#{d}.efresp = getelementptr i64, ptr %v#{d}.efres, i64 1")
+  codegen_util::cg_emit_line(out, "  %v#{d}.eferri = ptrtoint ptr %v#{d}.eferr to i64")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.eferri, ptr %v#{d}.efresp")
+  codegen_util::cg_emit_line(out, "  %v#{d}.efretE = ptrtoint ptr %v#{d}.efres to i64")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.efretE, ptr %v#{d}.ret_a")
+  codegen_util::cg_emit_line(out, "  br label %bin_unpack_u_join_#{d}")
+end
+
+## Emit MIR_BINARY_UNPACK for a layout with a discriminated union. Returns
+## Err(ParseError::UnexpectedEof) on short buffers, Err(InvalidDiscriminant)
+## when no arm matches, else Ok(struct) with the active arm's fields populated
+## and all other arm fields zeroed.
+def _cg_bin_emit_unpack_union(out: Int, prog: mir::MirProgram, dest: Int, layout_id: Int, bytes_val: Int): Void
+  var d = dest.to_s()
+  var src = bytes_val.to_s()
+  var field_count = mir::mir_binary_layout_field_count(prog, layout_id)
+  var prefix_bits = _cg_bin_fixed_prefix_bits(prog, layout_id, field_count)
+  var prefix_bytes = prefix_bits / 8
+  var prefix_np = _cg_bin_count_non_pad(prog, layout_id, field_count)
+  # Outer struct has prefix_np + number-of-unique-union-fields slots.
+  var arm_count = mir::mir_binary_layout_union_arm_count(prog, layout_id)
+  var unique_arm_fields = vec_new<String>()
+  for ai in 0..arm_count
+    var fc = mir::mir_binary_union_arm_field_count(prog, layout_id, ai)
+    for fi in 0..fc
+      var fname = mir::mir_binary_union_arm_field_name(prog, layout_id, ai, fi)
+      var seen = 0
+      var un = unique_arm_fields.size
+      for ui in 0..un
+        if unique_arm_fields[ui].eq(fname)
+          seen = 1
+        end
+      end
+      if seen == 0
+        unique_arm_fields.push(fname)
+      end
+    end
+  end
+  var out_slots = prefix_np + unique_arm_fields.size
+
+  # Cast Bytes handle to ptr; load Vec header then data ptr + size.
+  codegen_util::cg_emit_line(out, "  %v#{d}.bs = inttoptr i64 %v#{src} to ptr")
+  codegen_util::cg_emit_line(out, "  %v#{d}.vhi = load i64, ptr %v#{d}.bs")
+  codegen_util::cg_emit_line(out, "  %v#{d}.vh = inttoptr i64 %v#{d}.vhi to ptr")
+  codegen_util::cg_emit_line(out, "  %v#{d}.szp = getelementptr i64, ptr %v#{d}.vh, i64 1")
+  codegen_util::cg_emit_line(out, "  %v#{d}.sz = load i64, ptr %v#{d}.szp")
+  codegen_util::cg_emit_line(out, "  %v#{d}.dpp = getelementptr i64, ptr %v#{d}.vh, i64 2")
+  codegen_util::cg_emit_line(out, "  %v#{d}.dpi = load i64, ptr %v#{d}.dpp")
+  codegen_util::cg_emit_line(out, "  %v#{d}.dp = inttoptr i64 %v#{d}.dpi to ptr")
+
+  # Return slot (phi-style).
+  codegen_util::cg_emit_line(out, "  %v#{d}.ret_a = alloca i64")
+  # EOF check: size >= prefix_bytes.
+  codegen_util::cg_emit_line(out, "  %v#{d}.pref_cmp = icmp ult i64 %v#{d}.sz, #{prefix_bytes.to_s()}")
+  codegen_util::cg_emit_line(out, "  br i1 %v#{d}.pref_cmp, label %bin_unpack_u_eof_#{d}, label %bin_unpack_u_pref_#{d}")
+  codegen_util::cg_emit_line(out, "bin_unpack_u_pref_#{d}:")
+  # Allocate output struct (zero-filled) large enough for all slots.
+  codegen_util::cg_emit_line(out, "  %v#{d}.out = call ptr @__qz_alloc(i64 #{(out_slots * 8).to_s()})")
+  codegen_util::cg_emit_line(out, "  call ptr @memset(ptr %v#{d}.out, i32 0, i64 #{(out_slots * 8).to_s()})")
+
+  # Read fixed prefix into the output struct (writes struct slots [0..prefix_np)).
+  _cg_bin_emit_unpack_prefix_reads(out, prog, dest, layout_id, field_count)
+
+  # Load discriminator value from the outer struct (just written above).
+  var disc_idx = mir::mir_binary_layout_union_disc_idx(prog, layout_id)
+  var disc_slot = _cg_bin_count_non_pad(prog, layout_id, disc_idx)
+  codegen_util::cg_emit_line(out, "  %v#{d}.disc_gp = getelementptr i64, ptr %v#{d}.out, i64 #{disc_slot.to_s()}")
+  codegen_util::cg_emit_line(out, "  %v#{d}.disc = load i64, ptr %v#{d}.disc_gp")
+
+  # Per-arm dispatch: check discriminator, bounds-check the arm's byte
+  # length, read each arm field, write to the appropriate outer-struct slot.
+  for ai in 0..arm_count
+    var tag = mir::mir_binary_union_arm_tag(prog, layout_id, ai)
+    var ai_s = ai.to_s()
+    codegen_util::cg_emit_line(out, "  %v#{d}.ua#{ai_s}.cmp = icmp eq i64 %v#{d}.disc, #{tag.to_s()}")
+    codegen_util::cg_emit_line(out, "  br i1 %v#{d}.ua#{ai_s}.cmp, label %bin_unpack_u_arm#{ai_s}_chk_#{d}, label %bin_unpack_u_nxt#{ai_s}_#{d}")
+    codegen_util::cg_emit_line(out, "bin_unpack_u_arm#{ai_s}_chk_#{d}:")
+    # Total byte length for this arm.
+    var arm_bytes = 0
+    var fc = mir::mir_binary_union_arm_field_count(prog, layout_id, ai)
+    for fi in 0..fc
+      arm_bytes = arm_bytes + (mir::mir_binary_union_arm_field_width(prog, layout_id, ai, fi) / 8)
+    end
+    var need = prefix_bytes + arm_bytes
+    codegen_util::cg_emit_line(out, "  %v#{d}.ua#{ai_s}.need = icmp ult i64 %v#{d}.sz, #{need.to_s()}")
+    codegen_util::cg_emit_line(out, "  br i1 %v#{d}.ua#{ai_s}.need, label %bin_unpack_u_eof_#{d}, label %bin_unpack_u_arm#{ai_s}_read_#{d}")
+    codegen_util::cg_emit_line(out, "bin_unpack_u_arm#{ai_s}_read_#{d}:")
+    var byte_off = prefix_bytes
+    for fi in 0..fc
+      var fname = mir::mir_binary_union_arm_field_name(prog, layout_id, ai, fi)
+      var fspec = mir::mir_binary_union_arm_field_spec(prog, layout_id, ai, fi)
+      var fwidth = mir::mir_binary_union_arm_field_width(prog, layout_id, ai, fi)
+      var info = _cg_bin_parse_width_info(fspec)
+      var is_le = info[3]
+      var fbytes = fwidth / 8
+      var slot = _cg_bin_arm_field_struct_slot(prog, layout_id, fname, prefix_np)
+      var tag_s = "#{ai_s}_#{fi.to_s()}"
+      codegen_util::cg_emit_line(out, "  %v#{d}.ur#{tag_s}.acc0 = add i64 0, 0")
+      var acc = 0
+      for bi in 0..fbytes
+        codegen_util::cg_emit_line(out, "  %v#{d}.ur#{tag_s}.bp#{bi.to_s()} = getelementptr i64, ptr %v#{d}.dp, i64 #{(byte_off + bi).to_s()}")
+        codegen_util::cg_emit_line(out, "  %v#{d}.ur#{tag_s}.b#{bi.to_s()} = load i64, ptr %v#{d}.ur#{tag_s}.bp#{bi.to_s()}")
+        codegen_util::cg_emit_line(out, "  %v#{d}.ur#{tag_s}.bm#{bi.to_s()} = and i64 %v#{d}.ur#{tag_s}.b#{bi.to_s()}, 255")
+        var shift_amt = 0
+        if is_le == 0
+          shift_amt = (fbytes - 1 - bi) * 8
+        else
+          shift_amt = bi * 8
+        end
+        codegen_util::cg_emit_line(out, "  %v#{d}.ur#{tag_s}.bs#{bi.to_s()} = shl i64 %v#{d}.ur#{tag_s}.bm#{bi.to_s()}, #{shift_amt.to_s()}")
+        var next_acc = acc + 1
+        codegen_util::cg_emit_line(out, "  %v#{d}.ur#{tag_s}.acc#{next_acc.to_s()} = or i64 %v#{d}.ur#{tag_s}.acc#{acc.to_s()}, %v#{d}.ur#{tag_s}.bs#{bi.to_s()}")
+        acc = next_acc
+      end
+      codegen_util::cg_emit_line(out, "  %v#{d}.ur#{tag_s}.sp = getelementptr i64, ptr %v#{d}.out, i64 #{slot.to_s()}")
+      codegen_util::cg_emit_line(out, "  store i64 %v#{d}.ur#{tag_s}.acc#{acc.to_s()}, ptr %v#{d}.ur#{tag_s}.sp")
+      byte_off = byte_off + fbytes
+    end
+    codegen_util::cg_emit_line(out, "  br label %bin_unpack_u_ok_#{d}")
+    codegen_util::cg_emit_line(out, "bin_unpack_u_nxt#{ai_s}_#{d}:")
+  end
+  # No arm matched → Err(InvalidDiscriminant).
+  codegen_util::cg_emit_line(out, "  br label %bin_unpack_u_bad_#{d}")
+
+  # OK branch: wrap output struct in Result::Ok.
+  codegen_util::cg_emit_line(out, "bin_unpack_u_ok_#{d}:")
+  codegen_util::cg_emit_line(out, "  %v#{d}.rp = call ptr @__qz_alloc(i64 16)")
+  codegen_util::cg_emit_line(out, "  store i64 0, ptr %v#{d}.rp")
+  codegen_util::cg_emit_line(out, "  %v#{d}.rpp = getelementptr i64, ptr %v#{d}.rp, i64 1")
+  codegen_util::cg_emit_line(out, "  %v#{d}.outi = ptrtoint ptr %v#{d}.out to i64")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.outi, ptr %v#{d}.rpp")
+  codegen_util::cg_emit_line(out, "  %v#{d}.retO = ptrtoint ptr %v#{d}.rp to i64")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.retO, ptr %v#{d}.ret_a")
+  codegen_util::cg_emit_line(out, "  br label %bin_unpack_u_join_#{d}")
+  _cg_bin_emit_union_eof_branch(out, d)
+  _cg_bin_emit_invalid_disc_branch(out, d)
+  codegen_util::cg_emit_line(out, "bin_unpack_u_join_#{d}:")
+  codegen_util::cg_emit_line(out, "  %v#{d} = load i64, ptr %v#{d}.ret_a")
+end
+
+## Emit MIR_BINARY_UNPACK: decode a Bytes handle into a binary-block
+## struct, wrapped in Result::Ok. STEP 4 handles byte-aligned and
+## single-byte sub-byte fields; straddles + variable-width are filed
+## as follow-ups (see handoff). Bounds failure = UnexpectedEof.
+def cg_emit_binary_unpack(out: Int, prog: mir::MirProgram, dest: Int, layout_id: Int, bytes_val: Int): Void
+  var d = dest.to_s()
+  var src = bytes_val.to_s()
+  var field_count = mir::mir_binary_layout_field_count(prog, layout_id)
+  var lname = mir::mir_binary_layout_name(prog, layout_id)
+  # Phase 2 Track B: union dispatch.
+  if mir::mir_binary_layout_union_disc_idx(prog, layout_id) >= 0
+    _cg_bin_emit_unpack_union(out, prog, dest, layout_id, bytes_val)
+    return
+  end
+  # Phase 1.5 STEP 1: dispatch to variable-aware path if any field is
+  # variable-width.
+  var split = _cg_bin_find_var_split(prog, layout_id)
+  if split < field_count
+    _cg_bin_emit_unpack_variable(out, prog, dest, layout_id, bytes_val, split)
+    return
+  end
+  var total_bits = 0
+  var non_pad_count = 0
+  for fi in 0..field_count
+    total_bits = total_bits + mir::mir_binary_layout_field_width(prog, layout_id, fi)
+    var fname = mir::mir_binary_layout_field_name(prog, layout_id, fi)
+    if str_byte_len(fname) > 0 and not fname.eq("_")
+      non_pad_count = non_pad_count + 1
+    end
+  end
+  var total_bytes = total_bits / 8
+
+  # Cast Bytes handle (i64) to ptr, load _data Vec handle from offset 0.
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".bs = inttoptr i64 %v")
+  codegen_util::cg_emit(out, src)
+  codegen_util::cg_emit_line(out, " to ptr")
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".vhi = load i64, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".bs")
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".vh = inttoptr i64 %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".vhi to ptr")
+  # Vec header[1] = size (for bounds check).
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".szp = getelementptr i64, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".vh, i64 1")
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".sz = load i64, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".szp")
+  # Vec header[2] = data ptr.
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".dpp = getelementptr i64, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".vh, i64 2")
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".dpi = load i64, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".dpp")
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".dp = inttoptr i64 %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".dpi to ptr")
+
+  # Phase 1.5 STEP 3: EOF check — if the input buffer is shorter than the
+  # fixed layout size, return Err(ParseError::UnexpectedEof) before any
+  # field reads. Result flows through %v<d>.ret_a (alloca) with a final
+  # phi-style load at the join block.
+  codegen_util::cg_emit_line(out, "  %v#{d}.ret_a = alloca i64")
+  codegen_util::cg_emit_line(out, "  %v#{d}.eof_cmp = icmp ult i64 %v#{d}.sz, #{total_bytes.to_s()}")
+  codegen_util::cg_emit_line(out, "  br i1 %v#{d}.eof_cmp, label %bin_eof_err_#{d}, label %bin_eof_ok_#{d}")
+  _cg_bin_emit_eof_err_branch(out, d, d)
+  codegen_util::cg_emit_line(out, "bin_eof_ok_#{d}:")
+
+  # Allocate output struct: non_pad_count * 8 bytes, zeroed.
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".out = call ptr @__qz_alloc(i64 ")
+  codegen_util::cg_emit_int(out, non_pad_count * 8)
+  codegen_util::cg_emit_line(out, ")")
+  codegen_util::cg_emit(out, "  call ptr @memset(ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".out, i32 0, i64 ")
+  codegen_util::cg_emit_int(out, non_pad_count * 8)
+  codegen_util::cg_emit_line(out, ")")
+
+  # Walk fields and emit byte-level reads via the extracted helper.
+  _cg_bin_emit_unpack_prefix_reads(out, prog, dest, layout_id, field_count)
+
+
+  # Wrap struct in Result::Ok. Layout of Result::Ok: [tag=0, payload_ptr].
+  # Allocate a 16-byte buffer, store tag=0 and the struct handle.
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".rp = call ptr @__qz_alloc(i64 16)")
+  codegen_util::cg_emit(out, "  store i64 0, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".rp")
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".rpp = getelementptr i64, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".rp, i64 1")
+  codegen_util::cg_emit(out, "  %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".outi = ptrtoint ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".out to i64")
+  codegen_util::cg_emit(out, "  store i64 %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit(out, ".outi, ptr %v")
+  codegen_util::cg_emit(out, d)
+  codegen_util::cg_emit_line(out, ".rpp")
+  codegen_util::cg_emit_line(out, "  %v#{d}.retO = ptrtoint ptr %v#{d}.rp to i64")
+  codegen_util::cg_emit_line(out, "  store i64 %v#{d}.retO, ptr %v#{d}.ret_a")
+  codegen_util::cg_emit_line(out, "  br label %bin_eof_join_#{d}")
+  codegen_util::cg_emit_line(out, "bin_eof_join_#{d}:")
+  codegen_util::cg_emit_line(out, "  %v#{d} = load i64, ptr %v#{d}.ret_a")
+end

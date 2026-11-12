@@ -1,0 +1,4023 @@
+# std/net/http_server.qz - HTTP/1.1 + HTTP/2 Server (The Quartz Way)
+#
+# Supervised goroutine-per-connection server on the M:N scheduler with
+# Sinatra-shaped block-DSL routing via the `HttpRoute` effect
+# (Phase 6.1.d). Two entry shapes:
+#
+#   - `http_serve(port) do -> ... end`            — block DSL (recommended)
+#   - `http_serve_supervised(config, handler)`    — config + single dispatcher
+#   - `https_serve_supervised(config, tls, hdlr)` — TLS counterpart (ALPN h2/h1.1)
+#
+# Cross-platform; per-connection supervisor restart on handler crash;
+# graceful shutdown via SIGTERM/SIGINT or `http_server_shutdown()`;
+# unified-select listener loop via `tcp_acceptable`.
+#
+# Example - Hello World (block DSL, v1):
+#   import std/net/http_server
+#
+#   def main(): Int
+#     http_serve(8080) do ->
+#       route_get("/", req: Request -> text_response("Hello, Quartz!"))
+#     end
+#     return 0
+#   end
+#
+# Example - Multiple routes:
+#   import std/net/http_server
+#
+#   def main(): Int
+#     http_serve(8080) do ->
+#       route_get("/", req: Request -> text_response("Hello!"))
+#       route_get("/users/:id", req: Request -> {
+#         var id = route_param("/users/:id", req.path, "id")
+#         json_response("{\"id\":" + id + "}")
+#       })
+#       route_post("/echo", req: Request -> text_response(req.body))
+#     end
+#     return 0
+#   end
+#
+# Example - Single-dispatcher form (no routing DSL):
+#   import std/net/http_server
+#
+#   def main(): Int
+#     var r = router_new()
+#     r.router_get("/") do req: Request ->
+#       text_response("Hello!")
+#     end
+#     http_serve_supervised(http_server_config(8080),
+#                           r.router_handler() | with_logging)
+#     return 0
+#   end
+
+# =============================================================================
+# FFI Declarations (inline — extern "C" def doesn't cross module boundaries yet)
+# =============================================================================
+
+extern "C" def socket(domain: CInt, socket_type: CInt, protocol: CInt): CInt
+extern "C" def connect(sockfd: CInt, addr: CPtr, addrlen: CInt): CInt
+extern "C" def bind(sockfd: CInt, addr: CPtr, addrlen: CInt): CInt
+extern "C" def listen(sockfd: CInt, backlog: CInt): CInt
+extern "C" def accept(sockfd: CInt, addr: CPtr, addrlen: CPtr): CInt
+extern "C" def sendto(sockfd: CInt, buf: CPtr, len: CSize, flags: CInt, addr: CPtr, addrlen: CInt): Int
+extern "C" def recvfrom(sockfd: CInt, buf: CPtr, len: CSize, flags: CInt, addr: CPtr, addrlen: CPtr): Int
+
+# Wrappers: use sendto/recvfrom with NULL addr to avoid channel intrinsic collision
+def socket_send(sockfd: Int, buf: Int, len: Int, flags: Int): Int
+  sendto(sockfd, buf, len, flags, int_to_cptr(0), 0)
+end
+
+def socket_recv(sockfd: Int, buf: Int, len: Int, flags: Int): Int
+  recvfrom(sockfd, buf, len, flags, int_to_cptr(0), int_to_cptr(0))
+end
+extern "C" def shutdown(sockfd: CInt, how: CInt): CInt
+extern "C" def close(fd: CInt): CInt
+
+# Phase 8b step 1 — close-fd cross-target shim.
+# Hosted: libc close(fd). Freestanding: route through the kernel's
+# kern_tcp_close which sends FIN + transitions the slot to FIN_SENT.
+# Used by `http_serve_supervised`'s load-shed branch + a few TLS-path
+# close sites. Keeps the per-call-site code identical across targets.
+@cfg(not: os: "unknown")
+def _http_close_fd(fd: Int): Int = close(fd)
+
+@cfg(os: "unknown")
+def _http_close_fd(fd: Int): Int
+  # fd is the kernel conn slot ptr (fd ≡ slot ptr).
+  var _ignore_kc = kern_tcp_close(fd)
+  return 0
+end
+extern "C" def setsockopt(sockfd: CInt, level: CInt, optname: CInt, optval: CPtr, optlen: CInt): CInt
+extern "C" def htons(hostshort: CInt): CInt
+extern "C" def inet_pton(af: CInt, src: CPtr, dst: CPtr): CInt
+extern "C" def malloc(size: CSize): CPtr
+extern "C" def free(ptr: CPtr): Void
+extern "C" def memset(ptr: CPtr, value: CInt, size: CSize): CPtr
+extern "C" def strlen(str: CPtr): CSize
+extern "C" def fcntl(fd: CInt, cmd: CInt, arg: CInt): CInt
+
+# POSIX signal() — used to install SIG_IGN for SIGPIPE so a write to a
+# peer-closed socket returns EPIPE instead of terminating the process.
+# SIG_IGN is canonically `(void (*)(int)) 1` — pass as int_to_cptr(1).
+extern "C" def signal(sig: CInt, handler: CPtr): CPtr
+
+# TLS FFI (inline since extern C doesn't cross modules)
+extern "C" def OPENSSL_init_ssl(opts: Int, settings: CPtr): CInt
+extern "C" def TLS_server_method(): CPtr
+extern "C" def SSL_CTX_new(method: CPtr): CPtr
+extern "C" def SSL_CTX_free(ctx: CPtr): Void
+extern "C" def SSL_CTX_use_certificate_file(ctx: CPtr, file: CPtr, file_type: CInt): CInt
+extern "C" def SSL_CTX_use_PrivateKey_file(ctx: CPtr, file: CPtr, file_type: CInt): CInt
+extern "C" def SSL_CTX_check_private_key(ctx: CPtr): CInt
+extern "C" def SSL_CTX_ctrl(ctx: CPtr, cmd: CInt, larg: Int, parg: CPtr): Int
+
+# SSL_CTX_set_min_proto_version is a macro in OpenSSL — wrap SSL_CTX_ctrl.
+# SSL_CTRL_SET_MIN_PROTO_VERSION = 123
+def SSL_CTX_set_min_proto_version(ctx: CPtr, version: Int): Int
+  return SSL_CTX_ctrl(ctx, 123, version, int_to_cptr(0))
+end
+extern "C" def SSL_new(ctx: CPtr): CPtr
+extern "C" def SSL_free(ssl: CPtr): Void
+extern "C" def SSL_set_fd(ssl: CPtr, fd: CInt): CInt
+extern "C" def SSL_accept(ssl: CPtr): CInt
+extern "C" def SSL_read(ssl: CPtr, buf: CPtr, num: CInt): CInt
+extern "C" def SSL_write(ssl: CPtr, buf: CPtr, num: CInt): CInt
+extern "C" def SSL_shutdown(ssl: CPtr): CInt
+extern "C" def SSL_get_error(ssl: CPtr, ret: CInt): CInt
+extern "C" def SSL_pending(ssl: CPtr): CInt
+extern "C" def ERR_clear_error(): Void
+def SSL_FILETYPE_PEM(): Int = 1
+def TLS1_2_VERSION(): Int = 0x0303
+def SSL_ERROR_WANT_READ(): Int = 2
+def SSL_ERROR_WANT_WRITE(): Int = 3
+
+# ALPN FFI (for HTTP/2 negotiation)
+extern "C" def SSL_CTX_set_alpn_select_cb(ctx: CPtr, cb: CPtr, arg: CPtr): Void
+extern "C" def SSL_get0_alpn_selected(ssl: CPtr, data: CPtr, len: CPtr): Void
+extern "C" def SSL_select_next_proto(out: CPtr, outlen: CPtr, server: CPtr, server_len: CInt, client: CPtr, client_len: CInt): CInt
+
+# Platform constants
+def AF_INET(): Int = 2
+def SOCK_STREAM(): Int = 1
+
+@cfg(os: "macos")
+def SOL_SOCKET(): Int = 0xFFFF
+@cfg(os: "linux")
+def SOL_SOCKET(): Int = 1
+
+@cfg(os: "macos")
+def SO_REUSEADDR(): Int = 0x0004
+@cfg(os: "linux")
+def SO_REUSEADDR(): Int = 2
+
+@cfg(os: "macos")
+def SO_NOSIGPIPE(): Int = 0x1022
+
+import std/net/url
+import std/json
+import std/markdown
+import std/net/http2
+import std/net/hpack
+import std/log
+import std/throws
+import std/file_io
+import std/net/http_route
+import * from std/net/tcp
+import std/net/http_connection_handler
+import std/net/http_dynamic_goroutine_sup
+
+# =============================================================================
+# @repr(C) structs for socket address
+# =============================================================================
+
+@repr(C)
+struct SockaddrIn
+  @cfg(os: "macos")
+  sin_len: U8         # Length of structure (BSD only)
+  sin_family: U8      # AF_INET
+  sin_port: U16       # Port number (network byte order)
+  sin_addr: U32       # IP address (network byte order)
+  sin_zero: Int       # Padding (8 bytes)
+end
+
+# Platform-aware SockaddrIn constructor for INADDR_ANY on given port.
+@cfg(os: "macos")
+def _make_sockaddr_in(port: Int): SockaddrIn
+  var net_port = htons(port)
+  return SockaddrIn { sin_len: 16, sin_family: 2, sin_port: net_port, sin_addr: 0, sin_zero: 0 }
+end
+
+@cfg(os: "linux")
+def _make_sockaddr_in(port: Int): SockaddrIn
+  # Linux: sa_family_t is uint16_t (2 bytes), not U8. Write via struct then fix byte 1.
+  var net_port = htons(port)
+  var addr = SockaddrIn { sin_family: 2, sin_port: net_port, sin_addr: 0, sin_zero: 0 }
+  # Fix: @repr(C) padding byte after U8 sin_family may be garbage.
+  # Linux reads sin_family as uint16_t. Zero the padding byte.
+  var ptr = as_int_generic(addr)
+  ptr_write_byte(ptr_add(ptr, 1), 0)
+  return addr
+end
+
+# =============================================================================
+# Request Type
+# =============================================================================
+
+struct Request
+  method: String
+  path: String
+  query_string: String
+  body: String
+  raw_path: String
+  header_keys: Vec<String>
+  header_vals: Vec<String>
+  params: Map<String, String>   # path params (:id → "42")
+  query: Map<String, String>    # parsed query (first value per key)
+  context: Map<String, String>  # middleware → handler data
+end
+
+# =============================================================================
+# Response Type
+# =============================================================================
+
+## Response body shape:
+##  - body: String — the normal (copying) body. Used when body_ptr == 0.
+##  - body_ptr: Int — 0 means use body; nonzero is a raw-bytes pointer for
+##    zero-copy response bodies (e.g. an asset baked into PMM-resident
+##    memory on the freestanding unikernel, or a memory-mapped file).
+##  - body_len: Int — bytes at body_ptr (only meaningful if body_ptr != 0).
+##
+## When body_ptr is set, the writer emits headers via the existing String
+## send path, then emits the body via a second raw-bytes send — avoiding
+## the String concatenation that would copy body_len bytes per response.
+##
+## `Response` is `@repr(C)` to PIN it on the reference (Boxed) path under value-default
+## structs (F4). It crosses an erased effect-handler boundary as an `as_int` handle:
+## the `Throws` handler `_http_request_throws_handler` returns `as_int(server_error(msg))`
+## (a `Response`) and the unwind machinery reconstructs the `Response` from that Int handle
+## downstream. A value-layout struct has no stable handle to erase through `as_int`, so the
+## QZ0221 erased-boundary wall forbids it. `@repr(C)` is positively known-Boxed (never flips
+## to value-layout), so the handle survives the unwind AND QZ0221 positively excludes it —
+## exactly as `Router`/`Bytes`/`Suite`/`AstStorage`.
+@repr(C)
+struct Response
+  status: Int
+  body: String
+  content_type: String
+  extra_header_keys: Vec<String>
+  extra_header_vals: Vec<String>
+  body_ptr: Int
+  body_len: Int
+end
+
+# =============================================================================
+# Response Constructors
+# =============================================================================
+
+def empty_request(): Request
+  return Request { method: "", path: "", query_string: "", body: "", raw_path: "", header_keys: vec_new<String>(), header_vals: vec_new<String>(), params: map_new(), query: map_new(), context: map_new() }
+end
+
+def text_response(body: String): Response
+  return Response { status: 200, body: body, content_type: "text/plain", extra_header_keys: vec_new<String>(), extra_header_vals: vec_new<String>(), body_ptr: 0, body_len: 0 }
+end
+
+def json_response(body: String): Response
+  return Response { status: 200, body: body, content_type: "application/json", extra_header_keys: vec_new<String>(), extra_header_vals: vec_new<String>(), body_ptr: 0, body_len: 0 }
+end
+
+def html_response(body: String): Response
+  return Response { status: 200, body: body, content_type: "text/html", extra_header_keys: vec_new<String>(), extra_header_vals: vec_new<String>(), body_ptr: 0, body_len: 0 }
+end
+
+## Zero-copy raw-bytes response. The body is `len` bytes at `ptr`; the
+## writer emits headers + body in two sends so no copy of the body bytes
+## happens. Use for assets resident in PMM (unikernel) or memory-mapped
+## files (hosted) where the body is already a contiguous byte region.
+##
+## The caller owns `ptr` and must keep it alive for the duration of the
+## response write. Status is 200; use the {body_ptr, body_len} fields
+## directly to build other statuses.
+def bytes_response(content_type: String, ptr: Int, len: Int): Response
+  return Response { status: 200, body: "", content_type: content_type, extra_header_keys: vec_new<String>(), extra_header_vals: vec_new<String>(), body_ptr: ptr, body_len: len }
+end
+
+def not_found(): Response
+  return Response { status: 404, body: "404 Not Found", content_type: "text/plain", extra_header_keys: vec_new<String>(), extra_header_vals: vec_new<String>(), body_ptr: 0, body_len: 0 }
+end
+
+def method_not_allowed(): Response
+  return Response { status: 405, body: "405 Method Not Allowed", content_type: "text/plain", extra_header_keys: vec_new<String>(), extra_header_vals: vec_new<String>(), body_ptr: 0, body_len: 0 }
+end
+
+def payload_too_large(): Response
+  return Response { status: 413, body: "413 Payload Too Large", content_type: "text/plain", extra_header_keys: vec_new<String>(), extra_header_vals: vec_new<String>(), body_ptr: 0, body_len: 0 }
+end
+
+def server_error(msg: String): Response
+  return Response { status: 500, body: "500 Internal Server Error: " + msg, content_type: "text/plain", extra_header_keys: vec_new<String>(), extra_header_vals: vec_new<String>(), body_ptr: 0, body_len: 0 }
+end
+
+def redirect(url: String): Response
+  var resp = Response { status: 302, body: "", content_type: "text/plain", extra_header_keys: vec_new<String>(), extra_header_vals: vec_new<String>(), body_ptr: 0, body_len: 0 }
+  resp.extra_header_keys.push("Location")
+  resp.extra_header_vals.push(url)
+  return resp
+end
+
+def bad_request(msg: String): Response
+  return Response { status: 400, body: "400 Bad Request: " + msg, content_type: "text/plain", extra_header_keys: vec_new<String>(), extra_header_vals: vec_new<String>(), body_ptr: 0, body_len: 0 }
+end
+
+def unauthorized(): Response
+  return Response { status: 401, body: "401 Unauthorized", content_type: "text/plain", extra_header_keys: vec_new<String>(), extra_header_vals: vec_new<String>(), body_ptr: 0, body_len: 0 }
+end
+
+def forbidden(): Response
+  return Response { status: 403, body: "403 Forbidden", content_type: "text/plain", extra_header_keys: vec_new<String>(), extra_header_vals: vec_new<String>(), body_ptr: 0, body_len: 0 }
+end
+
+def no_content(): Response
+  return Response { status: 204, body: "", content_type: "text/plain", extra_header_keys: vec_new<String>(), extra_header_vals: vec_new<String>(), body_ptr: 0, body_len: 0 }
+end
+
+def created(body: String): Response
+  return Response { status: 201, body: body, content_type: "application/json", extra_header_keys: vec_new<String>(), extra_header_vals: vec_new<String>(), body_ptr: 0, body_len: 0 }
+end
+
+def response_header(resp: Response, key: String, value: String): Response
+  resp.extra_header_keys.push(key)
+  resp.extra_header_vals.push(value)
+  return resp
+end
+
+# =============================================================================
+# Init-Error Surface — HttpError + Throws<HttpError>
+# =============================================================================
+#
+# Server-init failure modes (socket/bind/listen) used to do
+# `log::error("..."); close(fd); return 1`. Phase 6.1.b lifts these onto
+# Throws so callers can install their own handler (testing, retry, custom
+# diagnostics) by wrapping `http_serve(...)` in a `with Throws { throw: h }`.
+#
+# Default behavior: the runtime's blessed Throws handler (Phase 6.1.b prep,
+# 7df8b805) writes the formatted message + newline to stderr and exits 66
+# — same diagnostic content as the old log+return-1 path, just delivered
+# through the effect substrate.
+#
+# TLS-specific variants (SslContextCreateFailed, SslCertLoadFailed, etc.)
+# ship in the next commit per design memo R2 — TLS unwind paths interact
+# with the OpenSSL state machine and want their own audited migration.
+#
+# NOTE on shape: BindFailed uses a tuple variant `(Int)` rather than the
+# more readable struct shape `{ port: Int }`. A struct-shaped variant in
+# a module with this many imports triggers a compiler bug that drives
+# typecheck memory past 28 GB before timing out (verified 2026-04-26).
+# Tuple variant is the workaround until the bug is fixed; see
+# docs/bugs/STRUCT_VARIANT_IN_HEAVY_IMPORT_MODULE_BLOWUP.md.
+
+enum HttpError
+  SocketCreateFailed
+  BindFailed(Int)
+  ListenFailed
+  SslContextCreateFailed
+  SslCertLoadFailed(String)
+  SslKeyLoadFailed(String)
+  SslKeyMismatch
+end
+
+def http_error_format(e: HttpError): String
+  match e
+    SocketCreateFailed => "Failed to create socket"
+    BindFailed(port) => "Failed to bind to port " + str_from_int(port)
+    ListenFailed => "Failed to listen"
+    SslContextCreateFailed => "Failed to create SSL context"
+    SslCertLoadFailed(path) => "Failed to load certificate: " + path
+    SslKeyLoadFailed(path) => "Failed to load private key: " + path
+    SslKeyMismatch => "Certificate and private key do not match"
+  end
+end
+
+# =============================================================================
+# Per-Request Effect Frame — Throws Conversion at Handler Boundary
+# =============================================================================
+#
+# Every framework entry point (http_serve / http_serve_supervised /
+# https_serve_supervised / _h2_call_handler / _h2_process_request) calls
+# user handler code via a single function-pointer dispatch. Phase 6.1.c wraps
+# each of those dispatches in a per-request `with Throws { throw: h }`
+# install whose handler converts the thrown String into a 500 Response. This
+# means a handler that does `throw("oops")` (or any deeper callee with
+# `can Throws`) produces a 500 error to the client INSTEAD of crashing the
+# whole server through the runtime's blessed default Throws handler (which
+# exits 66).
+#
+# The H1 hypothesis from `docs/design/PHASE_6_1_HTTP_EFFECTS.md` is that
+# 1000 concurrent fibers can each install their own `with Throws` around
+# their own handler invocation without cross-talk. The substrate test in
+# `phase_6_1c_concurrent_effect_frames_spec.qz` verifies this end-to-end
+# (with Log captures, since the cross-talk detection is easier to instrument).
+# Here the same install pattern is in production: one per-request frame
+# pushed at handler entry, popped at handler return.
+#
+# Why this fix needs `throw` to be kind=2 (unwind): a handler that throws
+# must NOT have its post-throw code execute. If `throw` were kind=1
+# (continuation-style), the handler-side install would run the converter
+# but execution would continue past the throw site — the user-visible
+# semantic would be "unwound" but the actual control flow would fall
+# through, frequently to a `return resp` of an undefined value. The
+# kind=2 `= resume(0)` marker in std/throws.qz delivers the correct
+# semantic.
+#
+# Why a wrapping helper instead of inlining at each site: the install
+# semantics are identical at every site; centralizing the install means
+# any future change (logging the throw, propagating to a request-scoped
+# Log effect, exposing the HttpError variant via reflection) lands in
+# one place.
+
+def _http_request_throws_handler(op_name: Int, argc: Int, argv: Int): Int
+  var msg = as_string(load(argv, 0))
+  return as_int(server_error(msg))
+end
+
+def _invoke_handler_safely(handler: Fn(Request): Response, req: Request): Response
+  return with Throws { throw: _http_request_throws_handler } do ->
+    handler(req)
+  end
+end
+
+# =============================================================================
+# Request Helpers
+# =============================================================================
+
+def request_header(req: Request, key: String): String
+  var i = 0
+  while i < req.header_keys.size
+    if str_eq_ignore_case(req.header_keys[i], key)
+      return req.header_vals[i]
+    end
+    i += 1
+  end
+  return ""
+end
+
+def str_eq_ignore_case(a: String, b: String): Int
+  var alen = str_byte_len(a)
+  var blen = str_byte_len(b)
+  if alen != blen
+    return 0
+  end
+  var i = 0
+  while i < alen
+    var ca = str_byte_at(a, i)
+    var cb = str_byte_at(b, i)
+    if ca >= 'A' and ca <= 'Z'
+      ca = ca + 32
+    end
+    if cb >= 'A' and cb <= 'Z'
+      cb = cb + 32
+    end
+    if ca != cb
+      return 0
+    end
+    i += 1
+  end
+  return 1
+end
+
+# =============================================================================
+# Query String Parsing (internal)
+# =============================================================================
+
+## Parse query_string into req.query Map (first value per key wins).
+## Splits on & then on first = per pair, URL-decodes both key and value.
+def _parse_query_into(req: Request): Void
+  var qs = req.query_string
+  var qs_len = str_byte_len(qs)
+  if qs_len == 0
+    return
+  end
+  var start = 0
+  while start <= qs_len
+    # Find next & or end
+    var amp = qs_len
+    var j = start
+    while j < qs_len
+      if str_byte_at(qs, j) == '&'
+        amp = j
+        break
+      end
+      j = j + 1
+    end
+    var pair = str_byte_slice(qs, start, amp)
+    if str_byte_len(pair) > 0
+      # Split on first =
+      var eq_pos = -1
+      var k = 0
+      var pair_len = str_byte_len(pair)
+      while k < pair_len
+        if str_byte_at(pair, k) == '='
+          eq_pos = k
+          break
+        end
+        k = k + 1
+      end
+      if eq_pos >= 0
+        var raw_key = str_byte_slice(pair, 0, eq_pos)
+        var raw_val = str_byte_slice(pair, eq_pos + 1, pair_len)
+        var key = url_decode(raw_key)
+        var value = url_decode(raw_val)
+        # First value per key wins
+        if not req.query.has(key)
+          req.query.set(key, value)
+        end
+      else
+        # Key with no value (e.g. "flag")
+        var key = url_decode(pair)
+        if not req.query.has(key)
+          req.query.set(key, "")
+        end
+      end
+    end
+    start = amp + 1
+  end
+end
+
+# =============================================================================
+# Query String API
+# =============================================================================
+
+## Get the first value for a query parameter, or "" if not present.
+def query_param(req: Request, key: String): String
+  match req.query.get(key)
+    Some(v) => return v
+    _ => return ""
+  end
+end
+
+## Get all values for a query parameter key (re-parses query string).
+def query_params(req: Request, key: String): Vec<String>
+  var result = vec_new<String>()
+  var qs = req.query_string
+  var qs_len = str_byte_len(qs)
+  if qs_len == 0
+    return result
+  end
+  var start = 0
+  while start <= qs_len
+    var amp = qs_len
+    var j = start
+    while j < qs_len
+      if str_byte_at(qs, j) == '&'
+        amp = j
+        break
+      end
+      j = j + 1
+    end
+    var pair = str_byte_slice(qs, start, amp)
+    if str_byte_len(pair) > 0
+      var eq_pos = -1
+      var k = 0
+      var pair_len = str_byte_len(pair)
+      while k < pair_len
+        if str_byte_at(pair, k) == '='
+          eq_pos = k
+          break
+        end
+        k = k + 1
+      end
+      if eq_pos >= 0
+        var raw_key = str_byte_slice(pair, 0, eq_pos)
+        if url_decode(raw_key) == key
+          result.push(url_decode(str_byte_slice(pair, eq_pos + 1, pair_len)))
+        end
+      end
+    end
+    start = amp + 1
+  end
+  return result
+end
+
+## Check if a query parameter exists.
+def query_has(req: Request, key: String): Bool
+  return req.query.has(key)
+end
+
+# =============================================================================
+# Path Parameters API
+# =============================================================================
+
+## Get a path parameter extracted at route match time, or "" if not present.
+def path_param(req: Request, name: String): String
+  match req.params.get(name)
+    Some(v) => return v
+    _ => return ""
+  end
+end
+
+## Extract all path params from pattern into req.params Map.
+## Called at route match time by router_handler.
+def _extract_params(pattern: String, path: String, params: Int): Void
+  var pi = 0
+  var ai = 0
+  var plen = str_byte_len(pattern)
+  var alen = str_byte_len(path)
+
+  while pi < plen and ai < alen
+    var pc = str_byte_at(pattern, pi)
+
+    if pc == '*'
+      # '*' — catch-all, capture rest of path
+      pi += 1
+      var name_start = pi
+      while pi < plen
+        pi += 1
+      end
+      var param_name = str_byte_slice(pattern, name_start, pi)
+      var param_val = url_decode(str_byte_slice(path, ai, alen))
+      map_set(params, param_name, param_val)
+      return
+    elsif pc == ':'
+      pi += 1
+      var name_start = pi
+      while pi < plen and str_byte_at(pattern, pi) != '/'
+        pi += 1
+      end
+      var param_name = str_byte_slice(pattern, name_start, pi)
+
+      var val_start = ai
+      while ai < alen and str_byte_at(path, ai) != '/'
+        ai += 1
+      end
+      var param_val = url_decode(str_byte_slice(path, val_start, ai))
+      map_set(params, param_name, param_val)
+    else
+      pi += 1
+      ai += 1
+    end
+  end
+end
+
+# =============================================================================
+# Request Context API
+# =============================================================================
+
+## Set a key-value pair in the request context (for middleware → handler data).
+def context_set(req: Request, key: String, value: String): Void
+  req.context.set(key, value)
+end
+
+## Get a value from the request context, or "" if not present.
+def context_get(req: Request, key: String): String
+  match req.context.get(key)
+    Some(v) => return v
+    _ => return ""
+  end
+end
+
+## Check if a key exists in the request context.
+def context_has(req: Request, key: String): Bool
+  return req.context.has(key)
+end
+
+# =============================================================================
+# Cookie API
+# =============================================================================
+
+struct CookieOpts
+  path: String
+  max_age: Int       # 0=session, -1=delete
+  http_only: Int     # 1=HttpOnly
+  secure: Int        # 1=Secure
+  same_site: String  # "Lax", "Strict", "None", ""
+end
+
+## Create a CookieOpts with sensible defaults.
+def cookie_opts(): CookieOpts
+  return CookieOpts { path: "/", max_age: 0, http_only: 0, secure: 0, same_site: "Lax" }
+end
+
+## Get a cookie value from the request, or "" if not present.
+def request_cookie(req: Request, name: String): String
+  var cookie_header = request_header(req, "Cookie")
+  if str_byte_len(cookie_header) == 0
+    return ""
+  end
+  # Split on "; "
+  var pos = 0
+  var len = str_byte_len(cookie_header)
+  while pos < len
+    # Find next "; " or end
+    var semi = len
+    var j = pos
+    while j < len - 1
+      if str_byte_at(cookie_header, j) == ';' and str_byte_at(cookie_header, j + 1) == ' '
+        semi = j
+        break
+      end
+      j = j + 1
+    end
+    var pair = str_byte_slice(cookie_header, pos, semi)
+    # Split on first =
+    var eq = -1
+    var k = 0
+    var plen = str_byte_len(pair)
+    while k < plen
+      if str_byte_at(pair, k) == '='
+        eq = k
+        break
+      end
+      k = k + 1
+    end
+    if eq >= 0
+      var cname = str_byte_slice(pair, 0, eq)
+      if cname == name
+        return url_decode(str_byte_slice(pair, eq + 1, plen))
+      end
+    end
+    if semi == len
+      pos = len
+    else
+      pos = semi + 2
+    end
+  end
+  return ""
+end
+
+## Check if a cookie exists in the request.
+def request_has_cookie(req: Request, name: String): Bool
+  var cookie_header = request_header(req, "Cookie")
+  if str_byte_len(cookie_header) == 0
+    return false
+  end
+  var pos = 0
+  var len = str_byte_len(cookie_header)
+  while pos < len
+    var semi = len
+    var j = pos
+    while j < len - 1
+      if str_byte_at(cookie_header, j) == ';' and str_byte_at(cookie_header, j + 1) == ' '
+        semi = j
+        break
+      end
+      j = j + 1
+    end
+    var pair = str_byte_slice(cookie_header, pos, semi)
+    var eq = -1
+    var k = 0
+    var plen = str_byte_len(pair)
+    while k < plen
+      if str_byte_at(pair, k) == '='
+        eq = k
+        break
+      end
+      k = k + 1
+    end
+    if eq >= 0
+      var cname = str_byte_slice(pair, 0, eq)
+      if cname == name
+        return true
+      end
+    end
+    if semi == len
+      pos = len
+    else
+      pos = semi + 2
+    end
+  end
+  return false
+end
+
+## Set a cookie on a response. Returns the response with Set-Cookie header added.
+def set_cookie(resp: Response, name: String, value: String, opts: CookieOpts): Response
+  var sb = sb_new()
+  sb.append(url_encode(name))
+  sb.append("=")
+  sb.append(url_encode(value))
+  if str_byte_len(opts.path) > 0
+    sb.append("; Path=")
+    sb.append(opts.path)
+  end
+  if opts.max_age != 0
+    sb.append("; Max-Age=")
+    sb.append(str_from_int(opts.max_age))
+  end
+  if opts.http_only == 1
+    sb.append("; HttpOnly")
+  end
+  if opts.secure == 1
+    sb.append("; Secure")
+  end
+  if str_byte_len(opts.same_site) > 0
+    sb.append("; SameSite=")
+    sb.append(opts.same_site)
+  end
+  resp.extra_header_keys.push("Set-Cookie")
+  resp.extra_header_vals.push(sb.to_string())
+  return resp
+end
+
+## Delete a cookie by setting Max-Age=-1.
+def delete_cookie(resp: Response, name: String): Response
+  var opts = CookieOpts { path: "/", max_age: -1, http_only: 0, secure: 0, same_site: "" }
+  return set_cookie(resp, name, "", opts)
+end
+
+# =============================================================================
+# JSON Body API
+# =============================================================================
+
+## Parse the request body as JSON with Content-Type validation.
+## Returns Err if Content-Type is not application/json or body is empty.
+def request_json(req: Request): Result<JsonValue, ParseError>
+  var ct = request_header(req, "Content-Type")
+  if str_byte_len(ct) == 0
+    return Result::Err(parse_error("Missing Content-Type header", 0, 0))
+  end
+  # Check content type contains "application/json"
+  match str_byte_find(ct, "application/json")
+    Some(pos) => {}
+    _ => return Result::Err(parse_error("Content-Type is not application/json", 0, 0))
+  end
+  if str_byte_len(req.body) == 0
+    return Result::Err(parse_error("Empty request body", 0, 0))
+  end
+  return json_parse(req.body)
+end
+
+# =============================================================================
+# Form Data Parsing
+# =============================================================================
+
+## Parse the request body as URL-encoded form data.
+## Returns Ok(Map handle) on success, Err if Content-Type is wrong or body is empty.
+def request_form(req: Request): Result<Map<String, String>, ParseError>
+  var ct = request_header(req, "Content-Type")
+  if str_byte_len(ct) == 0
+    return Result::Err(parse_error("Missing Content-Type header", 0, 0))
+  end
+  match str_byte_find(ct, "application/x-www-form-urlencoded")
+    Some(pos) => {}
+    _ => return Result::Err(parse_error("Content-Type is not application/x-www-form-urlencoded", 0, 0))
+  end
+  if str_byte_len(req.body) == 0
+    return Result::Err(parse_error("Empty request body", 0, 0))
+  end
+  return Result::Ok(_parse_form_body(req.body))
+end
+
+## Parse a URL-encoded key=value&key2=value2 string into a new Map.
+def _parse_form_body(body: String): Map<String, String>
+  var form = map_new()
+  var len = str_byte_len(body)
+  var start = 0
+  while start <= len
+    var amp = len
+    var j = start
+    while j < len
+      if str_byte_at(body, j) == '&'
+        amp = j
+        break
+      end
+      j = j + 1
+    end
+    var pair = str_byte_slice(body, start, amp)
+    if str_byte_len(pair) > 0
+      var eq_pos = -1
+      var k = 0
+      var pair_len = str_byte_len(pair)
+      while k < pair_len
+        if str_byte_at(pair, k) == '='
+          eq_pos = k
+          break
+        end
+        k = k + 1
+      end
+      if eq_pos >= 0
+        var raw_key = str_byte_slice(pair, 0, eq_pos)
+        var raw_val = str_byte_slice(pair, eq_pos + 1, pair_len)
+        var key = url_decode(raw_key)
+        var value = url_decode(raw_val)
+        if not form.has(key)
+          form.set(key, value)
+        end
+      else
+        var key = url_decode(pair)
+        if not form.has(key)
+          form.set(key, "")
+        end
+      end
+    end
+    start = amp + 1
+  end
+  return form
+end
+
+# =============================================================================
+# Status Text
+# =============================================================================
+
+def status_text(code: Int): String
+  if code == 200
+    return "OK"
+  end
+  if code == 201
+    return "Created"
+  end
+  if code == 204
+    return "No Content"
+  end
+  if code == 301
+    return "Moved Permanently"
+  end
+  if code == 302
+    return "Found"
+  end
+  if code == 304
+    return "Not Modified"
+  end
+  if code == 400
+    return "Bad Request"
+  end
+  if code == 401
+    return "Unauthorized"
+  end
+  if code == 403
+    return "Forbidden"
+  end
+  if code == 404
+    return "Not Found"
+  end
+  if code == 405
+    return "Method Not Allowed"
+  end
+  if code == 413
+    return "Payload Too Large"
+  end
+  if code == 500
+    return "Internal Server Error"
+  end
+  return "Unknown"
+end
+
+# =============================================================================
+# HTTP Parsing Helpers
+# =============================================================================
+
+def parse_method(line: String): String
+  match str_byte_find(line, " ")
+    Some(pos) => return str_byte_slice(line, 0, pos)
+    None => return ""
+    _ => return ""
+  end
+end
+
+def parse_path(line: String): String
+  match str_byte_find(line, " ")
+    Some(first_space) => {
+      var rest = str_byte_slice(line, first_space + 1, str_byte_len(line))
+      match str_byte_find(rest, " ")
+        Some(second_space) => return str_byte_slice(rest, 0, second_space)
+        None => return rest
+        _ => return rest
+      end
+    }
+    None => return "/"
+    _ => return "/"
+  end
+end
+
+# =============================================================================
+# Low-level TCP helpers
+# =============================================================================
+
+def tcp_read_bytes(fd: Int, max_len: Int): String
+  var buf = malloc(max_len + 1)
+  if ptr_is_null(buf) == 1
+    return ""
+  end
+  memset(buf, 0, max_len + 1)
+  var n = socket_recv(fd, buf, max_len, 0)
+  if n <= 0
+    mem_free(buf)
+    return ""
+  end
+  var result = str_from_ptr(buf, n)
+  mem_free(buf)
+  return result
+end
+
+def tcp_read_line_raw(fd: Int, max_len: Int): String
+  var buf = malloc(max_len + 1)
+  if ptr_is_null(buf) == 1
+    return ""
+  end
+  memset(buf, 0, max_len + 1)
+  var i = 0
+  while i < max_len
+    var one = malloc(1)
+    var n = socket_recv(fd, one, 1, 0)
+    if n <= 0
+      mem_free(one)
+      if i == 0
+        mem_free(buf)
+        return ""
+      end
+      var result = str_from_ptr(buf, i)
+      mem_free(buf)
+      return result
+    end
+    var ch = ptr_read_byte(one)
+    ptr_write_byte(ptr_add(buf, i), ch)
+    mem_free(one)
+    i += 1
+    if ch == '\n'
+      var result = str_from_ptr(buf, i)
+      mem_free(buf)
+      return result
+    end
+  end
+  var result = str_from_ptr(buf, i)
+  mem_free(buf)
+  return result
+end
+
+@cfg(not: os: "unknown")
+def tcp_write_str(fd: Int, data: String): Int
+  var len = str_byte_len(data)
+  var ptr = str_to_ptr(data)
+  var total = 0
+  while total < len
+    var n = socket_send(fd, ptr_add(ptr, total), len - total, 0)
+    if n <= 0
+      return -1
+    end
+    total = total + n
+  end
+  return total
+end
+
+# Freestanding (`@cfg(os: "unknown")`) body — D.11 Phase 8b step 1.
+# Routes through async_tcp_write so the kernel's tcp_try_push + tx-done
+# channel machinery handles the blocking write. fd is the kernel conn
+# slot ptr. Used by `_http_send_503` on the load-shed path.
+@cfg(os: "unknown")
+def tcp_write_str(fd: Int, data: String): Int
+  var len = str_byte_len(data)
+  var ptr = str_to_ptr(data)
+  return async_tcp_write(fd, ptr, len)
+end
+
+# Raw-bytes counterpart of tcp_write_str. Used by the response writers
+# when `body_ptr != 0`, so the body bytes are streamed straight from
+# their resident region (PMM asset, mmap'd file, etc.) without a copy
+# into a String first. D.11 multi-region body extension (Phase R.1).
+@cfg(not: os: "unknown")
+def tcp_write_bytes(fd: Int, ptr: Int, len: Int): Int
+  var total = 0
+  while total < len
+    var n = socket_send(fd, ptr_add(ptr, total), len - total, 0)
+    if n <= 0
+      return -1
+    end
+    total = total + n
+  end
+  return total
+end
+
+@cfg(os: "unknown")
+def tcp_write_bytes(fd: Int, ptr: Int, len: Int): Int = async_tcp_write(fd, ptr, len)
+
+# =============================================================================
+# HTTP Request Parsing
+# =============================================================================
+
+def http_parse_request(client_fd: Int): Request
+  # Read the request line
+  var request_line = tcp_read_line_raw(client_fd, 8192)
+  if str_byte_len(request_line) == 0
+    return empty_request()
+  end
+
+  var method = parse_method(request_line)
+  var raw_path = parse_path(request_line)
+  var path = raw_path
+  var query_string = ""
+
+  var qmark_opt = str_byte_find(raw_path, "?")
+  match qmark_opt
+    Some(qmark) => {
+      path = str_byte_slice(raw_path, 0, qmark)
+      query_string = str_byte_slice(raw_path, qmark + 1, str_byte_len(raw_path))
+    }
+    None => {}
+    _ => {}
+  end
+
+  # Read headers until empty line
+  var hkeys = vec_new<String>()
+  var hvals = vec_new<String>()
+  var content_length = 0
+  while true
+    var line = tcp_read_line_raw(client_fd, 8192)
+
+    if str_byte_len(line) <= 2
+      break
+    else
+      var colon_opt = str_byte_find(line, ": ")
+      match colon_opt
+        Some(colon) => {
+          var key = str_byte_slice(line, 0, colon)
+          var val_end = str_byte_len(line)
+          # Strip trailing \r\n
+          if val_end >= 2 and str_byte_at(line, val_end - 1) == '\n'
+            val_end = val_end - 1
+          end
+          if val_end >= 1 and str_byte_at(line, val_end - 1) == '\r'
+            val_end = val_end - 1
+          end
+          var value = str_byte_slice(line, colon + 2, val_end)
+          hkeys.push(key)
+          hvals.push(value)
+
+          if str_eq_ignore_case(key, "Content-Length") == 1
+            content_length = value.to_i()
+          end
+        }
+        None => {}
+        _ => {}
+      end
+    end
+  end
+
+  # Read body if Content-Length > 0
+  var body = ""
+  if content_length > 0
+    body = tcp_read_bytes(client_fd, content_length)
+  end
+
+  var req = Request { method: method, path: path, query_string: query_string, body: body, raw_path: raw_path, header_keys: hkeys, header_vals: hvals, params: map_new(), query: map_new(), context: map_new() }
+  _parse_query_into(req)
+  return req
+end
+
+# =============================================================================
+# HTTP Response Serialization
+# =============================================================================
+
+def http_write_response(client_fd: Int, resp: Response): Int
+  var status_line = "HTTP/1.1 " + str_from_int(resp.status) + " " + status_text(resp.status) + "\r\n"
+
+  # Content-Length derives from body_len when the response carries a
+  # raw-bytes body (body_ptr != 0); otherwise from the String body.
+  var content_length = 0
+  if resp.body_ptr != 0
+    content_length = resp.body_len
+  else
+    content_length = str_byte_len(resp.body)
+  end
+
+  var hdrs = "Content-Type: " + resp.content_type + "\r\n"
+  hdrs = hdrs + "Content-Length: " + str_from_int(content_length) + "\r\n"
+  hdrs = hdrs + "Connection: close\r\n"
+  hdrs = hdrs + "Server: Quartz/1.0\r\n"
+
+  var i = 0
+  while i < resp.extra_header_keys.size
+    hdrs = hdrs + resp.extra_header_keys[i] + ": " + resp.extra_header_vals[i] + "\r\n"
+    i += 1
+  end
+
+  if resp.body_ptr != 0
+    # Zero-copy path: emit headers then stream raw body bytes via a
+    # second send (TCP coalesces or splits at its own boundaries).
+    var header_block = status_line + hdrs + "\r\n"
+    if tcp_write_str(client_fd, header_block) < 0
+      return -1
+    end
+    if tcp_write_bytes(client_fd, resp.body_ptr, resp.body_len) < 0
+      return -1
+    end
+    return 0
+  end
+
+  var full_response = status_line + hdrs + "\r\n" + resp.body
+  tcp_write_str(client_fd, full_response)
+  return 0
+end
+
+# =============================================================================
+# Socket helpers
+# =============================================================================
+
+@cfg(any: os: "linux", os: "macos")
+def set_nonblocking(fd: Int): Int
+  var flags = fcntl(fd, 3, 0)    # F_GETFL
+  if flags < 0
+    return -1
+  end
+  return fcntl(fd, 4, bor(flags, 4))  # F_SETFL, O_NONBLOCK
+end
+
+# Freestanding no-op (`@cfg(os: "unknown")`) — D.11 Phase 8b step 1.
+# Kernel TCP is always non-blocking (chan_count + chan_recv under
+# CHAN_LOCK is the substrate); there is no fd flag to flip. The hosted
+# Windows path keeps its existing (no-@cfg) gap — http_server.qz is a
+# POSIX-only module on Windows by construction.
+@cfg(os: "unknown")
+def set_nonblocking(fd: Int): Int = 0
+
+# =============================================================================
+# Async I/O Helpers — non-blocking recv/send + parse/write with io_suspend
+# =============================================================================
+#
+# These power `_handle_tls_connection_with_ssl` and `http_serve_supervised`
+# per-connection bodies. The non-blocking socket op suspends the calling
+# task (not the OS thread) on EAGAIN via io_suspend / io_suspend_timeout.
+
+# errno helpers (needed for EAGAIN detection in async I/O)
+@cfg(os: "macos")
+extern "C" def __error(): CPtr
+
+@cfg(os: "linux")
+extern "C" def __errno_location(): CPtr
+
+@cfg(os: "macos")
+def _http_get_errno(): Int
+  var p = __error()
+  var b0 = ptr_read_byte(p)
+  var b1 = ptr_read_byte(ptr_add(p, 1))
+  var b2 = ptr_read_byte(ptr_add(p, 2))
+  var b3 = ptr_read_byte(ptr_add(p, 3))
+  return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+end
+
+@cfg(os: "linux")
+def _http_get_errno(): Int
+  var p = __errno_location()
+  var b0 = ptr_read_byte(p)
+  var b1 = ptr_read_byte(ptr_add(p, 1))
+  var b2 = ptr_read_byte(ptr_add(p, 2))
+  var b3 = ptr_read_byte(ptr_add(p, 3))
+  return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+end
+
+@cfg(os: "macos")
+def _http_EAGAIN(): Int = 35
+@cfg(os: "linux")
+def _http_EAGAIN(): Int = 11
+
+# Freestanding (`@cfg(os: "unknown")`) stubs — D.11 Phase 8b step 1.
+# Kernel TCP exposes async_tcp_read / async_tcp_write that block via
+# chan_recv on the slot's signal channels (step 4); EAGAIN-detection
+# isn't part of the kernel path. These stubs exist so http_server.qz
+# typechecks under `--target x86_64-unknown-none-elf` even though the
+# functions are unreachable in freestanding (the per-conn loop uses
+# the kernel-bridge `_async_http_recv` body below). `_http_EAGAIN()
+# == -1` is a sentinel that won't match the `_http_get_errno() == 0`
+# fallthrough.
+@cfg(os: "unknown")
+def _http_get_errno(): Int = 0
+@cfg(os: "unknown")
+def _http_EAGAIN(): Int = -1
+
+# Async recv: non-blocking read that suspends on EAGAIN.
+# Must be called from within an async context (state machine).
+@cfg(not: os: "unknown")
+def _async_http_recv(fd: Int, buf: Int, max_bytes: Int): Int
+  while true
+    var n = socket_recv(fd, buf, max_bytes, 0)
+    if n >= 0
+      return n
+    end
+    if _http_get_errno() == _http_EAGAIN()
+      io_suspend(fd)
+    else
+      return -1
+    end
+  end
+  return -1
+end
+
+# Freestanding (`@cfg(os: "unknown")`) body — D.11 Phase 8b step 1.
+# Delegate to async_tcp_read (step 4) which blocks via chan_recv on
+# the slot's payload-rx signal channel — no errno / EAGAIN protocol
+# in kernel context. fd is the kernel conn slot ptr (fd ≡ slot ptr
+# per Phase 8a).
+@cfg(os: "unknown")
+def _async_http_recv(fd: Int, buf: Int, max_bytes: Int): Int
+  return async_tcp_read(fd, buf, max_bytes)
+end
+
+# Async send: non-blocking write that suspends on EAGAIN.
+# Writes all bytes, looping on partial sends.
+@cfg(not: os: "unknown")
+def _async_http_send(fd: Int, buf: Int, len: Int): Int
+  var total = 0
+  while total < len
+    var n = socket_send(fd, ptr_add(buf, total), len - total, 0)
+    if n >= 0
+      total = total + n
+    elsif _http_get_errno() == _http_EAGAIN()
+      io_suspend(fd)
+    else
+      return -1
+    end
+  end
+  return total
+end
+
+# Freestanding (`@cfg(os: "unknown")`) body — D.11 Phase 8b step 1.
+# Delegate to async_tcp_write (step 4) which piggybacks on the kernel's
+# tcp_try_push retransmit machinery + tx-done channel — blocks until
+# the entire buffer is ACKed by the peer. Returns `len` on success.
+@cfg(os: "unknown")
+def _async_http_send(fd: Int, buf: Int, len: Int): Int
+  return async_tcp_write(fd, buf, len)
+end
+
+# Async recv with scheduler-aware timeout via io_suspend_timeout.
+# Returns bytes read, or -2 on timeout, -1 on error.
+# Suspends the async task (not the OS thread) until data arrives or timeout expires.
+@cfg(not: os: "unknown")
+def _async_http_recv_timeout(fd: Int, buf: Int, max_bytes: Int, timeout_ms: Int): Int
+  if timeout_ms <= 0
+    return _async_http_recv(fd, buf, max_bytes)
+  end
+  var deadline = time_mono_ns() / 1000000 + timeout_ms
+  while true
+    var n = socket_recv(fd, buf, max_bytes, 0)
+    if n >= 0
+      return n
+    end
+    if _http_get_errno() == _http_EAGAIN()
+      var remaining = deadline - time_mono_ns() / 1000000
+      if remaining <= 0
+        return -2
+      end
+      io_suspend_timeout(fd, remaining, 1)
+      if time_mono_ns() / 1000000 >= deadline
+        return -2
+      end
+    else
+      return -1
+    end
+  end
+  return -1
+end
+
+# Freestanding (`@cfg(os: "unknown")`) body — D.11 Phase 8b step 1.
+# Timeout is currently ignored — kernel async_tcp_read blocks indefinitely
+# on the payload-rx channel. Filed forward: scope_with_deadline-based
+# kernel read would let the listener loop honor read_timeout_ms here.
+# For Phase 8b minimal viable, the kernel demo doesn't expose
+# configurable timeouts, so the default (30s on hosted) effectively
+# becomes "block until peer sends" in freestanding.
+@cfg(os: "unknown")
+def _async_http_recv_timeout(fd: Int, buf: Int, max_bytes: Int, timeout_ms: Int): Int
+  return async_tcp_read(fd, buf, max_bytes)
+end
+
+# Async send with scheduler-aware timeout via io_suspend_timeout.
+# Returns bytes written, or -2 on timeout, -1 on error.
+# Suspends the async task (not the OS thread) until writable or timeout expires.
+@cfg(not: os: "unknown")
+def _async_http_send_timeout(fd: Int, buf: Int, len: Int, timeout_ms: Int): Int
+  if timeout_ms <= 0
+    return _async_http_send(fd, buf, len)
+  end
+  var deadline = time_mono_ns() / 1000000 + timeout_ms
+  var total = 0
+  while total < len
+    var n = socket_send(fd, ptr_add(buf, total), len - total, 0)
+    if n >= 0
+      total = total + n
+    elsif _http_get_errno() == _http_EAGAIN()
+      var remaining = deadline - time_mono_ns() / 1000000
+      if remaining <= 0
+        return -2
+      end
+      io_suspend_timeout(fd, remaining, 4)
+      if time_mono_ns() / 1000000 >= deadline
+        return -2
+      end
+    else
+      return -1
+    end
+  end
+  return total
+end
+
+# Freestanding (`@cfg(os: "unknown")`) body — D.11 Phase 8b step 1.
+# Timeout is ignored — async_tcp_write blocks via chan_recv on
+# SLOT_TX_DONE_CHAN until all bytes are ACKed by the peer. See the
+# parallel _async_http_recv_timeout body for filed-forward context.
+@cfg(os: "unknown")
+def _async_http_send_timeout(fd: Int, buf: Int, len: Int, timeout_ms: Int): Int
+  return async_tcp_write(fd, buf, len)
+end
+
+# Async HTTP request parser with timeout.
+def _async_http_parse_request_timeout(fd: Int, timeout_ms: Int, buf_size: Int): Request
+  var alloc_size = buf_size + 1
+  var buf = malloc(alloc_size)
+  memset(buf, 0, alloc_size)
+  var n = _async_http_recv_timeout(fd, buf, buf_size, timeout_ms)
+  if n <= 0
+    mem_free(buf)
+    return empty_request()
+  end
+  var data = str_from_ptr(buf, n)
+  mem_free(buf)
+  return _parse_request_from_buffer(data)
+end
+
+# Async HTTP response writer with timeout. Supports zero-copy body
+# (body_ptr != 0) — emits headers then streams body bytes via a second
+# send so the asset/mmap region is not copied into a String first.
+def _async_http_write_response_timeout(fd: Int, resp: Response, timeout_ms: Int): Int
+  var status_line = "HTTP/1.1 " + str_from_int(resp.status) + " " + status_text(resp.status) + "\r\n"
+
+  var content_length = 0
+  if resp.body_ptr != 0
+    content_length = resp.body_len
+  else
+    content_length = str_byte_len(resp.body)
+  end
+
+  var hdrs = "Content-Type: " + resp.content_type + "\r\n"
+  hdrs = hdrs + "Content-Length: " + str_from_int(content_length) + "\r\n"
+  hdrs = hdrs + "Connection: keep-alive\r\n"
+  hdrs = hdrs + "Server: Quartz/1.0\r\n"
+  var i = 0
+  while i < resp.extra_header_keys.size
+    hdrs = hdrs + resp.extra_header_keys[i] + ": " + resp.extra_header_vals[i] + "\r\n"
+    i = i + 1
+  end
+
+  if resp.body_ptr != 0
+    var header_block = status_line + hdrs + "\r\n"
+    var hptr = str_to_ptr(header_block)
+    var hlen = str_byte_len(header_block)
+    var hr = _async_http_send_timeout(fd, hptr, hlen, timeout_ms)
+    if hr < 0
+      return hr
+    end
+    return _async_http_send_timeout(fd, resp.body_ptr, resp.body_len, timeout_ms)
+  end
+
+  var full_response = status_line + hdrs + "\r\n" + resp.body
+  var ptr = str_to_ptr(full_response)
+  var len = str_byte_len(full_response)
+  return _async_http_send_timeout(fd, ptr, len, timeout_ms)
+end
+
+# Parse an HTTP request from a pre-read buffer string.
+def _parse_request_from_buffer(data: String): Request
+  var data_len = str_byte_len(data)
+  if data_len == 0
+    return empty_request()
+  end
+
+  # Find end of request line (\r\n)
+  var rl_end = 0
+  while rl_end < data_len - 1
+    if str_byte_at(data, rl_end) == '\r' and str_byte_at(data, rl_end + 1) == '\n'
+      break
+    end
+    rl_end = rl_end + 1
+  end
+
+  var request_line = str_byte_slice(data, 0, rl_end)
+  var method = parse_method(request_line)
+  var raw_path = parse_path(request_line)
+  var path = raw_path
+  var query_string = ""
+
+  match str_byte_find(raw_path, "?")
+    Some(qmark) => {
+      path = str_byte_slice(raw_path, 0, qmark)
+      query_string = str_byte_slice(raw_path, qmark + 1, str_byte_len(raw_path))
+    }
+    None => {}
+    _ => {}
+  end
+
+  # Parse headers
+  var hkeys = vec_new<String>()
+  var hvals = vec_new<String>()
+  var content_length = 0
+  var pos = rl_end + 2
+
+  while pos < data_len - 1
+    # Check for empty line (end of headers)
+    if str_byte_at(data, pos) == '\r' and str_byte_at(data, pos + 1) == '\n'
+      pos = pos + 2
+      break
+    end
+
+    # Find end of header line
+    var line_end = pos
+    while line_end < data_len - 1
+      if str_byte_at(data, line_end) == '\r' and str_byte_at(data, line_end + 1) == '\n'
+        break
+      end
+      line_end = line_end + 1
+    end
+
+    var line = str_byte_slice(data, pos, line_end)
+    match str_byte_find(line, ": ")
+      Some(colon) => {
+        var key = str_byte_slice(line, 0, colon)
+        var value = str_byte_slice(line, colon + 2, str_byte_len(line))
+        hkeys.push(key)
+        hvals.push(value)
+        if str_eq_ignore_case(key, "Content-Length") == 1
+          content_length = value.to_i()
+        end
+      }
+      None => {}
+      _ => {}
+    end
+
+    pos = line_end + 2
+  end
+
+  # Body
+  var body = ""
+  if content_length > 0 and pos + content_length <= data_len
+    body = str_byte_slice(data, pos, pos + content_length)
+  end
+
+  var req = Request { method: method, path: path, query_string: query_string, body: body, raw_path: raw_path, header_keys: hkeys, header_vals: hvals, params: map_new(), query: map_new(), context: map_new() }
+  _parse_query_into(req)
+  return req
+end
+
+# =============================================================================
+# Router
+# =============================================================================
+
+## Route handler storage: handler is the raw Quartz function pointer
+## (closure-tagged where applicable) reinterpreted as Int. Dispatch goes
+## through `call_fn(route.handler, req)` at request time — `call_fn`
+## untags closures and reads the captured environment automatically. The
+## Int-typed field exists so the HttpRoute effect dispatch (which
+## receives the handler via the i64 argv slot) can push a Route without
+## a typed Fn-cast intrinsic; the typed `router_get`/`router_post`/etc.
+## variants convert via `fn_to_int(handler)` at the registration
+## boundary.
+struct Route
+  method: String
+  pattern: String
+  handler: Int
+end
+
+# Router is `@repr(C)` to PIN it on the reference (Boxed) path under value-default
+# structs (F4). The route table is built by SHARED MUTATION through an as_int handle:
+# `http_serve` pushes `as_int_generic(router)` onto `_http_route_router_stack`, and the
+# named-effect handler `_http_route_register_handler` recovers it via `as_type<Router>`
+# and pushes into `.routes` from outside the calling lexical scope; `http_serve` then
+# reads those routes back from the original `router` binding. Value-copy semantics would
+# copy the router on read and drop those writes. `@repr(C)` is positively known-Boxed
+# (never flips to value-layout), so the existential-handle architecture keeps working AND
+# the QZ0221 erased-boundary wall positively excludes it — exactly as `Suite`/`AstStorage`.
+@repr(C)
+struct Router
+  routes: Vec<Route>
+end
+
+def router_new(): Router
+  return Router { routes: vec_new<Route>() }
+end
+
+def router_get(r: Router, pattern: String, handler: Fn(Request): Response): Int
+  r.routes.push(Route { method: "GET", pattern: pattern, handler: fn_to_int(handler) })
+  return 0
+end
+
+def router_post(r: Router, pattern: String, handler: Fn(Request): Response): Int
+  r.routes.push(Route { method: "POST", pattern: pattern, handler: fn_to_int(handler) })
+  return 0
+end
+
+def router_put(r: Router, pattern: String, handler: Fn(Request): Response): Int
+  r.routes.push(Route { method: "PUT", pattern: pattern, handler: fn_to_int(handler) })
+  return 0
+end
+
+def router_delete(r: Router, pattern: String, handler: Fn(Request): Response): Int
+  r.routes.push(Route { method: "DELETE", pattern: pattern, handler: fn_to_int(handler) })
+  return 0
+end
+
+# =============================================================================
+# Route Groups
+# =============================================================================
+
+struct RouterGroup
+  router: Router
+  prefix: String
+end
+
+def router_group(r: Router, prefix: String): RouterGroup
+  return RouterGroup { router: r, prefix: prefix }
+end
+
+def group_get(g: RouterGroup, pattern: String, handler: Fn(Request): Response): Int
+  g.router.routes.push(Route { method: "GET", pattern: g.prefix + pattern, handler: fn_to_int(handler) })
+  return 0
+end
+
+def group_post(g: RouterGroup, pattern: String, handler: Fn(Request): Response): Int
+  g.router.routes.push(Route { method: "POST", pattern: g.prefix + pattern, handler: fn_to_int(handler) })
+  return 0
+end
+
+def group_put(g: RouterGroup, pattern: String, handler: Fn(Request): Response): Int
+  g.router.routes.push(Route { method: "PUT", pattern: g.prefix + pattern, handler: fn_to_int(handler) })
+  return 0
+end
+
+def group_delete(g: RouterGroup, pattern: String, handler: Fn(Request): Response): Int
+  g.router.routes.push(Route { method: "DELETE", pattern: g.prefix + pattern, handler: fn_to_int(handler) })
+  return 0
+end
+
+# =============================================================================
+# Route Matching
+# =============================================================================
+
+def route_matches(pattern: String, path: String): Int
+  if pattern.eq(path)
+    return 1
+  end
+
+  var pi = 0
+  var ai = 0
+  var plen = str_byte_len(pattern)
+  var alen = str_byte_len(path)
+
+  while pi < plen and ai < alen
+    var pc = str_byte_at(pattern, pi)
+    var ac = str_byte_at(path, ai)
+
+    if pc == '*'
+      # '*' — catch-all, matches rest of path
+      return 1
+    elsif pc == ':'
+      # ':' — skip param segment in pattern
+      pi += 1
+      while pi < plen and str_byte_at(pattern, pi) != '/'
+        pi += 1
+      end
+      # Skip param value in path
+      while ai < alen and str_byte_at(path, ai) != '/'
+        ai += 1
+      end
+    elsif pc == ac
+      pi += 1
+      ai += 1
+    else
+      return 0
+    end
+  end
+
+  if pi == plen and ai == alen
+    return 1
+  end
+  return 0
+end
+
+def route_param(pattern: String, path: String, name: String): String
+  var pi = 0
+  var ai = 0
+  var plen = str_byte_len(pattern)
+  var alen = str_byte_len(path)
+
+  while pi < plen and ai < alen
+    var pc = str_byte_at(pattern, pi)
+
+    if pc == '*'
+      # '*' — catch-all
+      pi += 1
+      var name_start = pi
+      while pi < plen
+        pi += 1
+      end
+      var param_name = str_byte_slice(pattern, name_start, pi)
+      if param_name.eq(name)
+        return str_byte_slice(path, ai, alen)
+      end
+      return ""
+    elsif pc == ':'
+      pi += 1
+      var name_start = pi
+      while pi < plen and str_byte_at(pattern, pi) != '/'
+        pi += 1
+      end
+      var param_name = str_byte_slice(pattern, name_start, pi)
+
+      var val_start = ai
+      while ai < alen and str_byte_at(path, ai) != '/'
+        ai += 1
+      end
+      var param_val = str_byte_slice(path, val_start, ai)
+
+      if param_name.eq(name)
+        return param_val
+      end
+    else
+      pi += 1
+      ai += 1
+    end
+  end
+  return ""
+end
+
+# =============================================================================
+# Router Handler
+# =============================================================================
+
+def router_handler(r: Router): Fn(Request): Response
+  return req: Request -> {
+    var i = 0
+    while i < r.routes.size
+      var route = r.routes[i]
+      if (route.method.eq(req.method) or route.method.eq("*")) and route_matches(route.pattern, req.path) == 1
+        _extract_params(route.pattern, req.path, req.params)
+        return call_fn(route.handler, req)
+      end
+      i += 1
+    end
+    not_found()
+  }
+end
+
+# =============================================================================
+# Block-DSL — Phase 6.1.d
+# =============================================================================
+#
+# `http_serve(port) do ... end` opens a `with HttpRoute { register: ... }`
+# install around the body, capturing every `get`/`post`/`put`/`delete`/
+# `patch` call into a fresh `Router`, then forwards to
+# `http_serve_supervised(http_server_config(port), router_handler(router))`.
+# The active router
+# is threaded via a module-level Int stack so the named effect handler
+# (`_http_route_register_handler`, runtime ABI `(op, argc, argv) → Int`)
+# can recover it from outside the calling lexical scope. The stack
+# allows nested `http_serve` calls to compose without trampling each
+# other, even though concurrent in-process http_serve invocations are
+# not the design's primary use case.
+
+var _http_route_router_stack: Vec<Int> = vec_new<Int>()
+
+def _http_route_register_handler(op_name: Int, argc: Int, argv: Int): Int
+  if _http_route_router_stack.size == 0
+    return 0
+  end
+  var router_int = _http_route_router_stack[_http_route_router_stack.size - 1]
+  var r = as_type<Router>(router_int)
+  var method = as_string(load(argv, 0))
+  var pattern = as_string(load(argv, 1))
+  var handler_int = load(argv, 2)
+  r.routes.push(Route { method: method, pattern: pattern, handler: handler_int })
+  return 0
+end
+
+## Block-DSL entry point. `body` collects route registrations via the
+## verb performers (`route_get`/`route_post`/`route_put`/`route_delete`/
+## `route_patch`) before the supervised server starts. Test code can
+## install a custom `HttpRoute` handler around the call to intercept
+## registrations without binding a port:
+##
+##   def captured_register(op: Int, argc: Int, argv: Int): Int
+##     # ... record (method, pattern, handler) for later assertion ...
+##     return 0
+##   end
+##
+##   with HttpRoute { register: captured_register } do ->
+##     http_serve(8080, my_routes)
+##   end
+##
+## The outer install fires INSTEAD of the framework's default capture —
+## the routes never reach the internal Router and the supervised server
+## never starts. This is the "describe routes without binding a port"
+## pattern (useful for routing tables, OpenAPI generators, etc.).
+def http_serve(port: Int, body: Fn(): Void can HttpRoute): Int
+  var router = router_new()
+  _http_route_router_stack.push(as_int_generic(router))
+  with HttpRoute { register: _http_route_register_handler } do ->
+    body()
+  end
+  _http_route_router_stack.pop()
+  return http_serve_supervised(http_server_config(port), router_handler(router))
+end
+
+## Register a GET route. Performs `HttpRoute.register("GET", pattern,
+## fn_to_int(handler))` — under the framework's default install, the
+## route lands in the active server's Router; under a user install,
+## the user handler decides what to do.
+##
+## The verbs are named `route_<method>` rather than the bare Sinatra-
+## shape `get`/`post`/etc. because Quartz's open-UFCS rule registers
+## every impl method as a free-callable function (`JsonValue.get` →
+## `get/2`); the resolver's name+arity dedup then drops whichever was
+## registered second, silently. `route_<method>` is unambiguous and
+## doesn't collide with stdlib method names. Filed as Phase 6.1.f
+## follow-up: typed Routes parameter (`http_serve(8080) do routes ->
+## routes.get("/", h) end`) would free up the bare names via UFCS-on-
+## receiver — but that's compiler-side work on resolver disambiguation.
+def route_get(pattern: String, handler: Fn(Request): Response): Int can HttpRoute
+  return register("GET", pattern, fn_to_int(handler))
+end
+
+def route_post(pattern: String, handler: Fn(Request): Response): Int can HttpRoute
+  return register("POST", pattern, fn_to_int(handler))
+end
+
+def route_put(pattern: String, handler: Fn(Request): Response): Int can HttpRoute
+  return register("PUT", pattern, fn_to_int(handler))
+end
+
+def route_delete(pattern: String, handler: Fn(Request): Response): Int can HttpRoute
+  return register("DELETE", pattern, fn_to_int(handler))
+end
+
+def route_patch(pattern: String, handler: Fn(Request): Response): Int can HttpRoute
+  return register("PATCH", pattern, fn_to_int(handler))
+end
+
+# =============================================================================
+# Built-in Middleware
+# =============================================================================
+
+## Request/response access-log middleware.
+## Routes through the `Log` effect (Phase 6.1.a): tests install
+## `with Log { emit: capture } do -> http_serve(...) end` to capture
+## every access-log line without touching stderr. The runtime default
+## handler writes to stderr.
+def with_logging(handler: Fn(Request): Response): Fn(Request): Response
+  return req: Request -> {
+    log::raw(">> " + req.method + " " + req.path)
+    var resp = handler(req)
+    log::raw("<< " + str_from_int(resp.status))
+    resp
+  }
+end
+
+## CORS configuration. Each field maps directly to one
+## `Access-Control-Allow-*` response header; `max_age` of 0 omits
+## `Access-Control-Max-Age` entirely (browsers fall back to their own
+## default, typically 5 seconds). Construct via `cors_default()` for the
+## permissive baseline, then field-update for tightening:
+##
+##     var cfg = cors_default()
+##     cfg.origin = "https://app.example.com"
+##     cfg.headers = "Content-Type, Authorization, X-Request-Id"
+##     cfg.max_age = 600
+##     http_serve_supervised(http_server_config(8080),
+##                           with_cors(cfg, my_handler))
+##
+## Phase 6.1.f filing.
+struct CorsConfig
+  origin: String      # Access-Control-Allow-Origin
+  methods: String     # Access-Control-Allow-Methods (preflight only)
+  headers: String     # Access-Control-Allow-Headers (preflight only)
+  max_age: Int        # Access-Control-Max-Age in seconds (0 = omit)
+end
+
+## Permissive defaults: `*` origin, the five common HTTP verbs,
+## `Content-Type` + `Authorization` headers, no `Max-Age`. Mirrors
+## what the pre-6.1.f hardcoded `with_cors` shipped.
+def cors_default(): CorsConfig
+  return CorsConfig {
+    origin: "*",
+    methods: "GET, POST, PUT, DELETE, OPTIONS",
+    headers: "Content-Type, Authorization",
+    max_age: 0
+  }
+end
+
+## CORS middleware (Access-Control-Allow-* header injection).
+## Pure synchronous wrap — no effect surface needed for
+## test-mockability since there is no I/O to intercept. Apply
+## per-handler via `with_cors(cfg, handler)` or globally via
+## `http_serve_supervised(http_server_config(8080), with_cors(cfg, router_handler(r)))`.
+##
+## OPTIONS requests get a 204 preflight with the configured method
+## and header lists; non-OPTIONS requests pass through to `handler`
+## with `Access-Control-Allow-Origin` injected on the response.
+def with_cors(cfg: CorsConfig, handler: Fn(Request): Response): Fn(Request): Response
+  return req: Request -> {
+    if req.method.eq("OPTIONS")
+      var preflight = Response { status: 204, body: "", content_type: "", extra_header_keys: vec_new<String>(), extra_header_vals: vec_new<String>(), body_ptr: 0, body_len: 0 }
+      preflight = response_header(preflight, "Access-Control-Allow-Origin", cfg.origin)
+      preflight = response_header(preflight, "Access-Control-Allow-Methods", cfg.methods)
+      preflight = response_header(preflight, "Access-Control-Allow-Headers", cfg.headers)
+      if cfg.max_age > 0
+        preflight = response_header(preflight, "Access-Control-Max-Age", str_from_int(cfg.max_age))
+      end
+      return preflight
+    end
+    var resp = handler(req)
+    response_header(resp, "Access-Control-Allow-Origin", cfg.origin)
+  }
+end
+
+# =============================================================================
+# Static File Middleware
+# =============================================================================
+
+## Detect MIME type from file extension.
+def _mime_type(filename: String): String
+  if str_ends_with(filename, ".html")
+    return "text/html"
+  end
+  if str_ends_with(filename, ".css")
+    return "text/css"
+  end
+  if str_ends_with(filename, ".js")
+    return "application/javascript"
+  end
+  if str_ends_with(filename, ".json")
+    return "application/json"
+  end
+  if str_ends_with(filename, ".png")
+    return "image/png"
+  end
+  if str_ends_with(filename, ".jpg") or str_ends_with(filename, ".jpeg")
+    return "image/jpeg"
+  end
+  if str_ends_with(filename, ".gif")
+    return "image/gif"
+  end
+  if str_ends_with(filename, ".svg")
+    return "image/svg+xml"
+  end
+  if str_ends_with(filename, ".ico")
+    return "image/x-icon"
+  end
+  if str_ends_with(filename, ".woff")
+    return "font/woff"
+  end
+  if str_ends_with(filename, ".woff2")
+    return "font/woff2"
+  end
+  if str_ends_with(filename, ".txt")
+    return "text/plain"
+  end
+  if str_ends_with(filename, ".xml")
+    return "application/xml"
+  end
+  if str_ends_with(filename, ".pdf")
+    return "application/pdf"
+  end
+  if str_ends_with(filename, ".md")
+    return "text/html"
+  end
+  return "application/octet-stream"
+end
+
+## Check if a path contains ".." traversal (raw or percent-encoded).
+def _has_path_traversal(path: String): Bool
+  if str_contains(path, "..")
+    return true
+  end
+  if str_contains(path, "%2e%2e") or str_contains(path, "%2E%2E") or str_contains(path, "%2e%2E") or str_contains(path, "%2E%2e")
+    return true
+  end
+  return false
+end
+
+## Static file serving middleware with automatic Markdown rendering.
+## Serves files from `dir` when request path starts with `url_prefix`.
+## Markdown files (.md) are auto-rendered as styled HTML pages.
+## Falls through to the next handler if no matching file is found.
+##
+## Filesystem access routes through the `FileIo` effect (Phase 6.1.e):
+## tests install `with FileIo { fio_read: fixture, fio_exists: predicate }
+## do -> http_serve(...) end` to serve in-memory fixtures with no real
+## filesystem. The runtime default handler forwards to libc, so
+## production behavior is unchanged.
+##
+## D.11 Phase 8b.2.b — `@cfg(not: os: "unknown")` excludes the entire
+## static-file-serving stack from the freestanding kernel build. The
+## kernel has no filesystem (no `path_join`/`read_file`/etc.), and any
+## kernel route would handle static assets via the in-tree
+## `site_assets.qz`-style baked-in constants rather than going through
+## `with_static`. Pulling these definitions into freestanding would
+## reference `@qz_path_join` (hosted-only runtime helper) and the
+## libc-backed FileIo intrinsics; @cfg-gating the whole block keeps
+## those references out of the IR cleanly.
+##
+## Usage: http_serve_supervised(http_server_config(8080), handler | with_static("/", "./public"))
+@cfg(not: os: "unknown")
+def with_static(url_prefix: String, dir: String): Fn(Fn(Request): Response): Fn(Request): Response
+  return _static_middleware(url_prefix, dir)
+end
+
+@cfg(not: os: "unknown")
+def _static_middleware(url_prefix: String, dir: String): Fn(Fn(Request): Response): Fn(Request): Response
+  return handler -> _static_make_handler(url_prefix, dir, handler)
+end
+
+@cfg(not: os: "unknown")
+def _static_make_handler(url_prefix: String, dir: String, handler: Fn(Request): Response): Fn(Request): Response
+  return req: Request -> {
+    _static_handle_request(url_prefix, dir, handler, req)
+  }
+end
+
+@cfg(not: os: "unknown")
+def _static_handle_request(url_prefix: String, dir: String, handler: Fn(Request): Response, req: Request): Response
+  if str_starts_with(req.path, url_prefix) == false
+    return handler(req)
+  end
+  var suffix = str_byte_slice(req.path, str_byte_len(url_prefix), str_byte_len(req.path))
+  if _has_path_traversal(suffix)
+    return forbidden()
+  end
+  var decoded = url_decode(suffix)
+  if _has_path_traversal(decoded)
+    return forbidden()
+  end
+  # Filesystem access routes through the FileIo effect (Phase 5.4 / 6.1.e):
+  # the runtime default handler forwards to the libc-backed intrinsics,
+  # so production behavior is unchanged. Tests install
+  # `with FileIo { fio_read: fixture, fio_exists: predicate } do ->
+  #     http_serve(...) end` to serve in-memory fixtures with no real FS.
+  var file_path = path_join(dir, decoded)
+  if str_byte_len(decoded) == 0 or str_ends_with(decoded, "/")
+    # Directory index: try index.html then index.md
+    var idx_html = path_join(file_path, "index.html")
+    if fio_exists(idx_html)
+      file_path = idx_html
+    else
+      var idx_md = path_join(file_path, "index.md")
+      if fio_exists(idx_md)
+        file_path = idx_md
+      else
+        return handler(req)
+      end
+    end
+  end
+  if fio_exists(file_path) == false
+    return handler(req)
+  end
+  var content = fio_read(file_path)
+  if str_ends_with(file_path, ".md")
+    var title = decoded
+    if str_byte_len(title) == 0
+      title = "Index"
+    end
+    var page = md_to_html_page(content, title)
+    return html_response(page)
+  end
+  return Response { status: 200, body: content, content_type: _mime_type(file_path), extra_header_keys: vec_new<String>(), extra_header_vals: vec_new<String>(), body_ptr: 0, body_len: 0 }
+end
+
+# =============================================================================
+# Shutdown coordination — http_server_shutdown + _http_shutdown_flag
+# =============================================================================
+
+## Global shutdown flag — set via http_server_shutdown() to trigger graceful shutdown.
+var _http_shutdown_flag = atomic_new(0)
+
+## Request graceful shutdown of the HTTP server.
+## Can be called from any thread (uses atomic store).
+def http_server_shutdown(): Void
+  atomic_store(_http_shutdown_flag, 1)
+end
+
+## HTTP server configuration with production defaults.
+struct HttpServerConfig
+  port: Int
+  max_connections: Int
+  keepalive_max_requests: Int
+  keepalive_timeout_ms: Int
+  read_timeout_ms: Int
+  write_timeout_ms: Int
+  shutdown_timeout_ms: Int
+  max_body_size: Int     # Max request body size in bytes (0 = no limit, default 1MB)
+  read_buffer_limit: Int # Per-request read buffer size in bytes (default 65536 = 64KB)
+  handler_priority: Int  # Priority for connection handlers (0=CRITICAL, 1=HIGH, 2=NORMAL, 3=LOW)
+end
+
+## Create a server config with sensible production defaults.
+def http_server_config(port: Int): HttpServerConfig
+  return HttpServerConfig {
+    port: port,
+    max_connections: 0,
+    keepalive_max_requests: 1000,
+    keepalive_timeout_ms: 30000,
+    read_timeout_ms: 30000,
+    write_timeout_ms: 30000,
+    shutdown_timeout_ms: 5000,
+    max_body_size: 1048576,
+    read_buffer_limit: 65536,
+    handler_priority: 1
+  }
+end
+
+## Normalize the configured total shutdown deadline. Positive values are a
+## bounded graceful-drain budget in milliseconds. Zero means skip graceful
+## waiting and proceed directly to forced scheduler containment. Negative values
+## are normalized to zero so malformed config cannot become an unbounded wait.
+def _http_shutdown_timeout_ms(timeout_ms: Int): Int
+  if timeout_ms <= 0
+    return 0
+  end
+  return timeout_ms
+end
+
+## Capture a monotonic absolute deadline without overflowing Int.
+def _http_shutdown_deadline_ms(timeout_ms: Int): Int
+  var now_ms = time_mono_ns() / 1000000
+  var budget_ms = _http_shutdown_timeout_ms(timeout_ms)
+  var max_int = 9223372036854775807
+  if budget_ms > max_int - now_ms
+    return max_int
+  end
+  return now_ms + budget_ms
+end
+
+## Return the non-negative budget remaining before an absolute deadline.
+def _http_shutdown_remaining_ms(deadline_ms: Int): Int
+  var now_ms = time_mono_ns() / 1000000
+  if deadline_ms <= now_ms
+    return 0
+  end
+  return deadline_ms - now_ms
+end
+
+## Scheduler capacity includes two permanent server tasks: the listener/control
+## task and the supervisor watcher. The connection-level alive gate still limits
+## children to max_connections. Saturate instead of overflowing at Int max.
+def _http_scheduler_task_cap(max_connections: Int): Int
+  if max_connections <= 0
+    return 0
+  end
+  var max_int = 9223372036854775807
+  if max_connections > max_int - 2
+    return max_int
+  end
+  return max_connections + 2
+end
+
+# =============================================================================
+# HTTP Hardening — HEAD/OPTIONS, Chunked Encoding, Access Logging (P25)
+# =============================================================================
+
+## Auto-handle HEAD: strip body from response, keep Content-Length.
+def _http_handle_head(resp: Response): Response
+  return Response {
+    status: resp.status,
+    body: "",
+    content_type: resp.content_type,
+    extra_header_keys: resp.extra_header_keys,
+    extra_header_vals: resp.extra_header_vals,
+    body_ptr: 0,
+    body_len: 0
+  }
+end
+
+## Auto-handle OPTIONS: return 204 with Allow header listing all methods.
+def _http_handle_options(): Response
+  var resp = Response {
+    status: 204,
+    body: "",
+    content_type: "text/plain",
+    extra_header_keys: vec_new<String>(),
+    extra_header_vals: vec_new<String>(),
+    body_ptr: 0,
+    body_len: 0
+  }
+  resp.extra_header_keys.push("Allow")
+  resp.extra_header_vals.push("GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS")
+  return resp
+end
+
+## Decode chunked transfer encoding body.
+## Input: raw chunked body (e.g. "5\r\nhello\r\n0\r\n\r\n")
+## Returns: decoded body string
+def _http_decode_chunked(data: String): String
+  var result = ""
+  var pos = 0
+  var data_len = str_byte_len(data)
+  while pos < data_len
+    # Read chunk size (hex digits until \r\n)
+    var size_end = pos
+    while size_end < data_len - 1
+      if str_byte_at(data, size_end) == '\r' and str_byte_at(data, size_end + 1) == '\n'
+        break
+      end
+      size_end = size_end + 1
+    end
+    var size_str = str_byte_slice(data, pos, size_end)
+    var chunk_size = _hex_to_int(size_str)
+    if chunk_size == 0
+      break
+    end
+    pos = size_end + 2
+    if pos + chunk_size <= data_len
+      result = result + str_byte_slice(data, pos, pos + chunk_size)
+    end
+    pos = pos + chunk_size + 2
+  end
+  return result
+end
+
+## Parse hex string to integer (for chunked encoding).
+def _hex_to_int(s: String): Int
+  var result = 0
+  var i = 0
+  var len = str_byte_len(s)
+  while i < len
+    var c = str_byte_at(s, i)
+    result = result * 16
+    if c >= '0' and c <= '9'
+      result = result + c - '0'
+    elsif c >= 'A' and c <= 'F'
+      result = result + c - 55
+    elsif c >= 'a' and c <= 'f'
+      result = result + c - 87
+    end
+    i = i + 1
+  end
+  return result
+end
+
+## Get a header value by key (case-insensitive).
+def _http_get_header(req: Request, key: String): String
+  var keys = req.header_keys
+  var vals = req.header_vals
+  for i in 0..keys.size
+    if str_eq_ignore_case(keys[i], key) == 1
+      return vals[i]
+    end
+  end
+  return ""
+end
+
+## Log an HTTP request in Apache combined format.
+## Format: [timestamp] "METHOD /path HTTP/1.1" status body_length
+def _http_access_log(req: Request, resp: Response): Void
+  var ts = time_mono_ns() / 1000000
+  var body_size = 0
+  if resp.body_ptr != 0
+    body_size = resp.body_len
+  else
+    body_size = str_byte_len(resp.body)
+  end
+  log::raw("[#{ts.to_s()}] \"#{req.method} #{req.path} HTTP/1.1\" #{resp.status.to_s()} #{body_size.to_s()}")
+end
+
+## Process a request through the handler with HEAD/OPTIONS auto-handling,
+## chunked encoding decoding, and optional access logging.
+def _http_process_request(req: Request, handler: Fn(Request): Response, log_access: Bool): Response
+  # Auto-handle OPTIONS
+  if req.method == "OPTIONS"
+    var resp = _http_handle_options()
+    if log_access
+      _http_access_log(req, resp)
+    end
+    return resp
+  end
+
+  # Decode chunked body if present
+  var te = _http_get_header(req, "Transfer-Encoding")
+  if te == "chunked"
+    var decoded_body = _http_decode_chunked(req.body)
+    req = Request {
+      method: req.method,
+      path: req.path,
+      query_string: req.query_string,
+      body: decoded_body,
+      raw_path: req.raw_path,
+      header_keys: req.header_keys,
+      header_vals: req.header_vals,
+      params: req.params,
+      query: req.query,
+      context: req.context
+    }
+  end
+
+  # Call handler
+  var resp = _invoke_handler_safely(handler, req)
+
+  # Auto-handle HEAD (strip body after handler runs so Content-Length is correct)
+  if req.method == "HEAD"
+    resp = _http_handle_head(resp)
+  end
+
+  if log_access
+    _http_access_log(req, resp)
+  end
+  return resp
+end
+
+## Check if a request wants connection close.
+def _http_should_close(req: Request): Bool
+  var keys = req.header_keys
+  var vals = req.header_vals
+  for i in 0..keys.size
+    var key = keys[i]
+    if key == "Connection" or key == "connection"
+      var val = vals[i]
+      if val == "close"
+        return true
+      end
+    end
+  end
+  return false
+end
+
+# Send HTTP 503 Service Unavailable on a blocking socket and return.
+# Called before set_nonblocking so write completes synchronously.
+def _http_send_503(fd: Int): Void
+  var response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 23\r\nConnection: close\r\n\r\n503 Service Unavailable"
+  var _n = tcp_write_str(fd, response)
+end
+
+# =============================================================================
+# HTTPS Substrate — TLS config + helpers (https_serve_supervised dispatcher)
+# =============================================================================
+
+## TLS configuration for the HTTPS server.
+struct HttpsTlsConfig
+  cert_file: String
+  key_file: String
+end
+
+# Non-blocking TLS accept: SSL_accept with io_suspend loop.
+# Mirrors tls_accept_async from std/net/tls.qz but uses inline FFI.
+def _async_tls_accept(ssl_ctx: Int, client_fd: Int): Int
+  var ssl = SSL_new(int_to_cptr(ssl_ctx))
+  if ptr_is_null(ssl)
+    return 0
+  end
+  SSL_set_fd(ssl, client_fd)
+  while true
+    ERR_clear_error()
+    var ret = SSL_accept(ssl)
+    if ret == 1
+      return cptr_to_int(ssl)
+    end
+    var err = SSL_get_error(ssl, ret)
+    if err == SSL_ERROR_WANT_READ() or err == SSL_ERROR_WANT_WRITE()
+      io_suspend(client_fd)
+    else
+      SSL_free(ssl)
+      return 0
+    end
+  end
+  return 0
+end
+
+# Non-blocking TLS recv without timeout.
+def _async_tls_recv(ssl_ptr: Int, fd: Int, buf: Int, max_bytes: Int): Int
+  var ssl = int_to_cptr(ssl_ptr)
+  while true
+    ERR_clear_error()
+    var n = SSL_read(ssl, buf, max_bytes)
+    if n > 2147483647
+      n = n - 4294967296
+    end
+    if n > 0
+      return n
+    end
+    if n == 0
+      return 0
+    end
+    var err = SSL_get_error(ssl, n)
+    if err == SSL_ERROR_WANT_READ() or err == SSL_ERROR_WANT_WRITE()
+      if SSL_pending(ssl) == 0
+        io_suspend(fd)
+      end
+    else
+      return -1
+    end
+  end
+  return -1
+end
+
+# Non-blocking TLS recv with timeout.
+# Returns bytes read, or -2 on timeout, -1 on error, 0 on close.
+def _async_tls_recv_timeout(ssl_ptr: Int, fd: Int, buf: Int, max_bytes: Int, timeout_ms: Int): Int
+  if timeout_ms <= 0
+    return _async_tls_recv(ssl_ptr, fd, buf, max_bytes)
+  end
+  var ssl = int_to_cptr(ssl_ptr)
+  var deadline = time_mono_ns() / 1000000 + timeout_ms
+  while true
+    ERR_clear_error()
+    var n = SSL_read(ssl, buf, max_bytes)
+    if n > 2147483647
+      n = n - 4294967296
+    end
+    if n > 0
+      return n
+    end
+    if n == 0
+      return 0
+    end
+    var err = SSL_get_error(ssl, n)
+    if err == SSL_ERROR_WANT_READ() or err == SSL_ERROR_WANT_WRITE()
+      if SSL_pending(ssl) == 0
+        var remaining = deadline - time_mono_ns() / 1000000
+        if remaining <= 0
+          return -2
+        end
+        io_suspend_timeout(fd, remaining, 1)
+        if time_mono_ns() / 1000000 >= deadline
+          return -2
+        end
+      end
+    else
+      return -1
+    end
+  end
+  return -1
+end
+
+# Non-blocking TLS send-all without timeout.
+def _async_tls_send(ssl_ptr: Int, fd: Int, buf: Int, len: Int): Int
+  var ssl = int_to_cptr(ssl_ptr)
+  var total = 0
+  while total < len
+    ERR_clear_error()
+    var n = SSL_write(ssl, ptr_add(buf, total), len - total)
+    if n > 2147483647
+      n = n - 4294967296
+    end
+    if n > 0
+      total = total + n
+    else
+      var err = SSL_get_error(ssl, n)
+      if err == SSL_ERROR_WANT_READ() or err == SSL_ERROR_WANT_WRITE()
+        io_suspend(fd)
+      else
+        return -1
+      end
+    end
+  end
+  return total
+end
+
+# Non-blocking TLS send-all with timeout.
+# Returns total bytes written, or -2 on timeout, -1 on error.
+def _async_tls_send_timeout(ssl_ptr: Int, fd: Int, buf: Int, len: Int, timeout_ms: Int): Int
+  if timeout_ms <= 0
+    return _async_tls_send(ssl_ptr, fd, buf, len)
+  end
+  var ssl = int_to_cptr(ssl_ptr)
+  var deadline = time_mono_ns() / 1000000 + timeout_ms
+  var total = 0
+  while total < len
+    ERR_clear_error()
+    var n = SSL_write(ssl, ptr_add(buf, total), len - total)
+    if n > 2147483647
+      n = n - 4294967296
+    end
+    if n > 0
+      total = total + n
+    else
+      var err = SSL_get_error(ssl, n)
+      if err == SSL_ERROR_WANT_READ() or err == SSL_ERROR_WANT_WRITE()
+        var remaining = deadline - time_mono_ns() / 1000000
+        if remaining <= 0
+          return -2
+        end
+        io_suspend_timeout(fd, remaining, 4)
+        if time_mono_ns() / 1000000 >= deadline
+          return -2
+        end
+      else
+        return -1
+      end
+    end
+  end
+  return total
+end
+
+# Async TLS HTTP request parser with timeout.
+def _async_tls_parse_request_timeout(ssl_ptr: Int, fd: Int, timeout_ms: Int, buf_size: Int): Request
+  var alloc_size = buf_size + 1
+  var buf = malloc(alloc_size)
+  memset(buf, 0, alloc_size)
+  var n = _async_tls_recv_timeout(ssl_ptr, fd, buf, buf_size, timeout_ms)
+  if n <= 0
+    mem_free(buf)
+    return empty_request()
+  end
+  var data = str_from_ptr(buf, n)
+  mem_free(buf)
+  return _parse_request_from_buffer(data)
+end
+
+# Async TLS HTTP response writer with timeout. Supports zero-copy body.
+def _async_tls_write_response_timeout(ssl_ptr: Int, fd: Int, resp: Response, timeout_ms: Int): Int
+  var status_line = "HTTP/1.1 " + str_from_int(resp.status) + " " + status_text(resp.status) + "\r\n"
+
+  var content_length = 0
+  if resp.body_ptr != 0
+    content_length = resp.body_len
+  else
+    content_length = str_byte_len(resp.body)
+  end
+
+  var hdrs = "Content-Type: " + resp.content_type + "\r\n"
+  hdrs = hdrs + "Content-Length: " + str_from_int(content_length) + "\r\n"
+  hdrs = hdrs + "Connection: keep-alive\r\n"
+  hdrs = hdrs + "Server: Quartz/1.0\r\n"
+  var i = 0
+  while i < resp.extra_header_keys.size
+    hdrs = hdrs + resp.extra_header_keys[i] + ": " + resp.extra_header_vals[i] + "\r\n"
+    i = i + 1
+  end
+
+  if resp.body_ptr != 0
+    var header_block = status_line + hdrs + "\r\n"
+    var hptr = str_to_ptr(header_block)
+    var hlen = str_byte_len(header_block)
+    var hr = _async_tls_send_timeout(ssl_ptr, fd, hptr, hlen, timeout_ms)
+    if hr < 0
+      return hr
+    end
+    return _async_tls_send_timeout(ssl_ptr, fd, resp.body_ptr, resp.body_len, timeout_ms)
+  end
+
+  var full_response = status_line + hdrs + "\r\n" + resp.body
+  var ptr = str_to_ptr(full_response)
+  var len = str_byte_len(full_response)
+  return _async_tls_send_timeout(ssl_ptr, fd, ptr, len, timeout_ms)
+end
+
+# Non-blocking TLS shutdown.
+def _async_tls_shutdown(ssl_ptr: Int, fd: Int): Void
+  var ssl = int_to_cptr(ssl_ptr)
+  var attempts = 0
+  while attempts < 2
+    ERR_clear_error()
+    var ret = SSL_shutdown(ssl)
+    if ret > 2147483647
+      ret = ret - 4294967296
+    end
+    if ret == 1
+      break
+    end
+    if ret == 0
+      attempts = attempts + 1
+      continue
+    end
+    var err = SSL_get_error(ssl, ret)
+    if err == SSL_ERROR_WANT_READ() or err == SSL_ERROR_WANT_WRITE()
+      io_suspend(fd)
+      attempts = attempts + 1
+    else
+      break
+    end
+  end
+end
+
+# (_handle_tls_connection_keepalive deleted in D.11 Phase 4 — orphaned
+# since the original TLS keepalive body switched to
+# `_tls_accept_and_dispatch` for ALPN+h2 dispatch; the supervised path
+# now consumes the same dispatcher via `_https_supervised_per_conn_loop`.)
+
+## Handle a TLS connection with an already-established SSL session.
+## Used when TLS accept + ALPN check happen before dispatching to h1.1.
+def _handle_tls_connection_with_ssl(fd: Int, ssl_ptr: Int, handler: Fn(Request): Response, config: HttpServerConfig): Int
+  var requests = 0
+  while requests < config.keepalive_max_requests
+    if atomic_load(_http_shutdown_flag) == 1
+      break
+    end
+    var req = _async_tls_parse_request_timeout(ssl_ptr, fd, config.read_timeout_ms, config.read_buffer_limit)
+    if str_byte_len(req.method) == 0
+      break
+    end
+    requests = requests + 1
+    if config.max_body_size > 0 and str_byte_len(req.body) > config.max_body_size
+      var resp = payload_too_large()
+      _async_tls_write_response_timeout(ssl_ptr, fd, resp, config.write_timeout_ms)
+      break
+    end
+    var resp = _http_process_request(req, handler, false)
+    var should_close = _http_should_close(req)
+    var write_result = _async_tls_write_response_timeout(ssl_ptr, fd, resp, config.write_timeout_ms)
+    if write_result < 0
+      break
+    end
+    if should_close
+      break
+    end
+  end
+  _async_tls_shutdown(ssl_ptr, fd)
+  SSL_free(int_to_cptr(ssl_ptr))
+  var _ignore_close = _http_close_fd(fd)
+  return 0
+end
+
+# =============================================================================
+# ALPN Setup for HTTP/2 (P30)
+# =============================================================================
+
+# Wire-format ALPN protocol list: \x02h2\x08http/1.1
+var _alpn_protos_buf = 0
+
+def _alpn_init_protos(): Int
+  if _alpn_protos_buf != 0
+    return _alpn_protos_buf
+  end
+  var buf = malloc(12)
+  ptr_write_byte(buf, 2)                   # length of "h2"
+  ptr_write_byte(ptr_add(buf, 1), 104)     # h
+  ptr_write_byte(ptr_add(buf, 2), 50)      # 2
+  ptr_write_byte(ptr_add(buf, 3), 8)       # length of "http/1.1"
+  ptr_write_byte(ptr_add(buf, 4), 104)     # h
+  ptr_write_byte(ptr_add(buf, 5), 116)     # t
+  ptr_write_byte(ptr_add(buf, 6), 116)     # t
+  ptr_write_byte(ptr_add(buf, 7), 112)     # p
+  ptr_write_byte(ptr_add(buf, 8), 47)      # /
+  ptr_write_byte(ptr_add(buf, 9), 49)      # 1
+  ptr_write_byte(ptr_add(buf, 10), 46)     # .
+  ptr_write_byte(ptr_add(buf, 11), 49)     # 1
+  _alpn_protos_buf = buf
+  return buf
+end
+
+## ALPN callback for HTTP/2 negotiation. The callback function is emitted as
+## LLVM IR in codegen_runtime.qz (__qz_alpn_select_cb). This extern returns
+## its function pointer so we can pass it to SSL_CTX_set_alpn_select_cb.
+extern "C" def __qz_alpn_cb_ptr(): Int
+
+## Enable H2 ALPN on an SSL_CTX. Registers the server-side ALPN callback
+## that advertises "h2" and "http/1.1" to clients during TLS handshake.
+def _tls_enable_h2(ssl_ctx: CPtr): Void
+  var cb_ptr = __qz_alpn_cb_ptr()
+  SSL_CTX_set_alpn_select_cb(ssl_ctx, int_to_cptr(cb_ptr), int_to_cptr(0))
+end
+
+## Get negotiated ALPN protocol after TLS handshake. Returns "h2", "http/1.1", or "".
+def _tls_get_alpn(ssl_ptr: Int): String
+  var data_out = malloc(8)
+  var len_out = malloc(8)
+  store(data_out, 0, 0)
+  store(len_out, 0, 0)
+  SSL_get0_alpn_selected(int_to_cptr(ssl_ptr), data_out, len_out)
+  var data = load(data_out, 0)
+  var len = band(load(len_out, 0), 0xFFFFFFFF)
+  mem_free(data_out)
+  mem_free(len_out)
+  if len == 0
+    return ""
+  end
+  var result = ""
+  var i = 0
+  while i < len
+    result = result + str_from_codepoint(ptr_read_byte(ptr_add(data, i)))
+    i = i + 1
+  end
+  return result
+end
+
+# =============================================================================
+# HTTP/2 Stream Handler + Connection Entry Point (P30)
+# (Lives here because it needs Request/Response types)
+# =============================================================================
+
+## Handles a single HTTP/2 stream: builds Request from decoded headers,
+## Inline stream handler — writes response directly to TLS, bypassing write_ch.
+## Build Request + call handler + return Response — isolated from async $poll context.
+## Struct literals in $poll lose field values; this function runs on a fresh stack frame.
+def _h2_call_handler(method: String, clean_path: String, query_string: String, body_str: String, raw_path: String, req_keys: Vec<String>, req_vals: Vec<String>, handler: Fn(Request): Response): Response
+  var req = Request {
+    method: method,
+    path: clean_path,
+    query_string: query_string,
+    body: body_str,
+    raw_path: raw_path,
+    header_keys: req_keys,
+    header_vals: req_vals,
+    params: map_new(),
+    query: map_new(),
+    context: map_new()
+  }
+  return _invoke_handler_safely(handler, req)
+end
+
+## Process decoded headers + call user handler. No I/O → won't become async $poll.
+## Returns serialized response as two Bytes: [0]=HEADERS frame, [1]=DATA frame (or empty).
+def _h2_process_request(stream_id: Int, decoded: Vec<HpackHeader>, handler: Fn(Request): Response): Vec<Bytes>
+  var method = ""
+  var path = ""
+  var authority = ""
+  var req_keys = vec_new<String>()
+  var req_vals = vec_new<String>()
+  var i = 0
+  while i < decoded.size
+    var h = decoded[i]
+    if h.name == ":method"
+      method = h.value
+    elsif h.name == ":path"
+      path = h.value
+    elsif h.name == ":authority"
+      authority = h.value
+    elsif h.name == ":scheme"
+      i = i + 1
+      continue
+    else
+      req_keys.push(h.name)
+      req_vals.push(h.value)
+    end
+    i = i + 1
+  end
+  if str_byte_len(authority) > 0
+    req_keys.push("host")
+    req_vals.push(authority)
+  end
+  # Call handler IMMEDIATELY — intermediate code clobbers local vars on x86_64
+  var resp = _h2_call_handler(method, path, "", "", path, req_keys, req_vals, handler)
+  var resp_status = resp.status
+  var resp_body = resp.body
+  var resp_body_ptr = resp.body_ptr
+  var resp_body_len = resp.body_len
+  var resp_ct = resp.content_type
+
+  # Encode response headers via HPACK. Content-Length derives from
+  # body_len for raw-bytes responses, str_byte_len(body) otherwise.
+  var resp_content_length = 0
+  if resp_body_ptr != 0
+    resp_content_length = resp_body_len
+  else
+    resp_content_length = str_byte_len(resp_body)
+  end
+  var resp_headers = vec_new<HpackHeader>()
+  resp_headers.push(HpackHeader { name: ":status", value: str_from_int(resp_status) })
+  resp_headers.push(HpackHeader { name: "content-type", value: resp_ct })
+  resp_headers.push(HpackHeader { name: "content-length", value: str_from_int(resp_content_length) })
+  resp_headers.push(HpackHeader { name: "server", value: "Quartz/1.0" })
+  var encoded_headers = hpack_encode_block(resp_headers)
+  var body_bytes = Bytes { _data: vec_new() }
+  if resp_body_ptr != 0
+    body_bytes = h2_bytes_from_ptr(resp_body_ptr, resp_body_len)
+  else
+    body_bytes = h2_string_to_bytes(resp_body)
+  end
+
+  # Build HEADERS frame bytes
+  var hdr_raw = Bytes { _data: vec_new() }
+  var hdr_len = encoded_headers.size()
+  hdr_raw.push(band(shr(hdr_len, 16), 0xFF))
+  hdr_raw.push(band(shr(hdr_len, 8), 0xFF))
+  hdr_raw.push(band(hdr_len, 0xFF))
+  hdr_raw.push(H2_HEADERS())
+  var hdr_flags = H2_FLAG_END_HEADERS()
+  if body_bytes.size() == 0
+    hdr_flags = bor(hdr_flags, H2_FLAG_END_STREAM())
+  end
+  hdr_raw.push(hdr_flags)
+  hdr_raw.push(band(shr(stream_id, 24), 0x7F))
+  hdr_raw.push(band(shr(stream_id, 16), 0xFF))
+  hdr_raw.push(band(shr(stream_id, 8), 0xFF))
+  hdr_raw.push(band(stream_id, 0xFF))
+  var _hi = 0
+  while _hi < encoded_headers.size()
+    hdr_raw.push(encoded_headers.get(_hi))
+    _hi = _hi + 1
+  end
+
+  # Build DATA frame bytes (if body non-empty)
+  var data_raw = Bytes { _data: vec_new() }
+  if body_bytes.size() > 0
+    var data_len = body_bytes.size()
+    data_raw.push(band(shr(data_len, 16), 0xFF))
+    data_raw.push(band(shr(data_len, 8), 0xFF))
+    data_raw.push(band(data_len, 0xFF))
+    data_raw.push(H2_DATA())
+    data_raw.push(H2_FLAG_END_STREAM())
+    data_raw.push(band(shr(stream_id, 24), 0x7F))
+    data_raw.push(band(shr(stream_id, 16), 0xFF))
+    data_raw.push(band(shr(stream_id, 8), 0xFF))
+    data_raw.push(band(stream_id, 0xFF))
+    var _bi = 0
+    while _bi < body_bytes.size()
+      data_raw.push(body_bytes.get(_bi))
+      _bi = _bi + 1
+    end
+  end
+
+  var result = vec_new<Bytes>()
+  result.push(hdr_raw)
+  result.push(data_raw)
+  return result
+end
+
+## Per-stream go-task: HPACK-decodes the header block, constructs a Request,
+## calls user handler, encodes Response as HPACK+frames, sends to write_ch.
+## Enforces send-side flow control: blocks on window_ch when window exhausted.
+def _h2_handle_stream(stream_id: Int, decoded: Vec<HpackHeader>, body: Bytes, write_ch: Int, handler: Fn(Request): Response, done_ch: Int, send_window: Int, window_ch: Int): Void
+  var method = ""
+  var path = ""
+  var authority = ""
+  var req_keys = vec_new<String>()
+  var req_vals = vec_new<String>()
+  var i = 0
+  while i < decoded.size
+    var h = decoded[i]
+    if h.name == ":method"
+      method = h.value
+    elsif h.name == ":path"
+      path = h.value
+    elsif h.name == ":authority"
+      authority = h.value
+    elsif h.name == ":scheme"
+      i = i + 1
+      continue
+    else
+      req_keys.push(h.name)
+      req_vals.push(h.value)
+    end
+    i = i + 1
+  end
+  if str_byte_len(authority) > 0
+    req_keys.push("host")
+    req_vals.push(authority)
+  end
+  var query_string = ""
+  var clean_path = path
+  var qpos = str_find(path, "?")
+  if qpos >= 0
+    clean_path = str_slice(path, 0, qpos)
+    query_string = str_slice(path, qpos + 1, str_byte_len(path))
+  end
+  var body_str = h2_bytes_to_string(body)
+  var req = Request {
+    method: method,
+    path: clean_path,
+    query_string: query_string,
+    body: body_str,
+    raw_path: path,
+    header_keys: req_keys,
+    header_vals: req_vals,
+    params: map_new(),
+    query: map_new(),
+    context: map_new()
+  }
+  var resp = _invoke_handler_safely(handler, req)
+
+  # Encode response headers via HPACK. Content-Length derives from
+  # body_len for raw-bytes responses, str_byte_len(body) otherwise.
+  var resp_content_length = 0
+  if resp.body_ptr != 0
+    resp_content_length = resp.body_len
+  else
+    resp_content_length = str_byte_len(resp.body)
+  end
+  var resp_headers = vec_new<HpackHeader>()
+  resp_headers.push(HpackHeader { name: ":status", value: str_from_int(resp.status) })
+  resp_headers.push(HpackHeader { name: "content-type", value: resp.content_type })
+  resp_headers.push(HpackHeader { name: "content-length", value: str_from_int(resp_content_length) })
+  resp_headers.push(HpackHeader { name: "server", value: "Quartz/1.0" })
+  i = 0
+  while i < resp.extra_header_keys.size
+    resp_headers.push(HpackHeader { name: resp.extra_header_keys[i], value: resp.extra_header_vals[i] })
+    i = i + 1
+  end
+  var encoded_headers = hpack_encode_block(resp_headers)
+
+  var body_bytes = Bytes { _data: vec_new() }
+  if resp.body_ptr != 0
+    body_bytes = h2_bytes_from_ptr(resp.body_ptr, resp.body_len)
+  else
+    body_bytes = h2_string_to_bytes(resp.body)
+  end
+  var end_stream_on_headers = 0
+  if body_bytes.size() == 0
+    end_stream_on_headers = 1
+  end
+  var headers_frame = h2_headers_frame(stream_id, encoded_headers, end_stream_on_headers, 1)
+  var headers_ser = h2_serialize_frame(headers_frame)
+  send(write_ch, as_int_generic(headers_ser))
+
+  # Send DATA frames with flow control
+  if body_bytes.size() > 0
+    var max_data = H2_DEFAULT_MAX_FRAME_SIZE()
+    var remaining_window = send_window
+    var offset = 0
+    while offset < body_bytes.size()
+      # Wait for send window if exhausted
+      while remaining_window <= 0
+        var incr = recv(window_ch)
+        remaining_window = remaining_window + incr
+      end
+
+      # Chunk size = min(remaining_bytes, max_frame, remaining_window)
+      var chunk_size = body_bytes.size() - offset
+      if chunk_size > max_data
+        chunk_size = max_data
+      end
+      if chunk_size > remaining_window
+        chunk_size = remaining_window
+      end
+
+      var chunk = Bytes { _data: vec_new() }
+      var j = 0
+      while j < chunk_size
+        chunk.push(body_bytes.get(offset + j))
+        j = j + 1
+      end
+      var is_last = 0
+      if (offset + chunk_size) >= body_bytes.size()
+        is_last = 1
+      end
+      var data_frame = h2_data_frame(stream_id, chunk, is_last)
+      var data_ser = h2_serialize_frame(data_frame)
+      send(write_ch, as_int_generic(data_ser))
+      remaining_window = remaining_window - chunk_size
+      offset = offset + chunk_size
+
+      # Drain any pending window updates (non-blocking)
+      var extra_opt = try_recv(window_ch)
+      while option_is_some(extra_opt)
+        remaining_window = remaining_window + load(extra_opt, 1)
+        extra_opt = try_recv(window_ch)
+      end
+    end
+  end
+  send(done_ch, stream_id)
+end
+
+def _hex_nibble(n: Int): String
+  if n < 10
+    return str_from_codepoint(48 + n)
+  end
+  return str_from_codepoint(97 + n - 10)
+end
+
+def _hex_byte(b: Int): String
+  return _hex_nibble(shr(band(b, 0xF0), 4)) + _hex_nibble(band(b, 0x0F))
+end
+
+## Check if stream has both headers and end_stream. If so, HPACK decode + process request.
+## Returns serialized response frames (Vec<Bytes>) or empty Vec if not ready.
+## NO I/O — caller must send the frames to TLS.
+def _h2_maybe_dispatch(sp: Int, stream_id: Int, hpack_dec: HpackDynTable, write_ch: Int, handler: Fn(Request): Response, done_ch: Int, ssl_ptr: Int, fd: Int, write_timeout_ms: Int): Vec<Bytes>
+  var empty = vec_new<Bytes>()
+  if _h2s_headers_done(sp) == 0 or _h2s_end_stream(sp) == 0
+    return empty
+  end
+  var hdr_block = _h2s_hdr_block(sp)
+  if hdr_block.size() == 0
+    return empty
+  end
+  var decoded = hpack_decode_block(hdr_block, hpack_dec)
+  if decoded.size == 0 and hdr_block.size() > 0
+    eputs("[h2-diag] HPACK decode returned 0 headers from #{hdr_block.size()} bytes")
+  end
+  _h2s_set_state(sp, H2_STATE_HALF_CLOSED_REMOTE())
+  # Process request in a non-async function (no I/O → no $poll state machine)
+  return _h2_process_request(stream_id, decoded, handler)
+end
+
+## Handle an HTTP/2 connection. Reads preface, exchanges settings, runs frame reader.
+@cfg(not: os: "unknown")
+def _h2_handle_connection(ssl_ptr: Int, fd: Int, handler: Fn(Request): Response, read_timeout_ms: Int, write_timeout_ms: Int): Int
+  # Read and validate client connection preface
+  var preface_buf = malloc(H2_PREFACE_LEN())
+  var pn = _h2_tls_read_exact(ssl_ptr, fd, preface_buf, H2_PREFACE_LEN(), read_timeout_ms)
+  if pn <= 0
+    mem_free(preface_buf)
+    return 0
+  end
+  var preface_data = h2_bytes_from_ptr(preface_buf, H2_PREFACE_LEN())
+  mem_free(preface_buf)
+  if h2_validate_preface(preface_data) == 0
+    return 0
+  end
+
+  # Read client SETTINGS (must be first frame after preface)
+  var client_frame = _h2_read_frame(ssl_ptr, fd, read_timeout_ms, H2_DEFAULT_MAX_FRAME_SIZE())
+  if client_frame.length < 0 or client_frame.frame_type != H2_SETTINGS()
+    return 0
+  end
+
+  var remote_initial_window = H2_DEFAULT_INITIAL_WINDOW()
+  var remote_max_frame = H2_DEFAULT_MAX_FRAME_SIZE()
+  var remote_header_table_size = H2_DEFAULT_HEADER_TABLE_SIZE()
+  if band(client_frame.flags, H2_FLAG_ACK()) == 0
+    var csettings = h2_parse_settings(client_frame.payload)
+    var si = 0
+    while si < csettings.size
+      var s = csettings[si]
+      if s.id == H2_SETTINGS_INITIAL_WINDOW_SIZE()
+        remote_initial_window = s.value
+      elsif s.id == H2_SETTINGS_MAX_FRAME_SIZE()
+        remote_max_frame = s.value
+      elsif s.id == H2_SETTINGS_HEADER_TABLE_SIZE()
+        remote_header_table_size = s.value
+      end
+      si = si + 1
+    end
+  end
+
+  # Send server SETTINGS + ACK client SETTINGS
+  var srv_settings = h2_server_settings()
+  _h2_write_frame(ssl_ptr, fd, srv_settings, write_timeout_ms)
+  var settings_ack = h2_settings_frame(vec_new<H2Setting>(), 1)
+  _h2_write_frame(ssl_ptr, fd, settings_ack, write_timeout_ms)
+
+  # Initialize connection state
+  var conn_send_window = remote_initial_window
+  var conn_recv_window = H2_DEFAULT_INITIAL_WINDOW()
+  var streams = map_new()
+  var stream_ids = vec_new()  # Parallel tracker (avoids map_keys codegen bug)
+  var hpack_dec = hpack_dyn_new(remote_header_table_size)
+  var write_ch = channel_new(64)
+  var done_ch = channel_new(256)
+  var last_stream_id = 0
+  var goaway_sent = 0
+
+  # Security: rate limiting counters (CVE-2023-44487 Rapid Reset + Settings/CONTINUATION flood)
+  var rst_count = 0
+  var rst_window_start = time_mono_ns() / 1000000
+  var settings_count = 0
+  var settings_window_start = time_mono_ns() / 1000000
+
+  # NOTE: frame writer go-task disabled — go-lambda captures crash in async context
+  # (index -6 size 0). Responses written inline via _h2_handle_stream_inline instead.
+
+  # Production: PING keepalive tracking
+  var last_frame_time = time_mono_ns() / 1000000
+  var ping_sent = 0
+
+  # Frame reader loop
+  while true
+    # Clean up completed streams
+    var done_opt = try_recv(done_ch)
+    while option_is_some(done_opt)
+      var done_id = load(done_opt, 1)
+      if map_has(streams, done_id)
+        var dp = map_fetch(streams, done_id)
+        _h2s_free(dp)
+        map_delete(streams, done_id)
+        var _ri = vec_index_of(stream_ids, done_id)
+        if _ri >= 0
+          vec_delete(stream_ids, _ri)
+        end
+      end
+      done_opt = try_recv(done_ch)
+    end
+
+    # Use pointer-based frame reader to avoid struct return corruption in async context
+    var _fbuf = malloc(40)
+    var _frc = _h2_read_frame_into(ssl_ptr, fd, read_timeout_ms, H2_DEFAULT_MAX_FRAME_SIZE(), _fbuf)
+    var f_length = _h2f_length(_fbuf)
+    var f_type = _h2f_type(_fbuf)
+    var f_flags = _h2f_flags(_fbuf)
+    var f_payload = _h2f_payload(_fbuf)
+    var sid = _h2f_stream_id(_fbuf)
+    mem_free(_fbuf)
+    if f_length < 0
+      # Read timeout or error — check PING keepalive
+      var idle_ms = time_mono_ns() / 1000000 - last_frame_time
+      if idle_ms > 60000 and ping_sent == 0
+        # 60s idle: send PING keepalive
+        var ping_data = Bytes { _data: vec_new() }
+        var _pi = 0
+        while _pi < 8
+          ping_data.push(0)
+          _pi = _pi + 1
+        end
+        var ping = h2_ping_frame(ping_data, 0)
+        var ping_bytes = h2_serialize_frame(ping)
+        send(write_ch, as_int_generic(ping_bytes))
+        ping_sent = 1
+        continue
+      elsif idle_ms > 70000 and ping_sent == 1
+        # 70s: PING sent but no PONG received — connection dead
+        break
+      end
+      break
+    end
+    last_frame_time = time_mono_ns() / 1000000
+    ping_sent = 0
+
+    if f_type == H2_SETTINGS()
+      if band(f_flags, H2_FLAG_ACK()) != 0
+        continue
+      end
+      # Settings flood protection (CVE-2019-9515)
+      settings_count = settings_count + 1
+      var settings_now = time_mono_ns() / 1000000
+      if (settings_now - settings_window_start) > 10000
+        settings_count = 1
+        settings_window_start = settings_now
+      elsif settings_count > 20
+        var goaway = h2_goaway_frame(last_stream_id, H2_ENHANCE_YOUR_CALM())
+        _h2_write_frame(ssl_ptr, fd, goaway, write_timeout_ms)
+        goaway_sent = 1
+        break
+      end
+      var new_settings = h2_parse_settings(f_payload)
+      var nsi = 0
+      while nsi < new_settings.size
+        var ns = new_settings[nsi]
+        if ns.id == H2_SETTINGS_INITIAL_WINDOW_SIZE()
+          remote_initial_window = ns.value
+        elsif ns.id == H2_SETTINGS_MAX_FRAME_SIZE()
+          remote_max_frame = ns.value
+        elsif ns.id == H2_SETTINGS_HEADER_TABLE_SIZE()
+          remote_header_table_size = ns.value
+          hpack_dyn_set_max_size(hpack_dec, remote_header_table_size)
+        end
+        nsi = nsi + 1
+      end
+      var ack = h2_settings_frame(vec_new<H2Setting>(), 1)
+      var ack_bytes = h2_serialize_frame(ack)
+      send(write_ch, as_int_generic(ack_bytes))
+      continue
+    end
+
+    if f_type == H2_PING()
+      if band(f_flags, H2_FLAG_ACK()) != 0
+        continue
+      end
+      var pong = h2_ping_frame(f_payload, 1)
+      var pong_bytes = h2_serialize_frame(pong)
+      send(write_ch, as_int_generic(pong_bytes))
+      continue
+    end
+
+    if f_type == H2_GOAWAY()
+      break
+    end
+
+    if f_type == H2_WINDOW_UPDATE()
+      var increment = 0
+      if f_payload.size() >= 4
+        increment = shl(band(f_payload.get(0), 0x7F), 24) + shl(f_payload.get(1), 16) + shl(f_payload.get(2), 8) + f_payload.get(3)
+      end
+      if sid == 0
+        # Connection-level: update counter + signal all active streams
+        conn_send_window = conn_send_window + increment
+        var aki = 0
+        while aki < stream_ids.size
+          var asp = map_fetch(streams, stream_ids[aki])
+          if _h2s_state(asp) != H2_STATE_CLOSED()
+            try_send(_h2s_window_ch(asp), increment)
+          end
+          aki = aki + 1
+        end
+      elsif map_has(streams, sid)
+        # Stream-level: update counter + signal that stream's handler
+        var sp = map_fetch(streams, sid)
+        _h2s_set_send_win(sp, _h2s_send_win(sp) + increment)
+        try_send(_h2s_window_ch(sp), increment)
+      end
+      continue
+    end
+
+    if f_type == H2_RST_STREAM()
+      # CVE-2023-44487 Rapid Reset protection: rate-limit RST_STREAM
+      rst_count = rst_count + 1
+      var rst_now = time_mono_ns() / 1000000
+      if (rst_now - rst_window_start) > 10000
+        rst_count = 1
+        rst_window_start = rst_now
+      elsif rst_count > 50
+        # >50 resets in 10 seconds — send GOAWAY with ENHANCE_YOUR_CALM
+        var goaway = h2_goaway_frame(last_stream_id, H2_ENHANCE_YOUR_CALM())
+        _h2_write_frame(ssl_ptr, fd, goaway, write_timeout_ms)
+        goaway_sent = 1
+        break
+      end
+      if map_has(streams, sid)
+        var sp = map_fetch(streams, sid)
+        _h2s_free(sp)
+        map_delete(streams, sid)
+        var _rsti = vec_index_of(stream_ids, sid)
+        if _rsti >= 0
+          vec_delete(stream_ids, _rsti)
+        end
+      end
+      continue
+    end
+
+    if f_type == H2_HEADERS()
+      if sid == 0
+        break
+      end
+      if sid > last_stream_id
+        last_stream_id = sid
+      end
+      if map_size(streams) >= H2_DEFAULT_MAX_CONCURRENT() and not map_has(streams, sid)
+        var rst = h2_rst_stream_frame(sid, H2_REFUSED_STREAM())
+        var rst_bytes = h2_serialize_frame(rst)
+        send(write_ch, as_int_generic(rst_bytes))
+        continue
+      end
+      if not map_has(streams, sid)
+        map_set(streams, sid, _h2s_alloc(remote_initial_window))
+        stream_ids.push(sid)
+      end
+      var sp = map_fetch(streams, sid)
+      # RFC 7540 §6.2: Pad Length (if PADDED) comes BEFORE Priority fields (if PRIORITY)
+      var payload_start = 0
+      var pad_len = 0
+      if band(f_flags, H2_FLAG_PADDED()) != 0
+        pad_len = f_payload.get(0)
+        payload_start = 1
+      end
+      if band(f_flags, H2_FLAG_PRIORITY()) != 0
+        payload_start = payload_start + 5
+      end
+      var hdr_block = _h2s_hdr_block(sp)
+      var pi = payload_start
+      var end_pos = f_payload.size() - pad_len
+      while pi < end_pos
+        hdr_block.push(f_payload.get(pi))
+        pi = pi + 1
+      end
+      _h2s_set_hdr_block(sp, hdr_block)
+      if band(f_flags, H2_FLAG_END_STREAM()) != 0
+        _h2s_set_end_stream(sp)
+      end
+      if band(f_flags, H2_FLAG_END_HEADERS()) != 0
+        _h2s_set_headers_done(sp)
+        var _resp_frames = _h2_maybe_dispatch(sp, sid, hpack_dec, write_ch, handler, done_ch, ssl_ptr, fd, write_timeout_ms)
+        if _resp_frames.size == 2
+          var _hf = _resp_frames[0]
+          var _hb = h2_bytes_to_ptr(_hf)
+          _h2_tls_send_timeout(ssl_ptr, fd, _hb, _hf.size(), write_timeout_ms)
+          mem_free(_hb)
+          var _df = _resp_frames[1]
+          if _df.size() > 0
+            var _db = h2_bytes_to_ptr(_df)
+            _h2_tls_send_timeout(ssl_ptr, fd, _db, _df.size(), write_timeout_ms)
+            mem_free(_db)
+          end
+        end
+      end
+      continue
+    end
+
+    if f_type == H2_CONTINUATION()
+      if sid == 0 or not map_has(streams, sid)
+        break
+      end
+      var sp = map_fetch(streams, sid)
+      var hdr_block = _h2s_hdr_block(sp)
+      # CONTINUATION flood protection: limit accumulated header block to 64KB
+      if hdr_block.size() > 65536
+        var rst = h2_rst_stream_frame(sid, H2_ENHANCE_YOUR_CALM())
+        var rst_bytes = h2_serialize_frame(rst)
+        send(write_ch, as_int_generic(rst_bytes))
+        continue
+      end
+      var pi = 0
+      while pi < f_payload.size()
+        hdr_block.push(f_payload.get(pi))
+        pi = pi + 1
+      end
+      _h2s_set_hdr_block(sp, hdr_block)
+      if band(f_flags, H2_FLAG_END_HEADERS()) != 0
+        _h2s_set_headers_done(sp)
+        var _resp_frames = _h2_maybe_dispatch(sp, sid, hpack_dec, write_ch, handler, done_ch, ssl_ptr, fd, write_timeout_ms)
+        if _resp_frames.size == 2
+          var _hf = _resp_frames[0]
+          var _hb = h2_bytes_to_ptr(_hf)
+          _h2_tls_send_timeout(ssl_ptr, fd, _hb, _hf.size(), write_timeout_ms)
+          mem_free(_hb)
+          var _df = _resp_frames[1]
+          if _df.size() > 0
+            var _db = h2_bytes_to_ptr(_df)
+            _h2_tls_send_timeout(ssl_ptr, fd, _db, _df.size(), write_timeout_ms)
+            mem_free(_db)
+          end
+        end
+      end
+      continue
+    end
+
+    if f_type == H2_DATA()
+      if sid == 0
+        break
+      end
+      if not map_has(streams, sid)
+        var rst = h2_rst_stream_frame(sid, H2_STREAM_CLOSED())
+        var rst_bytes = h2_serialize_frame(rst)
+        send(write_ch, as_int_generic(rst_bytes))
+        continue
+      end
+      var sp = map_fetch(streams, sid)
+      var payload_start = 0
+      var pad_len = 0
+      if band(f_flags, H2_FLAG_PADDED()) != 0
+        pad_len = f_payload.get(0)
+        payload_start = 1
+      end
+      var body = _h2s_body(sp)
+      var pi = payload_start
+      var end_pos = f_payload.size() - pad_len
+      while pi < end_pos
+        body.push(f_payload.get(pi))
+        pi = pi + 1
+      end
+      _h2s_set_body(sp, body)
+      var data_len = f_length
+      conn_recv_window = conn_recv_window - data_len
+      _h2s_set_recv_win(sp, _h2s_recv_win(sp) - data_len)
+      if conn_recv_window < H2_DEFAULT_INITIAL_WINDOW() / 2
+        var incr = H2_DEFAULT_INITIAL_WINDOW() - conn_recv_window
+        conn_recv_window = conn_recv_window + incr
+        var wu = h2_window_update_frame(0, incr)
+        var wu_bytes = h2_serialize_frame(wu)
+        send(write_ch, as_int_generic(wu_bytes))
+      end
+      if _h2s_recv_win(sp) < H2_DEFAULT_INITIAL_WINDOW() / 2
+        var incr = H2_DEFAULT_INITIAL_WINDOW() - _h2s_recv_win(sp)
+        _h2s_set_recv_win(sp, _h2s_recv_win(sp) + incr)
+        var wu = h2_window_update_frame(sid, incr)
+        var wu_bytes = h2_serialize_frame(wu)
+        send(write_ch, as_int_generic(wu_bytes))
+      end
+      if band(f_flags, H2_FLAG_END_STREAM()) != 0
+        _h2s_set_end_stream(sp)
+        var _resp_frames = _h2_maybe_dispatch(sp, sid, hpack_dec, write_ch, handler, done_ch, ssl_ptr, fd, write_timeout_ms)
+        if _resp_frames.size == 2
+          var _hf = _resp_frames[0]
+          var _hb = h2_bytes_to_ptr(_hf)
+          _h2_tls_send_timeout(ssl_ptr, fd, _hb, _hf.size(), write_timeout_ms)
+          mem_free(_hb)
+          var _df = _resp_frames[1]
+          if _df.size() > 0
+            var _db = h2_bytes_to_ptr(_df)
+            _h2_tls_send_timeout(ssl_ptr, fd, _db, _df.size(), write_timeout_ms)
+            mem_free(_db)
+          end
+        end
+      end
+      continue
+    end
+  end
+
+  # Two-stage graceful shutdown (RFC 9113 §6.8)
+  if goaway_sent == 0
+    # Stage 1: GOAWAY with max stream ID — signals "no new streams"
+    var goaway1 = h2_goaway_frame(2147483647, H2_NO_ERROR())
+    _h2_write_frame(ssl_ptr, fd, goaway1, write_timeout_ms)
+    # Wait for in-flight requests (1 second)
+    sched_sleep(1000)
+    # Stage 2: GOAWAY with actual last processed stream ID
+    var goaway2 = h2_goaway_frame(last_stream_id, H2_NO_ERROR())
+    _h2_write_frame(ssl_ptr, fd, goaway2, write_timeout_ms)
+  end
+  send(write_ch, 0)
+  var ki = 0
+  while ki < stream_ids.size
+    var sp = map_fetch(streams, stream_ids[ki])
+    _h2s_free(sp)
+    ki = ki + 1
+  end
+  map_free(streams)
+  return 0
+end
+
+## Freestanding stub — D.11 Phase 8b.2.b Path B. The hosted body
+## references the userspace M:N scheduler global @__qz_sched
+## (channel try_send / close-event paths it reaches via map_*) which
+## is not defined in the freestanding runtime. h2 in the kernel is
+## NET.5 future work and is not reachable from any current
+## hello_x86.qz call site (the kernel doesn't link TLS through
+## std/net at all). The stub satisfies llc; linker `--gc-sections`
+## drops the dead `_https_supervised_per_conn_loop` → `_tls_accept_and_dispatch`
+## → `_h2_handle_connection` transitive closure entirely.
+@cfg(os: "unknown")
+def _h2_handle_connection(_ssl_ptr: Int, _fd: Int, _handler: Fn(Request): Response, _read_timeout_ms: Int, _write_timeout_ms: Int): Int
+  return -1
+end
+
+## Accept TLS and dispatch to HTTP/2 or HTTP/1.1 based on ALPN + preface detection.
+def _tls_accept_and_dispatch(fd: Int, ssl_ctx: Int, handler: Fn(Request): Response, config: HttpServerConfig): Int
+  # Perform async TLS handshake
+  var ssl_ptr = _async_tls_accept(ssl_ctx, fd)
+  if ssl_ptr == 0
+    var _ignore_c1 = _http_close_fd(fd)
+    return 0
+  end
+
+  # Check ALPN negotiation result
+  var proto = _tls_get_alpn(ssl_ptr)
+  if proto == "h2"
+    var result = _h2_handle_connection(ssl_ptr, fd, handler, config.read_timeout_ms, config.write_timeout_ms)
+    _async_tls_shutdown(ssl_ptr, fd)
+    SSL_free(int_to_cptr(ssl_ptr))
+    var _ignore_c2 = _http_close_fd(fd)
+    return result
+  end
+
+  # No ALPN or http/1.1 negotiated — try preface detection as fallback
+  if str_byte_len(proto) == 0
+    if h2_detect_preface(ssl_ptr, fd) == 1
+      var result = _h2_handle_connection(ssl_ptr, fd, handler, config.read_timeout_ms, config.write_timeout_ms)
+      _async_tls_shutdown(ssl_ptr, fd)
+      SSL_free(int_to_cptr(ssl_ptr))
+      var _ignore_c3 = _http_close_fd(fd)
+      return result
+    end
+  end
+
+  # HTTP/1.1
+  return _handle_tls_connection_with_ssl(fd, ssl_ptr, handler, config)
+end
+
+# =============================================================================
+# D.11 Phase 2 — supervised goroutine-per-connection HTTP server
+# (http_serve_supervised). Wires:
+#   - tcp_listener_scoped (B.8) for the listener,
+#   - http_dyn_gsup (D.11 Phase 2b) for per-connection goroutines,
+#   - tcp_acceptable (D.11 Phase 2a) for the accept arm of the listener
+#     select, alongside the legacy signal_on_flag-driven shutdown
+#     atomic for OS-signal handling,
+#   - tcp_stream_scoped (B.8) for per-connection auto-close,
+#   - ConnectionHandler trait (D.11 Phase 1) for the per-connection
+#     lifecycle, wrapped via DefaultConnectionHandler around the
+#     caller's Fn(Request): Response.
+#
+# Phase 2c surface deviates from the design memo's full unified-select
+# in three places, all Phase 2d filed-forward:
+#
+#   1. Shutdown coordination uses the existing `_http_shutdown_flag`
+#      atomic (set by SIGTERM/SIGINT via `signal_on_flag`) rather than
+#      a scope-tree cancel cascade. Reason: the resolver's
+#      wildcard-vs-qualified dedup currently drops cross-module const
+#      storage for `std/sync/composition/scope.qz` — qualified import
+#      loses constants; wildcard import loses struct types ([[feedback-
+#      resolver-wildcard-qualified-dedup]] filed forward). Atomic flag
+#      drives the shutdown plumbing for `http_serve_supervised`
+#      and ships now; the scope-cascade upgrade is a Phase 2d follow-on
+#      once the resolver bug is fixed.
+#
+#   2. Per-connection keep-alive loop polls `_http_shutdown_flag` +
+#      `time_mono_ns()` elapsed instead of `select { case _ =
+#      cancellable(s) => ... case _ = deadline_ms(t) => ... case req
+#      = http_request_selectable(fd) => ... }`. http_request_selectable
+#      isn't built yet (needs cross-poll buffer state); polling gives
+#      us reliable on_terminate(reason) plumbing for Phase 2c.
+#
+#   3. on_terminate reason in this phase is one of "close" / "timeout"
+#      / "shutdown" — no "crash:<msg>" plumbing yet. Unexpected throws
+#      inside the loop are swallowed by the http_dyn_gsup body
+#      wrapper; the connection's on_terminate still fires with the
+#      pre-throw reason or "close" by default. Phase 3 plumbs throw
+#      reason into on_terminate.
+# =============================================================================
+
+## Per-connection body. Spawned by http_dyn_gsup_spawn_one as the
+## supervised goroutine. Drives the ConnectionHandler lifecycle:
+##   on_open → keep-alive loop → on_keepalive_timeout (if idle) →
+##   on_terminate(reason).
+##
+## Keep-alive loop is poll-based (see Phase 2c surface notes above):
+##   - _http_shutdown_flag set (SIGTERM/SIGINT via signal_on_flag)
+##     → reason = "shutdown"
+##   - idle elapsed > keepalive_timeout_ms → reason = "timeout"
+##   - parse returns empty method → reason = "close" (peer disconnect)
+##   - keepalive_max_requests reached → reason = "close"
+##   - write_result < 0 → reason = "close"
+##   - explicit Connection: close from peer → reason = "close"
+##
+## Caller-side closure capture is single-value-per-conn (Phase 2c
+## rebinds fd_copy at the listener select arm to avoid stale-capture
+## across iterations).
+##
+## Phase 2c trait-dispatch limitation: this function accesses the
+## DefaultConnectionHandler's `handler_fn` field directly rather than
+## going through `h.handle_request(req)` (the ConnectionHandler trait
+## method). Reason: trait dispatch through a qualified-imported
+## extend block doesn't resolve in the current resolver
+## ([[feedback-resolver-wildcard-qualified-dedup]] — Phase 4.0
+## struct/trait dedup is filed forward). Lifecycle hooks (on_open,
+## on_keepalive_timeout, on_terminate) are no-ops on
+## DefaultConnectionHandler anyway, so v1 skips them entirely; full
+## trait dispatch is Phase 3 (custom ConnectionHandler impls), which
+## requires the resolver fix.
+##
+## fd cleanup: wrapped in `with tcp_stream_scoped(...) do _ -> ...`
+## so release fires on both normal exit AND throw-unwind. Backed by
+## the mir_lower_with_scoped handler-spill fix (handle survives async-
+## future yield/resume re-entry).
+def _http_supervised_per_conn_loop(
+  fd: Int,
+  h: http_connection_handler::DefaultConnectionHandler,
+  config: HttpServerConfig
+): Int
+  set_nonblocking(fd)
+  var stream = tcp_stream(fd, "client", 0)
+  with tcp_stream_scoped(stream) do _ ->
+    var done = 0
+    var requests = 0
+    var idle_start_ns = time_mono_ns()
+    var keepalive_ns = config.keepalive_timeout_ms * 1000000
+    while done == 0 and requests < config.keepalive_max_requests
+      # Per-request arena boundary. Captures every multi-page allocation
+      # made during one parse → handle → write cycle (request struct,
+      # response body, response_writer's status_line + headers + body
+      # concats — see _async_http_write_response_timeout) and releases
+      # them as a single batch back to the multi-page freelist at end-of-
+      # iteration. No-op on hosted; backed by qz_arena_begin/end in
+      # libc_stubs.c on freestanding (the kernel target). Lifetime
+      # invariant: nothing allocated during a request escapes past the
+      # write — `req` and `resp` are loop-iteration locals, and the
+      # handler's response is fully consumed by the writer before the
+      # iteration closes. See [[feedback-multipage-bump-no-reclaim]].
+      _http_arena_begin()
+      if atomic_load(_http_shutdown_flag) == 1
+        done = 1
+      elsif (time_mono_ns() - idle_start_ns) > keepalive_ns
+        done = 1
+      else
+        var req = _async_http_parse_request_timeout(fd, config.read_timeout_ms, config.read_buffer_limit)
+        if str_byte_len(req.method) == 0
+          done = 1
+        else
+          requests = requests + 1
+          if config.max_body_size > 0 and str_byte_len(req.body) > config.max_body_size
+            var resp_413 = payload_too_large()
+            _async_http_write_response_timeout(fd, resp_413, config.write_timeout_ms)
+            done = 1
+          else
+            var fn = h.handler_fn
+            var resp: Response = fn(req)
+            var should_close = _http_should_close(req)
+            var write_result = _async_http_write_response_timeout(fd, resp, config.write_timeout_ms)
+            if write_result < 0
+              done = 1
+            elsif should_close
+              done = 1
+            else
+              idle_start_ns = time_mono_ns()
+            end
+          end
+        end
+      end
+      _http_arena_end()
+    end
+  end
+  return 0
+end
+
+## Process-wide SIGPIPE → SIG_IGN. Required so a write to a peer-closed
+## socket (curl giving up mid-GOAWAY, a half-closed TCP, etc.) returns
+## EPIPE/-1 rather than killing the server. This is the same default
+## that Go's runtime, nginx, Apache, Node, and Python all install for
+## servers. Idempotent — `signal()` is the SUSv4 setter, calling it
+## repeatedly with the same disposition is a no-op.
+@cfg(not: os: "unknown")
+def _http_ignore_sigpipe(): Void
+  signal(13, int_to_cptr(1))
+end
+
+# Freestanding no-op (`@cfg(os: "unknown")`) — D.11 Phase 8b step 1.
+# No POSIX signals in kernel context; FIN/RST on a peer-closed slot
+# surfaces as kern_tcp_write returning -1, handled at the call site.
+@cfg(os: "unknown")
+def _http_ignore_sigpipe(): Void
+  return
+end
+
+## Per-request arena begin/end. Freestanding (`@cfg(os: "unknown")`) wires
+## these to the C-side allocator hooks in `tools/baremetal/libc_stubs.c`
+## via `extern "C" def qz_arena_begin/end` declared in
+## `tools/baremetal/hello_x86.qz`. Hosted targets get no-ops — glibc/musl
+## already reclaim on `free()`, and we don't want to pay the overhead of
+## tracking allocations through a separate chain.
+##
+## See [[feedback-multipage-bump-no-reclaim]] for why this exists:
+## `_async_http_write_response_timeout` allocates ~10–12 Quartz Strings
+## per request (status_line + header concats + final response body) with
+## no explicit `mem_free`. Without an arena, those chunks leaked
+## permanently into the multi-page bump pool and production exhausted PMM
+## in ~30 min wall.
+@cfg(not: os: "unknown")
+def _http_arena_begin(): Void
+  return
+end
+
+@cfg(not: os: "unknown")
+def _http_arena_end(): Void
+  return
+end
+
+@cfg(os: "unknown")
+extern "C" def qz_arena_begin(): Void
+
+@cfg(os: "unknown")
+extern "C" def qz_arena_end(): Void
+
+@cfg(os: "unknown")
+def _http_arena_begin(): Void
+  qz_arena_begin()
+end
+
+@cfg(os: "unknown")
+def _http_arena_end(): Void
+  qz_arena_end()
+end
+
+## Production HTTP server — D.11 Phase 2 supervised-goroutine model.
+##
+## Wires the Phase A-C concurrency primitives (B.8 Scoped TCP for the
+## listener and per-conn streams; C.13 unified-`select` shape for the
+## listener loop's tcp_acceptable arm; D.11 Phase 1 ConnectionHandler;
+## D.11 Phase 2a tcp_acceptable; D.11 Phase 2b http_dyn_gsup) into a
+## complete server. Architectural reference: `docs/design/D11_HTTP_SERVER_MIGRATION.md`.
+##
+## Lifecycle:
+##   1. sched_init + signal_on_flag(SIGTERM/SIGINT, _http_shutdown_flag)
+##   2. tcp_listen + tcp_listener_set_nonblocking
+##   3. http_dyn_gsup_new for per-connection goroutine tracking
+##   4. With tcp_listener_scoped block — listener auto-closes on exit
+##   5. Listener loop:
+##        - poll _http_shutdown_flag at top; if set, exit to drain
+##        - else select { tcp_acceptable(l_fd) | default }
+##        - on accept: load-shed against max_connections, then reserve and claim
+##          supervisor admission before constructing the per-connection task
+##        - on default: sched_yield to let other tasks run
+##   6. Capture one total shutdown deadline, then drain the supervisor with its
+##      remaining budget
+##   7. sched_shutdown_graceful(remaining budget) + sched_shutdown containment
+##
+## Returns 0 on clean shutdown.
+##
+## Load shedding: when config.max_connections > 0 and the supervisor's
+## alive count is at the cap, the accepted fd is sent a 503 and closed
+## without spawning a per-conn goroutine.
+##
+## Programmatic shutdown: call `http_server_shutdown()` (the
+## `_http_shutdown_flag` atomic) from any thread, OR send SIGTERM/SIGINT
+## via `kill(getpid(), 15)` (POSIX). Either path flips the flag, which
+## this entry point polls at the top of the listener loop.
+
+# KERN.PRIO.1 — supervised listener accept-wait helper, target-specific.
+#
+# Freestanding (`os: "unknown"`) variant BLOCKS the listener task on the
+# accept-channel waker. Hi ring is empty between accepts, so demos get
+# ~100% of CPU. HTTP latency stays low because per-conn handlers (hi-tier)
+# preempt demos when they're enqueued. Returns the accepted fd directly
+# — `select` with a single arm and no `default` parks the task via the
+# kernel waiter mechanism (`kernel_waiter_register` → `kernel_waiter_wake_all`).
+#
+# Hosted (`os: "macos"` / `os: "linux"`) variant keeps the historical
+# try_poll + `sched_yield()` shape. Returns -1 on no-accept; the caller
+# loops without doing anything else (the yield was the work).
+#
+# Shutdown latency: the freestanding variant blocks indefinitely on
+# `acc_sel` if no traffic arrives. Production has continuous healthcheck
+# traffic so SIGTERM is observed within the healthcheck interval; for
+# pure-idle deployments add an explicit deadline arm later.
+@cfg(os: "unknown")
+priv def _http_supervised_wait_accept(acc_sel: TcpAcceptableSelectable): Int
+  select
+    case fd = acc_sel => return fd
+  end
+  return -1
+end
+
+@cfg(os: "macos")
+priv def _http_supervised_wait_accept(acc_sel: TcpAcceptableSelectable): Int
+  var got_fd = -1
+  select
+    case fd = acc_sel => got_fd = fd
+    default => 0
+  end
+  if got_fd < 0
+    sched_yield()
+  end
+  return got_fd
+end
+
+@cfg(os: "linux")
+priv def _http_supervised_wait_accept(acc_sel: TcpAcceptableSelectable): Int
+  var got_fd = -1
+  select
+    case fd = acc_sel => got_fd = fd
+    default => 0
+  end
+  if got_fd < 0
+    sched_yield()
+  end
+  return got_fd
+end
+
+def http_serve_supervised(config: HttpServerConfig, handler: Fn(Request): Response): Int
+  _http_ignore_sigpipe()
+  sched_init(0)
+
+  if config.max_connections > 0
+    sched_set_max_tasks(_http_scheduler_task_cap(config.max_connections))
+  end
+
+  # Initialize the shutdown flag so http_server_shutdown() works against
+  # this entry point. Phase 2c uses the atomic-flag path because the
+  # scope-cascade path is blocked by
+  # [[feedback-resolver-wildcard-qualified-dedup]] — see the surface-
+  # notes block above this function.
+  atomic_store(_http_shutdown_flag, 0)
+  signal_on_flag(15, _http_shutdown_flag)
+  signal_on_flag(2, _http_shutdown_flag)
+
+  match tcp_listen(config.port)
+    Ok(listener) => {
+      var rc = tcp_listener_set_nonblocking(listener)
+      if rc < 0
+        var ignore = tcp_close_listener(listener)
+        throw(http_error_format(HttpError::ListenFailed))
+      end
+      log::info("Listening on port #{tcp_listener_port(listener).to_s()} (supervised)")
+
+      var sup = http_dynamic_goroutine_sup::http_dyn_gsup_new()
+      http_dynamic_goroutine_sup::http_dyn_gsup_set_max_children(sup, config.max_connections)
+      var dh = http_connection_handler::default_connection_handler(handler)
+      var shutdown_deadline_ms = 0
+
+      # Listener wrapped in `with tcp_listener_scoped do l_fd -> ...` —
+      # the Scoped impl closes the listener fd on both natural exit and
+      # throw-unwind. Backed by the mir_lower_with_scoped handler-spill
+      # fix that keeps the guard value addressable across async-future
+      # yield/resume re-entry (the listener loop suspends on
+      # tcp_acceptable + sched_yield).
+      with tcp_listener_scoped(listener) do l_fd ->
+      # Hoist the Selectable construction outside the hot poll loop.
+      # The `select { case x = tcp_acceptable(l_fd) ...; default }`
+      # shape allocates a fresh `TcpAcceptableSelectable` struct per
+      # iteration; with real freestanding goroutine spawn (D.11 Phase
+      # 8b.2.c), the supervised loop polls continuously rather than
+      # blocking on an inline per-conn handler, so the per-iteration
+      # alloc bleeds ~16 bytes per poll iteration into the size-16
+      # slab class — measured ~110K allocs/sec, ~900KB/s leaked on the
+      # prod VPS, exhausting the 3GB PMM pool inside an hour. Closes
+      # [[feedback-supervised-select-per-iter-alloc-leak]] (filed
+      # alongside this fix). The bound Selectable is reusable —
+      # try_poll is destructive on the underlying accept_chan, not on
+      # the wrapper struct.
+      var acc_sel = tcp_acceptable(l_fd)
+      var listener_done = 0
+      while listener_done == 0
+        # Top-of-loop shutdown poll. Catches signal-driven shutdown
+        # (signal_on_flag flipped the atomic above) and any
+        # programmatic call to http_server_shutdown(). Single atomic
+        # load on the hot path.
+        if atomic_load(_http_shutdown_flag) == 1
+          log::info("Shutting down gracefully (supervised)...")
+          listener_done = 1
+        else
+          # KERN.PRIO.1 — target-specific wait. Freestanding blocks on
+          # the accept-channel waker (hi ring drains, demos get CPU).
+          # Hosted keeps the try_poll + sched_yield shape.
+          var accepted_fd = _http_supervised_wait_accept(acc_sel)
+          if accepted_fd < 0
+            # Hosted no-accept path: the helper already yielded; loop.
+            0
+          else
+            # Reservation atomically counts live children and constructors against
+            # max_connections. A capacity rejection gets 503; stop just closes.
+            var reservation = http_dynamic_goroutine_sup::http_dyn_gsup_reserve(sup)
+            if reservation == 0
+              if http_dynamic_goroutine_sup::http_dyn_gsup_is_stopping(sup) == 0
+                _http_send_503(accepted_fd)
+              end
+              var _ignore_close_refused = _http_close_fd(accepted_fd)
+            else
+              var fd_copy = accepted_fd
+              var cfg_copy = config
+              var h_copy = dh
+              var published = http_dynamic_goroutine_sup::http_dyn_gsup_spawn_reserved(sup, reservation, -> _http_supervised_per_conn_loop(fd_copy, h_copy, cfg_copy))
+              if published == 0
+                var _ignore_close_unpublished = _http_close_fd(accepted_fd)
+              end
+            end
+          end
+        end
+      end
+
+      # One configured deadline covers both supervisor and scheduler phases.
+      shutdown_deadline_ms = _http_shutdown_deadline_ms(config.shutdown_timeout_ms)
+      http_dynamic_goroutine_sup::http_dyn_gsup_set_drain_timeout(sup, _http_shutdown_remaining_ms(shutdown_deadline_ms))
+      http_dynamic_goroutine_sup::http_dyn_gsup_stop(sup)
+      end
+      # Retain forced shutdown as process-exit containment. The current runtime
+      # does not unwind abandoned suspended frames or guarantee their resource
+      # destructors and waiter cleanup.
+      var _shutdown_forced = sched_shutdown_graceful(_http_shutdown_remaining_ms(shutdown_deadline_ms))
+      sched_shutdown()
+      return 0
+    }
+    Err(e) => {
+      throw(http_error_format(HttpError::BindFailed(config.port)))
+    }
+  end
+  return 0
+end
+
+# =============================================================================
+# D.11 Phase 4 — supervised goroutine-per-connection HTTPS server
+# (https_serve_supervised). TLS counterpart to http_serve_supervised.
+#
+# Same wiring as the plain-HTTP supervised path
+# (tcp_acceptable + http_dyn_gsup + atomic shutdown flag + signal_on_flag),
+# with TLS-specific additions:
+#
+#   1. SSL_CTX created up front; cert/key loaded; ALPN advertises h2 +
+#      http/1.1 (via `_tls_enable_h2`). Free on drain.
+#   2. Per-connection body delegates to the existing
+#      `_tls_accept_and_dispatch` helper, which performs an async TLS
+#      handshake (`_async_tls_accept` → io_suspend on WANT_*), inspects
+#      ALPN, and dispatches to either `_h2_handle_connection` (h2 path)
+#      or `_handle_tls_connection_with_ssl` (HTTP/1.1 keepalive loop).
+#      Both branches close the fd and free the SSL on return.
+#
+# Phase 4 surface mirrors Phase 2c exactly:
+#
+#   - Poll-based shutdown via `_http_shutdown_flag` rather than scope
+#     cascade — same resolver-dedup constraint
+#     ([[feedback-resolver-wildcard-qualified-dedup]]) blocks the
+#     scope-tree upgrade. Atomic flag shares with `http_server_shutdown()`.
+#   - No `tls_recvable` / `tls_sendable` Selectables yet — those are
+#     filed forward alongside `http_request_selectable` as a future
+#     unified phase. Polling-based keepalive lives inside the legacy
+#     `_handle_tls_connection_with_ssl` helper that this entry-point
+#     reuses.
+#   - Direct `h.handler_fn` field access for trait-dispatch parity with
+#     the plain-HTTP supervised path. Custom ConnectionHandler impls
+#     gated on the resolver fix.
+#   - Listener now wraps in `with tcp_listener_scoped` (post-Phase-2d
+#     Bug 4 fix). Per-conn TLS streams still use manual close + SSL_free
+#     because the lifecycle is paired (_async_tls_shutdown + SSL_free
+#     + close fd, in that order). Wrapping needs an SslGuard Scoped
+#     impl whose release does the shutdown+free triad before the inner
+#     TcpStreamGuard's close fires. Filed forward as a follow-on.
+# =============================================================================
+
+## Per-connection body for `https_serve_supervised`. Spawned by
+## http_dyn_gsup_spawn_one as the supervised goroutine. Delegates to
+## `_tls_accept_and_dispatch`, which:
+##   - Performs the async TLS handshake
+##   - Reads ALPN (or falls back to preface detection)
+##   - Dispatches to h2 connection driver OR h1.1 keepalive loop
+##   - Closes the fd + frees the SSL on every path
+##
+## fd cleanup: `_tls_accept_and_dispatch` and the h1.1/h2 paths it
+## dispatches to all close the fd before returning, so this wrapper
+## must not double-close. The http_dyn_gsup body wrapper's Throws
+## catcher provides throw-unwind safety for the entire dispatch path
+## (an unhandled throw inside h1.1/h2 still leaks the fd in that
+## specific edge case — same Phase 2c file-forward as the plain
+## supervised path).
+def _https_supervised_per_conn_loop(
+  fd: Int,
+  ssl_ctx_int: Int,
+  h: http_connection_handler::DefaultConnectionHandler,
+  config: HttpServerConfig
+): Int
+  # Direct field access — see surface-notes block above this section
+  # for the trait-dispatch parity rationale.
+  var fn = h.handler_fn
+  return _tls_accept_and_dispatch(fd, ssl_ctx_int, fn, config)
+end
+
+## Production HTTPS server — D.11 Phase 4 supervised-goroutine model.
+##
+## TLS counterpart to `http_serve_supervised`. Mirrors the same lifecycle
+## plus the SSL_CTX init/teardown around it.
+##
+## Lifecycle:
+##   1. OPENSSL_init_ssl + SSL_CTX_new + min TLS 1.2 enforcement
+##   2. Load cert/key + check key consistency
+##   3. Enable HTTP/2 ALPN negotiation (`_tls_enable_h2`)
+##   4. sched_init + signal_on_flag(SIGTERM/SIGINT, _http_shutdown_flag)
+##   5. tcp_listen + tcp_listener_set_nonblocking
+##   6. http_dyn_gsup_new for per-connection goroutine tracking
+##   7. Listener loop (identical shape to http_serve_supervised):
+##        - poll _http_shutdown_flag at top
+##        - else select { tcp_acceptable(l_fd) | default }
+##        - on accept: load-shed against max_connections, otherwise
+##          reserve -> claim -> construct -> publish the TLS dispatch task
+##        - on default: sched_yield
+##   8. Drain: http_dyn_gsup_stop (bounded by shutdown_timeout_ms)
+##   9. tcp_close_listener + bounded scheduler shutdown + SSL_CTX_free
+##
+## Returns 0 on clean shutdown.
+##
+## Each TLS init-error path frees SSL_CTX BEFORE throwing so unwind
+## doesn't leak the OpenSSL context.
+##
+## ALPN: `h2` and `http/1.1` are advertised; per-connection dispatch
+## checks the negotiated protocol and routes to `_h2_handle_connection`
+## or the HTTP/1.1 keepalive loop. h2 preface detection is the fallback
+## when ALPN didn't negotiate.
+##
+## Programmatic shutdown: identical to `http_serve_supervised` —
+## `http_server_shutdown()` or SIGTERM/SIGINT.
+def https_serve_supervised(config: HttpServerConfig, tls_config: HttpsTlsConfig, handler: Fn(Request): Response): Int
+  _http_ignore_sigpipe()
+  # Initialize TLS context up front. Free-before-throw on every
+  # init-error path.
+  OPENSSL_init_ssl(0, int_to_cptr(0))
+  var ssl_ctx = SSL_CTX_new(TLS_server_method())
+  if ptr_is_null(ssl_ctx) == 1
+    throw(http_error_format(HttpError::SslContextCreateFailed))
+  end
+  SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION())
+
+  var cert_cstr = string_to_cstr(tls_config.cert_file)
+  if SSL_CTX_use_certificate_file(ssl_ctx, cert_cstr, SSL_FILETYPE_PEM()) != 1
+    SSL_CTX_free(ssl_ctx)
+    throw(http_error_format(HttpError::SslCertLoadFailed(tls_config.cert_file)))
+  end
+  var key_cstr = string_to_cstr(tls_config.key_file)
+  if SSL_CTX_use_PrivateKey_file(ssl_ctx, key_cstr, SSL_FILETYPE_PEM()) != 1
+    SSL_CTX_free(ssl_ctx)
+    throw(http_error_format(HttpError::SslKeyLoadFailed(tls_config.key_file)))
+  end
+  if SSL_CTX_check_private_key(ssl_ctx) != 1
+    SSL_CTX_free(ssl_ctx)
+    throw(http_error_format(HttpError::SslKeyMismatch))
+  end
+
+  # Enable HTTP/2 ALPN negotiation.
+  _tls_enable_h2(ssl_ctx)
+
+  var ssl_ctx_int = cptr_to_int(ssl_ctx)
+
+  sched_init(0)
+
+  if config.max_connections > 0
+    sched_set_max_tasks(_http_scheduler_task_cap(config.max_connections))
+  end
+
+  atomic_store(_http_shutdown_flag, 0)
+  signal_on_flag(15, _http_shutdown_flag)
+  signal_on_flag(2, _http_shutdown_flag)
+
+  match tcp_listen(config.port)
+    Ok(listener) => {
+      var rc = tcp_listener_set_nonblocking(listener)
+      if rc < 0
+        var ignore = tcp_close_listener(listener)
+        SSL_CTX_free(ssl_ctx)
+        throw(http_error_format(HttpError::ListenFailed))
+      end
+      log::info("Listening on port #{tcp_listener_port(listener).to_s()} (HTTPS supervised)")
+
+      var sup = http_dynamic_goroutine_sup::http_dyn_gsup_new()
+      http_dynamic_goroutine_sup::http_dyn_gsup_set_max_children(sup, config.max_connections)
+      var dh = http_connection_handler::default_connection_handler(handler)
+      var shutdown_deadline_ms = 0
+
+      # Listener wrapped in `with tcp_listener_scoped do l_fd -> ...`
+      # so close fires on natural exit AND on throw-unwind. Backed by
+      # the mir_lower_with_scoped handler-spill fix (commit 5126d115).
+      # Per-conn TLS streams still use manual close + SSL_free in
+      # _tls_accept_and_dispatch / _handle_tls_connection_with_ssl —
+      # wrapping those needs an SslGuard Scoped impl to handle the
+      # paired _async_tls_shutdown + SSL_free + close lifecycle.
+      # Filed forward as a follow-on.
+      with tcp_listener_scoped(listener) do l_fd ->
+      # Hoist Selectable construction outside the hot poll loop — see
+      # the matching note in http_serve_supervised.
+      var acc_sel = tcp_acceptable(l_fd)
+      var listener_done = 0
+      while listener_done == 0
+        if atomic_load(_http_shutdown_flag) == 1
+          log::info("Shutting down gracefully (HTTPS supervised)...")
+          listener_done = 1
+        else
+          # KERN.PRIO.1 — target-specific wait. Same helper as HTTP path.
+          var accepted_fd = _http_supervised_wait_accept(acc_sel)
+          if accepted_fd < 0
+            0
+          else
+            var reservation = http_dynamic_goroutine_sup::http_dyn_gsup_reserve(sup)
+            if reservation == 0
+              if http_dynamic_goroutine_sup::http_dyn_gsup_is_stopping(sup) == 0
+                _http_send_503(accepted_fd)
+              end
+              var _ignore_close_refused = _http_close_fd(accepted_fd)
+            else
+              # SSL_new remains inside the published task body, so rejection
+              # owns only the accepted fd and no connection-local SSL object.
+              var fd_copy = accepted_fd
+              var ssl_ctx_copy = ssl_ctx_int
+              var cfg_copy = config
+              var h_copy = dh
+              var published = http_dynamic_goroutine_sup::http_dyn_gsup_spawn_reserved(sup, reservation, -> _https_supervised_per_conn_loop(fd_copy, ssl_ctx_copy, h_copy, cfg_copy))
+              if published == 0
+                var _ignore_close_unpublished = _http_close_fd(accepted_fd)
+              end
+            end
+          end
+        end
+      end
+
+      shutdown_deadline_ms = _http_shutdown_deadline_ms(config.shutdown_timeout_ms)
+      http_dynamic_goroutine_sup::http_dyn_gsup_set_drain_timeout(sup, _http_shutdown_remaining_ms(shutdown_deadline_ms))
+      http_dynamic_goroutine_sup::http_dyn_gsup_stop(sup)
+      end
+      # Keep SSL_CTX alive until workers stop executing TLS children. Forced
+      # scheduler containment does not unwind their abandoned frames.
+      var _shutdown_forced = sched_shutdown_graceful(_http_shutdown_remaining_ms(shutdown_deadline_ms))
+      sched_shutdown()
+      SSL_CTX_free(ssl_ctx)
+      return 0
+    }
+    Err(e) => {
+      SSL_CTX_free(ssl_ctx)
+      throw(http_error_format(HttpError::BindFailed(config.port)))
+    }
+  end
+  return 0
+end

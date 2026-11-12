@@ -1,0 +1,314 @@
+## QSpec coverage for the D.1 substrate bug — `Alloc.in_arena` under
+## codegen-density allocation traffic.
+##
+## Companion to `docs/bugs/D1_ALLOC_IN_ARENA_HEAVY_CODEGEN_CORRUPTION.md`.
+##
+## When the compiler is wrapped with `with Alloc.in_arena(cg_arena) do ->
+## codegen() end` and invoked with `--debug`, emitted IR has corrupted
+## register names (`%v4` becomes `%v4344611856` — an i64 heap pointer
+## decoded as ASCII) and `, !dbg !N` debug suffixes lose their literal
+## prefix. The B.1–B.4 alloc specs do not catch the bug because they use
+## small, uniform allocation patterns. Codegen drives variable-size
+## `Int.to_s()` + `+`-concat + `sb_append` at ~1.8M lines of IR worth of
+## density.
+##
+## **Result (2026-04-27, written under post-D.0 binary fixpoint 2347)**:
+## All four tests pass. This means the substrate bug is NOT reachable via
+## user-level density alone — the user-program patterns covered here
+## (sb_append density, codegen-shape interleave, `+` concat, nested
+## effect-stack pressure) all preserve bytes correctly under
+## `Alloc.in_arena`. The bug requires the compiler-internal regime: the
+## specific allocation sequence + effect-stack depth + ~1.8M-line volume
+## that running codegen itself produces. The spec stays in tree as
+## regression coverage for the user-level B.1 surface — once the
+## substrate fix lands, these tests must remain green.
+##
+## NOTE on triple-quoted snippet strings: `"""..."""` interpolates
+## `#{...}` at SPEC compile time. Snippets below build runtime output
+## via `str_from_int` + `sb_append` to keep variables in-snippet.
+
+import * from qspec
+import * from qspec/subprocess
+
+# -----------------------------------------------------------------------------
+# D1.1 — heavy `str_from_int` + `sb_append` density inside `in_arena`.
+# Mirrors codegen's most common allocation shape: int-to-string + delimiter.
+# 100 iters keeps the snippet small while pushing several SB grows.
+# -----------------------------------------------------------------------------
+
+var _SB_INT_DELIM: String = """import std/alloc
+import std/memory
+
+var g_result = \"\"
+
+def main(): Int
+  var ar = arena_new(65536)
+  with Alloc.in_arena(ar) do ->
+    var sb = sb_new()
+    var i = 0
+    while i < 100
+      sb.append(\"v\")
+      sb.append(str_from_int(i))
+      sb.append(\" \")
+      i = i + 1
+    end
+    g_result = sb.to_string()
+  end
+  puts(g_result)
+  arena_destroy(ar)
+  return 0
+end
+"""
+
+# Expected output computed at SPEC runtime (host allocator, no arena).
+# Mirrors the snippet's loop verbatim so any byte drift in the subprocess
+# surfaces as a stdout mismatch.
+def _expected_d11(): String
+  var sb = sb_new()
+  var i = 0
+  while i < 100
+    sb.append("v")
+    sb.append(str_from_int(i))
+    sb.append(" ")
+    i = i + 1
+  end
+  sb.append("\n")
+  return sb.to_string()
+end
+
+# -----------------------------------------------------------------------------
+# D1.2 — codegen-shaped IR text construction under `in_arena`.
+# Mirrors the exact corruption shape from the bug report:
+# `%vN = call i64 @foo(i64 %vM), !dbg !K|`. The trailing `|` is a stand-in
+# for `\n` (avoiding embedded-newline escaping in the spec source); the
+# allocation density and the register-id-then-dbg-suffix interleave is
+# what the bug stresses, not the line terminator itself.
+# 200 iters drives ~7 SB grows from the default cap.
+# -----------------------------------------------------------------------------
+
+var _CODEGEN_SHAPE: String = """import std/alloc
+import std/memory
+
+var g_result = \"\"
+
+def main(): Int
+  var ar = arena_new(131072)
+  with Alloc.in_arena(ar) do ->
+    var sb = sb_new()
+    var i = 0
+    while i < 200
+      sb.append(\"%v\")
+      sb.append(str_from_int(i))
+      sb.append(\" = call i64 @foo(i64 %v\")
+      sb.append(str_from_int(i + 1000))
+      sb.append(\"), !dbg !\")
+      sb.append(str_from_int(i + 50))
+      sb.append(\"|\")
+      i = i + 1
+    end
+    g_result = sb.to_string()
+  end
+  puts(g_result)
+  arena_destroy(ar)
+  return 0
+end
+"""
+
+def _expected_d12(): String
+  var sb = sb_new()
+  var i = 0
+  while i < 200
+    sb.append("%v")
+    sb.append(str_from_int(i))
+    sb.append(" = call i64 @foo(i64 %v")
+    sb.append(str_from_int(i + 1000))
+    sb.append("), !dbg !")
+    sb.append(str_from_int(i + 50))
+    sb.append("|")
+    i = i + 1
+  end
+  sb.append("\n")
+  return sb.to_string()
+end
+
+# -----------------------------------------------------------------------------
+# D1.3 — `+`-operator string concat (no SB) under `in_arena`.
+# Stresses the per-concat allocation path that codegen uses for inline
+# IR snippet assembly. Each iter allocates a NEW concatenated buffer;
+# the previous buffer remains arena-backed (dealloc no-op). 50 iters
+# keeps total bytes < 32 KB while still producing density.
+# -----------------------------------------------------------------------------
+
+var _CONCAT_DENSE: String = """import std/alloc
+import std/memory
+
+var g_result = \"\"
+
+def main(): Int
+  var ar = arena_new(65536)
+  with Alloc.in_arena(ar) do ->
+    var s = \"\"
+    var i = 0
+    while i < 50
+      s = s + \"r\" + str_from_int(i) + \" \"
+      i = i + 1
+    end
+    g_result = s
+  end
+  puts(g_result)
+  arena_destroy(ar)
+  return 0
+end
+"""
+
+def _expected_d13(): String
+  var s = ""
+  var i = 0
+  while i < 50
+    s = s + "r" + str_from_int(i) + " "
+    i = i + 1
+  end
+  return s + "\n"
+end
+
+# -----------------------------------------------------------------------------
+# D1.4 — escalation: nested `with Throws` installs inside `in_arena` to
+# add effect-stack pressure (Hypothesis 2 in the bug doc). Codegen does
+# many internal `with Emit { ... }` installs; user code can't reach
+# Emit, but stacking another effect adds the same depth dimension.
+# Uses a named handler (closures-as-handlers is a deferred Phase B item;
+# isolating to named handlers keeps this test focused on the arena +
+# effect-stack interaction rather than the closure path).
+# -----------------------------------------------------------------------------
+
+var _NESTED_EFFECT_PRESSURE: String = """import std/alloc
+import std/memory
+
+var g_result = \"\"
+
+def my_throws(msg: String): Int = 0
+
+def main(): Int
+  var ar = arena_new(131072)
+  with Alloc.in_arena(ar) do ->
+    var sb = sb_new()
+    var i = 0
+    while i < 100
+      with Throws { throw: my_throws } do ->
+        sb.append(\"x\")
+        sb.append(str_from_int(i))
+        sb.append(\":\")
+        sb.append(str_from_int(i * 3))
+        sb.append(\";\")
+        0
+      end
+      i = i + 1
+    end
+    g_result = sb.to_string()
+  end
+  puts(g_result)
+  arena_destroy(ar)
+  return 0
+end
+"""
+
+def _expected_d14(): String
+  var sb = sb_new()
+  var i = 0
+  while i < 100
+    sb.append("x")
+    sb.append(str_from_int(i))
+    sb.append(":")
+    sb.append(str_from_int(i * 3))
+    sb.append(";")
+    i = i + 1
+  end
+  sb.append("\n")
+  return sb.to_string()
+end
+
+# -----------------------------------------------------------------------------
+# D1.5 — interpolation INSIDE `+=` under `in_arena`. This mirrors the
+# precise compiler pattern at `codegen_instr.qz:624-630`, where `cg_emit
+# _call_indirect` builds a closure-call line via:
+#
+#   var ccall = "  %v#{d}.cres = call i64 %v#{d}.cfn(i64 %v#{d}.env"
+#   for i in 0..arg_count
+#     var arg = args[i]
+#     ccall += ", i64 %v#{arg.to_s()}"
+#   end
+#   ccall += ")#{dbg_suffix}"
+#
+# The substrate experiment (next-session bug-doc Step 5) showed this is
+# the exact source location producing corruption — `%v#{arg.to_s()}`
+# becomes `%v4343383056` (heap-pointer-shaped i64 as ASCII). D1.3 covered
+# `+=` with plain `+`-concat, which was clean — the suspect ingredient is
+# therefore string interpolation desugaring, NOT plain `+=`.
+# -----------------------------------------------------------------------------
+
+var _INTERP_IN_PLUSEQ: String = """import std/alloc
+import std/memory
+
+var g_result = \"\"
+
+def main(): Int
+  var ar = arena_new(65536)
+  with Alloc.in_arena(ar) do ->
+    var d = 6
+    var line = \"  %v\#{d}.cres = call i64 %v\#{d}.cfn(i64 %v\#{d}.env\"
+    var i = 0
+    while i < 30
+      line += \", i64 %v\#{i.to_s()}\"
+      i = i + 1
+    end
+    line += \")\"
+    g_result = line
+  end
+  puts(g_result)
+  arena_destroy(ar)
+  return 0
+end
+"""
+
+def _expected_d15(): String
+  var d = 6
+  var line = "  %v#{d}.cres = call i64 %v#{d}.cfn(i64 %v#{d}.env"
+  var i = 0
+  while i < 30
+    line += ", i64 %v#{i.to_s()}"
+    i = i + 1
+  end
+  line += ")"
+  return line + "\n"
+end
+
+# =============================================================================
+# Spec entry point
+# =============================================================================
+
+def main(): Int
+  describe("D.1 — Alloc.in_arena under codegen-density allocation traffic") do ->
+
+    it("sb_append + str_from_int (100 iters) preserves bytes") do ->
+      assert_run_stdout_eq(_SB_INT_DELIM, _expected_d11())
+    end
+
+    it("codegen-shaped IR text (200 iters, register/dbg interleave) preserves bytes") do ->
+      assert_run_stdout_eq(_CODEGEN_SHAPE, _expected_d12())
+    end
+
+    it("plain `+` concat (50 iters) preserves bytes") do ->
+      assert_run_stdout_eq(_CONCAT_DENSE, _expected_d13())
+    end
+
+    it("nested with Throws adding effect-stack pressure preserves bytes") do ->
+      assert_run_stdout_eq(_NESTED_EFFECT_PRESSURE, _expected_d14())
+    end
+
+    it("interpolation inside `+=` (mirrors codegen_instr.qz:624-630) preserves bytes") do ->
+      assert_run_stdout_eq(_INTERP_IN_PLUSEQ, _expected_d15())
+    end
+
+  end
+  return qspec_main()
+end

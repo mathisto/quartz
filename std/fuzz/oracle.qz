@@ -1,0 +1,260 @@
+# std/fuzz/oracle.qz — Multi-level oracle system for compiler fuzzing
+#
+# Four oracle levels, cheapest first:
+#   1. Crash oracle — compile the program, check for crash/signal
+#   2. Determinism oracle — compile twice, check IR identity
+#   3. IR validation oracle — run opt -verify on output
+#   4. Differential oracle — compare with another compiler version
+#
+# Usage:
+#   import std/fuzz/oracle
+#   result = fuzz_check_crash(source)
+
+import time
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+var _fuzz_compiler = ""
+var _fuzz_std_path = ""
+var _fuzz_counter = 0
+var _fuzz_initialized = false
+
+def fuzz_oracle_init(): Void
+  if _fuzz_initialized
+    return
+  end
+  _fuzz_initialized = true
+  _fuzz_compiler = getenv("QUARTZ_COMPILER")
+  _fuzz_std_path = getenv("QUARTZ_STD")
+end
+
+def _fuzz_next_id(): Int
+  var id = _fuzz_counter
+  _fuzz_counter = id + 1
+  return id
+end
+
+# =============================================================================
+# Result Types
+# =============================================================================
+
+struct FuzzResult
+  ok: Int           ## 1 = passed, 0 = failed
+  level: String     ## "crash", "determinism", "ir_valid", "differential"
+  message: String   ## Human-readable result
+end
+
+def fuzz_result_ok(level: String, msg: String): FuzzResult
+  return FuzzResult { ok: 1, level: level, message: msg }
+end
+
+def fuzz_result_fail(level: String, msg: String): FuzzResult
+  return FuzzResult { ok: 0, level: level, message: msg }
+end
+
+# =============================================================================
+# Oracle 1: Crash Detection
+# =============================================================================
+
+## Compile a program and check for crashes (signals or exit code > 1).
+## Exit code 1 = normal compile error (OK). Signal = compiler bug.
+def fuzz_check_crash(source: String): FuzzResult
+  fuzz_oracle_init()
+  var id = _fuzz_next_id()
+  var src_path = "/tmp/_fuzz_#{str_from_int(id)}.qz"
+  var ir_path = "/tmp/_fuzz_#{str_from_int(id)}.ll"
+  var err_path = "/tmp/_fuzz_#{str_from_int(id)}.err"
+
+  write_file(src_path, source)
+
+  var cmd = "#{_fuzz_compiler} --no-cache -I #{_fuzz_std_path} " +
+    "#{src_path} > #{ir_path} 2>#{err_path}"
+  var raw = system(cmd)
+  var sig = band(raw, 127)
+  var exit_code = raw / 256
+
+  ## Clean up
+  system("rm -f #{src_path} #{ir_path} #{err_path}")
+
+  if sig != 0
+    return fuzz_result_fail("crash", "Compiler crashed with signal #{str_from_int(sig)}")
+  end
+  if exit_code > 1
+    return fuzz_result_fail("crash", "Compiler exited with code #{str_from_int(exit_code)} (expected 0 or 1)")
+  end
+  return fuzz_result_ok("crash", "no crash (exit #{str_from_int(exit_code)})")
+end
+
+# =============================================================================
+# Oracle 2: Determinism Check
+# =============================================================================
+
+## Compile the same program twice and check that IR output is identical.
+def fuzz_check_determinism(source: String): FuzzResult
+  fuzz_oracle_init()
+  var id = _fuzz_next_id()
+  var src_path = "/tmp/_fuzz_det_#{str_from_int(id)}.qz"
+  var ir1_path = "/tmp/_fuzz_det_#{str_from_int(id)}_1.ll"
+  var ir2_path = "/tmp/_fuzz_det_#{str_from_int(id)}_2.ll"
+
+  write_file(src_path, source)
+
+  var cmd1 = "#{_fuzz_compiler} --no-cache -I #{_fuzz_std_path} " +
+    "#{src_path} > #{ir1_path} 2>/dev/null"
+  var raw1 = system(cmd1)
+  if raw1 != 0
+    system("rm -f #{src_path} #{ir1_path}")
+    return fuzz_result_ok("determinism", "skipped (compile error)")
+  end
+
+  var cmd2 = "#{_fuzz_compiler} --no-cache -I #{_fuzz_std_path} " +
+    "#{src_path} > #{ir2_path} 2>/dev/null"
+  var raw2 = system(cmd2)
+  if raw2 != 0
+    system("rm -f #{src_path} #{ir1_path} #{ir2_path}")
+    return fuzz_result_fail("determinism", "Second compilation failed but first succeeded")
+  end
+
+  ## Compare
+  var diff_result = system("diff -q #{ir1_path} #{ir2_path} >/dev/null 2>&1")
+
+  system("rm -f #{src_path} #{ir1_path} #{ir2_path}")
+
+  if diff_result != 0
+    return fuzz_result_fail("determinism", "IR differs between two compilations of identical source")
+  end
+  return fuzz_result_ok("determinism", "deterministic")
+end
+
+# =============================================================================
+# Oracle 3: IR Validation (opt -verify)
+# =============================================================================
+
+## Run LLVM opt -verify on compiled IR to check for codegen bugs.
+def fuzz_check_ir_valid(source: String): FuzzResult
+  fuzz_oracle_init()
+  var id = _fuzz_next_id()
+  var src_path = "/tmp/_fuzz_ir_#{str_from_int(id)}.qz"
+  var ir_path = "/tmp/_fuzz_ir_#{str_from_int(id)}.ll"
+  var err_path = "/tmp/_fuzz_ir_#{str_from_int(id)}.err"
+
+  write_file(src_path, source)
+
+  var cmd = "#{_fuzz_compiler} --no-cache -I #{_fuzz_std_path} " +
+    "#{src_path} > #{ir_path} 2>/dev/null"
+  var raw = system(cmd)
+  if raw != 0
+    system("rm -f #{src_path} #{ir_path}")
+    return fuzz_result_ok("ir_valid", "skipped (compile error)")
+  end
+
+  ## Run opt -passes=verify (LLVM new pass manager syntax)
+  var verify_cmd = "opt -passes=verify -S #{ir_path} -o /dev/null 2>#{err_path}"
+  var verify_raw = system(verify_cmd)
+  var verify_exit = verify_raw / 256
+
+  var err_content = ""
+  if verify_exit != 0
+    err_content = read_file(err_path)
+  end
+
+  system("rm -f #{src_path} #{ir_path} #{err_path}")
+
+  if verify_exit != 0
+    return fuzz_result_fail("ir_valid", "opt -verify failed: #{err_content}")
+  end
+  return fuzz_result_ok("ir_valid", "IR valid")
+end
+
+# =============================================================================
+# Oracle 4: Differential Testing
+# =============================================================================
+
+## Compile with current and alternate compiler, compare behavior.
+def fuzz_check_differential(source: String, alt_compiler: String): FuzzResult
+  fuzz_oracle_init()
+  var id = _fuzz_next_id()
+  var src_path = "/tmp/_fuzz_diff_#{str_from_int(id)}.qz"
+  var ir1_path = "/tmp/_fuzz_diff_#{str_from_int(id)}_cur.ll"
+  var ir2_path = "/tmp/_fuzz_diff_#{str_from_int(id)}_alt.ll"
+  var err1_path = "/tmp/_fuzz_diff_#{str_from_int(id)}_cur.err"
+  var err2_path = "/tmp/_fuzz_diff_#{str_from_int(id)}_alt.err"
+
+  write_file(src_path, source)
+
+  ## Compile with current
+  var cmd1 = "#{_fuzz_compiler} --no-cache -I #{_fuzz_std_path} " +
+    "#{src_path} > #{ir1_path} 2>#{err1_path}"
+  var raw1 = system(cmd1)
+  var exit1 = raw1 / 256
+  var sig1 = band(raw1, 127)
+
+  ## Compile with alternate
+  var cmd2 = "#{alt_compiler} --no-cache -I #{_fuzz_std_path} " +
+    "#{src_path} > #{ir2_path} 2>#{err2_path}"
+  var raw2 = system(cmd2)
+  var exit2 = raw2 / 256
+  var sig2 = band(raw2, 127)
+
+  system("rm -f #{src_path} #{ir1_path} #{ir2_path} #{err1_path} #{err2_path}")
+
+  ## Signals are always bugs
+  if sig1 != 0
+    return fuzz_result_fail("differential", "Current compiler crashed (signal #{str_from_int(sig1)})")
+  end
+  if sig2 != 0
+    return fuzz_result_fail("differential", "Alternate compiler crashed (signal #{str_from_int(sig2)})")
+  end
+
+  ## Both succeed or both fail = OK
+  var cur_ok = exit1 == 0
+  var alt_ok = exit2 == 0
+  if cur_ok and not alt_ok
+    return fuzz_result_fail("differential", "Current compiles but alternate rejects")
+  end
+  if not cur_ok and alt_ok
+    return fuzz_result_fail("differential", "Alternate compiles but current rejects")
+  end
+
+  return fuzz_result_ok("differential", "consistent behavior")
+end
+
+# =============================================================================
+# Delta Debugging (Shrink)
+# =============================================================================
+
+## Attempt to minimize a crashing program by removing lines.
+## Returns the smallest source that still triggers the same crash.
+def fuzz_shrink(source: String): String
+  var lines = str_split(source, "\n")
+  var best = source
+
+  ## Try removing each line one at a time
+  var i = 0
+  while i < lines.size
+    ## Build source without line i
+    var sb = sb_new()
+    for j in 0..lines.size
+      if j != i
+        sb_append(sb, lines[j])
+        sb_append(sb, "\n")
+      end
+    end
+    var candidate = sb_to_string(sb)
+
+    ## Check if it still crashes
+    var result = fuzz_check_crash(candidate)
+    if result.ok == 0
+      ## Still crashes — keep smaller version
+      best = candidate
+      lines = str_split(candidate, "\n")
+      ## Don't increment i: re-check same index with new lines
+    else
+      i += 1
+    end
+  end
+
+  return best
+end

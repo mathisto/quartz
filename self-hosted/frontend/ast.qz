@@ -1,0 +1,3932 @@
+##! # Abstract Syntax Tree
+##!
+##! Arena-style AST storage using parallel arrays for memory efficiency
+##! and cross-module Int handle compatibility.
+##!
+##! ## Architecture
+##!
+##! Instead of structs with pointers, the AST uses a storage vector
+##! containing 12 parallel arrays indexed by node handle:
+##!
+##! | Index | Field | Purpose |
+##! |-------|-------|---------|
+##! | 0 | kinds | NodeKind enum value |
+##! | 1 | lines | Source line number |
+##! | 2 | cols | Source column number |
+##! | 3 | int_vals | Integer values (for literals) |
+##! | 4 | str1s | Primary string (name, lexeme) |
+##! | 5 | str2s | Secondary string (type annotation) |
+##! | 6 | ops | Operator kind for binary/unary |
+##! | 7 | lefts | Left child handle |
+##! | 8 | rights | Right child handle |
+##! | 9 | extras | Extra data (flags, metadata) |
+##! | 10 | children | Vector of child handles |
+##! | 11 | docs | Docstring content |
+##!
+##! ## Node Handle Model
+##!
+##! Every AST node is identified by an integer handle (its index).
+##! Constructor functions return the handle; accessor functions take
+##! storage + handle to retrieve fields.
+##!
+##! ## Fixpoint Invariant
+##!
+##! NodeKind order MUST match C bootstrap's NodeType (bootstrap/src/ast.h).
+##! Modifying this order breaks fixpoint verification.
+##!
+##! @see parser Creates AST nodes during parsing
+##! @see typecheck Annotates AST with type information
+##! @see mir Transforms AST to MIR
+##! @since 1.0.0
+
+import string_intern
+
+import compiler_types
+
+## Operator types for binary and unary expressions.
+##
+## Used by ast_binary and ast_unary nodes.
+## Order matters for codegen mapping.
+enum OpKind
+  OpAdd
+  OpSub
+  OpMul
+  OpDiv
+  OpMod
+  OpEq
+  OpNe
+  OpLt
+  OpLe
+  OpGt
+  OpGe
+  OpAnd
+  OpOr
+  OpNot
+  OpNeg
+  OpBitAnd
+  OpBitOr
+  OpBitXor
+  OpBitNot
+  OpShl
+  OpShr
+end
+
+## Node kinds for all AST node types.
+##
+## **FIXPOINT CRITICAL**: Order MUST match C bootstrap's NodeType
+## in `quartz-bootstrap/src/ast.h` lines 80-170.
+##
+## @see quartz-bootstrap/src/ast.h Canonical C definition
+enum NodeKind
+  # === Expressions (0-21) ===
+  NodeIntLit          # 0  - 42
+  NodeBoolLit         # 1  - true, false
+  NodeNilLit          # 2  - nil
+  NodeStringLit       # 3  - "hello"
+  NodeSymbolLit       # 4  - :ok, :not_found
+  NodeRegexLit        # 5  - ~r"pattern"
+  NodeIdent           # 6  - foo (variable reference)
+  NodeUnary           # 7  - -x
+  NodeBinary          # 8  - a + b
+  NodeCall            # 9  - foo(a, b)
+  NodeArray           # 10 - [1, 2, 3] array literal
+  NodeSetLiteral      # 11 - {1, 2, 3} set literal
+  NodeMapLit          # 12 - {a: 1, b: 2} or {:a => 1} map literal
+  NodeIndex           # 13 - arr[i] array indexing
+  NodeStructInit      # 14 - Point { x: 1, y: 2 }
+  NodeFieldAccess     # 15 - p.x
+  NodeSafeFieldAccess # 16 - x?.field - safe navigation
+  NodeTryExpr         # 17 - expr? - early return on Err/None
+  NodeFuncRef         # 18 - &func - reference to function
+  NodeLambda          # 19 - x: Int -> x * 2 - anonymous function
+  NodeAllocExpr       # 20 - @heap [1,2,3] or @arena [1,2,3]
+  NodeCaptureVar      # 21 - $0-$9 - regex capture variable
+
+  # === Statements (22-31) ===
+  NodeReturn          # 22 - return expr
+  NodeIf              # 23 - if cond ... else ... end
+  NodeWhile           # 24 - while cond ... end
+  NodeLet             # 25 - let x = expr
+  NodeAssign          # 26 - x = expr
+  NodeIndexAssign     # 27 - arr[i] = expr
+  NodeFieldAssign     # 28 - p.x = expr
+  NodeExprStmt        # 29 - expr; (expression as statement)
+  NodeBreak           # 30 - break - exit loop
+  NodeContinue        # 31 - continue - next iteration
+
+  # === Structure (32-42) ===
+  NodeBlock           # 32 - { stmt; stmt; ... }
+  NodeParam           # 33 - Parameter in function definition
+  NodeFunction        # 34 - def foo(...) ... end
+  NodeProgram         # 35 - Root: list of functions
+  NodeStructDef       # 36 - struct Point x: Int y: Int end
+  NodeFieldDef        # 37 - Field in struct definition
+  NodeEnumDef         # 38 - enum Color Red Green Blue end
+  NodeEnumAccess      # 39 - Color::Red
+  NodeMatch           # 40 - match expr ... end
+  NodeMatchArm        # 41 - Pattern => expr
+  NodeWildcard        # 42 - _ (matches anything)
+
+  # === Surface Syntax (43-47) - desugared in MIR ===
+  NodeInterpString    # 43 - "Hello, #{name}!"
+  NodeFor             # 44 - for i in 0..10
+  NodeCompoundAssign  # 45 - x += 1
+  NodeListComp        # 46 - [x*2 for x in arr]
+  NodeMapComp         # 47 - {k => v for x in iter}
+
+  # === Module System (48-49) ===
+  NodeImport          # 48 - import foo, from foo import bar
+  NodeGlobalVar       # 49 - var g = expr at module level
+
+  # === Trait System (50-52) ===
+  NodeTraitDef        # 50 - trait Foo def method(self) end
+  NodeImplBlock       # 51 - impl Trait for Type def ... end
+  NodeExtendBlock     # 52 - extend Type { methods }
+
+  # === FFI (53-56) ===
+  NodeExternFn        # 53 - extern "C" fn strlen(s: CPtr): CSize
+  NodeInlineC         # 54 - @c("code")
+  NodeCInclude        # 55 - @cInclude("header.h")
+  NodeCImport         # 56 - @cImport(@cInclude(...))
+
+  # === Concurrency (58-60) ===
+  NodeAwait           # 58 - await handle
+  NodeSelect          # 59 - select { channel_arms }
+  NodeSelectArm       # 60 - recv/send/default arm in select
+
+  # === Memory Management (61-62) ===
+  NodeDefer           # 61 - defer expr
+  NodeArenaBlock      # 62 - arena name do ... end
+
+  # === Error Handling (63) ===
+  NodeTryCatch        # 63 - try expr catch pattern handler
+
+  # === Type Aliases (64-65) ===
+  NodeTypeAlias       # 64 - type Name = ExistingType
+  NodeNewtypeDef      # 65 - newtype Name = Type
+
+  # === Quartz-only Extensions (66+) - NOT in C bootstrap ===
+  NodeVariantDef      # 66 - Enum variant definition (Quartz-only)
+
+  # === Macro System (67) ===
+  NodeMacroCall       # 67 - $try(), $unwrap(), $assert(), $debug()
+
+  # === Float Literals (68) ===
+  NodeFloatLit        # 68 - Float literal (e.g. 3.14, 1.5e3)
+
+  # === Const Evaluation (69-70) ===
+  NodeConstDecl       # 69 - const NAME = expr
+  NodeStaticAssert    # 70 - static_assert(cond, "msg")
+
+  # === Structured Concurrency (71) ===
+  NodeTaskGroup       # 71 - task_group |g| ... end
+end
+
+## Typed AST storage arena with 12 parallel vectors for node fields.
+##
+## This struct documents the layout of the AST storage. At runtime,
+## storage is passed as Int (existential type) and accessed via indices:
+##
+## | Index | Field     | Purpose                          |
+## |-------|-----------|----------------------------------|
+## | 0     | kinds     | NodeKind enum values             |
+## | 1     | lines     | Source line numbers              |
+## | 2     | cols      | Source column numbers            |
+## | 3     | int_vals  | Integer values (for literals)    |
+## | 4     | str1s     | Primary strings (names, lexemes) |
+## | 5     | str2s     | Secondary strings (type annots)  |
+## | 6     | ops       | Operator kinds (binary/unary)    |
+## | 7     | lefts     | Left child handles               |
+## | 8     | rights    | Right child handles              |
+## | 9     | extras    | Extra data (flags, metadata)     |
+## | 10    | children  | Vectors of child handles         |
+## | 11    | docs      | Docstring content                |
+##
+## @since 5.10.0
+@repr(C)
+struct AstStorage
+  ## NodeKind enum values
+  kinds: Vec<Int>
+  ## Source line numbers
+  lines: Vec<Int>
+  ## Source column numbers
+  cols: Vec<Int>
+  ## Integer values (for literals)
+  int_vals: Vec<Int>
+  ## Primary strings (interned IDs — resolve via interner)
+  str1s: Vec<Int>
+  ## Secondary strings (interned IDs — resolve via interner)
+  str2s: Vec<Int>
+  ## Operator kinds (binary/unary)
+  ops: Vec<Int>
+  ## Left child handles
+  lefts: Vec<Int>
+  ## Right child handles
+  rights: Vec<Int>
+  ## Extra data (flags, metadata)
+  extras: Vec<Int>
+  ## Vectors of child handles
+  children: Vec<Int>
+  ## Docstring content (interned IDs — resolve via interner)
+  docs: Vec<Int>
+  ## String interner for deduplication
+  interner: StringInterner
+  ## Effect annotations for function nodes (sparse, lazily extended).
+  ## Index = node handle, value = effect bitset (0 = no annotation).
+  effect_annotations: Vec<Int>
+  ## Effect-row presence flag per NODE_FUNCTION (sparse, lazily extended).
+  ## 0 = no `can` clause (untracked), 1 = `can` clause was parsed.
+  ## Operation Piezoelectric Effects, Milestone B chunk B.3.
+  func_can_present: Vec<Int>
+  ## Effect-row labels per NODE_FUNCTION as comma-joined NAME strings
+  ## (sparse). "" when func_can_present is 0 OR `can` had no labels.
+  func_can_label_strs: Vec<String>
+  ## Effect-row tail var name per NODE_FUNCTION (sparse).
+  ## "" = closed tail (no `| var`), else the tail variable's identifier.
+  func_can_tail_strs: Vec<String>
+  ## Effect-op call annotation per NODE_CALL (sparse). Non-empty string
+  ## names the effect whose op this call invokes; empty = regular call.
+  ## Populated by tc_expr_call's C.3 block once an op is detected, so
+  ## mir_lower can route to MIR_PERFORM_OP without re-running effect
+  ## lookup (mir_lower has no access to tc). Parallel string holds the
+  ## op name from the same call site (= ast_get_str1(callee)).
+  ## Operation Piezoelectric Effects, Phase 1, Milestone C (chunk C.4).
+  op_call_effect_names: Vec<String>
+  op_call_op_names: Vec<String>
+  ## Per-NODE_CALL kind classification for op calls, populated alongside
+  ## op_call_effect_names / op_call_op_names. 0/1 = tail-resume (memo
+  ## §2.2 function kind), 2 = unwind (memo §2.3 operation kind). Piezo
+  ## F.3b: codegen reads this to decide whether MIR_PERFORM_OP should
+  ## pass kind=2 to the runtime (longjmp back to enclosing with-block
+  ## after the handler returns) or kind=1 (normal return). Unset entries
+  ## default to 1, matching F.3a's tail-resume fallback.
+  op_call_kinds: Vec<Int>
+  ## Macro-expansion provenance per node (sparse, lazily extended).
+  ## 0 = node came from user source; else 1-based index into the
+  ## module-level expansion-record store (`_ast_exp_*` vecs) where
+  ## (macro_name, def line/col, call-site line/col, parent_idx) lives.
+  ## Parent indices form a linked list so deeply nested expansions
+  ## (macro A calls macro B) reconstruct the full stack.
+  ##
+  ## Macro hygiene retrofit (Tier 2 #8b-followup) Phase 1 — schema only.
+  ## P2 renders these as `note: in expansion of X (defined at Y:L:C)`
+  ## in diagnostics; P3 consumes them for scope-set hygiene.
+  expansion_idx: Vec<Int>
+  ## Macro hygiene: scope-set index per node (sparse, lazily extended).
+  ## 0 = empty scope set (default for nodes born from user source — they
+  ## see all bindings whose scope sets are subsets of ∅, i.e. also empty).
+  ## Non-zero = 1-based index into `_ast_scope_sets` (the intern table of
+  ## sorted `Vec<Int>` scope lists). Populated by the expander in P3.b:
+  ## body-local idents get the def-site scope stamped; unquoted-argument
+  ## idents keep the caller's scope set (pass-through). The resolver in
+  ## P3.c consults this via Flatt's "largest subset" rule.
+  ## Macro hygiene retrofit (Tier 2 #8b-followup) Phase 3 — schema only.
+  scope_set_idx: Vec<Int>
+  ## Stable per-compile identity (PF3-P1). Assigned from a deterministic
+  ## monotonic counter in `ast_new_storage` and the build-cache loader.
+  ## Used as the cross-module registry key so an `AstStorage` can survive a
+  ## `Vec<Int>` boundary (the build-cache effect-op return) without erasing
+  ## the COW value-struct pointer to an i64. The consumer recovers the real
+  ## struct via `build_cache::cache_lookup_ast_by_id(id)`.
+  id: Int
+end
+
+## Creates a new AST storage arena.
+##
+## Allocates 12 parallel vectors for node fields. All node
+## constructor functions add entries to these vectors.
+##
+## @returns AstStorage struct with 12 parallel vectors
+## @example
+##   var storage = ast_new_storage()
+##   var root = ast_program(storage, children, 1, 1)
+# PF3-P1 — deterministic per-compile monotonic id counter for AstStorage.
+# Fresh process per compile → starts at 1, assigned in deterministic
+# allocation order, so fixpoint (gen1 == gen2) holds. 1-based so that id 0 is
+# reserved as "null/none" — the build-cache effect-op return uses 0 in its
+# `miss` sentinel and the resolver gates a cache hit on `result[0] != 0`.
+var _g_ast_storage_id_counter = 1
+
+def ast_next_storage_id(): Int
+  var id = _g_ast_storage_id_counter
+  _g_ast_storage_id_counter = _g_ast_storage_id_counter + 1
+  return id
+end
+
+def ast_new_storage(): AstStorage
+  var s = AstStorage {
+    kinds: vec_new(),
+    lines: vec_new(),
+    cols: vec_new(),
+    int_vals: vec_new(),
+    str1s: vec_new(),
+    str2s: vec_new(),
+    ops: vec_new(),
+    lefts: vec_new(),
+    rights: vec_new(),
+    extras: vec_new(),
+    children: vec_new(),
+    docs: vec_new(),
+    interner: string_intern::intern_global(),
+    effect_annotations: vec_new(),
+    func_can_present: vec_new(),
+    func_can_label_strs: vec_new<String>(),
+    func_can_tail_strs: vec_new<String>(),
+    op_call_effect_names: vec_new<String>(),
+    op_call_op_names: vec_new<String>(),
+    op_call_kinds: vec_new(),
+    expansion_idx: vec_new(),
+    scope_set_idx: vec_new(),
+    id: ast_next_storage_id()
+  }
+  ## Reserve handle 0 as null sentinel.
+  ## Throughout the codebase, handle 0 means "no node" (null).
+  ## Without this, the first real node gets handle 0 and is
+  ## indistinguishable from null, causing resolver/typecheck bugs
+  ## when zero-param functions have a callee IDENT as the first node.
+  s.kinds.push(0)
+  s.lines.push(0)
+  s.cols.push(0)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return s
+end
+
+## Gets the total number of nodes in the AST storage.
+## @param s AstStorage struct
+## @returns Number of nodes
+def ast_node_count(s: AstStorage): Int = s.kinds.size
+
+## Gets the NodeKind of a node.
+## @param s AstStorage struct
+## @param h Node handle
+## @returns NodeKind enum value
+def ast_get_kind(s: AstStorage, h: AstNodeId): Int
+  if h < 0
+    return 0
+  end
+  return s.kinds[h]
+end
+
+## Sets the NodeKind of a node.
+## Used for rewriting nodes during typechecking (e.g., .size -> string_len call).
+## @param s AstStorage struct
+## @param h Node handle
+## @param kind New NodeKind value
+def ast_set_kind(s: AstStorage, h: AstNodeId, kind: Int): Void
+  s.kinds[h] = kind
+end
+
+## Gets the source line number of a node.
+## @param s AstStorage struct
+## @param h Node handle
+## @returns 1-based line number
+def ast_get_line(s: AstStorage, h: AstNodeId): Int = s.lines[h]
+
+## Gets the source column number of a node.
+## @param s AstStorage struct
+## @param h Node handle
+## @returns 1-based column number
+def ast_get_col(s: AstStorage, h: AstNodeId): Int = s.cols[h]
+
+## Gets the integer value of a node (for int literals).
+## @param s AstStorage struct
+## @param h Node handle
+## @returns Integer value stored in the node
+def ast_get_int_val(s: AstStorage, h: AstNodeId): Int = s.int_vals[h]
+
+## Gets the primary string field (name, lexeme).
+## @param s AstStorage struct
+## @param h Node handle
+## @returns String value (resolved from intern ID)
+def ast_get_str1(s: AstStorage, h: AstNodeId): String = string_intern::intern_resolve_int(s.interner, s.str1s[h])
+
+## Sets the primary string field.
+## @param s AstStorage struct
+## @param h Node handle
+## @param val New string value
+def ast_set_str1(s: AstStorage, h: AstNodeId, val: String): Void
+  s.str1s[h] = string_intern::intern_id(s.interner, val)
+end
+
+## Gets the secondary string field (type annotation).
+## @param s AstStorage struct
+## @param h Node handle
+## @returns String value (resolved from intern ID)
+def ast_get_str2(s: AstStorage, h: AstNodeId): String = string_intern::intern_resolve_int(s.interner, s.str2s[h])
+
+## Sets the secondary string field (type annotation).
+## Used for writing inferred type args back to struct init nodes.
+def ast_set_str2(s: AstStorage, h: AstNodeId, val: String): Void
+  s.str2s[h] = string_intern::intern_id(s.interner, val)
+end
+
+## Gets the operator kind (for binary/unary nodes).
+## @param s AstStorage struct
+## @param h Node handle
+## @returns OpKind enum value
+def ast_get_op(s: AstStorage, h: AstNodeId): Int = s.ops[h]
+def ast_set_op(s: AstStorage, h: AstNodeId, op: Int): Void = s.ops.set_unchecked(h, op)
+
+## Gets the left child handle.
+## @param s AstStorage struct
+## @param h Node handle
+## @returns Child node handle
+def ast_get_left(s: AstStorage, h: AstNodeId): Int = s.lefts[h]
+
+## Sets the left child handle.
+## Used for rewriting nodes during typechecking.
+## @param s AstStorage struct
+## @param h Node handle
+## @param child New child node handle
+def ast_set_left(s: AstStorage, h: AstNodeId, child: Int): Void
+  s.lefts[h] = child
+end
+
+## Gets the right child handle.
+## @param s AstStorage struct
+## @param h Node handle
+## @returns Child node handle
+def ast_get_right(s: AstStorage, h: AstNodeId): Int = s.rights[h]
+
+## Sets the right child handle.
+## @param s AstStorage struct
+## @param h Node handle
+## @param child New child node handle
+def ast_set_right(s: AstStorage, h: AstNodeId, child: Int): Void
+  s.rights[h] = child
+end
+
+## Gets the extra field (flags, metadata).
+## @param s AstStorage struct
+## @param h Node handle
+## @returns Extra data value
+def ast_get_extra(s: AstStorage, h: AstNodeId): Int = s.extras[h]
+
+## Sets the int_val field.
+## @param s AstStorage struct
+## @param h Node handle
+## @param val New int_val value
+def ast_set_int_val(s: AstStorage, h: AstNodeId, val: Int): Void
+  s.int_vals[h] = val
+end
+
+## Sets the extra field.
+## @param s AstStorage struct
+## @param h Node handle
+## @param val New extra value
+def ast_set_extra(s: AstStorage, h: AstNodeId, val: Int): Void
+  s.extras[h] = val
+end
+
+## Gets the children vector handle.
+## @param s AstStorage struct
+## @param h Node handle
+## @returns Vector of child node handles
+def ast_get_children(s: AstStorage, h: AstNodeId): Vec = as_vec(s.children[h])
+
+## Raw children-slot handle for a node (the Int stored in `s.children[h]`, which is
+## 0 for childless nodes — `ast_get_children` would `as_vec(0)` it into a junk vec).
+## A generic whole-tree walker must check this is non-zero before treating the slot
+## as a real Vec, so a 0 slot is never reinterpreted as node handles.
+def ast_get_children_raw(s: AstStorage, h: AstNodeId): Int = s.children[h]
+
+## Sets the children vector for a node.
+## @param s AstStorage struct
+## @param h Node handle  
+## @param children New children vector handle
+def ast_set_children(s: AstStorage, h: AstNodeId, children: Vec): Void
+  s.children[h] = children
+end
+
+## Inserts a node at the start of a program's children.
+## Used for injecting prelude import.
+## @param s AstStorage struct
+## @param h Program node handle
+## @param child Node to insert at index 0
+def ast_program_insert_first(s: AstStorage, h: AstNodeId, child: Int): Void
+  var children = ast_get_children(s, h)
+  var count = children.size
+  # Shift all existing items right by 1
+  var new_children = vec_new()
+  new_children.push(child)
+  for i in 0..count
+    new_children.push(children[i])
+  end
+  ast_set_children(s, h, new_children)
+end
+
+## Gets the docstring for a node.
+## @param s AstStorage struct
+## @param h Node handle
+## @returns Documentation string or empty
+def ast_get_doc(s: AstStorage, h: AstNodeId): String = string_intern::intern_resolve_int(s.interner, s.docs[h])
+
+## Sets the docstring for a node.
+## @param s AstStorage struct
+## @param h Node handle
+## @param doc Documentation string
+def ast_set_doc(s: AstStorage, h: AstNodeId, doc: String): Void
+  s.docs[h] = string_intern::intern_id(s.interner, doc)
+end
+
+## Pushes an interned string into str1s.
+def ast_intern_push_str1(s: AstStorage, val: String): Void
+  s.str1s.push(string_intern::intern_id(s.interner, val))
+end
+
+## Pushes an interned string into str2s.
+def ast_intern_push_str2(s: AstStorage, val: String): Void
+  s.str2s.push(string_intern::intern_id(s.interner, val))
+end
+
+## Pushes an interned string into docs.
+def ast_intern_push_doc(s: AstStorage, val: String): Void
+  s.docs.push(string_intern::intern_id(s.interner, val))
+end
+
+## Gets the default value handle for a parameter node.
+## @param s AstStorage struct
+## @param h Parameter node handle
+## @returns Default value expression handle, or 0 if none
+def ast_param_default_value(s: AstStorage, h: AstNodeId): Int = s.ops[h]
+
+## Checks if a parameter is variadic.
+## @param s AstStorage struct
+## @param h Parameter node handle
+## @returns 1 if variadic, 0 otherwise
+def ast_param_is_variadic(s: AstStorage, h: AstNodeId): Int = s.int_vals[h]
+
+## Gets the pattern handle for a parameter node (multi-clause defs).
+## @param s AstStorage struct
+## @param h Parameter node handle
+## @returns Pattern AST handle, or 0 if no pattern
+def ast_param_get_pattern(s: AstStorage, h: AstNodeId): Int = s.lefts[h]
+
+## Sets the pattern handle for a parameter node (multi-clause defs).
+## @param s AstStorage struct
+## @param h Parameter node handle
+## @param pat Pattern AST handle
+def ast_param_set_pattern(s: AstStorage, h: AstNodeId, pat: Int): Void
+  s.lefts[h] = pat
+end
+
+## Receiver-borrow marker for a `self` param (item-20 Phase 7 / WS4-a). Encodes
+## the explicit borrow convention on a method's receiver param, in the otherwise-
+## unused `rights` slot of a NODE_PARAM (params never carry a right child):
+##   0 = bare `self` (or a non-self param) — legacy / inferred behavior
+##   1 = `&self`      (explicit read-borrow — desugars to bare `self`, no flag)
+##   2 = `&mut self`  (explicit mutable borrow — SETS mutates_self_field)
+## Defaults to 0 for every param (the constructor pushes 0 into `rights`), so
+## bare-`self` and non-receiver params are unchanged (byte-identical at gate 0).
+def ast_param_set_receiver_borrow(s: AstStorage, h: AstNodeId, kind: Int): Void
+  s.rights[h] = kind
+end
+
+## Reads the receiver-borrow marker (0=bare, 1=&self, 2=&mut self). See setter.
+def ast_param_receiver_borrow(s: AstStorage, h: AstNodeId): Int = s.rights[h]
+
+# ---------------------------------------------------------------------------
+# Literal Constructors
+# ---------------------------------------------------------------------------
+
+## Creates an integer literal node.
+## @param s AstStorage struct
+## @param value The integer value
+## @param line Source line
+## @param col Source column
+## @returns Node handle
+def ast_int_lit(s: AstStorage, value: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(0)
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(value)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Creates a float literal node.
+## Stores the float string in str1s since the compiler runs on i64-only
+## and cannot convert float values at compile time.
+## @param s AstStorage struct
+## @param text The float literal string (e.g. "3.14", "1.5e3")
+## @param line Source line
+## @param col Source column
+## @returns Node handle
+def ast_float_lit(s: AstStorage, text: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(68)  # NODE_FLOAT_LIT = 68
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, text)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Creates a boolean literal node.
+## @param s AstStorage struct
+## @param value 1 for true, 0 for false
+## @param line Source line
+## @param col Source column
+## @returns Node handle
+def ast_bool_lit(s: AstStorage, value: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(1)
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(value)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Creates a nil literal node.
+## @param s AstStorage struct
+## @param line Source line
+## @param col Source column
+## @returns Node handle
+def ast_nil_lit(s: AstStorage, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(2)  # NODE_NIL_LIT = 2
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Creates a string literal node.
+## @param s AstStorage struct
+## @param value The string content (with quotes stripped)
+## @param line Source line
+## @param col Source column
+## @returns Node handle
+def ast_string_lit(s: AstStorage, value: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(3)  # NODE_STRING_LIT = 3
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, value)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Creates a symbol literal node.
+## Symbols are atomic values like `:ok`, `:error`.
+## @param s AstStorage struct
+## @param name Symbol name (without leading colon)
+## @param line Source line
+## @param col Source column
+## @returns Node handle
+def ast_symbol_lit(s: AstStorage, name: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(4)  # NODE_SYMBOL_LIT = 4
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, name)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Creates an identifier node.
+## Used for variable references and names.
+## @param s AstStorage struct
+## @param name Identifier text
+## @param line Source line
+## @param col Source column
+## @returns Node handle
+def ast_ident(s: AstStorage, name: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(6)  # NODE_IDENT = 6
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, name)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Creates a function reference node.
+## Used for first-class function references with `&func` syntax.
+## @param s AstStorage struct
+## @param name Function name to reference
+## @param line Source line
+## @param col Source column
+## @returns Node handle
+# NodeFuncRef = 18 - function reference (&funcname syntax)
+# Stores function name the same way as NodeIdent (in str1/slot 4)
+def ast_func_ref(s: AstStorage, name: String, is_mut: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(18)  # NODE_FUNC_REF = 18
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_mut)
+  ast_intern_push_str1(s, name)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Creates a projected data-borrow node `&mut p.f` / `&p.f` / `&mut a[i]`.
+## Unlike ast_func_ref (which collapses the operand to a bare name string),
+## this carries the FULLY-LOWERED operand place-expression (NODE_FIELD_ACCESS /
+## NODE_INDEX subtree) in `left`, so the exclusivity checker can reason about
+## the projected place. int_val = is_mut (1 for `&mut`, 0 for `&`).
+## @param s AstStorage struct
+## @param operand Fully-lowered operand place node (field access / index)
+## @param is_mut 1 iff `&mut`, else 0
+## @param line Source line
+## @param col Source column
+## @returns Node handle
+def ast_borrow(s: AstStorage, operand: Int, is_mut: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(102)  # NODE_BORROW = 102
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_mut)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(operand)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Creates a binary expression node.
+## Used for all two-operand expressions (+, -, ==, etc.).
+## @param s AstStorage struct
+## @param left Left operand handle
+## @param op OpKind value
+## @param right Right operand handle
+## @param line Source line
+## @param col Source column
+## @returns Node handle
+def ast_binary(s: AstStorage, left: Int, op: Int, right: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(8)  # NODE_BINARY = 8
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(op)
+  s.lefts.push(left)
+  s.rights.push(right)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Creates a unary expression node.
+## Used for single-operand expressions (-, !, ~).
+## @param s AstStorage struct
+## @param op OpKind value
+## @param operand Operand handle
+## @param line Source line
+## @param col Source column
+## @returns Node handle
+def ast_unary(s: AstStorage, op: Int, operand: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(7)  # NODE_UNARY = 7
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(op)
+  s.lefts.push(operand)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Creates a function call node.
+## @param s AstStorage struct
+## @param callee Expression to call (identifier or expression)
+## @param args Vector of argument handles
+## @param line Source line
+## @param col Source column
+## @returns Node handle
+def ast_call(s: AstStorage, callee: Int, args: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(9)  # NODE_CALL = 9
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)  # str2 / type_arg for typed calls
+  s.ops.push(0)
+  s.lefts.push(callee)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(args)
+  s.docs.push(0)
+  return h
+end
+
+## ast_call_with_type_arg() - Create a typed function call node
+## 
+## For typed intrinsics like arena_alloc<Point>(arena)
+##
+## @param s AstStorage struct
+## @param callee Expression to call (identifier or expression)
+## @param type_arg Type argument string (e.g., "Point")
+## @param args Vector of argument handles
+## @param line Source line
+## @param col Source column
+## @returns Node handle
+def ast_call_with_type_arg(s: AstStorage, callee: Int, type_arg: String, args: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(9)  # NODE_CALL = 9
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  ast_intern_push_str2(s, type_arg)  # str2 stores type_arg for typed calls
+  s.ops.push(0)
+  s.lefts.push(callee)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(args)
+  s.docs.push(0)
+  return h
+end
+
+## ast_get_type_arg() - Get type argument for a typed call
+## 
+## Returns empty string if no type argument
+def ast_get_type_arg(s: AstStorage, h: AstNodeId): String = string_intern::intern_resolve_int(s.interner, s.str2s[h])
+
+## ast_call_set_is_ufcs() - Mark a call as coming from UFCS syntax
+##
+## Used to distinguish module.function(args) from legitimate calls
+## where first arg happens to match a module name.
+## Stores value in extras field (0 = not UFCS, nonzero = UFCS)
+def ast_call_set_is_ufcs(s: AstStorage, h: AstNodeId, val: Int): Void
+  ast_set_extra(s, h, val)
+end
+
+## ast_call_is_ufcs() - Check if call came from UFCS syntax
+def ast_call_is_ufcs(s: AstStorage, h: AstNodeId): Int = ast_get_extra(s, h)
+
+## ast_call_set_arg_names() - Store named argument names for a call node
+## names is a Vec<String> handle (as Int), 0 if no named args.
+## Each entry: "" for positional, "param_name" for named.
+def ast_call_set_arg_names(s: AstStorage, h: AstNodeId, names: Int): Void
+  s.ops[h] = names
+end
+
+## ast_call_get_arg_names() - Get named argument names for a call node
+## Returns Vec<String> handle (as Int), 0 if no named args.
+def ast_call_get_arg_names(s: AstStorage, h: AstNodeId): Int = s.ops[h]
+
+## ast_call_set_default_mask() - Store bitmask of parameter slots that need defaults
+## Bit i = 1 means param i should use its default value (named arg gap).
+def ast_call_set_default_mask(s: AstStorage, h: AstNodeId, mask: Int): Void
+  s.rights[h] = mask
+end
+
+## ast_call_get_default_mask() - Get bitmask of parameter slots needing defaults
+def ast_call_get_default_mask(s: AstStorage, h: AstNodeId): Int = s.rights[h]
+
+def ast_array(s: AstStorage, elements: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(10)  # NODE_ARRAY = 10
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(elements)
+  s.docs.push(0)
+  return h
+end
+
+def ast_interp_string(s: AstStorage, parts: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(43)  # NODE_INTERP_STRING
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(parts)
+  s.docs.push(0)
+  return h
+end
+
+def ast_spread(s: AstStorage, inner: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(82)  # NODE_SPREAD = 82
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(inner)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+def ast_set_literal(s: AstStorage, elements: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(11)  # NODE_SET_LITERAL = 11
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(elements)
+  s.docs.push(0)
+  return h
+end
+
+def ast_map_lit(s: AstStorage, keys: Int, values: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(12)  # NODE_MAP_LIT = 12
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(keys)
+  s.children.push(values)
+  s.docs.push(0)
+  return h
+end
+
+def ast_index(s: AstStorage, base: Int, index: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(13)  # NODE_INDEX = 13
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(base)
+  s.rights.push(index)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+def ast_field_access(s: AstStorage, base: Int, field: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(15)  # NODE_FIELD_ACCESS = 15
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, field)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(base)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+# ast_enum_access: Enum::Variant or pattern with bindings
+# - enum_name: The enum type name
+# - variant: The variant name  
+# - bound_names: Vector of string pointers for pattern bindings (when Some(x) -> x is bound)
+# - payloads: Vector of AST handles for construction expressions (Option::Some(expr))
+def ast_enum_access(s: AstStorage, enum_name: String, variant: String, bound_names: Int, payloads: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(39)  # NODE_ENUM_ACCESS = 39
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, enum_name)
+  ast_intern_push_str2(s, variant)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(bound_names)
+  s.children.push(payloads)
+  s.docs.push(0)
+  return h
+end
+
+# Is-check expression: expr is VariantName or expr is VariantName(bindings)
+# left = subject expression handle
+# str1 = variant name (e.g. "Some", "Err")
+# extras = bound_names Vec (0 for simple check, Vec of as_int(name) for bindings)
+def ast_is_check(s: AstStorage, subject: Int, variant_name: String, bound_names: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(92)  # NODE_IS_CHECK = 92
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, variant_name)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(subject)
+  s.rights.push(0)
+  s.extras.push(bound_names)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+# Get bound_names vector for enum_access pattern matching
+def ast_get_bound_names(s: AstStorage, h: AstNodeId): Vec = as_vec(s.extras[h])
+
+# Get enum name for enum_access (slot 4)
+def ast_get_enum_name(s: AstStorage, h: AstNodeId): String = string_intern::intern_resolve_int(s.interner, s.str1s[h])
+
+# Get variant name for enum_access (slot 5)
+def ast_get_variant(s: AstStorage, h: AstNodeId): String = string_intern::intern_resolve_int(s.interner, s.str2s[h])
+
+# Get payloads vector for enum_access constructor (slot 10)
+def ast_get_payloads(s: AstStorage, h: AstNodeId): Vec = as_vec(s.children[h])
+
+# Get keys vector for map literal (slot 9)
+def ast_get_map_keys(s: AstStorage, h: AstNodeId): Vec = as_vec(s.extras[h])
+
+# Get values vector for map literal (slot 10)
+def ast_get_map_values(s: AstStorage, h: AstNodeId): Vec = as_vec(s.children[h])
+
+def ast_struct_init(s: AstStorage, struct_name: String, fields: Int, field_names: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(14)  # NODE_STRUCT_INIT = 14
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, struct_name)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(field_names)  # Store field_names Vec handle
+  s.children.push(fields)
+  s.docs.push(0)
+  return h
+end
+
+def ast_struct_init_generic(s: AstStorage, struct_name: String, type_args: String, fields: Int, field_names: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(14)  # NODE_STRUCT_INIT = 14
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, struct_name)
+  ast_intern_push_str2(s, type_args)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(field_names)  # Store field_names Vec handle
+  s.children.push(fields)
+  s.docs.push(0)
+  return h
+end
+
+# Get field names vector for struct init (slot 9: extras)
+def ast_get_struct_init_field_names(s: AstStorage, h: AstNodeId): Vec = as_vec(s.extras[h])
+
+def ast_lambda(s: AstStorage, params: Int, return_type: String, body: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(19)  # NODE_LAMBDA = 19
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, return_type)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(params)
+  s.rights.push(body)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+def ast_block(s: AstStorage, stmts: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(32)  # NODE_BLOCK = 32
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(stmts)
+  s.docs.push(0)
+  return h
+end
+
+## Creates an arena block node: `arena name do ... end`
+## @param s AstStorage struct
+## @param name Arena name identifier
+## @param stmts Body statements vector
+## @param line Source line
+## @param col Source column
+## @returns Node handle
+def ast_arena_block(s: AstStorage, name: String, stmts: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(62)  # NODE_ARENA_BLOCK = 62
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, name)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(stmts)
+  s.docs.push(0)
+  return h
+end
+
+def ast_if(s: AstStorage, cond: Int, then_branch: Int, else_branch: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(23)  # NODE_IF = 23
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(cond)
+  s.rights.push(then_branch)
+  s.extras.push(else_branch)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+def ast_while(s: AstStorage, cond: Int, body: Int, label: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(24)  # NODE_WHILE = 24
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, label)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(cond)
+  s.rights.push(body)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+def ast_for(s: AstStorage, var_name: String, iter: Int, body: Int, label: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(44)  # NODE_FOR = 44
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, var_name)
+  ast_intern_push_str2(s, label)
+  s.ops.push(0)
+  s.lefts.push(iter)
+  s.rights.push(body)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+# For-await loop: for await x in channel — async iterator over channel
+# Layout: str1=binding_name, left=channel_expr, right=body
+def ast_for_await(s: AstStorage, var_name: String, channel: Int, body: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(86)  # NODE_FOR_AWAIT = 86
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, var_name)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(channel)
+  s.rights.push(body)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+# List comprehension: [expr for var in iter if cond]
+# Layout: left=expr, str1=var_name, right=iter, extra=cond (0 if no condition)
+def ast_list_comp(s: AstStorage, expr: Int, var_name: String, iterable: Int, condition: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(46)           # NODE_LIST_COMP = 46
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)           # int_vals
+  ast_intern_push_str1(s, var_name)  # str1 = var_name
+  s.str2s.push(0)           # str2
+  s.ops.push(0)           # ops
+  s.lefts.push(expr)        # left = expression
+  s.rights.push(iterable)    # right = iterable
+  s.extras.push(condition)   # extra = condition (0 if none)
+  s.children.push(0)          # children
+  s.docs.push(0)          # docs
+  return h
+end
+
+# Set comprehension: {expr for var in iter if cond}
+# Layout: left=expr, right=iterable, str1=var_name, extra=condition (0 if none)
+def ast_set_comp(s: AstStorage, expr: Int, var_name: String, iterable: Int, condition: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(48)           # NODE_SET_COMP = 48
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)           # int_vals
+  ast_intern_push_str1(s, var_name)  # str1 = var_name
+  s.str2s.push(0)           # str2
+  s.ops.push(0)           # ops
+  s.lefts.push(expr)        # left = expression
+  s.rights.push(iterable)    # right = iterable
+  s.extras.push(condition)   # extra = condition (0 if none)
+  s.children.push(0)          # children
+  s.docs.push(0)          # docs
+  return h
+end
+
+# Map comprehension: {key_expr => val_expr for var in iter if cond}
+# Layout: left=key_expr, right=val_expr, str1=var_name, extra=iter, children[0]=cond (0 if none)
+def ast_map_comp(s: AstStorage, key_expr: Int, val_expr: Int, var_name: String, iterable: Int, condition: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(47)           # NODE_MAP_COMP = 47
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)           # int_vals
+  ast_intern_push_str1(s, var_name)  # str1 = var_name
+  s.str2s.push(0)           # str2
+  s.ops.push(0)           # ops
+  s.lefts.push(key_expr)    # left = key expression
+  s.rights.push(val_expr)    # right = value expression
+  s.extras.push(iterable)    # extra = iterable
+  # Store condition in a children vec
+  var cond_vec = vec_new()
+  if condition != 0
+    cond_vec.push(condition)
+  end
+  s.children.push(as_int_generic(cond_vec))   # children = [cond] or []
+  s.docs.push(0)          # docs
+  return h
+end
+
+def ast_match(s: AstStorage, expr: Int, arms: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(40)  # NODE_MATCH = 40
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(expr)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(arms)
+  s.docs.push(0)
+  return h
+end
+
+def ast_match_arm(s: AstStorage, pattern: Int, guard: Int, body: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(41)  # NODE_MATCH_ARM = 41
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(pattern)
+  s.rights.push(body)
+  s.extras.push(guard)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+def ast_let(s: AstStorage, name: String, type_ann: String, value: Int, is_mut: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(25)  # NODE_LET = 25
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_mut)
+  ast_intern_push_str1(s, name)
+  ast_intern_push_str2(s, type_ann)
+  s.ops.push(0)
+  s.lefts.push(value)      # FIX: Store value in slot 7 (left)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Create a regex literal node (NODE_REGEX_LIT = 5).
+## Stores the regex pattern in str1 slot.
+## @param s AST storage
+## @param pattern Regex pattern string
+## @param line Source line
+## @param col Source column
+## @returns Node handle
+def ast_regex_lit(s: AstStorage, pattern: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(5)  # NODE_REGEX_LIT = 5
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, pattern)  # str1 = pattern
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+def ast_assign(s: AstStorage, target: String, value: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(26)  # NODE_ASSIGN = 26
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, target)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(value)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+# Creates an index assignment node: arr[idx] = val
+# NODE_INDEX_ASSIGN = 27 (C-aligned)
+# left = array, right = index, extra = value
+def ast_index_assign(s: AstStorage, array: Int, index: Int, value: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(27)  # NODE_INDEX_ASSIGN = 27
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(array)   # left = array
+  s.rights.push(index)   # right = index
+  s.extras.push(value)   # extra = value
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+# Creates a field assignment node: obj.field = val
+# NODE_FIELD_ASSIGN = 28 (C-aligned)
+# left = object, str1 = field name, extra = value
+def ast_field_assign(s: AstStorage, obj: Int, field: String, value: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(28)  # NODE_FIELD_ASSIGN = 28
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, field)  # field name
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(obj)    # left = object
+  s.rights.push(0)
+  s.extras.push(value)  # extra = value
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+def ast_return(s: AstStorage, value: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(22)  # NODE_RETURN = 22
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(value)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+def ast_break(s: AstStorage, label: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(30)  # NODE_BREAK = 30
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, label)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+def ast_continue(s: AstStorage, label: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(31)  # NODE_CONTINUE = 31
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, label)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+def ast_expr_stmt(s: AstStorage, expr: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(29)  # NODE_EXPR_STMT = 29
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(expr)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+def ast_param(s: AstStorage, name: String, type_ann: String, is_variadic: Int, default_value: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(33)  # NODE_PARAM = 33
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_variadic)
+  ast_intern_push_str1(s, name)
+  ast_intern_push_str2(s, type_ann)
+  s.ops.push(default_value)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+def ast_function(s: AstStorage, name: String, params: Int, return_type: String, body: Int, is_private: Int, type_params: String, type_param_bounds: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(34)  # NODE_FUNCTION = 34
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_private)
+  ast_intern_push_str1(s, name)
+  ast_intern_push_str2(s, return_type)
+  s.ops.push(as_int(type_params))
+  s.lefts.push(params)
+  s.rights.push(body)
+  s.extras.push(as_int(type_param_bounds))
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Get function type parameters (e.g., "T,U" from "<T: Eq, U: Ord>")
+def ast_func_type_params(s: AstStorage, node: AstNodeId): String = as_string(s.ops[node])
+
+## Get function type parameter bounds (e.g., "T:Eq,U:Ord")
+def ast_func_type_param_bounds(s: AstStorage, node: AstNodeId): String = as_string(s.extras[node])
+
+## Mark function as @naked (no prologue/epilogue)
+def ast_func_set_naked(s: AstStorage, node: AstNodeId): Void
+  s.children[node] = 1
+end
+
+## Check if function is @naked
+## Returns 1 only when children[h] == 1 (not guard-encoded values >= 2)
+def ast_func_is_naked(s: AstStorage, node: AstNodeId): Int
+  if s.children[node] == 1
+    return 1
+  end
+  return 0
+end
+
+## Attach an effect-row annotation to a function node.
+## Operation Piezoelectric Effects, Phase 1, Milestone B (chunk B.3).
+##
+## - labels: list of effect-label NAMES (post-resolve, no generic args).
+##   May be empty when the source is a bare `can` clause.
+## - tail: tail-variable identifier, or "" for a closed row.
+##
+## Stores in three sparse parallel side-tables. Lazily extended so callers
+## need not know the high-water-mark node handle.
+def ast_func_set_can_row(s: AstStorage, node: AstNodeId, labels: Vec<String>, tail: String): Void
+  var idx = 0 + node
+  while s.func_can_present.size <= idx
+    s.func_can_present.push(0)
+    s.func_can_label_strs.push("")
+    s.func_can_tail_strs.push("")
+  end
+  s.func_can_present[idx] = 1
+  var csv = ""
+  var n = labels.size
+  for i in 0..n
+    if i > 0
+      csv = csv + ","
+    end
+    csv = csv + labels[i]
+  end
+  s.func_can_label_strs[idx] = csv
+  s.func_can_tail_strs[idx] = tail
+end
+
+## Returns 1 if a `can` clause was attached to this function, else 0.
+def ast_func_has_can_row(s: AstStorage, node: AstNodeId): Int
+  var idx = 0 + node
+  if idx < s.func_can_present.size
+    return s.func_can_present[idx]
+  end
+  return 0
+end
+
+## Returns the comma-joined CSV of effect-label names for this function.
+## Empty string means either no `can` clause OR a `can` with no labels —
+## use ast_func_has_can_row to disambiguate.
+def ast_func_get_can_label_csv(s: AstStorage, node: AstNodeId): String
+  var idx = 0 + node
+  if idx < s.func_can_label_strs.size
+    return s.func_can_label_strs[idx]
+  end
+  return ""
+end
+
+## Returns the tail-variable identifier ("" = closed row).
+def ast_func_get_can_tail(s: AstStorage, node: AstNodeId): String
+  var idx = 0 + node
+  if idx < s.func_can_tail_strs.size
+    return s.func_can_tail_strs[idx]
+  end
+  return ""
+end
+
+## Mark a NODE_CALL as an effect-op invocation discovered by the
+## typechecker's C.3 op-detection block. `effect_name` is the effect
+## that declares this op; `op_name` is redundant today (equals callee's
+## str1) but stored alongside so mir_lower and codegen need not reach
+## back into the NODE_CALL subtree.
+## Operation Piezoelectric Effects, Phase 1, Milestone C (chunk C.4).
+def ast_mark_op_call(s: AstStorage, node: AstNodeId, effect_name: String, op_name: String): Void
+  var idx = 0 + node
+  while s.op_call_effect_names.size <= idx
+    s.op_call_effect_names.push("")
+    s.op_call_op_names.push("")
+  end
+  while s.op_call_kinds.size <= idx
+    s.op_call_kinds.push(1)
+  end
+  s.op_call_effect_names[idx] = effect_name
+  s.op_call_op_names[idx] = op_name
+end
+
+## Record the classified kind for an already-marked op call. Piezo F.3b.
+## Kind values mirror the typecheck registry's effect_decl_op_kinds:
+##   0  zero-param op, no resume (value kind per memo §2.1)
+##   1  has params, no resume / tail-only resume (function kind §2.2)
+##   2  body calls resume / operation kind (§2.3) — unwinds via longjmp
+def ast_mark_op_call_kind(s: AstStorage, node: AstNodeId, k: Int): Void
+  var idx = 0 + node
+  while s.op_call_kinds.size <= idx
+    s.op_call_kinds.push(1)
+  end
+  s.op_call_kinds[idx] = k
+end
+
+## Returns the classified op-call kind; default 1 (tail) for unset entries.
+def ast_op_call_kind(s: AstStorage, node: AstNodeId): Int
+  var idx = 0 + node
+  if idx < s.op_call_kinds.size
+    return s.op_call_kinds[idx]
+  end
+  return 1
+end
+
+## Returns 1 if this NODE_CALL was marked as an effect-op call (C.4).
+def ast_is_op_call(s: AstStorage, node: AstNodeId): Int
+  var idx = 0 + node
+  if idx < s.op_call_effect_names.size
+    if str_byte_len(s.op_call_effect_names[idx]) > 0
+      return 1
+    end
+  end
+  return 0
+end
+
+## Returns the effect name of an op-call annotation ("" if unmarked).
+def ast_op_call_effect_name(s: AstStorage, node: AstNodeId): String
+  var idx = 0 + node
+  if idx < s.op_call_effect_names.size
+    return s.op_call_effect_names[idx]
+  end
+  return ""
+end
+
+## Returns the op name of an op-call annotation ("" if unmarked).
+def ast_op_call_op_name(s: AstStorage, node: AstNodeId): String
+  var idx = 0 + node
+  if idx < s.op_call_op_names.size
+    return s.op_call_op_names[idx]
+  end
+  return ""
+end
+
+## Mark function as extern "C" def with body (C calling convention).
+## Uses effect_annotations bit 2048 to piggy-back on the existing parallel
+## side-table (same pattern as @no_preempt at bit 1024).
+def ast_func_set_cconv_c(s: AstStorage, h: AstNodeId): Void
+  var idx = 0 + h
+  while s.effect_annotations.size <= idx
+    s.effect_annotations.push(0)
+  end
+  s.effect_annotations[idx] = s.effect_annotations[idx] | 2048
+end
+
+## Check if function uses C calling convention (extern "C" def with body).
+def ast_func_is_cconv_c(s: AstStorage, node: AstNodeId): Int
+  var idx = 0 + node
+  if idx < s.effect_annotations.size
+    if s.effect_annotations[idx] & 2048 > 0
+      return 1
+    end
+  end
+  return 0
+end
+
+## Mark function as @weak — emit with LLVM weak linkage so a
+## non-weak definition at link time overrides it. Used for kernel
+## stubs (panic_handler, scheduler hooks, allocator slots) and any
+## "default can be replaced" pattern. Bit 4096 of effect_annotations.
+def ast_func_set_weak(s: AstStorage, h: AstNodeId): Void
+  var idx = 0 + h
+  while s.effect_annotations.size <= idx
+    s.effect_annotations.push(0)
+  end
+  s.effect_annotations[idx] = s.effect_annotations[idx] | 4096
+end
+
+## Check if function is marked @weak.
+def ast_func_is_weak(s: AstStorage, node: AstNodeId): Int
+  var idx = 0 + node
+  if idx < s.effect_annotations.size
+    if s.effect_annotations[idx] & 4096 > 0
+      return 1
+    end
+  end
+  return 0
+end
+
+## Mark function as @panic_handler — the program's single panic
+## handler. At every prelude panic site, the compiler emits a direct
+## call to this function instead of the libc write/longjmp/exit path.
+## Used by kernel / unikernel / embedded builds. Bit 8192.
+def ast_func_set_panic_handler(s: AstStorage, h: AstNodeId): Void
+  var idx = 0 + h
+  while s.effect_annotations.size <= idx
+    s.effect_annotations.push(0)
+  end
+  s.effect_annotations[idx] = s.effect_annotations[idx] | 8192
+end
+
+## Check if function is the @panic_handler.
+def ast_func_is_panic_handler(s: AstStorage, node: AstNodeId): Int
+  var idx = 0 + node
+  if idx < s.effect_annotations.size
+    if s.effect_annotations[idx] & 8192 > 0
+      return 1
+    end
+  end
+  return 0
+end
+
+## Mark function as using the `x86-interrupt` calling convention.
+## LLVM emits `define x86_intrcc void @...` — the backend adds the
+## interrupt prologue/epilogue (`iret` on exit, pointer argument is
+## the hardware-pushed interrupt stack frame). Used exclusively for
+## kernel interrupt service routines in IDT entries. Bit 16384.
+def ast_func_set_cconv_x86_intr(s: AstStorage, h: AstNodeId): Void
+  var idx = 0 + h
+  while s.effect_annotations.size <= idx
+    s.effect_annotations.push(0)
+  end
+  s.effect_annotations[idx] = s.effect_annotations[idx] | 16384
+end
+
+## Check if function uses x86-interrupt calling convention.
+def ast_func_is_cconv_x86_intr(s: AstStorage, node: AstNodeId): Int
+  var idx = 0 + node
+  if idx < s.effect_annotations.size
+    if s.effect_annotations[idx] & 16384 > 0
+      return 1
+    end
+  end
+  return 0
+end
+
+## Mark function as using LLVM `preserve_allcc` calling convention.
+## The callee is responsible for saving/restoring almost all registers
+## across the call. Useful for slow-path helpers invoked from fast
+## paths where the caller doesn't want its register state disturbed.
+## Prior art: Swift runtime, GHC's STG-invoke path. Bit 32768.
+def ast_func_set_cconv_preserve_all(s: AstStorage, h: AstNodeId): Void
+  var idx = 0 + h
+  while s.effect_annotations.size <= idx
+    s.effect_annotations.push(0)
+  end
+  s.effect_annotations[idx] = s.effect_annotations[idx] | 32768
+end
+
+## Check if function uses preserve_all calling convention.
+def ast_func_is_cconv_preserve_all(s: AstStorage, node: AstNodeId): Int
+  var idx = 0 + node
+  if idx < s.effect_annotations.size
+    if s.effect_annotations[idx] & 32768 > 0
+      return 1
+    end
+  end
+  return 0
+end
+
+## Mark function as using LLVM `preserve_mostcc` calling convention.
+## Similar to preserve_all but spares the most-used argument registers
+## from the save list, so "most" callee-saved is a slight misnomer —
+## in practice the ABI saves nearly everything except the first few
+## argument regs. Used by trap / fault / interrupt-entry trampolines
+## that do arg setup and tail-call into a normal-cconv handler.
+## Bit 65536.
+def ast_func_set_cconv_preserve_most(s: AstStorage, h: AstNodeId): Void
+  var idx = 0 + h
+  while s.effect_annotations.size <= idx
+    s.effect_annotations.push(0)
+  end
+  s.effect_annotations[idx] = s.effect_annotations[idx] | 65536
+end
+
+## Check if function uses preserve_most calling convention.
+def ast_func_is_cconv_preserve_most(s: AstStorage, node: AstNodeId): Int
+  var idx = 0 + node
+  if idx < s.effect_annotations.size
+    if s.effect_annotations[idx] & 65536 > 0
+      return 1
+    end
+  end
+  return 0
+end
+
+## Mark function as @export — expose under its source name in the
+## WASM backend's export section so the host environment (JS, wasmtime)
+## can call it directly. No effect on LLVM backend (all top-level defs
+## already have external linkage there). Bit 131072.
+def ast_func_set_export(s: AstStorage, h: AstNodeId): Void
+  var idx = 0 + h
+  while s.effect_annotations.size <= idx
+    s.effect_annotations.push(0)
+  end
+  s.effect_annotations[idx] = s.effect_annotations[idx] | 131072
+end
+
+## Check if function is marked @export.
+def ast_func_is_export(s: AstStorage, node: AstNodeId): Int
+  var idx = 0 + node
+  if idx < s.effect_annotations.size
+    if s.effect_annotations[idx] & 131072 > 0
+      return 1
+    end
+  end
+  return 0
+end
+
+## Mark function as @noinline — emit with the LLVM `noinline` function
+## attribute so the optimizer never inlines call sites. Used for: secure
+## scrub helpers (zeroize) where defense-in-depth against future optimizer
+## changes is wanted; benchmark harnesses where the timer must not be
+## folded into the measured body; boundary functions for stable backtraces.
+## Note: `volatile` IR primitives carry their own no-DCE guarantee independent
+## of inlining, so @noinline on a volatile-only function is belt-and-suspenders,
+## not load-bearing. Bit 262144.
+def ast_func_set_noinline(s: AstStorage, h: AstNodeId): Void
+  var idx = 0 + h
+  while s.effect_annotations.size <= idx
+    s.effect_annotations.push(0)
+  end
+  s.effect_annotations[idx] = s.effect_annotations[idx] | 262144
+end
+
+## Check if function is marked @noinline.
+def ast_func_is_noinline(s: AstStorage, node: AstNodeId): Int
+  var idx = 0 + node
+  if idx < s.effect_annotations.size
+    if s.effect_annotations[idx] & 262144 > 0
+      return 1
+    end
+  end
+  return 0
+end
+
+## Mark function as @ct — constant-time contract. The Layer 3 MIR taint pass
+## (`self-hosted/middle/ct_taint.qz`, NET.4 Layer 3) treats this function as a
+## CT region: every Secret<T>-typed parameter is a taint source, and the pass
+## rejects branches / array indices / comparisons / variable shifts whose
+## operand is taint-derived. Outside `@ct`, the typecheck-time strict-newtype
+## rejections (Layer 1) are the only enforcement. Bit 524288.
+def ast_func_set_ct(s: AstStorage, h: AstNodeId): Void
+  var idx = 0 + h
+  while s.effect_annotations.size <= idx
+    s.effect_annotations.push(0)
+  end
+  s.effect_annotations[idx] = s.effect_annotations[idx] | 524288
+end
+
+## Check if function is marked @ct.
+def ast_func_is_ct(s: AstStorage, node: AstNodeId): Int
+  var idx = 0 + node
+  if idx < s.effect_annotations.size
+    if s.effect_annotations[idx] & 524288 > 0
+      return 1
+    end
+  end
+  return 0
+end
+
+## Gets the guard expression handle for a function (multi-clause defs).
+## children[h] encoding: 0=none, 1=@naked, >=2 → guard handle = children[h] - 2
+## @returns Guard expression handle, or -1 if no guard
+def ast_func_get_guard(s: AstStorage, h: AstNodeId): Int
+  if s.children[h] >= 2
+    return s.children[h] - 2
+  end
+  return -1
+end
+
+## Sets the guard expression handle for a function (multi-clause defs).
+## @param guard Guard expression handle
+def ast_func_set_guard(s: AstStorage, h: AstNodeId, guard: Int): Void
+  s.children[h] = guard + 2
+end
+
+## Get the effect annotation bitset for a function node.
+## Returns 0 if no effect annotation was specified (infer effects).
+def ast_func_get_effect_annotation(s: AstStorage, h: AstNodeId): Int
+  var idx = 0 + h
+  if idx < s.effect_annotations.size
+    return s.effect_annotations[idx]
+  end
+  return 0
+end
+
+## Set the effect annotation bitset for a function node.
+## Called by the parser when @pure, @io, or @suspend annotations are present.
+## Lazily extends the Vec to accommodate the node handle.
+def ast_func_set_effect_annotation(s: AstStorage, h: AstNodeId, effects: Int): Void
+  var idx = 0 + h
+  while s.effect_annotations.size <= idx
+    s.effect_annotations.push(0)
+  end
+  s.effect_annotations[idx] = effects
+end
+
+## Check if function has @no_preempt attribute (bit 1024 in effect_annotations).
+def ast_func_is_no_preempt(s: AstStorage, h: AstNodeId): Int
+  var idx = 0 + h
+  if idx < s.effect_annotations.size
+    if s.effect_annotations[idx] & 1024 > 0
+      return 1
+    end
+  end
+  return 0
+end
+
+def ast_struct_def(s: AstStorage, name: String, fields: Int, type_params: String, is_private: Int, repr_c: Int, packed: Int, is_linear: Int, is_value: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(36)  # NODE_STRUCT_DEF = 36
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_private)
+  ast_intern_push_str1(s, name)
+  ast_intern_push_str2(s, type_params)
+  s.ops.push(repr_c)
+  s.lefts.push(is_value)
+  s.rights.push(is_linear)
+  s.extras.push(packed)
+  s.children.push(fields)
+  s.docs.push(0)
+  return h
+end
+
+## Get repr_c flag from struct_def (stored in ops slot)
+def ast_struct_get_repr_c(s: AstStorage, node: AstNodeId): Int = s.ops[node]
+
+## Get is_value flag from struct_def (stored in lefts slot)
+def ast_struct_is_value(s: AstStorage, node: AstNodeId): Int = s.lefts[node]
+
+## SYS.1 item 4 — struct-level alignment registry. Parallel to the
+## AST node handle array; index = struct node handle, value = requested
+## alignment in bytes (0 = no explicit alignment). Separate from
+## effect_annotations because structs need an arbitrary integer value,
+## not a bitset, and because the per-node slots are already claimed
+## (ops, lefts, rights, extras, children, docs).
+var _g_ast_struct_aligns = vec_new<Int>()
+
+## Mark a struct as requesting @align(N) alignment. N must be a power
+## of 2 ≥ 1; parser validates at source. Affects non-escaped @value
+## struct allocas at codegen time; heap-allocated structs are
+## unchanged (malloc gives 16-byte alignment regardless).
+def ast_struct_set_align(s: AstStorage, h: AstNodeId, align: Int): Void
+  var idx = 0 + h
+  while _g_ast_struct_aligns.size <= idx
+    _g_ast_struct_aligns.push(0)
+  end
+  _g_ast_struct_aligns[idx] = align
+end
+
+## Get the requested alignment of a struct, or 0 if none.
+def ast_struct_get_align(s: AstStorage, node: AstNodeId): Int
+  var idx = 0 + node
+  if idx < _g_ast_struct_aligns.size
+    return _g_ast_struct_aligns[idx]
+  end
+  return 0
+end
+
+def ast_field_def(s: AstStorage, name: String, type_ann: String, default_value: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(37)  # NODE_FIELD_DEF = 37
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, name)
+  ast_intern_push_str2(s, type_ann)
+  s.ops.push(0)
+  s.lefts.push(default_value)  # left: default value expression (0 = none)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Get field default value expression (0 = no default)
+def ast_field_default(s: AstStorage, node: AstNodeId): Int = s.lefts[node]
+
+## Create a NODE_BINARY_BLOCK: `type Name = binary { ... }`
+## name     - type name
+## fields   - Vec of NODE_BINARY_FIELD handles
+def ast_binary_block(s: AstStorage, name: String, fields: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(93)  # NODE_BINARY_BLOCK = 93
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, name)
+  ast_intern_push_str2(s, "")
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(fields)
+  s.docs.push(0)
+  return h
+end
+
+## Create a NODE_PACKED_STRUCT: `packed struct(uN) Name ... end`
+## name            - type name
+## backing_width   - integer width (8 / 16 / 32 / 64)
+## fields          - Vec of NODE_BINARY_FIELD handles
+def ast_packed_struct(s: AstStorage, name: String, backing_width: Int, fields: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(94)  # NODE_PACKED_STRUCT = 94
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(backing_width)
+  ast_intern_push_str1(s, name)
+  ast_intern_push_str2(s, "")
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(fields)
+  s.docs.push(0)
+  return h
+end
+
+## Create a NODE_BINARY_WITH: `value.with { field = expr; ... }` immutable
+## update on a packed struct (Binary DSL STEP 5).
+## base     - receiver expression (left slot)
+## children - vec of NODE_ASSIGN nodes (str1=field_name, left=value)
+def ast_binary_with(s: AstStorage, base: Int, children: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(96)  # NODE_BINARY_WITH = 96
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(base)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(children)
+  s.docs.push(0)
+  return h
+end
+
+## Create a NODE_TYPE_CAST: `expr as TypeName` — Binary DSL STEP 3 bitcast
+## between a packed struct and its backing integer.
+## base        - source expression (left slot)
+## target_type - target type name string (str1)
+def ast_type_cast(s: AstStorage, base: Int, target_type: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(97)  # NODE_TYPE_CAST = 97
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, target_type)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(base)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Create a NODE_BINARY_FIELD: a field inside `binary {}` or `packed struct(uN)`.
+## name       - field name ("_" for anonymous pad)
+## type_spec  - serialized type descriptor (e.g. "u4", "u16be", "[Entry;count]")
+## bit_width  - bit width when statically known (0 if variable)
+def ast_binary_field(s: AstStorage, name: String, type_spec: String, bit_width: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(95)  # NODE_BINARY_FIELD = 95
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(bit_width)
+  ast_intern_push_str1(s, name)
+  ast_intern_push_str2(s, type_spec)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Create a NODE_BINARY_UNION: `match <discriminator> ... end` inside a binary
+## block. Phase 2 Track B. discriminator = prior field name (str1).
+## arms = Vec<NODE_BINARY_UNION_ARM>.
+def ast_binary_union(s: AstStorage, discriminator: String, arms: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(98)  # NODE_BINARY_UNION = 98
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, discriminator)
+  ast_intern_push_str2(s, "")
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(arms)
+  s.docs.push(0)
+  return h
+end
+
+## Create a NODE_BINARY_UNION_ARM: one arm of a discriminated union. tag_value
+## is the literal integer discriminant; fields = Vec<NODE_BINARY_FIELD>.
+def ast_binary_union_arm(s: AstStorage, tag_value: Int, fields: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(99)  # NODE_BINARY_UNION_ARM = 99
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(tag_value)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(fields)
+  s.docs.push(0)
+  return h
+end
+
+def ast_actor_def(s: AstStorage, name: String, children: Int, type_params: String, is_private: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(91)  # NODE_ACTOR_DEF = 91
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_private)
+  ast_intern_push_str1(s, name)
+  ast_intern_push_str2(s, type_params)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(children)
+  s.docs.push(0)
+  return h
+end
+
+def ast_enum_def(s: AstStorage, name: String, variants: Int, type_params: String, is_private: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(38)  # NODE_ENUM_DEF = 38
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_private)
+  ast_intern_push_str1(s, name)
+  ast_intern_push_str2(s, type_params)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(variants)
+  s.docs.push(0)
+  return h
+end
+
+def ast_variant_def(s: AstStorage, name: String, fields: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(66)  # NODE_VARIANT_DEF = 66 (Quartz extension)
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, name)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(fields)
+  s.docs.push(0)
+  return h
+end
+
+## Create an import declaration node.
+## 
+## Parameters:
+##   s          - AST storage
+##   module_name - Module path string
+##   alias      - Alias name (empty string if none)
+##   symbols    - Vector of imported symbol names (0 if none)
+##   is_wildcard - 1 for 'from X import *', 0 otherwise
+##   line       - Line number
+##   col        - Column number
+##
+## Returns: Node handle
+def ast_import(s: AstStorage, module_name: String, alias: String, symbols: Int, is_wildcard: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(48)  # NODE_IMPORT = 48
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_wildcard)           # int_val: wildcard flag
+  ast_intern_push_str1(s, module_name)   # str1: module name
+  ast_intern_push_str2(s, alias)         # str2: alias
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)            # rights: is_pub flag (0 or 1)
+  s.extras.push(0)
+  s.children.push(symbols)              # children: imported symbols
+  s.docs.push(0)
+  return h
+end
+
+def ast_import_set_pub(s: AstStorage, h: AstNodeId, is_pub: Int): Void
+  s.rights.set_unchecked(h, is_pub)
+end
+
+def ast_import_is_pub(s: AstStorage, h: AstNodeId): Int = s.rights[h]
+
+## Attach the parallel aliases vec for `from X import a as b, c as d` renames.
+## `aliases` is a Vec<Int> of interned lexemes, same length as symbols.
+## When an entry has no `as` rename, aliases[i] equals symbols[i].
+## Stored in the AST's extras slot (default 0 = "no renames, use symbols as-is").
+def ast_import_set_aliases(s: AstStorage, h: AstNodeId, aliases: Int): Void
+  s.extras.set_unchecked(h, aliases)
+end
+
+## Returns the aliases vec for a selective `from X import a as b, ...` node,
+## or 0 when no aliases were attached (non-selective imports, pre-V3 ASTs).
+def ast_import_get_aliases(s: AstStorage, h: AstNodeId): Vec<Int> = as_vec(s.extras[h])
+
+## Create a C import node: cimport "header.h"
+def ast_c_import(s: AstStorage, header: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(56)  # NODE_C_IMPORT = 56
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, header)        # str1: header name
+  ast_intern_push_str2(s, "")            # str2: unused
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Create a global variable declaration node.
+## 
+## Parameters:
+##   s         - AST storage
+##   name      - Variable name
+##   init      - Initial value expression node
+##   is_mutable - 1 for var (mutable), 0 for const (immutable)
+##   line      - Line number
+##   col       - Column number
+##
+## Returns: Node handle
+def ast_global_var(s: AstStorage, name: String, init: Int, is_mutable: Int, is_thread_local: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(49)  # NODE_GLOBAL_VAR = 49
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_mutable)  # int_val: mutability flag
+  ast_intern_push_str1(s, name)  # str1: variable name
+  s.str2s.push(0)  # str2
+  s.ops.push(is_thread_local)  # op: thread-local flag
+  s.lefts.push(0)  # left
+  s.rights.push(init)  # right: initializer expression
+  s.extras.push(0)  # extra
+  s.children.push(0)             # children
+  s.docs.push(0)             # doc
+  return h
+end
+
+## Create a try-catch expression node.
+##
+## Syntax: try expr catch pattern handler end
+##
+## Evaluates body (must return Result<T, E>). On Ok(v), returns v.
+## On Err(e), matches pattern and evaluates handler.
+##
+## Params:
+## - s: AST storage
+## - body: Expression to try (must return Result<T, E>)
+## - pattern: Error pattern (ident, enum_access, or wildcard)
+## - handler: Handler expression for error case
+## - line, col: Source location
+##
+## Returns: Node handle
+def ast_try_catch(s: AstStorage, body: Int, pattern: Int, handler: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(63)  # NODE_TRY_CATCH = 63
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)       # int_val
+  s.str1s.push(0)       # str1
+  s.str2s.push(0)       # str2
+  s.ops.push(0)       # op
+  s.lefts.push(body)    # left: body expression
+  s.rights.push(handler) # right: handler expression
+  s.extras.push(pattern) # extra: pattern
+  s.children.push(0)      # children
+  s.docs.push(0)      # doc
+  return h
+end
+
+## Create a trait definition node (v5.0).
+## 
+## Parameters:
+##   s           - AST storage
+##   name        - Trait name
+##   supertraits - Supertrait names ("+"-separated string or empty)
+##   type_params - Type parameters (comma-separated string or empty)
+##   methods     - Method signature nodes (vector of function nodes)
+##   is_private  - 1 if in private section, 0 otherwise
+##   line        - Line number
+##   col         - Column number
+##
+## Returns: Node handle
+## Create an effect declaration node (Operation Piezoelectric Effects, Milestone B).
+##
+## - s    : AST storage
+## - name : effect name (e.g. "Throws")
+## - ops  : Vec<Int> of NODE_FUNCTION handles for declared op signatures
+## - line, col : source location
+##
+## str1 = effect name, children = ops vec.
+def ast_effect_decl(s: AstStorage, name: String, ops: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(100)  # NODE_EFFECT_DECL = 100
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, name)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(ops)
+  s.docs.push(0)
+  return h
+end
+
+## Create a handler-install block node: `with HANDLER do -> BODY end`
+## (Operation Piezoelectric Effects, Phase 1, Milestone C.1).
+##
+## - s            : AST storage
+## - handler_node : node handle of the handler expression
+## - body_node    : node handle of the body NODE_BLOCK
+## - line, col    : source location
+##
+## left = handler expr, right = body block. C.1 only retains the shape;
+## typecheck + MIR walkers forward to the body (handler is syntactically
+## validated and ignored at runtime). C.2 uses left for row narrowing;
+## C.4 lowers NODE_WITH to MIR_HANDLE_INSTALL + body + MIR_HANDLE_UNINSTALL.
+##
+## B.8 Phase 2: extras carries the optional bound-param NODE_PARAM handle
+## for `with X do x -> body end` Scoped-resource forms. -1 = no binding
+## (the legacy `with H do -> body end` and `with H do body end` shapes).
+## Set via ast_with_set_bound_param after construction; read via
+## ast_with_bound_param.
+def ast_with(s: AstStorage, handler_node: Int, body_node: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(101)  # NODE_WITH = 101
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(handler_node)
+  s.rights.push(body_node)
+  s.extras.push(-1)  # B.8 Phase 2: bound-param sentinel = none
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## B.8 Phase 2: get the bound-param NODE_PARAM handle for a NODE_WITH,
+## or -1 if the with-block was written without `do x ->` binding.
+def ast_with_bound_param(s: AstStorage, h: AstNodeId): Int = ast_get_extra(s, h)
+
+## B.8 Phase 2: attach a bound-param NODE_PARAM to a NODE_WITH. Called
+## by the parser after ast_with returns when the surface form is
+## `with X do x -> body end` or `with X do x: T -> body end`.
+def ast_with_set_bound_param(s: AstStorage, h: AstNodeId, param_node: Int): Void
+  ast_set_extra(s, h, param_node)
+end
+
+## B.8 Phase 4: get the resolved Scoped-impl struct name stamped on a
+## NODE_WITH by typecheck (`tc_with_scoped_bind`), or empty when the
+## with-block is not a Scoped form. Stored in str2 because str1 is
+## already in use by NODE_WITH for effect-claim names elsewhere; str2
+## was unused for this kind. MIR-lower reads this to decide between
+## the legacy effect-handler path and the Scoped acquire/release path.
+def ast_with_scoped_struct(s: AstStorage, h: AstNodeId): String = ast_get_str2(s, h)
+
+## B.8 Phase 4: stamp the resolved Scoped impl's struct name onto a
+## NODE_WITH. Called from `tc_with_scoped_bind` once the impl lookup
+## confirms a Scoped impl exists for the handler's struct type.
+def ast_with_set_scoped_struct(s: AstStorage, h: AstNodeId, name: String): Void
+  ast_set_str2(s, h, name)
+end
+
+def ast_trait_def(s: AstStorage, name: String, supertraits: String, type_params: String, methods: Int, is_private: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(50)  # NODE_TRAIT_DEF = 50
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_private)           # int_val: private flag
+  ast_intern_push_str1(s, name)          # str1: trait name
+  ast_intern_push_str2(s, supertraits)   # str2: supertraits
+  s.ops.push(0)                     # op
+  s.lefts.push(0)                     # left
+  s.rights.push(0)                     # right
+  s.extras.push(as_int(type_params))   # extra: type parameters as string
+  s.children.push(methods)              # children: method signatures
+  s.docs.push(0)                    # doc
+  return h
+end
+
+## Create an impl block node (v5.0).
+## 
+## Parameters:
+##   s           - AST storage
+##   trait_name  - Trait being implemented
+##   for_type    - Type implementing the trait
+##   type_params - Type parameters for generic impl (string or empty)
+##   methods     - Method implementation nodes (vector of function nodes)
+##   line        - Line number
+##   col         - Column number
+##
+## Returns: Node handle
+def ast_impl_block(s: AstStorage, trait_name: String, for_type: String, type_params: String, methods: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(51)  # NODE_IMPL_BLOCK = 51
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)                     # int_val
+  ast_intern_push_str1(s, trait_name)    # str1: trait name
+  ast_intern_push_str2(s, for_type)      # str2: implementing type
+  s.ops.push(0)                     # op
+  s.lefts.push(0)                     # left
+  s.rights.push(0)                     # right
+  s.extras.push(as_int(type_params))   # extra: type parameters
+  s.children.push(methods)              # children: method implementations
+  s.docs.push(0)                    # doc
+  return h
+end
+
+## Create an extend block node for type extensions
+## extend Int { def double(): Int = self * 2 }
+## Returns: Node handle
+def ast_extend_block(s: AstStorage, for_type: String, type_params: String, methods: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(52)  # NODE_EXTEND_BLOCK = 52
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)                     # int_val
+  ast_intern_push_str1(s, for_type)      # str1: type being extended
+  s.str2s.push(0)                     # str2: unused
+  s.ops.push(0)                     # op
+  s.lefts.push(0)                     # left
+  s.rights.push(0)                     # right
+  s.extras.push(as_int(type_params))   # extra: type parameters
+  s.children.push(methods)              # children: extension methods
+  s.docs.push(0)                    # doc
+  return h
+end
+
+## Create an extern function declaration node (FFI)
+##
+## - s: AST storage
+## - name: External function name (e.g., "strlen")
+## - convention: Calling convention ("C")
+## - params: Vector of parameter nodes
+## - return_type: Return type string
+## - line, col: Source location
+##
+## Returns: Node handle
+def ast_extern_fn(s: AstStorage, name: String, convention: String, params: Int, return_type: String, is_variadic: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(53)  # NODE_EXTERN_FN = 53
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_variadic)             # int_val: variadic flag
+  ast_intern_push_str1(s, name)          # str1: function name
+  ast_intern_push_str2(s, return_type)   # str2: return type
+  s.ops.push(as_int(convention))    # op: calling convention
+  s.lefts.push(0)                     # left
+  s.rights.push(0)                     # right
+  s.extras.push(0)                     # extra
+  s.children.push(params)               # children: parameters
+  s.docs.push(0)                    # doc
+  return h
+end
+
+## Create an extern variable declaration node (FFI)
+##
+## - s: AST storage
+## - name: External variable name (e.g., "UART_BASE")
+## - type_ann: Type annotation string (e.g., "Int")
+## - line, col: Source location
+##
+## Returns: Node handle
+def ast_extern_var(s: AstStorage, name: String, type_ann: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(76)  # NODE_EXTERN_VAR = 76
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)              # int_val
+  ast_intern_push_str1(s, name)   # str1: variable name
+  ast_intern_push_str2(s, type_ann)  # str2: type annotation
+  s.ops.push(0)              # op
+  s.lefts.push(0)              # left
+  s.rights.push(0)              # right
+  s.extras.push(0)              # extra
+  s.children.push(0)             # children
+  s.docs.push(0)             # doc
+  return h
+end
+
+## ast_extern_fn_is_variadic - Check if extern function is variadic
+##
+## @param s AST storage
+## @param h Node handle
+## @returns 1 if variadic, 0 otherwise
+def ast_extern_fn_is_variadic(s: AstStorage, h: AstNodeId): Int = s.int_vals[h]
+
+## ast_inline_c - Create inline C/asm escape hatch node
+##
+## @c("code") embeds raw C/asm code as LLVM inline assembly.
+## Returns Int type.
+##
+## Params:
+## - s: AST state
+## - code: The C/asm code string
+## - line, col: Source location
+##
+## Returns: Node handle
+def ast_inline_c(s: AstStorage, code: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(54)  # NODE_INLINE_C = 54
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)              # int_val
+  ast_intern_push_str1(s, code)   # str1: code
+  s.str2s.push(0)              # str2
+  s.ops.push(0)              # op
+  s.lefts.push(0)              # left
+  s.rights.push(0)              # right
+  s.extras.push(0)              # extra
+  s.children.push(0)             # children
+  s.docs.push(0)             # doc
+  return h
+end
+
+## ast_inline_c_with_args - Create inline C/asm node with variable bindings
+##
+## @c("code", var1, var2) embeds raw C/asm code with input operands.
+## Variables are accessible as $1, $2, etc. in the asm code.
+## $0 is the output register.
+##
+## Params:
+## - s: AST state
+## - code: The C/asm code string
+## - args: Vector of expression nodes for input operands
+## - line, col: Source location
+##
+## Returns: Node handle
+def ast_inline_c_with_args(s: AstStorage, code: String, args: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(54)  # NODE_INLINE_C = 54
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)              # int_val
+  ast_intern_push_str1(s, code)   # str1: code
+  s.str2s.push(0)              # str2
+  s.ops.push(0)              # op
+  s.lefts.push(0)              # left
+  s.rights.push(0)              # right
+  s.extras.push(0)              # extra
+  s.children.push(args)          # children: args vector
+  s.docs.push(0)             # doc
+  return h
+end
+
+## Create a type alias node.
+##
+## Syntax: type Name<T> = ExistingType<T>
+##
+## Parameters:
+##   s            - AST storage
+##   name         - Alias name
+##   aliased_type - The existing type being aliased (string)
+##   type_params  - Type parameters as string (e.g., "<T, U>" or "")
+##   line         - Line number
+##   col          - Column number
+##
+## Returns: Node handle
+def ast_type_alias(s: AstStorage, name: String, aliased_type: String, type_params: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(64)  # NODE_TYPE_ALIAS = 64
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)                     # int_val
+  ast_intern_push_str1(s, name)          # str1: alias name
+  ast_intern_push_str2(s, aliased_type)  # str2: aliased type
+  s.ops.push(0)                     # op
+  s.lefts.push(0)                     # left
+  s.rights.push(0)                     # right
+  s.extras.push(as_int(type_params))   # extra: type parameters
+  s.children.push(0)                    # children
+  s.docs.push(0)                    # doc
+  return h
+end
+
+##
+## ast_newtype() - Create a newtype definition AST node
+##
+## Newtypes create distinct types that are NOT interchangeable with the wrapped type.
+## Example: newtype UserId = Int
+##   - UserId and Int are different types
+##   - Compile-time safety, zero runtime cost
+##
+## Parameters:
+##   s             - AST storage
+##   name          - Newtype name
+##   wrapped_type  - The wrapped type (string)
+##   type_params   - Type parameters as string (e.g., "<T>" or "")
+##   line          - Line number
+##   col           - Column number
+##
+## Returns: Node handle
+def ast_newtype(s: AstStorage, name: String, wrapped_type: String, type_params: String, is_strict: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(65)  # NODE_NEWTYPE_DEF = 65
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_strict)             # int_val: 1 iff @strict newtype (STRICT_NEWTYPES)
+  ast_intern_push_str1(s, name)          # str1: newtype name
+  ast_intern_push_str2(s, wrapped_type)  # str2: wrapped type
+  s.ops.push(0)                     # op
+  s.lefts.push(0)                     # left
+  s.rights.push(0)                     # right
+  s.extras.push(as_int(type_params))   # extra: type parameters
+  s.children.push(0)                    # children
+  s.docs.push(0)                    # doc
+  return h
+end
+
+def ast_program(s: AstStorage, items: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(35)  # NODE_PROGRAM = 35
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(items)
+  s.docs.push(0)
+  return h
+end
+
+def ast_wildcard(s: AstStorage, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(42)  # NODE_WILDCARD = 42
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+def ast_try_expr(s: AstStorage, expr: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(17)  # NODE_TRY_EXPR = 17
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(expr)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+def ast_safe_field_access(s: AstStorage, base: Int, field: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(16)  # NODE_SAFE_FIELD_ACCESS = 16
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, field)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(base)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Create a defer statement node.
+##
+## The deferred expression will be executed on function exit.
+## Parameters:
+##   s    - AST storage
+##   expr - Expression to defer (typically a function call)
+##   line - Line number
+##   col  - Column number
+##
+## Returns: Node handle
+def ast_defer(s: AstStorage, expr: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(61)  # NODE_DEFER = 61
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)     # int_val
+  s.str1s.push(0)     # str1
+  s.str2s.push(0)     # str2
+  s.ops.push(0)     # op
+  s.lefts.push(expr)  # left = deferred expression
+  s.rights.push(0)     # right
+  s.extras.push(0)     # extra
+  s.children.push(0)    # children
+  s.docs.push(0)    # doc
+  return h
+end
+
+# ============================================================================
+# AST Accessor Helpers - Reduce Repetitive Pattern Access
+# ============================================================================
+
+## Get node metadata (kind, line, col) in one call.
+## Returns: Vec with [kind, line, col]
+def ast_get_metadata(s: AstStorage, node: AstNodeId): Int
+  var kind = ast_get_kind(s, node)
+  var line = ast_get_line(s, node)
+  var col = ast_get_col(s, node)
+  return [kind, line, col]
+end
+
+## Extract binary operator data (left, right, op) in one call.
+## Returns: Vec with [left, right, op]
+def ast_extract_binary(s: AstStorage, node: AstNodeId): Int
+  var left = ast_get_left(s, node)
+  var right = ast_get_right(s, node)
+  var op = ast_get_op(s, node)
+  return [left, right, op]
+end
+
+## Extract call data (callee, args) in one call.
+## Returns: Vec with [callee, args]
+def ast_extract_call(s: AstStorage, node: AstNodeId): Int
+  var callee = ast_get_left(s, node)
+  var args = ast_get_children(s, node)
+  return [callee, args]
+end
+
+## Extract let binding data (name, init, is_mutable) in one call.
+## Returns: Vec with [name, init, is_mutable]
+def ast_extract_let(s: AstStorage, node: AstNodeId): Int
+  var name = ast_get_str1(s, node)
+  var init_node = ast_get_left(s, node)
+  var is_mutable = ast_get_int_val(s, node)
+  return [as_int(name), init_node, is_mutable]
+end
+
+## Extract assign data (target, value) in one call.
+## Returns: Vec with [target, value]
+def ast_extract_assign(s: AstStorage, node: AstNodeId): Int
+  var target = ast_get_str1(s, node)
+  var value = ast_get_left(s, node)
+  return [as_int(target), value]
+end
+
+## Extract struct init data (struct_name, fields, field_names) in one call.
+## Returns: Vec with [struct_name, fields, field_names]
+def ast_extract_struct_init(s: AstStorage, node: AstNodeId): Int
+  var struct_name = ast_get_str1(s, node)
+  var fields = ast_get_children(s, node)
+  var field_names = ast_get_struct_init_field_names(s, node)
+  return [as_int(struct_name), fields, field_names]
+end
+
+## Extract match arm data (pattern, body) in one call.
+## Returns: Vec with [pattern, body]
+def ast_extract_match_arm(s: AstStorage, node: AstNodeId): Int
+  var pattern = ast_get_left(s, node)
+  var body = ast_get_right(s, node)
+  return [pattern, body]
+end
+
+## Extract function data (name, params, return_type, body) in one call.
+## Returns: Vec with [name, params, return_type, body]
+def ast_extract_function(s: AstStorage, node: AstNodeId): Int
+  var name = ast_get_str1(s, node)
+  var params = ast_get_left(s, node)
+  var return_type = ast_get_str2(s, node)
+  var body = ast_get_right(s, node)
+  return [as_int(name), params, as_int(return_type), body]
+end
+
+## ============================================================================
+## Concurrency AST Nodes
+## ============================================================================
+
+## Create an await expression node.
+##
+## Waits for a spawned task to complete and returns its result.
+##
+## Params:
+## - s: AST storage
+## - handle: The task handle from a spawn expression
+## - line, col: Source location
+##
+## Returns: Node handle
+def ast_await(s: AstStorage, handle: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(58)  # NODE_AWAIT = 58
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)       # int_val
+  s.str1s.push(0)       # str1
+  s.str2s.push(0)       # str2
+  s.ops.push(0)       # op
+  s.lefts.push(handle)  # left: task handle expression
+  s.rights.push(0)       # right
+  s.extras.push(0)       # extra
+  s.children.push(0)      # children
+  s.docs.push(0)      # doc
+  return h
+end
+
+## Create a yield expression node.
+##
+## Yields a value from a generator function (impl Iterator<T>).
+##
+## Params:
+## - s: AST storage
+## - value: The expression to yield
+## - line, col: Source location
+##
+## Returns: Node handle
+def ast_yield(s: AstStorage, value: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(83)  # NODE_YIELD = 83
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(value)  # left: yielded value
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Create an async call node: async func(args).
+## left: inner call expression (NODE_CALL)
+def ast_async_call(s: AstStorage, inner_call: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(84)  # NODE_ASYNC_CALL = 84
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(inner_call)  # left: inner call expression
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Create a go expression node: go func(args)
+## Desugars to: async func(args) → sched_spawn → return handle
+def ast_go_call(s: AstStorage, inner_call: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(85)  # NODE_GO = 85
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(inner_call)  # left: inner call expression
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Create a protocol definition node.
+## str1=name, str2=type_params, children=steps, int_val=is_private
+def ast_protocol_def(s: AstStorage, name: String, type_params: String, steps: Int, is_private: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(87)  # NODE_PROTOCOL_DEF = 87
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_private)
+  ast_intern_push_str1(s, name)
+  ast_intern_push_str2(s, type_params)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(steps)
+  s.docs.push(0)
+  return h
+end
+
+## Create a protocol step node.
+## int_val=step kind (1=send, 2=recv), str1=type name
+def ast_protocol_step(s: AstStorage, step_kind: Int, type_name: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(88)  # NODE_PROTOCOL_STEP = 88
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(step_kind)
+  ast_intern_push_str1(s, type_name)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Create a protocol choice node: choice ... or ... end
+## int_val=number of branches, children=flat list of branch step vecs
+## Each branch is a vec handle containing NODE_PROTOCOL_STEP nodes.
+def ast_protocol_choice(s: AstStorage, branches: Int, num_branches: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(89)  # NODE_PROTOCOL_CHOICE = 89
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(num_branches)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(branches)
+  s.docs.push(0)
+  return h
+end
+
+## Create a protocol loop node: loop ... end
+## children=body steps (NODE_PROTOCOL_STEP nodes)
+def ast_protocol_loop(s: AstStorage, body_steps: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(90)  # NODE_PROTOCOL_LOOP = 90
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(body_steps)
+  s.docs.push(0)
+  return h
+end
+
+## Create a select statement node.
+##
+## Waits on multiple channel operations. First ready arm executes.
+##
+## Params:
+## - s: AST storage
+## - arms: Vector of NodeSelectArm handles
+## - line, col: Source location
+##
+## Returns: Node handle
+def ast_select(s: AstStorage, arms: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(59)  # NODE_SELECT = 59
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)     # int_val
+  s.str1s.push(0)     # str1
+  s.str2s.push(0)     # str2
+  s.ops.push(0)     # op
+  s.lefts.push(0)     # left
+  s.rights.push(0)     # right
+  s.extras.push(0)     # extra
+  s.children.push(arms) # children: select arms
+  s.docs.push(0)    # doc
+  return h
+end
+
+## Create a select arm node.
+##
+## Represents one arm in a select statement (C.13 unified syntax —
+## written `case <pat> = <expr> => body` and `default => body`; the
+## parser de-sugars the legacy callee names into op-kind tags so MIR
+## keeps the existing per-op-kind dispatch).
+##
+## - recv(ch) as x => body  (op_kind = 0)
+## - send(ch, v) => body    (op_kind = 1)
+## - default => body        (op_kind = 2)
+## - await(task) as x => body (op_kind = 3)
+## - timeout(ms) => body    (op_kind = 4)
+##
+## Params:
+## - s: AST storage
+## - op_kind: 0=recv, 1=send, 2=default, 3=await, 4=timeout
+## - channel: Channel/task/timeout-ms expression (0 for default)
+## - binding: Binding name for recv/await, "" for send/default/timeout
+## - body: Body block to execute
+## - line, col: Source location
+##
+## Returns: Node handle
+def ast_select_arm(s: AstStorage, op_kind: Int, channel: Int, binding: String, body: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(60)  # NODE_SELECT_ARM = 60
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)               # int_val
+  ast_intern_push_str1(s, binding) # str1: binding name or ""
+  s.str2s.push(0)               # str2: Phase 3+4a — Selectable impl struct name (op_kind=5)
+  s.ops.push(op_kind)         # op: 0=recv, 1=send, 2=default, 3=await, 4=timeout, 5=Selectable
+  s.lefts.push(channel)         # left: channel expression / Selectable expression (op_kind=5)
+  s.rights.push(body)            # right: body block
+  s.extras.push(0)               # extra
+  s.children.push(0)             # children
+  s.docs.push(0)             # doc
+  return h
+end
+
+## C.13 Phase 3: get the resolved Selectable-impl struct name stamped on
+## a NODE_SELECT_ARM by typecheck (`tc_check_select_node`), or "" when
+## the arm is not a user-defined Selectable (op_kind != 5). Stored in
+## str2 — mirrors the `ast_with_scoped_struct` pattern on NODE_WITH.
+def ast_select_arm_struct(s: AstStorage, h: AstNodeId): String = ast_get_str2(s, h)
+
+## C.13 Phase 3: stamp the resolved Selectable impl's struct name onto a
+## NODE_SELECT_ARM. Called from `tc_check_select_node` once the impl
+## lookup confirms a `Selectable` impl exists for the selectable
+## expression's struct type.
+def ast_select_arm_set_struct(s: AstStorage, h: AstNodeId, name: String): Void
+  ast_set_str2(s, h, name)
+end
+
+## ast_macro_call() - Create a macro call node
+##
+## Represents $name(args...) syntax for built-in macros.
+## After macro expansion, these are replaced by their expansions.
+##
+## @param s AstStorage struct
+## @param name Macro name string (e.g., "try", "unwrap")
+## @param args Vector of argument handles
+## @param line Source line
+## @param col Source column
+## @returns Node handle
+def ast_macro_call(s: AstStorage, name: String, args: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(67)  # NODE_MACRO_CALL = 67
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)              # int_val
+  ast_intern_push_str1(s, name)   # str1: macro name
+  s.str2s.push(0)              # str2
+  s.ops.push(0)              # op
+  s.lefts.push(0)              # left
+  s.rights.push(0)              # right
+  s.extras.push(0)              # extra
+  s.children.push(args)          # children: macro arguments
+  s.docs.push(0)             # doc
+  return h
+end
+
+## Create a macro definition node.
+def ast_macro_def(s: AstStorage, name: String, params: Int, body: Int, is_variadic: Int, variadic_param: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(72)  # NODE_MACRO_DEF = 72
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_variadic)    # int_val: 1 if variadic
+  ast_intern_push_str1(s, name)              # str1: macro name
+  ast_intern_push_str2(s, variadic_param)    # str2: variadic param name
+  s.ops.push(0)                   # op
+  s.lefts.push(body)              # left: body node (string template or quote)
+  s.rights.push(0)                # right
+  s.extras.push(0)                # extra
+  s.children.push(params)         # children: param name nodes
+  s.docs.push(0)                 # doc
+  return h
+end
+
+## Create a quote block node.
+def ast_quote(s: AstStorage, body: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(73)  # NODE_QUOTE = 73
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(body)              # left: quoted body
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Create an unquote expression node.
+def ast_unquote(s: AstStorage, expr: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(74)  # NODE_UNQUOTE = 74
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(expr)              # left: expression to splice
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Create an unquote_each expression node.
+def ast_unquote_each(s: AstStorage, list_expr: Int, binding: String, body: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(75)  # NODE_UNQUOTE_EACH = 75
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  ast_intern_push_str1(s, binding)           # str1: loop variable name
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(list_expr)         # left: list expression
+  s.rights.push(body)             # right: template body
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Create an allocation expression node.
+##
+## Heap allocation: @heap expr
+## Arena allocation: @arena_name expr
+##
+## Params:
+## - s: AST storage
+## - target: Allocation target ("heap" or arena name)
+## - expr: Expression to allocate
+## - line, col: Source location
+##
+## Returns: Node handle
+def ast_alloc_expr(s: AstStorage, target: String, expr: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(20)  # NODE_ALLOC_EXPR = 20
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)              # int_val
+  ast_intern_push_str1(s, target) # str1: allocation target
+  s.str2s.push(0)              # str2
+  s.ops.push(0)              # op
+  s.lefts.push(expr)           # left: expression to allocate
+  s.rights.push(0)              # right
+  s.extras.push(0)              # extra
+  s.children.push(0)             # children
+  s.docs.push(0)             # doc
+  return h
+end
+
+## Create a const declaration node.
+##
+## Syntax: const NAME = expr
+##
+## Compile-time constant declaration. The initializer must be
+## const-evaluable (literals, arithmetic, references to other consts).
+##
+## Params:
+## - s: AST storage
+## - name: Constant name
+## - init: Initializer expression handle
+## - line: Source line number
+## - col: Source column number
+##
+## Returns: Node handle
+def ast_const_decl(s: AstStorage, name: String, init: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(69)  # NODE_CONST_DECL = 69
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)              # int_val: evaluated value (filled by MIR)
+  ast_intern_push_str1(s, name)  # str1: constant name
+  s.str2s.push(0)              # str2
+  s.ops.push(0)              # op
+  s.lefts.push(0)              # left
+  s.rights.push(init)           # right: initializer expression
+  s.extras.push(0)              # extra: is_evaluated flag
+  s.children.push(0)             # children
+  s.docs.push(0)             # doc
+  return h
+end
+
+## Create a static_assert node.
+##
+## Syntax: static_assert(condition, "message")
+##
+## Compile-time assertion. Condition must be const-evaluable.
+## If false, compilation fails with the given message.
+##
+## Params:
+## - s: AST storage
+## - condition: Condition expression handle
+## - message: Error message string
+## - line: Source line number
+## - col: Source column number
+##
+## Returns: Node handle
+def ast_static_assert(s: AstStorage, condition: Int, message: String, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(70)  # NODE_STATIC_ASSERT = 70
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)              # int_val
+  s.str1s.push(0)              # str1
+  ast_intern_push_str2(s, message)  # str2: error message
+  s.ops.push(0)              # op
+  s.lefts.push(condition)      # left: condition expression
+  s.rights.push(0)              # right
+  s.extras.push(0)              # extra
+  s.children.push(0)             # children
+  s.docs.push(0)             # doc
+  return h
+end
+
+def ast_task_group(s: AstStorage, binding_name: String, body: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(71)  # NODE_TASK_GROUP = 71
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)                    # int_val
+  ast_intern_push_str1(s, binding_name)    # str1: binding name
+  s.str2s.push(0)                       # str2
+  s.ops.push(0)                         # op
+  s.lefts.push(body)                    # left: body block
+  s.rights.push(0)                      # right
+  s.extras.push(0)                      # extra
+  s.children.push(0)                    # children
+  s.docs.push(0)                        # doc
+  return h
+end
+
+def ast_tuple_literal(s: AstStorage, elements: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(77)  # NODE_TUPLE_LITERAL = 77
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(elements)
+  s.docs.push(0)
+  return h
+end
+
+# Let destructuring: var (a, b) = expr
+# str1 = comma-separated binding names: "a,b,c"
+# left = init expression
+# int_val = is_mutable (0 or 1)
+def ast_let_destructure(s: AstStorage, names: String, init: Int, is_mut: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(78)  # NODE_LET_DESTRUCTURE = 78
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_mut)
+  s.str1s.push(string_intern::intern_id(s.interner, names))
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(init)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Struct destructuring: Point { x, y } = expr / var { x, y } = expr.
+## type_name: struct type name (e.g. "Point"), or "" for inferred type.
+## field_specs: comma-separated field bindings (e.g. "x,y" or "x:px,y:py").
+## init: initializer expression handle (0 in pattern context).
+## is_mut: 0=immutable, 1=mutable, -1=pattern context (match/for-in).
+## has_rest: 1 if `..` present, 0 otherwise.
+def ast_struct_destructure(s: AstStorage, type_name: String, field_specs: String, init: Int, is_mut: Int, has_rest: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(79)  # NODE_STRUCT_DESTRUCTURE
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_mut)
+  ast_intern_push_str1(s, type_name)
+  ast_intern_push_str2(s, field_specs)
+  s.ops.push(has_rest)
+  s.lefts.push(init)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Vec destructuring: [a, b, ..rest] = expr.
+## elem_names: comma-separated element bindings (e.g. "first,second").
+## rest_name: rest binding name (e.g. "rest"), or "" if `..` with no name or no rest.
+## init: initializer expression handle (0 in pattern context).
+## is_mut: 0=immutable, 1=mutable, -1=pattern context (match/for-in).
+## has_rest: 1 if `..` present, 0 otherwise.
+def ast_vec_destructure(s: AstStorage, elem_names: String, rest_name: String, init: Int, is_mut: Int, has_rest: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(80)  # NODE_VEC_DESTRUCTURE
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(is_mut)
+  ast_intern_push_str1(s, elem_names)
+  ast_intern_push_str2(s, rest_name)
+  s.ops.push(has_rest)
+  s.lefts.push(init)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(0)
+  s.docs.push(0)
+  return h
+end
+
+## Or-pattern node: pat1 | pat2 | pat3.
+## children stores the Vec of sub-pattern handles.
+def ast_or_pattern(s: AstStorage, patterns: Int, line: Int, col: Int): Int
+  var h = 0 + s.kinds.size
+  s.kinds.push(81)  # NODE_OR_PATTERN
+  s.lines.push(line)
+  s.cols.push(col)
+  s.int_vals.push(0)
+  s.str1s.push(0)
+  s.str2s.push(0)
+  s.ops.push(0)
+  s.lefts.push(0)
+  s.rights.push(0)
+  s.extras.push(0)
+  s.children.push(patterns)
+  s.docs.push(0)
+  return h
+end
+
+# =============================================================================
+# Macro Expansion Provenance — schema for Tier 2 #8b-followup
+# =============================================================================
+#
+# Every AST node knows where it came from in source (lines[h], cols[h]).
+# Nodes synthesized by macro expansion also need to know which macro
+# synthesized them, where that macro was defined, and where it was called —
+# so diagnostics can render `note: in expansion of macro X (defined at Y:L:C)`
+# and scope-set hygiene can stamp per-expansion scopes on identifiers.
+#
+# Storage layout:
+# - `AstStorage.expansion_idx[h]` is sparse, lazily extended. 0 (default) =
+#   node came straight from user source. Non-zero N = 1-based index into
+#   the module-level `_ast_exp_*` parallel vecs, where record (N-1) holds:
+#     * macro_name          — the `$macro_name` that produced this node
+#     * def_line, def_col   — location of the `macro` keyword in the defn
+#     * call_line, call_col — location of the invocation that fired this
+#     * parent              — 0 for outer-most expansion, else prior 1-based idx
+#
+# `ast_expansion_reset()` clears all records and is called at the top of
+# `compile()` in `quartz.qz` so multi-invocation drivers (LSP, tests) don't
+# leak records across runs. Same pattern as `diag_reset_error_count()`.
+#
+# Phase 1 (this commit) ships the schema + APIs only — macro_expand.qz is
+# not yet wired to populate them. Phase 2 will render them in diagnostics;
+# Phase 3 will consume them for scope-set hygiene.
+
+var _ast_exp_macro_names = vec_new<String>()
+var _ast_exp_def_lines = vec_new<Int>()
+var _ast_exp_def_cols = vec_new<Int>()
+var _ast_exp_call_lines = vec_new<Int>()
+var _ast_exp_call_cols = vec_new<Int>()
+var _ast_exp_parents = vec_new<Int>()
+
+## Reset the expansion-record store. Called by `compile()` at entry.
+def ast_expansion_reset(): Void
+  _ast_exp_macro_names = vec_new<String>()
+  _ast_exp_def_lines = vec_new<Int>()
+  _ast_exp_def_cols = vec_new<Int>()
+  _ast_exp_call_lines = vec_new<Int>()
+  _ast_exp_call_cols = vec_new<Int>()
+  _ast_exp_parents = vec_new<Int>()
+end
+
+## Push a new expansion record. Returns its 1-based index (0 is reserved
+## for "no expansion"). `parent_idx` is the 1-based index of the enclosing
+## expansion (for `$outer` calls `$inner` nesting), or 0 for top-level.
+def ast_expansion_push(macro_name: String, def_line: Int, def_col: Int, call_line: Int, call_col: Int, parent_idx: Int): Int
+  var new_idx = _ast_exp_macro_names.size + 1
+  _ast_exp_macro_names.push(macro_name)
+  _ast_exp_def_lines.push(def_line)
+  _ast_exp_def_cols.push(def_col)
+  _ast_exp_call_lines.push(call_line)
+  _ast_exp_call_cols.push(call_col)
+  _ast_exp_parents.push(parent_idx)
+  return new_idx
+end
+
+## Number of recorded expansions. Exposed for tests and `--explain-cache`.
+def ast_expansion_count(): Int = _ast_exp_macro_names.size
+
+def ast_expansion_macro_name(idx: Int): String
+  if idx <= 0 or idx > _ast_exp_macro_names.size
+    return ""
+  end
+  return _ast_exp_macro_names[idx - 1]
+end
+
+def ast_expansion_def_line(idx: Int): Int
+  if idx <= 0 or idx > _ast_exp_def_lines.size
+    return 0
+  end
+  return _ast_exp_def_lines[idx - 1]
+end
+
+def ast_expansion_def_col(idx: Int): Int
+  if idx <= 0 or idx > _ast_exp_def_cols.size
+    return 0
+  end
+  return _ast_exp_def_cols[idx - 1]
+end
+
+def ast_expansion_call_line(idx: Int): Int
+  if idx <= 0 or idx > _ast_exp_call_lines.size
+    return 0
+  end
+  return _ast_exp_call_lines[idx - 1]
+end
+
+def ast_expansion_call_col(idx: Int): Int
+  if idx <= 0 or idx > _ast_exp_call_cols.size
+    return 0
+  end
+  return _ast_exp_call_cols[idx - 1]
+end
+
+def ast_expansion_parent(idx: Int): Int
+  if idx <= 0 or idx > _ast_exp_parents.size
+    return 0
+  end
+  return _ast_exp_parents[idx - 1]
+end
+
+## Walk the expansion-record parent chain starting at `idx` and return a
+## list of `note:`-ready strings — innermost first. Each reads
+## `in expansion of macro '$X' (defined at L:C), called at L:C`. A zero
+## or out-of-range idx yields the empty vec.
+##
+## Lives here (not in `std/diagnostic.qz`) because the chain walk needs
+## the `_ast_exp_*` store — a compiler-side structure the std-tier
+## diagnostic module has no dependency on. A.16.1 lifted `diagnostic.qz`
+## to `std/` and stripped its AST-dependent renderer; the compiler-side
+## producers (`macro_expand`, `typecheck`) call this helper and push the
+## results as plain `diag_add_note` lines, which the std formatters
+## already render.
+def ast_expansion_notes(idx: Int): Vec<String>
+  var notes = vec_new<String>()
+  var cur = idx
+  while cur > 0
+    var name = ast_expansion_macro_name(cur)
+    var dl = ast_expansion_def_line(cur)
+    var dc = ast_expansion_def_col(cur)
+    var cl = ast_expansion_call_line(cur)
+    var cc = ast_expansion_call_col(cur)
+    var loc = ""
+    if dl > 0
+      loc = " (defined at #{to_str(dl)}:#{to_str(dc)})"
+    else
+      loc = " (built-in)"
+    end
+    notes.push("in expansion of macro '$#{name}'#{loc}, called at #{to_str(cl)}:#{to_str(cc)}")
+    cur = ast_expansion_parent(cur)
+  end
+  return notes
+end
+
+## Mark a node as born from expansion record `idx`. Sparse / lazy-extend
+## pattern mirrors `ast_func_set_cconv_c` — no node constructor changes.
+def ast_set_expansion(s: AstStorage, h: AstNodeId, idx: Int): Void
+  if h < 0
+    return
+  end
+  var sh = 0 + h
+  while s.expansion_idx.size <= sh
+    s.expansion_idx.push(0)
+  end
+  s.expansion_idx[sh] = idx
+end
+
+## Get the 1-based expansion-record index for node `h`. Returns 0 when
+## the node came from user source (never expanded) or when the sparse
+## vec hasn't been extended to cover `h` yet.
+def ast_get_expansion(s: AstStorage, h: AstNodeId): Int
+  if h < 0
+    return 0
+  end
+  var sh = 0 + h
+  if sh >= s.expansion_idx.size
+    return 0
+  end
+  return s.expansion_idx[sh]
+end
+
+# ============================================================================
+# Macro-hygiene scope-set store (Tier 2 #8b-followup Phase 3 — schema only)
+# ============================================================================
+#
+# Flatt POPL 2016 "Binding as Sets of Scopes" adapts cleanly onto Quartz's
+# AstStorage arena. A scope is a fresh small integer allocated per macro
+# expansion call; a scope set is a sorted `Vec<Int>` of such integers. Every
+# identifier (reference AND binder) carries a scope_set_idx pointing into
+# the intern table below. The resolver (P3.c) picks the binding whose scope
+# set is the largest subset of the reference's scope set — that gives you
+# hygienic shadowing without surgery on the rest of the name-resolution
+# pipeline.
+#
+# Storage shape, parallel to the expansion-record store:
+#
+# - `_ast_scope_counter` — monotonic fresh-scope allocator. One integer per
+#   distinct "expansion identity" (call-site scope, definition-site scope).
+#   Resets per compile() invocation.
+# - `_ast_scope_sets` — intern table, Vec<Vec<Int>>. Each entry is a SORTED
+#   deduped list of scope integers. Entry 0 is the empty set (reserved),
+#   so scope_set_idx == 0 universally means "no scopes stamped, i.e. user
+#   source." Resetting drops all entries and re-pushes `[]` so idx 0 stays
+#   valid across invocations.
+#
+# Interning is linear-scan. This is the P3-MVP approach: subset-testing
+# dominates lookup cost, not interning, and the corpus is small (one set
+# per AST node). If it shows up in profiles later, swap to a hash-cons with
+# identity-equal keys — the API surface doesn't change.
+#
+# P3.a (this commit) ships schema + APIs only. The expander (P3.b) will
+# populate AstStorage.scope_set_idx; the resolver (P3.c) will consume it.
+
+var _ast_scope_counter = 1
+var _ast_scope_sets = vec_new<Vec<Int>>()
+
+# Sparse side-table: `_ast_caller_flag[h] == 1` means "this node's
+# scope_set_idx was stamped by the `$caller(name)` escape hatch — leave
+# it alone." Used by the macro expander's post-stamp loop (P3.d) so that
+# when the caller's scope set legitimately IS 0 (empty set — the case of
+# `$caller` used at top level), the post-stamp doesn't overwrite it with
+# the current expansion's def-site scope. For non-caller nodes we just
+# rely on `scope_set_idx != 0` as the "already stamped" guard, but 0 is
+# ambiguous between "unstamped" and "stamped empty" so we need this flag.
+var _ast_caller_flag = vec_new<Int>()
+
+## Reset the scope-set store. Called by `compile()` at entry alongside
+## `ast_expansion_reset()` so the counter restarts at 1 and the intern
+## table is re-seeded with entry 0 = empty set.
+def ast_scope_reset(): Void
+  _ast_scope_counter = 1
+  _ast_scope_sets = vec_new<Vec<Int>>()
+  ## Entry 0: empty set. Reserved. `ast_scope_set_empty()` returns 0, and
+  ## the sparse AstStorage.scope_set_idx defaults to 0 for all nodes that
+  ## predate P3.b's stamping.
+  _ast_scope_sets.push(vec_new<Int>())
+  _ast_caller_flag = vec_new<Int>()
+end
+
+## Mark node `h` as emitted by the `$caller(name)` escape hatch. The
+## macro expander's post-stamp loop consults this to avoid overwriting
+## the caller-scope stamp. Sparse; auto-extends.
+def ast_set_caller_flag(h: AstNodeId, v: Int): Void
+  if h < 0
+    return
+  end
+  var sh = 0 + h
+  while _ast_caller_flag.size <= sh
+    _ast_caller_flag.push(0)
+  end
+  _ast_caller_flag[sh] = v
+end
+
+## Read the caller-escape flag for node `h`. Returns 0 for any node not
+## explicitly marked, 1 for `$caller(...)`-emitted idents.
+def ast_get_caller_flag(h: AstNodeId): Int
+  if h < 0
+    return 0
+  end
+  var sh = 0 + h
+  if sh >= _ast_caller_flag.size
+    return 0
+  end
+  return _ast_caller_flag[sh]
+end
+
+## Allocate a fresh scope integer. Each macro expansion mints one per
+## "scope identity" (one call-site scope, one def-site scope per call —
+## the expander manages the pairing). Returns a positive integer; 0 is
+## NOT a valid scope id (it's only a scope-SET sentinel).
+def ast_scope_fresh(): Int
+  var s = _ast_scope_counter
+  _ast_scope_counter += 1
+  return s
+end
+
+## The canonical empty scope set. Always returns 0.
+def ast_scope_set_empty(): Int = 0
+
+## Number of scopes in the scope set at `set_idx`. Returns 0 for the empty
+## set (idx 0) or any out-of-range idx.
+def ast_scope_set_len(set_idx: Int): Int
+  if set_idx < 0 or set_idx >= _ast_scope_sets.size
+    return 0
+  end
+  return _ast_scope_sets[set_idx].size
+end
+
+## Get the `i`-th member of the scope set at `set_idx` (sets are sorted,
+## so iteration is deterministic). Returns 0 on out-of-range.
+def ast_scope_set_get(set_idx: Int, i: Int): Int
+  if set_idx < 0 or set_idx >= _ast_scope_sets.size
+    return 0
+  end
+  var members = _ast_scope_sets[set_idx]
+  if i < 0 or i >= members.size
+    return 0
+  end
+  return members[i]
+end
+
+## Membership test: does scope set `set_idx` contain `scope`? Linear scan;
+## sorted order lets us short-circuit on overshoot. The intern table enforces
+## the sorted invariant, so `_ast_scope_sets[set_idx]` is always sorted.
+def ast_scope_set_contains(set_idx: Int, scope: Int): Bool
+  if set_idx <= 0 or set_idx >= _ast_scope_sets.size
+    return false
+  end
+  var members = _ast_scope_sets[set_idx]
+  var i = 0
+  while i < members.size
+    var m = members[i]
+    return true if m == scope
+    return false if m > scope
+    i += 1
+  end
+  return false
+end
+
+## Subset test: is every scope in set `a` also in set `b`? Core of the
+## Flatt resolver rule — a binding is a candidate only when its scope set
+## is a subset of the reference's scope set. Linear merge over sorted vecs.
+def ast_scope_set_is_subset(a: Int, b: Int): Bool
+  return true if a == b
+  if a <= 0
+    return true
+  end
+  if a >= _ast_scope_sets.size or b < 0 or b >= _ast_scope_sets.size
+    return false
+  end
+  var am = _ast_scope_sets[a]
+  var bm = _ast_scope_sets[b]
+  return true if am.size == 0
+  return false if am.size > bm.size
+  var i = 0
+  var j = 0
+  while i < am.size
+    var av = am[i]
+    var found = false
+    while j < bm.size
+      var bv = bm[j]
+      if bv == av
+        found = true
+        j += 1
+        break
+      end
+      if bv > av
+        break
+      end
+      j += 1
+    end
+    return false if not found
+    i += 1
+  end
+  return true
+end
+
+## Intern a sorted member list into the scope-set table and return its idx.
+## Assumes `members` is already sorted ascending and deduplicated — callers
+## use this via `ast_scope_set_add` which guarantees both. Linear scan looks
+## for an existing entry with byte-identical contents.
+def _ast_scope_set_intern_sorted(members: Vec<Int>): Int
+  return 0 if members.size == 0
+  var n = _ast_scope_sets.size
+  var i = 0
+  while i < n
+    var existing = _ast_scope_sets[i]
+    if existing.size == members.size
+      var same = true
+      var k = 0
+      while k < existing.size
+        if existing[k] != members[k]
+          same = false
+          break
+        end
+        k += 1
+      end
+      return i if same
+    end
+    i += 1
+  end
+  var copy = vec_new<Int>()
+  var p = 0
+  while p < members.size
+    copy.push(members[p])
+    p += 1
+  end
+  _ast_scope_sets.push(copy)
+  return n
+end
+
+## Add a single scope to set `set_idx`, returning the scope_set_idx of the
+## resulting set. Idempotent: if `scope` is already a member, returns
+## `set_idx` unchanged.
+def ast_scope_set_add(set_idx: Int, scope: Int): Int
+  if scope <= 0
+    return set_idx
+  end
+  return set_idx if ast_scope_set_contains(set_idx, scope)
+  var members = vec_new<Int>()
+  var base_size = ast_scope_set_len(set_idx)
+  var inserted = false
+  var i = 0
+  while i < base_size
+    var m = ast_scope_set_get(set_idx, i)
+    if not inserted and m > scope
+      members.push(scope)
+      inserted = true
+    end
+    members.push(m)
+    i += 1
+  end
+  if not inserted
+    members.push(scope)
+  end
+  return _ast_scope_set_intern_sorted(members)
+end
+
+## Remove a single scope from set `set_idx`, returning the scope_set_idx of
+## the resulting set. Idempotent: if `scope` is not a member, returns
+## `set_idx` unchanged. Used by the P3.d escape hatch (`caller!(name)` —
+## strip the def-site scope so the ident resolves against the caller).
+def ast_scope_set_remove(set_idx: Int, scope: Int): Int
+  return set_idx if not ast_scope_set_contains(set_idx, scope)
+  var members = vec_new<Int>()
+  var base_size = ast_scope_set_len(set_idx)
+  var i = 0
+  while i < base_size
+    var m = ast_scope_set_get(set_idx, i)
+    if m != scope
+      members.push(m)
+    end
+    i += 1
+  end
+  return _ast_scope_set_intern_sorted(members)
+end
+
+## Total number of distinct scope sets interned (diagnostics / `--explain-cache`).
+def ast_scope_set_count(): Int = _ast_scope_sets.size
+
+## Mark node `h` as carrying scope set `set_idx`. Sparse-vec pattern mirrors
+## `ast_set_expansion` — no node constructor changes required.
+def ast_set_scope_set(s: AstStorage, h: AstNodeId, set_idx: Int): Void
+  if h < 0
+    return
+  end
+  var sh = 0 + h
+  while s.scope_set_idx.size <= sh
+    s.scope_set_idx.push(0)
+  end
+  s.scope_set_idx[sh] = set_idx
+end
+
+## Get node `h`'s scope-set idx. Returns 0 (the empty set) for any node
+## whose scope_set_idx hasn't been explicitly stamped — which is the
+## correct default: user-source identifiers live in the empty scope set
+## and see every binding whose scope set is ⊆ ∅, i.e. also the empty set.
+def ast_get_scope_set(s: AstStorage, h: AstNodeId): Int
+  if h < 0
+    return 0
+  end
+  var sh = 0 + h
+  if sh >= s.scope_set_idx.size
+    return 0
+  end
+  return s.scope_set_idx[sh]
+end

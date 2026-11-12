@@ -1,0 +1,331 @@
+# Deckbuilder end-to-end replay coverage.
+#
+# Phase 10 alternate item from docs/design/TUI_ROADMAP.md (line 591) —
+# the deckbuilder gameplay flow (combat → reward → next combat → game
+# over) is exactly the kind of multi-screen state machine that
+# benefits from deterministic replay testing.
+#
+# Pattern: build a fixed Vec<FrameMsg<AppMsg>> as the input log, hand it
+# to `tui::program_replay` along with the deckbuilder's `update` and
+# `view` functions, then assert on direct field access of the returned
+# Game state. Replay is fully synchronous — no raw mode, no goroutines,
+# no timers; Cmd::Run/After/Every closures DO NOT execute (their results
+# would have been pre-recorded in a real session). Tests are
+# deterministic and fast.
+#
+# How to add a new flow:
+#   1. Use `key_msg(code)` to build a FrameMsg::Key for any keystroke.
+#      Constants from std/terminal (KEY_ENTER, etc.); printable ASCII
+#      uses the codepoint directly (113='q', 114='r', 101='e', 115='s',
+#      63='?').
+#   2. Push the messages onto a Vec<FrameMsg<db::AppMsg>>.
+#   3. Build a Program via `tui::program_new(db::initial_game(),
+#      my_update, my_view)`. The wrapper indirection (my_update / my_view)
+#      is required because passing `db::update` / `db::view` directly to
+#      a generic `program_new` call site doesn't infer cleanly across
+#      module boundaries; wrapping in local fns with explicit signatures
+#      sidesteps the inference hole.
+#   4. Replay via `tui::program_replay(p, msgs)`; assert on the
+#      returned Game's fields.
+#
+# Coverage in this file (4 specs):
+#   1. Combat-to-victory flow — 14 keystrokes win fight 1 → Reward screen.
+#   2. Combat-to-defeat flow — 7× 'e' (end-turn) drains player HP to 0.
+#   3. Reward-pick advances to next combat — Enter on Reward selects
+#      choice 0, deck grows by one card, fights_won unchanged.
+#   4. Multi-combat run — win fight 1, take reward, fight 2 starts at
+#      full HP / fresh enemy / fights_won=1.
+#
+# The `program_replay` Quit-detection bug (commit just landed in this
+# session): `is Quit` was matching across enums (FrameMsg::Quit's tag
+# overlapped with Cmd::After's tag in the M-parameterised case), causing
+# replay to terminate after the first message. Fixed at the use site by
+# switching to explicit `match` arms. Sister to the
+# is_none_non_option_segfault note in MEMORY.md.
+
+import * from qspec
+import std/tui/runtime as tui
+import std/terminal
+import game/deckbuilder/main as db
+
+# Wrapper functions for program_new — see "How to add a new flow" above
+# for why the indirection is necessary.
+def my_update(m: tui::FrameMsg<db::AppMsg>, g: db::Game): (db::Game, tui::Cmd<db::AppMsg>)
+  return db::update(m, g)
+end
+
+def my_view(g: db::Game): String = db::view(g)
+
+# Build a FrameMsg::Key carrying the supplied keycode.
+def key_msg(code: Int): tui::FrameMsg<db::AppMsg>
+  var ev: tui::KeyEvent = tui::KeyEvent { code: code, modifiers: 0 }
+  return tui::FrameMsg::Key(ev)
+end
+
+# Push an Enter onto the input log.
+def push_enter(msgs: Vec<tui::FrameMsg<db::AppMsg>>): Int
+  vec_push(msgs, key_msg(terminal::KEY_ENTER()))
+  return 0
+end
+
+# Push the 'e' key (combat: end-turn) onto the input log.
+def push_end_turn(msgs: Vec<tui::FrameMsg<db::AppMsg>>): Int
+  vec_push(msgs, key_msg(101))
+  return 0
+end
+
+# Convert Screen to a small Int for assert_eq comparison. Tests compare
+# Ints rather than enum values because qspec's assert_eq doesn't know
+# how to compare user enum variants directly.
+def screen_tag(s: db::Screen): Int
+  match s
+    CombatScreen => return 0
+    RewardScreen => return 1
+    DefeatScreen => return 2
+  end
+end
+
+# Build a fresh Program for each replay so tests don't share state.
+def fresh_program(): tui::Program<db::Game, db::AppMsg>
+  return tui::program_new(db::initial_game(), my_update, my_view)
+end
+
+def main(): Int
+  describe("deckbuilder replay — combat-to-victory") do ->
+    # Trace (verified by step-by-step execution against db::update):
+    #   Initial hand: [Defend, Defend, Strike, Strike, Strike], energy 3.
+    #   Steps 0-2  Enter Enter Enter — play Defend, Defend, Strike → enemy 24.
+    #   Step  3    'e' end_turn — block absorbs 6, hp 50, draw new hand
+    #              [Strike, Strike, Mend, Mend, IronWave].
+    #   Steps 4-6  Enter Enter Enter — Strike, Strike, Mend → enemy 12, energy 0.
+    #   Step  7    'e' end_turn — enemy hits 6, hp 44, draw new hand.
+    #   Steps 8-10 Enter Enter Enter — three plays cumulative dmg → enemy 7.
+    #   Step  11   'e' end_turn — enemy hits 6, hp 44 (block absorbed prior).
+    #   Steps 12-13 Enter Enter — final two plays, enemy → 0 → Victory →
+    #              Reward screen, fights_won = 1.
+
+    it("14-keystroke replay reaches Reward screen with fights_won=1") do ->
+      var p = fresh_program()
+      var msgs: Vec<tui::FrameMsg<db::AppMsg>> = vec_new()
+      var i = 0
+      while i < 3
+        push_enter(msgs)
+        push_enter(msgs)
+        push_enter(msgs)
+        push_end_turn(msgs)
+        i = i + 1
+      end
+      push_enter(msgs)
+      push_enter(msgs)
+      var fs = tui::program_replay(p, msgs)
+
+      assert_eq(fs.fights_won, 1)
+      assert_eq(screen_tag(fs.screen), 1)  # RewardScreen
+      assert_eq(fs.combat.enemy_hp, 0)
+    end
+
+    it("victory leaves player at full HP-headroom after combat ended") do ->
+      # Smoke for "combat ended" — energy and block both reset on the
+      # transition to Reward (combat snapshot is preserved; we just
+      # confirm the snapshot reflects the final-blow turn).
+      var p = fresh_program()
+      var msgs: Vec<tui::FrameMsg<db::AppMsg>> = vec_new()
+      var i = 0
+      while i < 3
+        push_enter(msgs)
+        push_enter(msgs)
+        push_enter(msgs)
+        push_end_turn(msgs)
+        i = i + 1
+      end
+      push_enter(msgs)
+      push_enter(msgs)
+      var fs = tui::program_replay(p, msgs)
+
+      # Player HP at victory was 44 (one Big Strike absorbed via Mend).
+      # The combat snapshot freezes here — Reward screen reads it.
+      assert_eq(fs.combat.player_hp, 44)
+    end
+  end
+
+  describe("deckbuilder replay — combat-to-defeat") do ->
+    # Pure end-turn deaths: never play a card, just press 'e' seven times.
+    # Enemy intent cycles Strike(6), Strike(6), BigStrike(11) on a
+    # 3-turn loop — total damage 6+6+11+6+6+11+6 = 52 over 7 turns.
+    # Player starts at 50 HP, hits 0 on turn 7's strike.
+
+    it("7× 'e' (no plays) ends in DefeatScreen with HP 0") do ->
+      var p = fresh_program()
+      var msgs: Vec<tui::FrameMsg<db::AppMsg>> = vec_new()
+      var i = 0
+      while i < 7
+        push_end_turn(msgs)
+        i = i + 1
+      end
+      var fs = tui::program_replay(p, msgs)
+
+      assert_eq(screen_tag(fs.screen), 2)  # DefeatScreen
+      assert_eq(fs.combat.player_hp, 0)
+      assert_eq(fs.fights_won, 0)
+    end
+
+    it("6× 'e' is not yet defeat — survival check") do ->
+      # After 6 end_turns: HP = 50 - (6+6+11+6+6+11) = 4. Still alive.
+      var p = fresh_program()
+      var msgs: Vec<tui::FrameMsg<db::AppMsg>> = vec_new()
+      var i = 0
+      while i < 6
+        push_end_turn(msgs)
+        i = i + 1
+      end
+      var fs = tui::program_replay(p, msgs)
+
+      assert_eq(screen_tag(fs.screen), 0)  # CombatScreen — still alive
+      assert_eq(fs.combat.player_hp, 4)
+    end
+  end
+
+  describe("deckbuilder replay — reward selection") do ->
+    # After fight 1 victory we're on RewardScreen with three choices.
+    # Deck size on entry to Reward equals the starting deck size (12) —
+    # all 12 cards have cycled through hand/discard/draw but none added.
+    # Pressing Enter selects choice 0 from `reward_choices_for(1)` =
+    # [Defend+, Strike+, IronWave+], appends to deck, advances to
+    # Combat for fight 2.
+
+    it("Enter on Reward → next combat, deck size +1, fights_won unchanged") do ->
+      # Win fight 1 (14 keys) + Enter on reward (15th key).
+      var p = fresh_program()
+      var msgs: Vec<tui::FrameMsg<db::AppMsg>> = vec_new()
+      var i = 0
+      while i < 3
+        push_enter(msgs)
+        push_enter(msgs)
+        push_enter(msgs)
+        push_end_turn(msgs)
+        i = i + 1
+      end
+      push_enter(msgs)
+      push_enter(msgs)
+      push_enter(msgs)  # 15th — reward selection
+      var fs = tui::program_replay(p, msgs)
+
+      # Deck size grew by 1 (12 starter + 1 reward).
+      assert_eq(fs.deck.size, 13)
+      # fights_won stays at 1 — taking a reward doesn't bump the counter,
+      # only winning the next combat does.
+      assert_eq(fs.fights_won, 1)
+      # Back to Combat screen for fight 2.
+      assert_eq(screen_tag(fs.screen), 0)
+      # Fresh enemy — full HP again.
+      assert_eq(fs.combat.enemy_hp, 30)
+      # Player full HP (each combat starts at 50/50; carry-HP is v0.4+).
+      assert_eq(fs.combat.player_hp, 50)
+      # Turn counter reset for the new combat.
+      assert_eq(fs.combat.turn, 1)
+    end
+
+    it("'s' on Reward skips selection — deck size unchanged") do ->
+      # Win fight 1 (14 keys) + 's' on reward (skip).
+      var p = fresh_program()
+      var msgs: Vec<tui::FrameMsg<db::AppMsg>> = vec_new()
+      var i = 0
+      while i < 3
+        push_enter(msgs)
+        push_enter(msgs)
+        push_enter(msgs)
+        push_end_turn(msgs)
+        i = i + 1
+      end
+      push_enter(msgs)
+      push_enter(msgs)
+      vec_push(msgs, key_msg(115))  # 's' — skip
+      var fs = tui::program_replay(p, msgs)
+
+      # Skipping leaves the deck at starter size.
+      assert_eq(fs.deck.size, 12)
+      assert_eq(fs.fights_won, 1)
+      assert_eq(screen_tag(fs.screen), 0)  # back to Combat
+      assert_eq(fs.combat.enemy_hp, 30)
+    end
+  end
+
+  describe("deckbuilder replay — quit confirm + help modal") do ->
+    # 'q' opens the quit-confirm dialog (visible flag flips). The dialog
+    # has hard modal priority — every other key is eaten until a confirm
+    # event fires. '?' on combat screen flips help_visible.
+
+    it("'q' from combat opens quit-confirm overlay") do ->
+      var p = fresh_program()
+      var msgs: Vec<tui::FrameMsg<db::AppMsg>> = vec_new()
+      vec_push(msgs, key_msg(113))  # 'q'
+      var fs = tui::program_replay(p, msgs)
+
+      assert_eq(if fs.quit_confirm_visible then 1 else 0 end, 1)
+      assert_eq(if fs.help_visible then 1 else 0 end, 0)
+      # Quit-confirm doesn't navigate screens — we're still in Combat.
+      assert_eq(screen_tag(fs.screen), 0)
+    end
+
+    it("'?' from combat opens help overlay (other state untouched)") do ->
+      var p = fresh_program()
+      var msgs: Vec<tui::FrameMsg<db::AppMsg>> = vec_new()
+      vec_push(msgs, key_msg(63))  # '?'
+      var fs = tui::program_replay(p, msgs)
+
+      assert_eq(if fs.help_visible then 1 else 0 end, 1)
+      assert_eq(if fs.quit_confirm_visible then 1 else 0 end, 0)
+      # Combat state untouched.
+      assert_eq(fs.combat.enemy_hp, 30)
+      assert_eq(fs.combat.energy, 3)
+    end
+  end
+
+  describe("deckbuilder replay — determinism") do ->
+    it("same input log replayed twice produces same final state") do ->
+      var p1 = fresh_program()
+      var p2 = fresh_program()
+      var msgs: Vec<tui::FrameMsg<db::AppMsg>> = vec_new()
+      var i = 0
+      while i < 3
+        push_enter(msgs)
+        push_enter(msgs)
+        push_enter(msgs)
+        push_end_turn(msgs)
+        i = i + 1
+      end
+      push_enter(msgs)
+      push_enter(msgs)
+
+      var fs1 = tui::program_replay(p1, msgs)
+      var fs2 = tui::program_replay(p2, msgs)
+      assert_eq(fs1.combat.enemy_hp, fs2.combat.enemy_hp)
+      assert_eq(fs1.combat.player_hp, fs2.combat.player_hp)
+      assert_eq(fs1.combat.turn, fs2.combat.turn)
+      assert_eq(fs1.fights_won, fs2.fights_won)
+      assert_eq(screen_tag(fs1.screen), screen_tag(fs2.screen))
+    end
+
+    it("FrameMsg::Quit terminates replay; later messages have no effect") do ->
+      var p = fresh_program()
+      var msgs: Vec<tui::FrameMsg<db::AppMsg>> = vec_new()
+      push_end_turn(msgs)  # one 'e' → turn 2, hp 44
+      vec_push(msgs, tui::FrameMsg::Quit)
+      # Subsequent messages must not be delivered to update.
+      var i = 0
+      while i < 20
+        push_end_turn(msgs)
+        i = i + 1
+      end
+      var fs = tui::program_replay(p, msgs)
+
+      # If Quit terminated correctly, only the first 'e' ran.
+      assert_eq(fs.combat.turn, 2)
+      assert_eq(fs.combat.player_hp, 44)
+      # Still alive — ignored 20 fatal end_turns.
+      assert_eq(screen_tag(fs.screen), 0)
+    end
+  end
+
+  return qspec_main()
+end

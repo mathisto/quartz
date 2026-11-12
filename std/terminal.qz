@@ -1,0 +1,1331 @@
+## Terminal utilities — raw mode, key reading, and terminal dimensions.
+##
+## Provides a high-level interface for interactive terminal applications
+## built on the POSIX termios FFI bindings.
+##
+## @since 5.13.0
+
+import std/ffi/termios
+import std/ffi/socket
+import * from std/sync/composition/scope
+
+# I/O surface comes from std/ffi/socket via qualified import. The
+# extern "C" defs there (`read`, `write`, `memcpy`, `fcntl`, `__error`,
+# `__errno_location`) are registered bare always (extern C ABI), so
+# their call sites stay bare. The non-extern helpers (`get_errno`,
+# `F_GETFL`, `F_SETFL`, `O_NONBLOCK`, `EAGAIN`, `EWOULDBLOCK`, `EINTR`)
+# carry the `socket::` prefix at call sites below.
+#
+# Why this unwind became possible:
+# - Path A (commit `76451ba7`) — arity-aware dispatch routes 2-arg
+#   `send(ch, val)` to the channel intrinsic and 4-arg `send(s, buf,
+#   len, flags)` to the ws2_32 extern, so the std/ffi/socket Windows
+#   block no longer collides with std/sync/composition/scope's
+#   channel-send / channel-recv intrinsic calls.
+# - The flags_hash gate (this commit) — the per-module `.qzmod` cache
+#   now keys on target/debug/no_opt/overflow, so a native compile's
+#   POSIX `@cfg` overloads no longer get served on a Windows
+#   cross-compile and vice versa.
+#
+# Wildcard `import * from std/ffi/socket` is still blocked by a
+# separate resolver dedup issue (first-import-mode wins; subsequent
+# qualified imports of the same module get skipped); qualified import
+# sidesteps that. Filed forward.
+
+# Short sleep — POSIX uses usleep (microsecond resolution); Windows uses
+# kernel32 Sleep (millisecond resolution) to avoid pulling libwinpthread
+# in via mingw-w64's usleep shim (Phase 4 of QUARTZ_WINDOWS_TARGET dropped
+# libwinpthread from pure-compute imports — preserve that).
+@cfg(not: os: "windows")
+extern "C" def usleep(usec: Int): Int
+
+@cfg(not: os: "windows")
+def _term_sleep_us(us: Int): Void
+  usleep(us)
+end
+
+@cfg(os: "windows")
+def _term_sleep_us(us: Int): Void
+  # Round up to milliseconds — never sleep zero (Sleep(0) yields the
+  # thread but doesn't drain the EAGAIN burst we're trying to ride out).
+  var ms = (us + 999) / 1000
+  if ms == 0
+    ms = 1
+  end
+  Sleep(ms)
+end
+
+# =============================================================================
+# Key Constants
+# =============================================================================
+
+## Special key codes (above byte range to avoid collisions).
+def KEY_UP(): Int = 1000
+def KEY_DOWN(): Int = 1001
+def KEY_RIGHT(): Int = 1002
+def KEY_LEFT(): Int = 1003
+def KEY_HOME(): Int = 1004
+def KEY_END(): Int = 1005
+def KEY_DELETE(): Int = 1006
+def KEY_BACKSPACE(): Int = 127
+def KEY_ENTER(): Int = 13
+def KEY_TAB(): Int = 9
+def KEY_EOF(): Int = -1
+
+## Sentinel returned by `term_read_key` / `term_read_key_cancellable`
+## when an SGR-encoded mouse sequence (ESC [ < ...) has been parsed.
+## After this is returned, call `term_last_mouse_event()` to retrieve
+## the structured event. The pump in `std/tui/runtime.qz` does this
+## dispatch automatically and emits `FrameMsg::Mouse(MouseEvent)`.
+def KEY_MOUSE_EVENT(): Int = 2000
+
+# =============================================================================
+# Mouse Events
+# =============================================================================
+#
+# SGR-encoded mouse events (DECSET 1006). Most modern terminals support
+# this — Terminal.app, iTerm2, Ghostty, kitty, alacritty, GNOME Terminal,
+# Konsole. The encoding is `ESC [ < BUTTON ; COL ; ROW M/m` where M is
+# press/drag and m is release. col/row are 1-indexed cell coordinates.
+#
+# Button byte decoding:
+#   low 2 bits: 0=left, 1=middle, 2=right, 3=none/released
+#   bit 2 (0x04): shift modifier
+#   bit 3 (0x08): alt modifier
+#   bit 4 (0x10): ctrl modifier
+#   bit 5 (0x20): drag (motion-while-pressed) flag
+#   bit 6 (0x40): scroll (button 64=scroll-up, 65=scroll-down)
+#
+# Apps enable mouse mode via `term_enable_mouse()` (DECSET 1006 + 1002).
+# Disable via `term_disable_mouse()` — required before raw mode exit so
+# the user's terminal doesn't get stuck capturing clicks.
+
+## What kind of mouse activity occurred.
+enum MouseKind
+  Press
+  Release
+  Drag
+  ScrollUp
+  ScrollDown
+end
+
+## Which mouse button. `NoButton` is used for scroll events and
+## release-without-button reports.
+enum MouseButton
+  Left
+  Middle
+  Right
+  NoButton
+end
+
+## A single mouse event. col/row are 1-indexed cell coordinates,
+## matching the terminal's internal cursor addressing scheme.
+struct MouseEvent
+  kind:   MouseKind
+  button: MouseButton
+  col:    Int
+  row:    Int
+  shift:  Bool
+  alt:    Bool
+  ctrl:   Bool
+end
+
+# Module-level scratch space for the most recently parsed mouse event.
+# The escape-sequence parser stashes here; consumers retrieve via
+# `term_last_mouse_event()`. Single-threaded discipline — only the
+# input pump goroutine writes; only its consumer reads. No locking
+# needed because the read happens immediately after the sentinel
+# return, before another mouse event can be parsed.
+var _term_last_mouse_kind:   Int = 0
+var _term_last_mouse_button: Int = 3
+var _term_last_mouse_col:    Int = 0
+var _term_last_mouse_row:    Int = 0
+var _term_last_mouse_mods:   Int = 0   # bit0=shift, bit1=alt, bit2=ctrl
+
+## Retrieve the most recently parsed mouse event. Call this after
+## `term_read_key_cancellable` (or sibling) returned `KEY_MOUSE_EVENT()`.
+def term_last_mouse_event(): MouseEvent
+  var kind = MouseKind::Press
+  if _term_last_mouse_kind == 1
+    kind = MouseKind::Release
+  end
+  if _term_last_mouse_kind == 2
+    kind = MouseKind::Drag
+  end
+  if _term_last_mouse_kind == 3
+    kind = MouseKind::ScrollUp
+  end
+  if _term_last_mouse_kind == 4
+    kind = MouseKind::ScrollDown
+  end
+  var btn = MouseButton::Left
+  if _term_last_mouse_button == 1
+    btn = MouseButton::Middle
+  end
+  if _term_last_mouse_button == 2
+    btn = MouseButton::Right
+  end
+  if _term_last_mouse_button == 3
+    btn = MouseButton::NoButton
+  end
+  return MouseEvent {
+    kind:   kind,
+    button: btn,
+    col:    _term_last_mouse_col,
+    row:    _term_last_mouse_row,
+    shift:  (_term_last_mouse_mods & 1) != 0,
+    alt:    (_term_last_mouse_mods & 2) != 0,
+    ctrl:   (_term_last_mouse_mods & 4) != 0
+  }
+end
+
+## Enable mouse-event reporting in SGR encoding (DECSET 1006) plus
+## button-event tracking (DECSET 1002). After this, mouse clicks /
+## drags / scroll wheels emit ESC[< sequences on stdin which the key
+## parser decodes to `KEY_MOUSE_EVENT` + a stashed MouseEvent.
+##
+## Pair with `term_disable_mouse()` before exiting raw mode — leaving
+## DECSET 1002 active across an app crash leaves the user's terminal
+## capturing clicks (no native text selection) until they reset.
+def term_enable_mouse(): Void
+  term_write("\x1b[?1006h\x1b[?1002h")
+end
+
+## Disable mouse-event reporting. Must be called before raw mode exit.
+def term_disable_mouse(): Void
+  term_write("\x1b[?1002l\x1b[?1006l")
+end
+
+# Ctrl-key helpers — Ctrl-A = 1, Ctrl-B = 2, ..., Ctrl-Z = 26
+def KEY_CTRL_A(): Int = 1
+def KEY_CTRL_B(): Int = 2
+def KEY_CTRL_C(): Int = 3
+def KEY_CTRL_D(): Int = 4
+def KEY_CTRL_E(): Int = 5
+def KEY_CTRL_F(): Int = 6
+def KEY_CTRL_K(): Int = 11
+def KEY_CTRL_L(): Int = 12
+def KEY_CTRL_N(): Int = 14
+def KEY_CTRL_P(): Int = 16
+def KEY_CTRL_U(): Int = 21
+def KEY_CTRL_W(): Int = 23
+
+# =============================================================================
+# Raw Mode Management
+# =============================================================================
+
+## Saved original termios state for restoration.
+var _term_saved_ptr = 0
+
+## Whether raw mode is currently active.
+var _term_raw_active = 0
+
+## Saved fcntl flags for stdin (sentinel -2 = not yet captured).
+## term_read_key_cancellable lazily switches stdin to O_NONBLOCK on
+## first call and term_exit_raw_mode restores the original flags.
+##
+## Unused on Windows — console handles can't be flipped to non-blocking;
+## the Windows `_term_read_byte_nb` path peeks the input queue instead.
+var _term_stdin_saved_flags = -2
+
+# Windows console state. The raw-mode entry/exit pair captures both the
+# stdin handle's mode (line/echo/processed/VT-input bits) and the stdout
+# handle's mode (VT-processing bit) so a clean exit restores both. Cached
+# on first raw-mode entry; restored on exit.
+#
+# Unused on POSIX; declared unconditionally because var-cells are cheap
+# i64s and gating @var declarations doesn't compose with the rest of the
+# stdlib pattern.
+var _term_win_stdin_handle = 0
+var _term_win_stdout_handle = 0
+var _term_win_saved_stdin_mode = 0
+var _term_win_saved_stdout_mode = 0
+
+## Check if stdin is a terminal.
+def term_is_tty(): Bool = isatty(0) != 0
+
+## Enter raw terminal mode.
+## Disables canonical mode, echo, and signal processing.
+## Sets VMIN=1, VTIME=0 for single-character reads.
+## Returns 1 on success, 0 on failure.
+@cfg(not: os: "windows")
+def term_enter_raw_mode(): Int
+  if _term_raw_active == 1
+    return 1
+  end
+
+  # Allocate space for saved + working termios copies
+  _term_saved_ptr = mem_alloc(TERMIOS_SIZE() * 2)
+  var work_ptr = ptr_add(_term_saved_ptr, TERMIOS_SIZE())
+
+  # Save current attributes
+  if tcgetattr(0, _term_saved_ptr) != 0
+    qz_free(_term_saved_ptr)
+    _term_saved_ptr = 0
+    return 0
+  end
+
+  # Copy saved to working buffer
+  memcpy(work_ptr, _term_saved_ptr, TERMIOS_SIZE())
+
+  # Read c_lflag
+  var lflag = _term_read_field(work_ptr, TERMIOS_LFLAG_OFFSET(), TERMIOS_LFLAG_WIDTH())
+  # Disable ICANON, ECHO, ISIG, IEXTEN
+  lflag = band(lflag, bnot(bor(bor(bor(ICANON(), ECHO()), ISIG()), IEXTEN())))
+  _term_write_field(work_ptr, TERMIOS_LFLAG_OFFSET(), TERMIOS_LFLAG_WIDTH(), lflag)
+
+  # Read c_iflag and disable ICRNL (CR to NL translation)
+  var iflag = _term_read_field(work_ptr, TERMIOS_IFLAG_OFFSET(), TERMIOS_IFLAG_WIDTH())
+  iflag = band(iflag, bnot(ICRNL()))
+  _term_write_field(work_ptr, TERMIOS_IFLAG_OFFSET(), TERMIOS_IFLAG_WIDTH(), iflag)
+
+  # Set VMIN=1, VTIME=0 for single-char reads
+  var cc_ptr = ptr_add(work_ptr, TERMIOS_CC_OFFSET())
+  ptr_write_byte(ptr_add(cc_ptr, VMIN()), 1)
+  ptr_write_byte(ptr_add(cc_ptr, VTIME()), 0)
+
+  # Apply
+  if tcsetattr(0, TCSANOW(), work_ptr) != 0
+    qz_free(_term_saved_ptr)
+    _term_saved_ptr = 0
+    return 0
+  end
+
+  _term_raw_active = 1
+  return 1
+end
+
+## Enter raw terminal mode — Win32 console flavor.
+##
+## Captures the current input and output console modes, then:
+##   - stdin: clears ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT |
+##            ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE;
+##            sets ENABLE_VIRTUAL_TERMINAL_INPUT + ENABLE_EXTENDED_FLAGS
+##            so keypresses arrive as ANSI escape sequences via read(0)
+##            (matching the POSIX shape) and ConHost's quick-edit overlay
+##            doesn't capture mouse selections.
+##   - stdout: sets ENABLE_VIRTUAL_TERMINAL_PROCESSING +
+##             DISABLE_NEWLINE_AUTO_RETURN so write(1, "\x1b[31mhi") is
+##             interpreted as a SGR sequence and LF doesn't auto-CR
+##             (otherwise full-screen redraw paints a staircase).
+##
+## Windows 10 1809+ supports VT input + processing. Older conhost does
+## not — there's no graceful fallback, so this returns 0 (failure) if
+## either GetConsoleMode call returns 0. Modern Windows Terminal +
+## ConEmu + every Win11 console host clears this bar.
+@cfg(os: "windows")
+def term_enter_raw_mode(): Int
+  if _term_raw_active == 1
+    return 1
+  end
+  # Cache the std handles. GetStdHandle is documented as returning the
+  # same value for the life of the process, so caching is safe.
+  if _term_win_stdin_handle == 0
+    _term_win_stdin_handle = GetStdHandle(STD_INPUT_HANDLE())
+  end
+  if _term_win_stdout_handle == 0
+    _term_win_stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE())
+  end
+  var mode_buf = mem_alloc(4)
+  # Save + flip stdin mode.
+  if GetConsoleMode(_term_win_stdin_handle, mode_buf) == 0
+    qz_free(mode_buf)
+    return 0
+  end
+  _term_win_saved_stdin_mode = _winconsole_read_u32_le(mode_buf)
+  var in_mode = _term_win_saved_stdin_mode
+  in_mode = band(in_mode, bnot(bor(bor(bor(ENABLE_LINE_INPUT(), ENABLE_ECHO_INPUT()), ENABLE_PROCESSED_INPUT()), ENABLE_QUICK_EDIT_MODE())))
+  in_mode = bor(bor(in_mode, ENABLE_VIRTUAL_TERMINAL_INPUT()), ENABLE_EXTENDED_FLAGS())
+  if SetConsoleMode(_term_win_stdin_handle, in_mode) == 0
+    qz_free(mode_buf)
+    return 0
+  end
+  # Save + flip stdout mode.
+  if GetConsoleMode(_term_win_stdout_handle, mode_buf) == 0
+    # Best effort to roll the stdin change back so we don't leave the
+    # console half-modified on partial failure.
+    SetConsoleMode(_term_win_stdin_handle, _term_win_saved_stdin_mode)
+    qz_free(mode_buf)
+    return 0
+  end
+  _term_win_saved_stdout_mode = _winconsole_read_u32_le(mode_buf)
+  var out_mode = bor(bor(_term_win_saved_stdout_mode, ENABLE_VIRTUAL_TERMINAL_PROCESSING()), DISABLE_NEWLINE_AUTO_RETURN())
+  if SetConsoleMode(_term_win_stdout_handle, out_mode) == 0
+    SetConsoleMode(_term_win_stdin_handle, _term_win_saved_stdin_mode)
+    qz_free(mode_buf)
+    return 0
+  end
+  qz_free(mode_buf)
+  _term_raw_active = 1
+  return 1
+end
+
+## Exit raw terminal mode, restoring original settings.
+## Also restores stdin's fcntl flags if term_read_key_cancellable
+## switched stdin to O_NONBLOCK during the session.
+@cfg(not: os: "windows")
+def term_exit_raw_mode(): Void
+  if _term_raw_active == 0
+    return
+  end
+  # Defensive: disable mouse mode unconditionally. If the app never
+  # called term_enable_mouse, the DECRSTs are silent no-ops; if the
+  # app DID enable but didn't disable (e.g. crashed), this prevents
+  # the user's terminal from staying stuck in click-capture mode.
+  term_disable_mouse()
+  tcsetattr(0, TCSANOW(), _term_saved_ptr)
+  qz_free(_term_saved_ptr)
+  _term_saved_ptr = 0
+  _term_raw_active = 0
+  if _term_stdin_saved_flags != -2
+    fcntl(0, socket::F_SETFL(), _term_stdin_saved_flags)
+    _term_stdin_saved_flags = -2
+  end
+end
+
+## Exit raw terminal mode — Win32 console flavor.
+##
+## Restores the saved stdin + stdout console modes captured at entry.
+## No fcntl restore (Windows console handles are inherently
+## "blocking-with-peek"; PeekConsoleInputW does the non-blocking work).
+@cfg(os: "windows")
+def term_exit_raw_mode(): Void
+  if _term_raw_active == 0
+    return
+  end
+  term_disable_mouse()
+  if _term_win_stdin_handle != 0
+    SetConsoleMode(_term_win_stdin_handle, _term_win_saved_stdin_mode)
+  end
+  if _term_win_stdout_handle != 0
+    SetConsoleMode(_term_win_stdout_handle, _term_win_saved_stdout_mode)
+  end
+  _term_raw_active = 0
+end
+
+# =============================================================================
+# Key Reading
+# =============================================================================
+
+## Read a single byte from stdin. Returns byte value, or -1 on EOF/error.
+def term_read_byte(): Int
+  var buf = mem_alloc(1)
+  var n = read(0, buf, 1)
+  if n <= 0
+    qz_free(buf)
+    return -1
+  end
+  var byte_val = ptr_read_byte(buf)
+  qz_free(buf)
+  return byte_val
+end
+
+## Read a single keystroke, decoding escape sequences.
+## Returns a key constant (KEY_UP, etc.) or a byte value for regular chars.
+def term_read_key(): Int
+  var c = term_read_byte()
+  if c < 0
+    return KEY_EOF()
+  end
+
+  # ESC sequence
+  if c == 27
+    var seq1 = term_read_byte()
+    if seq1 < 0
+      return 27
+    end
+
+    if seq1 == '['
+      var seq2 = term_read_byte()
+      if seq2 < 0
+        return 27
+      end
+
+      # Arrow keys: ESC [ A/B/C/D
+      if seq2 == 'A'
+        return KEY_UP()
+      end
+      if seq2 == 'B'
+        return KEY_DOWN()
+      end
+      if seq2 == 'C'
+        return KEY_RIGHT()
+      end
+      if seq2 == 'D'
+        return KEY_LEFT()
+      end
+      if seq2 == 'H'
+        return KEY_HOME()
+      end
+      if seq2 == 'F'
+        return KEY_END()
+      end
+
+      # Extended sequences: ESC [ N ~
+      if seq2 >= '0' and seq2 <= '9'
+        var seq3 = term_read_byte()
+        if seq3 == '~'
+          if seq2 == '1'
+            return KEY_HOME()
+          end
+          if seq2 == '3'
+            return KEY_DELETE()
+          end
+          if seq2 == '4'
+            return KEY_END()
+          end
+          if seq2 == '7'
+            return KEY_HOME()
+          end
+          if seq2 == '8'
+            return KEY_END()
+          end
+        end
+      end
+    end
+
+    # ESC O sequences (some terminals)
+    if seq1 == 'O'
+      var seq2 = term_read_byte()
+      if seq2 == 'H'
+        return KEY_HOME()
+      end
+      if seq2 == 'F'
+        return KEY_END()
+      end
+    end
+
+    return 27
+  end
+
+  return c
+end
+
+# =============================================================================
+# Scope-aware key reading (B.7 Phase 4e family — stdin)
+# =============================================================================
+#
+# `term_read_key_cancellable(scope)` joins the existing scope-aware blocking
+# helpers (scope_sleep_ms / scope_recv / scope_send / scope_lock /
+# scope_rwlock_read / scope_rwlock_write). Same chunked-poll shape, applied
+# to stdin: on each iteration, try a non-blocking read; on EAGAIN, suspend
+# via `io_suspend_timeout(0, chunk_ms, 1)` so the scheduler's I/O poller
+# wakes us when bytes arrive OR after chunk_ms — whichever fires first.
+# Between waits, observe `scope_is_cancelled` and unwind via Throws.
+#
+# Cancel observation latency: bounded by the chunk size (50ms by default,
+# matching the rest of the Phase 4e family). On a real keypress the
+# I/O poller wakes us within microseconds, so user-visible latency is
+# unchanged from blocking `term_read_key`.
+#
+# Lazily switches stdin to O_NONBLOCK on first call within a raw-mode
+# session; `term_exit_raw_mode` restores the original flags. Synchronous
+# `term_read_key` / `term_read_byte` keep their blocking semantics — only
+# this entry-point opts into the non-blocking + scope-cancellable shape.
+
+# Chunk size for the cooperative wait loop on stdin. Mirrors
+# `SCOPE_SLEEP_CHUNK_MS` — 50ms is a balance of cancel latency
+# vs scheduler wakeups for idle terminal sessions.
+def _TERM_KEY_CHUNK_MS(): Int = 50
+
+# Tighter timeout for ESC sequence continuation bytes. ESC sequences
+# arrive in a single PTY packet ~always, so 5ms covers the slowest
+# realistic terminal; missing a continuation byte after that is treated
+# as a bare ESC press. Matches Bubbletea / standard terminal practice.
+def _TERM_ESC_CONT_MS(): Int = 5
+
+# Set stdin to O_NONBLOCK on first call within a raw-mode session.
+# Idempotent — subsequent calls are no-ops. The original fcntl flags are
+# saved into `_term_stdin_saved_flags` for restoration in
+# `term_exit_raw_mode`. Returns 1 on success, 0 on fcntl failure.
+@cfg(not: os: "windows")
+def _term_ensure_stdin_nonblocking(): Int
+  if _term_stdin_saved_flags != -2
+    return 1
+  end
+  var flags = fcntl(0, socket::F_GETFL(), 0)
+  if flags < 0
+    return 0
+  end
+  _term_stdin_saved_flags = flags
+  if fcntl(0, socket::F_SETFL(), flags | socket::O_NONBLOCK()) < 0
+    _term_stdin_saved_flags = -2
+    return 0
+  end
+  return 1
+end
+
+# Windows console handles can't be put into O_NONBLOCK mode — the
+# Win32 API has no fcntl analog for console input. PeekConsoleInputW
+# (used by `_term_read_byte_nb` below) provides the equivalent
+# "is there a byte to read right now" decision inherently. So
+# this is a no-op on Windows that always reports success.
+@cfg(os: "windows")
+def _term_ensure_stdin_nonblocking(): Int
+  if _term_win_stdin_handle == 0
+    _term_win_stdin_handle = GetStdHandle(STD_INPUT_HANDLE())
+  end
+  return 1
+end
+
+# Try a single non-blocking byte read from stdin. Return values:
+#   >= 0  byte value (0..255)
+#   -1    EAGAIN — no data available right now
+#   -2    EOF or read error
+@cfg(not: os: "windows")
+def _term_read_byte_nb(): Int
+  var buf = mem_alloc(1)
+  var n = read(0, buf, 1)
+  if n > 0
+    var byte_val = ptr_read_byte(buf)
+    qz_free(buf)
+    return byte_val
+  end
+  qz_free(buf)
+  if n == 0
+    return -2
+  end
+  var err = socket::get_errno()
+  if err == socket::EAGAIN() or err == socket::EWOULDBLOCK() or err == socket::EINTR()
+    return -1
+  end
+  return -2
+end
+
+# Windows non-blocking byte peek. PeekConsoleInputW reports the next
+# input record without consuming it:
+#   - numRead == 0: queue is empty → return -1 (EAGAIN equivalent).
+#   - record.EventType == KEY_EVENT (1): a key event is at the head,
+#     and ENABLE_VIRTUAL_TERMINAL_INPUT will translate it into one or
+#     more VT bytes on read(0). Call read(0) to consume; the call
+#     completes without blocking because conhost has already
+#     translated and buffered the bytes.
+#   - any other EventType (mouse, focus, buffer-resize, menu): drain
+#     the event with ReadConsoleInputW so it doesn't sit at the head
+#     of the queue and report EAGAIN — the caller's outer loop will
+#     re-peek on the next chunk.
+#
+# Note that mouse events with ENABLE_MOUSE_INPUT enabled and VT input
+# emit ESC[< sequences via read(0) — they are NOT delivered as
+# MOUSE_EVENT records. The MOUSE_EVENT drain branch fires only when
+# the app hasn't called term_enable_mouse but conhost emits a residual
+# mouse event from a window-focus transition.
+@cfg(os: "windows")
+def _term_read_byte_nb(): Int
+  if _term_win_stdin_handle == 0
+    _term_win_stdin_handle = GetStdHandle(STD_INPUT_HANDLE())
+    if _term_win_stdin_handle == 0
+      return -2
+    end
+  end
+  var rec_buf = mem_alloc(INPUT_RECORD_SIZE())
+  var nread_buf = mem_alloc(4)
+  if PeekConsoleInputW(_term_win_stdin_handle, rec_buf, 1, nread_buf) == 0
+    qz_free(rec_buf)
+    qz_free(nread_buf)
+    return -2
+  end
+  var n_events = _winconsole_read_u32_le(nread_buf)
+  if n_events == 0
+    qz_free(rec_buf)
+    qz_free(nread_buf)
+    return -1
+  end
+  # EventType is the first u16 of INPUT_RECORD.
+  var event_type = ptr_read_byte(rec_buf) + ptr_read_byte(ptr_add(rec_buf, 1)) * 256
+  if event_type == KEY_EVENT_TYPE()
+    qz_free(rec_buf)
+    qz_free(nread_buf)
+    # read(0) will return immediately with one VT-translated byte
+    # because conhost has the event ready.
+    var rb = mem_alloc(1)
+    var n = read(0, rb, 1)
+    if n > 0
+      var byte_val = ptr_read_byte(rb)
+      qz_free(rb)
+      return byte_val
+    end
+    qz_free(rb)
+    if n == 0
+      return -2
+    end
+    return -1
+  end
+  # Drain one non-key event. Reuse rec_buf; nread_buf gets overwritten
+  # but we don't read it back.
+  ReadConsoleInputW(_term_win_stdin_handle, rec_buf, 1, nread_buf)
+  qz_free(rec_buf)
+  qz_free(nread_buf)
+  return -1
+end
+
+# Cooperative wait while no input byte is ready. POSIX registers fd 0
+# with kqueue / epoll via `io_suspend_timeout` so the scheduler's I/O
+# poller wakes the task at byte arrival OR after `ms` — whichever
+# fires first. Windows console handles can't be registered with AFD
+# (it's socket-only), so on Windows the wait is timer-only via
+# `sched_sleep` and the next iteration's `PeekConsoleInputW` decides
+# whether bytes are ready. Cancel observation latency on Windows is
+# bounded by the chunk size (B.7 Phase 4e family contract).
+@cfg(not: os: "windows")
+def _term_wait_input(ms: Int): Void
+  io_suspend_timeout(0, ms, 1)
+end
+
+@cfg(os: "windows")
+def _term_wait_input(ms: Int): Void
+  sched_sleep(ms)
+end
+
+# Read one byte with a short timeout; used for ESC-sequence continuation
+# reads where we expect bytes 2..4 to arrive within milliseconds. Polls
+# repeatedly via `_term_wait_input` until a byte arrives or the budget
+# expires. Returns the byte (>= 0) or -1 if no byte arrived in budget_ms.
+def _term_read_byte_short_timeout(budget_ms: Int): Int
+  var start_ns = time_mono_ns()
+  while true
+    var b = _term_read_byte_nb()
+    if b >= 0
+      return b
+    end
+    if b == -2
+      return -1
+    end
+    var elapsed_ms = (time_mono_ns() - start_ns) / 1_000_000
+    if elapsed_ms >= budget_ms
+      return -1
+    end
+    var remaining = budget_ms - elapsed_ms
+    if remaining < 1
+      remaining = 1
+    end
+    _term_wait_input(remaining)
+  end
+  return -1
+end
+
+# Parse SGR-encoded mouse sequence after `ESC [ <` has been consumed.
+# Reads `BUTTON ; COL ; ROW [Mm]` digit-by-digit, decodes button bits,
+# and stashes the result into the module-level _term_last_mouse_* slots.
+# Returns true on success; false on timeout / malformed input (caller
+# falls through to bare-ESC handling).
+def _term_parse_sgr_mouse_after_lt(): Bool
+  # Button digits, terminated by ';'.
+  var button = 0
+  var any = false
+  loop
+    var b = _term_read_byte_short_timeout(_TERM_ESC_CONT_MS())
+    if b < 0
+      return false
+    end
+    if b == 59                         # ';'
+      if not any
+        return false
+      end
+      break
+    end
+    if b < 48 or b > 57
+      return false
+    end
+    button = button * 10 + (b - 48)
+    any = true
+  end
+  # Col digits, terminated by ';'.
+  var col = 0
+  any = false
+  loop
+    var b = _term_read_byte_short_timeout(_TERM_ESC_CONT_MS())
+    if b < 0
+      return false
+    end
+    if b == 59
+      if not any
+        return false
+      end
+      break
+    end
+    if b < 48 or b > 57
+      return false
+    end
+    col = col * 10 + (b - 48)
+    any = true
+  end
+  # Row digits, terminated by 'M' (press/drag) or 'm' (release).
+  var row = 0
+  any = false
+  var terminator = 0
+  loop
+    var b = _term_read_byte_short_timeout(_TERM_ESC_CONT_MS())
+    if b < 0
+      return false
+    end
+    if b == 77 or b == 109             # 'M' or 'm'
+      if not any
+        return false
+      end
+      terminator = b
+      break
+    end
+    if b < 48 or b > 57
+      return false
+    end
+    row = row * 10 + (b - 48)
+    any = true
+  end
+  _term_decode_sgr_mouse(button, col, row, terminator)
+  return true
+end
+
+# Decode the SGR mouse triplet into the module-level slots. Pulled out
+# of the parser so the spec can drive decode logic with synthetic input.
+def _term_decode_sgr_mouse(button: Int, col: Int, row: Int, terminator: Int): Void
+  _term_last_mouse_col = col
+  _term_last_mouse_row = row
+  var mods = 0
+  if (button & 0x04) != 0
+    mods = mods | 1
+  end
+  if (button & 0x08) != 0
+    mods = mods | 2
+  end
+  if (button & 0x10) != 0
+    mods = mods | 4
+  end
+  _term_last_mouse_mods = mods
+  # Scroll: bit 6 (0x40) set. Low bit is direction: even=up, odd=down.
+  if (button & 0x40) != 0
+    if (button & 1) == 0
+      _term_last_mouse_kind = 3       # ScrollUp
+    else
+      _term_last_mouse_kind = 4       # ScrollDown
+    end
+    _term_last_mouse_button = 3       # NoButton
+    return
+  end
+  # Drag: bit 5 (0x20). Else: terminator m=Release, M=Press.
+  if (button & 0x20) != 0
+    _term_last_mouse_kind = 2         # Drag
+  elsif terminator == 109             # 'm'
+    _term_last_mouse_kind = 1         # Release
+  else
+    _term_last_mouse_kind = 0         # Press
+  end
+  var bits = button & 0x03
+  if bits == 0
+    _term_last_mouse_button = 0       # Left
+  elsif bits == 1
+    _term_last_mouse_button = 1       # Middle
+  elsif bits == 2
+    _term_last_mouse_button = 2       # Right
+  else
+    _term_last_mouse_button = 3       # NoButton
+  end
+end
+
+# Decode the rest of an ESC sequence after the leading 0x1b has been read.
+# Mirrors the synchronous `term_read_key` ESC arm but uses
+# `_term_read_byte_short_timeout` for continuation bytes so a bare ESC press
+# (no follow-up bytes) decodes to KEY_ESC = 27 within ~5ms instead of
+# blocking forever.
+def _term_decode_esc_sequence_nb(): Int
+  var seq1 = _term_read_byte_short_timeout(_TERM_ESC_CONT_MS())
+  if seq1 < 0
+    return 27
+  end
+
+  if seq1 == '['
+    var seq2 = _term_read_byte_short_timeout(_TERM_ESC_CONT_MS())
+    if seq2 < 0
+      return 27
+    end
+    # SGR mouse: ESC [ < BUTTON ; COL ; ROW M-or-m
+    if seq2 == '<'
+      if _term_parse_sgr_mouse_after_lt()
+        return KEY_MOUSE_EVENT()
+      end
+      # Parse failed (timeout, malformed) — fall through to bare ESC.
+      return 27
+    end
+    if seq2 == 'A'
+      return KEY_UP()
+    end
+    if seq2 == 'B'
+      return KEY_DOWN()
+    end
+    if seq2 == 'C'
+      return KEY_RIGHT()
+    end
+    if seq2 == 'D'
+      return KEY_LEFT()
+    end
+    if seq2 == 'H'
+      return KEY_HOME()
+    end
+    if seq2 == 'F'
+      return KEY_END()
+    end
+    if seq2 >= '0' and seq2 <= '9'
+      var seq3 = _term_read_byte_short_timeout(_TERM_ESC_CONT_MS())
+      if seq3 == '~'
+        if seq2 == '1'
+          return KEY_HOME()
+        end
+        if seq2 == '3'
+          return KEY_DELETE()
+        end
+        if seq2 == '4'
+          return KEY_END()
+        end
+        if seq2 == '7'
+          return KEY_HOME()
+        end
+        if seq2 == '8'
+          return KEY_END()
+        end
+      end
+    end
+    return 27
+  end
+
+  if seq1 == 'O'
+    var seq2 = _term_read_byte_short_timeout(_TERM_ESC_CONT_MS())
+    if seq2 == 'H'
+      return KEY_HOME()
+    end
+    if seq2 == 'F'
+      return KEY_END()
+    end
+    return 27
+  end
+
+  return 27
+end
+
+## Read a single keystroke, observing the current scope's cancellation and
+## deadline. Throws via the unified Throws transport ("cancelled" /
+## "deadline_exceeded" / user-supplied reason) if `scope` is cancelled
+## before or during the wait. Returns KEY_EOF on stdin EOF or read error.
+##
+## Under root scope, degrades to blocking `term_read_key` — root is
+## uncancellable and has no deadline, so the suspend/cancel-check loop
+## would all be no-ops.
+##
+## Sister to `scope_sleep_ms` / `scope_recv` / `scope_send` /
+## `scope_lock` / `scope_rwlock_read` / `scope_rwlock_write` — joins the
+## B.7 Phase 4e chunked-poll family. Uses `io_suspend_timeout(0, ms, 1)`
+## as the wait primitive so the scheduler's I/O poller wakes the task
+## within microseconds of a real keypress while still bounding cancel
+## observation at the chunk size.
+def term_read_key_cancellable(s: Int): Int
+  if s == 0 or s == scope_root()
+    return term_read_key()
+  end
+  if _term_ensure_stdin_nonblocking() == 0
+    return term_read_key()
+  end
+  scope_check(s)
+  var self_frame = task_self()
+  _scope_register_waiter(s, self_frame)
+  if scope_is_cancelled(s)
+    _scope_unregister_waiter(s, self_frame)
+    throw(scope_cancel_reason(s))
+  end
+  var byte1 = -1
+  var cancelled = 0
+  while byte1 < 0 and cancelled == 0
+    var b = _term_read_byte_nb()
+    if b >= 0
+      byte1 = b
+    elsif b == -2
+      _scope_unregister_waiter(s, self_frame)
+      return KEY_EOF()
+    else
+      var chunk = _TERM_KEY_CHUNK_MS()
+      var rem = scope_deadline_remaining_ms(s)
+      if rem >= 0 and rem < chunk
+        chunk = rem
+      end
+      if chunk < 1
+        chunk = 1
+      end
+      _term_wait_input(chunk)
+      if scope_is_cancelled(s)
+        cancelled = 1
+      end
+    end
+  end
+  _scope_unregister_waiter(s, self_frame)
+  if cancelled == 1
+    throw(scope_cancel_reason(s))
+  end
+  if byte1 == 27
+    return _term_decode_esc_sequence_nb()
+  end
+  return byte1
+end
+
+# =============================================================================
+# Terminal Dimensions
+# =============================================================================
+
+## Get terminal width in columns.
+## Returns 80 as fallback if ioctl fails.
+@cfg(not: os: "windows")
+def term_get_width(): Int
+  # struct winsize is 8 bytes: { u16 ws_row, u16 ws_col, u16 ws_xpixel, u16 ws_ypixel }
+  var buf = mem_alloc(8)
+  var ret = ioctl(1, TIOCGWINSZ(), buf)
+  if ret != 0
+    qz_free(buf)
+    return 80
+  end
+  # ws_col is at offset 2, 2 bytes little-endian
+  var b0 = ptr_read_byte(ptr_add(buf, 2))
+  var b1 = ptr_read_byte(ptr_add(buf, 3))
+  var cols = b0 + b1 * 256
+  qz_free(buf)
+  if cols <= 0
+    return 80
+  end
+  return cols
+end
+
+## Get terminal width in columns — Win32 console flavor.
+##
+## Reads the visible-viewport rectangle (`srWindow`) from
+## CONSOLE_SCREEN_BUFFER_INFO, not the screen-buffer size (`dwSize`).
+## The buffer can be wider than the visible columns (it stores the
+## scrollback width), so srWindow.Right - srWindow.Left + 1 is the
+## correct "what the user actually sees" measurement.
+@cfg(os: "windows")
+def term_get_width(): Int
+  if _term_win_stdout_handle == 0
+    _term_win_stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE())
+  end
+  if _term_win_stdout_handle == 0
+    return 80
+  end
+  var buf = mem_alloc(CONSOLE_SCREEN_BUFFER_INFO_SIZE())
+  if GetConsoleScreenBufferInfo(_term_win_stdout_handle, buf) == 0
+    qz_free(buf)
+    return 80
+  end
+  var left  = _winconsole_read_i16_le(ptr_add(buf, CSBI_SRWINDOW_LEFT_OFFSET()))
+  var right = _winconsole_read_i16_le(ptr_add(buf, CSBI_SRWINDOW_RIGHT_OFFSET()))
+  qz_free(buf)
+  var cols = right - left + 1
+  if cols <= 0
+    return 80
+  end
+  return cols
+end
+
+## Get terminal height in rows.
+## Returns 24 as fallback if ioctl fails.
+@cfg(not: os: "windows")
+def term_get_height(): Int
+  var buf = mem_alloc(8)
+  var ret = ioctl(1, TIOCGWINSZ(), buf)
+  if ret != 0
+    qz_free(buf)
+    return 24
+  end
+  # ws_row is at offset 0, 2 bytes little-endian
+  var b0 = ptr_read_byte(buf)
+  var b1 = ptr_read_byte(ptr_add(buf, 1))
+  var rows = b0 + b1 * 256
+  qz_free(buf)
+  if rows <= 0
+    return 24
+  end
+  return rows
+end
+
+## Get terminal height in rows — Win32 console flavor.
+## srWindow.Bottom - srWindow.Top + 1 — see term_get_width for why.
+@cfg(os: "windows")
+def term_get_height(): Int
+  if _term_win_stdout_handle == 0
+    _term_win_stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE())
+  end
+  if _term_win_stdout_handle == 0
+    return 24
+  end
+  var buf = mem_alloc(CONSOLE_SCREEN_BUFFER_INFO_SIZE())
+  if GetConsoleScreenBufferInfo(_term_win_stdout_handle, buf) == 0
+    qz_free(buf)
+    return 24
+  end
+  var top    = _winconsole_read_i16_le(ptr_add(buf, CSBI_SRWINDOW_TOP_OFFSET()))
+  var bottom = _winconsole_read_i16_le(ptr_add(buf, CSBI_SRWINDOW_BOTTOM_OFFSET()))
+  qz_free(buf)
+  var rows = bottom - top + 1
+  if rows <= 0
+    return 24
+  end
+  return rows
+end
+
+# =============================================================================
+# Raw Output Helpers
+# =============================================================================
+
+# Negative-return classifier used by term_write. Returns 1 if the
+# error is recoverable (sleep + retry); 0 if it's terminal (abort).
+#
+# On POSIX, this is the EAGAIN/EWOULDBLOCK/EINTR ride-out shape.
+# On Windows console handles, write(1, ...) under VT processing is
+# robust — there's no PTY-output-queue analog to drain — so any
+# negative return is terminal. The EAGAIN-retry path is dead code
+# on Windows and we'd be reading errno via _errno() (not declared in
+# the Windows side of std/ffi/socket.qz; that gap is filed as a
+# follow-up but isn't load-bearing for terminal_smoke).
+@cfg(not: os: "windows")
+def _term_write_handle_neg(): Int
+  var err = socket::get_errno()
+  if err == socket::EAGAIN() or err == socket::EWOULDBLOCK() or err == socket::EINTR()
+    # PTY queue full or signal interruption — drain briefly, then
+    # the caller retries the same chunk. SIGWINCH delivery during a
+    # write would otherwise abort mid-frame and leave the terminal
+    # in a torn state; treat EINTR identically to EAGAIN.
+    _term_sleep_us(500)
+    return 1
+  end
+  return 0
+end
+
+@cfg(os: "windows")
+def _term_write_handle_neg(): Int = 0
+
+## Write a string directly to stdout (fd 1) without buffering.
+##
+## Loops on partial writes. `write(2)` is allowed to return with fewer
+## bytes than requested even on a regular fd; for a TUI render frame
+## that bundles base view + overlay cursor-positioning escapes (1500+
+## bytes), losing the tail of the buffer means dropped escape codes
+## and corrupt visuals — silently. Loop until the full length is sent
+## or the syscall errors with a non-recoverable error.
+##
+## EAGAIN/EWOULDBLOCK retry: on TTY-spawned processes, fd 0/1/2 share
+## one open-file-description (they're all dup'd from the same
+## controlling-tty open). Once `_term_ensure_stdin_nonblocking` flips
+## fd 0 to O_NONBLOCK for cancellable key reads, fd 1 inherits the
+## same flag — so `write(1, ...)` can return -1/EAGAIN when the PTY's
+## output queue fills. (TTY queues are typically 1024-4096 bytes; a
+## single bordered frame easily exceeds that.) On EAGAIN we sleep
+## briefly to let the consumer drain and retry. Anything else negative
+## is treated as a real error and aborts.
+def term_write(s: String): Void
+  var total = str_byte_len(s)
+  if total == 0
+    return
+  end
+  var rem = s
+  var rem_len = total
+  while rem_len > 0
+    var n = write(1, rem, rem_len)
+    if n < 0
+      if _term_write_handle_neg() == 0
+        ## Real error; bail.
+        return
+      end
+    elsif n == 0
+      ## Spec is "wrote zero bytes": treat as EOF, bail.
+      return
+    elsif n >= rem_len
+      return
+    else
+      rem = str_substr(rem, n, rem_len - n)
+      rem_len = rem_len - n
+    end
+  end
+end
+
+## Ring the terminal bell.
+def term_bell(): Void
+  term_write(str_from_char(7))
+end
+
+# =============================================================================
+# Terminal Capability Detection
+# =============================================================================
+
+## Check if a specific file descriptor is a terminal.
+## fd 0 = stdin, 1 = stdout, 2 = stderr.
+def term_is_tty_fd(fd: Int): Bool = isatty(fd) != 0
+
+## Check if stdout is a terminal.
+def term_is_tty_stdout(): Bool = isatty(1) != 0
+
+## Check if stderr is a terminal.
+def term_is_tty_stderr(): Bool = isatty(2) != 0
+
+## Sentinel: color depth not yet computed.
+var _term_color_depth_cached = -2
+
+## Detect terminal color depth.
+## Returns: 0 (no color), 16, 256, or 16777216 (truecolor).
+##
+## Respects standard env vars:
+##   NO_COLOR        — disables all color (https://no-color.org)
+##   CLICOLOR_FORCE  — forces color even when not a TTY
+##   CLICOLOR=0      — disables color
+##   COLORTERM       — "truecolor" or "24bit" → 16M colors
+##   TERM            — "256color" substring → 256, "dumb" → 0
+def term_color_depth(): Int
+  if _term_color_depth_cached != -2
+    return _term_color_depth_cached
+  end
+  _term_color_depth_cached = _term_detect_color_depth()
+  return _term_color_depth_cached
+end
+
+## Reset cached color depth (for testing or after env changes).
+def term_reset_color_cache(): Void
+  _term_color_depth_cached = -2
+end
+
+def _term_detect_color_depth(): Int
+  # NO_COLOR takes absolute precedence (https://no-color.org)
+  var no_color = getenv("NO_COLOR")
+  if str_byte_len(no_color) > 0
+    return 0
+  end
+
+  # CLICOLOR=0 explicitly disables
+  var clicolor = getenv("CLICOLOR")
+  if str_byte_len(clicolor) > 0 and clicolor == "0"
+    return 0
+  end
+
+  # CLICOLOR_FORCE bypasses TTY check
+  var force = getenv("CLICOLOR_FORCE")
+  var is_forced = str_byte_len(force) > 0 and force != "0"
+
+  # If not forced and not a TTY, no colors
+  if not is_forced and not term_is_tty_stdout()
+    return 0
+  end
+
+  # Check COLORTERM for truecolor
+  var colorterm = getenv("COLORTERM")
+  if colorterm == "truecolor" or colorterm == "24bit"
+    return 16777216
+  end
+
+  # Check TERM_PROGRAM for known truecolor terminals
+  var term_program = getenv("TERM_PROGRAM")
+  if term_program == "iTerm.app" or term_program == "WezTerm" or term_program == "Hyper"
+    return 16777216
+  end
+
+  # Check TERM for 256-color or dumb
+  var term = getenv("TERM")
+  if term == "dumb"
+    return 0
+  end
+  if str_contains(term, "256color")
+    return 256
+  end
+  if str_contains(term, "color") or str_contains(term, "ansi") or str_contains(term, "xterm")
+    return 16
+  end
+
+  # Default: assume basic 16 colors if we passed TTY check
+  return 16
+end
+
+## Sentinel: unicode support not yet computed.
+var _term_unicode_cached = -1
+
+## Check if the terminal supports Unicode output.
+## Inspects LC_ALL, LC_CTYPE, and LANG for UTF-8 indicators.
+def term_supports_unicode(): Bool
+  if _term_unicode_cached != -1
+    return _term_unicode_cached == 1
+  end
+  var result = _term_detect_unicode()
+  if result
+    _term_unicode_cached = 1
+  else
+    _term_unicode_cached = 0
+  end
+  return result
+end
+
+## Reset cached unicode detection (for testing or after env changes).
+def term_reset_unicode_cache(): Void
+  _term_unicode_cached = -1
+end
+
+def _term_has_utf8(val: String): Bool
+  if str_byte_len(val) == 0
+    return false
+  end
+  return str_contains(val, "UTF-8") or str_contains(val, "utf-8") or str_contains(val, "UTF8") or str_contains(val, "utf8")
+end
+
+def _term_detect_unicode(): Bool
+  # Check locale env vars in priority order
+  var lc_all = getenv("LC_ALL")
+  if _term_has_utf8(lc_all)
+    return true
+  end
+
+  var lc_ctype = getenv("LC_CTYPE")
+  if _term_has_utf8(lc_ctype)
+    return true
+  end
+
+  var lang = getenv("LANG")
+  if _term_has_utf8(lang)
+    return true
+  end
+
+  # Check TERM_PROGRAM for known Unicode-capable terminals
+  var term_program = getenv("TERM_PROGRAM")
+  if term_program == "iTerm.app" or term_program == "Apple_Terminal" or term_program == "WezTerm" or term_program == "vscode"
+    return true
+  end
+
+  return false
+end
+
+# =============================================================================
+# Internal Helpers — field read/write for termios struct manipulation
+# =============================================================================
+
+def _term_read_field(base: Int, offset: Int, width: Int): Int
+  var p = ptr_add(base, offset)
+  if width == 4
+    var b0 = ptr_read_byte(p)
+    var b1 = ptr_read_byte(ptr_add(p, 1))
+    var b2 = ptr_read_byte(ptr_add(p, 2))
+    var b3 = ptr_read_byte(ptr_add(p, 3))
+    return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+  end
+  # 8-byte field (macOS)
+  var b0 = ptr_read_byte(p)
+  var b1 = ptr_read_byte(ptr_add(p, 1))
+  var b2 = ptr_read_byte(ptr_add(p, 2))
+  var b3 = ptr_read_byte(ptr_add(p, 3))
+  var b4 = ptr_read_byte(ptr_add(p, 4))
+  var b5 = ptr_read_byte(ptr_add(p, 5))
+  var b6 = ptr_read_byte(ptr_add(p, 6))
+  var b7 = ptr_read_byte(ptr_add(p, 7))
+  return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216 + b4 * 4294967296 + b5 * 1099511627776 + b6 * 281474976710656 + b7 * 72057594037927936
+end
+
+def _term_write_field(base: Int, offset: Int, width: Int, value: Int): Void
+  var p = ptr_add(base, offset)
+  ptr_write_byte(p, band(value, 255))
+  ptr_write_byte(ptr_add(p, 1), band(shr(value, 8), 255))
+  ptr_write_byte(ptr_add(p, 2), band(shr(value, 16), 255))
+  ptr_write_byte(ptr_add(p, 3), band(shr(value, 24), 255))
+  if width == 8
+    ptr_write_byte(ptr_add(p, 4), band(shr(value, 32), 255))
+    ptr_write_byte(ptr_add(p, 5), band(shr(value, 40), 255))
+    ptr_write_byte(ptr_add(p, 6), band(shr(value, 48), 255))
+    ptr_write_byte(ptr_add(p, 7), band(shr(value, 56), 255))
+  end
+end

@@ -1,0 +1,558 @@
+## std/tui/plane.qz — 2D cell plane (Tier B of the v0.6 cell engine).
+##
+## A `Plane` is a rectangular cell buffer with parent-relative
+## coordinates and a z-order label. It is the unit of composition for
+## the v0.6 cell engine: widgets render into planes, and the runtime
+## composes planes into the final frame via `plane_merge_down`.
+##
+## **Tier B vs Tier A.** Tier A (today's `std/style.qz` API) renders
+## styled strings via `Style.render(s)`. Tier B (this module) renders
+## `Cell` grids via plane operations. The two coexist in v0.6: most
+## widgets stay on Tier A; cell-level consumers (roguelikes, dense
+## info displays, lighting-heavy apps) opt into Tier B. v0.7 will
+## reimplement Tier A on top of Tier B (single 1×N plane = same
+## result as today's String pipeline).
+##
+## **DAG metadata.** Each plane carries `rel_x`, `rel_y`, `z`, and an
+## optional `parent` PlaneId label. The parent slot is a label, not a
+## live tree pointer — composition is explicit via repeated
+## `plane_merge_down` calls. This keeps Plane an immutable value
+## type, in line with the rest of std/tui. Apps that need a live DAG
+## (e.g., a window manager) can build their own plane registry on
+## top.
+##
+## **Phase 6.1 scope.** Constructors, per-cell ops (getc / putc /
+## fill), DAG metadata builders (with_pos / with_z / with_parent),
+## and `plane_merge_down` with last-writer-wins semantics
+## (`AlphaMode::Transparent` cells in the top plane preserve the
+## bottom).
+##
+## **Phase 6.2 extensions.** `plane_merge_down_with(top, bottom, mode)`
+## extends composition with the libtcod-derived blend-mode dispatch
+## (`Add`, `Multiply`, `Screen`, `Lighten`, `Darken`, `Overlay`,
+## `Burn`, `Dodge`, `Alpha(pct)`). `plane_blit(src, dst, sx, sy, sw,
+## sh, dx, dy, mode)` performs sub-rect copy with blend. The damage /
+## diff renderer + DEC 2026 sync output land in Phase 6.3.
+##
+## **Out-of-bounds.** Silent no-op on writes (Notcurses behavior); a
+## blank cell on reads. Tier B treats clipping as a normal
+## composition operation, not an error — small planes drawn near
+## edges of large planes get partially merged without callers having
+## to bounds-check at every site.
+##
+## See `docs/design/TUI_V06_CELL_ENGINE.md` D2 (composition tiers) +
+## `docs/design/TUI_V06_OPEN_QUESTIONS.md` Q3 (cell coordinates).
+##
+## @since 5.28.x
+
+import std/tui/cell as cl
+import std/tui/blend as bl
+
+# =============================================================================
+# Plane handle (DAG label, not a registry index)
+# =============================================================================
+
+## Sentinel meaning "no parent" — top-level plane. PlaneId is just a
+## metadata Int label; the v0.6 stdlib does not maintain a registry
+## of planes. Apps that want a live DAG own their own.
+def PLANE_ID_ROOT(): Int = -1
+
+# =============================================================================
+# Plane struct
+# =============================================================================
+
+## A rectangular cell buffer.
+##
+## - `rel_x`, `rel_y`: position relative to parent (or absolute if
+##   `parent` is `Option::None`).
+## - `z`: z-order hint. Higher z renders on top in `plane_merge_down`
+##   call sequences; the final ordering is determined by call order,
+##   not the field. The `z` field exists for app-level tracking.
+## - `w`, `h`: dimensions in cells.
+## - `cells`: row-major `w * h` buffer. `cells[y * w + x]` is the
+##   cell at column `x`, row `y`.
+## - `parent`: optional PlaneId label. `Option::None` = top-level.
+struct Plane
+  rel_x:  Int
+  rel_y:  Int
+  z:      Int
+  w:      Int
+  h:      Int
+  cells:  Vec<Cell>
+  parent: Option<Int>
+end
+
+# =============================================================================
+# Constructors
+# =============================================================================
+
+## Internal: build a `w × h` cells buffer pre-filled with `cell`.
+def _plane_fill_cells(w: Int, h: Int, c: Cell): Vec<Cell>
+  var cells = vec_new<Cell>()
+  var n = w * h
+  if n < 0
+    n = 0
+  end
+  var i = 0
+  while i < n
+    cells.push(c)
+    i += 1
+  end
+  return cells
+end
+
+## Construct a plane with explicit DAG metadata.
+##
+## `cells` is initialized to a `w × h` blank-cell buffer
+## (`cell::cell_blank()` repeated). Negative `w` or `h` produce a
+## zero-size plane — well-defined but useless; callers should clamp.
+def plane_new(rel_x: Int, rel_y: Int, w: Int, h: Int, z: Int, parent: Option<Int>): Plane
+  var ww = w
+  var hh = h
+  if ww < 0
+    ww = 0
+  end
+  if hh < 0
+    hh = 0
+  end
+  return Plane {
+    rel_x:  rel_x,
+    rel_y:  rel_y,
+    z:      z,
+    w:      ww,
+    h:      hh,
+    cells:  _plane_fill_cells(ww, hh, cl::cell_blank()),
+    parent: Option::None
+  }
+end
+
+## Convenience constructor: top-level plane at origin (rel_x=0,
+## rel_y=0, z=0, no parent), filled with blank cells.
+def plane_create(w: Int, h: Int): Plane
+  return plane_new(0, 0, w, h, 0, Option::None)
+end
+
+# =============================================================================
+# Per-cell read / write
+# =============================================================================
+
+## Read the cell at `(x, y)`. Returns a blank cell if `(x, y)` is
+## out-of-bounds — Notcurses-style silent OOB.
+def plane_getc(p: Plane, x: Int, y: Int): Cell
+  if x < 0 or y < 0 or x >= p.w or y >= p.h
+    return cl::cell_blank()
+  end
+  var cells = p.cells
+  return cells[y * p.w + x]
+end
+
+## Write `c` at `(x, y)`. Returns the original plane unchanged if
+## `(x, y)` is out-of-bounds. Otherwise returns a new plane with the
+## cell replaced.
+def plane_putc(p: Plane, x: Int, y: Int, c: Cell): Plane
+  if x < 0 or y < 0 or x >= p.w or y >= p.h
+    return p
+  end
+  var new_cells = vec_new<Cell>()
+  var cells = p.cells
+  var n = p.w * p.h
+  var target = y * p.w + x
+  var i = 0
+  while i < n
+    if i == target
+      new_cells.push(c)
+    else
+      new_cells.push(cells[i])
+    end
+    i += 1
+  end
+  return Plane {
+    rel_x:  p.rel_x,
+    rel_y:  p.rel_y,
+    z:      p.z,
+    w:      p.w,
+    h:      p.h,
+    cells:  new_cells,
+    parent: p.parent
+  }
+end
+
+## Fill every cell of the plane with `c`. Returns a new plane.
+def plane_fill(p: Plane, c: Cell): Plane
+  return Plane {
+    rel_x:  p.rel_x,
+    rel_y:  p.rel_y,
+    z:      p.z,
+    w:      p.w,
+    h:      p.h,
+    cells:  _plane_fill_cells(p.w, p.h, c),
+    parent: p.parent
+  }
+end
+
+# =============================================================================
+# DAG metadata builders
+# =============================================================================
+
+## Reposition the plane (update `rel_x` and `rel_y`).
+## Cell content unchanged.
+def plane_with_pos(p: Plane, rel_x: Int, rel_y: Int): Plane
+  return Plane {
+    rel_x:  rel_x,
+    rel_y:  rel_y,
+    z:      p.z,
+    w:      p.w,
+    h:      p.h,
+    cells:  p.cells,
+    parent: p.parent
+  }
+end
+
+## Update z-order label. Cell content unchanged.
+def plane_with_z(p: Plane, z: Int): Plane
+  return Plane {
+    rel_x:  p.rel_x,
+    rel_y:  p.rel_y,
+    z:      z,
+    w:      p.w,
+    h:      p.h,
+    cells:  p.cells,
+    parent: p.parent
+  }
+end
+
+## Reparent the plane (update parent label). `Option::None` makes it
+## top-level. Cell content unchanged.
+def plane_with_parent(p: Plane, parent: Option<Int>): Plane
+  return Plane {
+    rel_x:  p.rel_x,
+    rel_y:  p.rel_y,
+    z:      p.z,
+    w:      p.w,
+    h:      p.h,
+    cells:  p.cells,
+    parent: parent
+  }
+end
+
+# =============================================================================
+# Composition — plane_merge_down (last-writer-wins, transparent-skip)
+# =============================================================================
+
+## Internal: should `top_cell` be written, or should `bottom_cell`
+## show through? For Phase 6.1, the answer is purely
+## `top.fg.alpha == AlphaMode::Transparent` AND
+## `top.bg.alpha == AlphaMode::Transparent` → bottom shows through;
+## otherwise top wins. Phase 6.2 extends this with the full blend-mode
+## dispatch.
+def _plane_top_cell_is_transparent(top_cell: Cell): Bool
+  var fg = top_cell.fg
+  var bg = top_cell.bg
+  var fg_t = false
+  var bg_t = false
+  if fg.alpha is Transparent
+    fg_t = true
+  end
+  if bg.alpha is Transparent
+    bg_t = true
+  end
+  if fg_t and bg_t
+    return true
+  end
+  return false
+end
+
+## Composite `top` onto `bottom`.
+##
+## `top.rel_x` and `top.rel_y` are interpreted as the offset of `top`
+## relative to `bottom`'s origin (cell coordinates). Cells in `top`
+## that fall outside `bottom`'s rectangle are clipped silently.
+##
+## A `top` cell whose fg AND bg are both `AlphaMode::Transparent`
+## preserves the underlying `bottom` cell. Any other top cell
+## overwrites bottom's cell wholesale (last-writer-wins). Phase 6.2
+## will route non-transparent cells through the full blend-mode
+## dispatch (Add, Multiply, Screen, …).
+##
+## The merged plane inherits `bottom`'s position, dimensions, z, and
+## parent label. The point is: composition produces a value with
+## bottom's identity but new visible cells.
+def plane_merge_down(top: Plane, bottom: Plane): Plane
+  var new_cells = vec_new<Cell>()
+  var bottom_cells = bottom.cells
+  var top_cells = top.cells
+  var dx = top.rel_x
+  var dy = top.rel_y
+  var bw = bottom.w
+  var bh = bottom.h
+  var tw = top.w
+  var th = top.h
+  var y = 0
+  while y < bh
+    var x = 0
+    while x < bw
+      var bottom_cell = bottom_cells[y * bw + x]
+      var tx = x - dx
+      var ty = y - dy
+      var top_in_bounds = tx >= 0 and ty >= 0 and tx < tw and ty < th
+      if top_in_bounds
+        var top_cell = top_cells[ty * tw + tx]
+        if _plane_top_cell_is_transparent(top_cell)
+          new_cells.push(bottom_cell)
+        else
+          new_cells.push(top_cell)
+        end
+      else
+        new_cells.push(bottom_cell)
+      end
+      x += 1
+    end
+    y += 1
+  end
+  return Plane {
+    rel_x:  bottom.rel_x,
+    rel_y:  bottom.rel_y,
+    z:      bottom.z,
+    w:      bw,
+    h:      bh,
+    cells:  new_cells,
+    parent: bottom.parent
+  }
+end
+
+# =============================================================================
+# Composition — Phase 6.2 blend-aware (plane_merge_down_with, plane_blit)
+# =============================================================================
+
+## Internal: compose `top_cell` over `bottom_cell` using `mode`.
+##
+## Rules:
+##   - If top.fg.alpha AND top.bg.alpha are both Transparent → keep bottom
+##     (egc, fg, bg, attrs) entirely. Phase 6.1's "transparent-skip" rule.
+##   - Otherwise, the result's egc + attrs come from top, and each
+##     channel's rgb is blended against bottom's corresponding channel
+##     per `mode`. AlphaMode::Transparent on just one channel preserves
+##     that channel from bottom; AlphaMode::Opaque or Blend goes through
+##     `blend_colors`. HighContrast is treated as Opaque for v0.6.2 (full
+##     auto-pick wired in Phase 6.3 alongside the diff renderer).
+def _compose_cell(top: cl::Cell, bottom: cl::Cell, mode: bl::BlendMode): cl::Cell
+  var top_fg: cl::Channel = top.fg
+  var top_bg: cl::Channel = top.bg
+  var bot_fg: cl::Channel = bottom.fg
+  var bot_bg: cl::Channel = bottom.bg
+
+  var fg_t = false
+  var bg_t = false
+  if top_fg.alpha is Transparent
+    fg_t = true
+  end
+  if top_bg.alpha is Transparent
+    bg_t = true
+  end
+
+  # Both channels transparent → bottom wins entirely.
+  if fg_t and bg_t
+    return bottom
+  end
+
+  # Per-channel: transparent → keep bottom's channel as-is; otherwise
+  # blend top.rgb + bottom.rgb under the supplied mode.
+  var out_fg: cl::Channel = top_fg
+  var out_bg: cl::Channel = top_bg
+
+  if fg_t
+    out_fg = bot_fg
+  else
+    out_fg = cl::Channel {
+      color:         bl::blend_colors(top_fg.color, bot_fg.color, mode),
+      alpha:         top_fg.alpha,
+      default_color: top_fg.default_color,
+      palette:       top_fg.palette
+    }
+  end
+
+  if bg_t
+    out_bg = bot_bg
+  else
+    out_bg = cl::Channel {
+      color:         bl::blend_colors(top_bg.color, bot_bg.color, mode),
+      alpha:         top_bg.alpha,
+      default_color: top_bg.default_color,
+      palette:       top_bg.palette
+    }
+  end
+
+  return cl::Cell {
+    egc:   top.egc,
+    fg:    out_fg,
+    bg:    out_bg,
+    attrs: top.attrs
+  }
+end
+
+## Composite `top` onto `bottom` with explicit blend mode.
+##
+## `BlendMode::None` is equivalent to `plane_merge_down(top, bottom)`
+## — last-writer-wins with transparent-skip. Other modes blend
+## non-transparent top cells with their corresponding bottom cells per
+## `bl::blend_colors`. Top cells outside bottom's rectangle are clipped
+## silently (same as 6.1).
+def plane_merge_down_with(top: Plane, bottom: Plane, mode: bl::BlendMode): Plane
+  var new_cells = vec_new<cl::Cell>()
+  var bottom_cells = bottom.cells
+  var top_cells = top.cells
+  var dx = top.rel_x
+  var dy = top.rel_y
+  var bw = bottom.w
+  var bh = bottom.h
+  var tw = top.w
+  var th = top.h
+  var y = 0
+  while y < bh
+    var x = 0
+    while x < bw
+      var bottom_cell = bottom_cells[y * bw + x]
+      var tx = x - dx
+      var ty = y - dy
+      var top_in_bounds = tx >= 0 and ty >= 0 and tx < tw and ty < th
+      if top_in_bounds
+        var top_cell = top_cells[ty * tw + tx]
+        new_cells.push(_compose_cell(top_cell, bottom_cell, mode))
+      else
+        new_cells.push(bottom_cell)
+      end
+      x += 1
+    end
+    y += 1
+  end
+  return Plane {
+    rel_x:  bottom.rel_x,
+    rel_y:  bottom.rel_y,
+    z:      bottom.z,
+    w:      bw,
+    h:      bh,
+    cells:  new_cells,
+    parent: bottom.parent
+  }
+end
+
+# =============================================================================
+# Inline rendering — Plane → ANSI String (Tier B → Tier A bridge)
+# =============================================================================
+#
+# `plane_render_inline` is the cursorless "render a plane to a String"
+# path. Single-row planes emit pure inline ANSI (no cursor positioning,
+# no terminal-sized framing); multi-row planes interleave `\n` between
+# rows. This is the path Tier A's `Style.render(text)` takes through
+# the cell engine for one-line styled strings, and the path
+# higher-level "string-shaped" formatters (banners, status lines,
+# log decorators) reach for when they want cell-level fidelity but
+# String output ergonomics.
+#
+# For full-screen frame composition with cursor positioning + DEC 2026
+# atomic-presentation + diffing, use `std/tui/render::renderer_diff`
+# instead.
+
+## Render a `Plane` to an inline ANSI escape String.
+##
+## Single-row planes (h == 1): emit cells left-to-right with combined
+## SGR transitions, no cursor moves. Equivalent to
+## `cl::cells_render_inline(plane.cells, depth)`.
+##
+## Multi-row planes (h > 1): emit each row inline; insert a literal
+## `\n` between rows. Each row's SGR state is closed (with a final
+## `\x1b[0m` from `cells_render_inline`) before the newline, so rows
+## render independently and don't bleed style into terminal scrollback.
+##
+## `depth == 0` short-circuits color/attr emission entirely (egcs +
+## row separators only).
+def plane_render_inline(p: Plane, depth: Int): String
+  if p.h <= 0 or p.w <= 0
+    return ""
+  end
+  var cells = p.cells
+  var w = p.w
+  var h = p.h
+  if h == 1
+    return cl::cells_render_inline(cells, depth)
+  end
+  var sb = sb_new()
+  var y = 0
+  while y < h
+    var row = vec_new<cl::Cell>()
+    var x = 0
+    while x < w
+      row.push(cells[y * w + x])
+      x += 1
+    end
+    sb.append(cl::cells_render_inline(row, depth))
+    if y < h - 1
+      sb.append("\n")
+    end
+    y += 1
+  end
+  return sb.to_string()
+end
+
+## Sub-rectangle copy from `src` onto `dst` with blend.
+##
+## Reads the rectangle `(sx, sy)` — `(sx + sw, sy + sh)` from `src`
+## and writes it onto `dst` starting at `(dx, dy)`. Cells outside
+## either rectangle's bounds are clipped silently. `mode` controls how
+## src cells composite with the existing dst cells (see
+## `bl::BlendMode`).
+##
+## Returns a new `dst`. `src` is unchanged.
+##
+## This is the cell-level analogue of bitmap blits in 2D graphics
+## libraries — useful for sprite drawing, scroll regions, partial
+## redraws of widget interiors, etc.
+def plane_blit(
+  src: Plane, dst: Plane,
+  sx: Int, sy: Int, sw: Int, sh: Int,
+  dx: Int, dy: Int,
+  mode: bl::BlendMode
+): Plane
+  var src_cells = src.cells
+  var src_w = src.w
+  var src_h = src.h
+  var dst_cells = dst.cells
+  var dst_w = dst.w
+  var dst_h = dst.h
+  var n = dst_w * dst_h
+  var new_cells = vec_new<cl::Cell>()
+  var i = 0
+  while i < n
+    new_cells.push(dst_cells[i])
+    i += 1
+  end
+  var ry = 0
+  while ry < sh
+    var rx = 0
+    while rx < sw
+      var s_col = sx + rx
+      var s_row = sy + ry
+      var d_col = dx + rx
+      var d_row = dy + ry
+      var src_in = s_col >= 0 and s_row >= 0 and s_col < src_w and s_row < src_h
+      var dst_in = d_col >= 0 and d_row >= 0 and d_col < dst_w and d_row < dst_h
+      if src_in and dst_in
+        var sc = src_cells[s_row * src_w + s_col]
+        var dst_idx = d_row * dst_w + d_col
+        var dc = new_cells[dst_idx]
+        new_cells[dst_idx] = _compose_cell(sc, dc, mode)
+      end
+      rx += 1
+    end
+    ry += 1
+  end
+  return Plane {
+    rel_x:  dst.rel_x,
+    rel_y:  dst.rel_y,
+    z:      dst.z,
+    w:      dst_w,
+    h:      dst_h,
+    cells:  new_cells,
+    parent: dst.parent
+  }
+end

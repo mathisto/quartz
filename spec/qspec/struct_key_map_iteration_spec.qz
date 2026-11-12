@@ -1,0 +1,293 @@
+## Struct-key Map iteration regression spec (R1b lock-in, commit 8adc2ac1)
+##
+## R1b routed value-layout struct map KEYS to the qz_map_custom_* runtime for
+## get/has/set/delete, and delegated map_keys / map_values / for-in to the
+## string-key emitter on the claim that the [cap,size,keys,vals] header + slot
+## encoding are identical.
+##
+## This spec asserts the DESIRED behavior: build a Map<Point, Int>, insert 4
+## distinct value-layout struct keys, and enumerate them via map_keys /
+## map_values / for-in. Order is not guaranteed, so assertions use count +
+## order-independent checksums, never positional access.
+##
+## STATUS (2026-07-01): The struct-value map get/set works (value_sum == 1000,
+## keys().size == 4), but the KEYS read back from map_keys()/for-in are garbage
+## (raw pointers decoded as inline value-layout structs), and feeding an
+## enumerated key back into m.get(k) misses (None). See the two checksum/for-in
+## cases below — they encode the CORRECT expected values and currently FAIL,
+## pinpointing the iteration-decode mismatch that R1b did not cover.
+
+import * from qspec
+
+struct Point
+  x: Int
+  y: Int
+end
+
+# item 1c: a Map<Struct, V> return-type ANNOTATION must typecheck. Before the
+# annotation-path hashability gate was routed through tc_is_struct_type (matching
+# the map_new expression path), this helper was REJECTED at typecheck with
+# "Map key type 'Point' is not hashable". It now compiles, so struct-key maps are
+# first-class in type annotations, not just constructible inline.
+def make_point_map(): Map<Point, Int>
+  var m = map_new<Point, Int>()
+  m.set(Point{x: 1, y: 2}, 100)
+  m.set(Point{x: 3, y: 4}, 200)
+  m.set(Point{x: 5, y: 6}, 300)
+  m.set(Point{x: 10, y: 20}, 400)
+  return m
+end
+
+# item 1c: a Map<Struct, V> PARAMETER annotation must also typecheck.
+def sum_vals(m: Map<Point, Int>): Int
+  var vals = m.values()
+  var sum = 0
+  for v in vals
+    sum += v
+  end
+  return sum
+end
+
+# key sum (x+y):   (1+2)+(3+4)+(5+6)+(10+20) = 3+7+11+30 = 51
+# value sum:       100+200+300+400            = 1000
+def print_keys_checksum(): Void
+  var m = map_new<Point, Int>()
+  m.set(Point{x: 1, y: 2}, 100)
+  m.set(Point{x: 3, y: 4}, 200)
+  m.set(Point{x: 5, y: 6}, 300)
+  m.set(Point{x: 10, y: 20}, 400)
+  var keys = m.keys()
+  var sum = 0
+  for k in keys
+    sum += k.x + k.y
+  end
+  puts(sum.to_s())
+end
+
+def print_values_checksum(): Void
+  var m = map_new<Point, Int>()
+  m.set(Point{x: 1, y: 2}, 100)
+  m.set(Point{x: 3, y: 4}, 200)
+  m.set(Point{x: 5, y: 6}, 300)
+  m.set(Point{x: 10, y: 20}, 400)
+  var vals = m.values()
+  var sum = 0
+  for v in vals
+    sum += v
+  end
+  puts(sum.to_s())
+end
+
+def print_forin_value_sum(): Void
+  var m = map_new<Point, Int>()
+  m.set(Point{x: 1, y: 2}, 100)
+  m.set(Point{x: 3, y: 4}, 200)
+  m.set(Point{x: 5, y: 6}, 300)
+  m.set(Point{x: 10, y: 20}, 400)
+  var sum = 0
+  for k in m
+    sum += m.get(k).unwrap()
+  end
+  puts(sum.to_s())
+end
+
+# ---------------------------------------------------------------------------
+# item-20 Phase 6 — struct-key OWN-ON-INSERT lifetime (BORROW_RECEIVER_CONVENTION
+# §5 Phase 6 / §7 Q3). A value-layout struct key must be COPIED into map-owned
+# heap storage on insert, so the map is safe to OUTLIVE the scope where its keys
+# were created. Before the fix, a FLAT (≤16B) key was stored as a raw pointer into
+# the caller's stack frame; a map built in a helper and returned held DANGLING key
+# pointers -> get()/keys() read freed stack -> wrong result / garbage keys.
+# ---------------------------------------------------------------------------
+
+# >16B struct key (3 fields, CoW layout). Its stored key is a heap CoW buffer
+# pointer, so it already outlived the caller frame pre-fix — this locks that in.
+struct Key3
+  a: Int
+  b: Int
+  c: Int
+end
+
+# Build a map with LOCAL keys in a helper and RETURN it. The Point{..} literals are
+# caller-frame allocas that die when build_escaped() returns.
+def build_escaped(): Map<Point, Int>
+  var m = map_new<Point, Int>()
+  var a = Point{x: 1, y: 2}
+  var b = Point{x: 3, y: 4}
+  var c = Point{x: 5, y: 6}
+  m.set(a, 100)
+  m.set(b, 200)
+  m.set(c, 300)
+  return m
+end
+
+def build_escaped_wide(): Map<Key3, Int>
+  var m = map_new<Key3, Int>()
+  m.set(Key3{a: 1, b: 2, c: 3}, 111)
+  m.set(Key3{a: 4, b: 5, c: 6}, 222)
+  m.set(Key3{a: 7, b: 8, c: 9}, 333)
+  return m
+end
+
+# Recursive filler to churn / overwrite the (now-dead) helper stack frame between
+# build and lookup, so a dangling key pointer would read corrupted memory.
+def churn(n: Int): Int
+  if n <= 0
+    return 0
+  end
+  var p = Point{x: n * 7, y: n * 13}
+  return p.x + p.y + churn(n - 1)
+end
+
+# Insert a key in a scope that ENDS, reusing the same alloca slot across calls.
+def ins_pt(m: Map<Point, Int>, xx: Int, yy: Int, v: Int): Void
+  var p = Point{x: xx, y: yy}
+  m.set(p, v)
+end
+
+# Sum the checksum (x+y) over all keys of an escaped map after churning the stack.
+def escaped_key_checksum(): Void
+  var m = build_escaped()
+  var junk = churn(200)
+  var sum = 0
+  for k in m
+    sum += k.x + k.y
+  end
+  puts(sum.to_s())
+end
+
+def main(): Int
+  describe("struct-key map iteration (R1b lock-in)") do ->
+    it("map_keys returns all inserted keys (count)") do ->
+      # obtained through the annotated Map<Point, Int> return-type boundary (item 1c)
+      var m = make_point_map()
+      assert_eq(m.keys().size, 4)
+    end
+
+    it("Map<Struct,V> return-type annotation typechecks and works (item 1c)") do ->
+      var m = make_point_map()
+      assert_eq(m.values().size, 4)
+    end
+
+    it("Map<Struct,V> param-type annotation typechecks (item 1c, sum == 1000)") do ->
+      var m = make_point_map()
+      assert_eq(sum_vals(m), 1000)
+    end
+
+    it("map_keys enumerates every key exactly once (checksum == 51)") do ->
+      # order-independent: sum of x+y over all keys
+      assert_output("51\n", print_keys_checksum)
+    end
+
+    it("map_values returns all inserted values (count)") do ->
+      var m = map_new<Point, Int>()
+      m.set(Point{x: 1, y: 2}, 100)
+      m.set(Point{x: 3, y: 4}, 200)
+      m.set(Point{x: 5, y: 6}, 300)
+      m.set(Point{x: 10, y: 20}, 400)
+      assert_eq(m.values().size, 4)
+    end
+
+    it("map_values enumerates every value exactly once (checksum == 1000)") do ->
+      assert_output("1000\n", print_values_checksum)
+    end
+
+    it("for-in over a struct-key map enumerates every entry once (count == 4)") do ->
+      var m = map_new<Point, Int>()
+      m.set(Point{x: 1, y: 2}, 100)
+      m.set(Point{x: 3, y: 4}, 200)
+      m.set(Point{x: 5, y: 6}, 300)
+      m.set(Point{x: 10, y: 20}, 400)
+      var count = 0
+      for k in m
+        count += 1
+      end
+      assert_eq(count, 4)
+    end
+
+    it("for-in yields keys that get() correctly (value sum via keys == 1000)") do ->
+      assert_output("1000\n", print_forin_value_sum)
+    end
+
+    it("get on struct keys works post-R1b") do ->
+      var m = map_new<Point, Int>()
+      m.set(Point{x: 3, y: 4}, 200)
+      assert_eq(m.get(Point{x: 3, y: 4}).unwrap(), 200)
+    end
+
+    it("empty struct-key map yields zero keys") do ->
+      var m = map_new<Point, Int>()
+      assert_eq(m.keys().size, 0)
+    end
+
+    # --- item-20 Phase 6: own-on-insert lifetime (flat ≤16B keys) ---
+
+    it("flat key map OUTLIVES its key allocas: get() from caller hits (100)") do ->
+      # build_escaped() creates Point keys in its own frame and returns the map.
+      # A dangling stored key -> miss (None) -> unwrap panic / wrong value.
+      var m = build_escaped()
+      var junk = churn(200)
+      assert_eq(m.get(Point{x: 1, y: 2}).unwrap(), 100)
+    end
+
+    it("escaped flat-key map: all three keys survive (sum 600)") do ->
+      var m = build_escaped()
+      var junk = churn(300)
+      var s = m.get(Point{x: 1, y: 2}).unwrap() +
+        m.get(Point{x: 3, y: 4}).unwrap() +
+        m.get(Point{x: 5, y: 6}).unwrap()
+      assert_eq(s, 600)
+    end
+
+    it("escaped flat-key iteration returns real keys, not stack garbage (21)") do ->
+      # x+y checksum: (1+2)+(3+4)+(5+6) = 21. Pre-fix: garbage pointer bits.
+      assert_output("21\n", escaped_key_checksum)
+    end
+
+    it("reinsert reusing a dead alloca slot keeps distinct owned keys") do ->
+      var m = map_new<Point, Int>()
+      ins_pt(m, 1, 1, 10)
+      ins_pt(m, 2, 2, 20)
+      ins_pt(m, 3, 3, 30)
+      assert_eq(m.size, 3)
+      assert_eq(m.get(Point{x: 1, y: 1}).unwrap(), 10)
+      assert_eq(m.get(Point{x: 2, y: 2}).unwrap(), 20)
+      assert_eq(m.get(Point{x: 3, y: 3}).unwrap(), 30)
+    end
+
+    it("update (overwrite) an existing flat key keeps map consistent") do ->
+      var m = map_new<Point, Int>()
+      ins_pt(m, 2, 2, 20)
+      ins_pt(m, 2, 2, 99)
+      ins_pt(m, 2, 2, 42)
+      assert_eq(m.size, 1)
+      assert_eq(m.get(Point{x: 2, y: 2}).unwrap(), 42)
+    end
+
+    it("delete a flat key removes it (size + None)") do ->
+      var m = build_escaped()
+      m.delete(Point{x: 3, y: 4})
+      assert_eq(m.size, 2)
+      assert_eq(m.get(Point{x: 3, y: 4}).is_none(), 1)
+      # Remaining keys still resolve.
+      assert_eq(m.get(Point{x: 1, y: 2}).unwrap(), 100)
+    end
+
+    # --- item-20 Phase 6: CoW (>16B) keys already heap-owned — lock it in ---
+
+    it("wide (CoW) key map OUTLIVES its scope: get() from caller hits (111)") do ->
+      var m = build_escaped_wide()
+      assert_eq(m.get(Key3{a: 1, b: 2, c: 3}).unwrap(), 111)
+    end
+
+    it("escaped wide-key map: all three keys survive (sum 666)") do ->
+      var m = build_escaped_wide()
+      var s = m.get(Key3{a: 1, b: 2, c: 3}).unwrap() +
+        m.get(Key3{a: 4, b: 5, c: 6}).unwrap() +
+        m.get(Key3{a: 7, b: 8, c: 9}).unwrap()
+      assert_eq(s, 666)
+    end
+  end
+
+  return qspec_main()
+end

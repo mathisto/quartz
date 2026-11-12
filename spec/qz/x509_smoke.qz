@@ -1,0 +1,639 @@
+# NET.5b.2 — X.509 parser + Ed25519 chain verify KAT runner.
+#
+# Standalone smoke driven from `quake x509:smoke`. Builds real Ed25519-signed
+# X.509 v3 certificates inside the test (using ed25519_sign), parses them
+# back via x509_parse, and walks every verification path (sig / validity /
+# hostname / chain / CA bit / path length).
+#
+# Why we build certs in-test instead of embedding KAT bytes: the cert chain
+# verifier is the load-bearing piece; we want signatures computed by our own
+# ed25519 primitive against our own parsed tbsCertificate bytes. End-to-end
+# coverage matters more than "matches openssl" — that's NET.5e.3's job (TLS
+# interop).
+#
+# Vector groups (~40 checks total):
+#   1. Build + parse a self-signed leaf — every Cert field populated correctly
+#   2. Sig verify on the self-signed cert — round-trip
+#   3. Tamper the sig → verify must reject
+#   4. Validity bounds: in-range / before / after / at boundary
+#   5. Hostname match: exact / wildcard / wrong / no SAN
+#   6. CA + path_len: leaf-as-root vs intermediate chain
+#   7. Negative parse: malformed DER, non-Ed25519 OID, BIT STRING wrong length
+
+import * from ffi/socket
+import * from std/core/crypto/secret
+import * from std/core/crypto/ed25519
+import * from std/core/crypto/x509
+import * from std/core/crypto/asn1
+
+# =============================================================================
+# Pass/fail trackers (mirrors asn1_smoke / aes_smoke)
+# =============================================================================
+
+var g_total: Int = 0
+var g_passed: Int = 0
+
+def check_eq_int(label: String, got: Int, want: Int): Void
+  g_total = g_total + 1
+  if got == want
+    g_passed = g_passed + 1
+    puts("OK   " + label)
+    return
+  end
+  puts("FAIL " + label)
+  puts("       got:  " + got.to_s())
+  puts("       want: " + want.to_s())
+end
+
+def check_eq_str(label: String, got: String, want: String): Void
+  g_total = g_total + 1
+  if got == want
+    g_passed = g_passed + 1
+    puts("OK   " + label)
+    return
+  end
+  puts("FAIL " + label)
+  puts("       got:  " + got)
+  puts("       want: " + want)
+end
+
+def check_ptr_eq(label: String, p1: Int, p2: Int, len: Int): Void
+  g_total = g_total + 1
+  var i = 0
+  while i < len
+    if ptr_read_byte(p1 + i) != ptr_read_byte(p2 + i)
+      puts("FAIL " + label + " byte " + i.to_s())
+      return
+    end
+    i = i + 1
+  end
+  g_passed = g_passed + 1
+  puts("OK   " + label)
+end
+
+# =============================================================================
+# Minimal in-test DER builder (~100 LoC, just enough to build a v3 cert)
+# =============================================================================
+
+# Write TLV's length octets at `off`; return bytes written. Mirrors asn1.qz's
+# minimal-DER form: short (≤127) or long-1/2.
+def _emit_length(buf: Int, off: Int, len: Int): Int
+  if len < 128
+    ptr_write_byte(buf + off, len)
+    return 1
+  end
+  if len < 256
+    ptr_write_byte(buf + off, 0x81)
+    ptr_write_byte(buf + off + 1, len)
+    return 2
+  end
+  if len < 65536
+    ptr_write_byte(buf + off, 0x82)
+    ptr_write_byte(buf + off + 1, (len >> 8) & 0xff)
+    ptr_write_byte(buf + off + 2, len & 0xff)
+    return 3
+  end
+  # Won't hit for any X.509 we build in tests.
+  return 0
+end
+
+# Emit tag + len + value bytes at `off`. Returns bytes written.
+def _emit_tlv(buf: Int, off: Int, tag: Int, value_ptr: Int, value_len: Int): Int
+  ptr_write_byte(buf + off, tag)
+  var ll = _emit_length(buf, off + 1, value_len)
+  var i = 0
+  while i < value_len
+    ptr_write_byte(buf + off + 1 + ll + i, ptr_read_byte(value_ptr + i))
+    i = i + 1
+  end
+  return 1 + ll + value_len
+end
+
+# Wrap `inner` (existing bytes) with a SEQUENCE (0x30) header. Returns new
+# malloc'd buffer + length via DerEmit.
+struct DerEmit
+  buf: Int
+  len: Int
+end
+
+def _wrap(tag: Int, inner: Int, inner_len: Int): DerEmit
+  var out = malloc(4 + inner_len + 8)
+  var n = _emit_tlv(out, 0, tag, inner, inner_len)
+  return DerEmit { buf: out, len: n, }
+end
+
+def _sequence(inner: Int, inner_len: Int): DerEmit = _wrap(0x30, inner, inner_len)
+def _set(inner: Int, inner_len: Int): DerEmit = _wrap(0x31, inner, inner_len)
+def _ctx_explicit(n: Int, inner: Int, inner_len: Int): DerEmit = _wrap(0xa0 | n, inner, inner_len)
+
+# INTEGER from a small positive int (no canonical pad needed for ≤127).
+def _integer_small(v: Int): DerEmit
+  var out = malloc(8)
+  ptr_write_byte(out, 0x02)
+  ptr_write_byte(out + 1, 0x01)
+  ptr_write_byte(out + 2, v & 0xff)
+  return DerEmit { buf: out, len: 3, }
+end
+
+# OID for Ed25519 (1.3.101.112 → value 2B 65 70).
+def _oid_ed25519(): DerEmit
+  var out = malloc(8)
+  ptr_write_byte(out, 0x06)
+  ptr_write_byte(out + 1, 0x03)
+  ptr_write_byte(out + 2, 0x2b)
+  ptr_write_byte(out + 3, 0x65)
+  ptr_write_byte(out + 4, 0x70)
+  return DerEmit { buf: out, len: 5, }
+end
+
+# OID for commonName (2.5.4.3 → 55 04 03).
+def _oid_cn(): DerEmit
+  var out = malloc(8)
+  ptr_write_byte(out, 0x06)
+  ptr_write_byte(out + 1, 0x03)
+  ptr_write_byte(out + 2, 0x55)
+  ptr_write_byte(out + 3, 0x04)
+  ptr_write_byte(out + 4, 0x03)
+  return DerEmit { buf: out, len: 5, }
+end
+
+# OID for BasicConstraints (2.5.29.19 → 55 1D 13).
+def _oid_bc(): DerEmit
+  var out = malloc(8)
+  ptr_write_byte(out, 0x06)
+  ptr_write_byte(out + 1, 0x03)
+  ptr_write_byte(out + 2, 0x55)
+  ptr_write_byte(out + 3, 0x1d)
+  ptr_write_byte(out + 4, 0x13)
+  return DerEmit { buf: out, len: 5, }
+end
+
+# OID for SubjectAltName (2.5.29.17 → 55 1D 11).
+def _oid_san(): DerEmit
+  var out = malloc(8)
+  ptr_write_byte(out, 0x06)
+  ptr_write_byte(out + 1, 0x03)
+  ptr_write_byte(out + 2, 0x55)
+  ptr_write_byte(out + 3, 0x1d)
+  ptr_write_byte(out + 4, 0x11)
+  return DerEmit { buf: out, len: 5, }
+end
+
+# UTF8String (tag 0x0C) holding `s`.
+def _utf8_string(s: String): DerEmit
+  var n = str_byte_len(s)
+  var bytes = malloc(if n == 0 then 1 else n end)
+  var i = 0
+  while i < n
+    ptr_write_byte(bytes + i, str_byte_at(s, i))
+    i = i + 1
+  end
+  var out = malloc(n + 8)
+  var sz = _emit_tlv(out, 0, 0x0c, bytes, n)
+  free(bytes)
+  return DerEmit { buf: out, len: sz, }
+end
+
+# UTCTime "YYMMDDhhmmssZ" (13 ASCII bytes).
+def _utctime(yy: Int, mm: Int, dd: Int, hh: Int, mi: Int, ss: Int): DerEmit
+  var ts = malloc(13)
+  var pos = 0
+  ptr_write_byte(ts + pos, 48 + (yy / 10)); pos = pos + 1
+  ptr_write_byte(ts + pos, 48 + (yy % 10)); pos = pos + 1
+  ptr_write_byte(ts + pos, 48 + (mm / 10)); pos = pos + 1
+  ptr_write_byte(ts + pos, 48 + (mm % 10)); pos = pos + 1
+  ptr_write_byte(ts + pos, 48 + (dd / 10)); pos = pos + 1
+  ptr_write_byte(ts + pos, 48 + (dd % 10)); pos = pos + 1
+  ptr_write_byte(ts + pos, 48 + (hh / 10)); pos = pos + 1
+  ptr_write_byte(ts + pos, 48 + (hh % 10)); pos = pos + 1
+  ptr_write_byte(ts + pos, 48 + (mi / 10)); pos = pos + 1
+  ptr_write_byte(ts + pos, 48 + (mi % 10)); pos = pos + 1
+  ptr_write_byte(ts + pos, 48 + (ss / 10)); pos = pos + 1
+  ptr_write_byte(ts + pos, 48 + (ss % 10)); pos = pos + 1
+  ptr_write_byte(ts + pos, 0x5a)   # 'Z'
+  var out = malloc(20)
+  var sz = _emit_tlv(out, 0, 0x17, ts, 13)
+  free(ts)
+  return DerEmit { buf: out, len: sz, }
+end
+
+# Concat two DerEmit blobs into one (frees both inputs).
+def _cat(a: DerEmit, b: DerEmit): DerEmit
+  var out = malloc(a.len + b.len + 4)
+  memcpy(out, a.buf, a.len)
+  memcpy(out + a.len, b.buf, b.len)
+  var n = a.len + b.len
+  free(a.buf)
+  free(b.buf)
+  return DerEmit { buf: out, len: n, }
+end
+
+# RDN containing a single CN. issuer / subject share this shape:
+# SEQUENCE OF SET OF SEQUENCE { OID(cn), UTF8String(cn_value) }
+def _name_with_cn(cn: String): DerEmit
+  var atv_inner = _cat(_oid_cn(), _utf8_string(cn))
+  var atv = _sequence(atv_inner.buf, atv_inner.len)
+  free(atv_inner.buf)
+  var rdn = _set(atv.buf, atv.len)
+  free(atv.buf)
+  var rdn_seq = _sequence(rdn.buf, rdn.len)
+  free(rdn.buf)
+  return rdn_seq
+end
+
+# AlgorithmIdentifier for Ed25519: SEQUENCE { OID 1.3.101.112 } (no parameters).
+def _alg_id_ed25519(): DerEmit
+  var oid = _oid_ed25519()
+  var seq = _sequence(oid.buf, oid.len)
+  free(oid.buf)
+  return seq
+end
+
+# SubjectPublicKeyInfo for Ed25519: SEQUENCE { alg_id, BIT STRING { 00 || pub[32] } }
+def _spki_ed25519(pub: Int): DerEmit
+  var alg = _alg_id_ed25519()
+  # BIT STRING value = 0x00 (unused-bits) || pub[32]
+  var bs_val = malloc(33)
+  ptr_write_byte(bs_val, 0)
+  memcpy(bs_val + 1, pub, 32)
+  var bs_out = malloc(40)
+  var bs_sz = _emit_tlv(bs_out, 0, 0x03, bs_val, 33)
+  free(bs_val)
+  var bs = DerEmit { buf: bs_out, len: bs_sz, }
+  var inner = _cat(alg, bs)
+  var seq = _sequence(inner.buf, inner.len)
+  free(inner.buf)
+  return seq
+end
+
+# Validity = SEQUENCE { UTCTime(notBefore), UTCTime(notAfter) }
+def _validity_ymd(y1: Int, m1: Int, d1: Int, y2: Int, m2: Int, d2: Int): DerEmit
+  var nb = _utctime(y1, m1, d1, 0, 0, 0)
+  var na = _utctime(y2, m2, d2, 0, 0, 0)
+  var inner = _cat(nb, na)
+  var seq = _sequence(inner.buf, inner.len)
+  free(inner.buf)
+  return seq
+end
+
+# Single dNSName SAN extension: [3] EXPLICIT SEQUENCE OF Extension where
+# the Extension is { OID(SAN), OCTET STRING { SEQUENCE OF [2] IA5String dns } }.
+# `dns_names` is a comma-separated list (split inside).
+def _ext_san_single(dns: String): DerEmit
+  var n = str_byte_len(dns)
+  var name_bytes = malloc(if n == 0 then 1 else n end)
+  var i = 0
+  while i < n
+    ptr_write_byte(name_bytes + i, str_byte_at(dns, i))
+    i = i + 1
+  end
+  var name_out = malloc(n + 8)
+  var name_sz = _emit_tlv(name_out, 0, 0x82, name_bytes, n)   # [2] IMPLICIT IA5String
+  free(name_bytes)
+  var name_tlv = DerEmit { buf: name_out, len: name_sz, }
+
+  var san_seq = _sequence(name_tlv.buf, name_tlv.len)
+  free(name_tlv.buf)
+  # Wrap in OCTET STRING (extnValue).
+  var os = _wrap(0x04, san_seq.buf, san_seq.len)
+  free(san_seq.buf)
+  # Build the Extension SEQUENCE: { OID, OCTET STRING }
+  var oid = _oid_san()
+  var ext_inner = _cat(oid, os)
+  var ext = _sequence(ext_inner.buf, ext_inner.len)
+  free(ext_inner.buf)
+  return ext
+end
+
+# BasicConstraints extension: { OID, BOOLEAN critical=TRUE, OCTET STRING { SEQUENCE { BOOLEAN CA } } }
+def _ext_basic_constraints_ca(): DerEmit
+  # Inner: BOOLEAN TRUE (no path-len for v1).
+  var bc_inner = malloc(8)
+  ptr_write_byte(bc_inner, 0x01)   # BOOLEAN tag
+  ptr_write_byte(bc_inner + 1, 0x01)   # len 1
+  ptr_write_byte(bc_inner + 2, 0xff)   # TRUE
+  var bc_seq = _sequence(bc_inner, 3)
+  free(bc_inner)
+  var os = _wrap(0x04, bc_seq.buf, bc_seq.len)
+  free(bc_seq.buf)
+  var oid = _oid_bc()
+  # critical=TRUE
+  var crit = malloc(8)
+  ptr_write_byte(crit, 0x01)
+  ptr_write_byte(crit + 1, 0x01)
+  ptr_write_byte(crit + 2, 0xff)
+  var crit_em = DerEmit { buf: crit, len: 3, }
+  var ext_inner = _cat(_cat(oid, crit_em), os)
+  var ext = _sequence(ext_inner.buf, ext_inner.len)
+  free(ext_inner.buf)
+  return ext
+end
+
+# Wrap a list of extensions into the [3] EXPLICIT SEQUENCE OF Extension.
+def _extensions_wrapper(inner: DerEmit): DerEmit
+  var seq = _sequence(inner.buf, inner.len)
+  free(inner.buf)
+  var ctx = _ctx_explicit(3, seq.buf, seq.len)
+  free(seq.buf)
+  return ctx
+end
+
+# Build a v3 tbsCertificate. Caller frees the returned buf.
+def _build_tbs(serial: Int, issuer_cn: String, subject_cn: String,
+               y1: Int, m1: Int, d1: Int, y2: Int, m2: Int, d2: Int,
+               pub: Int, dns: String, is_ca: Int): DerEmit
+  # version [0] EXPLICIT INTEGER 2 — DEFAULT v1, present here as v3.
+  var v_inner = _integer_small(2)
+  var version_real = _ctx_explicit(0, v_inner.buf, v_inner.len)
+  free(v_inner.buf)
+
+  var ser = _integer_small(serial)
+  var sig_alg = _alg_id_ed25519()
+  var issuer = _name_with_cn(issuer_cn)
+  var validity = _validity_ymd(y1, m1, d1, y2, m2, d2)
+  var subject = _name_with_cn(subject_cn)
+  var spki = _spki_ed25519(pub)
+
+  # Extensions: SAN always; BasicConstraints CA only if is_ca==1.
+  var san_ext = _ext_san_single(dns)
+  var exts_inner = san_ext
+  if is_ca == 1
+    var bc_ext = _ext_basic_constraints_ca()
+    exts_inner = _cat(exts_inner, bc_ext)
+  end
+  var exts_wrapped = _extensions_wrapper(exts_inner)
+
+  # Concat all parts of tbs.
+  var tbs_inner = _cat(version_real, ser)
+  tbs_inner = _cat(tbs_inner, sig_alg)
+  tbs_inner = _cat(tbs_inner, issuer)
+  tbs_inner = _cat(tbs_inner, validity)
+  tbs_inner = _cat(tbs_inner, subject)
+  tbs_inner = _cat(tbs_inner, spki)
+  tbs_inner = _cat(tbs_inner, exts_wrapped)
+  var tbs = _sequence(tbs_inner.buf, tbs_inner.len)
+  free(tbs_inner.buf)
+  return tbs
+end
+
+# Build a full Certificate by signing `tbs` with `seed`. Caller frees the
+# returned buf. The pub key passed in `pub` MUST correspond to seed.
+def _build_signed_cert(tbs: DerEmit, seed: Int, pub: Int): DerEmit
+  var sig = malloc(64)
+  ed25519_sign(sig, tbs.buf, tbs.len, secret_wrap<Int>(seed), pub)
+  # signatureValue BIT STRING { 00 || sig[64] }
+  var bs_val = malloc(65)
+  ptr_write_byte(bs_val, 0)
+  memcpy(bs_val + 1, sig, 64)
+  var bs_out = malloc(72)
+  var bs_sz = _emit_tlv(bs_out, 0, 0x03, bs_val, 65)
+  free(bs_val)
+  free(sig)
+  var bs = DerEmit { buf: bs_out, len: bs_sz, }
+  var sig_alg = _alg_id_ed25519()
+  var inner = _cat(_cat(tbs, sig_alg), bs)
+  var cert = _sequence(inner.buf, inner.len)
+  free(inner.buf)
+  return cert
+end
+
+# Build a self-signed cert in one shot. Returns (cert_buf, cert_len).
+def _build_self_signed(serial: Int, cn: String, dns: String, is_ca: Int,
+                       y1: Int, m1: Int, d1: Int, y2: Int, m2: Int, d2: Int,
+                       seed: Int, pub: Int): DerEmit
+  var tbs = _build_tbs(serial, cn, cn, y1, m1, d1, y2, m2, d2, pub, dns, is_ca)
+  return _build_signed_cert(tbs, seed, pub)
+end
+
+# Build a cert signed by a different key (cross-signed / intermediate→leaf).
+def _build_cross_signed(serial: Int, issuer_cn: String, subject_cn: String,
+                        dns: String, is_ca: Int,
+                        y1: Int, m1: Int, d1: Int, y2: Int, m2: Int, d2: Int,
+                        leaf_pub: Int, signer_seed: Int, signer_pub: Int): DerEmit
+  var tbs = _build_tbs(serial, issuer_cn, subject_cn, y1, m1, d1, y2, m2, d2,
+                       leaf_pub, dns, is_ca)
+  return _build_signed_cert(tbs, signer_seed, signer_pub)
+end
+
+# =============================================================================
+# Test suites
+# =============================================================================
+
+# Deterministic Ed25519 seed for the "leaf-and-root" key.
+def _fill_seed(buf: Int, b: Int): Void
+  var i = 0
+  while i < 32
+    ptr_write_byte(buf + i, (i + b) & 0xff)
+    i = i + 1
+  end
+end
+
+def test_self_signed_parse(): Void
+  puts("--- self-signed parse + verify ---")
+  var seed = malloc(32)
+  _fill_seed(seed, 0)
+  var pub = malloc(32)
+  ed25519_secret_to_public(pub, secret_wrap<Int>(seed))
+
+  var cert_em = _build_self_signed(1, "Test CA", "test.example.com", 1,
+                                   26, 1, 1, 27, 1, 1, seed, pub)
+  var cert = x509_parse(cert_em.buf, cert_em.len)
+
+  check_eq_int("parse ok",            cert.err,             0)
+  check_eq_int("spki is Ed25519",     cert.spki_is_ed25519, 1)
+  check_eq_int("spki len",            cert.spki_len,        32)
+  check_ptr_eq("spki bytes match pub", cert.spki_ptr, pub,  32)
+  check_eq_int("sig is Ed25519",      cert.sig_is_ed25519,  1)
+  check_eq_int("sig len 64",          cert.sig_len,         64)
+  check_eq_str("subject_cn",          cert.subject_cn,      "Test CA")
+  check_eq_int("san count",           cert.san_dns.size(),  1)
+  if cert.san_dns.size() >= 1
+    check_eq_str("san[0]",            cert.san_dns[0],      "test.example.com")
+  end
+  check_eq_int("is_ca true",          cert.is_ca,           1)
+  # notBefore for 2026-01-01 00:00:00 UTC = 1767225600.
+  check_eq_int("notBefore", cert.not_before, 1767225600)
+  # notAfter for 2027-01-01 00:00:00 UTC = 1798761600.
+  check_eq_int("notAfter",  cert.not_after,  1798761600)
+
+  # Self-signed sig verify.
+  check_eq_int("self sig verifies", x509_verify_signature(cert, cert.spki_ptr), 1)
+
+  # Tamper sig (flip first byte) → must reject.
+  var orig_byte = ptr_read_byte(cert.sig_ptr)
+  ptr_write_byte(cert.sig_ptr, orig_byte ^ 0x01)
+  check_eq_int("tampered sig rejects", x509_verify_signature(cert, cert.spki_ptr), 0)
+  ptr_write_byte(cert.sig_ptr, orig_byte)
+  check_eq_int("restored sig verifies", x509_verify_signature(cert, cert.spki_ptr), 1)
+
+  free(cert_em.buf)
+  free(pub); free(seed)
+end
+
+def test_validity_bounds(): Void
+  puts("--- validity bounds ---")
+  var seed = malloc(32)
+  _fill_seed(seed, 0)
+  var pub = malloc(32)
+  ed25519_secret_to_public(pub, secret_wrap<Int>(seed))
+
+  # Window: 2026-01-01 to 2027-01-01.
+  var cert_em = _build_self_signed(1, "Test", "host.example.com", 0,
+                                   26, 1, 1, 27, 1, 1, seed, pub)
+  var cert = x509_parse(cert_em.buf, cert_em.len)
+  check_eq_int("parse ok", cert.err, 0)
+
+  # 1767225600 = 2026-01-01 00:00:00 UTC. Right at the boundary.
+  check_eq_int("at notBefore (inclusive)", x509_check_validity(cert, 1767225600), 0)
+  # 1779451200 = 2026-05-22 12:00:00 UTC. In range.
+  check_eq_int("in range",                 x509_check_validity(cert, 1779451200), 0)
+  # 1767225599 = one sec before notBefore.
+  check_eq_int("one sec before",  x509_check_validity(cert, 1767225599), X509_ERR_TIME())
+  # 1798761600 = exactly notAfter (exclusive per RFC 5280 §4.1.2.5).
+  check_eq_int("at notAfter (exclusive)", x509_check_validity(cert, 1798761600), X509_ERR_TIME())
+  # 1798761601 = just past notAfter.
+  check_eq_int("one sec past notAfter",   x509_check_validity(cert, 1798761601), X509_ERR_TIME())
+
+  free(cert_em.buf)
+  free(pub); free(seed)
+end
+
+def test_hostname_match(): Void
+  puts("--- hostname matching ---")
+  var seed = malloc(32)
+  _fill_seed(seed, 0)
+  var pub = malloc(32)
+  ed25519_secret_to_public(pub, secret_wrap<Int>(seed))
+
+  # Exact-match cert.
+  var c1 = _build_self_signed(1, "Test", "test.example.com", 0,
+                              26, 1, 1, 27, 1, 1, seed, pub)
+  var cert1 = x509_parse(c1.buf, c1.len)
+  check_eq_int("exact match",      x509_match_hostname(cert1, "test.example.com"), 1)
+  check_eq_int("case-insensitive", x509_match_hostname(cert1, "Test.Example.Com"), 1)
+  check_eq_int("subdomain reject", x509_match_hostname(cert1, "sub.test.example.com"), 0)
+  check_eq_int("different host",   x509_match_hostname(cert1, "other.example.com"), 0)
+  check_eq_int("empty reject",     x509_match_hostname(cert1, ""), 0)
+  free(c1.buf)
+
+  # Wildcard cert.
+  var c2 = _build_self_signed(2, "Test", "*.example.com", 0,
+                              26, 1, 1, 27, 1, 1, seed, pub)
+  var cert2 = x509_parse(c2.buf, c2.len)
+  check_eq_int("wildcard match foo",   x509_match_hostname(cert2, "foo.example.com"), 1)
+  check_eq_int("wildcard match bar",   x509_match_hostname(cert2, "bar.example.com"), 1)
+  check_eq_int("wildcard reject root", x509_match_hostname(cert2, "example.com"), 0)
+  check_eq_int("wildcard reject sub-sub", x509_match_hostname(cert2, "a.b.example.com"), 0)
+  check_eq_int("wildcard reject diff TLD",  x509_match_hostname(cert2, "foo.example.org"), 0)
+  free(c2.buf)
+
+  free(pub); free(seed)
+end
+
+def test_chain_self_signed_as_root(): Void
+  puts("--- chain: self-signed leaf in root store ---")
+  var seed = malloc(32)
+  _fill_seed(seed, 0)
+  var pub = malloc(32)
+  ed25519_secret_to_public(pub, secret_wrap<Int>(seed))
+
+  # Self-signed cert that's BOTH the leaf and the root.
+  var cert_em = _build_self_signed(1, "Self", "self.example.com", 1,
+                                   26, 1, 1, 27, 1, 1, seed, pub)
+  var cert = x509_parse(cert_em.buf, cert_em.len)
+
+  var ints = vec_new<Cert>()
+  var roots = vec_new<Cert>()
+  roots.push(cert)
+
+  var rc = x509_verify_chain(cert, ints, roots, 1779451200, "self.example.com")
+  check_eq_int("self-signed-as-root verifies", rc, 0)
+
+  # Wrong hostname.
+  var rc2 = x509_verify_chain(cert, ints, roots, 1779451200, "other.example.com")
+  check_eq_int("self-signed wrong hostname rejects", rc2, X509_ERR_HOSTNAME())
+
+  # Out of validity.
+  var rc3 = x509_verify_chain(cert, ints, roots, 1767225599, "self.example.com")
+  check_eq_int("self-signed before notBefore rejects", rc3, X509_ERR_TIME())
+
+  free(cert_em.buf)
+  free(pub); free(seed)
+end
+
+def test_chain_two_level(): Void
+  puts("--- chain: leaf signed by separate root ---")
+  var rseed = malloc(32); _fill_seed(rseed, 100)
+  var rpub = malloc(32); ed25519_secret_to_public(rpub, secret_wrap<Int>(rseed))
+  var lseed = malloc(32); _fill_seed(lseed, 200)
+  var lpub = malloc(32); ed25519_secret_to_public(lpub, secret_wrap<Int>(lseed))
+
+  # Self-signed root (CA=true).
+  var root_em = _build_self_signed(10, "Test Root CA", "test-root.example.com", 1,
+                                   26, 1, 1, 27, 1, 1, rseed, rpub)
+  var root = x509_parse(root_em.buf, root_em.len)
+  check_eq_int("root parse",     root.err,   0)
+  check_eq_int("root is CA",     root.is_ca, 1)
+
+  # Leaf signed by root.
+  var leaf_em = _build_cross_signed(20, "Test Root CA", "leaf.example.com",
+                                    "leaf.example.com", 0,
+                                    26, 1, 1, 27, 1, 1, lpub, rseed, rpub)
+  var leaf = x509_parse(leaf_em.buf, leaf_em.len)
+  check_eq_int("leaf parse",     leaf.err,   0)
+  check_eq_int("leaf is_ca",     leaf.is_ca, 0)
+  check_eq_int("leaf sig under root", x509_verify_signature(leaf, root.spki_ptr), 1)
+
+  var ints = vec_new<Cert>()
+  var roots = vec_new<Cert>()
+  roots.push(root)
+  var rc = x509_verify_chain(leaf, ints, roots, 1779451200, "leaf.example.com")
+  check_eq_int("2-level chain verifies", rc, 0)
+
+  # Leaf without a matching root → CHAIN error.
+  var empty_roots = vec_new<Cert>()
+  var rc_no_root = x509_verify_chain(leaf, ints, empty_roots, 1779451200, "leaf.example.com")
+  check_eq_int("missing root rejects", rc_no_root, X509_ERR_CHAIN())
+
+  free(leaf_em.buf); free(root_em.buf)
+  free(lpub); free(lseed); free(rpub); free(rseed)
+end
+
+def test_negative_parse(): Void
+  puts("--- negative parse ---")
+
+  # Empty buffer.
+  var empty = malloc(1)
+  var c = x509_parse(empty, 0)
+  check_eq_int("empty rejects", c.err, X509_ERR_PARSE())
+  free(empty)
+
+  # Random garbage.
+  var junk = malloc(16)
+  var i = 0
+  while i < 16
+    ptr_write_byte(junk + i, 0xff)
+    i = i + 1
+  end
+  var c2 = x509_parse(junk, 16)
+  check_eq_int("garbage rejects", c2.err, X509_ERR_PARSE())
+  free(junk)
+end
+
+# =============================================================================
+# Entry point
+# =============================================================================
+
+def main(): Int
+  test_self_signed_parse()
+  test_validity_bounds()
+  test_hostname_match()
+  test_chain_self_signed_as_root()
+  test_chain_two_level()
+  test_negative_parse()
+
+  puts("")
+  puts(g_passed.to_s() + "/" + g_total.to_s() + " checks green")
+  if g_passed == g_total then return 0 end
+  return 1
+end

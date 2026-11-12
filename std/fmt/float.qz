@@ -1,0 +1,413 @@
+## std/fmt/float — pure-Quartz shortest-round-trip float formatting
+##
+## `f64_to_str(f)` renders an F64 as the SHORTEST decimal string that parses
+## back to exactly `f` (round-trip), matching Go `strconv.FormatFloat(f,'g',-1,64)`
+## / Rust `{}`. No libc — pure integer arithmetic, so it works freestanding
+## (the unikernel has no `sprintf`). See docs/design/FLOAT_TO_STRING.md and
+## docs/bugs/FLOAT_TO_STRING_SILENT_BITS.md.
+##
+## Algorithm: Dragon4 (Steele & White / Burger & Dybvig free-format). Exact
+## rational arithmetic over a small bignum — no precomputed power tables, so
+## no magic constants. The faster table-driven cores (Ryū / Dragonbox /
+## Schubfach) are the documented speed follow-up (ROADMAP Tier 5 #31); they
+## produce the same output behind this same API + the round-trip oracle.
+##
+## Bignum: little-endian Vec<Int>, base 2^30 limbs (each in [0, 2^30)). 30-bit
+## limbs keep every limb product (limb × small) inside i64 with room to spare,
+## so no widening multiply and no overflow handling are needed. Ops are
+## functional (return a fresh Vec) to sidestep in-place-mutation hazards.
+
+# =============================================================================
+# bignum (base 2^30, little-endian, normalized: no high zero limbs; 0 == empty)
+# =============================================================================
+
+# Drop high-order zero limbs so cmp-by-length holds.
+def _bn_norm(a: Vec<Int>): Vec<Int>
+  var n = a.size
+  while n > 0 and a[n - 1] == 0
+    n = n - 1
+  end
+  if n == a.size
+    return a
+  end
+  var r = vec_new<Int>()
+  var i = 0
+  while i < n
+    r.push(a[i])
+    i = i + 1
+  end
+  return r
+end
+
+# x >= 0, fits in i64.
+def _bn_from_int(x: Int): Vec<Int>
+  var r = vec_new<Int>()
+  var v = x
+  while v > 0
+    r.push(v & 1073741823)
+    v = v >> 30
+  end
+  return r
+end
+
+# Compare magnitudes: -1 if a<b, 0 if equal, 1 if a>b. Inputs normalized.
+def _bn_cmp(a: Vec<Int>, b: Vec<Int>): Int
+  if a.size != b.size
+    if a.size < b.size
+      return -1
+    end
+    return 1
+  end
+  var i = a.size - 1
+  while i >= 0
+    if a[i] != b[i]
+      if a[i] < b[i]
+        return -1
+      end
+      return 1
+    end
+    i = i - 1
+  end
+  return 0
+end
+
+def _bn_add(a: Vec<Int>, b: Vec<Int>): Vec<Int>
+  var r = vec_new<Int>()
+  var carry = 0
+  var n = a.size
+  if b.size > n
+    n = b.size
+  end
+  var i = 0
+  while i < n
+    var s = carry
+    if i < a.size
+      s = s + a[i]
+    end
+    if i < b.size
+      s = s + b[i]
+    end
+    r.push(s & 1073741823)
+    carry = s >> 30
+    i = i + 1
+  end
+  if carry > 0
+    r.push(carry)
+  end
+  return _bn_norm(r)
+end
+
+# a - b, assumes a >= b.
+def _bn_sub(a: Vec<Int>, b: Vec<Int>): Vec<Int>
+  var r = vec_new<Int>()
+  var borrow = 0
+  var i = 0
+  while i < a.size
+    var s = a[i] - borrow
+    if i < b.size
+      s = s - b[i]
+    end
+    if s < 0
+      s = s + 1073741824
+      borrow = 1
+    else
+      borrow = 0
+    end
+    r.push(s)
+    i = i + 1
+  end
+  return _bn_norm(r)
+end
+
+# a * m, m small (used only with 2, 4, 5, 10 — m*limb stays well inside i64).
+def _bn_mul_small(a: Vec<Int>, m: Int): Vec<Int>
+  if m == 0 or a.size == 0
+    return vec_new<Int>()
+  end
+  var r = vec_new<Int>()
+  var carry = 0
+  var i = 0
+  while i < a.size
+    var t = a[i] * m + carry
+    r.push(t & 1073741823)
+    carry = t >> 30
+    i = i + 1
+  end
+  while carry > 0
+    r.push(carry & 1073741823)
+    carry = carry >> 30
+  end
+  return _bn_norm(r)
+end
+
+# a * 2^n.
+def _bn_shl_bits(a: Vec<Int>, n: Int): Vec<Int>
+  if a.size == 0
+    return vec_new<Int>()
+  end
+  var words = n / 30
+  var bit = n % 30
+  var r = vec_new<Int>()
+  var i = 0
+  while i < words
+    r.push(0)
+    i = i + 1
+  end
+  if bit == 0
+    var j = 0
+    while j < a.size
+      r.push(a[j])
+      j = j + 1
+    end
+    return _bn_norm(r)
+  end
+  var carry = 0
+  var j = 0
+  while j < a.size
+    var t = (a[j] << bit) | carry
+    r.push(t & 1073741823)
+    carry = t >> 30
+    j = j + 1
+  end
+  if carry > 0
+    r.push(carry)
+  end
+  return _bn_norm(r)
+end
+
+# =============================================================================
+# Dragon4
+# =============================================================================
+
+# Render `f` as its shortest round-tripping decimal string.
+def f64_to_str(f: F64): String
+  var bits = as_int(f)
+  var sign = (bits >> 63) & 1
+  # Masking discards the sign bit, so no 1<<63 literal is needed.
+  var ieee_exp = (bits >> 52) & 2047
+  var mant = bits & ((1 << 52) - 1)
+
+  if ieee_exp == 2047
+    if mant == 0
+      if sign == 1
+        return "-inf"
+      end
+      return "inf"
+    end
+    return "nan"
+  end
+
+  if ieee_exp == 0 and mant == 0
+    if sign == 1
+      return "-0"
+    end
+    return "0"
+  end
+
+  var fsig = 0
+  var e = 0
+  if ieee_exp == 0
+    fsig = mant
+    e = -1074
+  else
+    fsig = mant | (1 << 52)
+    e = ieee_exp - 1075
+  end
+  var even = (fsig & 1) == 0
+  var lower_closer = (mant == 0) and (ieee_exp > 1)
+
+  # ---- setup scaled integers R, S, M+ (Mp), M- (Mm) ----
+  # value = R/S ; the float rounds anything in (value - Mm/S, value + Mp/S).
+  var rr = vec_new<Int>()
+  var ss = vec_new<Int>()
+  var mp = vec_new<Int>()
+  var mm = vec_new<Int>()
+  if e >= 0
+    var be = _bn_shl_bits(_bn_from_int(1), e)
+    var fbe = _bn_shl_bits(_bn_from_int(fsig), e)
+    if lower_closer
+      rr = _bn_mul_small(fbe, 4)
+      ss = _bn_from_int(4)
+      mp = _bn_mul_small(be, 2)
+      mm = be
+    else
+      rr = _bn_mul_small(fbe, 2)
+      ss = _bn_from_int(2)
+      mp = be
+      mm = be
+    end
+  else
+    if lower_closer
+      rr = _bn_mul_small(_bn_from_int(fsig), 4)
+      ss = _bn_shl_bits(_bn_from_int(1), 2 - e)
+      mp = _bn_from_int(2)
+      mm = _bn_from_int(1)
+    else
+      rr = _bn_mul_small(_bn_from_int(fsig), 2)
+      ss = _bn_shl_bits(_bn_from_int(1), 1 - e)
+      mp = _bn_from_int(1)
+      mm = _bn_from_int(1)
+    end
+  end
+
+  # ---- scale: position k so the first generated digit is in [1,9]
+  #      (value = 0.d1d2...dn * 10^k) ----
+  #
+  # Scale on the value numerator `rr` alone, with strict magnitude tests, in
+  # two SEQUENTIAL phases — never interleaved. An earlier bidirectional loop
+  # that tested `rr + mp` with `even`-inclusive comparisons on both sides
+  # oscillated forever when `rr + mp == ss` exactly (e.g. 9.999999999999999e22,
+  # whose upper boundary touches a power of ten): high bumped `ss` up, low
+  # bumped it straight back. The decade-boundary round-up that `rr + mp` was
+  # meant to catch (rounding interval reaching the next power of ten, so the
+  # shortest form has one fewer digit) is handled instead by the `carry_out`
+  # path in the generate loop, so the scale step only needs the magnitude.
+  #
+  # After both phases, rr is in [ss/10, ss); the generate loop's first
+  # `rr *= 10` then puts the leading digit in [1,9].
+  var k = 0
+  # Phase A — value too big (rr >= ss): grow ss.
+  while _bn_cmp(rr, ss) >= 0
+    ss = _bn_mul_small(ss, 10)
+    k = k + 1
+  end
+  # Phase B — value too small (rr*10 < ss): grow rr (and the boundaries).
+  while _bn_cmp(_bn_mul_small(rr, 10), ss) < 0
+    rr = _bn_mul_small(rr, 10)
+    mp = _bn_mul_small(mp, 10)
+    mm = _bn_mul_small(mm, 10)
+    k = k - 1
+  end
+
+  # ---- generate digits ----
+  var digits = vec_new<Int>()
+  var carry_out = false
+  var generating = true
+  while generating
+    rr = _bn_mul_small(rr, 10)
+    mp = _bn_mul_small(mp, 10)
+    mm = _bn_mul_small(mm, 10)
+    var d = 0
+    while _bn_cmp(rr, ss) >= 0
+      rr = _bn_sub(rr, ss)
+      d = d + 1
+    end
+    var cl = _bn_cmp(rr, mm)
+    var low = cl < 0
+    if even
+      low = cl <= 0
+    end
+    var ch = _bn_cmp(_bn_add(rr, mp), ss)
+    var high = ch > 0
+    if even
+      high = ch >= 0
+    end
+    if (not low) and (not high)
+      digits.push(d)
+    else
+      var dfinal = d
+      if low and (not high)
+        dfinal = d
+      elsif high and (not low)
+        dfinal = d + 1
+      else
+        var c2 = _bn_cmp(_bn_mul_small(rr, 2), ss)
+        if c2 > 0
+          dfinal = d + 1
+        elsif c2 < 0
+          dfinal = d
+        else
+          # exact midpoint: round to even last digit
+          if (d & 1) == 0
+            dfinal = d
+          else
+            dfinal = d + 1
+          end
+        end
+      end
+      if dfinal == 10
+        # all-nines rounded up: 0.99..9 -> 1.0 == 0.1 * 10^(k+1)
+        carry_out = true
+      else
+        digits.push(dfinal)
+      end
+      generating = false
+    end
+  end
+
+  if carry_out
+    digits = vec_new<Int>()
+    digits.push(1)
+    k = k + 1
+  end
+
+  # ---- format (Go %g policy: scientific when exp10 < -4 or >= 21) ----
+  var n = digits.size
+  var exp10 = k - 1
+  var sb = sb_new()
+  if sign == 1
+    sb_append(sb, "-")
+  end
+  if exp10 < -4 or exp10 >= 21
+    sb_append_int(sb, digits[0])
+    if n > 1
+      sb_append(sb, ".")
+      var i = 1
+      while i < n
+        sb_append_int(sb, digits[i])
+        i = i + 1
+      end
+    end
+    sb_append(sb, "e")
+    var ae = exp10
+    if exp10 >= 0
+      sb_append(sb, "+")
+    else
+      sb_append(sb, "-")
+      ae = -exp10
+    end
+    if ae < 10
+      sb_append(sb, "0")
+    end
+    sb_append_int(sb, ae)
+  else
+    if k <= 0
+      sb_append(sb, "0.")
+      var z = 0
+      while z < (0 - k)
+        sb_append(sb, "0")
+        z = z + 1
+      end
+      var i = 0
+      while i < n
+        sb_append_int(sb, digits[i])
+        i = i + 1
+      end
+    elsif k >= n
+      var i = 0
+      while i < n
+        sb_append_int(sb, digits[i])
+        i = i + 1
+      end
+      var z = 0
+      while z < (k - n)
+        sb_append(sb, "0")
+        z = z + 1
+      end
+    else
+      var i = 0
+      while i < k
+        sb_append_int(sb, digits[i])
+        i = i + 1
+      end
+      sb_append(sb, ".")
+      while i < n
+        sb_append_int(sb, digits[i])
+        i = i + 1
+      end
+    end
+  end
+  var result = sb_to_string(sb)
+  sb_free(sb)
+  return result
+end

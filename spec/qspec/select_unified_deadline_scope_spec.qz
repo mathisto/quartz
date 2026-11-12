@@ -1,0 +1,213 @@
+## C.13 Phase 5 — DeadlineSelectable + ScopeCancelSelectable round-trip
+## through real Selectable trait dispatch. Exercises:
+##   - DeadlineSelectable.try_poll fires after time_mono_ns >= deadline
+##   - DeadlineSelectable.complete throws "deadline_exceeded" via Throws
+##   - ScopeCancelSelectable.try_poll observes scope_is_cancelled
+##   - ScopeCancelSelectable.complete throws scope_cancel_reason via Throws
+##   - chunked-poll fall-through composes with default arms cleanly
+##
+## **Throw semantics**: when a deadline/cancel arm "wins" the select,
+## `complete` throws via Throws BEFORE the arm body runs. The body's
+## bound value (via `case _ = ...`) is therefore unobservable in
+## practice — the user's actual handling lives in a surrounding
+## `with Throws { throw: handler } do -> ... end`. Tests that exercise
+## the firing case wrap the select in such a handler.
+##
+## Active-wake retrofit (Phase 4b) will tighten deadline precision;
+## this spec only tests pre-retrofit chunked-poll behavior so the
+## non-firing tests stay default-only (no chunked-poll latency).
+
+import * from qspec
+import * from std/sync/composition/scope
+import * from std/sync/communication/channel
+import * from std/throws
+
+# Capture for Throws-driven assertions.
+var dl_caught_msg = ""
+var dl_caught_count = 0
+
+def dl_capture(op_name: Int, argc: Int, argv: Int): Int
+  dl_caught_msg = as_type<String>(load(argv, 0))
+  dl_caught_count += 1
+  return 0
+end
+
+def reset_capture(): Void
+  dl_caught_msg = ""
+  dl_caught_count = 0
+end
+
+# ---------------------------------------------------------------------------
+# Non-firing path: default arm beats a non-ready Selectable. No throws.
+# ---------------------------------------------------------------------------
+
+def test_deadline_default_when_far_future(): Int
+  var fired = 0
+  select
+    case _ = deadline_ms(60000) => fired = 1
+    default => fired = 99
+  end
+  return fired
+end
+
+def test_cancellable_default_when_uncancelled(): Int
+  var s = scope_with_cancel(scope_root())
+  var fired = 0
+  select
+    case _ = cancellable(s) => fired = 1
+    default => fired = 99
+  end
+  return fired
+end
+
+def test_recv_wins_against_far_deadline(): Int
+  var ch = channel_new(1)
+  send(ch, 42)
+  var got = -1
+  select
+    case v = recvable(ch) => got = v
+    case _ = deadline_ms(60000) => got = -2
+    default => got = -3
+  end
+  return got
+end
+
+def test_recv_wins_against_uncancelled_scope(): Int
+  var ch = channel_new(1)
+  send(ch, 7)
+  var s = scope_with_cancel(scope_root())
+  var got = -1
+  select
+    case v = recvable(ch) => got = v
+    case _ = cancellable(s) => got = -2
+    default => got = -3
+  end
+  return got
+end
+
+# ---------------------------------------------------------------------------
+# Firing path: ready Selectable's `complete` throws via Throws. Each test
+# wraps its body in `with Throws { throw: dl_capture } do -> ... end` so
+# the handler observes the throw and the test function returns the
+# captured count / message.
+# ---------------------------------------------------------------------------
+
+# Body slot for the deadline-throw test — captures whether the arm body ran.
+var dl_arm_body_ran = 0
+
+def deadline_throw_body(): Int
+  dl_arm_body_ran = 0
+  select
+    case _ = deadline_ms(0) => dl_arm_body_ran = 1
+  end
+  return 0
+end
+
+def test_deadline_complete_throws_via_throws(): Int
+  reset_capture()
+  dl_arm_body_ran = 0
+  with Throws { throw: dl_capture } do ->
+    deadline_throw_body()
+    0
+  end
+  return dl_caught_count
+end
+
+def test_deadline_complete_throw_message(): String
+  reset_capture()
+  dl_arm_body_ran = 0
+  with Throws { throw: dl_capture } do ->
+    deadline_throw_body()
+    0
+  end
+  return dl_caught_msg
+end
+
+def test_deadline_arm_body_skipped_on_throw(): Int
+  reset_capture()
+  dl_arm_body_ran = 0
+  with Throws { throw: dl_capture } do ->
+    deadline_throw_body()
+    0
+  end
+  return dl_arm_body_ran
+end
+
+# Pre-cancelled scope body for the cancel-throw test.
+var sc_arm_body_ran = 0
+
+def cancel_throw_body(): Int
+  var s = scope_with_cancel(scope_root())
+  scope_cancel_with(s, "user_aborted_select")
+  sc_arm_body_ran = 0
+  select
+    case _ = cancellable(s) => sc_arm_body_ran = 1
+  end
+  return 0
+end
+
+def test_cancellable_complete_throws_via_throws(): Int
+  reset_capture()
+  sc_arm_body_ran = 0
+  with Throws { throw: dl_capture } do ->
+    cancel_throw_body()
+    0
+  end
+  return dl_caught_count
+end
+
+def test_cancellable_complete_carries_user_reason(): String
+  reset_capture()
+  sc_arm_body_ran = 0
+  with Throws { throw: dl_capture } do ->
+    cancel_throw_body()
+    0
+  end
+  return dl_caught_msg
+end
+
+def test_cancellable_arm_body_skipped_on_throw(): Int
+  reset_capture()
+  sc_arm_body_ran = 0
+  with Throws { throw: dl_capture } do ->
+    cancel_throw_body()
+    0
+  end
+  return sc_arm_body_ran
+end
+
+def main(): Int
+  describe("select unified — DeadlineSelectable + ScopeCancelSelectable") do ->
+    it("deadline_ms(far-future) loses to default in non-blocking select") do ->
+      assert_eq(test_deadline_default_when_far_future(), 99)
+    end
+    it("cancellable(uncancelled) loses to default in non-blocking select") do ->
+      assert_eq(test_cancellable_default_when_uncancelled(), 99)
+    end
+    it("recvable beats far-future deadline in the same select") do ->
+      assert_eq(test_recv_wins_against_far_deadline(), 42)
+    end
+    it("recvable beats uncancelled scope-cancel in the same select") do ->
+      assert_eq(test_recv_wins_against_uncancelled_scope(), 7)
+    end
+    it("deadline complete throws via Throws — handler observes one throw") do ->
+      assert_eq(test_deadline_complete_throws_via_throws(), 1)
+    end
+    it("deadline throw message is `deadline_exceeded`") do ->
+      assert_eq_str(test_deadline_complete_throw_message(), "deadline_exceeded")
+    end
+    it("deadline arm body never runs once complete throws") do ->
+      assert_eq(test_deadline_arm_body_skipped_on_throw(), 0)
+    end
+    it("cancellable complete throws via Throws — handler observes one throw") do ->
+      assert_eq(test_cancellable_complete_throws_via_throws(), 1)
+    end
+    it("cancellable complete carries the user-supplied cancel reason") do ->
+      assert_eq_str(test_cancellable_complete_carries_user_reason(), "user_aborted_select")
+    end
+    it("cancellable arm body never runs once complete throws") do ->
+      assert_eq(test_cancellable_arm_body_skipped_on_throw(), 0)
+    end
+  end
+  return qspec_main()
+end

@@ -1,0 +1,204 @@
+## Phase 4.B.4.c — `impl Iterator<T>` migrates to kind=3 $poll path.
+##
+## Operation Piezoelectric Effects, Phase 4 Path B, Milestone 4.B.4.c.
+##
+## This milestone flipped the MIR-side dispatch for `def gen(): impl
+## Iterator<T>`: the legacy state-machine emission (`mir_lower_generator`
+## — 500+ LOC of $next + resume blocks) is bypassed entirely. Instead:
+##
+##   - The generator is registered as an async target. PASS 1.2a
+##     synthesizes `__Future_<name>$poll` from the generator body, with
+##     NODE_YIELD routing through kind=3 `perform(Yield, yield, [v])`
+##     via mir_lower_stmt_yield's `_gen_active >= 2` branch.
+##   - PASS 1.3c synthesizes `__Future_<name>$new` (the frame allocator;
+##     eager pre-poll is skipped because yield registers the generator
+##     as a suspendable leaf, so `mir_is_suspendable` returns true).
+##   - A thin `<name>` constructor (user-facing symbol) calls `$new`
+##     and wraps the frame in a 2-word `Stream<T> {frame, step}` where
+##     `step` points directly at `__Future_<name>$poll`.
+##
+## Stream.next() in std/gen.qz installs a `with Yield { yield:
+## __qz_gen_yield_capture } do -> step(frame) end`. Each `yield v` in
+## the generator body performs kind=3 on Yield; the handler stashes v
+## into a TLS slot via `__qz_gen_stash` and returns
+## `__qz_effect_suspend()` (0). kind=3 dispatch sees resumed[i]=0 and
+## longjmps back to the `with` install site, so the whole expression
+## evaluates to POLL_SUSPENDED (0). Stream.next() reads the stashed
+## value and returns `Option::Some(v)`. POLL_READY (1) — body completed
+## — yields `Option::None`.
+##
+## Originally landed under the `--piezo-gen-b` feature flag; the flag
+## was retired in 4.B.6 and Path B is now the sole code path.
+##
+## What this spec pins down:
+##
+##   - A generator emits `__Future_<name>$poll` (kind=3 yield perform)
+##     and NOT `__GenState_<name>$next` (old sync step machine). IR-shape
+##     check proves the dispatch.
+##   - Consumer-drive `.next()` round-trip over a generator with
+##     parameters, locals, and multi-yield bodies — value-correct.
+##   - Generators with loops + conditionals + int-arithmetic work.
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("4.B.4.c — impl Iterator<T> migrates to kind=3 \$poll") do ->
+    it("generator emits __Future_<name>\$poll + kind=3 yield perform (not __GenState)") do ->
+      assert_ir_contains("""
+def three(): impl Iterator<Int>
+  yield 1
+  yield 2
+  yield 3
+end
+
+def main(): Int
+  var s = three()
+  s.next()
+  return 0
+end
+""", "__Future_three$poll")
+    end
+
+    it("generator body's yield routes through __qz_effect_perform (kind=3)") do ->
+      assert_ir_contains("""
+def three(): impl Iterator<Int>
+  yield 1
+  yield 2
+  yield 3
+end
+
+def main(): Int
+  var s = three()
+  s.next()
+  return 0
+end
+""", "__qz_effect_perform")
+    end
+
+    it("no __GenState_three\$next emission for this generator") do ->
+      assert_ir_not_contains("""
+def three(): impl Iterator<Int>
+  yield 1
+  yield 2
+  yield 3
+end
+
+def main(): Int
+  var s = three()
+  s.next()
+  return 0
+end
+""", "__GenState_three$next")
+    end
+
+    it("parameterized generator — gen_range(2, 5) yields 2,3,4") do ->
+      assert_run_stdout_eq("""
+def gen_range(lo: Int, hi: Int): impl Iterator<Int>
+  var i = lo
+  while i < hi
+    yield i
+    i = i + 1
+  end
+end
+
+def main(): Int
+  var s = gen_range(2, 5)
+  var sum = 0
+  var done = 0
+  while done == 0
+    var opt = s.next()
+    match opt
+      Some(v) => sum = sum + v
+      None => done = 1
+    end
+  end
+  puts(str_from_int(sum))
+  return 0
+end
+""", "9\n")
+    end
+
+    it("generator with conditional yield paths") do ->
+      assert_run_stdout_eq("""
+def evens_below(n: Int): impl Iterator<Int>
+  var i = 0
+  while i < n
+    if i % 2 == 0
+      yield i
+    end
+    i = i + 1
+  end
+end
+
+def main(): Int
+  var s = evens_below(7)
+  # Expect 0, 2, 4, 6
+  var sum = 0
+  var count = 0
+  var done = 0
+  while done == 0
+    var opt = s.next()
+    match opt
+      Some(v) => { sum = sum + v; count = count + 1 }
+      None => done = 1
+    end
+  end
+  puts(str_from_int(sum))
+  puts(str_from_int(count))
+  return 0
+end
+""", "12\n4\n")
+    end
+
+    it("multiple independent Stream instances from same generator def interleave correctly") do ->
+      assert_run_stdout_eq("""
+def count3(start: Int): impl Iterator<Int>
+  yield start
+  yield start + 1
+  yield start + 2
+end
+
+def main(): Int
+  var sa = count3(10)
+  var sb = count3(100)
+  var ra1 = sa.next()
+  var rb1 = sb.next()
+  var ra2 = sa.next()
+  var rb2 = sb.next()
+  var ra3 = sa.next()
+  var rb3 = sb.next()
+  var ra4 = sa.next()  # None
+  puts(str_from_int(ra1.unwrap()))
+  puts(str_from_int(rb1.unwrap()))
+  puts(str_from_int(ra2.unwrap()))
+  puts(str_from_int(rb2.unwrap()))
+  puts(str_from_int(ra3.unwrap()))
+  puts(str_from_int(rb3.unwrap()))
+  if ra4 is None
+    puts("done")
+  end
+  return 0
+end
+""", "10\n100\n11\n101\n12\n102\ndone\n")
+    end
+
+    it("zero-yield generator returns None immediately") do ->
+      assert_run_stdout_eq("""
+def empty_gen(): impl Iterator<Int>
+  # no yields — generator exhausted immediately
+end
+
+def main(): Int
+  var s = empty_gen()
+  var r = s.next()
+  if r is None
+    puts("empty")
+  end
+  return 0
+end
+""", "empty\n")
+    end
+  end
+  return qspec_main()
+end

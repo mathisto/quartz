@@ -1,0 +1,1489 @@
+##! qzmod_emit — Walk a typecheck "view" and write a `.qzmod` module
+##! artifact directory (Phase 1.1).
+##!
+##! Design memo: `docs/design/QZMOD_FORMAT.md`.
+##!
+##! v1 emit shape (per design § 4.2): directory of `.bin` files via
+##! vec_save / strvec_save, plus a `header.txt`. Files that would be empty
+##! are skipped (absent file = section absent — see § 4.2 last paragraph).
+##!
+##! Input is a flat `QzmodEmitInput` view, NOT the full `TcRegistry`. The
+##! view holds just the slice of post-typecheck data emit needs. This
+##! decouples qzmod_emit from typecheck.qz's internal dependency tree —
+##! tests (and any future tooling that wants to emit without driving a
+##! full compile) can construct the view directly. Phase 1.4's compile()
+##! integration builds the view from `tc.registry` in a thin adaptor.
+##!
+##! Partitioning convention:
+##!   - Functions are pre-filtered by the caller (only entries belonging
+##!     to THIS module appear in func_* fields). The view doesn't carry
+##!     the `func_ast_stores` parallel array since filtering already
+##!     happened upstream.
+##!   - Non-fn decls (structs, enums, traits, ...) are likewise pre-filtered.
+##!   - This contract simplifies emit and is the natural shape the
+##!     compile() integration produces anyway (`tc.registry` slots are
+##!     visited in resolver-tag-grouped passes — see quartz.qz Phase 4.0a-f).
+##!
+##! Per-decl type IDs in this view are producer-global IDs (verbatim from
+##! tc.registry). Phase 1.4.a adds a TYPES section (`types_tag.bin` /
+##! `types_arg1.bin` / `types_arg2.bin`) that mirrors the producer's
+##! `tc.ptype_*` arena verbatim. Sig/field blobs remain unchanged — they
+##! still hold producer-global IDs. The decoder (Phase 1.4.b) uses the
+##! TYPES section to build a `producer_ptype_idx → consumer_type_id`
+##! remap, then walks sig/field blobs and remaps each ID. This keeps
+##! Phase 1.4.a small + the on-disk format stable: future phases only
+##! enrich, never rewrite.
+##!
+##! Per design Principle #6 (advisory cache): every failure mode is
+##! silent — the function returns "" on any structural issue rather than
+##! panicking. Callers log + fall back to from-scratch compile.
+
+import file_io
+import qzmod_format
+import mir
+import * from str_compat
+
+# =============================================================================
+# QzmodEmitInput — emit's input view. All vecs are pre-filtered to the
+# decls belonging to the module being emitted. Outer vecs are parallel
+# arrays per category.
+# =============================================================================
+
+struct QzmodEmitInput
+  module_name: String
+
+  # --- Functions ---
+  func_names: Vec<String>
+  func_param_types: Vec<Vec<Int>>       # outer parallel to func_names
+  func_return_types: Vec<Int>
+  func_required_counts: Vec<Int>
+
+  # Phase 1.4.c.3 — per-function effect rows.
+  # `func_effect_state[i]` is a tri-state parallel to func_names:
+  #   0 = untracked (-1 row id), 1 = closed row (tail = -1),
+  #   2 = open row (tail is a fresh erv on the producer; consumer
+  #                 re-allocates fresh on inject).
+  # `func_effect_labels[i]` carries the row's label name strings
+  # (resolved via `string_intern::intern_resolve_int(tc.interner, ...)`
+  # at push time); empty for state==0.
+  func_effect_state: Vec<Int>
+  func_effect_labels: Vec<Vec<String>>
+
+  # Phase 1.4.c.3 — per-function string annotations (parallel to
+  # func_names). Required for cross-module UFCS struct/enum name
+  # propagation. See `qzmod_format.qz` section header for details.
+  func_return_annotations: Vec<String>
+  func_param_annotations: Vec<String>
+  func_param_names: Vec<String>
+  func_type_params: Vec<String>
+  func_type_param_bounds: Vec<String>
+
+  # Per-function Fn(...) param annotations. Flat strvec; per-func
+  # range is recorded in `func_param_fn_anns_starts` + counts.
+  # Empty string for non-Fn params (preserves per-param positional
+  # indexing into the inner `Vec<Int>`).
+  func_param_fn_anns: Vec<String>
+  func_param_fn_anns_starts: Vec<Int>
+  func_param_fn_anns_counts: Vec<Int>
+
+  # --- Structs ---
+  struct_names: Vec<String>
+  struct_field_names: Vec<Vec<String>>  # outer parallel to struct_names
+  struct_field_types: Vec<Vec<Int>>     # outer parallel to struct_names
+  struct_is_linear: Vec<Int>            # parallel to struct_names
+
+  # --- Enums ---
+  enum_names: Vec<String>
+  enum_variant_names: Vec<Vec<String>>   # outer parallel to enum_names
+  enum_variant_payloads: Vec<Vec<Int>>   # outer parallel to enum_names
+
+  # --- Traits ---
+  trait_names: Vec<String>
+  trait_method_names: Vec<Vec<String>>   # outer parallel to trait_names
+  trait_method_sigs: Vec<Vec<Int>>       # outer parallel to trait_names
+  trait_method_defaults: Vec<Vec<Int>>   # outer parallel to trait_names
+
+  # --- Impls ---
+  impl_trait_names: Vec<String>          # parallel to impl_for_types
+  impl_for_types: Vec<String>
+
+  # --- Type aliases ---
+  type_alias_names: Vec<String>          # parallel to type_alias_types
+  type_alias_types: Vec<String>
+
+  # --- Newtypes ---
+  newtype_names: Vec<String>             # parallel to newtype_wrapped_types
+  newtype_wrapped_types: Vec<String>
+  # INC.1.9 — producer-global newtype type ID (TYPE_NEWTYPE_BASE + i in
+  # the producer's tc.registry.newtype_type_ids slot). Shipped so the
+  # consumer can build a producer→consumer newtype remap for the
+  # 1000..TYPE_UNION_BASE range. Parallel to newtype_names.
+  newtype_type_ids: Vec<Int>
+  # STRICT_NEWTYPES_QZMOD — per-newtype `@strict` flag from
+  # tc.registry.newtype_strict_flags (1 = strict, 0 = loose). Parallel
+  # to newtype_names. Cross-module consumers (`tc_register_newtype` in
+  # qzmod_remap.qz) thread this through so a `Secret<T>` declared in
+  # std/core/crypto/secret.qz keeps its strictness when consumed by
+  # mlkem/ed25519/hkdf/etc. via the qzmod cache path.
+  newtype_strict_flags: Vec<Int>
+
+  # --- Effects ---
+  # Op data is stored flat across effects, as in tc.registry: per-effect
+  # entry in `effect_decl_op_starts[i]` + `effect_decl_op_counts[i]`
+  # indexes into the four flat op_* arrays.
+  effect_decl_names: Vec<String>
+  effect_decl_op_starts: Vec<Int>        # parallel to effect_decl_names
+  effect_decl_op_counts: Vec<Int>        # parallel to effect_decl_names
+  effect_decl_op_names: Vec<String>      # flat — indexed by op_starts[i]+op_i
+  effect_decl_op_kinds: Vec<Int>         # flat
+  effect_decl_op_return_types: Vec<Int>  # flat
+  effect_decl_op_param_types: Vec<Vec<Int>>  # flat, outer parallel to op_names
+
+  # --- Consts / globals ---
+  # Phase 1.1 emits names only — type plumbing tightens in Phase 1.2/1.3.
+  const_names: Vec<String>
+  global_names: Vec<String>
+
+  # --- Parametric types arena (Phase 1.4.a) ---
+  # Verbatim mirror of `tc.registry.ptype_*`. A ptype id is encoded in the
+  # producer's space as `PTYPE_BASE + i`; the producer pushed `(base, arg1,
+  # arg2)` into these three parallel arrays at slot i.
+  #
+  # Compilers walk this top-down in tc.registry to register parametric
+  # types; the emit ships the full arena (no closure computation yet —
+  # closure-bounded ship deferred to Phase 2 once measurement justifies
+  # the complexity). The decoder rebuilds each entry into the consumer's
+  # registry in order, building a producer_idx → consumer_type_id remap.
+  #
+  # `arg1` / `arg2` for a TYPE_STRUCT-tagged entry are the producer's
+  # struct_idx values; for TYPE_ENUM, enum_idx; for ordinary parametric
+  # base tags (TYPE_OPTION, TYPE_RESULT, TYPE_VEC, …) they're type IDs
+  # (possibly other ptypes, primitives, or struct_idx-bearing ptypes).
+  # Cross-module struct/enum name lookup is the decoder's job (Phase 1.4.b);
+  # at emit time, struct_names / enum_names below carry THIS MODULE's
+  # symbol surface and the producer's `tc.registry.struct_names` /
+  # `enum_names` give the decoder enough to resolve refs by name later.
+  ptype_bases: Vec<Int>
+  ptype_arg1s: Vec<Int>
+  ptype_arg2s: Vec<Int>
+
+  # --- Per-ptype identity strings (Phase 1.4.b.1) ---
+  # Parallel to ptype_bases. Slot i carries the string previously set via
+  # `tc_ptype_set_name` on the producer's ptype — e.g. "Point" for a
+  # TYPE_STRUCT(Point), "Stream" for a synthesized generator ptype, or
+  # "" for unnamed primitive-arg ptypes like Vec<Int>. The decoder uses
+  # this to round-trip identity onto the consumer's freshly-minted ptype
+  # via `tc_ptype_set_name`, so cross-module struct/enum refs resolve by
+  # name in the consumer's own registry.
+  ptype_names: Vec<String>
+
+  # --- Producer fn_type registry (Phase 1.4.b.1) ---
+  # The producer's `tc.registry.fn_type_annotations` verbatim, indexed by
+  # producer fn_id. TYPE_FUNCTION ptypes carry arg1 = producer fn_id; the
+  # decoder reads the annotation here and re-interns it via
+  # `tc_register_fn_type` to get a consumer-local fn_id (returning the
+  # existing one if the consumer's typecheck already saw this annotation).
+  fn_type_annotations: Vec<String>
+
+  # --- Union / record structural-signature tables (D3) ---
+  # Anonymous structural value types (union `A | B`, record `{ x: Int }`)
+  # carry no named-decl section — they surface only as raw type ids in the
+  # TYPE_UNION_BASE..TYPE_RECORD_BASE band inside sig / field / payload
+  # blobs. Post-termification such a value can cross a module boundary, so
+  # the producer ships the structural signature of exactly the band ids THIS
+  # module's blobs reference (closure-bounded, populated by
+  # `_tc_emit_qzmod_close_types`) and the consumer re-interns each in its own
+  # registry to remap the id (`qzmod_remap.qz` prepass).
+  #
+  # `union_sig_ids[k]` is the producer-global union id (TYPE_UNION_BASE + idx);
+  # `union_sig_members[k]` is the verbatim pipe-joined member string
+  # ("Int|String") from `tc.registry.union_member_strings`. Parallel arrays.
+  union_sig_ids: Vec<Int>
+  union_sig_members: Vec<String>
+  # `record_sig_ids[k]` is the producer-global record id (TYPE_RECORD_BASE +
+  # idx); `record_sig_field_names[k]` / `record_sig_field_types[k]` are the
+  # record's field-name / field-type-annotation lists (from
+  # `tc.registry.record_field_names` / `record_field_types`). Parallel arrays.
+  record_sig_ids: Vec<Int>
+  record_sig_field_names: Vec<Vec<String>>
+  record_sig_field_types: Vec<Vec<String>>
+
+  # --- Generic / sub-trait / annotation enrichment (Phase 1.4.c.0) ---
+  # Required by `tc_inject_qzmod` to reproduce struct/enum/trait state
+  # verbatim. The AST-path captures these on a from-scratch typecheck;
+  # without them inject diverges from AST-path on generics, sub-trait
+  # bounds, and Send/Sync field annotation checks.
+  #
+  # Parallel to `struct_names` / `enum_names` / `trait_names` respectively.
+  struct_type_params: Vec<String>
+  enum_type_params: Vec<String>
+
+  # Per-struct / per-enum annotation lists. Outer parallel to the matching
+  # name vec; inner is one annotation string per field / variant.
+  struct_field_annotations: Vec<Vec<String>>
+  enum_variant_field_annotations: Vec<Vec<String>>
+
+  trait_type_params: Vec<String>
+  trait_super_traits: Vec<String>
+
+  # --- MIR bodies (INC.1.2) ---
+  # Parallel to `func_names`. Slot i holds the MirFunc for function
+  # `func_names[i]`, or 0 (as_int_generic sentinel) if no MIR body
+  # was produced for this function (forward decls, bounded generics
+  # skipped at producer per `mir_lower.qz:5183`). Sentinel slots land
+  # as offset = -1 in `mir_bodies_off.bin` so the consumer falls back
+  # to MIR lowering for that function. Stored as `Vec<Int>` (holding
+  # `as_int_generic(MirFunc)` handles) because Quartz's parser
+  # rejects triple-nested generic annotations and `Vec<MirFunc>` is
+  # the typed shape we'd want — same `as_int_generic` pattern as
+  # `MirBlock.instructions`.
+  mir_funcs: Vec<mir::MirFunc>
+end
+
+## Construct an empty input view. Callers push into the vecs to populate.
+def qzmod_input_new(module_name: String): QzmodEmitInput
+  return QzmodEmitInput {
+    module_name: module_name,
+
+    func_names: vec_new<String>(),
+    func_param_types: vec_new<Vec<Int>>(),
+    func_return_types: vec_new(),
+    func_required_counts: vec_new(),
+    func_effect_state: vec_new(),
+    func_effect_labels: vec_new<Vec<String>>(),
+    func_return_annotations: vec_new<String>(),
+    func_param_annotations: vec_new<String>(),
+    func_param_names: vec_new<String>(),
+    func_type_params: vec_new<String>(),
+    func_type_param_bounds: vec_new<String>(),
+    func_param_fn_anns: vec_new<String>(),
+    func_param_fn_anns_starts: vec_new(),
+    func_param_fn_anns_counts: vec_new(),
+
+    struct_names: vec_new<String>(),
+    struct_field_names: vec_new<Vec<String>>(),
+    struct_field_types: vec_new<Vec<Int>>(),
+    struct_is_linear: vec_new(),
+
+    enum_names: vec_new<String>(),
+    enum_variant_names: vec_new<Vec<String>>(),
+    enum_variant_payloads: vec_new<Vec<Int>>(),
+
+    trait_names: vec_new<String>(),
+    trait_method_names: vec_new<Vec<String>>(),
+    trait_method_sigs: vec_new<Vec<Int>>(),
+    trait_method_defaults: vec_new<Vec<Int>>(),
+
+    impl_trait_names: vec_new<String>(),
+    impl_for_types: vec_new<String>(),
+
+    type_alias_names: vec_new<String>(),
+    type_alias_types: vec_new<String>(),
+
+    newtype_names: vec_new<String>(),
+    newtype_wrapped_types: vec_new<String>(),
+    newtype_type_ids: vec_new<Int>(),
+    newtype_strict_flags: vec_new<Int>(),
+
+    effect_decl_names: vec_new<String>(),
+    effect_decl_op_starts: vec_new(),
+    effect_decl_op_counts: vec_new(),
+    effect_decl_op_names: vec_new<String>(),
+    effect_decl_op_kinds: vec_new(),
+    effect_decl_op_return_types: vec_new(),
+    effect_decl_op_param_types: vec_new<Vec<Int>>(),
+
+    const_names: vec_new<String>(),
+    global_names: vec_new<String>(),
+
+    ptype_bases: vec_new(),
+    ptype_arg1s: vec_new(),
+    ptype_arg2s: vec_new(),
+
+    ptype_names: vec_new<String>(),
+    fn_type_annotations: vec_new<String>(),
+
+    union_sig_ids: vec_new<Int>(),
+    union_sig_members: vec_new<String>(),
+    record_sig_ids: vec_new<Int>(),
+    record_sig_field_names: vec_new<Vec<String>>(),
+    record_sig_field_types: vec_new<Vec<String>>(),
+
+    struct_type_params: vec_new<String>(),
+    enum_type_params: vec_new<String>(),
+    struct_field_annotations: vec_new<Vec<String>>(),
+    enum_variant_field_annotations: vec_new<Vec<String>>(),
+    trait_type_params: vec_new<String>(),
+    trait_super_traits: vec_new<String>(),
+
+    mir_funcs: vec_new<mir::MirFunc>()
+  }
+end
+
+# =============================================================================
+# Local string pool — module-local interner, populated as we walk the input.
+# Every name emitted into a section's _name.bin / _blob.bin file goes through
+# `qzmod_pool_intern` and lands as an index into the eventual strings.bin.
+# =============================================================================
+
+struct QzmodEmitPool
+  strings: Vec<String>
+  lookup: Map<String, Int>
+end
+
+def qzmod_pool_new(): QzmodEmitPool
+  return QzmodEmitPool {
+    strings: vec_new<String>(),
+    lookup: map_new<String, Int>()
+  }
+end
+
+## Intern `s` into the local pool. Returns the assigned index. Stable across
+## repeated lookups (same string → same index).
+def qzmod_pool_intern(pool: QzmodEmitPool, s: String): Int
+  if map_has(pool.lookup, s)
+    return map_fetch(pool.lookup, s)
+  end
+  var idx = pool.strings.size
+  pool.strings.push(s)
+  map_set(pool.lookup, s, idx)
+  return idx
+end
+
+# =============================================================================
+# Per-section emit — each function below appends to caller-owned per-section
+# Vecs, interning names into `pool`. They never write files directly; the
+# top-level qzmod_emit_module is the single place that calls vec_save /
+# strvec_save / fio_write, so failure paths stay centralized.
+# =============================================================================
+
+## Funcs.
+##
+## Sig blob entry layout per function:
+##   [n_params, return_type_id, required_count, param_type_id_0, ...]
+##   length = 3 + n_params
+##
+## Type IDs are verbatim producer-global IDs for Phase 1.1 (see header
+## comment).
+def _qzmod_emit_funcs(
+  input: QzmodEmitInput,
+  pool: QzmodEmitPool,
+  name_idx: Vec<Int>,
+  sig_blob: Vec<Int>,
+  sig_off: Vec<Int>
+): Void
+  for i in 0..input.func_names.size
+    name_idx.push(qzmod_pool_intern(pool, input.func_names[i]))
+    sig_off.push(sig_blob.size)
+    var ptypes = input.func_param_types[i]
+    sig_blob.push(ptypes.size)
+    sig_blob.push(input.func_return_types[i])
+    sig_blob.push(input.func_required_counts[i])
+    for pi in 0..ptypes.size
+      sig_blob.push(ptypes[pi])
+    end
+  end
+end
+
+## Structs.
+##
+## Fields blob entry layout per struct:
+##   [n_fields, is_linear, name_idx_0, type_id_0, ..., name_idx_{n-1}, type_id_{n-1}]
+##   length = 2 + 2 * n_fields
+def _qzmod_emit_structs(
+  input: QzmodEmitInput,
+  pool: QzmodEmitPool,
+  name_idx: Vec<Int>,
+  fields_blob: Vec<Int>,
+  fields_off: Vec<Int>
+): Void
+  for si in 0..input.struct_names.size
+    name_idx.push(qzmod_pool_intern(pool, input.struct_names[si]))
+    fields_off.push(fields_blob.size)
+    var fnames = input.struct_field_names[si]
+    var ftypes = input.struct_field_types[si]
+    var is_linear = 0
+    if si < input.struct_is_linear.size
+      is_linear = input.struct_is_linear[si]
+    end
+    fields_blob.push(fnames.size)
+    fields_blob.push(is_linear)
+    for fi in 0..fnames.size
+      fields_blob.push(qzmod_pool_intern(pool, fnames[fi]))
+      var ft = 0
+      if fi < ftypes.size
+        ft = ftypes[fi]
+      end
+      fields_blob.push(ft)
+    end
+  end
+end
+
+## Enums.
+##
+## Variants blob entry layout per enum (Phase 1.4.c.2.b layout —
+## supersedes the broken Phase 1.1 layout that conflated per-variant
+## payload Vec<Int>'s with a flat Vec<Int>):
+##   [n_variants,
+##    name_idx_0, n_payloads_0, payload_type_0_0, payload_type_0_1, ...,
+##    name_idx_1, n_payloads_1, payload_type_1_0, ...,
+##    ...]
+##
+## `tc.registry.enum_variant_payloads[ei]` is semantically `Vec<Vec<Int>>`
+## (outer per-variant, inner per-payload type id). Iterating it as flat
+## Vec<Int> shipped raw Vec handles into the blob — fixed here by walking
+## the 2-D structure explicitly.
+def _qzmod_emit_enums(
+  input: QzmodEmitInput,
+  pool: QzmodEmitPool,
+  name_idx: Vec<Int>,
+  variants_blob: Vec<Int>,
+  variants_off: Vec<Int>
+): Void
+  for ei in 0..input.enum_names.size
+    name_idx.push(qzmod_pool_intern(pool, input.enum_names[ei]))
+    variants_off.push(variants_blob.size)
+    var vnames = input.enum_variant_names[ei]
+    var vpayloads = input.enum_variant_payloads[ei]
+    variants_blob.push(vnames.size)
+    for vi in 0..vnames.size
+      variants_blob.push(qzmod_pool_intern(pool, vnames[vi]))
+      var v_payloads = vec_new<Int>()
+      if vi < vpayloads.size
+        v_payloads = vpayloads[vi]
+      end
+      variants_blob.push(v_payloads.size)
+      for pi in 0..v_payloads.size
+        variants_blob.push(v_payloads[pi])
+      end
+    end
+  end
+end
+
+## Traits (Phase 1.4.d).
+##
+## Per-trait blob layout:
+##   [n_methods,
+##    name_idx_0, default_0, n_params_0, return_type_0, param_0_0, ..., param_0_{n_params_0-1},
+##    name_idx_1, default_1, n_params_1, return_type_1, ...,
+##    ...]
+##
+## Supersedes the broken Phase 1.1 fixed-stride layout that shipped each
+## method's sig as a raw heap pointer (`msigs[mi]` is conceptually
+## `Vec<Int>` per `tc.registry.trait_method_sigs[ti]`'s declared element
+## type, but the heap reality is `[param_types_handle, return_type]`).
+## Heap pointers don't round-trip across processes, so the old encoding
+## was dormant. Inject (`tc_inject_qzmod` Step 8) decodes the new layout
+## directly into a fresh consumer-side `Vec<Vec<Int>>`.
+##
+## Type IDs in the blob are producer-global (verbatim from
+## `tc.registry.trait_method_sigs`); the consumer remaps them through
+## the same closure-bounded ptype path the func sig blob uses.
+def _qzmod_emit_traits(
+  input: QzmodEmitInput,
+  pool: QzmodEmitPool,
+  name_idx: Vec<Int>,
+  methods_blob: Vec<Int>,
+  methods_off: Vec<Int>
+): Void
+  for ti in 0..input.trait_names.size
+    name_idx.push(qzmod_pool_intern(pool, input.trait_names[ti]))
+    methods_off.push(methods_blob.size)
+    var mnames = input.trait_method_names[ti]
+    var msigs = input.trait_method_sigs[ti]
+    var mdefaults = input.trait_method_defaults[ti]
+    methods_blob.push(mnames.size)
+    for mi in 0..mnames.size
+      methods_blob.push(qzmod_pool_intern(pool, mnames[mi]))
+      var def_v = 0
+      if mi < mdefaults.size
+        def_v = mdefaults[mi]
+      end
+      methods_blob.push(def_v)
+      # Walk the inner `[param_types_handle, return_type]` pair through
+      # the same Int-as-heap-handle launder pattern the AST-path uses
+      # (typecheck.qz:4141 reads `trait_sig[0]` on a declared-Int slot).
+      var sig = 0
+      if mi < msigs.size
+        sig = msigs[mi]
+      end
+      var n_params = 0
+      var ret_t = 0
+      if sig != 0
+        var params_handle = sig[0]
+        ret_t = sig[1]
+        if params_handle != 0
+          n_params = vec_size(params_handle)
+        end
+        methods_blob.push(n_params)
+        methods_blob.push(ret_t)
+        for pi in 0..n_params
+          methods_blob.push(params_handle[pi])
+        end
+      else
+        methods_blob.push(0)
+        methods_blob.push(0)
+      end
+    end
+  end
+end
+
+## Impls (Phase 1.4.d) — fixed-stride [trait_name_idx, for_type_name_idx]
+## pairs with a parallel offsets table (offsets[i] = 2*i, kept explicit
+## so a future variable-stride layout — e.g. shipping per-impl method
+## names — can land without a MAJOR bump). Method names are NOT shipped
+## in this phase: `tc.registry.impl_method_names` has no live readers in
+## the self-hosted compiler today (per `tc_impl_method_names` grep), so
+## the consumer's Step 9 passes `vec_new<String>()` and saves the
+## section weight.
+def _qzmod_emit_impls(
+  input: QzmodEmitInput,
+  pool: QzmodEmitPool,
+  impls_blob: Vec<Int>,
+  impls_off: Vec<Int>
+): Void
+  for ii in 0..input.impl_trait_names.size
+    impls_off.push(impls_blob.size)
+    impls_blob.push(qzmod_pool_intern(pool, input.impl_trait_names[ii]))
+    var for_t = ""
+    if ii < input.impl_for_types.size
+      for_t = input.impl_for_types[ii]
+    end
+    impls_blob.push(qzmod_pool_intern(pool, for_t))
+  end
+end
+
+## Type aliases.
+def _qzmod_emit_type_aliases(
+  input: QzmodEmitInput,
+  pool: QzmodEmitPool,
+  name_idx: Vec<Int>,
+  target_idx: Vec<Int>
+): Void
+  for ai in 0..input.type_alias_names.size
+    name_idx.push(qzmod_pool_intern(pool, input.type_alias_names[ai]))
+    var tgt = ""
+    if ai < input.type_alias_types.size
+      tgt = input.type_alias_types[ai]
+    end
+    target_idx.push(qzmod_pool_intern(pool, tgt))
+  end
+end
+
+## Newtypes.
+##
+## INC.1.9 — `type_id_out` is parallel to `name_idx` and carries the
+## producer-global newtype type ID (`TYPE_NEWTYPE_BASE + i`) from
+## `tc.registry.newtype_type_ids`. The consumer uses these to key a
+## producer→consumer newtype remap so func sigs referencing newtype
+## params (AstNodeId, TypeId, MirReg, MirLabel, InternId) inject cleanly.
+##
+## STRICT_NEWTYPES_QZMOD — `strict_out` is parallel to `name_idx` and
+## carries the per-newtype `@strict` flag (1 / 0). Cross-module consumers
+## thread this through `tc_register_newtype` so strictness survives the
+## qzmod cache path. Missing entries default to 0 (loose) on the consumer.
+def _qzmod_emit_newtypes(
+  input: QzmodEmitInput,
+  pool: QzmodEmitPool,
+  name_idx: Vec<Int>,
+  wrapped_idx: Vec<Int>,
+  type_id_out: Vec<Int>,
+  strict_out: Vec<Int>
+): Void
+  for ni in 0..input.newtype_names.size
+    name_idx.push(qzmod_pool_intern(pool, input.newtype_names[ni]))
+    var wrapped = ""
+    if ni < input.newtype_wrapped_types.size
+      wrapped = input.newtype_wrapped_types[ni]
+    end
+    wrapped_idx.push(qzmod_pool_intern(pool, wrapped))
+    var t_id = 0
+    if ni < input.newtype_type_ids.size
+      t_id = input.newtype_type_ids[ni]
+    end
+    type_id_out.push(t_id)
+    var is_strict = 0
+    if ni < input.newtype_strict_flags.size
+      is_strict = input.newtype_strict_flags[ni]
+    end
+    strict_out.push(is_strict)
+  end
+end
+
+## Effects.
+##
+## Ops blob entry layout per effect:
+##   [n_ops, name_idx_0, kind_0, return_type_id_0, n_params_0, param_type_id_0_0, ...]
+def _qzmod_emit_effects(
+  input: QzmodEmitInput,
+  pool: QzmodEmitPool,
+  name_idx: Vec<Int>,
+  ops_blob: Vec<Int>,
+  ops_off: Vec<Int>
+): Void
+  for ei in 0..input.effect_decl_names.size
+    name_idx.push(qzmod_pool_intern(pool, input.effect_decl_names[ei]))
+    ops_off.push(ops_blob.size)
+    var op_start = input.effect_decl_op_starts[ei]
+    var op_count = input.effect_decl_op_counts[ei]
+    ops_blob.push(op_count)
+    for op_i in 0..op_count
+      var slot = op_start + op_i
+      ops_blob.push(qzmod_pool_intern(pool, input.effect_decl_op_names[slot]))
+      ops_blob.push(input.effect_decl_op_kinds[slot])
+      ops_blob.push(input.effect_decl_op_return_types[slot])
+      var op_params = input.effect_decl_op_param_types[slot]
+      ops_blob.push(op_params.size)
+      for pi in 0..op_params.size
+        ops_blob.push(op_params[pi])
+      end
+    end
+  end
+end
+
+## Consts and globals — Phase 1.1 emits names only.
+def _qzmod_emit_consts(
+  input: QzmodEmitInput,
+  pool: QzmodEmitPool,
+  name_idx: Vec<Int>,
+  type_blob: Vec<Int>
+): Void
+  for ci in 0..input.const_names.size
+    name_idx.push(qzmod_pool_intern(pool, input.const_names[ci]))
+    type_blob.push(0)
+  end
+end
+
+def _qzmod_emit_globals(
+  input: QzmodEmitInput,
+  pool: QzmodEmitPool,
+  name_idx: Vec<Int>,
+  type_blob: Vec<Int>
+): Void
+  for gi in 0..input.global_names.size
+    name_idx.push(qzmod_pool_intern(pool, input.global_names[gi]))
+    type_blob.push(0)
+  end
+end
+
+## Per-outer-slot annotation lists (Phase 1.4.c.0).
+##
+## Used for struct_field_annotations (genuinely 2-D: outer per struct,
+## inner per field). Blob layout per outer slot:
+##   [n_items, pool_idx_0, pool_idx_1, ..., pool_idx_{n-1}]
+##
+## offsets[i] = start of slot i in the blob. Empty inner Vec emits
+## `[0]` (a single zero), preserving the parallel-array invariant.
+def _qzmod_emit_anns_2d(
+  outer: Vec<Vec<String>>,
+  pool: QzmodEmitPool,
+  blob: Vec<Int>,
+  offsets: Vec<Int>
+): Void
+  for oi in 0..outer.size
+    offsets.push(blob.size)
+    var inner = outer[oi]
+    blob.push(inner.size)
+    for ii in 0..inner.size
+      blob.push(qzmod_pool_intern(pool, inner[ii]))
+    end
+  end
+end
+
+## Phase 1.4.c.2.b — per-enum / per-variant / per-payload-field annotation
+## lists (genuinely 3-D). `tc.registry.enum_variant_field_annotations[ei]`
+## is `Vec<Vec<String>>` (outer per variant, inner per payload-field
+## annotation). Blob layout per enum:
+##   [n_variants,
+##    n_anns_0, pool_idx_0_0, pool_idx_0_1, ...,
+##    n_anns_1, pool_idx_1_0, ...,
+##    ...]
+##
+## Phase 1.1 reused `_qzmod_emit_anns_2d` for this 3-D shape — that
+## flattened per-variant Vec<String> handles as if they were strings,
+## shipping heap pointers as pool indices and crashing
+## `tc_bind_pattern_variables` when inject went live. Switched here in
+## 1.4.c.2.b so injected enums round-trip variant payload type
+## annotations correctly.
+def _qzmod_emit_anns_3d(
+  outer: Vec<Vec<Vec<String>>>,
+  pool: QzmodEmitPool,
+  blob: Vec<Int>,
+  offsets: Vec<Int>
+): Void
+  for ei in 0..outer.size
+    offsets.push(blob.size)
+    var variants = outer[ei]
+    blob.push(variants.size)
+    for vi in 0..variants.size
+      var anns = variants[vi]
+      blob.push(anns.size)
+      for ai in 0..anns.size
+        blob.push(qzmod_pool_intern(pool, anns[ai]))
+      end
+    end
+  end
+end
+
+## TYPES — verbatim ptype arena (Phase 1.4.a).
+##
+## Three parallel files: `types_tag.bin`, `types_arg1.bin`, `types_arg2.bin`.
+## (`types_args_blob.bin` is reserved for variable-length type arg lists in
+## v2; today's ptype arena is fixed-arity so the file is omitted.)
+##
+## Entry i corresponds to the producer's ptype-arena slot i, whose
+## producer-global type ID is `PTYPE_BASE + i`. The decoder walks entries
+## in order, builds a `producer_ptype_idx → consumer_type_id` remap, and
+## uses that remap to rewrite type IDs encountered in sig/field/etc. blobs
+## during inject (Phase 1.4.c).
+##
+## The output vecs are left empty (zero-length) when the input has no
+## ptypes; the caller's `_qzmod_save_int_file` then skips writing the
+## file, which decodes as "section absent" per design § 4.2.
+def _qzmod_emit_types(
+  input: QzmodEmitInput,
+  types_tag: Vec<Int>,
+  types_arg1: Vec<Int>,
+  types_arg2: Vec<Int>
+): Void
+  var n = input.ptype_bases.size
+  for i in 0..n
+    types_tag.push(input.ptype_bases[i])
+    var a1 = 0
+    if i < input.ptype_arg1s.size
+      a1 = input.ptype_arg1s[i]
+    end
+    var a2 = 0
+    if i < input.ptype_arg2s.size
+      a2 = input.ptype_arg2s[i]
+    end
+    types_arg1.push(a1)
+    types_arg2.push(a2)
+  end
+end
+
+## Union / record structural-signature tables (D3).
+##
+## Emits (into caller-owned per-section vecs):
+##   - union_sig_ids: producer-global union ids, verbatim.
+##   - union_sig_members: pipe-joined member strings, verbatim strvec.
+##   - record_sig_ids: producer-global record ids, verbatim.
+##   - record_sig_blob / record_sig_off: per-record field list. Blob layout
+##     per record: [n_fields, name_idx_0, type_idx_0, name_idx_1, ...] with
+##     both the field name and its type-annotation string pool-interned.
+##     `off[k]` is the start of record-sig k in the blob.
+##
+## Field type strings are pool-interned rather than remapped: a record's
+## field type annotation ("Int", "Point", "Foo<T>") is name-based, so the
+## consumer re-interns it against its own registry via `tc_register_record`
+## exactly as the AST path would — mirroring how newtype wrapped-type
+## strings round-trip by name (INC.1.9).
+def _qzmod_emit_union_record_sigs(
+  input: QzmodEmitInput,
+  pool: QzmodEmitPool,
+  union_ids: Vec<Int>,
+  union_members: Vec<String>,
+  record_ids: Vec<Int>,
+  record_blob: Vec<Int>,
+  record_off: Vec<Int>
+): Void
+  for ui in 0..input.union_sig_ids.size
+    union_ids.push(input.union_sig_ids[ui])
+    var members = ""
+    if ui < input.union_sig_members.size
+      members = input.union_sig_members[ui]
+    end
+    union_members.push(members)
+  end
+  for ri in 0..input.record_sig_ids.size
+    record_ids.push(input.record_sig_ids[ri])
+    record_off.push(record_blob.size)
+    var fnames = vec_new<String>()
+    if ri < input.record_sig_field_names.size
+      fnames = input.record_sig_field_names[ri]
+    end
+    var ftypes = vec_new<String>()
+    if ri < input.record_sig_field_types.size
+      ftypes = input.record_sig_field_types[ri]
+    end
+    record_blob.push(fnames.size)
+    for fi in 0..fnames.size
+      record_blob.push(qzmod_pool_intern(pool, fnames[fi]))
+      var ft = ""
+      if fi < ftypes.size
+        ft = ftypes[fi]
+      end
+      record_blob.push(qzmod_pool_intern(pool, ft))
+    end
+  end
+end
+
+## MIR bodies (INC.1.2) — walk `input.mir_funcs`, pickle each MirFunc via
+## `mir_pickle_function`, and emit three parallel section blobs:
+##   - mir_bodies.bin     flat `Vec<Int>`, concatenated per-fn pickle records
+##   - mir_bodies_off.bin per-fn start-offset into mir_bodies.bin (-1 = skip)
+##   - mir_bodies_name.bin strvec parallel to offsets, one fn name per slot
+##
+## Sentinel slot (`input.mir_funcs[i] == 0`) lands as offset = -1 with an
+## empty-string name; the consumer falls back to live MIR lowering for
+## that function (advisory cache, design Principle #6).
+##
+## The walk must run BEFORE the strings pool save in `qzmod_emit_module`
+## because `mir_pickle_function` calls `qzmod_pool_intern` on every
+## string-typed instr operand and every string-shaped MirFunc field.
+def _qzmod_emit_mir_bodies(
+  input: QzmodEmitInput,
+  pool: QzmodEmitPool,
+  blob: Vec<Int>,
+  off: Vec<Int>,
+  name: Vec<String>
+): Void
+  for i in 0..input.mir_funcs.size
+    var handle = input.mir_funcs[i]
+    if handle == 0
+      off.push(-1)
+      name.push("")
+    else
+      var start = blob.size
+      var fn_blob = mir_pickle_function(handle, pool)
+      for fi in 0..fn_blob.size
+        blob.push(fn_blob[fi])
+      end
+      off.push(start)
+      name.push(handle.mir_func_get_name())
+    end
+  end
+end
+
+# =============================================================================
+# Public entry point
+# =============================================================================
+
+## Emit a `.qzmod` directory for one module.
+##
+## Returns the computed output_hash on success (non-empty string), or "" on
+## any structural failure (the cache is advisory — see § 4.2 last paragraph).
+## The caller is responsible for the directory's parent existing; `mkdir`
+## is best-effort here.
+##
+## Parameters:
+##   input              — pre-filtered slice of post-typecheck data for this
+##                        module. See `QzmodEmitInput`.
+##   source_hash        — content_hash of this module's canonical source bytes.
+##   flags_hash         — hash of canonical compile flags (see qzmod_format).
+##   dep_names          — transitive dep module names (parallel to dep_iface_hashes).
+##   dep_iface_hashes   — per-dep interface hashes (each dep's prior
+##                        output_hash from its .qzmod header).
+##   output_dir         — target directory; usually `qzmod_module_dir(...)`.
+def qzmod_emit_module(
+  input: QzmodEmitInput,
+  source_hash: String,
+  flags_hash: String,
+  dep_names: Vec<String>,
+  dep_iface_hashes: Vec<String>,
+  output_dir: String
+): String
+  if str_byte_len(output_dir) == 0
+    return ""
+  end
+  _qzmod_mkdir_p(output_dir)
+
+  var pool = qzmod_pool_new()
+
+  # --- Functions ---
+  var funcs_name_idx = vec_new()
+  var funcs_sig_blob = vec_new()
+  var funcs_sig_off = vec_new()
+  _qzmod_emit_funcs(input, pool, funcs_name_idx, funcs_sig_blob, funcs_sig_off)
+
+  # --- Structs ---
+  var structs_name_idx = vec_new()
+  var structs_fields_blob = vec_new()
+  var structs_fields_off = vec_new()
+  _qzmod_emit_structs(input, pool, structs_name_idx, structs_fields_blob, structs_fields_off)
+
+  # --- Enums ---
+  var enums_name_idx = vec_new()
+  var enums_variants_blob = vec_new()
+  var enums_variants_off = vec_new()
+  _qzmod_emit_enums(input, pool, enums_name_idx, enums_variants_blob, enums_variants_off)
+
+  # --- Traits ---
+  var traits_name_idx = vec_new()
+  var traits_methods_blob = vec_new()
+  var traits_methods_off = vec_new()
+  _qzmod_emit_traits(input, pool, traits_name_idx, traits_methods_blob, traits_methods_off)
+
+  # --- Impls ---
+  var impls_blob = vec_new()
+  var impls_off = vec_new()
+  _qzmod_emit_impls(input, pool, impls_blob, impls_off)
+
+  # --- Type aliases ---
+  var aliases_name_idx = vec_new()
+  var aliases_target_idx = vec_new()
+  _qzmod_emit_type_aliases(input, pool, aliases_name_idx, aliases_target_idx)
+
+  # --- Newtypes ---
+  var newtypes_name_idx = vec_new()
+  var newtypes_wrapped_idx = vec_new()
+  var newtypes_type_id = vec_new()
+  var newtypes_strict = vec_new<Int>()
+  _qzmod_emit_newtypes(input, pool, newtypes_name_idx, newtypes_wrapped_idx, newtypes_type_id, newtypes_strict)
+
+  # --- Effects ---
+  var effects_name_idx = vec_new()
+  var effects_ops_blob = vec_new()
+  var effects_ops_off = vec_new()
+  _qzmod_emit_effects(input, pool, effects_name_idx, effects_ops_blob, effects_ops_off)
+
+  # --- Consts / globals ---
+  var consts_name_idx = vec_new()
+  var consts_type = vec_new()
+  _qzmod_emit_consts(input, pool, consts_name_idx, consts_type)
+
+  var globals_name_idx = vec_new()
+  var globals_type = vec_new()
+  _qzmod_emit_globals(input, pool, globals_name_idx, globals_type)
+
+  # --- TYPES (Phase 1.4.a). Producer's ptype arena, verbatim. ---
+  var types_tag = vec_new()
+  var types_arg1 = vec_new()
+  var types_arg2 = vec_new()
+  _qzmod_emit_types(input, types_tag, types_arg1, types_arg2)
+
+  # --- Per-struct / per-enum field-annotation blobs (Phase 1.4.c.0).
+  # 2-D Vec<Vec<String>> serialized as a flat int-blob + offsets table.
+  var structs_field_anns_blob = vec_new()
+  var structs_field_anns_off = vec_new()
+  _qzmod_emit_anns_2d(input.struct_field_annotations, pool, structs_field_anns_blob, structs_field_anns_off)
+
+  var enums_variant_anns_blob = vec_new()
+  var enums_variant_anns_off = vec_new()
+  # 3-D shape (per-enum / per-variant / per-payload-field) — see
+  # `_qzmod_emit_anns_3d` docstring. The 2-D helper Phase 1.1 used here
+  # shipped Vec<String> handles as bogus pool indices.
+  _qzmod_emit_anns_3d(input.enum_variant_field_annotations, pool, enums_variant_anns_blob, enums_variant_anns_off)
+
+  # --- Per-function effect labels (Phase 1.4.c.3) — built BEFORE the
+  # strings pool save so any new label names ("Sched", "Throws", ...)
+  # interned during the 2-D walk land in `pool.strings` and become
+  # decipherable on load.
+  var funcs_effect_labels_blob = vec_new<Int>()
+  var funcs_effect_labels_off = vec_new<Int>()
+  _qzmod_emit_anns_2d(input.func_effect_labels, pool, funcs_effect_labels_blob, funcs_effect_labels_off)
+
+  # --- MIR bodies (INC.1.2) — must also run BEFORE the strings pool save.
+  # `mir_pickle_function` calls `qzmod_pool_intern` for every string-typed
+  # operand and every string-shaped field (name, origin_module, params,
+  # locals, narrows, return-type-name, block labels). All those land in
+  # `pool.strings` and become decipherable on load.
+  var mir_bodies_blob = vec_new<Int>()
+  var mir_bodies_off = vec_new<Int>()
+  var mir_bodies_name = vec_new<String>()
+  _qzmod_emit_mir_bodies(input, pool, mir_bodies_blob, mir_bodies_off, mir_bodies_name)
+
+  # --- Union / record structural-signature tables (D3) — built BEFORE the
+  # strings pool save because the record-sig blob pool-interns field names +
+  # type strings. Union members are stored as a raw strvec (no interning).
+  var union_sig_ids = vec_new<Int>()
+  var union_sig_members = vec_new<String>()
+  var record_sig_ids = vec_new<Int>()
+  var record_sig_blob = vec_new<Int>()
+  var record_sig_off = vec_new<Int>()
+  _qzmod_emit_union_record_sigs(input, pool, union_sig_ids, union_sig_members, record_sig_ids, record_sig_blob, record_sig_off)
+
+  # --- Strings pool: always emit if any section interned anything. The
+  # pool is what makes every section file decipherable on load.
+  if pool.strings.size > 0
+    var _s = strvec_save(pool.strings, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_strings()))
+  end
+
+  # --- Per-section .bin files. Skip empties (per design § 4.2: missing
+  # file = section absent, which is a valid encoding).
+  _qzmod_save_int_file(funcs_name_idx, output_dir, qzmod_format::qzmod_file_funcs_name())
+  _qzmod_save_int_file(funcs_sig_blob, output_dir, qzmod_format::qzmod_file_funcs_sig_blob())
+  _qzmod_save_int_file(funcs_sig_off,  output_dir, qzmod_format::qzmod_file_funcs_sig_off())
+
+  # Per-function effect rows — state vec parallel to funcs_name; labels
+  # blob built above. Both files written only when at least one function
+  # has a tracked row, so byte-identical output is preserved for modules
+  # with no `can` clauses.
+  if _qzmod_any_nonzero(input.func_effect_state) == 1
+    var _fes = vec_save(input.func_effect_state, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_funcs_effect_state()))
+  end
+  _qzmod_save_int_file(funcs_effect_labels_blob, output_dir, qzmod_format::qzmod_file_funcs_effect_labels_blob())
+  _qzmod_save_int_file(funcs_effect_labels_off,  output_dir, qzmod_format::qzmod_file_funcs_effect_labels_off())
+
+  # --- Per-function string annotations (Phase 1.4.c.3) ---
+  # Skip empty / all-blank slot patterns so byte-identical output_hash
+  # is preserved for modules whose funcs all have empty annotations.
+  # Empty inner strings still count as "had a slot", so a vector of
+  # all-"" is non-empty and gets shipped — the parallel-array
+  # invariant requires it.
+  if input.func_return_annotations.size > 0
+    var _fra = strvec_save(input.func_return_annotations, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_funcs_return_annotations()))
+  end
+  if input.func_param_annotations.size > 0
+    var _fpa = strvec_save(input.func_param_annotations, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_funcs_param_annotations()))
+  end
+  if input.func_param_names.size > 0
+    var _fpn = strvec_save(input.func_param_names, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_funcs_param_names()))
+  end
+  if input.func_type_params.size > 0
+    var _ftp = strvec_save(input.func_type_params, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_funcs_type_params()))
+  end
+  if input.func_type_param_bounds.size > 0
+    var _ftb = strvec_save(input.func_type_param_bounds, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_funcs_type_param_bounds()))
+  end
+  if input.func_param_fn_anns.size > 0
+    var _fpfn = strvec_save(input.func_param_fn_anns, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_funcs_param_fn_anns()))
+  end
+  if input.func_param_fn_anns_starts.size > 0
+    # Pack starts+counts into a single flat Vec<Int>: [starts..., counts...].
+    # Tail-store the counts so consumer can split on `func_names.size`.
+    var packed = vec_new<Int>()
+    for _s in 0..input.func_param_fn_anns_starts.size
+      packed.push(input.func_param_fn_anns_starts[_s])
+    end
+    for _c in 0..input.func_param_fn_anns_counts.size
+      packed.push(input.func_param_fn_anns_counts[_c])
+    end
+    var _fpfo = vec_save(packed, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_funcs_param_fn_anns_off()))
+  end
+
+  _qzmod_save_int_file(structs_name_idx,    output_dir, qzmod_format::qzmod_file_structs_name())
+  _qzmod_save_int_file(structs_fields_blob, output_dir, qzmod_format::qzmod_file_structs_fields_blob())
+  _qzmod_save_int_file(structs_fields_off,  output_dir, qzmod_format::qzmod_file_structs_fields_off())
+
+  _qzmod_save_int_file(enums_name_idx,      output_dir, qzmod_format::qzmod_file_enums_name())
+  _qzmod_save_int_file(enums_variants_blob, output_dir, qzmod_format::qzmod_file_enums_variants_blob())
+  _qzmod_save_int_file(enums_variants_off,  output_dir, qzmod_format::qzmod_file_enums_variants_off())
+
+  _qzmod_save_int_file(traits_name_idx,      output_dir, qzmod_format::qzmod_file_traits_name())
+  _qzmod_save_int_file(traits_methods_blob,  output_dir, qzmod_format::qzmod_file_traits_methods_blob())
+  _qzmod_save_int_file(traits_methods_off,   output_dir, qzmod_format::qzmod_file_traits_methods_off())
+
+  _qzmod_save_int_file(impls_blob, output_dir, qzmod_format::qzmod_file_impls_blob())
+  _qzmod_save_int_file(impls_off,  output_dir, qzmod_format::qzmod_file_impls_off())
+
+  _qzmod_save_int_file(effects_name_idx,      output_dir, qzmod_format::qzmod_file_effects_name())
+  _qzmod_save_int_file(effects_ops_blob,      output_dir, qzmod_format::qzmod_file_effects_ops_blob())
+  _qzmod_save_int_file(effects_ops_off,       output_dir, qzmod_format::qzmod_file_effects_ops_off())
+
+  _qzmod_save_int_file(consts_name_idx, output_dir, qzmod_format::qzmod_file_consts_name())
+  _qzmod_save_int_file(consts_type,     output_dir, qzmod_format::qzmod_file_consts_type())
+
+  _qzmod_save_int_file(globals_name_idx, output_dir, qzmod_format::qzmod_file_globals_name())
+  _qzmod_save_int_file(globals_type,     output_dir, qzmod_format::qzmod_file_globals_type())
+
+  _qzmod_save_int_file(aliases_name_idx,   output_dir, qzmod_format::qzmod_file_type_aliases_name())
+  _qzmod_save_int_file(aliases_target_idx, output_dir, qzmod_format::qzmod_file_type_aliases_target())
+
+  _qzmod_save_int_file(newtypes_name_idx,    output_dir, qzmod_format::qzmod_file_newtypes_name())
+  _qzmod_save_int_file(newtypes_wrapped_idx, output_dir, qzmod_format::qzmod_file_newtypes_wrapped())
+  _qzmod_save_int_file(newtypes_type_id,     output_dir, qzmod_format::qzmod_file_newtypes_type_id())
+  # STRICT_NEWTYPES_QZMOD — ship per-newtype strict flag only when at least
+  # one newtype in the module opts into `@strict`. Modules that never use
+  # the attribute keep byte-identical output_hash (no new file on disk).
+  if _qzmod_any_nonzero(newtypes_strict) == 1
+    var _ns = vec_save(newtypes_strict, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_newtypes_strict()))
+  end
+
+  _qzmod_save_int_file(types_tag,  output_dir, qzmod_format::qzmod_file_types_tag())
+  _qzmod_save_int_file(types_arg1, output_dir, qzmod_format::qzmod_file_types_arg1())
+  _qzmod_save_int_file(types_arg2, output_dir, qzmod_format::qzmod_file_types_arg2())
+
+  # --- Per-ptype identity strings (Phase 1.4.b.1) — `types_names.bin` is
+  # a strvec parallel to types_tag carrying the producer's ptype_names
+  # entries verbatim (including empty slots). Skipped when no ptypes.
+  if input.ptype_names.size > 0
+    var _tn = strvec_save(input.ptype_names, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_types_names()))
+  end
+
+  # --- Fn_type registry annotations (Phase 1.4.b.1) — indexed by producer
+  # fn_id. TYPE_FUNCTION ptypes' arg1 carries the fn_id; consumer re-interns
+  # by annotation to get its own fn_id. Skipped when no fn types.
+  if input.fn_type_annotations.size > 0
+    var _fn = strvec_save(input.fn_type_annotations, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_fn_type_annotations()))
+  end
+
+  # --- Union / record structural-signature tables (D3). Written only when
+  # this module references at least one union / record band id (the
+  # closure-bounded ship leaves these empty otherwise), so a module with no
+  # cross-module structural value keeps a byte-identical output_hash to a
+  # pre-D3 emit. `_qzmod_save_int_file` already skips empty int vecs; the
+  # union-members strvec is gated on the parallel ids being non-empty.
+  _qzmod_save_int_file(union_sig_ids, output_dir, qzmod_format::qzmod_file_union_sig_ids())
+  if union_sig_ids.size > 0
+    var _um = strvec_save(union_sig_members, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_union_sig_members()))
+  end
+  _qzmod_save_int_file(record_sig_ids,  output_dir, qzmod_format::qzmod_file_record_sig_ids())
+  _qzmod_save_int_file(record_sig_blob, output_dir, qzmod_format::qzmod_file_record_sig_blob())
+  _qzmod_save_int_file(record_sig_off,  output_dir, qzmod_format::qzmod_file_record_sig_off())
+
+  # --- Generic + super-trait + annotation enrichment (Phase 1.4.c.0).
+  # 1-D strvec sections — parallel to the matching name vec; empty slots
+  # encode "" so positional alignment survives round-trip.
+  if input.struct_type_params.size > 0
+    var _stp = strvec_save(input.struct_type_params, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_structs_type_params()))
+  end
+  if input.enum_type_params.size > 0
+    var _etp = strvec_save(input.enum_type_params, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_enums_type_params()))
+  end
+  if input.trait_type_params.size > 0
+    var _ttp = strvec_save(input.trait_type_params, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_traits_type_params()))
+  end
+  if input.trait_super_traits.size > 0
+    var _tst = strvec_save(input.trait_super_traits, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_traits_super_traits()))
+  end
+
+  # 2-D Vec<Vec<String>> annotation blobs (pool-indexed).
+  _qzmod_save_int_file(structs_field_anns_blob, output_dir, qzmod_format::qzmod_file_structs_field_anns_blob())
+  _qzmod_save_int_file(structs_field_anns_off,  output_dir, qzmod_format::qzmod_file_structs_field_anns_off())
+  _qzmod_save_int_file(enums_variant_anns_blob, output_dir, qzmod_format::qzmod_file_enums_variant_anns_blob())
+  _qzmod_save_int_file(enums_variant_anns_off,  output_dir, qzmod_format::qzmod_file_enums_variant_anns_off())
+
+  # --- MIR bodies (INC.1.2). The three files are write-elided together
+  # when the module has no shippable MirFuncs (mir_bodies_name.size == 0)
+  # so modules whose functions are all synthetic / __main__ / bounded
+  # generics produce byte-identical output_hash to pre-INC.1.2 emits.
+  # INC.1.4: actively delete stale MIR files when nothing is shipped.
+  # The dep_graph aliases ("terminal" + "std/terminal" for the same
+  # source) both get a `.qzmod` directory, but only the canonical alias
+  # (whose name matches `origin_module`) has funcs that match the MIR
+  # filter; the other alias would otherwise leave stale `mir_bodies.bin`
+  # from an earlier compile, and a subsequent run's consumer can load
+  # the stale alias first (via `loaded_stores` dedup) and pin the wrong
+  # contents — producing duplicate `terminal$KEY_UP` defines at codegen.
+  if mir_bodies_name.size > 0
+    _qzmod_save_int_file(mir_bodies_blob, output_dir, qzmod_format::qzmod_file_mir_bodies())
+    _qzmod_save_int_file(mir_bodies_off,  output_dir, qzmod_format::qzmod_file_mir_bodies_off())
+    var _mbn = strvec_save(mir_bodies_name, qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_mir_bodies_name()))
+  else
+    file_delete(qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_mir_bodies()))
+    file_delete(qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_mir_bodies_off()))
+    file_delete(qzmod_format::qzmod_section_path(output_dir, qzmod_format::qzmod_file_mir_bodies_name()))
+  end
+
+  # --- Compute output_hash AFTER all bin files are flushed to disk. ---
+  var output_hash = qzmod_format::qzmod_compute_output_hash(output_dir)
+
+  # --- Write header.txt last, including the computed output_hash. ---
+  var compiler_hash = qzmod_format::qzmod_compiler_hash()
+  var header = qzmod_format::qzmod_header_format(
+    compiler_hash, source_hash, output_hash, flags_hash, dep_names, dep_iface_hashes
+  )
+  var _wr = fio_write(qzmod_format::qzmod_header_path(output_dir), header)
+  return output_hash
+end
+
+## Save a Vec<Int> to `<output_dir>/<filename>`, skipping the call entirely
+## when the vec is empty (so the file doesn't exist on disk and the section
+## reads as absent during load + output_hash computation).
+def _qzmod_save_int_file(v: Vec<Int>, output_dir: String, filename: String): Void
+  if v.size == 0
+    return
+  end
+  var path = qzmod_format::qzmod_section_path(output_dir, filename)
+  var _r = vec_save(v, path)
+end
+
+## Return 1 if any element is non-zero, else 0. Used to decide whether to
+## ship `funcs_effect_state.bin` — most modules' funcs are all untracked
+## (state==0), so the file is omitted entirely to keep the canonical
+## output hash byte-identical to pre-1.4.c.3 emits for those modules.
+def _qzmod_any_nonzero(v: Vec<Int>): Int
+  for i in 0..v.size
+    if v[i] != 0
+      return 1
+    end
+  end
+  return 0
+end
+
+# =============================================================================
+# MIR Body Pickling — INC.1.1 (`.qzmod` MIR_BODIES section primitive).
+# =============================================================================
+#
+# Per-function MIR pickling. Producer integration in INC.1.2 will call
+# `mir_pickle_function` per `MirFunc` in `mir_prog.functions` belonging to
+# the module being emitted, concatenating outputs into `mir_bodies.bin`
+# and recording start offsets in `mir_bodies_off.bin`. INC.1.1 is the
+# primitive only — no producer/consumer integration yet.
+#
+# Byte layout: see `docs/design/QZMOD_MIR_BODIES.md` §4.1 (fn_meta_section
+# + blocks_section, each `instr_record` an 11-int row + variable `args`
+# list).
+#
+# String operands carried by MIR opcodes are pool-substituted via the
+# `mir::mir_kind_string_mask` table. String slot encoding:
+#   raw value 0  → 0 in pickle           (null / absent sentinel)
+#   raw value !0 → (pool_idx + 1)         (consumer subtracts 1)
+# This keeps "no string" distinguishable from real pool index 0.
+
+## Encode a possibly-null string operand by pool-interning. Returns the
+## pickle-domain integer (0 for null, else pool_idx + 1).
+def _mir_pickle_string_slot(raw: Int, pool: QzmodEmitPool): Int
+  if raw == 0
+    return 0
+  end
+  return qzmod_pool_intern(pool, as_string(raw)) + 1
+end
+
+## INC.1.3 — translate a MirBlock heap pointer to its index in `func.blocks`.
+## Returns -1 when the pointer isn't in the vec (unset / sentinel / stale).
+## MIR uses block heap pointers as labels for terminator targets and PHI
+## inputs — those pointers don't survive serialization, so the pickle
+## carries indices instead and the consumer patches them back to live
+## pointers in a fix-up pass after all blocks are unpickled.
+def _mir_pickle_block_ref(blocks: Vec<mir::MirBlock>, raw: mir::MirBlock): Int
+  if as_int_generic(raw) == 0
+    return -1
+  end
+  for i in 0..blocks.size
+    if as_int_generic(blocks[i]) == as_int_generic(raw)
+      return i
+    end
+  end
+  return -1
+end
+
+## Pickle one MirInstr into `blob`. Mirrors `instr_record` per §4.1:
+##   kind | dest_id | dest_type | operand1 | operand2 | op |
+##   n_args | arg_0 ... arg_{n-1} | slot1 | slot2 | line | col
+##
+## String-typed operand slots are pool-interned via the kind mask. SSA
+## register IDs and raw integers (block indices, offsets, layout IDs,
+## arity, op codes, flags) pass through verbatim.
+def _mir_pickle_instr(instr: MirInstr, blob: Vec<Int>, pool: QzmodEmitPool, blocks: Vec<mir::MirBlock>): Void
+  var kind = instr.mir_instr_get_kind()
+  var mask = mir::mir_kind_string_mask(kind)
+  blob.push(kind)
+  blob.push(instr.mir_instr_get_dest_id())
+  blob.push(instr.mir_instr_get_dest_type())
+
+  var op1 = instr.mir_instr_get_operand1()
+  if (mask & mir::MIR_KIND_OP1_STR) != 0
+    blob.push(_mir_pickle_string_slot(op1, pool))
+  else
+    blob.push(op1)
+  end
+
+  var op2 = instr.mir_instr_get_operand2()
+  if (mask & mir::MIR_KIND_OP2_STR) != 0
+    blob.push(_mir_pickle_string_slot(op2, pool))
+  else
+    blob.push(op2)
+  end
+
+  var op = instr.mir_instr_get_op()
+  if (mask & mir::MIR_KIND_OP_STR) != 0
+    blob.push(_mir_pickle_string_slot(op, pool))
+  else
+    blob.push(op)
+  end
+
+  var args = instr.mir_instr_get_args()
+  var n_args = 0
+  if args != 0
+    n_args = args.size
+  end
+  blob.push(n_args)
+  var args_are_strings = (mask & mir::MIR_KIND_ARGS_STR) != 0
+  for ai in 0..n_args
+    var a = args[ai]
+    if args_are_strings
+      blob.push(_mir_pickle_string_slot(a, pool))
+    else
+      blob.push(a)
+    end
+  end
+
+  # INC.1.3 block-ref fix: MIR_PHI slot1/slot2 carry MirBlock heap pointers
+  # (block labels for the two PHI input edges). Translate to indices so the
+  # consumer can re-link to its own MirBlock allocations after unpickle.
+  var s1 = instr.mir_instr_get_slot1()
+  if (mask & mir::MIR_KIND_SLOT1_STR) != 0
+    blob.push(_mir_pickle_string_slot(s1, pool))
+  elsif kind == mir::MIR_PHI
+    blob.push(_mir_pickle_block_ref(blocks, s1))
+  else
+    blob.push(s1)
+  end
+
+  var s2 = instr.mir_instr_get_slot2()
+  if (mask & mir::MIR_KIND_SLOT2_STR) != 0
+    blob.push(_mir_pickle_string_slot(s2, pool))
+  elsif kind == mir::MIR_PHI
+    blob.push(_mir_pickle_block_ref(blocks, s2))
+  else
+    blob.push(s2)
+  end
+
+  blob.push(instr.mir_instr_get_line())
+  blob.push(instr.mir_instr_get_col())
+end
+
+## Pickle one MirBlock into `blob`. Layout per §4.1:
+##   label_idx | n_instructions | instr_record_0 ... |
+##   term_kind | term_data | branch_true_idx | branch_false_idx |
+##   terminated_flag
+def _mir_pickle_block(block: MirBlock, blob: Vec<Int>, pool: QzmodEmitPool, blocks: Vec<mir::MirBlock>): Void
+  blob.push(qzmod_pool_intern(pool, block.mir_block_get_label()))
+  var instrs = block.mir_block_get_instructions()
+  blob.push(instrs.size)
+  for ii in 0..instrs.size
+    _mir_pickle_instr(instrs[ii], blob, pool, blocks)
+  end
+  var term_kind = block.mir_block_get_term_kind()
+  blob.push(term_kind)
+  # INC.1.3 block-ref fix: term_data is per-kind discriminated. TERM_JUMP
+  # carries the target block's heap pointer; everything else (RETURN's
+  # SSA reg, BRANCH/SWITCH's condition SSA reg, UNREACHABLE's unused
+  # slot) is an integer pass-through.
+  var term_data = block.mir_block_get_term_data()
+  if term_kind == mir::TERM_JUMP
+    blob.push(_mir_pickle_block_ref(blocks, term_data))
+  else
+    blob.push(term_data)
+  end
+  blob.push(_mir_pickle_block_ref(blocks, block.mir_block_get_branch_true()))
+  blob.push(_mir_pickle_block_ref(blocks, block.mir_block_get_branch_false()))
+  blob.push(block.mir_block_is_terminated())
+end
+
+## Pickle a MirFunc into a flat `Vec<Int>` blob fragment. Strings are
+## pool-interned via `qzmod_pool_intern`; no I/O. INC.1.2 producer
+## integration concatenates fragments into `mir_bodies.bin` and writes
+## per-function start offsets into `mir_bodies_off.bin`.
+##
+## Layout per `docs/design/QZMOD_MIR_BODIES.md` §4.1:
+##   fn_meta_section: name | origin_module | return_type | n_params + names +
+##     types + param-anns | return-ann | n_locals + names | n_narrow + names +
+##     types | flags | entry | value_counter | block_counter | line | col
+##   blocks_section: n_blocks + block_record × N
+##
+## `origin_module` is the source module that owns this function (set during
+## MIR lowering from `ctx.module_name`); INC.1.2's producer integration
+## filters `mir_prog.functions` by `origin_module == module_name` so each
+## .qzmod artifact carries only its own functions' bodies. Empty string
+## means "no module attribution" — synthetic / specialization / __main__
+## bodies don't ship.
+##
+## Flags are packed: bit0=is_naked, bit1=is_no_preempt, bit2=is_weak,
+## bit3=is_export, bit4=is_noinline, bit5=mutates_self_field (item 20 P1).
+## The producer-side cconv side-tables
+## (`_g_cconv_*_funcs`) are NOT carried in v1 — INC.1.2 will extend the
+## format with a `cconv` field once the producer integration encounters a
+## function that needs it.
+def mir_pickle_function(func: MirFunc, pool: QzmodEmitPool): Vec<Int>
+  var blob = vec_new<Int>()
+
+  blob.push(qzmod_pool_intern(pool, func.name))
+  blob.push(qzmod_pool_intern(pool, func.origin_module))
+  blob.push(func.return_type)
+
+  var params = func.params
+  blob.push(params.size)
+  for pi in 0..params.size
+    blob.push(qzmod_pool_intern(pool, params[pi]))
+  end
+  var param_types = func.param_types
+  for pi in 0..params.size
+    var pt = 0
+    if pi < param_types.size
+      pt = param_types[pi]
+    end
+    blob.push(pt)
+  end
+  var param_anns = func.param_type_names
+  for pi in 0..params.size
+    var pa = ""
+    if pi < param_anns.size
+      pa = param_anns[pi]
+    end
+    blob.push(qzmod_pool_intern(pool, pa))
+  end
+
+  blob.push(qzmod_pool_intern(pool, func.return_type_name))
+
+  var locals = func.locals
+  blob.push(locals.size)
+  for li in 0..locals.size
+    blob.push(qzmod_pool_intern(pool, locals[li]))
+  end
+
+  var ln_names = func.local_narrow_names
+  var ln_types = func.local_narrow_types
+  blob.push(ln_names.size)
+  for li in 0..ln_names.size
+    blob.push(qzmod_pool_intern(pool, ln_names[li]))
+  end
+  for li in 0..ln_names.size
+    var lt = ""
+    if li < ln_types.size
+      lt = ln_types[li]
+    end
+    blob.push(qzmod_pool_intern(pool, lt))
+  end
+
+  var flags = func.is_naked
+  flags = flags + func.is_no_preempt * 2
+  flags = flags + func.is_weak * 4
+  flags = flags + func.is_export * 8
+  flags = flags + func.is_noinline * 16
+  # item 20 P1 — bit 5: direct-self-field-mutation marker, so a cached value-
+  # struct method body keeps its register-decompose exclusion.
+  flags = flags + func.mutates_self_field * 32
+  # item 38 — bit 6: associated-fn phantom-self marker, so a cached associated
+  # fn keeps its param-0 register-decompose exclusion (else the phantom `self`
+  # null-derefs when its struct type is value-layout).
+  flags = flags + func.assoc_phantom_self * 64
+  blob.push(flags)
+
+  var blocks = func.blocks
+  # INC.1.3 block-ref fix: `func.entry` is a MirBlock heap pointer; ship
+  # its index in `blocks` so the consumer can rebind to its own allocations
+  # after the per-block unpickle.
+  blob.push(_mir_pickle_block_ref(blocks, func.entry))
+  blob.push(func.value_counter)
+  blob.push(func.block_counter)
+  blob.push(func.line)
+  blob.push(func.col)
+
+  blob.push(blocks.size)
+  for bi in 0..blocks.size
+    _mir_pickle_block(blocks[bi], blob, pool, blocks)
+  end
+
+  return blob
+end
+
+## mkdir -p style — walk the path components, creating each level. Idempotent
+## on EEXIST. Quartz's `mkdir` intrinsic is single-level, so the cache root
+## (`.quartz-cache/<shard>/<module>/`) is created across three calls. Inlined
+## here (not pulled from std/quake.qz) so qzmod_emit.qz keeps a minimal
+## import surface — `quake` is a build-system module, conceptually wrong to
+## depend on from compiler-internal code.
+def _qzmod_mkdir_p(path: String): Void
+  var parts = str_split(path, "/")
+  var current = ""
+  for i in 0..parts.size
+    var part = parts[i]
+    if str_byte_len(part) == 0
+      if i == 0
+        current = "/"
+      end
+    else
+      if str_byte_len(current) == 0
+        current = part
+      elsif str_eq(current, "/")
+        current = "#{current}#{part}"
+      else
+        current = "#{current}/#{part}"
+      end
+      var _r = mkdir(current)
+    end
+  end
+end

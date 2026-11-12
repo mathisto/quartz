@@ -1,0 +1,5949 @@
+##! # Quartz Language Server Protocol (LSP) Server
+##!
+##! JSON-RPC 2.0 over stdio, LSP 3.17 compatible.
+##! Provides real-time parse diagnostics as you type.
+##!
+##! Transport: Content-Length headers over stdin/stdout.
+##! All logging goes to stderr to keep the LSP channel clean.
+
+import lexer
+import ast
+import node_constants
+import token_constants
+import diagnostic
+import string_intern
+import typecheck
+import typecheck_walk
+import typecheck_util
+import file_io
+import * from str_compat
+
+# ============================================================================
+# LSP Logging (stderr only — stdout is the LSP transport)
+# ============================================================================
+
+def lsp_log(msg: String): Void
+  eputs("[quartz-lsp] #{msg}")
+end
+
+# ============================================================================
+# JSON Field Extraction
+#
+# Minimal JSON access for LSP messages. Finds keys at the top level of a
+# JSON object (depth 1), respecting string escapes and nested structures.
+# ============================================================================
+
+## Find the byte position of a key's value in a JSON object.
+## Searches only at the outermost object level (depth 1).
+## Returns byte position after the colon + whitespace, or -1 if not found.
+def _lsp_find_value_pos(json: String, key: String): Int
+  var target = "\"#{key}\""
+  var target_len = str_byte_len(target)
+  var jlen = str_byte_len(json)
+  var pos = 0
+  var depth = 0
+  var in_str = 0
+  while pos < jlen
+    var ch = str_byte_at(json, pos)
+    if in_str == 1
+      if ch == '\\'
+        pos += 2
+      else
+        if ch == '"'
+          in_str = 0
+        end
+        pos += 1
+      end
+    else
+      if ch == '"'
+        # Check if this is our target key at depth 1
+        if depth == 1 and pos + target_len <= jlen
+          var candidate = str_byte_slice(json, pos, pos + target_len)
+          if candidate == target
+            # Found key — advance past "key" : <whitespace>
+            var vpos = pos + target_len
+            while vpos < jlen and str_byte_at(json, vpos) != ':'
+              vpos += 1
+            end
+            vpos += 1
+            while vpos < jlen
+              var wc = str_byte_at(json, vpos)
+              if wc != ' ' and wc != '\t' and wc != '\n' and wc != '\r'
+                break
+              end
+              vpos += 1
+            end
+            return vpos
+          end
+        end
+        in_str = 1
+        pos += 1
+      elsif ch == '{' or ch == '['
+        depth += 1
+        pos += 1
+      elsif ch == '}' or ch == ']'
+        depth -= 1
+        pos += 1
+      else
+        pos += 1
+      end
+    end
+  end
+  return -1
+end
+
+## Extract a JSON string value by key from the outermost object level.
+## Handles escape sequences (\", \\, \n, \r, \t, \/).
+## Returns "" if the key is not found or the value is not a string.
+def lsp_json_get_str(json: String, key: String): String
+  var vpos = _lsp_find_value_pos(json, key)
+  if vpos < 0
+    return ""
+  end
+  var jlen = str_byte_len(json)
+  if vpos >= jlen or str_byte_at(json, vpos) != '"'
+    return ""
+  end
+  vpos += 1
+  var sb = sb_new()
+  while vpos < jlen
+    var ch = str_byte_at(json, vpos)
+    if ch == '"'
+      break
+    end
+    if ch == '\\'
+      vpos += 1
+      if vpos < jlen
+        var esc = str_byte_at(json, vpos)
+        if esc == '"'
+          sb_append_char(sb, '"')
+        elsif esc == '\\'
+          sb_append_char(sb, '\\')
+        elsif esc == 'n'
+          sb_append_char(sb, '\n')
+        elsif esc == 'r'
+          sb_append_char(sb, '\r')
+        elsif esc == 't'
+          sb_append_char(sb, '\t')
+        elsif esc == '/'
+          sb_append_char(sb, '/')
+        else
+          sb_append_char(sb, esc)
+        end
+      end
+    else
+      sb_append_char(sb, ch)
+    end
+    vpos += 1
+  end
+  var result = sb_to_string(sb)
+  sb_free(sb)
+  return result
+end
+
+## Extract a JSON integer value by key. Returns -1 if not found.
+def lsp_json_get_int(json: String, key: String): Int
+  var vpos = _lsp_find_value_pos(json, key)
+  if vpos < 0
+    return -1
+  end
+  var jlen = str_byte_len(json)
+  var sb = sb_new()
+  while vpos < jlen
+    var ch = str_byte_at(json, vpos)
+    if (ch >= '0' and ch <= '9') or (ch == '-' and sb_size(sb) == 0)
+      sb_append_char(sb, ch)
+    else
+      break
+    end
+    vpos += 1
+  end
+  var s = sb_to_string(sb)
+  sb_free(sb)
+  if str_byte_len(s) == 0
+    return -1
+  end
+  return str_to_int(s)
+end
+
+## Extract a JSON object or array value as a raw substring.
+## Matches braces/brackets to find the complete value.
+## Returns "" if the key is not found or the value is not an object/array.
+def lsp_json_get_obj(json: String, key: String): String
+  var vpos = _lsp_find_value_pos(json, key)
+  if vpos < 0
+    return ""
+  end
+  var jlen = str_byte_len(json)
+  if vpos >= jlen
+    return ""
+  end
+  var ch = str_byte_at(json, vpos)
+  if ch != '{' and ch != '['
+    return ""
+  end
+  var close_char = '}'
+  if ch == '['
+    close_char = ']'
+  end
+  var depth = 1
+  var end_pos = vpos + 1
+  var in_str = 0
+  while end_pos < jlen and depth > 0
+    var c = str_byte_at(json, end_pos)
+    if in_str == 1
+      if c == '\\'
+        end_pos += 1
+      elsif c == '"'
+        in_str = 0
+      end
+    else
+      if c == '"'
+        in_str = 1
+      elsif c == ch
+        depth += 1
+      elsif c == close_char
+        depth -= 1
+      end
+    end
+    end_pos += 1
+  end
+  return str_byte_slice(json, vpos, end_pos)
+end
+
+# ============================================================================
+# JSON Response Builders
+# ============================================================================
+
+## Escape a string for inclusion in a JSON string value.
+def _lsp_json_escape(s: String): String
+  var sb = sb_new()
+  var len = str_byte_len(s)
+  var i = 0
+  while i < len
+    var ch = str_byte_at(s, i)
+    if ch == '"'
+      sb.append("\\\"")
+    elsif ch == '\\'
+      sb.append("\\\\")
+    elsif ch == '\n'
+      sb.append("\\n")
+    elsif ch == '\r'
+      sb.append("\\r")
+    elsif ch == '\t'
+      sb.append("\\t")
+    elsif ch < 32
+      # Control characters — skip
+    else
+      sb_append_char(sb, ch)
+    end
+    i += 1
+  end
+  var result = sb.to_string()
+  sb_free(sb)
+  return result
+end
+
+def _lsp_response(id: Int, result: String): String
+  return "{\"jsonrpc\":\"2.0\",\"id\":#{id},\"result\":#{result}}"
+end
+
+def _lsp_notification(method: String, params: String): String
+  return "{\"jsonrpc\":\"2.0\",\"method\":\"#{method}\",\"params\":#{params}}"
+end
+
+def _lsp_null_response(id: Int): String
+  return "{\"jsonrpc\":\"2.0\",\"id\":#{id},\"result\":null}"
+end
+
+def _lsp_error_response(id: Int, code: Int, message: String): String
+  return "{\"jsonrpc\":\"2.0\",\"id\":#{id},\"error\":{\"code\":#{code},\"message\":\"#{_lsp_json_escape(message)}\"}}"
+end
+
+# ============================================================================
+# LSP Transport (JSON-RPC 2.0 over stdio)
+# ============================================================================
+
+var g_lsp_stdin_handle = 0
+
+def _lsp_init_io(): Void
+  g_lsp_stdin_handle = open_file("/dev/stdin", "r")
+end
+
+## Read one JSON-RPC message from stdin.
+## Parses Content-Length header, reads the blank separator line,
+## then reads exactly that many bytes of JSON body.
+## Returns "" on EOF or read error.
+def lsp_read_message(): String
+  var content_length = 0
+  while true
+    var line = file_read_line(g_lsp_stdin_handle)
+    if str_byte_len(line) == 0
+      return ""
+    end
+    # Strip trailing \r (LSP uses \r\n line endings)
+    var len = str_byte_len(line)
+    if len > 0 and str_byte_at(line, len - 1) == '\r'
+      line = str_byte_slice(line, 0, len - 1)
+      len -= 1
+    end
+    if len == 0
+      break
+    end
+    if str_starts_with(line, "Content-Length: ")
+      content_length = str_to_int(str_byte_slice(line, 16, str_byte_len(line)))
+    end
+  end
+  if content_length <= 0
+    return ""
+  end
+  return fread(g_lsp_stdin_handle, content_length)
+end
+
+## Send a JSON-RPC message to stdout with Content-Length header.
+def lsp_send(json: String): Void
+  var len = str_byte_len(json)
+  print("Content-Length: #{len}\r\n\r\n#{json}")
+end
+
+# ============================================================================
+# Document Store
+# ============================================================================
+
+var g_lsp_doc_uris = vec_new<String>()
+var g_lsp_doc_texts = vec_new<String>()
+
+def _lsp_doc_set(uri: String, text: String): Void
+  for i in 0..g_lsp_doc_uris.size
+    if g_lsp_doc_uris[i] == uri
+      g_lsp_doc_texts[i] = text
+      return
+    end
+  end
+  g_lsp_doc_uris.push(uri)
+  g_lsp_doc_texts.push(text)
+end
+
+def _lsp_doc_get(uri: String): String
+  for i in 0..g_lsp_doc_uris.size
+    if g_lsp_doc_uris[i] == uri
+      return g_lsp_doc_texts[i]
+    end
+  end
+  return ""
+end
+
+def _lsp_doc_remove(uri: String): Void
+  for i in 0..g_lsp_doc_uris.size
+    if g_lsp_doc_uris[i] == uri
+      var last = g_lsp_doc_uris.size - 1
+      if i < last
+        g_lsp_doc_uris[i] = g_lsp_doc_uris[last]
+        g_lsp_doc_texts[i] = g_lsp_doc_texts[last]
+      end
+      __vec_pop_raw(g_lsp_doc_uris)
+      __vec_pop_raw(g_lsp_doc_texts)
+      return
+    end
+  end
+end
+
+# ============================================================================
+# AST Cache (per-document parsed AST for hover/definition/symbols)
+# ============================================================================
+
+var g_lsp_ast_uris = vec_new<String>()
+var g_lsp_ast_stores = vec_new<Int>()
+var g_lsp_ast_roots = vec_new<Int>()
+
+def _lsp_ast_cache_set(uri: String, store: Int, root: Int): Void
+  for i in 0..g_lsp_ast_uris.size
+    if g_lsp_ast_uris[i] == uri
+      g_lsp_ast_stores[i] = store
+      g_lsp_ast_roots[i] = root
+      return
+    end
+  end
+  g_lsp_ast_uris.push(uri)
+  g_lsp_ast_stores.push(store)
+  g_lsp_ast_roots.push(root)
+end
+
+def _lsp_ast_cache_get_store(uri: String): Int
+  for i in 0..g_lsp_ast_uris.size
+    if g_lsp_ast_uris[i] == uri
+      return g_lsp_ast_stores[i]
+    end
+  end
+  return 0
+end
+
+def _lsp_ast_cache_get_root(uri: String): Int
+  for i in 0..g_lsp_ast_uris.size
+    if g_lsp_ast_uris[i] == uri
+      return g_lsp_ast_roots[i]
+    end
+  end
+  return 0
+end
+
+# ============================================================================
+# Hover: Extract identifier at cursor position
+# ============================================================================
+
+## Check if a byte is part of an identifier (a-z, A-Z, 0-9, _, $, ?, !)
+def _lsp_is_ident_char(ch: Int): Bool
+  return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '$' or ch == '?' or ch == '!'
+end
+
+## Extract the identifier (word) at a given 0-based line and column.
+## Returns "" if no identifier found at that position.
+def _lsp_word_at(source: String, line: Int, col: Int): String
+  # Find the byte offset of the target line
+  var src_len = str_byte_len(source)
+  var cur_line = 0
+  var line_start = 0
+  var pos = 0
+  while pos < src_len and cur_line < line
+    if str_byte_at(source, pos) == '\n'
+      cur_line += 1
+      line_start = pos + 1
+    end
+    pos += 1
+  end
+  if cur_line != line
+    return ""
+  end
+  # Find end of this line
+  var line_end = line_start
+  while line_end < src_len and str_byte_at(source, line_end) != '\n'
+    line_end += 1
+  end
+  var target = line_start + col
+  if target >= line_end
+    return ""
+  end
+  if not _lsp_is_ident_char(str_byte_at(source, target))
+    return ""
+  end
+  # Expand left
+  var start = target
+  while start > line_start and _lsp_is_ident_char(str_byte_at(source, start - 1))
+    start -= 1
+  end
+  # Expand right
+  var end_pos = target + 1
+  while end_pos < line_end and _lsp_is_ident_char(str_byte_at(source, end_pos))
+    end_pos += 1
+  end
+  return str_byte_slice(source, start, end_pos)
+end
+
+# ============================================================================
+# Hover: AST Walk for Definitions
+# ============================================================================
+
+## Build a hover signature string for a function AST node.
+def _lsp_format_function_hover(store: Int, node: Int): String
+  var name = ast::ast_get_str1(store, node)
+  var ret_ann = ast::ast_get_str2(store, node)
+  var doc = ast::ast_get_doc(store, node)
+  var params_vec = ast::ast_get_left(store, node)
+  # Build parameter list
+  var sb = sb_new()
+  sb.append("```quartz\ndef ")
+  sb.append(name)
+  sb.append("(")
+  if params_vec != 0
+    var param_count = vec_size(params_vec)
+    for pi in 0..param_count
+      if pi > 0
+        sb.append(", ")
+      end
+      var ph = vec_get(params_vec, pi)
+      var pname = ast::ast_get_str1(store, ph)
+      var ptype = ast::ast_get_str2(store, ph)
+      sb.append(pname)
+      if str_byte_len(ptype) > 0
+        sb.append(": ")
+        sb.append(ptype)
+      end
+    end
+  end
+  sb.append(")")
+  if str_byte_len(ret_ann) > 0
+    sb.append(": ")
+    sb.append(ret_ann)
+  end
+  sb.append("\n```")
+  if str_byte_len(doc) > 0
+    sb.append("\n\n---\n\n")
+    sb.append(doc)
+  end
+  var result = sb.to_string()
+  sb_free(sb)
+  return result
+end
+
+## Build a hover string for a struct AST node.
+def _lsp_format_struct_hover(store: Int, node: Int): String
+  var name = ast::ast_get_str1(store, node)
+  var doc = ast::ast_get_doc(store, node)
+  var fields = ast::ast_get_children(store, node)
+  var sb = sb_new()
+  sb.append("```quartz\nstruct ")
+  sb.append(name)
+  sb.append("\n")
+  if fields != 0
+    var fcount = vec_size(fields)
+    for fi in 0..fcount
+      var fh = vec_get(fields, fi)
+      var fkind = ast::ast_get_kind(store, fh)
+      if fkind == node_constants::NODE_FIELD_DEF
+        var fname = ast::ast_get_str1(store, fh)
+        var ftype = ast::ast_get_str2(store, fh)
+        sb.append("  ")
+        sb.append(fname)
+        if str_byte_len(ftype) > 0
+          sb.append(": ")
+          sb.append(ftype)
+        end
+        sb.append("\n")
+      end
+    end
+  end
+  sb.append("end\n```")
+  if str_byte_len(doc) > 0
+    sb.append("\n\n---\n\n")
+    sb.append(doc)
+  end
+  var result = sb.to_string()
+  sb_free(sb)
+  return result
+end
+
+## Build a hover string for an enum AST node.
+def _lsp_format_enum_hover(store: Int, node: Int): String
+  var name = ast::ast_get_str1(store, node)
+  var doc = ast::ast_get_doc(store, node)
+  var variants = ast::ast_get_children(store, node)
+  var sb = sb_new()
+  sb.append("```quartz\nenum ")
+  sb.append(name)
+  sb.append("\n")
+  if variants != 0
+    var vcount = vec_size(variants)
+    for vi in 0..vcount
+      var vh = vec_get(variants, vi)
+      var vname = ast::ast_get_str1(store, vh)
+      sb.append("  ")
+      sb.append(vname)
+      sb.append("\n")
+    end
+  end
+  sb.append("end\n```")
+  if str_byte_len(doc) > 0
+    sb.append("\n\n---\n\n")
+    sb.append(doc)
+  end
+  var result = sb.to_string()
+  sb_free(sb)
+  return result
+end
+
+## Search the AST for a definition matching the given name.
+## Returns a formatted hover string, or "" if not found.
+def _lsp_find_hover_in_ast(store: Int, root: Int, name: String): String
+  if store == 0 or root == 0
+    return ""
+  end
+  var children = ast::ast_get_children(store, root)
+  if children == 0
+    return ""
+  end
+  var count = vec_size(children)
+  for i in 0..count
+    var child = vec_get(children, i)
+    if child == 0
+      continue
+    end
+    var kind = ast::ast_get_kind(store, child)
+    if kind == node_constants::NODE_FUNCTION
+      var fname = ast::ast_get_str1(store, child)
+      if fname == name
+        return _lsp_format_function_hover(store, child)
+      end
+    elsif kind == node_constants::NODE_STRUCT_DEF
+      var sname = ast::ast_get_str1(store, child)
+      if sname == name
+        return _lsp_format_struct_hover(store, child)
+      end
+    elsif kind == node_constants::NODE_ENUM_DEF
+      var ename = ast::ast_get_str1(store, child)
+      if ename == name
+        return _lsp_format_enum_hover(store, child)
+      end
+    end
+  end
+  return ""
+end
+
+# ============================================================================
+# Diagnostic Publishing
+# ============================================================================
+
+## Convert a file:// URI to a filesystem path.
+def _lsp_uri_to_path(uri: String): String
+  if str_starts_with(uri, "file://")
+    return str_byte_slice(uri, 7, str_byte_len(uri))
+  end
+  return uri
+end
+
+## Run the parse pipeline on source text and publish diagnostics.
+## Parse diagnostics on every call. Typecheck diagnostics when run_tc == 1.
+def lsp_publish_diagnostics(uri: String, source: String, run_tc: Int): Void
+  var filename = _lsp_uri_to_path(uri)
+
+  # Phase 1: Lex
+  var interner = string_intern::intern_global()
+  var lex_result = lexer::lexer_tokenize(source, interner)
+
+  # Phase 2: Parse
+  var types = lex_result.get_types()
+  var lexemes = lex_result.get_lexemes()
+  var lines = lex_result.get_lines()
+  var cols = lex_result.get_cols()
+  var count = lex_result.token_count()
+
+  # Collect parse error diagnostics
+  var diag_sb = sb_new()
+  sb_append(diag_sb, "[")
+  var diag_count = 0
+  var parse_ok = false
+  var ast_store = 0
+  var ast_root = 0
+
+  # Parse the whole document via cst_parser -> cst_lower (matching the
+  # main-module / resolver routing). The CST parser records every recovered
+  # error in err_msgs/err_lines (no err_cols — column defaults to 0, mirroring
+  # the main-module CST diagnostic shape which hardcodes column 1/char 0).
+  var cst_res = cst_parser::cst_parse_source(source)
+  parse_ok = cst_res.parser.had_error == 0
+  if parse_ok == false
+    var cst_msgs = cst_res.parser.err_msgs
+    var cst_lines = cst_res.parser.err_lines
+    for i in 0..cst_msgs.size
+      if diag_count > 0
+        sb_append(diag_sb, ",")
+      end
+      var msg = "CST parse error"
+      if str_byte_len(cst_msgs[i]) > 0
+        msg = cst_msgs[i]
+      end
+      # LSP uses 0-based line/column
+      var line = cst_lines[i] - 1
+      if line < 0
+        line = 0
+      end
+      sb_append(diag_sb, "{\"range\":{\"start\":{\"line\":")
+      sb_append(diag_sb, str_from_int(line))
+      sb_append(diag_sb, ",\"character\":0},\"end\":{\"line\":")
+      sb_append(diag_sb, str_from_int(line))
+      sb_append(diag_sb, ",\"character\":1")
+      sb_append(diag_sb, "}},\"severity\":1,\"source\":\"quartz\",\"message\":\"")
+      sb_append(diag_sb, _lsp_json_escape(msg))
+      sb_append(diag_sb, "\"}")
+      diag_count += 1
+    end
+  else
+    ast_store = ast::ast_new_storage()
+    ast_root = cst_lower::cst_lower(cst_res.parser.store, cst_res.root, ast_store)
+    _lsp_ast_cache_set(uri, ast_store, ast_root)
+  end
+
+  # Phase 3: Typecheck diagnostics (on save/open only)
+  if run_tc == 1 and g_lsp_tc_ready == 1 and ast_store != 0
+    var tc = typecheck::tc_new()
+    _lsp_register_workspace_types(tc)
+    typecheck_walk::tc_program(tc, ast_store, ast_root)
+    var tc_err_count = typecheck_util::tc_error_count(tc)
+    for ei in 0..tc_err_count
+      var tc_msg = typecheck_util::tc_get_error(tc, ei)
+      var eline = typecheck_util::tc_get_error_line(tc, ei) - 1
+      var ecol = typecheck_util::tc_get_error_col(tc, ei) - 1
+      if eline < 0
+        eline = 0
+      end
+      if ecol < 0
+        ecol = 0
+      end
+      if diag_count > 0
+        sb_append(diag_sb, ",")
+      end
+      var end_ecol = ecol + 1
+      sb_append(diag_sb, "{\"range\":{\"start\":{\"line\":")
+      sb_append(diag_sb, str_from_int(eline))
+      sb_append(diag_sb, ",\"character\":")
+      sb_append(diag_sb, str_from_int(ecol))
+      sb_append(diag_sb, "},\"end\":{\"line\":")
+      sb_append(diag_sb, str_from_int(eline))
+      sb_append(diag_sb, ",\"character\":")
+      sb_append(diag_sb, str_from_int(end_ecol))
+      sb_append(diag_sb, "}},\"severity\":1,\"source\":\"quartz-tc\",\"message\":\"")
+      sb_append(diag_sb, _lsp_json_escape(tc_msg))
+      sb_append(diag_sb, "\"}")
+      diag_count += 1
+    end
+    # Cache TC state for hover queries
+    g_lsp_tc = tc
+
+    # Capture binding types for inlay hints
+    g_lsp_hint_lines = vec_new<Int>()
+    g_lsp_hint_cols = vec_new<Int>()
+    g_lsp_hint_types = vec_new<String>()
+    g_lsp_hint_uri = uri
+    var hint_children = ast::ast_get_children(ast_store, ast_root)
+    if hint_children != 0
+      var hcc = vec_size(hint_children)
+      for hci in 0..hcc
+        var hchild = vec_get(hint_children, hci)
+        if hchild == 0
+          continue
+        end
+        var hck = ast::ast_get_kind(ast_store, hchild)
+        if hck == node_constants::NODE_FUNCTION
+          # Re-typecheck this function to capture binding data
+          typecheck_walk::tc_function(tc, ast_store, hchild)
+          # Read physical vector data (preserved after tc_exit_scope)
+          var phys_size = tc.scope.binding_names.size
+          var hbody = ast::ast_get_right(ast_store, hchild)
+          if hbody != 0
+            _lsp_capture_hint_bindings(ast_store, hbody, tc, phys_size)
+          end
+        end
+      end
+    end
+  end
+
+  sb_append(diag_sb, "]")
+  var diags = sb_to_string(diag_sb)
+  sb_free(diag_sb)
+
+  var params_sb = sb_new()
+  sb_append(params_sb, "{\"uri\":\"")
+  sb_append(params_sb, _lsp_json_escape(uri))
+  sb_append(params_sb, "\",\"diagnostics\":")
+  sb_append(params_sb, diags)
+  sb_append(params_sb, "}")
+  var params = sb_to_string(params_sb)
+  sb_free(params_sb)
+  lsp_send(_lsp_notification("textDocument/publishDiagnostics", params))
+end
+
+# ============================================================================
+# LSP Handlers
+# ============================================================================
+
+def _lsp_handle_initialize(id: Int, params: String): Void
+  # Extract rootUri for workspace scanning
+  var root_uri = lsp_json_get_str(params, "rootUri")
+  if str_byte_len(root_uri) > 0
+    g_lsp_workspace_root = _lsp_uri_to_path(root_uri)
+    lsp_log("workspace root: #{g_lsp_workspace_root}")
+  end
+
+  var result_sb = sb_new()
+  sb_append(result_sb, "{\"capabilities\":{")
+  sb_append(result_sb, "\"textDocumentSync\":2")
+  sb_append(result_sb, ",\"hoverProvider\":true")
+  sb_append(result_sb, ",\"definitionProvider\":true")
+  sb_append(result_sb, ",\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]}")
+  sb_append(result_sb, ",\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]}")
+  sb_append(result_sb, ",\"documentSymbolProvider\":true")
+  sb_append(result_sb, ",\"documentFormattingProvider\":true")
+  sb_append(result_sb, ",\"referencesProvider\":true")
+  sb_append(result_sb, ",\"foldingRangeProvider\":true")
+  sb_append(result_sb, ",\"documentLinkProvider\":{}")
+  sb_append(result_sb, ",\"inlayHintProvider\":true")
+  sb_append(result_sb, ",\"documentHighlightProvider\":true")
+  sb_append(result_sb, ",\"selectionRangeProvider\":true")
+  sb_append(result_sb, ",\"renameProvider\":{\"prepareProvider\":true}")
+  sb_append(result_sb, ",\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\",\"source\"]}")
+  sb_append(result_sb, ",\"workspaceSymbolProvider\":true")
+  sb_append(result_sb, ",\"codeLensProvider\":{\"resolveProvider\":true}")
+  sb_append(result_sb, ",\"callHierarchyProvider\":true")
+  sb_append(result_sb, ",\"typeHierarchyProvider\":true")
+  sb_append(result_sb, ",\"inlineCompletionProvider\":{}")
+  sb_append(result_sb, ",\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"function\",\"variable\",\"parameter\",\"type\",\"struct\",\"enum\",\"property\",\"enumMember\",\"keyword\",\"comment\",\"string\",\"number\"],\"tokenModifiers\":[\"declaration\",\"definition\",\"readonly\",\"static\",\"deprecated\",\"modification\"]},\"full\":true}")
+  sb_append(result_sb, "},\"serverInfo\":{\"name\":\"quartz-lsp\",\"version\":\"0.3.0\"}}")
+  var result = sb_to_string(result_sb)
+  sb_free(result_sb)
+  lsp_send(_lsp_response(id, result))
+  lsp_log("initialized")
+end
+
+def _lsp_handle_shutdown(id: Int): Void
+  lsp_send(_lsp_null_response(id))
+  lsp_log("shutdown acknowledged")
+end
+
+def _lsp_handle_did_open(params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  var text = lsp_json_get_str(td, "text")
+  _lsp_doc_set(uri, text)
+  lsp_log("opened: #{uri}")
+  lsp_publish_diagnostics(uri, text, 1)
+end
+
+## Compute byte offset from (0-based line, 0-based col) in source text.
+def _lsp_line_col_to_offset(source: String, line: Int, col: Int): Int
+  var slen = str_byte_len(source)
+  var cur_line = 0
+  var pos = 0
+  while pos < slen and cur_line < line
+    if str_byte_at(source, pos) == '\n'
+      cur_line += 1
+    end
+    pos += 1
+  end
+  var offset = pos + col
+  if offset > slen
+    offset = slen
+  end
+  return offset
+end
+
+def _lsp_handle_did_change(params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  var changes_arr = lsp_json_get_obj(params, "contentChanges")
+  var current_text = _lsp_doc_get(uri)
+
+  # Process each change in the contentChanges array
+  # For incremental sync (textDocumentSync: 2), each change has range + text
+  # For full sync fallback, no range is present — just "text"
+  var arr_len = str_byte_len(changes_arr)
+  var cpos = 0
+  while cpos < arr_len
+    # Find next change object
+    var brace_start = -1
+    while cpos < arr_len
+      if str_byte_at(changes_arr, cpos) == '{'
+        brace_start = cpos
+        break
+      end
+      cpos += 1
+    end
+    if brace_start < 0
+      break
+    end
+    # Extract this change object
+    var depth = 1
+    var brace_end = brace_start + 1
+    var in_str = 0
+    while brace_end < arr_len and depth > 0
+      var bc = str_byte_at(changes_arr, brace_end)
+      if in_str == 1
+        if bc == '\\'
+          brace_end += 1
+        elsif bc == '"'
+          in_str = 0
+        end
+      else
+        if bc == '"'
+          in_str = 1
+        elsif bc == '{'
+          depth += 1
+        elsif bc == '}'
+          depth -= 1
+        end
+      end
+      brace_end += 1
+    end
+    var change_obj = str_byte_slice(changes_arr, brace_start, brace_end)
+    cpos = brace_end
+
+    # Check if this change has a range (incremental) or not (full)
+    var range_obj = lsp_json_get_obj(change_obj, "range")
+    var new_text = lsp_json_get_str(change_obj, "text")
+
+    if str_byte_len(range_obj) > 2
+      # Incremental change: apply range edit
+      var start_obj = lsp_json_get_obj(range_obj, "start")
+      var end_obj = lsp_json_get_obj(range_obj, "end")
+      var start_line = lsp_json_get_int(start_obj, "line")
+      var start_col = lsp_json_get_int(start_obj, "character")
+      var end_line = lsp_json_get_int(end_obj, "line")
+      var end_col = lsp_json_get_int(end_obj, "character")
+
+      var start_offset = _lsp_line_col_to_offset(current_text, start_line, start_col)
+      var end_offset = _lsp_line_col_to_offset(current_text, end_line, end_col)
+
+      var prefix = str_byte_slice(current_text, 0, start_offset)
+      var suffix = str_byte_slice(current_text, end_offset, str_byte_len(current_text))
+      var edit_sb = sb_new()
+      edit_sb.append(prefix)
+      edit_sb.append(new_text)
+      edit_sb.append(suffix)
+      current_text = edit_sb.to_string()
+      sb_free(edit_sb)
+    else
+      # Full document replacement
+      current_text = new_text
+    end
+  end
+
+  if str_byte_len(current_text) > 0
+    _lsp_doc_set(uri, current_text)
+    lsp_publish_diagnostics(uri, current_text, 0)
+    # Mark dirty for debounced typecheck
+    g_lsp_dirty_uri = uri
+    g_lsp_dirty_time_ns = time_mono_ns()
+  end
+end
+
+def _lsp_handle_did_close(params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  _lsp_doc_remove(uri)
+  lsp_log("closed: #{uri}")
+  # Clear diagnostics for the closed file
+  var clear_sb = sb_new()
+  sb_append(clear_sb, "{\"uri\":\"")
+  sb_append(clear_sb, _lsp_json_escape(uri))
+  sb_append(clear_sb, "\",\"diagnostics\":[]}")
+  var clear_params = sb_to_string(clear_sb)
+  sb_free(clear_sb)
+  lsp_send(_lsp_notification("textDocument/publishDiagnostics", clear_params))
+end
+
+def _lsp_send_hover(id: Int, hover_text: String): Void
+  var rsb = sb_new()
+  sb_append(rsb, "{\"contents\":{\"kind\":\"markdown\",\"value\":\"")
+  sb_append(rsb, _lsp_json_escape(hover_text))
+  sb_append(rsb, "\"}}")
+  var result = sb_to_string(rsb)
+  sb_free(rsb)
+  lsp_send(_lsp_response(id, result))
+end
+
+def _lsp_handle_hover(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  var pos_obj = lsp_json_get_obj(params, "position")
+  var line = lsp_json_get_int(pos_obj, "line")
+  var col = lsp_json_get_int(pos_obj, "character")
+
+  var source = _lsp_doc_get(uri)
+  if str_byte_len(source) == 0
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+
+  var word = _lsp_word_at(source, line, col)
+  if str_byte_len(word) == 0
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+
+  # 1. Try current file's AST definitions
+  var store = _lsp_ast_cache_get_store(uri)
+  var root = _lsp_ast_cache_get_root(uri)
+  var hover_text = _lsp_find_hover_in_ast(store, root, word)
+  if str_byte_len(hover_text) > 0
+    _lsp_send_hover(id, hover_text)
+    return
+  end
+
+  # 2. Try local scope bindings (params + let/var)
+  var target_line = line + 1
+  var scope_names = vec_new<String>()
+  var scope_types = vec_new<String>()
+  _lsp_collect_scope_bindings(store, root, target_line, scope_names, scope_types)
+  for si in 0..scope_names.size
+    if scope_names[si] == word
+      var type_ann = scope_types[si]
+      if str_byte_len(type_ann) > 0
+        _lsp_send_hover(id, "```quartz\n#{word}: #{type_ann}\n```")
+      else
+        _lsp_send_hover(id, "```quartz\n#{word}\n```")
+      end
+      return
+    end
+  end
+
+  # 3. Try workspace symbol index (cross-file definitions)
+  for wi in 0..g_lsp_sym_names.size
+    if g_lsp_sym_names[wi] == word
+      # Found in workspace — load its AST and format hover
+      var ws_uri = g_lsp_sym_uris[wi]
+      var ws_store = 0
+      var ws_root = 0
+      for wsi in 0..g_lsp_ws_uris.size
+        if g_lsp_ws_uris[wsi] == ws_uri
+          ws_store = g_lsp_ws_stores[wsi]
+          ws_root = g_lsp_ws_roots[wsi]
+          break
+        end
+      end
+      if ws_store != 0 and ws_root != 0
+        var ws_hover = _lsp_find_hover_in_ast(ws_store, ws_root, word)
+        if str_byte_len(ws_hover) > 0
+          _lsp_send_hover(id, ws_hover)
+          return
+        end
+      end
+      # Fallback: show name and source file
+      var short_path = ws_uri
+      if str_starts_with(short_path, "file://")
+        short_path = str_byte_slice(short_path, 7, str_byte_len(short_path))
+      end
+      _lsp_send_hover(id, "```quartz\n#{word}\n```\n\nDefined in `#{short_path}`")
+      return
+    end
+  end
+
+  lsp_send(_lsp_null_response(id))
+end
+
+def _lsp_send_location(id: Int, loc_uri: String, loc_line: Int, loc_col: Int, name_len: Int): Void
+  var rsb = sb_new()
+  sb_append(rsb, "{\"uri\":\"")
+  sb_append(rsb, _lsp_json_escape(loc_uri))
+  sb_append(rsb, "\",\"range\":{\"start\":{\"line\":")
+  sb_append(rsb, str_from_int(loc_line))
+  sb_append(rsb, ",\"character\":")
+  sb_append(rsb, str_from_int(loc_col))
+  sb_append(rsb, "},\"end\":{\"line\":")
+  sb_append(rsb, str_from_int(loc_line))
+  sb_append(rsb, ",\"character\":")
+  sb_append(rsb, str_from_int(loc_col + name_len))
+  sb_append(rsb, "}}}")
+  var result = sb_to_string(rsb)
+  sb_free(rsb)
+  lsp_send(_lsp_response(id, result))
+end
+
+def _lsp_handle_definition(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  var pos_obj = lsp_json_get_obj(params, "position")
+  var line = lsp_json_get_int(pos_obj, "line")
+  var col = lsp_json_get_int(pos_obj, "character")
+
+  var source = _lsp_doc_get(uri)
+  if str_byte_len(source) == 0
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+
+  var word = _lsp_word_at(source, line, col)
+  if str_byte_len(word) == 0
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+
+  # Search cached AST for the definition in current file
+  var store = _lsp_ast_cache_get_store(uri)
+  var root = _lsp_ast_cache_get_root(uri)
+  if store != 0 and root != 0
+    var children = ast::ast_get_children(store, root)
+    if children != 0
+      var count = vec_size(children)
+      for i in 0..count
+        var child = vec_get(children, i)
+        if child == 0
+          continue
+        end
+        var kind = ast::ast_get_kind(store, child)
+        var def_name = ""
+        if kind == node_constants::NODE_FUNCTION or kind == node_constants::NODE_STRUCT_DEF or kind == node_constants::NODE_ENUM_DEF or kind == node_constants::NODE_TRAIT_DEF
+          def_name = ast::ast_get_str1(store, child)
+        end
+        if str_byte_len(def_name) > 0 and def_name == word
+          var def_line = ast::ast_get_line(store, child) - 1
+          var def_col = ast::ast_get_col(store, child) - 1
+          if def_line < 0
+            def_line = 0
+          end
+          if def_col < 0
+            def_col = 0
+          end
+          _lsp_send_location(id, uri, def_line, def_col, str_byte_len(def_name))
+          return
+        end
+      end
+    end
+  end
+
+  # Cross-file: search workspace symbol index
+  for si in 0..g_lsp_sym_names.size
+    if g_lsp_sym_names[si] == word
+      var def_line = g_lsp_sym_lines[si] - 1
+      var def_col = g_lsp_sym_cols[si] - 1
+      if def_line < 0
+        def_line = 0
+      end
+      if def_col < 0
+        def_col = 0
+      end
+      _lsp_send_location(id, g_lsp_sym_uris[si], def_line, def_col, str_byte_len(word))
+      return
+    end
+  end
+
+  lsp_send(_lsp_null_response(id))
+end
+
+# ============================================================================
+# Completion
+# ============================================================================
+
+# LSP CompletionItemKind constants
+const LSP_CIK_FUNCTION = 3
+const LSP_CIK_FIELD = 5
+const LSP_CIK_VARIABLE = 6
+const LSP_CIK_CLASS = 7
+const LSP_CIK_ENUM = 13
+const LSP_CIK_KEYWORD = 14
+const LSP_CIK_STRUCT = 22
+const LSP_CIK_ENUM_MEMBER = 20
+
+## Append a completion item to the StringBuilder.
+def _lsp_append_completion(sb: StringBuilder, label: String, kind: Int, detail: String, need_comma: Int): Int
+  if need_comma == 1
+    sb.append(",")
+  end
+  sb.append("{\"label\":\"")
+  sb.append(_lsp_json_escape(label))
+  sb.append("\",\"kind\":")
+  sb.append(str_from_int(kind))
+  if str_byte_len(detail) > 0
+    sb.append(",\"detail\":\"")
+    sb.append(_lsp_json_escape(detail))
+    sb.append("\"")
+  end
+  sb.append("}")
+  return 1
+end
+
+## Collect local scope bindings (params + let/var) visible at target_line in the
+## enclosing function. Walks function body collecting NODE_PARAM, NODE_LET,
+## NODE_GLOBAL_VAR, and NODE_FOR variable bindings before the target line.
+def _lsp_collect_scope_bindings(store: Int, root: Int, target_line: Int, names: Vec<String>, type_anns: Vec<String>): Void
+  if store == 0 or root == 0
+    return
+  end
+  var children = ast::ast_get_children(store, root)
+  if children == 0
+    return
+  end
+  var count = vec_size(children)
+  for i in 0..count
+    var child = vec_get(children, i)
+    if child == 0
+      continue
+    end
+    var kind = ast::ast_get_kind(store, child)
+    if kind == node_constants::NODE_FUNCTION
+      var fn_line = ast::ast_get_line(store, child)
+      if target_line >= fn_line
+        # Collect parameters
+        var params_vec = ast::ast_get_left(store, child)
+        if params_vec != 0
+          var pc = vec_size(params_vec)
+          for pi in 0..pc
+            var ph = vec_get(params_vec, pi)
+            if ph != 0
+              var pname = ast::ast_get_str1(store, ph)
+              var ptype = ast::ast_get_str2(store, ph)
+              if str_byte_len(pname) > 0
+                names.push(pname)
+                type_anns.push(ptype)
+              end
+            end
+          end
+        end
+        # Walk function body for let/var/for bindings before target_line
+        var body = ast::ast_get_right(store, child)
+        if body != 0
+          _lsp_collect_body_bindings(store, body, target_line, names, type_anns)
+        end
+      end
+    end
+  end
+end
+
+## Recursively collect let/var/for bindings from a body node before target_line.
+def _lsp_collect_body_bindings(store: Int, node: Int, target_line: Int, names: Vec<String>, type_anns: Vec<String>): Void
+  if node == 0
+    return
+  end
+  var kind = ast::ast_get_kind(store, node)
+  var node_line = ast::ast_get_line(store, node)
+
+  # Collect let/var bindings before target line
+  if kind == node_constants::NODE_LET or kind == node_constants::NODE_GLOBAL_VAR
+    if node_line <= target_line
+      var vname = ast::ast_get_str1(store, node)
+      var vtype = ast::ast_get_str2(store, node)
+      if str_byte_len(vname) > 0
+        names.push(vname)
+        type_anns.push(vtype)
+      end
+    end
+  end
+
+  # Collect for-loop variable
+  if kind == node_constants::NODE_FOR
+    if node_line <= target_line
+      var fname = ast::ast_get_str1(store, node)
+      if str_byte_len(fname) > 0
+        names.push(fname)
+        type_anns.push("Int")
+      end
+    end
+  end
+
+  # Skip recursing into nested functions/lambdas (different scope)
+  if kind == node_constants::NODE_FUNCTION or kind == node_constants::NODE_LAMBDA
+    return
+  end
+
+  # Recurse into children
+  var children = ast::ast_get_children(store, node)
+  if children != 0
+    var cc = vec_size(children)
+    for ci in 0..cc
+      _lsp_collect_body_bindings(store, vec_get(children, ci), target_line, names, type_anns)
+    end
+  end
+  # Recurse into left/right (statement nodes like if/while/for have bodies in right)
+  var left = ast::ast_get_left(store, node)
+  if left != 0
+    _lsp_collect_body_bindings(store, left, target_line, names, type_anns)
+  end
+  var right = ast::ast_get_right(store, node)
+  if right != 0
+    _lsp_collect_body_bindings(store, right, target_line, names, type_anns)
+  end
+  # if-else: else branch
+  if kind == node_constants::NODE_IF
+    var else_branch = ast::ast_get_extra(store, node)
+    if else_branch != 0
+      _lsp_collect_body_bindings(store, else_branch, target_line, names, type_anns)
+    end
+  end
+end
+
+## Look up struct field names from a struct name in workspace ASTs.
+## Returns field names and type annotations.
+def _lsp_lookup_struct_fields(struct_name: String, field_names: Vec<String>, field_types: Vec<String>): Void
+  for wi in 0..g_lsp_ws_uris.size
+    var ws_store = g_lsp_ws_stores[wi]
+    var ws_root = g_lsp_ws_roots[wi]
+    if ws_store == 0 or ws_root == 0
+      continue
+    end
+    var children = ast::ast_get_children(ws_store, ws_root)
+    if children == 0
+      continue
+    end
+    var cc = vec_size(children)
+    for ci in 0..cc
+      var child = vec_get(children, ci)
+      if child == 0
+        continue
+      end
+      if ast::ast_get_kind(ws_store, child) == node_constants::NODE_STRUCT_DEF
+        var sname = ast::ast_get_str1(ws_store, child)
+        if sname == struct_name
+          var fields = ast::ast_get_children(ws_store, child)
+          if fields != 0
+            var fc = vec_size(fields)
+            for fi in 0..fc
+              var fh = vec_get(fields, fi)
+              if fh != 0 and ast::ast_get_kind(ws_store, fh) == node_constants::NODE_FIELD_DEF
+                field_names.push(ast::ast_get_str1(ws_store, fh))
+                field_types.push(ast::ast_get_str2(ws_store, fh))
+              end
+            end
+          end
+          return
+        end
+      end
+    end
+  end
+  # Also check current file AST caches
+  for ai in 0..g_lsp_ast_uris.size
+    var as_store = g_lsp_ast_stores[ai]
+    var as_root = g_lsp_ast_roots[ai]
+    if as_store == 0 or as_root == 0
+      continue
+    end
+    var children = ast::ast_get_children(as_store, as_root)
+    if children == 0
+      continue
+    end
+    var cc = vec_size(children)
+    for ci in 0..cc
+      var child = vec_get(children, ci)
+      if child == 0
+        continue
+      end
+      if ast::ast_get_kind(as_store, child) == node_constants::NODE_STRUCT_DEF
+        if ast::ast_get_str1(as_store, child) == struct_name
+          var fields = ast::ast_get_children(as_store, child)
+          if fields != 0
+            var fc = vec_size(fields)
+            for fi in 0..fc
+              var fh = vec_get(fields, fi)
+              if fh != 0 and ast::ast_get_kind(as_store, fh) == node_constants::NODE_FIELD_DEF
+                field_names.push(ast::ast_get_str1(as_store, fh))
+                field_types.push(ast::ast_get_str2(as_store, fh))
+              end
+            end
+          end
+          return
+        end
+      end
+    end
+  end
+end
+
+def _lsp_handle_completion(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  var pos_obj = lsp_json_get_obj(params, "position")
+  var cursor_line = lsp_json_get_int(pos_obj, "line") + 1
+  var cursor_col = lsp_json_get_int(pos_obj, "character")
+  var store = _lsp_ast_cache_get_store(uri)
+  var root = _lsp_ast_cache_get_root(uri)
+
+  # Detect dot-trigger: check character before cursor
+  var source = _lsp_doc_get(uri)
+  var is_dot = 0
+  if str_byte_len(source) > 0 and cursor_col > 0
+    # Find byte offset of cursor
+    var slen = str_byte_len(source)
+    var cur_line = 0
+    var line_start = 0
+    var spos = 0
+    while spos < slen and cur_line < cursor_line - 1
+      if str_byte_at(source, spos) == '\n'
+        cur_line += 1
+        line_start = spos + 1
+      end
+      spos += 1
+    end
+    var dot_pos = line_start + cursor_col - 1
+    if dot_pos >= 0 and dot_pos < slen and str_byte_at(source, dot_pos) == '.'
+      is_dot = 1
+    end
+  end
+
+  var sb = sb_new()
+  sb.append("{\"isIncomplete\":false,\"items\":[")
+  var has_item = 0
+
+  if is_dot == 1
+    # Dot-completion: find identifier before "." and look up struct fields
+    var ident_before_dot = ""
+    if str_byte_len(source) > 0
+      # Scan backwards from dot to find the identifier
+      var slen = str_byte_len(source)
+      var cur_line = 0
+      var line_start = 0
+      var spos = 0
+      while spos < slen and cur_line < cursor_line - 1
+        if str_byte_at(source, spos) == '\n'
+          cur_line += 1
+          line_start = spos + 1
+        end
+        spos += 1
+      end
+      var dot_byte = line_start + cursor_col - 1
+      if dot_byte > 0
+        var id_end = dot_byte
+        var id_start = id_end - 1
+        while id_start >= line_start and _lsp_is_ident_char(str_byte_at(source, id_start))
+          id_start -= 1
+        end
+        id_start += 1
+        if id_start < id_end
+          ident_before_dot = str_byte_slice(source, id_start, id_end)
+        end
+      end
+    end
+
+    if str_byte_len(ident_before_dot) > 0
+      # Look up the type of this identifier in scope bindings
+      var scope_names = vec_new<String>()
+      var scope_types = vec_new<String>()
+      _lsp_collect_scope_bindings(store, root, cursor_line, scope_names, scope_types)
+      var type_ann = ""
+      for si in 0..scope_names.size
+        if scope_names[si] == ident_before_dot
+          type_ann = scope_types[si]
+        end
+      end
+      # Look up struct fields for this type
+      if str_byte_len(type_ann) > 0
+        var field_names = vec_new<String>()
+        var field_types = vec_new<String>()
+        _lsp_lookup_struct_fields(type_ann, field_names, field_types)
+        for fi in 0..field_names.size
+          var detail = ""
+          if str_byte_len(field_types[fi]) > 0
+            detail = field_types[fi]
+          end
+          has_item = _lsp_append_completion(sb, field_names[fi], LSP_CIK_FIELD, detail, has_item)
+        end
+      end
+    end
+  else
+    # Normal completion: keywords + definitions + locals + workspace symbols
+
+    # Keywords
+    var kw = vec_new<String>()
+    kw.push("def")
+    kw.push("var")
+    kw.push("const")
+    kw.push("if")
+    kw.push("elsif")
+    kw.push("else")
+    kw.push("end")
+    kw.push("for")
+    kw.push("while")
+    kw.push("match")
+    kw.push("return")
+    kw.push("import")
+    kw.push("struct")
+    kw.push("enum")
+    kw.push("trait")
+    kw.push("impl")
+    kw.push("true")
+    kw.push("false")
+    kw.push("nil")
+    kw.push("and")
+    kw.push("or")
+    kw.push("not")
+    kw.push("in")
+    kw.push("break")
+    kw.push("continue")
+    for ki in 0..kw.size
+      has_item = _lsp_append_completion(sb, kw[ki], LSP_CIK_KEYWORD, "", has_item)
+    end
+
+    # Local scope bindings (params + let/var before cursor)
+    var scope_names = vec_new<String>()
+    var scope_types = vec_new<String>()
+    _lsp_collect_scope_bindings(store, root, cursor_line, scope_names, scope_types)
+    for si in 0..scope_names.size
+      var detail = ""
+      if str_byte_len(scope_types[si]) > 0
+        detail = scope_types[si]
+      end
+      has_item = _lsp_append_completion(sb, scope_names[si], LSP_CIK_VARIABLE, detail, has_item)
+    end
+
+    # Definitions from current file's AST
+    if store != 0 and root != 0
+      var children = ast::ast_get_children(store, root)
+      if children != 0
+        var count = vec_size(children)
+        for i in 0..count
+          var child = vec_get(children, i)
+          if child == 0
+            continue
+          end
+          var kind = ast::ast_get_kind(store, child)
+          if kind == node_constants::NODE_FUNCTION
+            var fname = ast::ast_get_str1(store, child)
+            var ret_ann = ast::ast_get_str2(store, child)
+            var detail = ""
+            if str_byte_len(ret_ann) > 0
+              detail = "(): #{ret_ann}"
+            end
+            has_item = _lsp_append_completion(sb, fname, LSP_CIK_FUNCTION, detail, has_item)
+          elsif kind == node_constants::NODE_STRUCT_DEF
+            var sname = ast::ast_get_str1(store, child)
+            has_item = _lsp_append_completion(sb, sname, LSP_CIK_STRUCT, "struct", has_item)
+          elsif kind == node_constants::NODE_ENUM_DEF
+            var ename = ast::ast_get_str1(store, child)
+            has_item = _lsp_append_completion(sb, ename, LSP_CIK_ENUM, "enum", has_item)
+          elsif kind == node_constants::NODE_TRAIT_DEF
+            var tname = ast::ast_get_str1(store, child)
+            has_item = _lsp_append_completion(sb, tname, LSP_CIK_CLASS, "trait", has_item)
+          end
+        end
+      end
+    end
+
+    # Workspace symbols (deduplicate against current file)
+    for wi in 0..g_lsp_sym_names.size
+      if g_lsp_sym_uris[wi] != uri
+        var sym_name = g_lsp_sym_names[wi]
+        var sym_kind = g_lsp_sym_kinds[wi]
+        var cik = LSP_CIK_VARIABLE
+        if sym_kind == node_constants::NODE_FUNCTION
+          cik = LSP_CIK_FUNCTION
+        elsif sym_kind == node_constants::NODE_STRUCT_DEF
+          cik = LSP_CIK_STRUCT
+        elsif sym_kind == node_constants::NODE_ENUM_DEF
+          cik = LSP_CIK_ENUM
+        elsif sym_kind == node_constants::NODE_TRAIT_DEF
+          cik = LSP_CIK_CLASS
+        end
+        has_item = _lsp_append_completion(sb, sym_name, cik, "", has_item)
+      end
+    end
+  end
+
+  sb.append("]}")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+# ============================================================================
+# Document Symbols
+# ============================================================================
+
+# LSP SymbolKind constants
+const LSP_SK_FUNCTION = 12
+const LSP_SK_STRUCT = 23
+const LSP_SK_ENUM = 10
+const LSP_SK_INTERFACE = 11
+const LSP_SK_CONSTANT = 14
+
+def _lsp_handle_document_symbol(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  var store = _lsp_ast_cache_get_store(uri)
+  var root = _lsp_ast_cache_get_root(uri)
+
+  var sb = sb_new()
+  sb.append("[")
+  var has_item = 0
+
+  if store != 0 and root != 0
+    var children = ast::ast_get_children(store, root)
+    if children != 0
+      var count = vec_size(children)
+      for i in 0..count
+        var child = vec_get(children, i)
+        if child == 0
+          continue
+        end
+        var kind = ast::ast_get_kind(store, child)
+        var sym_name = ""
+        var sym_kind = 0
+        if kind == node_constants::NODE_FUNCTION
+          sym_name = ast::ast_get_str1(store, child)
+          sym_kind = LSP_SK_FUNCTION
+        elsif kind == node_constants::NODE_STRUCT_DEF
+          sym_name = ast::ast_get_str1(store, child)
+          sym_kind = LSP_SK_STRUCT
+        elsif kind == node_constants::NODE_ENUM_DEF
+          sym_name = ast::ast_get_str1(store, child)
+          sym_kind = LSP_SK_ENUM
+        elsif kind == node_constants::NODE_TRAIT_DEF
+          sym_name = ast::ast_get_str1(store, child)
+          sym_kind = LSP_SK_INTERFACE
+        end
+        if str_byte_len(sym_name) > 0 and sym_kind > 0
+          if has_item == 1
+            sb.append(",")
+          end
+          var sline = ast::ast_get_line(store, child) - 1
+          var scol = ast::ast_get_col(store, child) - 1
+          if sline < 0
+            sline = 0
+          end
+          if scol < 0
+            scol = 0
+          end
+          sb.append("{\"name\":\"")
+          sb.append(_lsp_json_escape(sym_name))
+          sb.append("\",\"kind\":")
+          sb.append(str_from_int(sym_kind))
+          sb.append(",\"range\":{\"start\":{\"line\":")
+          sb.append(str_from_int(sline))
+          sb.append(",\"character\":")
+          sb.append(str_from_int(scol))
+          sb.append("},\"end\":{\"line\":")
+          sb.append(str_from_int(sline))
+          sb.append(",\"character\":")
+          sb.append(str_from_int(scol + str_byte_len(sym_name)))
+          sb.append("}},\"selectionRange\":{\"start\":{\"line\":")
+          sb.append(str_from_int(sline))
+          sb.append(",\"character\":")
+          sb.append(str_from_int(scol))
+          sb.append("},\"end\":{\"line\":")
+          sb.append(str_from_int(sline))
+          sb.append(",\"character\":")
+          sb.append(str_from_int(scol + str_byte_len(sym_name)))
+          sb.append("}}}")
+          has_item = 1
+        end
+      end
+    end
+  end
+
+  sb.append("]")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+# ============================================================================
+# Signature Help
+# ============================================================================
+
+## Scan backwards from cursor position to find the function name being called
+## and count commas to determine the active parameter index.
+## Returns (func_name, active_param) packed as "name|index", or "" if not in a call.
+def _lsp_find_call_context(source: String, line: Int, col: Int): String
+  # Find byte offset of cursor
+  var src_len = str_byte_len(source)
+  var cur_line = 0
+  var line_start = 0
+  var pos = 0
+  while pos < src_len and cur_line < line
+    if str_byte_at(source, pos) == '\n'
+      cur_line += 1
+      line_start = pos + 1
+    end
+    pos += 1
+  end
+  var cursor = line_start + col
+  if cursor > src_len
+    cursor = src_len
+  end
+
+  # Scan backwards to find matching '(' counting depth
+  var depth = 0
+  var comma_count = 0
+  var scan = cursor - 1
+  while scan >= 0
+    var ch = str_byte_at(source, scan)
+    if ch == ')'
+      depth += 1
+    elsif ch == '('
+      if depth == 0
+        # Found our opening paren — scan left for function name
+        var name_end = scan
+        var name_start = scan - 1
+        while name_start >= 0 and _lsp_is_ident_char(str_byte_at(source, name_start))
+          name_start -= 1
+        end
+        name_start += 1
+        if name_start < name_end
+          var func_name = str_byte_slice(source, name_start, name_end)
+          return "#{func_name}|#{comma_count}"
+        end
+        return ""
+      end
+      depth -= 1
+    elsif ch == ',' and depth == 0
+      comma_count += 1
+    elsif ch == '\n'
+      # Don't scan past the previous line for safety
+      # Actually, function calls can span lines, so keep going
+    end
+    scan -= 1
+  end
+  return ""
+end
+
+## Build a SignatureHelp response for a function AST node.
+def _lsp_build_signature_help(store: Int, node: Int, active_param: Int): String
+  var name = ast::ast_get_str1(store, node)
+  var ret_ann = ast::ast_get_str2(store, node)
+  var params_vec = ast::ast_get_left(store, node)
+
+  # Build the full signature label
+  var label_sb = sb_new()
+  sb_append(label_sb, name)
+  sb_append(label_sb, "(")
+
+  # Build parameter labels
+  var param_labels_sb = sb_new()
+  var param_count = 0
+  if params_vec != 0
+    param_count = vec_size(params_vec)
+    for pi in 0..param_count
+      if pi > 0
+        sb_append(label_sb, ", ")
+        sb_append(param_labels_sb, ",")
+      end
+      var ph = vec_get(params_vec, pi)
+      var pname = ast::ast_get_str1(store, ph)
+      var ptype = ast::ast_get_str2(store, ph)
+      var plabel = pname
+      if str_byte_len(ptype) > 0
+        plabel = "#{pname}: #{ptype}"
+      end
+      sb_append(label_sb, plabel)
+      sb_append(param_labels_sb, "\"")
+      sb_append(param_labels_sb, _lsp_json_escape(plabel))
+      sb_append(param_labels_sb, "\"")
+    end
+  end
+
+  sb_append(label_sb, ")")
+  if str_byte_len(ret_ann) > 0
+    sb_append(label_sb, ": ")
+    sb_append(label_sb, ret_ann)
+  end
+
+  var label = sb_to_string(label_sb)
+  sb_free(label_sb)
+  var param_labels = sb_to_string(param_labels_sb)
+  sb_free(param_labels_sb)
+
+  # Clamp active param
+  if active_param >= param_count
+    active_param = param_count - 1
+  end
+  if active_param < 0
+    active_param = 0
+  end
+
+  # Build parameters array with label strings
+  var params_arr_sb = sb_new()
+  sb_append(params_arr_sb, "[")
+  var plabels = str_split(param_labels, ",")
+  for pi in 0..plabels.size
+    if pi > 0
+      sb_append(params_arr_sb, ",")
+    end
+    sb_append(params_arr_sb, "{\"label\":")
+    sb_append(params_arr_sb, plabels[pi])
+    sb_append(params_arr_sb, "}")
+  end
+  sb_append(params_arr_sb, "]")
+  var params_arr = sb_to_string(params_arr_sb)
+  sb_free(params_arr_sb)
+
+  var doc = ast::ast_get_doc(store, node)
+  var rsb = sb_new()
+  sb_append(rsb, "{\"signatures\":[{\"label\":\"")
+  sb_append(rsb, _lsp_json_escape(label))
+  sb_append(rsb, "\",\"parameters\":")
+  sb_append(rsb, params_arr)
+  if str_byte_len(doc) > 0
+    sb_append(rsb, ",\"documentation\":{\"kind\":\"markdown\",\"value\":\"")
+    sb_append(rsb, _lsp_json_escape(doc))
+    sb_append(rsb, "\"}")
+  end
+  sb_append(rsb, "}],\"activeSignature\":0,\"activeParameter\":")
+  sb_append(rsb, str_from_int(active_param))
+  sb_append(rsb, "}")
+  var result = sb_to_string(rsb)
+  sb_free(rsb)
+  return result
+end
+
+def _lsp_handle_signature_help(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  var pos_obj = lsp_json_get_obj(params, "position")
+  var line = lsp_json_get_int(pos_obj, "line")
+  var col = lsp_json_get_int(pos_obj, "character")
+
+  var source = _lsp_doc_get(uri)
+  if str_byte_len(source) == 0
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+
+  var ctx = _lsp_find_call_context(source, line, col)
+  if str_byte_len(ctx) == 0
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+
+  # Parse "func_name|active_param"
+  var pipe_pos = __char_index(ctx, '|')
+  if pipe_pos < 0
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+  var func_name = str_byte_slice(ctx, 0, pipe_pos)
+  var active_param = str_to_int(str_byte_slice(ctx, pipe_pos + 1, str_byte_len(ctx)))
+
+  # Look up function in AST
+  var store = _lsp_ast_cache_get_store(uri)
+  var root = _lsp_ast_cache_get_root(uri)
+  if store == 0 or root == 0
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+
+  var children = ast::ast_get_children(store, root)
+  if children == 0
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+
+  var count = vec_size(children)
+  for i in 0..count
+    var child = vec_get(children, i)
+    if child == 0
+      continue
+    end
+    var kind = ast::ast_get_kind(store, child)
+    if kind == node_constants::NODE_FUNCTION
+      var fname = ast::ast_get_str1(store, child)
+      if fname == func_name
+        var result = _lsp_build_signature_help(store, child, active_param)
+        lsp_send(_lsp_response(id, result))
+        return
+      end
+    end
+  end
+
+  lsp_send(_lsp_null_response(id))
+end
+
+# ============================================================================
+# Formatting
+# ============================================================================
+
+## Format a Quartz source string by spawning `quartz --format` as a subprocess.
+## Returns the formatted source, or "" on failure.
+def _lsp_format_source(source: String): String
+  # Write source to a temp file, run formatter, read result
+  var tmp_in = "/tmp/_quartz_lsp_fmt_in.qz"
+  var tmp_out = "/tmp/_quartz_lsp_fmt_out.qz"
+  fio_write(tmp_in, source)
+  # Use the current binary's --format flag
+  # The formatter reads from stdin when given --format
+  var bin_path = argv(0)
+  var cmd = "#{bin_path} --format < #{tmp_in} > #{tmp_out} 2>/dev/null"
+  var raw = system(cmd)
+  # Check exit status
+  var signaled = band(raw, 127)
+  var exit_code = band(shr(raw, 8), 255)
+  if signaled != 0 or exit_code != 0
+    file_delete(tmp_in)
+    file_delete(tmp_out)
+    return ""
+  end
+  var result = fio_read(tmp_out)
+  file_delete(tmp_in)
+  file_delete(tmp_out)
+  return result
+end
+
+def _lsp_handle_formatting(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+
+  var source = _lsp_doc_get(uri)
+  if str_byte_len(source) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  var formatted = _lsp_format_source(source)
+  if str_byte_len(formatted) == 0 or formatted == source
+    # Format failed or no changes
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  # Count lines in source for the full-document range
+  var line_count = 0
+  var src_len = str_byte_len(source)
+  for si in 0..src_len
+    if str_byte_at(source, si) == '\n'
+      line_count += 1
+    end
+  end
+
+  # Return a single TextEdit replacing the entire document
+  var rsb = sb_new()
+  sb_append(rsb, "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":")
+  sb_append(rsb, str_from_int(line_count + 1))
+  sb_append(rsb, ",\"character\":0}},\"newText\":\"")
+  sb_append(rsb, _lsp_json_escape(formatted))
+  sb_append(rsb, "\"}]")
+  var result = sb_to_string(rsb)
+  sb_free(rsb)
+  lsp_send(_lsp_response(id, result))
+end
+
+# ============================================================================
+# Find References
+# ============================================================================
+
+## Recursively walk an AST subtree collecting all positions where `name` appears
+## as an identifier reference. Appends Location objects to `sb`.
+def _lsp_collect_refs_in_node(store: Int, node: Int, name: String, uri: String, sb: StringBuilder, has_item: Int): Int
+  if node == 0
+    return has_item
+  end
+  var kind = ast::ast_get_kind(store, node)
+
+  # Check if this node references the name
+  var node_name = ast::ast_get_str1(store, node)
+  if str_byte_len(node_name) > 0 and node_name == name
+    var rline = ast::ast_get_line(store, node) - 1
+    var rcol = ast::ast_get_col(store, node) - 1
+    if rline < 0
+      rline = 0
+    end
+    if rcol < 0
+      rcol = 0
+    end
+    if has_item == 1
+      sb.append(",")
+    end
+    sb.append("{\"uri\":\"")
+    sb.append(_lsp_json_escape(uri))
+    sb.append("\",\"range\":{\"start\":{\"line\":")
+    sb.append(str_from_int(rline))
+    sb.append(",\"character\":")
+    sb.append(str_from_int(rcol))
+    sb.append("},\"end\":{\"line\":")
+    sb.append(str_from_int(rline))
+    sb.append(",\"character\":")
+    sb.append(str_from_int(rcol + str_byte_len(name)))
+    sb.append("}}}")
+    has_item = 1
+  end
+
+  # Recurse into children
+  var children = ast::ast_get_children(store, node)
+  if children != 0
+    var count = vec_size(children)
+    for i in 0..count
+      var child = vec_get(children, i)
+      has_item = _lsp_collect_refs_in_node(store, child, name, uri, sb, has_item)
+    end
+  end
+
+  # Recurse into left/right subtrees
+  var left = ast::ast_get_left(store, node)
+  if left != 0
+    # Left might be a Vec of params or a single node
+    # For functions, left is the param vector; for binary ops, it's a node
+    if kind == node_constants::NODE_FUNCTION
+      # left is params vector — iterate
+      var pcount = vec_size(left)
+      for pi in 0..pcount
+        var ph = vec_get(left, pi)
+        has_item = _lsp_collect_refs_in_node(store, ph, name, uri, sb, has_item)
+      end
+    else
+      has_item = _lsp_collect_refs_in_node(store, left, name, uri, sb, has_item)
+    end
+  end
+
+  var right = ast::ast_get_right(store, node)
+  if right != 0
+    has_item = _lsp_collect_refs_in_node(store, right, name, uri, sb, has_item)
+  end
+
+  return has_item
+end
+
+def _lsp_handle_references(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  var pos_obj = lsp_json_get_obj(params, "position")
+  var line = lsp_json_get_int(pos_obj, "line")
+  var col = lsp_json_get_int(pos_obj, "character")
+
+  var source = _lsp_doc_get(uri)
+  if str_byte_len(source) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  var word = _lsp_word_at(source, line, col)
+  if str_byte_len(word) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  var store = _lsp_ast_cache_get_store(uri)
+  var root = _lsp_ast_cache_get_root(uri)
+  if store == 0 or root == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  var sb = sb_new()
+  sb.append("[")
+  var has_item = _lsp_collect_refs_in_node(store, root, word, uri, sb, 0)
+  sb.append("]")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+# ============================================================================
+# Deep AST Walker — generic recursive traversal collecting name occurrences
+#
+# Correctly handles all node kinds' field semantics:
+#   NODE_FUNCTION/LAMBDA: left=params Vec, right=body, children=encoding
+#   NODE_CALL: left=callee, children=args Vec
+#   NODE_IF: left=cond, right=then, extras=else
+#   NODE_WHILE/FOR: left=cond/iter, right=body
+#   NODE_MATCH: left=expr, children=arms Vec
+#   NODE_MATCH_ARM: left=pattern, right=body, extras=guard
+#   NODE_BLOCK/PROGRAM: children=statements Vec
+#   NODE_IMPL_BLOCK/TRAIT_DEF: children=methods Vec
+#   Default: recurse left, right, children (if looks like Vec)
+# ============================================================================
+
+## Walk an AST subtree collecting all identifier occurrences matching `target`.
+## Results appended to parallel Vecs: (names, lines, cols, kinds).
+def _lsp_deep_walk(store: Int, node: Int, target: String, hit_lines: Vec<Int>, hit_cols: Vec<Int>, hit_kinds: Vec<Int>): Void
+  if node == 0
+    return
+  end
+  var kind = ast::ast_get_kind(store, node)
+  var nline = ast::ast_get_line(store, node)
+  var ncol = ast::ast_get_col(store, node)
+
+  # Check if this node's name matches the target
+  var node_name = ast::ast_get_str1(store, node)
+  if str_byte_len(node_name) > 0 and node_name == target
+    hit_lines.push(nline)
+    hit_cols.push(ncol)
+    hit_kinds.push(kind)
+  end
+
+  # NODE_FUNCTION: left=params Vec, right=body, children=naked/guard (NOT a Vec)
+  if kind == node_constants::NODE_FUNCTION
+    var params_vec = ast::ast_get_left(store, node)
+    if params_vec != 0
+      var pc = vec_size(params_vec)
+      for pi in 0..pc
+        _lsp_deep_walk(store, vec_get(params_vec, pi), target, hit_lines, hit_cols, hit_kinds)
+      end
+    end
+    var body = ast::ast_get_right(store, node)
+    if body != 0
+      _lsp_deep_walk(store, body, target, hit_lines, hit_cols, hit_kinds)
+    end
+    return
+  end
+
+  # NODE_LAMBDA: left=params Vec, right=body, children=0
+  if kind == node_constants::NODE_LAMBDA
+    var params_vec = ast::ast_get_left(store, node)
+    if params_vec != 0
+      var pc = vec_size(params_vec)
+      for pi in 0..pc
+        _lsp_deep_walk(store, vec_get(params_vec, pi), target, hit_lines, hit_cols, hit_kinds)
+      end
+    end
+    var body = ast::ast_get_right(store, node)
+    if body != 0
+      _lsp_deep_walk(store, body, target, hit_lines, hit_cols, hit_kinds)
+    end
+    return
+  end
+
+  # NODE_CALL: left=callee node, children=args Vec
+  if kind == node_constants::NODE_CALL
+    var callee = ast::ast_get_left(store, node)
+    if callee != 0
+      _lsp_deep_walk(store, callee, target, hit_lines, hit_cols, hit_kinds)
+    end
+    var args = ast::ast_get_children(store, node)
+    if args != 0
+      var ac = vec_size(args)
+      for ai in 0..ac
+        _lsp_deep_walk(store, vec_get(args, ai), target, hit_lines, hit_cols, hit_kinds)
+      end
+    end
+    return
+  end
+
+  # NODE_IF: left=cond, right=then, extras=else
+  if kind == node_constants::NODE_IF
+    var cond = ast::ast_get_left(store, node)
+    if cond != 0
+      _lsp_deep_walk(store, cond, target, hit_lines, hit_cols, hit_kinds)
+    end
+    var then_b = ast::ast_get_right(store, node)
+    if then_b != 0
+      _lsp_deep_walk(store, then_b, target, hit_lines, hit_cols, hit_kinds)
+    end
+    var else_b = ast::ast_get_extra(store, node)
+    if else_b != 0
+      _lsp_deep_walk(store, else_b, target, hit_lines, hit_cols, hit_kinds)
+    end
+    return
+  end
+
+  # NODE_MATCH: left=expr, children=arms Vec
+  if kind == node_constants::NODE_MATCH
+    var expr = ast::ast_get_left(store, node)
+    if expr != 0
+      _lsp_deep_walk(store, expr, target, hit_lines, hit_cols, hit_kinds)
+    end
+    var arms = ast::ast_get_children(store, node)
+    if arms != 0
+      var ac = vec_size(arms)
+      for ai in 0..ac
+        _lsp_deep_walk(store, vec_get(arms, ai), target, hit_lines, hit_cols, hit_kinds)
+      end
+    end
+    return
+  end
+
+  # NODE_MATCH_ARM: left=pattern, right=body, extras=guard
+  if kind == node_constants::NODE_MATCH_ARM
+    var pat = ast::ast_get_left(store, node)
+    if pat != 0
+      _lsp_deep_walk(store, pat, target, hit_lines, hit_cols, hit_kinds)
+    end
+    var body = ast::ast_get_right(store, node)
+    if body != 0
+      _lsp_deep_walk(store, body, target, hit_lines, hit_cols, hit_kinds)
+    end
+    var guard = ast::ast_get_extra(store, node)
+    if guard != 0
+      _lsp_deep_walk(store, guard, target, hit_lines, hit_cols, hit_kinds)
+    end
+    return
+  end
+
+  # Default: recurse left, right, children
+  var children = ast::ast_get_children(store, node)
+  if children != 0
+    var cc = vec_size(children)
+    for ci in 0..cc
+      _lsp_deep_walk(store, vec_get(children, ci), target, hit_lines, hit_cols, hit_kinds)
+    end
+  end
+  var left = ast::ast_get_left(store, node)
+  if left != 0
+    _lsp_deep_walk(store, left, target, hit_lines, hit_cols, hit_kinds)
+  end
+  var right = ast::ast_get_right(store, node)
+  if right != 0
+    _lsp_deep_walk(store, right, target, hit_lines, hit_cols, hit_kinds)
+  end
+end
+
+## Walk AST collecting ALL name occurrences (not filtered by target).
+## Used for workspace symbols — collects definitions only.
+def _lsp_collect_definitions(store: Int, node: Int, names: Vec<String>, kinds: Vec<Int>, def_lines: Vec<Int>, def_cols: Vec<Int>): Void
+  if node == 0
+    return
+  end
+  var kind = ast::ast_get_kind(store, node)
+  var name = ast::ast_get_str1(store, node)
+
+  # Collect top-level definitions
+  if kind == node_constants::NODE_FUNCTION and str_byte_len(name) > 0
+    names.push(name)
+    kinds.push(kind)
+    def_lines.push(ast::ast_get_line(store, node))
+    def_cols.push(ast::ast_get_col(store, node))
+  elsif kind == node_constants::NODE_STRUCT_DEF and str_byte_len(name) > 0
+    names.push(name)
+    kinds.push(kind)
+    def_lines.push(ast::ast_get_line(store, node))
+    def_cols.push(ast::ast_get_col(store, node))
+  elsif kind == node_constants::NODE_ENUM_DEF and str_byte_len(name) > 0
+    names.push(name)
+    kinds.push(kind)
+    def_lines.push(ast::ast_get_line(store, node))
+    def_cols.push(ast::ast_get_col(store, node))
+  elsif kind == node_constants::NODE_TRAIT_DEF and str_byte_len(name) > 0
+    names.push(name)
+    kinds.push(kind)
+    def_lines.push(ast::ast_get_line(store, node))
+    def_cols.push(ast::ast_get_col(store, node))
+  elsif kind == node_constants::NODE_CONST_DECL and str_byte_len(name) > 0
+    names.push(name)
+    kinds.push(kind)
+    def_lines.push(ast::ast_get_line(store, node))
+    def_cols.push(ast::ast_get_col(store, node))
+  elsif kind == node_constants::NODE_GLOBAL_VAR and str_byte_len(name) > 0
+    names.push(name)
+    kinds.push(kind)
+    def_lines.push(ast::ast_get_line(store, node))
+    def_cols.push(ast::ast_get_col(store, node))
+  end
+
+  # Recurse into children for PROGRAM, BLOCK, IMPL_BLOCK, TRAIT_DEF
+  var children = ast::ast_get_children(store, node)
+  if children != 0
+    var cc = vec_size(children)
+    for ci in 0..cc
+      _lsp_collect_definitions(store, vec_get(children, ci), names, kinds, def_lines, def_cols)
+    end
+  end
+end
+
+## Find the enclosing function for a given position.
+## Returns the function name, or "" if not inside a function.
+def _lsp_find_enclosing_function(store: Int, node: Int, target_line: Int, target_col: Int): String
+  if node == 0
+    return ""
+  end
+  var kind = ast::ast_get_kind(store, node)
+
+  # For PROGRAM/BLOCK: check children
+  if kind == node_constants::NODE_PROGRAM or kind == node_constants::NODE_BLOCK
+    var children = ast::ast_get_children(store, node)
+    if children != 0
+      var cc = vec_size(children)
+      for ci in 0..cc
+        var result = _lsp_find_enclosing_function(store, vec_get(children, ci), target_line, target_col)
+        if str_byte_len(result) > 0
+          return result
+        end
+      end
+    end
+    return ""
+  end
+
+  # For FUNCTION: check if target is within this function's span
+  if kind == node_constants::NODE_FUNCTION
+    var fn_line = ast::ast_get_line(store, node)
+    # If target is at or after the function start, search its body
+    if target_line >= fn_line
+      var body = ast::ast_get_right(store, node)
+      if body != 0
+        # Check if target matches anything in the body (heuristic: assume function encloses)
+        var name = ast::ast_get_str1(store, node)
+        # Recurse into body to find more specific enclosing function (nested functions)
+        var inner = _lsp_find_enclosing_function(store, body, target_line, target_col)
+        if str_byte_len(inner) > 0
+          return inner
+        end
+        # Otherwise this function is the encloser
+        return name
+      end
+    end
+    return ""
+  end
+
+  # For IMPL_BLOCK/TRAIT_DEF: check methods
+  if kind == node_constants::NODE_IMPL_BLOCK or kind == node_constants::NODE_TRAIT_DEF
+    var methods = ast::ast_get_children(store, node)
+    if methods != 0
+      var mc = vec_size(methods)
+      for mi in 0..mc
+        var result = _lsp_find_enclosing_function(store, vec_get(methods, mi), target_line, target_col)
+        if str_byte_len(result) > 0
+          return result
+        end
+      end
+    end
+    return ""
+  end
+
+  return ""
+end
+
+# ============================================================================
+# Document Highlight (T4.4d)
+# ============================================================================
+
+# Highlight kinds
+const LSP_DH_TEXT = 1
+const LSP_DH_READ = 2
+const LSP_DH_WRITE = 3
+
+## Classify a node kind as a highlight kind (write vs read)
+def _lsp_highlight_kind(kind: Int): Int
+  if kind == node_constants::NODE_FUNCTION or kind == node_constants::NODE_STRUCT_DEF or kind == node_constants::NODE_ENUM_DEF or kind == node_constants::NODE_TRAIT_DEF
+    return LSP_DH_WRITE
+  end
+  if kind == node_constants::NODE_LET or kind == node_constants::NODE_PARAM or kind == node_constants::NODE_ASSIGN or kind == node_constants::NODE_FOR
+    return LSP_DH_WRITE
+  end
+  if kind == node_constants::NODE_IDENT or kind == node_constants::NODE_FIELD_ACCESS or kind == node_constants::NODE_CALL
+    return LSP_DH_READ
+  end
+  return LSP_DH_TEXT
+end
+
+def _lsp_handle_document_highlight(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  var pos_obj = lsp_json_get_obj(params, "position")
+  var line = lsp_json_get_int(pos_obj, "line")
+  var col = lsp_json_get_int(pos_obj, "character")
+
+  var source = _lsp_doc_get(uri)
+  if str_byte_len(source) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  var word = _lsp_word_at(source, line, col)
+  if str_byte_len(word) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  var store = _lsp_ast_cache_get_store(uri)
+  var root = _lsp_ast_cache_get_root(uri)
+  if store == 0 or root == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  # Walk AST collecting all positions where name matches
+  var hit_lines = vec_new<Int>()
+  var hit_cols = vec_new<Int>()
+  var hit_kinds = vec_new<Int>()
+  _lsp_deep_walk(store, root, word, hit_lines, hit_cols, hit_kinds)
+
+  var sb = sb_new()
+  sb.append("[")
+  var hc = hit_lines.size
+  for i in 0..hc
+    if i > 0
+      sb.append(",")
+    end
+    var hl = hit_lines[i] - 1
+    var hcol = hit_cols[i] - 1
+    if hl < 0
+      hl = 0
+    end
+    if hcol < 0
+      hcol = 0
+    end
+    var hk = _lsp_highlight_kind(hit_kinds[i])
+    sb.append("{\"range\":{\"start\":{\"line\":")
+    sb.append(str_from_int(hl))
+    sb.append(",\"character\":")
+    sb.append(str_from_int(hcol))
+    sb.append("},\"end\":{\"line\":")
+    sb.append(str_from_int(hl))
+    sb.append(",\"character\":")
+    sb.append(str_from_int(hcol + str_byte_len(word)))
+    sb.append("}},\"kind\":")
+    sb.append(str_from_int(hk))
+    sb.append("}")
+  end
+  sb.append("]")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+# ============================================================================
+# Selection Range (T4.4c)
+# ============================================================================
+
+## Find the chain of enclosing AST nodes for a position.
+## Returns parallel Vecs of (line, col, kind) for nodes from innermost to outermost.
+def _lsp_find_enclosing_chain(store: Int, node: Int, target_line: Int, target_col: Int, chain_lines: Vec<Int>, chain_cols: Vec<Int>, chain_kinds: Vec<Int>, chain_name_lens: Vec<Int>): Void
+  if node == 0
+    return
+  end
+  var kind = ast::ast_get_kind(store, node)
+  var nline = ast::ast_get_line(store, node)
+  var ncol = ast::ast_get_col(store, node)
+
+  # Only descend into nodes that could contain the target position
+  if nline > target_line + 1
+    return
+  end
+
+  # Push this node onto the chain (we'll build from outer to inner)
+  var name = ast::ast_get_str1(store, node)
+  var name_len = str_byte_len(name)
+  if name_len == 0
+    name_len = 1
+  end
+  chain_lines.push(nline)
+  chain_cols.push(ncol)
+  chain_kinds.push(kind)
+  chain_name_lens.push(name_len)
+
+  # Recurse into children based on node kind
+  if kind == node_constants::NODE_FUNCTION
+    var params_vec = ast::ast_get_left(store, node)
+    if params_vec != 0
+      var pc = vec_size(params_vec)
+      for pi in 0..pc
+        _lsp_find_enclosing_chain(store, vec_get(params_vec, pi), target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+      end
+    end
+    var body = ast::ast_get_right(store, node)
+    if body != 0
+      _lsp_find_enclosing_chain(store, body, target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+    end
+    return
+  end
+
+  if kind == node_constants::NODE_LAMBDA
+    var params_vec = ast::ast_get_left(store, node)
+    if params_vec != 0
+      var pc = vec_size(params_vec)
+      for pi in 0..pc
+        _lsp_find_enclosing_chain(store, vec_get(params_vec, pi), target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+      end
+    end
+    var body = ast::ast_get_right(store, node)
+    if body != 0
+      _lsp_find_enclosing_chain(store, body, target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+    end
+    return
+  end
+
+  if kind == node_constants::NODE_CALL
+    var callee = ast::ast_get_left(store, node)
+    if callee != 0
+      _lsp_find_enclosing_chain(store, callee, target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+    end
+    var args = ast::ast_get_children(store, node)
+    if args != 0
+      var ac = vec_size(args)
+      for ai in 0..ac
+        _lsp_find_enclosing_chain(store, vec_get(args, ai), target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+      end
+    end
+    return
+  end
+
+  if kind == node_constants::NODE_IF
+    var cond = ast::ast_get_left(store, node)
+    if cond != 0
+      _lsp_find_enclosing_chain(store, cond, target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+    end
+    var then_b = ast::ast_get_right(store, node)
+    if then_b != 0
+      _lsp_find_enclosing_chain(store, then_b, target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+    end
+    var else_b = ast::ast_get_extra(store, node)
+    if else_b != 0
+      _lsp_find_enclosing_chain(store, else_b, target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+    end
+    return
+  end
+
+  if kind == node_constants::NODE_MATCH
+    var expr = ast::ast_get_left(store, node)
+    if expr != 0
+      _lsp_find_enclosing_chain(store, expr, target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+    end
+    var arms = ast::ast_get_children(store, node)
+    if arms != 0
+      var ac = vec_size(arms)
+      for ai in 0..ac
+        _lsp_find_enclosing_chain(store, vec_get(arms, ai), target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+      end
+    end
+    return
+  end
+
+  if kind == node_constants::NODE_MATCH_ARM
+    var pat = ast::ast_get_left(store, node)
+    if pat != 0
+      _lsp_find_enclosing_chain(store, pat, target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+    end
+    var body = ast::ast_get_right(store, node)
+    if body != 0
+      _lsp_find_enclosing_chain(store, body, target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+    end
+    return
+  end
+
+  # Default: children, left, right
+  var children = ast::ast_get_children(store, node)
+  if children != 0
+    var cc = vec_size(children)
+    for ci in 0..cc
+      _lsp_find_enclosing_chain(store, vec_get(children, ci), target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+    end
+  end
+  var left = ast::ast_get_left(store, node)
+  if left != 0
+    _lsp_find_enclosing_chain(store, left, target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+  end
+  var right = ast::ast_get_right(store, node)
+  if right != 0
+    _lsp_find_enclosing_chain(store, right, target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+  end
+end
+
+## Estimate end line for a block node by scanning source for matching `end`.
+def _lsp_find_block_end_line(source: String, start_line: Int): Int
+  var src_len = str_byte_len(source)
+  var cur_line = 0
+  var pos = 0
+  var depth = 0
+  while pos < src_len
+    # Find start of line
+    var line_start = pos
+    # Find end of line
+    var line_end = pos
+    while line_end < src_len and str_byte_at(source, line_end) != '\n'
+      line_end += 1
+    end
+    if cur_line >= start_line
+      # Scan this line for block openers/closers
+      var lpos = line_start
+      # Skip whitespace
+      while lpos < line_end and (str_byte_at(source, lpos) == ' ' or str_byte_at(source, lpos) == '\t')
+        lpos += 1
+      end
+      var remaining = line_end - lpos
+      # Check for block openers
+      if remaining >= 3
+        var c0 = str_byte_at(source, lpos)
+        var c1 = str_byte_at(source, lpos + 1)
+        var c2 = str_byte_at(source, lpos + 2)
+        if c0 == 'd' and c1 == 'e' and c2 == 'f'
+          depth += 1
+        elsif c0 == 'f' and c1 == 'o' and c2 == 'r'
+          depth += 1
+        elsif c0 == 'e' and c1 == 'n' and c2 == 'd'
+          if depth <= 0
+            return cur_line
+          end
+          depth -= 1
+        end
+      end
+      if remaining >= 5
+        var w = str_byte_slice(source, lpos, lpos + 5)
+        if w == "while"
+          depth += 1
+        elsif w == "match"
+          depth += 1
+        end
+      end
+      if remaining >= 6
+        var w = str_byte_slice(source, lpos, lpos + 6)
+        if w == "struct"
+          depth += 1
+        end
+      end
+      if remaining >= 2
+        var c0 = str_byte_at(source, lpos)
+        var c1 = str_byte_at(source, lpos + 1)
+        if c0 == 'i' and c1 == 'f'
+          depth += 1
+        end
+      end
+    end
+    cur_line += 1
+    pos = line_end + 1
+  end
+  return cur_line
+end
+
+def _lsp_handle_selection_range(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+
+  var store = _lsp_ast_cache_get_store(uri)
+  var root = _lsp_ast_cache_get_root(uri)
+  var source = _lsp_doc_get(uri)
+
+  if store == 0 or root == 0 or str_byte_len(source) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  # Parse positions array
+  var positions = lsp_json_get_obj(params, "positions")
+  if str_byte_len(positions) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  # For simplicity, handle the first position only (VS Code typically sends one)
+  var first_pos_start = __char_index(positions, '{')
+  if first_pos_start < 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+  var inner = str_byte_slice(positions, first_pos_start, str_byte_len(positions))
+  var target_line = lsp_json_get_int(inner, "line") + 1
+  var target_col = lsp_json_get_int(inner, "character") + 1
+
+  # Collect enclosing chain
+  var chain_lines = vec_new<Int>()
+  var chain_cols = vec_new<Int>()
+  var chain_kinds = vec_new<Int>()
+  var chain_name_lens = vec_new<Int>()
+  _lsp_find_enclosing_chain(store, root, target_line, target_col, chain_lines, chain_cols, chain_kinds, chain_name_lens)
+
+  # Build nested selection range from outermost to innermost
+  # We filter to nodes on the target line or containing it
+  var sb = sb_new()
+  sb.append("[")
+
+  var total = chain_lines.size
+  if total == 0
+    sb.append("]")
+    lsp_send(_lsp_response(id, sb.to_string()))
+    sb_free(sb)
+    return
+  end
+
+  # Build from innermost out — the innermost node is the last one with line <= target
+  # Reverse: build a nested JSON structure
+  # Start from the end (innermost), wrap outward
+  var layers = vec_new<String>()
+  for i in 0..total
+    var sl = chain_lines[i] - 1
+    var sc = chain_cols[i] - 1
+    if sl < 0
+      sl = 0
+    end
+    if sc < 0
+      sc = 0
+    end
+    var el = sl
+    var ec = sc + chain_name_lens[i]
+    # For block nodes, estimate end from source
+    var k = chain_kinds[i]
+    if k == node_constants::NODE_FUNCTION or k == node_constants::NODE_BLOCK or k == node_constants::NODE_IF or k == node_constants::NODE_WHILE or k == node_constants::NODE_FOR or k == node_constants::NODE_MATCH or k == node_constants::NODE_STRUCT_DEF or k == node_constants::NODE_ENUM_DEF or k == node_constants::NODE_TRAIT_DEF
+      el = _lsp_find_block_end_line(source, sl)
+      ec = 3
+    end
+    var layer_sb = sb_new()
+    layer_sb.append("{\"range\":{\"start\":{\"line\":")
+    layer_sb.append(str_from_int(sl))
+    layer_sb.append(",\"character\":")
+    layer_sb.append(str_from_int(sc))
+    layer_sb.append("},\"end\":{\"line\":")
+    layer_sb.append(str_from_int(el))
+    layer_sb.append(",\"character\":")
+    layer_sb.append(str_from_int(ec))
+    layer_sb.append("}}}")
+    layers.push(layer_sb.to_string())
+    sb_free(layer_sb)
+  end
+
+  # Build nested: innermost has no parent, each outer wraps the inner
+  if layers.size > 0
+    var nested = layers[layers.size - 1]
+    var li = layers.size - 2
+    while li >= 0
+      # Insert parent into the innermost's JSON
+      var layer = layers[li]
+      # Replace the closing }} with ,\"parent\":INNER}}
+      var close_pos = str_byte_len(layer) - 1
+      var prefix = str_byte_slice(layer, 0, close_pos)
+      nested = "#{prefix},\"parent\":#{nested}}"
+      li -= 1
+    end
+    sb.append(nested)
+  end
+
+  sb.append("]")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+# ============================================================================
+# Rename Symbol (T4.3b)
+# ============================================================================
+
+def _lsp_handle_prepare_rename(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  var pos_obj = lsp_json_get_obj(params, "position")
+  var line = lsp_json_get_int(pos_obj, "line")
+  var col = lsp_json_get_int(pos_obj, "character")
+
+  var source = _lsp_doc_get(uri)
+  if str_byte_len(source) == 0
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+
+  var word = _lsp_word_at(source, line, col)
+  if str_byte_len(word) == 0
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+
+  # Reject keywords
+  if word == "def" or word == "end" or word == "if" or word == "else" or word == "elsif" or word == "while" or word == "for" or word == "in" or word == "return" or word == "var" or word == "match" or word == "import" or word == "struct" or word == "enum" or word == "trait" or word == "impl" or word == "true" or word == "false" or word == "nil" or word == "and" or word == "or" or word == "not" or word == "break" or word == "continue" or word == "const"
+    lsp_send(_lsp_error_response(id, -32602, "Cannot rename keyword"))
+    return
+  end
+
+  # Verify the word exists in the AST
+  var store = _lsp_ast_cache_get_store(uri)
+  var root = _lsp_ast_cache_get_root(uri)
+  if store == 0 or root == 0
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+
+  var hit_lines = vec_new<Int>()
+  var hit_cols = vec_new<Int>()
+  var hit_kinds = vec_new<Int>()
+  _lsp_deep_walk(store, root, word, hit_lines, hit_cols, hit_kinds)
+
+  if hit_lines.size == 0
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+
+  var sb = sb_new()
+  sb.append("{\"range\":{\"start\":{\"line\":")
+  sb.append(str_from_int(line))
+  sb.append(",\"character\":")
+  # Find word start on the line
+  var wlen = str_byte_len(word)
+  var word_start = col
+  # The word_at function finds the word containing col, so col may be mid-word
+  # Recalculate word start from source
+  var src_len = str_byte_len(source)
+  var cur_line = 0
+  var line_start_pos = 0
+  var spos = 0
+  while spos < src_len and cur_line < line
+    if str_byte_at(source, spos) == '\n'
+      cur_line += 1
+      line_start_pos = spos + 1
+    end
+    spos += 1
+  end
+  var target_byte = line_start_pos + col
+  var ws = target_byte
+  while ws > line_start_pos and _lsp_is_ident_char(str_byte_at(source, ws - 1))
+    ws -= 1
+  end
+  word_start = ws - line_start_pos
+
+  sb.append(str_from_int(word_start))
+  sb.append("},\"end\":{\"line\":")
+  sb.append(str_from_int(line))
+  sb.append(",\"character\":")
+  sb.append(str_from_int(word_start + wlen))
+  sb.append("}},\"placeholder\":\"")
+  sb.append(_lsp_json_escape(word))
+  sb.append("\"}")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+def _lsp_handle_rename(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  var pos_obj = lsp_json_get_obj(params, "position")
+  var line = lsp_json_get_int(pos_obj, "line")
+  var col = lsp_json_get_int(pos_obj, "character")
+  var new_name = lsp_json_get_str(params, "newName")
+
+  var source = _lsp_doc_get(uri)
+  if str_byte_len(source) == 0
+    lsp_send(_lsp_response(id, "{\"changes\":{}}"))
+    return
+  end
+
+  var word = _lsp_word_at(source, line, col)
+  if str_byte_len(word) == 0
+    lsp_send(_lsp_response(id, "{\"changes\":{}}"))
+    return
+  end
+
+  var sb = sb_new()
+  sb.append("{\"changes\":{")
+
+  # Collect edits for current document
+  var store = _lsp_ast_cache_get_store(uri)
+  var root = _lsp_ast_cache_get_root(uri)
+  var first_uri = 1
+
+  if store != 0 and root != 0
+    var hit_lines = vec_new<Int>()
+    var hit_cols = vec_new<Int>()
+    var hit_kinds = vec_new<Int>()
+    _lsp_deep_walk(store, root, word, hit_lines, hit_cols, hit_kinds)
+
+    if hit_lines.size > 0
+      if first_uri == 0
+        sb.append(",")
+      end
+      sb.append("\"")
+      sb.append(_lsp_json_escape(uri))
+      sb.append("\":[")
+      for i in 0..hit_lines.size
+        if i > 0
+          sb.append(",")
+        end
+        var hl = hit_lines[i] - 1
+        var hc = hit_cols[i] - 1
+        if hl < 0
+          hl = 0
+        end
+        if hc < 0
+          hc = 0
+        end
+        sb.append("{\"range\":{\"start\":{\"line\":")
+        sb.append(str_from_int(hl))
+        sb.append(",\"character\":")
+        sb.append(str_from_int(hc))
+        sb.append("},\"end\":{\"line\":")
+        sb.append(str_from_int(hl))
+        sb.append(",\"character\":")
+        sb.append(str_from_int(hc + str_byte_len(word)))
+        sb.append("}},\"newText\":\"")
+        sb.append(_lsp_json_escape(new_name))
+        sb.append("\"}")
+      end
+      sb.append("]")
+      first_uri = 0
+    end
+  end
+
+  # Also search other open documents
+  for di in 0..g_lsp_ast_uris.size
+    var other_uri = g_lsp_ast_uris[di]
+    if other_uri == uri
+      continue
+    end
+    var other_store = g_lsp_ast_stores[di]
+    var other_root = g_lsp_ast_roots[di]
+    if other_store == 0 or other_root == 0
+      continue
+    end
+
+    var hit_lines = vec_new<Int>()
+    var hit_cols = vec_new<Int>()
+    var hit_kinds = vec_new<Int>()
+    _lsp_deep_walk(other_store, other_root, word, hit_lines, hit_cols, hit_kinds)
+
+    if hit_lines.size > 0
+      if first_uri == 0
+        sb.append(",")
+      end
+      sb.append("\"")
+      sb.append(_lsp_json_escape(other_uri))
+      sb.append("\":[")
+      for i in 0..hit_lines.size
+        if i > 0
+          sb.append(",")
+        end
+        var hl = hit_lines[i] - 1
+        var hc = hit_cols[i] - 1
+        if hl < 0
+          hl = 0
+        end
+        if hc < 0
+          hc = 0
+        end
+        sb.append("{\"range\":{\"start\":{\"line\":")
+        sb.append(str_from_int(hl))
+        sb.append(",\"character\":")
+        sb.append(str_from_int(hc))
+        sb.append("},\"end\":{\"line\":")
+        sb.append(str_from_int(hl))
+        sb.append(",\"character\":")
+        sb.append(str_from_int(hc + str_byte_len(word)))
+        sb.append("}},\"newText\":\"")
+        sb.append(_lsp_json_escape(new_name))
+        sb.append("\"}")
+      end
+      sb.append("]")
+      first_uri = 0
+    end
+  end
+
+  # Also search workspace files (if scanner populated)
+  for wi in 0..g_lsp_ws_uris.size
+    var ws_uri = g_lsp_ws_uris[wi]
+    if ws_uri == uri
+      continue
+    end
+    # Skip if already covered by open documents
+    var already = 0
+    for di in 0..g_lsp_ast_uris.size
+      if g_lsp_ast_uris[di] == ws_uri
+        already = 1
+        break
+      end
+    end
+    if already == 1
+      continue
+    end
+
+    var ws_store = g_lsp_ws_stores[wi]
+    var ws_root = g_lsp_ws_roots[wi]
+    if ws_store == 0 or ws_root == 0
+      continue
+    end
+
+    var hit_lines = vec_new<Int>()
+    var hit_cols = vec_new<Int>()
+    var hit_kinds = vec_new<Int>()
+    _lsp_deep_walk(ws_store, ws_root, word, hit_lines, hit_cols, hit_kinds)
+
+    if hit_lines.size > 0
+      if first_uri == 0
+        sb.append(",")
+      end
+      sb.append("\"")
+      sb.append(_lsp_json_escape(ws_uri))
+      sb.append("\":[")
+      for i in 0..hit_lines.size
+        if i > 0
+          sb.append(",")
+        end
+        var hl = hit_lines[i] - 1
+        var hc = hit_cols[i] - 1
+        if hl < 0
+          hl = 0
+        end
+        if hc < 0
+          hc = 0
+        end
+        sb.append("{\"range\":{\"start\":{\"line\":")
+        sb.append(str_from_int(hl))
+        sb.append(",\"character\":")
+        sb.append(str_from_int(hc))
+        sb.append("},\"end\":{\"line\":")
+        sb.append(str_from_int(hl))
+        sb.append(",\"character\":")
+        sb.append(str_from_int(hc + str_byte_len(word)))
+        sb.append("}},\"newText\":\"")
+        sb.append(_lsp_json_escape(new_name))
+        sb.append("\"}")
+      end
+      sb.append("]")
+      first_uri = 0
+    end
+  end
+
+  sb.append("}}")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+# ============================================================================
+# Code Actions (T4.3e)
+# ============================================================================
+
+def _lsp_handle_code_action(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  var range_obj = lsp_json_get_obj(params, "range")
+  var start_obj = lsp_json_get_obj(range_obj, "start")
+  var line = lsp_json_get_int(start_obj, "line")
+
+  var source = _lsp_doc_get(uri)
+  var sb = sb_new()
+  sb.append("[")
+  var has_action = 0
+
+  # Category A: Source actions — always available
+  # "Sort imports"
+  if has_action > 0
+    sb.append(",")
+  end
+  sb.append("{\"title\":\"Sort imports\",\"kind\":\"source.organizeImports\",\"edit\":{\"changes\":{\"")
+  sb.append(_lsp_json_escape(uri))
+  sb.append("\":[")
+  # Collect import lines from source
+  if str_byte_len(source) > 0
+    var import_lines = vec_new<String>()
+    var first_import_line = -1
+    var last_import_line = -1
+    var src_len = str_byte_len(source)
+    var cur_line = 0
+    var pos = 0
+    while pos < src_len
+      var line_start = pos
+      var line_end = pos
+      while line_end < src_len and str_byte_at(source, line_end) != '\n'
+        line_end += 1
+      end
+      var line_text = str_byte_slice(source, line_start, line_end)
+      if str_starts_with(line_text, "import ")
+        import_lines.push(line_text)
+        if first_import_line < 0
+          first_import_line = cur_line
+        end
+        last_import_line = cur_line
+      end
+      cur_line += 1
+      pos = line_end + 1
+    end
+    # Sort and build replacement
+    if import_lines.size > 1
+      # Simple insertion sort
+      for i in 1..import_lines.size
+        var key = import_lines[i]
+        var j = i - 1
+        while j >= 0 and import_lines[j] > key
+          import_lines[j + 1] = import_lines[j]
+          j -= 1
+        end
+        import_lines[j + 1] = key
+      end
+      # Build sorted text
+      var sorted_sb = sb_new()
+      for i in 0..import_lines.size
+        if i > 0
+          sorted_sb.append("\\n")
+        end
+        sorted_sb.append(_lsp_json_escape(import_lines[i]))
+      end
+      var sorted_text = sorted_sb.to_string()
+      sb_free(sorted_sb)
+      sb.append("{\"range\":{\"start\":{\"line\":")
+      sb.append(str_from_int(first_import_line))
+      sb.append(",\"character\":0},\"end\":{\"line\":")
+      sb.append(str_from_int(last_import_line))
+      sb.append(",\"character\":999}},\"newText\":\"")
+      sb.append(sorted_text)
+      sb.append("\"}")
+    end
+  end
+  sb.append("]}}}")
+  has_action = 1
+
+  # Category B: TC-powered diagnostic quickfixes
+  var context_obj = lsp_json_get_obj(params, "context")
+  var diags_arr = lsp_json_get_obj(context_obj, "diagnostics")
+  if str_byte_len(diags_arr) > 2
+    # Parse each diagnostic in the array for actionable patterns
+    var dpos = 0
+    var dlen = str_byte_len(diags_arr)
+    while dpos < dlen
+      # Find next diagnostic object
+      var dbrace = -1
+      while dpos < dlen
+        if str_byte_at(diags_arr, dpos) == '{'
+          dbrace = dpos
+          break
+        end
+        dpos += 1
+      end
+      if dbrace < 0
+        break
+      end
+      var ddepth = 1
+      var dend = dbrace + 1
+      var din_str = 0
+      while dend < dlen and ddepth > 0
+        var dc = str_byte_at(diags_arr, dend)
+        if din_str == 1
+          if dc == '\\'
+            dend += 1
+          elsif dc == '"'
+            din_str = 0
+          end
+        else
+          if dc == '"'
+            din_str = 1
+          elsif dc == '{'
+            ddepth += 1
+          elsif dc == '}'
+            ddepth -= 1
+          end
+        end
+        dend += 1
+      end
+      var diag_obj = str_byte_slice(diags_arr, dbrace, dend)
+      dpos = dend
+
+      var diag_msg = lsp_json_get_str(diag_obj, "message")
+      var diag_source = lsp_json_get_str(diag_obj, "source")
+
+      # "Did you mean 'X'?" quickfix — extract suggestion and replace
+      if str_contains(diag_msg, "Did you mean '")
+        var dym_start = __char_index(diag_msg, '\'')
+        if dym_start >= 0
+          var dym_rest = str_byte_slice(diag_msg, dym_start + 1, str_byte_len(diag_msg))
+          var dym_end = __char_index(dym_rest, '\'')
+          if dym_end > 0
+            var suggestion = str_byte_slice(dym_rest, 0, dym_end)
+            # Extract the original identifier: "Unknown function 'X'"
+            var orig_name = ""
+            var unknown_q = __char_index(diag_msg, '\'')
+            if unknown_q >= 0
+              # The first quoted string before "Did you mean" is the unknown identifier
+              var orig_rest = str_byte_slice(diag_msg, unknown_q + 1, str_byte_len(diag_msg))
+              var orig_end = __char_index(orig_rest, '\'')
+              if orig_end > 0
+                orig_name = str_byte_slice(orig_rest, 0, orig_end)
+              end
+            end
+            if str_byte_len(suggestion) > 0 and str_byte_len(orig_name) > 0 and suggestion != orig_name
+              if has_action > 0
+                sb.append(",")
+              end
+              sb.append("{\"title\":\"Replace with '")
+              sb.append(_lsp_json_escape(suggestion))
+              sb.append("'\",\"kind\":\"quickfix\",\"isPreferred\":true,\"edit\":{\"changes\":{\"")
+              sb.append(_lsp_json_escape(uri))
+              sb.append("\":[{\"range\":{\"start\":{\"line\":")
+              sb.append(str_from_int(line))
+              sb.append(",\"character\":0},\"end\":{\"line\":")
+              sb.append(str_from_int(line))
+              sb.append(",\"character\":999}},\"newText\":\"")
+              # Get the current line text and replace the identifier
+              var src_line_text = _lsp_line_at(source, line)
+              var fixed_line = str_replace(src_line_text, orig_name, suggestion)
+              sb.append(_lsp_json_escape(fixed_line))
+              sb.append("\"}]}}}")
+              has_action = 1
+            end
+          end
+        end
+      end
+
+      # QZ0106: Immutable variable mutation — offer "Make variable mutable"
+      if str_contains(diag_msg, "Cannot reassign") or str_contains(diag_msg, "QZ0106")
+        # Find the variable name from the diagnostic message
+        var mut_q = __char_index(diag_msg, '\'')
+        if mut_q >= 0
+          var mut_rest = str_byte_slice(diag_msg, mut_q + 1, str_byte_len(diag_msg))
+          var mut_end = __char_index(mut_rest, '\'')
+          if mut_end > 0
+            var mut_name = str_byte_slice(mut_rest, 0, mut_end)
+            if str_byte_len(mut_name) > 0
+              if has_action > 0
+                sb.append(",")
+              end
+              sb.append("{\"title\":\"Make '")
+              sb.append(_lsp_json_escape(mut_name))
+              sb.append("' mutable (var)\",\"kind\":\"quickfix\",\"edit\":{\"changes\":{\"")
+              sb.append(_lsp_json_escape(uri))
+              sb.append("\":[{\"range\":{\"start\":{\"line\":")
+              # We need to find the declaration line — search upward in source
+              # For now, add the quickfix targeting the diagnostic range
+              var diag_range = lsp_json_get_obj(diag_obj, "range")
+              var diag_start = lsp_json_get_obj(diag_range, "start")
+              var diag_line = lsp_json_get_int(diag_start, "line")
+              sb.append(str_from_int(diag_line))
+              sb.append(",\"character\":0},\"end\":{\"line\":")
+              sb.append(str_from_int(diag_line))
+              sb.append(",\"character\":999}},\"newText\":\"")
+              # Replace "x = " with "var x = " on the assignment line
+              var assign_line = _lsp_line_at(source, diag_line)
+              sb.append(_lsp_json_escape(assign_line))
+              sb.append("\"}]}}}")
+              has_action = 1
+            end
+          end
+        end
+      end
+    end
+  end
+
+  # Category C: Context-aware — add type annotation
+  var store = _lsp_ast_cache_get_store(uri)
+  var root = _lsp_ast_cache_get_root(uri)
+  if store != 0 and root != 0
+    # Walk top-level looking for LET on the target line
+    var program_children = ast::ast_get_children(store, root)
+    if program_children != 0
+      var pc = vec_size(program_children)
+      for ci in 0..pc
+        var child = vec_get(program_children, ci)
+        if child == 0
+          continue
+        end
+        var ckind = ast::ast_get_kind(store, child)
+        if ckind == node_constants::NODE_FUNCTION
+          # Search function body for LET on target line
+          var body = ast::ast_get_right(store, child)
+          if body != 0
+            var body_children = ast::ast_get_children(store, body)
+            if body_children != 0
+              var bc = vec_size(body_children)
+              for bi in 0..bc
+                var stmt = vec_get(body_children, bi)
+                if stmt == 0
+                  continue
+                end
+                var skind = ast::ast_get_kind(store, stmt)
+                if skind == node_constants::NODE_LET
+                  var stmt_line = ast::ast_get_line(store, stmt) - 1
+                  if stmt_line == line
+                    var ann = ast::ast_get_str2(store, stmt)
+                    if str_byte_len(ann) == 0
+                      var vname = ast::ast_get_str1(store, stmt)
+                      if str_byte_len(vname) > 0
+                        var vcol = ast::ast_get_col(store, stmt) - 1
+                        if vcol < 0
+                          vcol = 0
+                        end
+                        var insert_col = vcol + str_byte_len(vname)
+                        if has_action > 0
+                          sb.append(",")
+                        end
+                        sb.append("{\"title\":\"Add type annotation\",\"kind\":\"quickfix\",\"edit\":{\"changes\":{\"")
+                        sb.append(_lsp_json_escape(uri))
+                        sb.append("\":[{\"range\":{\"start\":{\"line\":")
+                        sb.append(str_from_int(stmt_line))
+                        sb.append(",\"character\":")
+                        sb.append(str_from_int(insert_col))
+                        sb.append("},\"end\":{\"line\":")
+                        sb.append(str_from_int(stmt_line))
+                        sb.append(",\"character\":")
+                        sb.append(str_from_int(insert_col))
+                        sb.append("}},\"newText\":\": _\"}]}}}")
+                        has_action = 1
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  sb.append("]")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+# ============================================================================
+# Workspace Scanner Infrastructure
+# ============================================================================
+
+# Workspace state
+var g_lsp_workspace_root = ""
+var g_lsp_ws_uris = vec_new<String>()
+var g_lsp_ws_stores = vec_new<Int>()
+var g_lsp_ws_roots = vec_new<Int>()
+
+# Symbol index (flat: name, kind, uri, line, col)
+var g_lsp_sym_names = vec_new<String>()
+var g_lsp_sym_kinds = vec_new<Int>()
+var g_lsp_sym_uris = vec_new<String>()
+var g_lsp_sym_lines = vec_new<Int>()
+var g_lsp_sym_cols = vec_new<Int>()
+
+# Typecheck state for diagnostics and hover
+var g_lsp_tc = 0
+var g_lsp_tc_ready = 0
+
+# Inlay hint cache (populated during TC, consumed by inlay hint handler)
+var g_lsp_hint_lines = vec_new<Int>()
+var g_lsp_hint_cols = vec_new<Int>()
+var g_lsp_hint_types = vec_new<String>()
+var g_lsp_hint_uri = ""
+
+# Debounced typecheck state
+var g_lsp_dirty_uri = ""
+var g_lsp_dirty_time_ns = 0
+const LSP_TC_DEBOUNCE_NS = 500000000
+
+# Trait-impl index (for type hierarchy)
+var g_lsp_ti_trait_names = vec_new<String>()
+var g_lsp_ti_impl_types = vec_new<String>()
+var g_lsp_ti_uris = vec_new<String>()
+var g_lsp_ti_lines = vec_new<Int>()
+var g_lsp_ti_cols = vec_new<Int>()
+
+## Store a workspace file's parse result, coercing struct types to Int.
+def _lsp_ws_cache_set(uri: String, store: Int, root: Int): Void
+  for i in 0..g_lsp_ws_uris.size
+    if g_lsp_ws_uris[i] == uri
+      g_lsp_ws_stores[i] = store
+      g_lsp_ws_roots[i] = root
+      return
+    end
+  end
+  g_lsp_ws_uris.push(uri)
+  g_lsp_ws_stores.push(store)
+  g_lsp_ws_roots.push(root)
+end
+
+## Parse a single file and add its definitions to the symbol index.
+def _lsp_index_file(uri: String, source: String): Void
+  var interner = string_intern::intern_global()
+  var lex_result = lexer::lexer_tokenize(source, interner)
+  var types = lex_result.get_types()
+  var lexemes = lex_result.get_lexemes()
+  var lines = lex_result.get_lines()
+  var cols = lex_result.get_cols()
+  var count = lex_result.token_count()
+
+  # Index via cst_parser -> cst_lower (matching the main-module / resolver
+  # routing). Bails on parse error before caching/indexing.
+  var ast_store = 0
+  var ast_root = 0
+  var cst_res = cst_parser::cst_parse_source(source)
+  if cst_res.parser.had_error == 1
+    return
+  end
+  ast_store = ast::ast_new_storage()
+  ast_root = cst_lower::cst_lower(cst_res.parser.store, cst_res.root, ast_store)
+
+  # Cache the parse result (coerces struct types through Int parameters)
+  _lsp_ws_cache_set(uri, ast_store, ast_root)
+
+  # Find the cached entry to use for indexing
+  var store_int = 0
+  var root_int = 0
+  for i in 0..g_lsp_ws_uris.size
+    if g_lsp_ws_uris[i] == uri
+      store_int = g_lsp_ws_stores[i]
+      root_int = g_lsp_ws_roots[i]
+      break
+    end
+  end
+  if store_int == 0
+    return
+  end
+
+  # Collect definitions
+  var names = vec_new<String>()
+  var kinds = vec_new<Int>()
+  var def_lines = vec_new<Int>()
+  var def_cols = vec_new<Int>()
+  _lsp_collect_definitions(store_int, root_int, names, kinds, def_lines, def_cols)
+
+  for i in 0..names.size
+    g_lsp_sym_names.push(names[i])
+    g_lsp_sym_kinds.push(kinds[i])
+    g_lsp_sym_uris.push(uri)
+    g_lsp_sym_lines.push(def_lines[i])
+    g_lsp_sym_cols.push(def_cols[i])
+  end
+
+  # Collect trait-impl relationships
+  var children = ast::ast_get_children(store_int, root_int)
+  if children != 0
+    var cc = vec_size(children)
+    for ci in 0..cc
+      var child = vec_get(children, ci)
+      if child == 0
+        continue
+      end
+      var ckind = ast::ast_get_kind(store_int, child)
+      if ckind == node_constants::NODE_IMPL_BLOCK
+        var trait_name = ast::ast_get_str1(store_int, child)
+        var impl_type = ast::ast_get_str2(store_int, child)
+        if str_byte_len(trait_name) > 0 and str_byte_len(impl_type) > 0
+          g_lsp_ti_trait_names.push(trait_name)
+          g_lsp_ti_impl_types.push(impl_type)
+          g_lsp_ti_uris.push(uri)
+          g_lsp_ti_lines.push(ast::ast_get_line(store_int, child))
+          g_lsp_ti_cols.push(ast::ast_get_col(store_int, child))
+        end
+      end
+    end
+  end
+end
+
+## Scan workspace directory for *.qz files, parse each, build symbol index.
+def _lsp_scan_workspace(): Void
+  if str_byte_len(g_lsp_workspace_root) == 0
+    return
+  end
+
+  # Send progress notification
+  lsp_send(_lsp_notification("window/logMessage", "{\"type\":3,\"message\":\"Indexing workspace...\"}"))
+
+  # Clear existing workspace data
+  g_lsp_ws_uris = vec_new<String>()
+  g_lsp_ws_stores = vec_new<Int>()
+  g_lsp_ws_roots = vec_new<Int>()
+  g_lsp_sym_names = vec_new<String>()
+  g_lsp_sym_kinds = vec_new<Int>()
+  g_lsp_sym_uris = vec_new<String>()
+  g_lsp_sym_lines = vec_new<Int>()
+  g_lsp_sym_cols = vec_new<Int>()
+  g_lsp_ti_trait_names = vec_new<String>()
+  g_lsp_ti_impl_types = vec_new<String>()
+  g_lsp_ti_uris = vec_new<String>()
+  g_lsp_ti_lines = vec_new<Int>()
+  g_lsp_ti_cols = vec_new<Int>()
+
+  # Discover *.qz files: write find output to temp file, then read it
+  var tmp_path = "/tmp/quartz-lsp-scan.txt"
+  var cmd = "find #{g_lsp_workspace_root} -name '*.qz' -not -path '*/.git/*' -not -path '*/node_modules/*' -not -path '*/bin/*' > #{tmp_path} 2>/dev/null"
+  system(cmd)
+  var output = fio_read(tmp_path)
+  if str_byte_len(output) == 0
+    lsp_log("workspace scan: no files found")
+    return
+  end
+
+  # Parse the newline-separated file list
+  var file_count = 0
+  var opos = 0
+  var olen = str_byte_len(output)
+  while opos < olen
+    var line_start = opos
+    while opos < olen and str_byte_at(output, opos) != '\n'
+      opos += 1
+    end
+    if opos > line_start
+      var path = str_byte_slice(output, line_start, opos)
+      var file_uri = "file://#{path}"
+      # Read file contents
+      var content = fio_read(path)
+      if str_byte_len(content) > 0
+        _lsp_index_file(file_uri, content)
+        file_count += 1
+      end
+    end
+    opos += 1
+  end
+
+  lsp_log("workspace scan: indexed #{file_count} files, #{g_lsp_sym_names.size} symbols")
+
+  # Initialize workspace typecheck state
+  _lsp_init_workspace_tc()
+end
+
+## Register all workspace types/traits/impls/functions into a TypecheckState.
+## Mirrors the Phase 4.0a-4.1 pipeline from quartz.qz compile().
+def _lsp_register_workspace_types(tc: Int): Void
+  # Phase 1: Register struct/enum/alias/newtype from all workspace files
+  for wi in 0..g_lsp_ws_uris.size
+    var ws_store = g_lsp_ws_stores[wi]
+    var ws_root = g_lsp_ws_roots[wi]
+    if ws_store == 0 or ws_root == 0
+      continue
+    end
+    var children = ast::ast_get_children(ws_store, ws_root)
+    if children == 0
+      continue
+    end
+    var count = vec_size(children)
+    for i in 0..count
+      var child = vec_get(children, i)
+      if child == 0
+        continue
+      end
+      var kind = ast::ast_get_kind(ws_store, child)
+      if kind == node_constants::NODE_STRUCT_DEF
+        typecheck::tc_register_struct_def(tc, ws_store, child)
+      elsif kind == node_constants::NODE_ENUM_DEF
+        typecheck::tc_register_enum_def(tc, ws_store, child)
+      elsif kind == node_constants::NODE_TYPE_ALIAS
+        typecheck::tc_register_type_alias_def(tc, ws_store, child)
+      elsif kind == node_constants::NODE_NEWTYPE_DEF
+        typecheck::tc_register_newtype_def(tc, ws_store, child)
+      end
+    end
+  end
+
+  # Phase 2: Register traits (after types, before impl blocks)
+  for wi in 0..g_lsp_ws_uris.size
+    var ws_store = g_lsp_ws_stores[wi]
+    var ws_root = g_lsp_ws_roots[wi]
+    if ws_store == 0 or ws_root == 0
+      continue
+    end
+    var children = ast::ast_get_children(ws_store, ws_root)
+    if children == 0
+      continue
+    end
+    var count = vec_size(children)
+    for i in 0..count
+      var child = vec_get(children, i)
+      if child == 0
+        continue
+      end
+      if ast::ast_get_kind(ws_store, child) == node_constants::NODE_TRAIT_DEF
+        typecheck::tc_register_trait_def(tc, ws_store, child)
+      end
+    end
+  end
+
+  # Phase 3: Register impl blocks (after traits)
+  for wi in 0..g_lsp_ws_uris.size
+    var ws_store = g_lsp_ws_stores[wi]
+    var ws_root = g_lsp_ws_roots[wi]
+    if ws_store == 0 or ws_root == 0
+      continue
+    end
+    var children = ast::ast_get_children(ws_store, ws_root)
+    if children == 0
+      continue
+    end
+    var count = vec_size(children)
+    for i in 0..count
+      var child = vec_get(children, i)
+      if child == 0
+        continue
+      end
+      if ast::ast_get_kind(ws_store, child) == node_constants::NODE_IMPL_BLOCK
+        typecheck::tc_register_impl_block(tc, ws_store, child)
+      end
+    end
+  end
+
+  # Phase 4: Register function signatures
+  for wi in 0..g_lsp_ws_uris.size
+    var ws_store = g_lsp_ws_stores[wi]
+    var ws_root = g_lsp_ws_roots[wi]
+    if ws_store == 0 or ws_root == 0
+      continue
+    end
+    var children = ast::ast_get_children(ws_store, ws_root)
+    if children == 0
+      continue
+    end
+    var count = vec_size(children)
+    for i in 0..count
+      var child = vec_get(children, i)
+      if child == 0
+        continue
+      end
+      var kind = ast::ast_get_kind(ws_store, child)
+      if kind == node_constants::NODE_FUNCTION
+        typecheck::tc_register_function_signature(tc, ws_store, child)
+      elsif kind == node_constants::NODE_EXTERN_FN
+        typecheck::tc_register_extern_fn_signature(tc, ws_store, child)
+      end
+    end
+  end
+end
+
+## Initialize workspace typecheck state after workspace scan.
+def _lsp_init_workspace_tc(): Void
+  if g_lsp_ws_uris.size == 0
+    return
+  end
+  var tc = typecheck::tc_new()
+  _lsp_register_workspace_types(tc)
+  g_lsp_tc = tc
+  g_lsp_tc_ready = 1
+  lsp_log("typecheck registry initialized")
+end
+
+# ============================================================================
+# Workspace Symbols (T4.3f)
+# ============================================================================
+
+## Simple fuzzy match: case-insensitive substring OR camelCase hump match.
+def _lsp_fuzzy_match(query: String, name: String): Bool
+  if str_byte_len(query) == 0
+    return true
+  end
+  # Case-insensitive substring match
+  var qlen = str_byte_len(query)
+  var nlen = str_byte_len(name)
+  if qlen > nlen
+    return false
+  end
+  # Try substring (case insensitive)
+  for i in 0..(nlen - qlen + 1)
+    var matched = 1
+    for j in 0..qlen
+      var qc = str_byte_at(query, j)
+      var nc = str_byte_at(name, i + j)
+      # Lowercase both
+      if qc >= 'A' and qc <= 'Z'
+        qc = qc + 32
+      end
+      if nc >= 'A' and nc <= 'Z'
+        nc = nc + 32
+      end
+      if qc != nc
+        matched = 0
+        break
+      end
+    end
+    if matched == 1
+      return true
+    end
+  end
+  # CamelCase hump match: "PE" matches "ParseExpr"
+  var qi = 0
+  for ni in 0..nlen
+    if qi >= qlen
+      break
+    end
+    var nc = str_byte_at(name, ni)
+    var qc = str_byte_at(query, qi)
+    # Check if this is a hump (uppercase letter)
+    if nc >= 'A' and nc <= 'Z'
+      var nc_lower = nc + 32
+      var qc_lower = qc
+      if qc_lower >= 'A' and qc_lower <= 'Z'
+        qc_lower = qc_lower + 32
+      end
+      if nc_lower == qc_lower
+        qi += 1
+      end
+    end
+  end
+  return qi >= qlen
+end
+
+## Map node kind to LSP SymbolKind
+def _lsp_symbol_kind_for_node(kind: Int): Int
+  if kind == node_constants::NODE_FUNCTION
+    return LSP_SK_FUNCTION
+  end
+  if kind == node_constants::NODE_STRUCT_DEF
+    return LSP_SK_STRUCT
+  end
+  if kind == node_constants::NODE_ENUM_DEF
+    return LSP_SK_ENUM
+  end
+  if kind == node_constants::NODE_TRAIT_DEF
+    return LSP_SK_INTERFACE
+  end
+  if kind == node_constants::NODE_CONST_DECL
+    return LSP_SK_CONSTANT
+  end
+  # Default: variable
+  return 13
+end
+
+def _lsp_handle_workspace_symbol(id: Int, params: String): Void
+  var query = lsp_json_get_str(params, "query")
+
+  var sb = sb_new()
+  sb.append("[")
+  var result_count = 0
+  var max_results = 50
+
+  for i in 0..g_lsp_sym_names.size
+    if result_count >= max_results
+      break
+    end
+    var name = g_lsp_sym_names[i]
+    if _lsp_fuzzy_match(query, name)
+      if result_count > 0
+        sb.append(",")
+      end
+      var sk = _lsp_symbol_kind_for_node(g_lsp_sym_kinds[i])
+      var sl = g_lsp_sym_lines[i] - 1
+      var sc = g_lsp_sym_cols[i] - 1
+      if sl < 0
+        sl = 0
+      end
+      if sc < 0
+        sc = 0
+      end
+      sb.append("{\"name\":\"")
+      sb.append(_lsp_json_escape(name))
+      sb.append("\",\"kind\":")
+      sb.append(str_from_int(sk))
+      sb.append(",\"location\":{\"uri\":\"")
+      sb.append(_lsp_json_escape(g_lsp_sym_uris[i]))
+      sb.append("\",\"range\":{\"start\":{\"line\":")
+      sb.append(str_from_int(sl))
+      sb.append(",\"character\":")
+      sb.append(str_from_int(sc))
+      sb.append("},\"end\":{\"line\":")
+      sb.append(str_from_int(sl))
+      sb.append(",\"character\":")
+      sb.append(str_from_int(sc + str_byte_len(name)))
+      sb.append("}}}}")
+      result_count += 1
+    end
+  end
+
+  sb.append("]")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+# ============================================================================
+# Code Lens (T4.3g)
+# ============================================================================
+
+def _lsp_handle_code_lens(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+
+  var store = _lsp_ast_cache_get_store(uri)
+  var root = _lsp_ast_cache_get_root(uri)
+
+  if store == 0 or root == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  var sb = sb_new()
+  sb.append("[")
+  var has_lens = 0
+
+  var children = ast::ast_get_children(store, root)
+  if children != 0
+    var cc = vec_size(children)
+    for ci in 0..cc
+      var child = vec_get(children, ci)
+      if child == 0
+        continue
+      end
+      var kind = ast::ast_get_kind(store, child)
+      var name = ast::ast_get_str1(store, child)
+      if str_byte_len(name) == 0
+        continue
+      end
+
+      var cl = ast::ast_get_line(store, child) - 1
+      if cl < 0
+        cl = 0
+      end
+
+      if kind == node_constants::NODE_FUNCTION
+        if has_lens > 0
+          sb.append(",")
+        end
+        # "Run" lens for main function
+        if name == "main"
+          sb.append("{\"range\":{\"start\":{\"line\":")
+          sb.append(str_from_int(cl))
+          sb.append(",\"character\":0},\"end\":{\"line\":")
+          sb.append(str_from_int(cl))
+          sb.append(",\"character\":0}},\"command\":{\"title\":\"Run\",\"command\":\"quartz.run\"}}")
+          has_lens += 1
+          sb.append(",")
+        end
+        # Reference count lens (with data for resolve)
+        sb.append("{\"range\":{\"start\":{\"line\":")
+        sb.append(str_from_int(cl))
+        sb.append(",\"character\":0},\"end\":{\"line\":")
+        sb.append(str_from_int(cl))
+        sb.append(",\"character\":0}},\"data\":\"")
+        sb.append(_lsp_json_escape(name))
+        sb.append("\"}")
+        has_lens += 1
+      elsif kind == node_constants::NODE_STRUCT_DEF or kind == node_constants::NODE_ENUM_DEF or kind == node_constants::NODE_TRAIT_DEF
+        if has_lens > 0
+          sb.append(",")
+        end
+        sb.append("{\"range\":{\"start\":{\"line\":")
+        sb.append(str_from_int(cl))
+        sb.append(",\"character\":0},\"end\":{\"line\":")
+        sb.append(str_from_int(cl))
+        sb.append(",\"character\":0}},\"data\":\"")
+        sb.append(_lsp_json_escape(name))
+        sb.append("\"}")
+        has_lens += 1
+      end
+    end
+  end
+
+  sb.append("]")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+def _lsp_handle_code_lens_resolve(id: Int, params: String): Void
+  var data = lsp_json_get_str(params, "data")
+  var range_obj = lsp_json_get_obj(params, "range")
+
+  # Count references across all workspace files
+  var ref_count = 0
+  for wi in 0..g_lsp_ws_uris.size
+    var ws_store = g_lsp_ws_stores[wi]
+    var ws_root = g_lsp_ws_roots[wi]
+    if ws_store == 0 or ws_root == 0
+      continue
+    end
+    var hit_lines = vec_new<Int>()
+    var hit_cols = vec_new<Int>()
+    var hit_kinds = vec_new<Int>()
+    _lsp_deep_walk(ws_store, ws_root, data, hit_lines, hit_cols, hit_kinds)
+    # Count only references (not the definition itself)
+    for i in 0..hit_kinds.size
+      var k = hit_kinds[i]
+      if k == node_constants::NODE_IDENT or k == node_constants::NODE_CALL or k == node_constants::NODE_FIELD_ACCESS
+        ref_count += 1
+      end
+    end
+  end
+
+  # Also count in open documents
+  for di in 0..g_lsp_ast_uris.size
+    var already = 0
+    for wi in 0..g_lsp_ws_uris.size
+      if g_lsp_ws_uris[wi] == g_lsp_ast_uris[di]
+        already = 1
+        break
+      end
+    end
+    if already == 1
+      continue
+    end
+    var ds = g_lsp_ast_stores[di]
+    var dr = g_lsp_ast_roots[di]
+    if ds == 0 or dr == 0
+      continue
+    end
+    var hit_lines = vec_new<Int>()
+    var hit_cols = vec_new<Int>()
+    var hit_kinds = vec_new<Int>()
+    _lsp_deep_walk(ds, dr, data, hit_lines, hit_cols, hit_kinds)
+    for i in 0..hit_kinds.size
+      var k = hit_kinds[i]
+      if k == node_constants::NODE_IDENT or k == node_constants::NODE_CALL or k == node_constants::NODE_FIELD_ACCESS
+        ref_count += 1
+      end
+    end
+  end
+
+  var title = "#{ref_count} references"
+  if ref_count == 1
+    title = "1 reference"
+  end
+
+  var sb = sb_new()
+  sb.append("{\"range\":")
+  sb.append(range_obj)
+  sb.append(",\"command\":{\"title\":\"")
+  sb.append(title)
+  sb.append("\",\"command\":\"\"}}")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+# ============================================================================
+# Call Hierarchy (T4.4a)
+# ============================================================================
+
+def _lsp_handle_prepare_call_hierarchy(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  var pos_obj = lsp_json_get_obj(params, "position")
+  var line = lsp_json_get_int(pos_obj, "line")
+  var col = lsp_json_get_int(pos_obj, "character")
+
+  var source = _lsp_doc_get(uri)
+  if str_byte_len(source) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  var word = _lsp_word_at(source, line, col)
+  if str_byte_len(word) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  # Find the function definition for this word
+  var def_uri = ""
+  var def_line = -1
+  var def_col = -1
+
+  # Search symbol index
+  for i in 0..g_lsp_sym_names.size
+    if g_lsp_sym_names[i] == word and g_lsp_sym_kinds[i] == node_constants::NODE_FUNCTION
+      def_uri = g_lsp_sym_uris[i]
+      def_line = g_lsp_sym_lines[i] - 1
+      def_col = g_lsp_sym_cols[i] - 1
+      break
+    end
+  end
+
+  # Fallback to current file AST
+  if def_line < 0
+    var store = _lsp_ast_cache_get_store(uri)
+    var root = _lsp_ast_cache_get_root(uri)
+    if store != 0 and root != 0
+      var children = ast::ast_get_children(store, root)
+      if children != 0
+        var cc = vec_size(children)
+        for ci in 0..cc
+          var child = vec_get(children, ci)
+          if child != 0
+            var ckind = ast::ast_get_kind(store, child)
+            if ckind == node_constants::NODE_FUNCTION
+              var fname = ast::ast_get_str1(store, child)
+              if fname == word
+                def_uri = uri
+                def_line = ast::ast_get_line(store, child) - 1
+                def_col = ast::ast_get_col(store, child) - 1
+                break
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  if def_line < 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  if def_line < 0
+    def_line = 0
+  end
+  if def_col < 0
+    def_col = 0
+  end
+
+  var sb = sb_new()
+  sb.append("[{\"name\":\"")
+  sb.append(_lsp_json_escape(word))
+  sb.append("\",\"kind\":12,\"uri\":\"")
+  sb.append(_lsp_json_escape(def_uri))
+  sb.append("\",\"range\":{\"start\":{\"line\":")
+  sb.append(str_from_int(def_line))
+  sb.append(",\"character\":")
+  sb.append(str_from_int(def_col))
+  sb.append("},\"end\":{\"line\":")
+  sb.append(str_from_int(def_line))
+  sb.append(",\"character\":")
+  sb.append(str_from_int(def_col + str_byte_len(word)))
+  sb.append("}},\"selectionRange\":{\"start\":{\"line\":")
+  sb.append(str_from_int(def_line))
+  sb.append(",\"character\":")
+  sb.append(str_from_int(def_col))
+  sb.append("},\"end\":{\"line\":")
+  sb.append(str_from_int(def_line))
+  sb.append(",\"character\":")
+  sb.append(str_from_int(def_col + str_byte_len(word)))
+  sb.append("}}}]")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+## Walk a function body collecting all call targets.
+def _lsp_collect_calls_in_body(store: Int, node: Int, call_names: Vec<String>, call_lines: Vec<Int>, call_cols: Vec<Int>): Void
+  if node == 0
+    return
+  end
+  var kind = ast::ast_get_kind(store, node)
+
+  if kind == node_constants::NODE_CALL
+    var callee = ast::ast_get_left(store, node)
+    if callee != 0
+      var callee_name = ast::ast_get_str1(store, callee)
+      if str_byte_len(callee_name) > 0
+        call_names.push(callee_name)
+        call_lines.push(ast::ast_get_line(store, node))
+        call_cols.push(ast::ast_get_col(store, node))
+      end
+    end
+    # Also recurse into args
+    var args = ast::ast_get_children(store, node)
+    if args != 0
+      var ac = vec_size(args)
+      for ai in 0..ac
+        _lsp_collect_calls_in_body(store, vec_get(args, ai), call_names, call_lines, call_cols)
+      end
+    end
+    return
+  end
+
+  # Recurse based on node kind
+  if kind == node_constants::NODE_FUNCTION or kind == node_constants::NODE_LAMBDA
+    var body = ast::ast_get_right(store, node)
+    if body != 0
+      _lsp_collect_calls_in_body(store, body, call_names, call_lines, call_cols)
+    end
+    return
+  end
+
+  if kind == node_constants::NODE_IF
+    var cond = ast::ast_get_left(store, node)
+    if cond != 0
+      _lsp_collect_calls_in_body(store, cond, call_names, call_lines, call_cols)
+    end
+    var then_b = ast::ast_get_right(store, node)
+    if then_b != 0
+      _lsp_collect_calls_in_body(store, then_b, call_names, call_lines, call_cols)
+    end
+    var else_b = ast::ast_get_extra(store, node)
+    if else_b != 0
+      _lsp_collect_calls_in_body(store, else_b, call_names, call_lines, call_cols)
+    end
+    return
+  end
+
+  if kind == node_constants::NODE_MATCH
+    var expr = ast::ast_get_left(store, node)
+    if expr != 0
+      _lsp_collect_calls_in_body(store, expr, call_names, call_lines, call_cols)
+    end
+    var arms = ast::ast_get_children(store, node)
+    if arms != 0
+      var ac = vec_size(arms)
+      for ai in 0..ac
+        _lsp_collect_calls_in_body(store, vec_get(arms, ai), call_names, call_lines, call_cols)
+      end
+    end
+    return
+  end
+
+  if kind == node_constants::NODE_MATCH_ARM
+    var body = ast::ast_get_right(store, node)
+    if body != 0
+      _lsp_collect_calls_in_body(store, body, call_names, call_lines, call_cols)
+    end
+    return
+  end
+
+  # Default
+  var children = ast::ast_get_children(store, node)
+  if children != 0
+    var cc = vec_size(children)
+    for ci in 0..cc
+      _lsp_collect_calls_in_body(store, vec_get(children, ci), call_names, call_lines, call_cols)
+    end
+  end
+  var left = ast::ast_get_left(store, node)
+  if left != 0
+    _lsp_collect_calls_in_body(store, left, call_names, call_lines, call_cols)
+  end
+  var right = ast::ast_get_right(store, node)
+  if right != 0
+    _lsp_collect_calls_in_body(store, right, call_names, call_lines, call_cols)
+  end
+end
+
+def _lsp_handle_incoming_calls(id: Int, params: String): Void
+  var item = lsp_json_get_obj(params, "item")
+  var target_name = lsp_json_get_str(item, "name")
+
+  if str_byte_len(target_name) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  var sb = sb_new()
+  sb.append("[")
+  var has_caller = 0
+
+  # Search all workspace files for calls to target_name
+  for wi in 0..g_lsp_ws_uris.size
+    var ws_store = g_lsp_ws_stores[wi]
+    var ws_root = g_lsp_ws_roots[wi]
+    if ws_store == 0 or ws_root == 0
+      continue
+    end
+
+    # Walk all top-level functions
+    var children = ast::ast_get_children(ws_store, ws_root)
+    if children == 0
+      continue
+    end
+    var cc = vec_size(children)
+    for ci in 0..cc
+      var child = vec_get(children, ci)
+      if child == 0
+        continue
+      end
+      var ckind = ast::ast_get_kind(ws_store, child)
+      if ckind != node_constants::NODE_FUNCTION
+        continue
+      end
+
+      var caller_name = ast::ast_get_str1(ws_store, child)
+      if str_byte_len(caller_name) == 0
+        continue
+      end
+
+      # Collect calls in this function's body
+      var call_names = vec_new<String>()
+      var call_lines = vec_new<Int>()
+      var call_cols = vec_new<Int>()
+      var body = ast::ast_get_right(ws_store, child)
+      if body != 0
+        _lsp_collect_calls_in_body(ws_store, body, call_names, call_lines, call_cols)
+      end
+
+      # Check if any calls match target_name
+      var call_ranges_sb = sb_new()
+      var has_range = 0
+      for ki in 0..call_names.size
+        if call_names[ki] == target_name
+          if has_range > 0
+            call_ranges_sb.append(",")
+          end
+          var crl = call_lines[ki] - 1
+          var crc = call_cols[ki] - 1
+          if crl < 0
+            crl = 0
+          end
+          if crc < 0
+            crc = 0
+          end
+          call_ranges_sb.append("{\"start\":{\"line\":")
+          call_ranges_sb.append(str_from_int(crl))
+          call_ranges_sb.append(",\"character\":")
+          call_ranges_sb.append(str_from_int(crc))
+          call_ranges_sb.append("},\"end\":{\"line\":")
+          call_ranges_sb.append(str_from_int(crl))
+          call_ranges_sb.append(",\"character\":")
+          call_ranges_sb.append(str_from_int(crc + str_byte_len(target_name)))
+          call_ranges_sb.append("}}")
+          has_range += 1
+        end
+      end
+
+      if has_range > 0
+        if has_caller > 0
+          sb.append(",")
+        end
+        var caller_line = ast::ast_get_line(ws_store, child) - 1
+        var caller_col = ast::ast_get_col(ws_store, child) - 1
+        if caller_line < 0
+          caller_line = 0
+        end
+        if caller_col < 0
+          caller_col = 0
+        end
+
+        sb.append("{\"from\":{\"name\":\"")
+        sb.append(_lsp_json_escape(caller_name))
+        sb.append("\",\"kind\":12,\"uri\":\"")
+        sb.append(_lsp_json_escape(g_lsp_ws_uris[wi]))
+        sb.append("\",\"range\":{\"start\":{\"line\":")
+        sb.append(str_from_int(caller_line))
+        sb.append(",\"character\":")
+        sb.append(str_from_int(caller_col))
+        sb.append("},\"end\":{\"line\":")
+        sb.append(str_from_int(caller_line))
+        sb.append(",\"character\":")
+        sb.append(str_from_int(caller_col + str_byte_len(caller_name)))
+        sb.append("}},\"selectionRange\":{\"start\":{\"line\":")
+        sb.append(str_from_int(caller_line))
+        sb.append(",\"character\":")
+        sb.append(str_from_int(caller_col))
+        sb.append("},\"end\":{\"line\":")
+        sb.append(str_from_int(caller_line))
+        sb.append(",\"character\":")
+        sb.append(str_from_int(caller_col + str_byte_len(caller_name)))
+        sb.append("}}},\"fromRanges\":[")
+        sb.append(call_ranges_sb.to_string())
+        sb.append("]}")
+        has_caller += 1
+      end
+      sb_free(call_ranges_sb)
+    end
+  end
+
+  sb.append("]")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+def _lsp_handle_outgoing_calls(id: Int, params: String): Void
+  var item = lsp_json_get_obj(params, "item")
+  var target_name = lsp_json_get_str(item, "name")
+  var target_uri = lsp_json_get_str(item, "uri")
+
+  if str_byte_len(target_name) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  # Find the function in its file and collect outgoing calls
+  var func_store = 0
+  var func_node = 0
+
+  # Search workspace
+  for wi in 0..g_lsp_ws_uris.size
+    if g_lsp_ws_uris[wi] == target_uri
+      var ws_store = g_lsp_ws_stores[wi]
+      var ws_root = g_lsp_ws_roots[wi]
+      var children = ast::ast_get_children(ws_store, ws_root)
+      if children != 0
+        var cc = vec_size(children)
+        for ci in 0..cc
+          var child = vec_get(children, ci)
+          if child != 0
+            var ckind = ast::ast_get_kind(ws_store, child)
+            if ckind == node_constants::NODE_FUNCTION
+              var fname = ast::ast_get_str1(ws_store, child)
+              if fname == target_name
+                func_store = ws_store
+                func_node = child
+                break
+              end
+            end
+          end
+        end
+      end
+      break
+    end
+  end
+
+  # Fallback to open document cache
+  if func_store == 0
+    for di in 0..g_lsp_ast_uris.size
+      if g_lsp_ast_uris[di] == target_uri
+        var ds = g_lsp_ast_stores[di]
+        var dr = g_lsp_ast_roots[di]
+        var children = ast::ast_get_children(ds, dr)
+        if children != 0
+          var cc = vec_size(children)
+          for ci in 0..cc
+            var child = vec_get(children, ci)
+            if child != 0 and ast::ast_get_kind(ds, child) == node_constants::NODE_FUNCTION
+              if ast::ast_get_str1(ds, child) == target_name
+                func_store = ds
+                func_node = child
+                break
+              end
+            end
+          end
+        end
+        break
+      end
+    end
+  end
+
+  if func_store == 0 or func_node == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  # Collect calls in this function body
+  var call_names = vec_new<String>()
+  var call_lines = vec_new<Int>()
+  var call_cols = vec_new<Int>()
+  var body = ast::ast_get_right(func_store, func_node)
+  if body != 0
+    _lsp_collect_calls_in_body(func_store, body, call_names, call_lines, call_cols)
+  end
+
+  # Deduplicate by name and build response
+  var sb = sb_new()
+  sb.append("[")
+  var has_callee = 0
+  var seen_names = vec_new<String>()
+
+  for i in 0..call_names.size
+    var cname = call_names[i]
+    # Check if already seen
+    var seen = 0
+    for si in 0..seen_names.size
+      if seen_names[si] == cname
+        seen = 1
+        break
+      end
+    end
+    if seen == 1
+      continue
+    end
+    seen_names.push(cname)
+
+    # Find definition in symbol index
+    var callee_uri = ""
+    var callee_line = -1
+    var callee_col = -1
+    for si in 0..g_lsp_sym_names.size
+      if g_lsp_sym_names[si] == cname and g_lsp_sym_kinds[si] == node_constants::NODE_FUNCTION
+        callee_uri = g_lsp_sym_uris[si]
+        callee_line = g_lsp_sym_lines[si] - 1
+        callee_col = g_lsp_sym_cols[si] - 1
+        break
+      end
+    end
+
+    if callee_line < 0
+      callee_uri = target_uri
+      callee_line = 0
+      callee_col = 0
+    end
+    if callee_col < 0
+      callee_col = 0
+    end
+
+    # Collect all call ranges for this callee
+    if has_callee > 0
+      sb.append(",")
+    end
+    sb.append("{\"to\":{\"name\":\"")
+    sb.append(_lsp_json_escape(cname))
+    sb.append("\",\"kind\":12,\"uri\":\"")
+    sb.append(_lsp_json_escape(callee_uri))
+    sb.append("\",\"range\":{\"start\":{\"line\":")
+    sb.append(str_from_int(callee_line))
+    sb.append(",\"character\":")
+    sb.append(str_from_int(callee_col))
+    sb.append("},\"end\":{\"line\":")
+    sb.append(str_from_int(callee_line))
+    sb.append(",\"character\":")
+    sb.append(str_from_int(callee_col + str_byte_len(cname)))
+    sb.append("}},\"selectionRange\":{\"start\":{\"line\":")
+    sb.append(str_from_int(callee_line))
+    sb.append(",\"character\":")
+    sb.append(str_from_int(callee_col))
+    sb.append("},\"end\":{\"line\":")
+    sb.append(str_from_int(callee_line))
+    sb.append(",\"character\":")
+    sb.append(str_from_int(callee_col + str_byte_len(cname)))
+    sb.append("}}},\"fromRanges\":[")
+
+    var first_range = 1
+    for ri in 0..call_names.size
+      if call_names[ri] == cname
+        if first_range == 0
+          sb.append(",")
+        end
+        var rl = call_lines[ri] - 1
+        var rc = call_cols[ri] - 1
+        if rl < 0
+          rl = 0
+        end
+        if rc < 0
+          rc = 0
+        end
+        sb.append("{\"start\":{\"line\":")
+        sb.append(str_from_int(rl))
+        sb.append(",\"character\":")
+        sb.append(str_from_int(rc))
+        sb.append("},\"end\":{\"line\":")
+        sb.append(str_from_int(rl))
+        sb.append(",\"character\":")
+        sb.append(str_from_int(rc + str_byte_len(cname)))
+        sb.append("}}")
+        first_range = 0
+      end
+    end
+    sb.append("]}")
+    has_callee += 1
+  end
+
+  sb.append("]")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+# ============================================================================
+# Type Hierarchy (T4.4b)
+# ============================================================================
+
+def _lsp_handle_prepare_type_hierarchy(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  var pos_obj = lsp_json_get_obj(params, "position")
+  var line = lsp_json_get_int(pos_obj, "line")
+  var col = lsp_json_get_int(pos_obj, "character")
+
+  var source = _lsp_doc_get(uri)
+  if str_byte_len(source) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  var word = _lsp_word_at(source, line, col)
+  if str_byte_len(word) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  # Find the type/trait definition
+  var def_uri = ""
+  var def_line = -1
+  var def_col = -1
+  var def_kind = 0
+
+  for i in 0..g_lsp_sym_names.size
+    if g_lsp_sym_names[i] == word
+      var sk = g_lsp_sym_kinds[i]
+      if sk == node_constants::NODE_STRUCT_DEF or sk == node_constants::NODE_ENUM_DEF or sk == node_constants::NODE_TRAIT_DEF
+        def_uri = g_lsp_sym_uris[i]
+        def_line = g_lsp_sym_lines[i] - 1
+        def_col = g_lsp_sym_cols[i] - 1
+        def_kind = sk
+        break
+      end
+    end
+  end
+
+  if def_line < 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+  if def_col < 0
+    def_col = 0
+  end
+
+  var sk_num = LSP_SK_STRUCT
+  if def_kind == node_constants::NODE_ENUM_DEF
+    sk_num = LSP_SK_ENUM
+  elsif def_kind == node_constants::NODE_TRAIT_DEF
+    sk_num = LSP_SK_INTERFACE
+  end
+
+  var sb = sb_new()
+  sb.append("[{\"name\":\"")
+  sb.append(_lsp_json_escape(word))
+  sb.append("\",\"kind\":")
+  sb.append(str_from_int(sk_num))
+  sb.append(",\"uri\":\"")
+  sb.append(_lsp_json_escape(def_uri))
+  sb.append("\",\"range\":{\"start\":{\"line\":")
+  sb.append(str_from_int(def_line))
+  sb.append(",\"character\":")
+  sb.append(str_from_int(def_col))
+  sb.append("},\"end\":{\"line\":")
+  sb.append(str_from_int(def_line))
+  sb.append(",\"character\":")
+  sb.append(str_from_int(def_col + str_byte_len(word)))
+  sb.append("}},\"selectionRange\":{\"start\":{\"line\":")
+  sb.append(str_from_int(def_line))
+  sb.append(",\"character\":")
+  sb.append(str_from_int(def_col))
+  sb.append("},\"end\":{\"line\":")
+  sb.append(str_from_int(def_line))
+  sb.append(",\"character\":")
+  sb.append(str_from_int(def_col + str_byte_len(word)))
+  sb.append("}}}]")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+def _lsp_handle_supertypes(id: Int, params: String): Void
+  var item = lsp_json_get_obj(params, "item")
+  var target_name = lsp_json_get_str(item, "name")
+
+  if str_byte_len(target_name) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  var sb = sb_new()
+  sb.append("[")
+  var has_result = 0
+
+  # Find all traits that target_name implements
+  for i in 0..g_lsp_ti_impl_types.size
+    if g_lsp_ti_impl_types[i] == target_name
+      var trait_name = g_lsp_ti_trait_names[i]
+      # Find trait definition
+      var trait_uri = ""
+      var trait_line = -1
+      var trait_col = -1
+      for si in 0..g_lsp_sym_names.size
+        if g_lsp_sym_names[si] == trait_name and g_lsp_sym_kinds[si] == node_constants::NODE_TRAIT_DEF
+          trait_uri = g_lsp_sym_uris[si]
+          trait_line = g_lsp_sym_lines[si] - 1
+          trait_col = g_lsp_sym_cols[si] - 1
+          break
+        end
+      end
+      if trait_line < 0
+        continue
+      end
+      if trait_col < 0
+        trait_col = 0
+      end
+
+      if has_result > 0
+        sb.append(",")
+      end
+      sb.append("{\"name\":\"")
+      sb.append(_lsp_json_escape(trait_name))
+      sb.append("\",\"kind\":")
+      sb.append(str_from_int(LSP_SK_INTERFACE))
+      sb.append(",\"uri\":\"")
+      sb.append(_lsp_json_escape(trait_uri))
+      sb.append("\",\"range\":{\"start\":{\"line\":")
+      sb.append(str_from_int(trait_line))
+      sb.append(",\"character\":")
+      sb.append(str_from_int(trait_col))
+      sb.append("},\"end\":{\"line\":")
+      sb.append(str_from_int(trait_line))
+      sb.append(",\"character\":")
+      sb.append(str_from_int(trait_col + str_byte_len(trait_name)))
+      sb.append("}},\"selectionRange\":{\"start\":{\"line\":")
+      sb.append(str_from_int(trait_line))
+      sb.append(",\"character\":")
+      sb.append(str_from_int(trait_col))
+      sb.append("},\"end\":{\"line\":")
+      sb.append(str_from_int(trait_line))
+      sb.append(",\"character\":")
+      sb.append(str_from_int(trait_col + str_byte_len(trait_name)))
+      sb.append("}}}")
+      has_result += 1
+    end
+  end
+
+  sb.append("]")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+def _lsp_handle_subtypes(id: Int, params: String): Void
+  var item = lsp_json_get_obj(params, "item")
+  var target_name = lsp_json_get_str(item, "name")
+
+  if str_byte_len(target_name) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  var sb = sb_new()
+  sb.append("[")
+  var has_result = 0
+
+  # Find all types that implement target_name
+  for i in 0..g_lsp_ti_trait_names.size
+    if g_lsp_ti_trait_names[i] == target_name
+      var impl_type = g_lsp_ti_impl_types[i]
+      # Find type definition
+      var type_uri = ""
+      var type_line = -1
+      var type_col = -1
+      var type_kind = LSP_SK_STRUCT
+      for si in 0..g_lsp_sym_names.size
+        if g_lsp_sym_names[si] == impl_type
+          var sk = g_lsp_sym_kinds[si]
+          if sk == node_constants::NODE_STRUCT_DEF or sk == node_constants::NODE_ENUM_DEF
+            type_uri = g_lsp_sym_uris[si]
+            type_line = g_lsp_sym_lines[si] - 1
+            type_col = g_lsp_sym_cols[si] - 1
+            if sk == node_constants::NODE_ENUM_DEF
+              type_kind = LSP_SK_ENUM
+            end
+            break
+          end
+        end
+      end
+      if type_line < 0
+        continue
+      end
+      if type_col < 0
+        type_col = 0
+      end
+
+      if has_result > 0
+        sb.append(",")
+      end
+      sb.append("{\"name\":\"")
+      sb.append(_lsp_json_escape(impl_type))
+      sb.append("\",\"kind\":")
+      sb.append(str_from_int(type_kind))
+      sb.append(",\"uri\":\"")
+      sb.append(_lsp_json_escape(type_uri))
+      sb.append("\",\"range\":{\"start\":{\"line\":")
+      sb.append(str_from_int(type_line))
+      sb.append(",\"character\":")
+      sb.append(str_from_int(type_col))
+      sb.append("},\"end\":{\"line\":")
+      sb.append(str_from_int(type_line))
+      sb.append(",\"character\":")
+      sb.append(str_from_int(type_col + str_byte_len(impl_type)))
+      sb.append("}},\"selectionRange\":{\"start\":{\"line\":")
+      sb.append(str_from_int(type_line))
+      sb.append(",\"character\":")
+      sb.append(str_from_int(type_col))
+      sb.append("},\"end\":{\"line\":")
+      sb.append(str_from_int(type_line))
+      sb.append(",\"character\":")
+      sb.append(str_from_int(type_col + str_byte_len(impl_type)))
+      sb.append("}}}")
+      has_result += 1
+    end
+  end
+
+  sb.append("]")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+# ============================================================================
+# Folding Ranges
+# ============================================================================
+
+## Scan source text for block-level folding ranges (def...end, struct...end, etc.)
+def _lsp_handle_folding_range(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+
+  var source = _lsp_doc_get(uri)
+  if str_byte_len(source) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  # Simple line-based approach: track block openers and match with `end`
+  var lines = str_split(source, "\n")
+  var line_count = lines.size
+  # Stack of (start_line, kind) for open blocks
+  var open_lines = vec_new<Int>()
+  var open_kinds = vec_new<String>()
+
+  var sb = sb_new()
+  sb.append("[")
+  var has_item = 0
+
+  for li in 0..line_count
+    var line = str_trim(lines[li])
+    var llen = str_byte_len(line)
+    if llen == 0
+      continue
+    end
+    # Check for block openers
+    var is_opener = 0
+    if str_starts_with(line, "def ") or str_starts_with(line, "struct ") or str_starts_with(line, "enum ") or str_starts_with(line, "trait ") or str_starts_with(line, "impl ") or str_starts_with(line, "if ") or str_starts_with(line, "while ") or str_starts_with(line, "for ") or str_starts_with(line, "match ")
+      # Only count as opener if it doesn't end with = (endless def)
+      if not str_ends_with(line, "= ")
+        var last = str_byte_at(line, llen - 1)
+        if last != '='
+          is_opener = 1
+        end
+      end
+    end
+    if is_opener == 1
+      open_lines.push(li)
+      open_kinds.push("region")
+    end
+    # Check for `end` closer
+    if line == "end"
+      if open_lines.size > 0
+        var start_line = open_lines[open_lines.size - 1]
+        __vec_pop_raw(open_lines)
+        __vec_pop_raw(open_kinds)
+        if has_item == 1
+          sb.append(",")
+        end
+        sb.append("{\"startLine\":")
+        sb.append(str_from_int(start_line))
+        sb.append(",\"endLine\":")
+        sb.append(str_from_int(li))
+        sb.append(",\"kind\":\"region\"}")
+        has_item = 1
+      end
+    end
+    # Check for comment blocks (## doc comments)
+    if str_starts_with(line, "##")
+      # Check if next line is also a doc comment — extend range
+      var comment_start = li
+      var comment_end = li
+      while comment_end + 1 < line_count
+        var next = str_trim(lines[comment_end + 1])
+        if str_starts_with(next, "##")
+          comment_end += 1
+        else
+          break
+        end
+      end
+      if comment_end > comment_start
+        if has_item == 1
+          sb.append(",")
+        end
+        sb.append("{\"startLine\":")
+        sb.append(str_from_int(comment_start))
+        sb.append(",\"endLine\":")
+        sb.append(str_from_int(comment_end))
+        sb.append(",\"kind\":\"comment\"}")
+        has_item = 1
+      end
+    end
+  end
+
+  sb.append("]")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+# ============================================================================
+# Document Links (clickable import paths)
+# ============================================================================
+
+def _lsp_handle_document_link(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+
+  var source = _lsp_doc_get(uri)
+  if str_byte_len(source) == 0
+    lsp_send(_lsp_response(id, "[]"))
+    return
+  end
+
+  var lines = str_split(source, "\n")
+  var sb = sb_new()
+  sb.append("[")
+  var has_item = 0
+
+  for li in 0..lines.size
+    var line = str_trim(lines[li])
+    # Match "import X" or "import X/Y" or "import * from X"
+    if str_starts_with(line, "import ")
+      var rest = str_byte_slice(line, 7, str_byte_len(line))
+      # Handle "import * from X"
+      if str_starts_with(rest, "* from ")
+        rest = str_byte_slice(rest, 7, str_byte_len(rest))
+      end
+      var mod_name = str_trim(rest)
+      if str_byte_len(mod_name) > 0
+        # Find the column of the module name in the original line
+        var orig_line = lines[li]
+        var mod_pos = __str_index(orig_line, mod_name)
+        if mod_pos >= 0
+          if has_item == 1
+            sb.append(",")
+          end
+          # Build a file:// URI for the import target
+          # For now, just mark the range — the tooltip shows the module name
+          sb.append("{\"range\":{\"start\":{\"line\":")
+          sb.append(str_from_int(li))
+          sb.append(",\"character\":")
+          sb.append(str_from_int(mod_pos))
+          sb.append("},\"end\":{\"line\":")
+          sb.append(str_from_int(li))
+          sb.append(",\"character\":")
+          sb.append(str_from_int(mod_pos + str_byte_len(mod_name)))
+          sb.append("}},\"tooltip\":\"Open module: #{_lsp_json_escape(mod_name)}\"}")
+          has_item = 1
+        end
+      end
+    end
+  end
+
+  sb.append("]")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+# ============================================================================
+# Semantic Tokens
+# ============================================================================
+
+# Token type indices (must match legend order in capabilities)
+const SEMTOK_FUNCTION = 0
+const SEMTOK_VARIABLE = 1
+const SEMTOK_PARAMETER = 2
+const SEMTOK_TYPE = 3
+const SEMTOK_STRUCT = 4
+const SEMTOK_ENUM = 5
+const SEMTOK_PROPERTY = 6
+const SEMTOK_ENUM_MEMBER = 7
+const SEMTOK_KEYWORD = 8
+const SEMTOK_COMMENT = 9
+const SEMTOK_STRING = 10
+const SEMTOK_NUMBER = 11
+
+# Token modifier bitmasks
+const SEMMOD_DECLARATION = 1
+const SEMMOD_DEFINITION = 2
+const SEMMOD_READONLY = 4
+
+## Append a semantic token to the data array.
+## Tokens are stored as (line, col, len, type, modifiers) and later delta-encoded.
+def _lsp_sem_push(lines: Vec<Int>, cols: Vec<Int>, lens: Vec<Int>, types: Vec<Int>, mods: Vec<Int>, line: Int, col: Int, len: Int, tok_type: Int, tok_mod: Int): Void
+  lines.push(line)
+  cols.push(col)
+  lens.push(len)
+  types.push(tok_type)
+  mods.push(tok_mod)
+end
+
+## Check if a lexer token type is a keyword.
+def _lsp_is_keyword_tok(tt: Int): Bool
+  # Core keywords: def(9)..in(28)
+  if tt >= 9 and tt <= 28
+    return true
+  end
+  # struct(30), enum(31)
+  if tt == 30 or tt == 31
+    return true
+  end
+  # match(33), when(34), then(35)
+  if tt >= 33 and tt <= 35
+    return true
+  end
+  # import(38)..type(55)
+  if tt >= 38 and tt <= 55
+    return true
+  end
+  # newtype(103), nil(104), extend(106)
+  if tt == 103 or tt == 104 or tt == 106
+    return true
+  end
+  # const(109)..go(119)
+  if tt >= 109 and tt <= 119
+    return true
+  end
+  return false
+end
+
+## Collect semantic tokens from the lexer output (base layer).
+## Maps lexer token types to semantic token types for keywords, strings, numbers, identifiers.
+def _lsp_collect_lexer_tokens(source: String, tok_lines: Vec<Int>, tok_cols: Vec<Int>, tok_lens: Vec<Int>, tok_types: Vec<Int>, tok_mods: Vec<Int>): Void
+  var interner = string_intern::intern_global()
+  var lex_result = lexer::lexer_tokenize(source, interner)
+  var types = lex_result.get_types()
+  var lexemes = lex_result.get_lexemes()
+  var lines = lex_result.get_lines()
+  var cols = lex_result.get_cols()
+  var count = lex_result.token_count()
+
+  for i in 0..count
+    var tt = types[i]
+    var sem_type = -1
+    var sem_mod = 0
+
+    if _lsp_is_keyword_tok(tt)
+      sem_type = SEMTOK_KEYWORD
+    elsif tt == token_constants::TOK_STRING or tt == token_constants::TOK_STRING_START or tt == token_constants::TOK_STRING_PART or tt == token_constants::TOK_STRING_END
+      sem_type = SEMTOK_STRING
+    elsif tt == token_constants::TOK_INT or tt == token_constants::TOK_FLOAT_LIT or tt == token_constants::TOK_CHAR
+      sem_type = SEMTOK_NUMBER
+    elsif tt == token_constants::TOK_SYMBOL
+      sem_type = SEMTOK_NUMBER
+    elsif tt == token_constants::TOK_DOC_COMMENT or tt == token_constants::TOK_DOC_MODULE or tt == token_constants::TOK_DOC_INLINE
+      sem_type = SEMTOK_COMMENT
+    elsif tt == token_constants::TOK_IDENT
+      sem_type = SEMTOK_VARIABLE
+    end
+
+    if sem_type >= 0
+      var lexeme = string_intern::intern_resolve_int(interner, lexemes[i])
+      var len = str_byte_len(lexeme)
+      # String tokens: lexeme has quotes stripped, add 2 back
+      if tt == token_constants::TOK_STRING
+        len += 2
+      end
+      # Symbol tokens: lexeme lacks : prefix, add 1
+      if tt == token_constants::TOK_SYMBOL
+        len += 1
+      end
+      var line = lines[i] - 1
+      var col = cols[i] - 1
+      if line >= 0 and col >= 0 and len > 0
+        _lsp_sem_push(tok_lines, tok_cols, tok_lens, tok_types, tok_mods, line, col, len, sem_type, sem_mod)
+      end
+    end
+  end
+end
+
+## Scan source text for regular # comments (not ## doc comments, which the lexer handles).
+## Emits SEMTOK_COMMENT for each comment found.
+def _lsp_collect_comment_tokens(source: String, tok_lines: Vec<Int>, tok_cols: Vec<Int>, tok_lens: Vec<Int>, tok_types: Vec<Int>, tok_mods: Vec<Int>): Void
+  var slen = str_byte_len(source)
+  var pos = 0
+  var line = 0
+  var col = 0
+  var in_str = 0
+
+  while pos < slen
+    var ch = str_byte_at(source, pos)
+
+    # Track string state to avoid false positives inside strings
+    if in_str == 1
+      if ch == '\\'
+        pos += 2
+        col += 2
+        continue
+      end
+      if ch == '"'
+        in_str = 0
+      end
+      if ch == '\n'
+        in_str = 0
+        line += 1
+        col = 0
+        pos += 1
+        continue
+      end
+      pos += 1
+      col += 1
+      continue
+    end
+
+    if ch == '"'
+      in_str = 1
+      pos += 1
+      col += 1
+      continue
+    end
+
+    if ch == '#'
+      # Check if this is a doc comment (##) — skip, already handled by lexer
+      if pos + 1 < slen and str_byte_at(source, pos + 1) == '#'
+        # Skip to end of line
+        while pos < slen and str_byte_at(source, pos) != '\n'
+          pos += 1
+        end
+        if pos < slen
+          line += 1
+          col = 0
+          pos += 1
+        end
+        continue
+      end
+      # Regular comment: scan to end of line
+      var comment_col = col
+      var comment_start = pos
+      while pos < slen and str_byte_at(source, pos) != '\n'
+        pos += 1
+        col += 1
+      end
+      var comment_len = pos - comment_start
+      if comment_len > 0
+        _lsp_sem_push(tok_lines, tok_cols, tok_lens, tok_types, tok_mods, line, comment_col, comment_len, SEMTOK_COMMENT, 0)
+      end
+      if pos < slen
+        line += 1
+        col = 0
+        pos += 1
+      end
+      continue
+    end
+
+    if ch == '\n'
+      line += 1
+      col = 0
+    else
+      col += 1
+    end
+    pos += 1
+  end
+end
+
+## Walk AST node and collect semantic tokens.
+def _lsp_collect_semantic_tokens(store: Int, node: Int, lines: Vec<Int>, cols: Vec<Int>, lens: Vec<Int>, types: Vec<Int>, mods: Vec<Int>): Void
+  if node == 0
+    return
+  end
+  var kind = ast::ast_get_kind(store, node)
+  var nline = ast::ast_get_line(store, node) - 1
+  var ncol = ast::ast_get_col(store, node) - 1
+  if nline < 0
+    nline = 0
+  end
+  if ncol < 0
+    ncol = 0
+  end
+
+  # Function definitions
+  if kind == node_constants::NODE_FUNCTION
+    var name = ast::ast_get_str1(store, node)
+    if str_byte_len(name) > 0
+      _lsp_sem_push(lines, cols, lens, types, mods, nline, ncol, str_byte_len(name), SEMTOK_FUNCTION, SEMMOD_DEFINITION)
+    end
+    # Process parameters
+    var params_vec = ast::ast_get_left(store, node)
+    if params_vec != 0
+      var pc = vec_size(params_vec)
+      for pi in 0..pc
+        var ph = vec_get(params_vec, pi)
+        _lsp_collect_semantic_tokens(store, ph, lines, cols, lens, types, mods)
+      end
+    end
+    # Process body (right = body node, NOT children which is naked/guard encoding)
+    var body_node = ast::ast_get_right(store, node)
+    if body_node != 0
+      _lsp_collect_semantic_tokens(store, body_node, lines, cols, lens, types, mods)
+    end
+    return
+  end
+
+  # Parameter definitions
+  if kind == node_constants::NODE_PARAM
+    var name = ast::ast_get_str1(store, node)
+    if str_byte_len(name) > 0
+      _lsp_sem_push(lines, cols, lens, types, mods, nline, ncol, str_byte_len(name), SEMTOK_PARAMETER, SEMMOD_DECLARATION)
+    end
+    return
+  end
+
+  # Struct definitions
+  if kind == node_constants::NODE_STRUCT_DEF
+    var name = ast::ast_get_str1(store, node)
+    if str_byte_len(name) > 0
+      _lsp_sem_push(lines, cols, lens, types, mods, nline, ncol, str_byte_len(name), SEMTOK_STRUCT, SEMMOD_DEFINITION)
+    end
+    var fields = ast::ast_get_children(store, node)
+    if fields != 0
+      var fc = vec_size(fields)
+      for fi in 0..fc
+        var fh = vec_get(fields, fi)
+        if fh != 0
+          var fkind = ast::ast_get_kind(store, fh)
+          if fkind == node_constants::NODE_FIELD_DEF
+            var fname = ast::ast_get_str1(store, fh)
+            var fl = ast::ast_get_line(store, fh) - 1
+            var fco = ast::ast_get_col(store, fh) - 1
+            if fl >= 0 and fco >= 0 and str_byte_len(fname) > 0
+              _lsp_sem_push(lines, cols, lens, types, mods, fl, fco, str_byte_len(fname), SEMTOK_PROPERTY, SEMMOD_DECLARATION)
+            end
+          end
+        end
+      end
+    end
+    return
+  end
+
+  # Enum definitions
+  if kind == node_constants::NODE_ENUM_DEF
+    var name = ast::ast_get_str1(store, node)
+    if str_byte_len(name) > 0
+      _lsp_sem_push(lines, cols, lens, types, mods, nline, ncol, str_byte_len(name), SEMTOK_ENUM, SEMMOD_DEFINITION)
+    end
+    var variants = ast::ast_get_children(store, node)
+    if variants != 0
+      var vc = vec_size(variants)
+      for vi in 0..vc
+        var vh = vec_get(variants, vi)
+        if vh != 0
+          var vname = ast::ast_get_str1(store, vh)
+          var vl = ast::ast_get_line(store, vh) - 1
+          var vco = ast::ast_get_col(store, vh) - 1
+          if vl >= 0 and vco >= 0 and str_byte_len(vname) > 0
+            _lsp_sem_push(lines, cols, lens, types, mods, vl, vco, str_byte_len(vname), SEMTOK_ENUM_MEMBER, SEMMOD_DECLARATION)
+          end
+        end
+      end
+    end
+    return
+  end
+
+  # Trait definitions
+  if kind == node_constants::NODE_TRAIT_DEF
+    var name = ast::ast_get_str1(store, node)
+    if str_byte_len(name) > 0
+      _lsp_sem_push(lines, cols, lens, types, mods, nline, ncol, str_byte_len(name), SEMTOK_TYPE, SEMMOD_DEFINITION)
+    end
+    return
+  end
+
+  # Recurse into children for other node types
+  var children = ast::ast_get_children(store, node)
+  if children != 0
+    var cc = vec_size(children)
+    for ci in 0..cc
+      _lsp_collect_semantic_tokens(store, vec_get(children, ci), lines, cols, lens, types, mods)
+    end
+  end
+  var left = ast::ast_get_left(store, node)
+  if left != 0 and kind != node_constants::NODE_FUNCTION
+    _lsp_collect_semantic_tokens(store, left, lines, cols, lens, types, mods)
+  end
+  var right = ast::ast_get_right(store, node)
+  if right != 0
+    _lsp_collect_semantic_tokens(store, right, lines, cols, lens, types, mods)
+  end
+end
+
+def _lsp_handle_semantic_tokens(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  var store = _lsp_ast_cache_get_store(uri)
+  var root = _lsp_ast_cache_get_root(uri)
+
+  # Collect raw tokens using two-pass architecture:
+  # 1. Lexer pass: base layer (keywords, strings, numbers, identifiers, doc comments)
+  # 2. Comment scanner: regular # comments (stripped by lexer)
+  # 3. AST pass: upgrades definition-site tokens (function names, params, structs, etc.)
+  var tok_lines = vec_new<Int>()
+  var tok_cols = vec_new<Int>()
+  var tok_lens = vec_new<Int>()
+  var tok_types = vec_new<Int>()
+  var tok_mods = vec_new<Int>()
+
+  # Pass 1: Lexer tokens (base layer)
+  var source = _lsp_doc_get(uri)
+  if str_byte_len(source) > 0
+    _lsp_collect_lexer_tokens(source, tok_lines, tok_cols, tok_lens, tok_types, tok_mods)
+    # Pass 2: Regular comment tokens
+    _lsp_collect_comment_tokens(source, tok_lines, tok_cols, tok_lens, tok_types, tok_mods)
+  end
+
+  # Pass 3: AST definition upgrades (overrides lexer VARIABLE with FUNCTION, PARAMETER, etc.)
+  if store != 0 and root != 0
+    var children = ast::ast_get_children(store, root)
+    if children != 0
+      var cc = vec_size(children)
+      for ci in 0..cc
+        _lsp_collect_semantic_tokens(store, vec_get(children, ci), tok_lines, tok_cols, tok_lens, tok_types, tok_mods)
+      end
+    end
+  end
+
+  # Sort tokens by (line, col) — stable insertion sort
+  var n = tok_lines.size
+  for i in 1..n
+    var key_line = tok_lines[i]
+    var key_col = tok_cols[i]
+    var key_len = tok_lens[i]
+    var key_type = tok_types[i]
+    var key_mod = tok_mods[i]
+    var j = i - 1
+    while j >= 0 and (tok_lines[j] > key_line or (tok_lines[j] == key_line and tok_cols[j] > key_col))
+      tok_lines[j + 1] = tok_lines[j]
+      tok_cols[j + 1] = tok_cols[j]
+      tok_lens[j + 1] = tok_lens[j]
+      tok_types[j + 1] = tok_types[j]
+      tok_mods[j + 1] = tok_mods[j]
+      j -= 1
+    end
+    tok_lines[j + 1] = key_line
+    tok_cols[j + 1] = key_col
+    tok_lens[j + 1] = key_len
+    tok_types[j + 1] = key_type
+    tok_mods[j + 1] = key_mod
+  end
+
+  # Dedup: for consecutive tokens at same (line, col), keep last (AST upgrade wins)
+  var dedup_lines = vec_new<Int>()
+  var dedup_cols = vec_new<Int>()
+  var dedup_lens = vec_new<Int>()
+  var dedup_types = vec_new<Int>()
+  var dedup_mods = vec_new<Int>()
+  for i in 0..n
+    # If next token has same position, skip this one (keep later = AST upgrade)
+    if i + 1 < n and tok_lines[i] == tok_lines[i + 1] and tok_cols[i] == tok_cols[i + 1]
+      continue
+    end
+    dedup_lines.push(tok_lines[i])
+    dedup_cols.push(tok_cols[i])
+    dedup_lens.push(tok_lens[i])
+    dedup_types.push(tok_types[i])
+    dedup_mods.push(tok_mods[i])
+  end
+
+  # Delta-encode into flat array
+  var dn = dedup_lines.size
+  var sb = sb_new()
+  sb.append("{\"data\":[")
+  var prev_line = 0
+  var prev_col = 0
+  for i in 0..dn
+    if i > 0
+      sb.append(",")
+    end
+    var dl = dedup_lines[i] - prev_line
+    var dc = dedup_cols[i]
+    if dl == 0
+      dc = dedup_cols[i] - prev_col
+    end
+    prev_line = dedup_lines[i]
+    prev_col = dedup_cols[i]
+    sb.append(str_from_int(dl))
+    sb.append(",")
+    sb.append(str_from_int(dc))
+    sb.append(",")
+    sb.append(str_from_int(dedup_lens[i]))
+    sb.append(",")
+    sb.append(str_from_int(dedup_types[i]))
+    sb.append(",")
+    sb.append(str_from_int(dedup_mods[i]))
+  end
+  sb.append("]}")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+# ============================================================================
+# Inlay Hint Type Capture (populated during TC in lsp_publish_diagnostics)
+# ============================================================================
+
+## Walk a function body AST and capture inferred types for unannotated let bindings.
+## Reads the TC scope vectors (physically preserved after tc_exit_scope) to find
+## the type for each binding by name.
+def _lsp_capture_hint_bindings(store: Int, node: Int, tc: TypecheckState, phys_size: Int): Void
+  if node == 0
+    return
+  end
+  var kind = ast::ast_get_kind(store, node)
+
+  if kind == node_constants::NODE_LET
+    var vname = ast::ast_get_str1(store, node)
+    var annotation = ast::ast_get_str2(store, node)
+    if str_byte_len(vname) > 0 and str_byte_len(annotation) == 0
+      # Unannotated binding — look up type from TC scope vectors
+      var type_str = ""
+      var binding_names = tc.scope.binding_names
+      var binding_types = tc.scope.binding_types
+      var binding_type_annotations = tc.scope.binding_type_annotations
+      var binding_struct_names = tc.scope.binding_struct_names
+      var i = phys_size - 1
+      while i >= 0
+        if binding_names[i] == vname
+          # Found matching binding — prefer annotation, then struct name, then type name
+          if str_byte_len(binding_type_annotations[i]) > 0
+            type_str = binding_type_annotations[i]
+          elsif str_byte_len(binding_struct_names[i]) > 0
+            type_str = binding_struct_names[i]
+          else
+            type_str = typecheck::tc_type_name_full(tc, binding_types[i])
+          end
+          break
+        end
+        i -= 1
+      end
+      if str_byte_len(type_str) > 0 and type_str != "unknown" and type_str != "error"
+        var hline = ast::ast_get_line(store, node)
+        var hcol = ast::ast_get_col(store, node)
+        g_lsp_hint_lines.push(hline)
+        g_lsp_hint_cols.push(hcol)
+        g_lsp_hint_types.push(type_str)
+      end
+    end
+  end
+
+  # Skip nested functions/lambdas (different scope)
+  if kind == node_constants::NODE_FUNCTION or kind == node_constants::NODE_LAMBDA
+    return
+  end
+
+  # Recurse into children
+  var children = ast::ast_get_children(store, node)
+  if children != 0
+    var cc = vec_size(children)
+    for ci in 0..cc
+      _lsp_capture_hint_bindings(store, vec_get(children, ci), tc, phys_size)
+    end
+  end
+  var left = ast::ast_get_left(store, node)
+  if left != 0
+    _lsp_capture_hint_bindings(store, left, tc, phys_size)
+  end
+  var right = ast::ast_get_right(store, node)
+  if right != 0
+    _lsp_capture_hint_bindings(store, right, tc, phys_size)
+  end
+  if kind == node_constants::NODE_IF
+    var else_branch = ast::ast_get_extra(store, node)
+    if else_branch != 0
+      _lsp_capture_hint_bindings(store, else_branch, tc, phys_size)
+    end
+  end
+end
+
+# ============================================================================
+# Inlay Hints (ghost text for inferred types)
+# ============================================================================
+
+## Scan source text for variable bindings without explicit type annotations.
+## Produces inlay hints showing the variable name position where `: Type` would go.
+def _lsp_handle_inlay_hint(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+
+  var store = _lsp_ast_cache_get_store(uri)
+  var root = _lsp_ast_cache_get_root(uri)
+
+  var sb = sb_new()
+  sb.append("[")
+  var has_item = 0
+
+  if store != 0 and root != 0
+    var children = ast::ast_get_children(store, root)
+    if children != 0
+      var count = vec_size(children)
+      for i in 0..count
+        var child = vec_get(children, i)
+        if child == 0
+          continue
+        end
+        var kind = ast::ast_get_kind(store, child)
+        # Look for function definitions and scan their bodies for LET nodes
+        # (right = body node, NOT children which is naked/guard encoding)
+        if kind == node_constants::NODE_FUNCTION
+          var body_node = ast::ast_get_right(store, child)
+          if body_node != 0
+            has_item = _lsp_collect_inlay_hints(store, body_node, sb, has_item)
+          end
+        end
+      end
+    end
+  end
+
+  sb.append("]")
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+## Check if an AST node is a let/var binding without a type annotation,
+## and emit an inlay hint if so.
+def _lsp_collect_inlay_hints(store: Int, node: Int, sb: StringBuilder, has_item: Int): Int
+  if node == 0
+    return has_item
+  end
+  var kind = ast::ast_get_kind(store, node)
+
+  # NODE_LET (25) = let/var binding
+  if kind == node_constants::NODE_LET
+    var vname = ast::ast_get_str1(store, node)
+    var annotation = ast::ast_get_str2(store, node)
+    # If no explicit type annotation, show a hint
+    if str_byte_len(vname) > 0 and str_byte_len(annotation) == 0
+      var hline = ast::ast_get_line(store, node) - 1
+      var hcol = ast::ast_get_col(store, node) - 1
+      if hline >= 0 and hcol >= 0
+        # Position hint after the variable name
+        var hint_col = hcol + str_byte_len(vname)
+        # Look up inferred type from hint cache
+        var hint_label = ": _"
+        var node_line = ast::ast_get_line(store, node)
+        var node_col = ast::ast_get_col(store, node)
+        for hi in 0..g_lsp_hint_lines.size
+          if g_lsp_hint_lines[hi] == node_line and g_lsp_hint_cols[hi] == node_col
+            hint_label = ": #{g_lsp_hint_types[hi]}"
+            break
+          end
+        end
+        if has_item == 1
+          sb.append(",")
+        end
+        sb.append("{\"position\":{\"line\":")
+        sb.append(str_from_int(hline))
+        sb.append(",\"character\":")
+        sb.append(str_from_int(hint_col))
+        sb.append("},\"label\":\"")
+        sb.append(_lsp_json_escape(hint_label))
+        sb.append("\",\"kind\":1,\"paddingLeft\":false,\"paddingRight\":true}")
+        has_item = 1
+      end
+    end
+  end
+
+  # For NODE_FUNCTION/LAMBDA: left=params Vec, right=body, children=encoding (not a Vec)
+  if kind == node_constants::NODE_FUNCTION or kind == node_constants::NODE_LAMBDA
+    var body_node = ast::ast_get_right(store, node)
+    if body_node != 0
+      has_item = _lsp_collect_inlay_hints(store, body_node, sb, has_item)
+    end
+    return has_item
+  end
+
+  # Recurse into children for nested scopes (if/for/while bodies)
+  var children = ast::ast_get_children(store, node)
+  if children != 0
+    var count = vec_size(children)
+    for i in 0..count
+      var child = vec_get(children, i)
+      has_item = _lsp_collect_inlay_hints(store, child, sb, has_item)
+    end
+  end
+
+  # Recurse into left/right for statement nodes (return, assign, expr_stmt, if, while, for, etc.)
+  var left = ast::ast_get_left(store, node)
+  if left != 0
+    has_item = _lsp_collect_inlay_hints(store, left, sb, has_item)
+  end
+  var right = ast::ast_get_right(store, node)
+  if right != 0
+    has_item = _lsp_collect_inlay_hints(store, right, sb, has_item)
+  end
+  # if-else: else branch is in extras
+  if kind == node_constants::NODE_IF
+    var else_branch = ast::ast_get_extra(store, node)
+    if else_branch != 0
+      has_item = _lsp_collect_inlay_hints(store, else_branch, sb, has_item)
+    end
+  end
+
+  return has_item
+end
+
+# ============================================================================
+# Inline Completion (Ghost Text) — LSP 3.18+
+# ============================================================================
+
+## Extract the text of a specific 0-based line from source via byte scan.
+## Returns "" if line_num is out of range.
+def _lsp_line_at(source: String, line_num: Int): String
+  var slen = str_byte_len(source)
+  var cur_line = 0
+  var line_start = 0
+  var pos = 0
+  while pos < slen
+    if cur_line == line_num
+      # Found the start — scan to end of line
+      var line_end = pos
+      while line_end < slen and str_byte_at(source, line_end) != '\n'
+        line_end += 1
+      end
+      return str_byte_slice(source, pos, line_end)
+    end
+    if str_byte_at(source, pos) == '\n'
+      cur_line += 1
+    end
+    pos += 1
+  end
+  return ""
+end
+
+## Count leading spaces in a line.
+def _lsp_count_indent(line: String): Int
+  var count = 0
+  var llen = str_byte_len(line)
+  while count < llen and str_byte_at(line, count) == ' '
+    count += 1
+  end
+  return count
+end
+
+## Get the trimmed text of the next non-empty line after line_num.
+## Returns "" if no such line exists.
+def _lsp_next_nonempty_line(source: String, line_num: Int): String
+  var slen = str_byte_len(source)
+  var cur_line = 0
+  var pos = 0
+  # Advance to start of line after line_num
+  while pos < slen and cur_line <= line_num
+    if str_byte_at(source, pos) == '\n'
+      cur_line += 1
+    end
+    pos += 1
+  end
+  # Now scan forward for first non-empty line
+  while pos < slen
+    var line_end = pos
+    while line_end < slen and str_byte_at(source, line_end) != '\n'
+      line_end += 1
+    end
+    var line_text = str_byte_slice(source, pos, line_end)
+    var trimmed = str_trim(line_text)
+    if str_byte_len(trimmed) > 0
+      return trimmed
+    end
+    pos = line_end + 1
+  end
+  return ""
+end
+
+## Build an indentation string of `count` spaces.
+def _lsp_build_indent(count: Int): String
+  var sb = sb_new()
+  for i in 0..count
+    sb.append(" ")
+  end
+  var result = sb.to_string()
+  sb_free(sb)
+  return result
+end
+
+## Check if a def line is an endless def (trailing `=` or `= expr`).
+## Looks for `=` after `)` or after `: Type` that is NOT `==`.
+def _lsp_is_endless_def(line: String): Bool
+  var llen = str_byte_len(line)
+  if llen == 0
+    return false
+  end
+  # Scan backwards from end for '=' skipping trailing whitespace
+  var pos = llen - 1
+  while pos >= 0 and str_byte_at(line, pos) == ' '
+    pos -= 1
+  end
+  # If the last non-space char is '=', check it's not '=='
+  if pos >= 0 and str_byte_at(line, pos) == '='
+    if pos > 0 and str_byte_at(line, pos - 1) == '='
+      return false
+    end
+    return true
+  end
+  # Also check if there's a `= <expr>` somewhere after the closing `)` or `: Type`
+  # Find last ')' position
+  var paren_pos = -1
+  for i in 0..llen
+    if str_byte_at(line, i) == ')'
+      paren_pos = i
+    end
+  end
+  if paren_pos >= 0
+    var after = paren_pos + 1
+    # Skip optional `: Type` annotation
+    while after < llen and str_byte_at(line, after) == ' '
+      after += 1
+    end
+    if after < llen and str_byte_at(line, after) == ':'
+      after += 1
+      # Skip type annotation
+      while after < llen and str_byte_at(line, after) != '='
+        after += 1
+      end
+    end
+    while after < llen and str_byte_at(line, after) == ' '
+      after += 1
+    end
+    if after < llen and str_byte_at(line, after) == '='
+      if after + 1 < llen and str_byte_at(line, after + 1) == '='
+        return false
+      end
+      return true
+    end
+  end
+  return false
+end
+
+## Check if a line ends with `do ->` or `do x ->` (callback block).
+def _lsp_ends_with_do_arrow(line: String): Bool
+  var trimmed = str_trim(line)
+  if str_ends_with(trimmed, "do ->")
+    return true
+  end
+  # Check for `do x ->` pattern: ends with `->`, has `do ` before the param
+  if not str_ends_with(trimmed, "->")
+    return false
+  end
+  var tlen = str_byte_len(trimmed)
+  # Scan backwards from "->", skip param name, look for "do "
+  var pos = tlen - 3
+  while pos >= 0 and str_byte_at(trimmed, pos) == ' '
+    pos -= 1
+  end
+  # Skip parameter name (identifier chars)
+  while pos >= 0
+    var ch = str_byte_at(trimmed, pos)
+    if ch == ' '
+      break
+    end
+    pos -= 1
+  end
+  # Now we should be at space before param, check for "do" before it
+  while pos >= 0 and str_byte_at(trimmed, pos) == ' '
+    pos -= 1
+  end
+  if pos >= 1
+    if str_byte_at(trimmed, pos - 1) == 'd' and str_byte_at(trimmed, pos) == 'o'
+      # Ensure 'do' is preceded by space or is at start
+      if pos - 1 == 0 or str_byte_at(trimmed, pos - 2) == ' '
+        return true
+      end
+    end
+  end
+  return false
+end
+
+## Handle textDocument/inlineCompletion — deterministic ghost text suggestions.
+def _lsp_handle_inline_completion(id: Int, params: String): Void
+  var td = lsp_json_get_obj(params, "textDocument")
+  var uri = lsp_json_get_str(td, "uri")
+  var pos_obj = lsp_json_get_obj(params, "position")
+  var line_num = lsp_json_get_int(pos_obj, "line")
+  var col = lsp_json_get_int(pos_obj, "character")
+
+  # Extract trigger kind: 1=Invoked, 2=Automatic
+  var ctx_obj = lsp_json_get_obj(params, "context")
+  var trigger_kind = lsp_json_get_int(ctx_obj, "triggerKind")
+
+  var source = _lsp_doc_get(uri)
+  if str_byte_len(source) == 0
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+
+  var line_text = _lsp_line_at(source, line_num)
+  if str_byte_len(line_text) == 0
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+
+  var trimmed = str_trim(line_text)
+  var trimmed_len = str_byte_len(trimmed)
+
+  # Guard: skip empty lines and comments
+  if trimmed_len == 0 or str_starts_with(trimmed, "#")
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+
+  var indent = _lsp_count_indent(line_text)
+  var inner_indent = _lsp_build_indent(indent + 2)
+  var outer_indent = _lsp_build_indent(indent)
+
+  # Dedup guard: if next non-empty line is `end` at same or lesser indent, skip
+  var next_line = _lsp_next_nonempty_line(source, line_num)
+  var has_end = next_line == "end"
+
+  # Standard block ghost text: \n{inner}\n{outer}end
+  var block_text = "\\n#{inner_indent}\\n#{outer_indent}end"
+  # Match block: \n{inner}_ => \n{outer}end
+  var match_text = "\\n#{inner_indent}_ => \\n#{outer_indent}end"
+  # Inner-only (elsif): \n{inner}
+  var inner_text = "\\n#{inner_indent}"
+
+  var sb = sb_new()
+  var matched = 0
+
+  # --- Tier 1: Block completions ---
+
+  # def (with endless def exclusion)
+  if matched == 0 and str_starts_with(trimmed, "def ")
+    if not _lsp_is_endless_def(trimmed)
+      if not has_end
+        matched = 1
+        sb.append("{\"items\":[{\"insertText\":\"")
+        sb.append(block_text)
+        sb.append("\"}]}")
+      end
+    end
+  end
+
+  # if (not `if_` — guard against identifiers like `if_found`)
+  if matched == 0 and str_starts_with(trimmed, "if ")
+    if not has_end
+      matched = 1
+      if trigger_kind == 1
+        # Invoked: offer if, if/else, if/elsif/else variants
+        sb.append("{\"items\":[")
+        sb.append("{\"insertText\":\"")
+        sb.append(block_text)
+        sb.append("\"}")
+        sb.append(",{\"insertText\":\"")
+        sb.append("\\n#{inner_indent}\\n#{outer_indent}else\\n#{inner_indent}\\n#{outer_indent}end")
+        sb.append("\"}")
+        sb.append(",{\"insertText\":\"")
+        sb.append("\\n#{inner_indent}\\n#{outer_indent}elsif \\n#{inner_indent}\\n#{outer_indent}else\\n#{inner_indent}\\n#{outer_indent}end")
+        sb.append("\"}")
+        sb.append("]}")
+      else
+        sb.append("{\"items\":[{\"insertText\":\"")
+        sb.append(block_text)
+        sb.append("\"}]}")
+      end
+    end
+  end
+
+  # elsif (inner only — parent `if` owns the `end`)
+  if matched == 0 and str_starts_with(trimmed, "elsif ")
+    matched = 1
+    sb.append("{\"items\":[{\"insertText\":\"")
+    sb.append(inner_text)
+    sb.append("\"}]}")
+  end
+
+  # match
+  if matched == 0 and str_starts_with(trimmed, "match ")
+    if not has_end
+      matched = 1
+      if trigger_kind == 1
+        sb.append("{\"items\":[")
+        sb.append("{\"insertText\":\"")
+        sb.append(match_text)
+        sb.append("\"}")
+        sb.append(",{\"insertText\":\"")
+        sb.append("\\n#{inner_indent}pattern => result\\n#{inner_indent}_ => \\n#{outer_indent}end")
+        sb.append("\"}")
+        sb.append("]}")
+      else
+        sb.append("{\"items\":[{\"insertText\":\"")
+        sb.append(match_text)
+        sb.append("\"}]}")
+      end
+    end
+  end
+
+  # for
+  if matched == 0 and str_starts_with(trimmed, "for ")
+    if not has_end
+      matched = 1
+      sb.append("{\"items\":[{\"insertText\":\"")
+      sb.append(block_text)
+      sb.append("\"}]}")
+    end
+  end
+
+  # while
+  if matched == 0 and str_starts_with(trimmed, "while ")
+    if not has_end
+      matched = 1
+      sb.append("{\"items\":[{\"insertText\":\"")
+      sb.append(block_text)
+      sb.append("\"}]}")
+    end
+  end
+
+  # struct
+  if matched == 0 and str_starts_with(trimmed, "struct ")
+    if not has_end
+      matched = 1
+      sb.append("{\"items\":[{\"insertText\":\"")
+      sb.append(block_text)
+      sb.append("\"}]}")
+    end
+  end
+
+  # enum
+  if matched == 0 and str_starts_with(trimmed, "enum ")
+    if not has_end
+      matched = 1
+      sb.append("{\"items\":[{\"insertText\":\"")
+      sb.append(block_text)
+      sb.append("\"}]}")
+    end
+  end
+
+  # trait
+  if matched == 0 and str_starts_with(trimmed, "trait ")
+    if not has_end
+      matched = 1
+      sb.append("{\"items\":[{\"insertText\":\"")
+      sb.append(block_text)
+      sb.append("\"}]}")
+    end
+  end
+
+  # impl
+  if matched == 0 and str_starts_with(trimmed, "impl ")
+    if not has_end
+      matched = 1
+      sb.append("{\"items\":[{\"insertText\":\"")
+      sb.append(block_text)
+      sb.append("\"}]}")
+    end
+  end
+
+  # --- Tier 2: do -> block pattern (catches QSpec describe/it and all callbacks) ---
+  if matched == 0 and _lsp_ends_with_do_arrow(trimmed)
+    if not has_end
+      matched = 1
+      sb.append("{\"items\":[{\"insertText\":\"")
+      sb.append(block_text)
+      sb.append("\"}]}")
+    end
+  end
+
+  if matched == 0
+    sb_free(sb)
+    lsp_send(_lsp_null_response(id))
+    return
+  end
+
+  var result = sb.to_string()
+  sb_free(sb)
+  lsp_send(_lsp_response(id, result))
+end
+
+# ============================================================================
+# Main Event Loop
+# ============================================================================
+
+## Start the LSP server. Reads JSON-RPC messages from stdin, dispatches
+## to handlers, sends responses to stdout. Returns 0 on clean shutdown.
+def lsp_main(): Int
+  _lsp_init_io()
+  lsp_log("Quartz LSP server starting...")
+
+  var running = 1
+  var shutdown_received = 0
+
+  while running == 1
+    var message = lsp_read_message()
+    if str_byte_len(message) == 0
+      running = 0
+      break
+    end
+
+    # Debounced typecheck: if enough time has elapsed since last edit, run TC
+    if str_byte_len(g_lsp_dirty_uri) > 0
+      var elapsed = time_mono_ns() - g_lsp_dirty_time_ns
+      if elapsed >= LSP_TC_DEBOUNCE_NS
+        var dirty_source = _lsp_doc_get(g_lsp_dirty_uri)
+        if str_byte_len(dirty_source) > 0
+          lsp_publish_diagnostics(g_lsp_dirty_uri, dirty_source, 1)
+        end
+        g_lsp_dirty_uri = ""
+      end
+    end
+
+    var method = lsp_json_get_str(message, "method")
+    var id = lsp_json_get_int(message, "id")
+
+    if method == "initialize"
+      var p = lsp_json_get_obj(message, "params")
+      _lsp_handle_initialize(id, p)
+    elsif method == "initialized"
+      # Trigger workspace scan after initialization
+      _lsp_scan_workspace()
+    elsif method == "shutdown"
+      _lsp_handle_shutdown(id)
+      shutdown_received = 1
+    elsif method == "exit"
+      running = 0
+    elsif method == "textDocument/didOpen"
+      var p = lsp_json_get_obj(message, "params")
+      _lsp_handle_did_open(p)
+    elsif method == "textDocument/didChange"
+      var p = lsp_json_get_obj(message, "params")
+      _lsp_handle_did_change(p)
+    elsif method == "textDocument/didClose"
+      var p = lsp_json_get_obj(message, "params")
+      _lsp_handle_did_close(p)
+    elsif method == "textDocument/hover"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_hover(id, p)
+      end
+    elsif method == "textDocument/definition"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_definition(id, p)
+      end
+    elsif method == "textDocument/completion"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_completion(id, p)
+      end
+    elsif method == "textDocument/signatureHelp"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_signature_help(id, p)
+      end
+    elsif method == "textDocument/documentSymbol"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_document_symbol(id, p)
+      end
+    elsif method == "textDocument/formatting"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_formatting(id, p)
+      end
+    elsif method == "textDocument/semanticTokens/full"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_semantic_tokens(id, p)
+      end
+    elsif method == "textDocument/inlayHint"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_inlay_hint(id, p)
+      end
+    elsif method == "textDocument/references"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_references(id, p)
+      end
+    elsif method == "textDocument/foldingRange"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_folding_range(id, p)
+      end
+    elsif method == "textDocument/documentLink"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_document_link(id, p)
+      end
+    elsif method == "textDocument/documentHighlight"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_document_highlight(id, p)
+      end
+    elsif method == "textDocument/selectionRange"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_selection_range(id, p)
+      end
+    elsif method == "textDocument/prepareRename"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_prepare_rename(id, p)
+      end
+    elsif method == "textDocument/rename"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_rename(id, p)
+      end
+    elsif method == "textDocument/codeAction"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_code_action(id, p)
+      end
+    elsif method == "textDocument/codeLens"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_code_lens(id, p)
+      end
+    elsif method == "codeLens/resolve"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_code_lens_resolve(id, p)
+      end
+    elsif method == "textDocument/prepareCallHierarchy"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_prepare_call_hierarchy(id, p)
+      end
+    elsif method == "callHierarchy/incomingCalls"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_incoming_calls(id, p)
+      end
+    elsif method == "callHierarchy/outgoingCalls"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_outgoing_calls(id, p)
+      end
+    elsif method == "textDocument/prepareTypeHierarchy"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_prepare_type_hierarchy(id, p)
+      end
+    elsif method == "typeHierarchy/supertypes"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_supertypes(id, p)
+      end
+    elsif method == "typeHierarchy/subtypes"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_subtypes(id, p)
+      end
+    elsif method == "workspace/symbol"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_workspace_symbol(id, p)
+      end
+    elsif method == "textDocument/inlineCompletion"
+      if id >= 0
+        var p = lsp_json_get_obj(message, "params")
+        _lsp_handle_inline_completion(id, p)
+      end
+    elsif method == "textDocument/didSave"
+      # Re-publish diagnostics on save with typecheck
+      var p = lsp_json_get_obj(message, "params")
+      var td = lsp_json_get_obj(p, "textDocument")
+      var uri = lsp_json_get_str(td, "uri")
+      # Clear dirty flag to avoid double-run from debounce
+      if g_lsp_dirty_uri == uri
+        g_lsp_dirty_uri = ""
+      end
+      var source = _lsp_doc_get(uri)
+      if str_byte_len(source) > 0
+        lsp_publish_diagnostics(uri, source, 1)
+      end
+    elsif method == "$/cancelRequest"
+      # Request cancellation — currently single-threaded so requests are already
+      # complete by the time we read the cancellation. Acknowledge silently.
+    elsif str_starts_with(method, "$/")
+      # Protocol notifications ($/setTrace, etc.) — ignore
+    elsif str_starts_with(method, "window/")
+      # Window notifications — ignore
+    elsif str_starts_with(method, "workspace/")
+      # Workspace notifications — ignore for now
+      if id >= 0
+        lsp_send(_lsp_null_response(id))
+      end
+    else
+      # Unknown method — error response for requests, ignore notifications
+      if id >= 0
+        lsp_send(_lsp_error_response(id, -32601, "Method not found: #{method}"))
+      end
+    end
+  end
+
+  if shutdown_received == 1
+    return 0
+  end
+  return 1
+end

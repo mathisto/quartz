@@ -1,0 +1,219 @@
+## Scoped resources — B.8 Phase 4a (normal-exit release) + Phase 4b
+## (throw-safe release_on_throw via runtime Throws frame).
+##
+## Contract:
+##   1. `with mutex_guard do v -> body end` calls Scoped::acquire on
+##      block entry, binds the result to v, and calls Scoped::release
+##      on normal block exit.
+##   2. The bound v reflects the current protected value at acquire
+##      time.
+##   3. release receives v unchanged when the body doesn't reassign.
+##   4. Nested `with` blocks acquire/release in correct LIFO order.
+##   5. Early `return` inside the body still fires release (wrap_stack
+##      drain at NODE_RETURN).
+##   6. (Phase 4b) A `throw` or `panic` inside the body fires
+##      release_on_throw and the exception unwinds to the next outer
+##      Throws handler. The lock is released — a subsequent with-block
+##      acquires immediately rather than deadlocking.
+##   7. (Phase 4b) Nested Scoped blocks unwind release_on_throw in LIFO
+##      order before the throw escapes past the outermost.
+
+import * from qspec
+import * from std/sync/exclusion/mutex
+import * from std/throws
+
+# --- Test 1: Normal-exit release writes the bound value back. -----------
+
+def b8_simple_normal_exit(): Int
+  var m = mutex(7)
+  var captured = 0
+  with m.lock do v ->
+    captured = v
+  end
+  # After exit, the protected value should still be 7 — release(v) wrote
+  # back v unchanged because the body didn't pass a new value.
+  return captured
+end
+
+# --- Test 2: Sequential blocks acquire and release independently. -------
+
+def b8_sequential_blocks(): Int
+  var m = mutex(0)
+  var t1 = 0
+  var t2 = 0
+  with m.lock do v ->
+    t1 = v + 100
+  end
+  with m.lock do v ->
+    t2 = v + 200
+  end
+  return t1 + t2
+end
+
+# --- Test 3: Nested with-blocks on different mutexes. -------------------
+
+def b8_nested_blocks(): Int
+  var m1 = mutex(10)
+  var m2 = mutex(20)
+  var sum = 0
+  with m1.lock do a ->
+    with m2.lock do b ->
+      sum = a + b
+    end
+  end
+  return sum
+end
+
+# --- Test 4: Bound param refers correctly inside expression context. ---
+
+def b8_bound_param_in_expr(): Int
+  var m = mutex(42)
+  var doubled = 0
+  with m.lock do v ->
+    doubled = v * 2
+  end
+  return doubled
+end
+
+# --- Test 5: Multiple sequential acquire/release on same mutex. --------
+
+def b8_repeat_lock(): Int
+  var m = mutex(1)
+  var total = 0
+  for i in 0..3
+    with m.lock do v ->
+      total = total + v
+    end
+  end
+  return total
+end
+
+# --- Phase 4b throw-safety tests ----------------------------------------
+
+# Module-level capture for throw-handler results so it() blocks can verify.
+var b8_caught_msg = ""
+var b8_caught_count = 0
+
+def b8_capture_throw(op_name: Int, argc: Int, argv: Int): Int
+  b8_caught_msg = as_type<String>(load(argv, 0))
+  b8_caught_count += 1
+  return 0
+end
+
+# --- Test 6: throw inside Scoped fires release_on_throw + unlock. -------
+
+def b8_throw_fires_release_on_throw(): Int
+  var m = mutex(7)
+  with Throws { throw: b8_capture_throw } do ->
+    with m.lock do v ->
+      throw("boom")
+    end
+    0
+  end
+  # Outer with-block returned 0 (handler's return). The mutex SHOULD be
+  # released — release_on_throw ran on the inner unwind. A second
+  # with-block here would deadlock if the lock had leaked.
+  var sentinel = 0
+  with m.lock do v ->
+    sentinel = v
+  end
+  return sentinel
+end
+
+# --- Test 7: panic inside Scoped fires release_on_throw + unlock. ------
+
+def b8_panic_inside_scoped_unwinds_through_release(): Int
+  var m = mutex(11)
+  b8_caught_msg = ""
+  with Throws { throw: b8_capture_throw } do ->
+    with m.lock do v ->
+      panic("kaboom")
+    end
+    0
+  end
+  # Verify the lock released by acquiring again.
+  var seen = 0
+  with m.lock do v ->
+    seen = v
+  end
+  return seen
+end
+
+# --- Test 8: Nested Scoped blocks unwind release_on_throw LIFO. --------
+
+def b8_nested_scoped_unwinds_in_lifo_order(): Int
+  var m1 = mutex(100)
+  var m2 = mutex(200)
+  with Throws { throw: b8_capture_throw } do ->
+    with m1.lock do a ->
+      with m2.lock do b ->
+        throw("nested")
+      end
+    end
+    0
+  end
+  # Both locks should be released — verify by re-acquiring both.
+  var sum = 0
+  with m1.lock do a ->
+    with m2.lock do b ->
+      sum = a + b
+    end
+  end
+  return sum
+end
+
+# --- Test 9: handler captures the original throw msg. ------------------
+
+def b8_msg_preserved_through_release(): Int
+  var m = mutex(0)
+  b8_caught_msg = ""
+  with Throws { throw: b8_capture_throw } do ->
+    with m.lock do v ->
+      throw("preserved")
+    end
+    0
+  end
+  return str_byte_len(b8_caught_msg)  # "preserved" → 9 chars
+end
+
+def main(): Int
+  describe("Scoped resources — B.8 Phase 4a + 4b") do ->
+    it("acquire binds v; release fires on normal exit") do ->
+      assert_eq(b8_simple_normal_exit(), 7)
+    end
+
+    it("sequential blocks acquire and release independently") do ->
+      assert_eq(b8_sequential_blocks(), 300)
+    end
+
+    it("nested with-blocks lock LIFO and bind separately") do ->
+      assert_eq(b8_nested_blocks(), 30)
+    end
+
+    it("bound param flows into surrounding expression") do ->
+      assert_eq(b8_bound_param_in_expr(), 84)
+    end
+
+    it("repeated acquire/release on the same mutex") do ->
+      assert_eq(b8_repeat_lock(), 3)
+    end
+
+    it("throw inside Scoped fires release_on_throw, lock released") do ->
+      assert_eq(b8_throw_fires_release_on_throw(), 7)
+    end
+
+    it("panic inside Scoped fires release_on_throw, lock released") do ->
+      assert_eq(b8_panic_inside_scoped_unwinds_through_release(), 11)
+    end
+
+    it("nested Scoped blocks unwind release_on_throw LIFO") do ->
+      assert_eq(b8_nested_scoped_unwinds_in_lifo_order(), 300)
+    end
+
+    it("throw msg flows through release_on_throw to outer Throws handler") do ->
+      assert_eq(b8_msg_preserved_through_release(), 9)
+    end
+  end
+
+  return qspec_main()
+end

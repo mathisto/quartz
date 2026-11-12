@@ -1,0 +1,1148 @@
+##! # Quake — The Quartz Build System
+##!
+##! A self-hosted build automation library for Quartz.
+##! Quakefiles are valid Quartz programs that `import * from quake`.
+##!
+##! ## Usage
+##!
+##!   ```qz
+##!   import * from quake
+##!
+##!   def main(): Int
+##!     task("build", "Build the compiler") do ->
+##!       sh("make build")
+##!     end
+##!     return quake_main()
+##!   end
+##!   ```
+##!
+##! @since Quartz 5.14.0
+
+import * from colors
+import std/reader
+import std/log
+import std/throws
+
+# =============================================================================
+# Task Registry (global, same pattern as QSpec)
+# =============================================================================
+
+## QuakeTask — registered once per `task`/`task_dep`/`task_alias` call.
+##
+## Named `QuakeTask` (not just `Task`) to avoid colliding with `std/progress`'s
+## `Task` struct in dual-import contexts (`Quakefile.qz` imports both).
+## `action == 0` distinguishes alias-only tasks (dependency aggregators with
+## no body) from tasks that run a closure. The closure itself is stored as
+## `as_int(Fn(): Void)` because Fn-typed struct fields surface the friction
+## documented in `feedback_fn_typed_field_call_friction.md`; consumers
+## already use `call_fn(action)` on the Int form.
+@repr(C)
+struct QuakeTask
+  name: String
+  desc: String
+  depends: Vec<String>
+  action: Int  # 0 = no action; else as_int(Fn(): Void)
+end
+
+# Vec<Int> of as_int(QuakeTask) handles
+var _tasks = vec_new()
+
+# Track execution state to prevent re-execution of dependencies
+var _executed = vec_new<String>()
+
+# Verbosity is read from a Reader<Int> ambient installed by `quake_main()`:
+#   0  = normal       (default — task banners, no command echo)
+#   1  = verbose      (`--verbose`/`-v`: also echo each command)
+#   -1 = quiet        (`--quiet`/`-q`: errors only, suppress task banners)
+# Inside any quake_main()-rooted task action, `ask()` returns the
+# installed level. Outside any install (e.g., direct unit tests of the
+# helpers), Reader's runtime default returns 0 — same as today's "no
+# args supplied" behavior.
+
+# =============================================================================
+# Task Definition
+# =============================================================================
+
+## Register a task with name, description, and action.
+def task(name: String, desc: String, action: Fn(): Void): Void
+  _tasks.push(as_int(QuakeTask {
+    name: name,
+    desc: desc,
+    depends: vec_new<String>(),
+    action: as_int(action),
+  }))
+end
+
+## Register a task with dependencies.
+def task_dep(name: String, desc: String, depends: Vec<String>, action: Fn(): Void): Void
+  _tasks.push(as_int(QuakeTask {
+    name: name,
+    desc: desc,
+    depends: depends,
+    action: as_int(action),
+  }))
+end
+
+## Register a dependency-only task (no action body).
+def task_alias(name: String, depends: Vec<String>): Void
+  _tasks.push(as_int(QuakeTask {
+    name: name,
+    desc: "",
+    depends: depends,
+    action: 0,
+  }))
+end
+
+# =============================================================================
+# Task accessors
+# =============================================================================
+
+def _task_name(t: Int): String = as_type<QuakeTask>(t).name
+def _task_desc(t: Int): String = as_type<QuakeTask>(t).desc
+def _task_deps(t: Int): Vec<String> = as_type<QuakeTask>(t).depends
+def _task_action(t: Int): Int = as_type<QuakeTask>(t).action
+
+def _find_task(name: String): Int
+  var count = _tasks.size
+  for i in 0..count
+    var t = _tasks[i]
+    if _task_name(t) == name
+      return t
+    end
+  end
+  return 0
+end
+
+# =============================================================================
+# Shell Execution Primitives
+# =============================================================================
+#
+# Operation Piezoelectric Effects, Phase 6.2.b. Every command-running
+# helper (`sh`, `sh_maybe`, `sh_capture`, `sh_buffered`, `sh_quiet`)
+# is now a thin wrapper over the `Exec` algebraic effect declared
+# below. The default handler implements the union of legacy behaviors
+# (system call, optional stdout capture, optional stderr buffering with
+# step-name UX). User-installable handlers unlock free `--dry-run`,
+# capture-for-test, and remote-executor stories without touching the
+# Quakefile DSL.
+
+## ExecOpts — the per-call knobs the default handler routes on.
+##
+## - `capture_stdout`: when true, run via `pipe_open` and populate
+##   `ExecResult.stdout`. Used by `sh_capture`. Mutually exclusive with
+##   `step_name` (sh_buffered semantics own the stderr-capture path).
+## - `step_name`: when non-empty, run via `cmd 2>tempfile`, populate
+##   `ExecResult.stderr` on failure, and print a colored
+##   `[step] FAILED (exit N)` banner followed by captured stderr to
+##   stderr. Used by `sh_buffered`. Empty string means "plain run".
+@repr(C)
+struct ExecOpts
+  capture_stdout: Bool
+  step_name: String
+end
+
+## ExecResult — what every Exec handler returns. Caller helpers map
+## the fields they care about back to their public return type
+## (Int for sh/sh_maybe/sh_quiet, String for sh_capture, etc).
+@repr(C)
+struct ExecResult
+  exit_code: Int
+  stdout: String
+  stderr: String
+end
+
+## Exec — pluggable command execution.
+##
+## The single op `exec(cmd, opts)` is kind=1 (synchronous return).
+## Every `with Exec { exec: my_handler } do -> ... end` install
+## intercepts subsequent `sh*` calls inside the block. Production
+## quake invocations install `default_exec_handler` (libc `system` +
+## optional pipe / tempfile bookkeeping). `tools/quake.qz`'s
+## `--dry-run` flag swaps in `dry_run_handler` (logs the cmd, returns
+## success without forking). Test harnesses install capture handlers
+## that record commands into a Vec and assert on order.
+effect Exec
+  def exec(cmd: String, opts: ExecOpts): ExecResult
+end
+
+# Monotonic counter for per-call tempfile naming so concurrent
+# sh_buffered-shaped Exec calls don't clobber each other. Wraps via
+# modulo at 2^31 to stay in Int range.
+var _exec_buffered_counter: Int = 0
+
+## Default Exec handler — implements the legacy sh*/sh_capture/
+## sh_buffered behaviors in one function, branching on `opts`.
+## Installed by `quake_main()` unless overridden. Reads the verbosity
+## level via `ask()` and routes the verbose echo through `log::raw`,
+## so capture handlers further out on the Log stack still see the
+## command echoes.
+def default_exec_handler(op_name: Int, argc: Int, argv: Int): Int can Reader, Log
+  var cmd = as_string(load(argv, 0))
+  var opts = as_type<ExecOpts>(load(argv, 1))
+
+  if ask() >= 1
+    log::raw(color_dim("  $ #{cmd}"))
+  end
+
+  if opts.capture_stdout
+    var handle = pipe_open(cmd, "r")
+    if handle == 0
+      var rerr = ExecResult { exit_code: 1, stdout: "", stderr: "Failed to open pipe: #{cmd}" }
+      return as_int(rerr)
+    end
+    var captured = ""
+    var buf = fread(handle, 4096)
+    while str_byte_len(buf) > 0
+      captured = "#{captured}#{buf}"
+      buf = fread(handle, 4096)
+    end
+    pipe_close(handle)
+    var rok = ExecResult { exit_code: 0, stdout: captured, stderr: "" }
+    return as_int(rok)
+  end
+
+  if str_byte_len(opts.step_name) > 0
+    _exec_buffered_counter += 1
+    var err_path = "/tmp/quake-#{opts.step_name}-#{str_from_int(_exec_buffered_counter)}.err"
+    var wrapped = "#{cmd} 2>#{err_path}"
+    var rc_b = system(wrapped)
+    var errs = ""
+    if rc_b != 0
+      if file_exists(err_path) == 1
+        errs = read_file(err_path)
+      end
+      eputs(red("\n[#{opts.step_name}] FAILED (exit #{str_from_int(rc_b)})"))
+      eputs(dim("  $ #{cmd}"))
+      if str_byte_len(errs) > 0
+        eputs(errs)
+      else
+        eputs(dim("  (no stderr captured — process may have crashed)"))
+      end
+    end
+    if file_exists(err_path) == 1
+      file_delete(err_path)
+    end
+    var rb = ExecResult { exit_code: rc_b, stdout: "", stderr: errs }
+    return as_int(rb)
+  end
+
+  var rc_p = system(cmd)
+  var rp = ExecResult { exit_code: rc_p, stdout: "", stderr: "" }
+  return as_int(rp)
+end
+
+## Dry-run Exec handler — logs the command via the Log effect and
+## returns success without forking a subprocess. Install via
+## `with Exec { exec: dry_run_handler } do -> quake_main() end` (or
+## via the launcher's `--dry-run` flag) to preview a build pipeline
+## without side effects. `sh_capture` consumers see empty stdout in
+## dry-run mode — that's the inherent limitation; tasks that fan
+## decisions on captured output should not be dry-run-tested.
+def dry_run_handler(op_name: Int, argc: Int, argv: Int): Int can Reader, Log
+  var cmd = as_string(load(argv, 0))
+  log::raw(color_dim("  $ #{cmd}  ") + color_yellow("[dry-run]"))
+  var r = ExecResult { exit_code: 0, stdout: "", stderr: "" }
+  return as_int(r)
+end
+
+# =============================================================================
+# Test handler factories (A.7 — Phase 6)
+# =============================================================================
+#
+# Drop-in handlers for spec-testing Quakefile tasks without forking
+# subprocesses. Mirror the Cache (A.3 Phase 3) and Random (A.8 Phase 4)
+# factory pattern: a module-level accumulator + an `exec_*_handler`
+# function + reset/inspect helpers. Install via:
+#
+#   with Exec { exec: exec_recording_handler } do -> task_action() end
+#
+# and assert on `exec_recording_log()` afterwards.
+
+## Module-level command log for `exec_recording_handler`. Read via
+## `exec_recording_log()`, reset via `exec_recording_reset()`. Tests
+## that share a process MUST reset between runs to avoid bleed.
+var _exec_recording_log: Vec<String> = vec_new<String>()
+
+## Recording Exec handler — appends every cmd into a module-level Vec
+## and returns success without executing the subprocess. Idiomatic
+## stand-in for the inline `cap_exec` pattern in the original 6.2.b
+## acceptance spec.
+##
+## Note: `opts.capture_stdout` is honored to the extent that the
+## returned ExecResult has empty stdout — sh_capture under this handler
+## returns "". Tests that need canned stdout/stderr should use
+## `exec_replaying_handler` instead.
+def exec_recording_handler(op_name: Int, argc: Int, argv: Int): Int
+  var cmd = as_string(load(argv, 0))
+  _exec_recording_log.push(cmd)
+  var r = ExecResult { exit_code: 0, stdout: "", stderr: "" }
+  return as_int(r)
+end
+
+## Read the recorded commands accumulated by `exec_recording_handler`.
+## Returns the live module-level Vec; do not mutate. Use
+## `exec_recording_reset()` to clear between tests.
+def exec_recording_log(): Vec<String> = _exec_recording_log
+
+## Clear the recording log. Call between tests that share a process.
+def exec_recording_reset(): Void
+  _exec_recording_log = vec_new<String>()
+end
+
+## Module-level replay tables for `exec_replaying_handler`. Fields are stored
+## independently so registration never retains a pointer to a temporary struct.
+## Populated via
+## `exec_replaying_register(...)`, reset via `exec_replaying_reset()`.
+var _exec_replay_exit: Map<String, Int> = map_new<String, Int>()
+var _exec_replay_stdout: Map<String, String> = map_new<String, String>()
+var _exec_replay_stderr: Map<String, String> = map_new<String, String>()
+var _exec_replay_return = ExecResult { exit_code: 0, stdout: "", stderr: "" }
+
+## Replaying Exec handler — looks up the cmd in a pre-seeded table and
+## returns the canned ExecResult. Missing commands fail loudly via
+## `fail()` so spec tests catch unrecorded shell-out attempts.
+##
+## Use to test code paths that decision-fan on subprocess stdout/exit
+## without forking real subprocesses. Combine with
+## `exec_recording_handler` (innermost) to both assert the order of
+## commands AND control what they return.
+def exec_replaying_handler(op_name: Int, argc: Int, argv: Int): Int can Throws
+  var cmd = as_string(load(argv, 0))
+  var result = 0
+  match _exec_replay_exit.get(cmd)
+    Some(exit_code) => {
+      _exec_replay_return = ExecResult {
+        exit_code: exit_code,
+        stdout: _exec_replay_stdout.get(cmd).unwrap_or(""),
+        stderr: _exec_replay_stderr.get(cmd).unwrap_or(""),
+      }
+      result = as_int(_exec_replay_return)
+    }
+    None => fail("no replay registered for: #{cmd}")
+  end
+  return result
+end
+
+## Register a canned ExecResult for a given cmd. Subsequent calls to
+## `sh*(cmd)` under `exec_replaying_handler` return this result. Later
+## registrations for the same cmd overwrite the earlier one.
+def exec_replaying_register(cmd: String, exit_code: Int, stdout: String, stderr: String): Void
+  _exec_replay_exit.set(cmd, exit_code)
+  _exec_replay_stdout.set(cmd, stdout)
+  _exec_replay_stderr.set(cmd, stderr)
+end
+
+## Clear the replay table. Call between tests that share a process.
+def exec_replaying_reset(): Void
+  _exec_replay_exit = map_new<String, Int>()
+  _exec_replay_stdout = map_new<String, String>()
+  _exec_replay_stderr = map_new<String, String>()
+end
+
+## Run a shell command. Fails the build on non-zero exit code.
+def sh(cmd: String): Int can Exec
+  var opts = ExecOpts { capture_stdout: false, step_name: "" }
+  var r = exec(cmd, opts)
+  if r.exit_code != 0
+    fail_typed(BuildError::CommandFailed(cmd, r.exit_code))
+  end
+  return r.exit_code
+end
+
+## Run a shell command, returning the exit code without failing.
+def sh_maybe(cmd: String): Int can Exec
+  var opts = ExecOpts { capture_stdout: false, step_name: "" }
+  var r = exec(cmd, opts)
+  # ExecResult is @repr(C); use its stable field-0 ABI here. In large imported
+  # programs, nominal field lookup can be shadowed and mis-lower this access to
+  # an unrelated field offset after deferred QSpec registration.
+  return load(as_int(r), 0)
+end
+
+## Run a shell command and capture its stdout as a String.
+def sh_capture(cmd: String): String can Exec
+  var opts = ExecOpts { capture_stdout: true, step_name: "" }
+  var r = exec(cmd, opts)
+  if r.exit_code != 0 and str_byte_len(r.stderr) > 0
+    _quake_fail(r.stderr)
+    return ""
+  end
+  return r.stdout
+end
+
+## Run a shell command, suppressing output. Fails on non-zero exit.
+def sh_quiet(cmd: String): Int can Exec
+  var full_cmd = "#{cmd} > /dev/null 2>&1"
+  var opts = ExecOpts { capture_stdout: false, step_name: "" }
+  var r = exec(full_cmd, opts)
+  if r.exit_code != 0
+    fail_typed(BuildError::CommandFailed(cmd, r.exit_code))
+  end
+  return r.exit_code
+end
+
+## Run a shell command with buffered stderr — silent on success, dumps
+## captured stderr on failure along with the failing command. Ninja-style
+## discipline: never swallow stderr to `/dev/null`; when something fails, the
+## user sees exactly what the tool said.
+##
+## `step_name` is a short label used in the error header and as part of the
+## tempfile name. Pass something descriptive like "llc" or "link-gen1".
+##
+## Returns the exit code (0 on success). Does NOT call `_quake_fail` — the
+## caller decides whether the failure is fatal. This lets callers try
+## alternate tool paths (e.g., `/opt/homebrew/opt/llvm/bin/llc`) without
+## aborting on the first miss.
+def sh_buffered(cmd: String, step_name: String): Int can Exec
+  var opts = ExecOpts { capture_stdout: false, step_name: step_name }
+  return exec(cmd, opts).exit_code
+end
+
+# =============================================================================
+# Bare-Metal Linking (SYS.1)
+# =============================================================================
+#
+# Freestanding / kernel / unikernel builds need a linker invocation that
+# pins load address, section layout, and entry symbol via an explicit
+# linker script. `ld.lld -T script.ld ...` is the canonical pipeline for
+# both aarch64 bare-metal (QEMU virt, Raspberry Pi bootloaders) and
+# x86_64 Multiboot kernels. This primitive wraps that invocation so
+# Quakefiles can express a kernel link without reaching for raw `sh()`.
+#
+# The linker is invoked directly as `ld.lld`, not via the clang driver —
+# we want zero default startup (no crt0, no libc, no libgcc) and the
+# clang driver's default libraries can't be fully disabled with one
+# flag on every host. Callers who need host-toolchain link behavior
+# should keep using `_linker()` in their Quakefiles.
+
+## Link bare-metal object files into an ELF using an explicit linker
+## script. Does not pull in libc, crt0, or any host startup code — this
+## is the kernel/unikernel link step.
+##
+## Parameters:
+##   objs          — list of object files to link (.o). At least one.
+##   output        — output path (e.g. "build/kernel.elf").
+##   linker_script — path to the linker script (e.g. "tools/baremetal/aarch64-virt.ld").
+##   extra_flags   — additional `ld.lld` flags, space-separated, or "".
+##                   Common examples: "--gc-sections", "--no-relax",
+##                   "-z max-page-size=0x1000", "--defsym=_foo=0x1000".
+##
+## Returns the exit code from `ld.lld` (0 = success). Non-zero failures
+## surface `ld.lld`'s stderr via `sh_buffered`'s error-capture path.
+## Does NOT call `_quake_fail` — callers decide whether link failure is
+## fatal for their pipeline.
+def link_baremetal(objs: Vec<String>, output: String, linker_script: String, extra_flags: String): Int
+  if objs.size == 0
+    _quake_fail("link_baremetal: no object files provided")
+  end
+  if str_byte_len(linker_script) == 0
+    _quake_fail("link_baremetal: linker_script path required")
+  end
+  if file_exists(linker_script) == 0
+    _quake_fail("link_baremetal: linker script not found: #{linker_script}")
+  end
+  var obj_list = ""
+  var count = objs.size
+  for i in 0..count
+    if i > 0
+      obj_list = "#{obj_list} "
+    end
+    obj_list = "#{obj_list}#{objs[i]}"
+  end
+  var cmd = "ld.lld -T #{linker_script} -o #{output} #{obj_list}"
+  if str_byte_len(extra_flags) > 0
+    cmd = "#{cmd} #{extra_flags}"
+  end
+  return sh_buffered(cmd, "link-baremetal")
+end
+
+## Assemble a `.s` file to a `.o` object file via clang-as-assembler,
+## with an explicit target triple and no host defaults. The clang driver
+## here is used only for its assembler front-end; no linking, no libc,
+## no crt0 is pulled in.
+##
+## Parameters:
+##   source      — path to the `.s` assembly source.
+##   output      — path to the output `.o` object file.
+##   target      — LLVM target triple for the assembler
+##                 (e.g. "aarch64-unknown-none", "x86_64-unknown-none-elf").
+##                 Passed as `--target=<triple>` to clang.
+##   extra_flags — additional clang flags, space-separated, or "".
+##                 Common examples: "-march=armv8-a", "-mcpu=cortex-a57",
+##                 "-fno-pic", "-fno-stack-protector".
+##
+## Returns the exit code from `clang -c` (0 = success). Does NOT call
+## `_quake_fail`; callers decide whether assembler failure is fatal.
+def assemble(source: String, output: String, target: String, extra_flags: String): Int
+  if str_byte_len(source) == 0
+    _quake_fail("assemble: source path required")
+  end
+  if file_exists(source) == 0
+    _quake_fail("assemble: source not found: #{source}")
+  end
+  if str_byte_len(output) == 0
+    _quake_fail("assemble: output path required")
+  end
+  if str_byte_len(target) == 0
+    _quake_fail("assemble: target triple required (e.g. 'aarch64-unknown-none')")
+  end
+  var cmd = "clang --target=#{target} -c #{source} -o #{output}"
+  if str_byte_len(extra_flags) > 0
+    cmd = "#{cmd} #{extra_flags}"
+  end
+  return sh_buffered(cmd, "assemble")
+end
+
+## Compile LLVM IR (`.ll`) to an object file (`.o`) via `llc`, passing
+## through arbitrary target-knob flags. This is the step where kernel /
+## freestanding / embedded builds thread in their CPU-feature knobs
+## (disable SSE, disable red zone, kernel code model, static relocation),
+## without touching the Quartz compiler's own IR generation.
+##
+## Parameters:
+##   ll_source   — path to the `.ll` IR source.
+##   output      — path to the output `.o` object file.
+##   extra_flags — additional `llc` flags, space-separated, or "".
+##                 Common kernel-level knobs:
+##                   "-mtriple=x86_64-unknown-none-elf -march=x86-64
+##                    -mattr=-sse,-mmx,-avx -relocation-model=static
+##                    -code-model=kernel"
+##                   "-mtriple=aarch64-unknown-none -march=armv8-a"
+##                 Red-zone is controlled per-function via the
+##                 `"no-red-zone"` attribute in the IR, not at the LLC
+##                 command line.
+##
+## Returns the exit code from `llc` (0 = success). Tries `llc` from PATH
+## first, then `/opt/homebrew/opt/llvm/bin/llc`, then common Linux paths.
+## Does NOT call `_quake_fail`; callers decide whether LLC failure is
+## fatal for their pipeline.
+def compile_llc_to_obj(ll_source: String, output: String, extra_flags: String): Int
+  if str_byte_len(ll_source) == 0
+    _quake_fail("compile_llc_to_obj: ll_source path required")
+  end
+  if file_exists(ll_source) == 0
+    _quake_fail("compile_llc_to_obj: IR source not found: #{ll_source}")
+  end
+  if str_byte_len(output) == 0
+    _quake_fail("compile_llc_to_obj: output path required")
+  end
+  var llc_bin = _find_llc()
+  if str_byte_len(llc_bin) == 0
+    _quake_fail("compile_llc_to_obj: llc not found in PATH or common install paths")
+  end
+  var cmd = "#{llc_bin} -filetype=obj #{ll_source} -o #{output}"
+  if str_byte_len(extra_flags) > 0
+    cmd = "#{cmd} #{extra_flags}"
+  end
+  return sh_buffered(cmd, "llc")
+end
+
+## Find the `llc` binary on the current host. Matches the probe list
+## used by `tools/quake.qz` (the launcher) so the primitives here and
+## the launcher stay consistent. Returns "" if no llc is found.
+def _find_llc(): String
+  var candidates = vec_new<String>()
+  candidates.push("llc")
+  candidates.push("/opt/homebrew/opt/llvm/bin/llc")
+  candidates.push("/usr/lib/llvm-21/bin/llc")
+  candidates.push("/usr/lib/llvm-20/bin/llc")
+  candidates.push("/usr/lib/llvm-19/bin/llc")
+  var n = candidates.size
+  for i in 0..n
+    var c = candidates[i]
+    # `c --version` exits 0 if the binary exists; exit 127 from the
+    # shell means "command not found." Redirect output so the probe
+    # stays silent on the happy path.
+    var rc = system("#{c} --version > /dev/null 2>&1")
+    if rc == 0
+      return c
+    end
+  end
+  return ""
+end
+
+# =============================================================================
+# File Operations
+# =============================================================================
+
+## Remove a file (silently ignores if file doesn't exist).
+def rm(path: String): Void
+  if file_exists(path) == 1
+    file_delete(path)
+  end
+end
+
+## Move/rename a file.
+def mv(src: String, dst: String): Void
+  var result = rename(src, dst)
+  if result != 0
+    fail_typed(BuildError::IOError(src, "mv failed: #{src} -> #{dst}"))
+  end
+end
+
+## Copy a file.
+def cp(src: String, dst: String): Void
+  var content = read_file(src)
+  var _w = write_file(dst, content)
+end
+
+## Create a directory (with parents, like mkdir -p).
+## Silently succeeds if the directory already exists.
+def mkdir_p(path: String): Void
+  var parts = str_split(path, "/")
+  var count = vec_size(parts)
+  var current = ""
+  for i in 0..count
+    var part = as_string(parts[i])
+    if str_byte_len(part) == 0
+      if i == 0
+        current = "/"
+      end
+    else
+      if str_byte_len(current) == 0
+        current = part
+      elsif current == "/"
+        current = "#{current}#{part}"
+      else
+        current = "#{current}/#{part}"
+      end
+      mkdir(current)
+    end
+  end
+end
+
+## Recursively remove a directory and all its contents.
+def rm_rf(path: String): Void
+  if file_exists(path) == 0
+    return
+  end
+  # Try as file first
+  file_delete(path)
+  if file_exists(path) == 0
+    return
+  end
+  # Must be a directory — recurse
+  var entries = readdir(path)
+  var count = vec_size(entries)
+  for i in 0..count
+    var entry = as_string(entries[i])
+    if entry != "." and entry != ".."
+      var child = "#{path}/#{entry}"
+      rm_rf(child)
+    end
+  end
+  var _r = rmdir(path)
+end
+
+## Check if a path exists (file or directory).
+def exists(path: String): Int = file_exists(path)
+
+## Get the basename of a path (filename without directory).
+def basename(path: String): String = path_basename(path)
+
+## Get the basename with a specific extension stripped.
+def basename_no_ext(path: String, ext: String): String
+  var base = path_basename(path)
+  if str_ends_with(base, ext) == 1
+    return str_byte_slice(base, 0, str_byte_len(base) - str_byte_len(ext))
+  end
+  return base
+end
+
+## Get the directory part of a path.
+def dirname(path: String): String = path_dir(path)
+
+# =============================================================================
+# Glob — Pure Quartz Implementation
+# =============================================================================
+
+## Find files matching a glob pattern.
+## Supports `*` (any chars in filename) and `**` (recursive directory descent).
+def glob(pattern: String): Vec<String>
+  var results = vec_new<String>()
+  var parts = str_split(pattern, "/")
+  _glob_walk(".", parts, 0, results)
+  vec_sort(results)
+  return results
+end
+
+def _glob_walk(dir: String, parts: Vec<Int>, idx: Int, results: Vec<String>): Void
+  var part_count = vec_size(parts)
+  if idx >= part_count
+    return
+  end
+
+  var segment = as_string(parts[idx])
+  var is_last = idx == part_count - 1
+
+  # ** — recursive descent
+  if segment == "**"
+    _glob_walk(dir, parts, idx + 1, results)
+    var entries = readdir(dir)
+    var count = vec_size(entries)
+    for i in 0..count
+      var entry = as_string(entries[i])
+      if entry != "." and entry != ".."
+        var child_path = _path_join(dir, entry)
+        _glob_walk(child_path, parts, idx, results)
+      end
+    end
+    return
+  end
+
+  # Regular segment (may contain *)
+  var entries = readdir(dir)
+  var count = vec_size(entries)
+  for i in 0..count
+    var entry = as_string(entries[i])
+    if entry == "." or entry == ".."
+    elsif _glob_match(segment, entry) == 1
+      var child_path = _path_join(dir, entry)
+      if is_last
+        results.push(child_path)
+      else
+        _glob_walk(child_path, parts, idx + 1, results)
+      end
+    end
+  end
+end
+
+## Simple glob pattern matching (* matches any chars).
+def _glob_match(pattern: String, name: String): Int
+  var plen = str_byte_len(pattern)
+  var nlen = str_byte_len(name)
+  return _glob_match_rec(pattern, 0, plen, name, 0, nlen)
+end
+
+def _glob_match_rec(p: String, pi: Int, plen: Int, n: String, ni: Int, nlen: Int): Int
+  if pi == plen and ni == nlen
+    return 1
+  end
+  if pi == plen
+    return 0
+  end
+  var pc = str_byte_at(p, pi)
+  if pc == '*'
+    var try_ni = ni
+    while try_ni <= nlen
+      if _glob_match_rec(p, pi + 1, plen, n, try_ni, nlen) == 1
+        return 1
+      end
+      try_ni = try_ni + 1
+    end
+    return 0
+  end
+  if ni >= nlen
+    return 0
+  end
+  var nc = str_byte_at(n, ni)
+  if pc == nc
+    return _glob_match_rec(p, pi + 1, plen, n, ni + 1, nlen)
+  end
+  return 0
+end
+
+def _path_join(dir: String, name: String): String
+  if dir == "."
+    return name
+  end
+  return "#{dir}/#{name}"
+end
+
+# =============================================================================
+# Environment
+# =============================================================================
+
+## Set an environment variable.
+def env(key: String, val: String): Void
+  var _s = setenv(key, val)
+end
+
+## Get an environment variable (returns "" if not set).
+def env_get(key: String): String = getenv(key)
+
+# =============================================================================
+# Progress & Error Reporting
+# =============================================================================
+
+## Execute a named step within a task, with progress output.
+def step(name: String, action: Fn(): Void): Void
+  eprint("#{color_bold(color_cyan("  → "))}#{name} ")
+  action()
+  eputs(color_green("✓"))
+end
+
+## BuildError — typed Quake-specific error variants. Phase 6.2.c
+## introduces this for structured error construction at high-value
+## sites (`sh()` failures, task lookup misses). Internally these get
+## stringified and routed through the std/throws `throw(msg)` op
+## (kind=2 unwind), so the existing `with Throws { throw: capture }`
+## handler ABI catches them. Test harnesses can capture via Throws;
+## the launcher's `--keep-going` mode wraps each task action with
+## a collect handler so a failed task doesn't abort the run.
+enum BuildError
+  CommandFailed(cmd: String, exit_code: Int)
+  TaskNotFound(name: String)
+  AssertionFailed(msg: String)
+  IOError(path: String, msg: String)
+end
+
+## Format a BuildError for human consumption + Throws transport.
+## Single-line so it fits the existing `[red]✗ FAILED: <msg>` print
+## format used by the default Quake Throws handler.
+def _build_error_to_string(err: BuildError): String
+  match err
+    BuildError::CommandFailed(cmd, code) => "Command failed (exit " + str_from_int(code) + "): " + cmd
+    BuildError::TaskNotFound(name) => "Unknown task: " + name
+    BuildError::AssertionFailed(msg) => msg
+    BuildError::IOError(path, msg) => "I/O error at " + path + ": " + msg
+  end
+end
+
+## Public alias for raising a typed BuildError. Throws via std/throws.
+## Captured by the Throws handler installed by `quake_main()` (default:
+## print + exit 1; --keep-going: per-task collect + continue).
+def fail_typed(err: BuildError): Void
+  throw(_build_error_to_string(err))
+end
+
+## Fail the build with an error message. Terminates immediately under
+## the default Throws handler (`quake_main()` installs one that does
+## `eputs("[red]✗ FAILED: <msg>"); exit(1)`). Test harnesses install
+## `with Throws { throw: capture } do -> sh("...") end` to intercept.
+def fail(msg: String): Void
+  fail_typed(BuildError::AssertionFailed(msg))
+end
+
+def _quake_fail(msg: String): Void
+  fail_typed(BuildError::AssertionFailed(msg))
+end
+
+# =============================================================================
+# Content Hashing — Change Detection
+# =============================================================================
+
+## Check if target is stale relative to any of the source files.
+## Returns 1 if target doesn't exist or any source is newer.
+def needs_update(target: String, sources: Vec<String>): Int
+  if file_exists(target) == 0
+    return 1
+  end
+  # Conservative: always rebuild. Phase 8 adds content hashing.
+  return 1
+end
+
+# =============================================================================
+# CLI Dispatch — quake_main()
+# =============================================================================
+
+## Default Log handler installed by `quake_main()`. Routes log lines to
+## stdout (preserving the pre-6.2.a behavior where `_print_cmd` used
+## `puts(...)`). Spec tests override via `with Log { emit: capture } do ->
+## _quake_dispatch(...) end` to intercept command echoes.
+def _quake_log_stdout(op_name: Int, argc_l: Int, argv_l: Int): Int
+  var msg = as_string(load(argv_l, 0))
+  puts(msg)
+  return 0
+end
+
+## Default Throws handler installed by `quake_main()`. Replaces the
+## pre-6.2.c `_quake_fail`'s `eputs(...) ; exit(1)` body. Captures
+## throws routed through `std/throws`'s `throw(msg)` op (which Quake's
+## `fail` / `fail_typed` / `_quake_fail` all wrap).
+def _quake_throws_print_and_exit(op_name: Int, argc_l: Int, argv_l: Int): Int
+  var msg = as_string(load(argv_l, 0))
+  eputs("")
+  eputs("#{color_bold(color_red("✗ FAILED: "))}#{msg}")
+  exit(1)
+  return 0
+end
+
+## --keep-going error accumulator. Reset by `quake_main()` when the
+## flag is passed. Per-task wraps in `_execute_task` install a Throws
+## handler that pushes here + resumes (kind=2 unwind back to the
+## with-block, but the with-block is per-task so the OUTER task loop
+## continues to the next task).
+var _quake_collected_errors = vec_new<String>()
+
+## Per-task collect Throws handler used in --keep-going mode.
+## Records the msg + prints a non-fatal yellow header. Returns 1
+## from the with-block; `_execute_task` ignores the value (action
+## was Void anyway).
+def _quake_throws_collect(op_name: Int, argc_l: Int, argv_l: Int): Int can Reader
+  var msg = as_string(load(argv_l, 0))
+  _quake_collected_errors.push(msg)
+  if ask() >= 0
+    eputs("#{color_bold(color_yellow("⚠ task failed: "))}#{msg}")
+  end
+  return 1
+end
+
+# When non-zero, `_execute_task` wraps each `call_fn(action)` in
+# `with Throws { throw: _quake_throws_collect }` so a single task
+# failure doesn't abort the run. Set by `quake_main()` from the
+# --keep-going flag.
+var _quake_keep_going: Int = 0
+
+## Entry point for Quakefiles. Parses CLI args, then installs the
+## ambient `Reader<Verbosity>`, `Log`, `Throws`, and `Exec` effect
+## frames before dispatching the requested task. Verbosity reads
+## via `ask()`; command echoes route through `log::raw`; subprocess
+## execution routes through `exec(cmd, opts)` (handled by either
+## `default_exec_handler` or `dry_run_handler` based on `--dry-run`);
+## fatal errors route through `throw(msg)` (handled by
+## `_quake_throws_print_and_exit` at outer scope, which gives the
+## same "✗ FAILED + exit 1" UX as pre-6.2.c `_quake_fail`).
+def quake_main(): Int
+  colors_auto()
+
+  var task_name = ""
+  var verbosity = 0
+  var dry_run = false
+  var keep_going = false
+  var arg_count = argc()
+
+  var i = 1
+  while i < arg_count
+    var arg = argv(i)
+    if arg == "--list" or arg == "-l"
+      _list_tasks()
+      return 0
+    end
+    if arg == "--help" or arg == "-h"
+      _print_help()
+      return 0
+    end
+    if arg == "--verbose" or arg == "-v"
+      verbosity = 1
+      i = i + 1
+    elsif arg == "--quiet" or arg == "-q"
+      verbosity = -1
+      i = i + 1
+    elsif arg == "--dry-run" or arg == "-n"
+      dry_run = true
+      i = i + 1
+    elsif arg == "--keep-going" or arg == "-k"
+      keep_going = true
+      i = i + 1
+    elsif str_starts_with(arg, "-") == 1
+      eputs(color_red("Unknown option: #{arg}"))
+      return 1
+    else
+      if str_byte_len(task_name) == 0
+        task_name = arg
+      else
+        eputs(color_red("Too many arguments. Expected: quake [task]"))
+        return 1
+      end
+      i = i + 1
+    end
+  end
+
+  if str_byte_len(task_name) == 0
+    task_name = "default"
+  end
+
+  if keep_going
+    _quake_keep_going = 1
+    _quake_collected_errors = vec_new<String>()
+  else
+    _quake_keep_going = 0
+  end
+
+  var rc = with Reader(verbosity) do ->
+    with Log { emit: _quake_log_stdout } do ->
+      with Throws { throw: _quake_throws_print_and_exit } do ->
+        if dry_run
+          with Exec { exec: dry_run_handler } do ->
+            _quake_dispatch(task_name)
+          end
+        else
+          with Exec { exec: default_exec_handler } do ->
+            _quake_dispatch(task_name)
+          end
+        end
+      end
+    end
+  end
+
+  # In --keep-going mode, surface the collected error summary at the
+  # end and exit non-zero if any task failed. The outer Throws install
+  # above never fires under --keep-going (per-task collect handlers
+  # in _execute_task always shadow it for action-time throws).
+  if keep_going and _quake_collected_errors.size > 0
+    eputs("")
+    eputs(color_red("Failed tasks (--keep-going):"))
+    var n = _quake_collected_errors.size
+    for ei in 0..n
+      eputs("  - #{as_string(_quake_collected_errors[ei])}")
+    end
+    return 1
+  end
+
+  return rc
+end
+
+## Resolve and execute the named task under the currently-installed
+## Reader/Log/Throws/Exec frames. Split out from `quake_main()` so
+## spec tests can drive task execution under their own effect
+## installs without going through argv parsing.
+def _quake_dispatch(task_name: String): Int
+  var t = _find_task(task_name)
+  if t == 0
+    _task_not_found(task_name)
+    return 1
+  end
+  _execute_task(task_name)
+  return 0
+end
+
+# =============================================================================
+# Dependency Resolution & Execution
+# =============================================================================
+
+def _execute_task(name: String): Void can Reader
+  # Prevent re-execution in diamond deps
+  var exec_count = vec_size(_executed)
+  for i in 0..exec_count
+    if as_string(_executed[i]) == name
+      return
+    end
+  end
+  _executed.push(name)
+
+  var t = _find_task(name)
+  if t == 0
+    fail_typed(BuildError::TaskNotFound(name))
+  end
+
+  # Execute dependencies first (topological order via recursion)
+  var deps = _task_deps(t)
+  if deps != 0
+    var dep_count = vec_size(deps)
+    for i in 0..dep_count
+      var dep_name = as_string(deps[i])
+      _execute_task(dep_name)
+    end
+  end
+
+  # Execute the task action
+  var action = _task_action(t)
+  if action != 0
+    var desc = _task_desc(t)
+    if ask() >= 0
+      eputs("#{color_bold(color_blue("▸ "))}#{color_bold(name)}#{_fmt_desc(desc)}")
+    end
+    if _quake_keep_going == 1
+      # Per-task collect wrap: shadow the outer print+exit handler so a
+      # single task's throw is captured instead of aborting the run.
+      # The with-block evaluates to handler's return value (1), which
+      # we discard — `action` is Fn(): Void, the task contract is
+      # "ran or failed", not "returned a value".
+      var _wbr = with Throws { throw: _quake_throws_collect } do ->
+        call_fn(action)
+        return 0
+      end
+    else
+      call_fn(action)
+    end
+  end
+end
+
+def _fmt_desc(desc: String): String
+  if str_byte_len(desc) == 0
+    return ""
+  end
+  return color_dim(" — #{desc}")
+end
+
+# =============================================================================
+# Help & Discovery
+# =============================================================================
+
+def _list_tasks(): Void
+  eputs(color_bold("Available tasks:"))
+  eputs("")
+  var count = _tasks.size
+  var max_len = 0
+  for i in 0..count
+    var t = _tasks[i]
+    var name_len = str_byte_len(_task_name(t))
+    if name_len > max_len
+      max_len = name_len
+    end
+  end
+  for i in 0..count
+    var t = _tasks[i]
+    var name = _task_name(t)
+    var desc = _task_desc(t)
+    var pad = max_len - str_byte_len(name) + 2
+    var line = "  #{color_green(name)}"
+    var j = 0
+    while j < pad
+      line = "#{line} "
+      j = j + 1
+    end
+    if str_byte_len(desc) > 0
+      line = "#{line}#{color_dim("# #{desc}")}"
+    end
+    eputs(line)
+  end
+end
+
+def _task_not_found(name: String): Void
+  eputs("#{color_red("Task not found: ")}#{color_bold(name)}")
+
+  var count = _tasks.size
+  var suggestions = vec_new<String>()
+  for i in 0..count
+    var t = _tasks[i]
+    var t_name = _task_name(t)
+    if str_contains(t_name, name) == 1 or str_contains(name, t_name) == 1
+      suggestions.push(t_name)
+    end
+  end
+
+  if suggestions.size > 0
+    eprint(color_dim("  Did you mean: "))
+    var scount = suggestions.size
+    for i in 0..scount
+      if i > 0
+        eprint(", ")
+      end
+      eprint(color_green(suggestions[i]))
+    end
+    eputs("")
+  end
+
+  eputs("")
+  eputs("#{color_dim("Run ")}#{color_bold("quake --list")}#{color_dim(" to see all tasks")}")
+end
+
+def _print_help(): Void
+  eputs("#{color_bold("Quake")} — The Quartz Build System")
+  eputs("")
+  eputs("#{color_bold("Usage:")} quake [task] [options]")
+  eputs("")
+  eputs(color_bold("Options:"))
+  eputs("  -l, --list       List all tasks")
+  eputs("  -v, --verbose    Verbose output (show commands)")
+  eputs("  -q, --quiet      Quiet output (errors only)")
+  eputs("  -n, --dry-run    Print commands without executing them")
+  eputs("  -k, --keep-going Continue past task failures; print summary at end")
+  eputs("  -h, --help       Show this help")
+  eputs("")
+  eputs(color_dim("If no task is specified, runs the 'default' task."))
+end
+
+# =============================================================================
+# ANSI Color Helpers (delegate to colors module)
+# =============================================================================
+
+def color_red(s: String): String = red(s)
+def color_green(s: String): String = green(s)
+def color_yellow(s: String): String = yellow(s)
+def color_blue(s: String): String = blue(s)
+def color_cyan(s: String): String = cyan(s)
+def color_dim(s: String): String = dim(s)
+def color_bold(s: String): String = bold(s)

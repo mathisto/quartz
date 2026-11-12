@@ -1,0 +1,1340 @@
+## std/sync/composition/scope — Unified cancellation, deadlines, and structured-concurrency scopes (B.7)
+##
+## A `Scope` is the dynamic extent of concurrent work. It carries a cancel
+## flag, an optional deadline, and a parent pointer (forming a tree).
+## Cancelling a scope auto-cancels all descendants. Deadlines auto-fire
+## (lazily, on next is_cancelled / check) when the absolute deadline is
+## reached.
+##
+## **Phase 2 (substrate)**: data structure + constructors + cancellation
+## walk + deadline lazy-fire — exercisable in isolation.
+##
+## **Phase 3 (this module + below)**: per-thread `current_scope()` tracking
+## + `scope_with(s, body)` helper. Scopes are pushed onto a per-thread
+## stack on entry, restored + auto-cancelled on exit (normal OR throw
+## via the unified Throws transport). Stand-in for the future
+## `with scope.X do ... end` syntactic sugar that lands with B.8's
+## unified `with`-block dispatcher; same desugar shape, function-level
+## API for now.
+##
+## **Phase 4 (shipped)**: spawn-time scope inheritance for goroutines (4a-c),
+## proactive deadline timer (4d), blocking-primitive integration via
+## chunked-poll wakes for sleep/recv/send/mutex/rwlock_read/rwlock_write
+## (4e.1-5). `await fut` and `io_suspend` deferred-shape — see
+## [`docs/design/SCOPE_PHASE_4E_AWAIT_IO_DEFERRED.md`](../../docs/design/SCOPE_PHASE_4E_AWAIT_IO_DEFERRED.md).
+##
+## **Phase 5 (deferred)**: legacy-primitive migration. Scoped to the
+## structured-concurrency wrappers (`go_scope` / `go_supervisor` /
+## `go_scope_timeout` / `structured_scope` / `structured_supervisor`) —
+## becomes thin wrappers around `scope_with`. Cancel-token primitives
+## (`go_cancellable` / `cancel_token_*` / `supervisor_tree`) stay as the
+## explicit (capability, explicit) corner. See
+## [`docs/design/SCOPE_PHASE_5_LEGACY_MIGRATION.md`](../../docs/design/SCOPE_PHASE_5_LEGACY_MIGRATION.md).
+##
+## See `docs/design/SCOPE_UNIFICATION.md` for the full design.
+##
+## # API surface
+##
+##   scope_root()                   — get/init the root scope
+##   scope_timeout(parent, ms)      — child with deadline = min(parent, now+ms)
+##   scope_deadline(parent, ns)     — child with absolute deadline (capped to parent's)
+##   scope_with_cancel(parent)      — child with no deadline; manually cancellable
+##   scope_supervised(parent)       — child with no deadline; failures-don't-cascade flag
+##
+##   scope_is_cancelled(s)          — Bool; lazy-fires deadline if past
+##   scope_cancelled_at(s)          — Int (ns since epoch when cancelled, -1 if not)
+##   scope_deadline_remaining_ms(s) — Int (ms remaining; negative if past; -1 if no deadline)
+##   scope_cancel_reason(s)         — String ("" if not cancelled or no reason)
+##   scope_is_supervised(s)         — Bool (read of supervisor flag)
+##
+##   scope_check(s)                 — `throw(reason)` if cancelled (else no-op)
+##   scope_cancel(s)                — cancel with reason "cancelled"
+##   scope_cancel_with(s, reason)   — cancel with explicit reason
+##
+##   current_scope()                — Phase 3: get the per-thread current scope
+##   scope_with(s, body)            — Phase 3: push s, run body, cancel s, pop
+##                                     (throw-safe; restores scope + rethrows)
+##   scope_owned(s)                 — B.8 Phase 5: ScopeGuard wrapper for use in
+##                                     `with scope_owned(s) do _ -> body end`
+##                                     blocks. Same throw-safe push/cancel/pop
+##                                     semantics as scope_with via `impl Scoped`.
+##
+## # Open-UFCS dispatch
+##
+## Every scope_* function takes a Scope handle as its first arg, so they
+## are callable as `s.timeout(ms)`, `s.is_cancelled()`, `s.check()`, etc.
+## via Quartz's open-UFCS rule.
+##
+## # Lifetime
+##
+## Scope nodes are heap-allocated and not freed in this phase. Phase 5's
+## migration will add reference counting or a tree-walk free at parent-cancel
+## time. Pre-launch this is acceptable: short-running test programs leak
+## a few hundred bytes per scope; long-running programs would not yet use
+## scopes at this phase since spawn integration ships in Phase 4.
+
+import std/throws
+import * from std/scoped
+import * from std/selectable
+import * from std/sync/exclusion/mutex
+
+# ============================================================================
+# Node layout (mem_alloc(72) = 9 i64 slots)
+# ============================================================================
+# slot 0: parent_handle      (0 if root)
+# slot 1: cancel_atom_handle (atomic_new(0); 1 once cancelled)
+# slot 2: deadline_ns        (-1 = no deadline; absolute ns since boot)
+# slot 3: cancelled_at_ns    (-1 = not cancelled; else time_mono_ns() at fire)
+# slot 4: reason_handle      (0 = no reason; else as_int(reason_string))
+# slot 5: supervised_flag    (0/1; supervisor scope = failures don't cascade)
+# slot 6: first_child_handle (0 = no children; intrusive linked list)
+# slot 7: next_sibling_handle (0 = end of list)
+# slot 8: waiters_vec        (B.7 Phase 4e.8: lazily-allocated Vec<Int> of
+#                             task frames parked under this scope via the
+#                             chunked-poll helpers; 0 = empty/unallocated.
+#                             Cancel walker walks this list and calls
+#                             sched_wake on each entry to interrupt their
+#                             pending sched_sleep, dropping cancel
+#                             observation latency from ~chunk_ms to ~0ms.)
+
+const SLOT_PARENT       = 0
+const SLOT_CANCEL_ATOM  = 1
+const SLOT_DEADLINE     = 2
+const SLOT_CANCELLED_AT = 3
+const SLOT_REASON       = 4
+const SLOT_SUPERVISED   = 5
+const SLOT_FIRST_CHILD  = 6
+const SLOT_NEXT_SIBLING = 7
+const SLOT_WAITERS      = 8
+
+const NODE_BYTES = 72
+
+const NO_DEADLINE = -1
+const NOT_CANCELLED = -1
+
+# ============================================================================
+# Module-private state
+# ============================================================================
+
+var _scope_tree_mutex = 0
+var _scope_root_handle = 0
+
+def _scope_init_once(): Void
+  if _scope_tree_mutex == 0
+    _scope_tree_mutex = mutex_new(0)
+    _scope_root_handle = _scope_alloc_node(0, NO_DEADLINE, 0)
+  end
+end
+
+# Construct a transient MutexGuard for the lazy-initialized tree mutex
+# handle. The guard is a thin `{ handle: Int }` wrapper so this is
+# effectively zero-cost; callers wrap it with `with _scope_tree_lock()
+# do _v -> ... end` to get Phase 4b throw-safety + Phase 6.5 write-back
+# discipline. The protected value is unused (0 sentinel) — this mutex
+# is a pure synchronization lock, not a state cell.
+def _scope_tree_lock(): MutexGuard = MutexGuard { handle: _scope_tree_mutex }
+
+def _scope_alloc_node(parent: Int, deadline_ns: Int, supervised: Int): Int
+  var n = mem_alloc(NODE_BYTES)
+  store(n, SLOT_PARENT, parent)
+  store(n, SLOT_CANCEL_ATOM, atomic_new(0))
+  store(n, SLOT_DEADLINE, deadline_ns)
+  store(n, SLOT_CANCELLED_AT, NOT_CANCELLED)
+  store(n, SLOT_REASON, 0)
+  store(n, SLOT_SUPERVISED, supervised)
+  store(n, SLOT_FIRST_CHILD, 0)
+  store(n, SLOT_NEXT_SIBLING, 0)
+  store(n, SLOT_WAITERS, 0)
+  return n
+end
+
+def _scope_link_child_locked(parent: Int, child: Int): Void
+  if parent == 0
+    return
+  end
+  var prev_first = load(parent, SLOT_FIRST_CHILD)
+  store(child, SLOT_NEXT_SIBLING, prev_first)
+  store(parent, SLOT_FIRST_CHILD, child)
+end
+
+# Compute the effective deadline for a new child: min(parent, requested).
+# A requested deadline of NO_DEADLINE inherits the parent's; a parent with
+# NO_DEADLINE accepts the child's. NO_DEADLINE on both = no deadline.
+def _scope_min_deadline(parent: Int, requested_ns: Int): Int
+  if parent == 0
+    return requested_ns
+  end
+  var parent_dl = load(parent, SLOT_DEADLINE)
+  if parent_dl == NO_DEADLINE
+    return requested_ns
+  end
+  if requested_ns == NO_DEADLINE
+    return parent_dl
+  end
+  if parent_dl < requested_ns
+    return parent_dl
+  end
+  return requested_ns
+end
+
+# ============================================================================
+# Constructors
+# ============================================================================
+
+## The root scope. Always alive, never cancellable. Lazily initialized.
+def scope_root(): Int
+  _scope_init_once()
+  return _scope_root_handle
+end
+
+## Child scope with a relative-millisecond deadline.
+## The effective deadline is min(parent_deadline, now + ms).
+def scope_timeout(parent: Int, ms: Int): Int
+  var requested = time_mono_ns() + ms * 1_000_000
+  var dl = _scope_min_deadline(parent, requested)
+  return _scope_make_child(parent, dl, 0)
+end
+
+## Child scope with an absolute deadline in nanoseconds (monotonic clock).
+## The effective deadline is min(parent_deadline, abs_ns).
+def scope_deadline(parent: Int, abs_ns: Int): Int
+  var dl = _scope_min_deadline(parent, abs_ns)
+  return _scope_make_child(parent, dl, 0)
+end
+
+## Child scope with no deadline of its own (inherits parent's). Cancellable
+## via `scope_cancel(s)`.
+def scope_with_cancel(parent: Int): Int
+  var dl = _scope_min_deadline(parent, NO_DEADLINE)
+  return _scope_make_child(parent, dl, 0)
+end
+
+## Supervised child — supervised flag set; failures don't cascade to siblings
+## (Phase 4+ behavior; substrate just records the flag).
+def scope_supervised(parent: Int): Int
+  var dl = _scope_min_deadline(parent, NO_DEADLINE)
+  return _scope_make_child(parent, dl, 1)
+end
+
+def _scope_make_child(parent: Int, deadline_ns: Int, supervised: Int): Int
+  _scope_init_once()
+  var child = _scope_alloc_node(parent, deadline_ns, supervised)
+  with _scope_tree_lock() do _v ->
+    _scope_link_child_locked(parent, child)
+  end
+  # B.7 Phase 4d: register a proactive deadline timer iff this scope is
+  # the originator of its (effective) deadline. If parent already has a
+  # deadline ≤ ours, parent's timer fires first and the cancel walk reaches
+  # us — no point spawning a duplicate thread.
+  if deadline_ns != NO_DEADLINE
+    var parent_dl = NO_DEADLINE
+    if parent != 0
+      parent_dl = load(parent, SLOT_DEADLINE)
+    end
+    if parent_dl == NO_DEADLINE or parent_dl > deadline_ns
+      scope_register_deadline(child, deadline_ns)
+    end
+  end
+  return child
+end
+
+# ============================================================================
+# Inspection
+# ============================================================================
+
+## Returns true if this scope is cancelled OR its deadline has passed.
+## Lazy-fires the cancellation in the deadline-passed case so subsequent
+## reads observe the propagated state on descendants.
+def scope_is_cancelled(s: Int): Bool
+  if s == 0
+    return false
+  end
+  var cflag = load(s, SLOT_CANCEL_ATOM)
+  if atomic_load(cflag) == 1
+    return true
+  end
+  var dl = load(s, SLOT_DEADLINE)
+  if dl != NO_DEADLINE and time_mono_ns() >= dl
+    _scope_fire_cancel(s, "deadline_exceeded")
+    return true
+  end
+  return false
+end
+
+## Returns the monotonic-ns timestamp at which this scope was cancelled,
+## or -1 if it has not been cancelled. Lazy-fires deadline.
+def scope_cancelled_at(s: Int): Int
+  if scope_is_cancelled(s) == false
+    return -1
+  end
+  return load(s, SLOT_CANCELLED_AT)
+end
+
+## Returns the time remaining until this scope's deadline, in milliseconds.
+## Returns -1 if the scope has no deadline. May be negative if the deadline
+## has passed but the scope hasn't yet been queried via is_cancelled (lazy
+## fire happens in is_cancelled, not here).
+def scope_deadline_remaining_ms(s: Int): Int
+  if s == 0
+    return -1
+  end
+  var dl = load(s, SLOT_DEADLINE)
+  if dl == NO_DEADLINE
+    return -1
+  end
+  return (dl - time_mono_ns()) / 1_000_000
+end
+
+## Returns the cancel reason ("cancelled" / "deadline_exceeded" / user-supplied),
+## or "" if the scope is not cancelled. Lazy-fires deadline.
+def scope_cancel_reason(s: Int): String
+  if scope_is_cancelled(s) == false
+    return ""
+  end
+  var raw = load(s, SLOT_REASON)
+  if raw == 0
+    return ""
+  end
+  return as_string(raw)
+end
+
+## Returns true if this scope was created via `scope_supervised` — failures
+## of children don't cascade-cancel siblings (Phase 4+ behavior).
+def scope_is_supervised(s: Int): Bool
+  if s == 0
+    return false
+  end
+  return load(s, SLOT_SUPERVISED) == 1
+end
+
+# ============================================================================
+# Cancellation
+# ============================================================================
+
+## Throws `<reason>` if the scope is cancelled (lazy-firing deadline);
+## no-op otherwise. The throw rides the unified Throws transport (B.9):
+## a `with Throws { throw: handler } do -> ... end` upstream catches it.
+def scope_check(s: Int): Void
+  if scope_is_cancelled(s) == false
+    return
+  end
+  throw(scope_cancel_reason(s))
+end
+
+## Cancel this scope (and all descendants), with reason "cancelled".
+## Idempotent — second call is a no-op. The cancel is structural: every
+## scope reachable via the first_child / next_sibling chain is also marked.
+def scope_cancel(s: Int): Void
+  _scope_fire_cancel(s, "cancelled")
+end
+
+## Cancel this scope with an explicit reason string. See `scope_cancel`.
+def scope_cancel_with(s: Int, reason: String): Void
+  _scope_fire_cancel(s, reason)
+end
+
+# B.7 Phase 4d: invoked from `__qz_scope_deadline_thread` (a pthread spawned
+# at scope-creation time when this scope is the deadline originator). The
+# thread calls this with the scope handle after sleeping until the deadline;
+# we route through `_scope_fire_cancel` so the cancel walk reaches all
+# descendants under the tree mutex. Idempotent — if the scope was already
+# cancelled (e.g. via explicit `scope_cancel`), this is a no-op.
+#
+# IMPORTANT: this function MUST be reachable under its bare name from LLVM IR.
+# The runtime's `__qz_scope_deadline_thread` (in codegen_runtime.qz) calls
+# `@_scope_fire_deadline_exceeded` directly, NOT a mangled `scope$_*` form.
+# Consumers of this module MUST use the wildcard import:
+#
+#     import * from std/sync/scope
+#
+# Named imports (`import std/sync/scope as scope`) would mangle this symbol
+# and break linking against the runtime thread. The wildcard form is the
+# only supported import shape for this module. (Long-term cleanup: move the
+# trampoline into codegen_runtime.qz so the runtime calls a `__qz_*` symbol
+# that's never mangled. Tracked as a P3 cleanup; impact is zero today
+# because no user-facing API would suffer from the constraint.)
+def _scope_fire_deadline_exceeded(s: Int): Void
+  _scope_fire_cancel(s, "deadline_exceeded")
+end
+
+# ============================================================================
+# Internal — cancel + descendant walk under the tree mutex.
+# ============================================================================
+
+# Atomic-cas the cancel flag. Returns true on the winning call (first to
+# flip 0 → 1), false on every subsequent call. The winner is responsible
+# for storing reason + cancelled_at_ns and walking descendants.
+def _scope_try_fire_atomic(s: Int): Bool
+  var cflag = load(s, SLOT_CANCEL_ATOM)
+  return atomic_cas(cflag, 0, 1)
+end
+
+def _scope_fire_cancel(s: Int, reason: String): Void
+  if s == 0
+    return
+  end
+  if s == _scope_root_handle
+    # Root is uncancellable by design (no parent to attribute to, no
+    # bounded extent). Silently ignore.
+    return
+  end
+  if _scope_try_fire_atomic(s) == false
+    return
+  end
+  store(s, SLOT_CANCELLED_AT, time_mono_ns())
+  store(s, SLOT_REASON, as_int(reason))
+  with _scope_tree_lock() do _v ->
+    _scope_wake_waiters_locked(s)
+    _scope_cancel_descendants_locked(s, reason)
+  end
+end
+
+# Walk `s`'s children + their descendants, atomically marking each as
+# cancelled. Reason propagates from the originator. Called under the tree
+# mutex; the per-node atomic cas means the descendant walk is safe even if
+# a sibling thread tried to cancel a node concurrently — exactly one wins
+# and stores reason/timestamp.
+#
+# B.7 Phase 4e.8: each cancelled descendant's waiter list is also walked
+# and each task frame is woken via `sched_wake`. Combined with Layer A
+# (sched_wake interrupts sched_sleep), this drops cancel observation
+# latency in the chunked-poll helpers from ~chunk_ms to ~0ms.
+def _scope_cancel_descendants_locked(s: Int, reason: String): Void
+  var child = load(s, SLOT_FIRST_CHILD)
+  while child != 0
+    if _scope_try_fire_atomic(child)
+      store(child, SLOT_CANCELLED_AT, time_mono_ns())
+      store(child, SLOT_REASON, as_int(reason))
+      _scope_wake_waiters_locked(child)
+      _scope_cancel_descendants_locked(child, reason)
+    end
+    child = load(child, SLOT_NEXT_SIBLING)
+  end
+end
+
+# B.7 Phase 4e.8 — Wake all tasks parked under scope `s` via the chunked-poll
+# helpers. Called under the tree mutex from `_scope_fire_cancel` (originator)
+# and `_scope_cancel_descendants_locked` (descendants). The wake happens via
+# `sched_wake(frame)`; combined with Layer A's timer-cancel path in the
+# scheduler, this interrupts the task's pending `sched_sleep` within
+# microseconds. The task on resume observes `scope_is_cancelled(s)` and
+# throws via the unified Throws transport.
+#
+# Idempotent — multiple calls (e.g. from sibling cancels racing) are safe
+# because `sched_wake` itself is race-safe (CAS protocol on frame[5]).
+def _scope_wake_waiters_locked(s: Int): Void
+  var w = load(s, SLOT_WAITERS)
+  if w == 0
+    return
+  end
+  var n = w.size
+  var i = 0
+  while i < n
+    var frame = w[i]
+    if frame != 0
+      sched_wake(frame)
+    end
+    i += 1
+  end
+end
+
+# B.7 Phase 4e.8 — Add `frame` to scope `s`'s waiter list. Called by the
+# chunked-poll helpers (scope_sleep_ms / scope_recv / scope_send / scope_lock
+# / scope_rwlock_read / scope_rwlock_write) before entering their wait loop
+# so a concurrent `_scope_fire_cancel` can wake the parked task.
+#
+# Lazy-allocates the vec on first push to keep zero-cost for scopes that are
+# never used as wait targets. No-op for `s == 0` (root) since root is
+# uncancellable and the scope helpers fast-path around it.
+def _scope_register_waiter(s: Int, frame: Int): Void
+  if s == 0
+    return
+  end
+  if frame == 0
+    return
+  end
+  with _scope_tree_lock() do _v ->
+    var w = load(s, SLOT_WAITERS)
+    if w == 0
+      w = vec_new<Int>()
+      store(s, SLOT_WAITERS, as_int(w))
+    end
+    var w_typed = as_type<Vec<Int>>(load(s, SLOT_WAITERS))
+    w_typed.push(frame)
+  end
+end
+
+# B.7 Phase 4e.8 — Remove `frame` from scope `s`'s waiter list. Called by the
+# chunked-poll helpers after their wait loop exits (success OR cancel). O(n)
+# linear scan + swap-with-last; n is small (typically 1-3 tasks per scope).
+#
+# Idempotent — if `frame` is not present (e.g., already removed by a prior
+# call), this is a no-op.
+def _scope_unregister_waiter(s: Int, frame: Int): Void
+  if s == 0
+    return
+  end
+  # Phase 4b/6.5: wrap_stack drain on the inner `return` paths fires
+  # release(self, current_v) which is just mutex_unlock with the unused
+  # 0 sentinel. Two early-exits (waiter list empty / target found and
+  # removed) collapse from manual `mutex_unlock; return` pairs to a
+  # bare `return`.
+  with _scope_tree_lock() do _v ->
+    var w = load(s, SLOT_WAITERS)
+    if w == 0
+      return
+    end
+    var w_typed = as_type<Vec<Int>>(w)
+    var n = w_typed.size
+    var i = 0
+    while i < n
+      if w_typed[i] == frame
+        var last = w_typed[n - 1]
+        w_typed[i] = last
+        w_typed.pop()
+        return
+      end
+      i += 1
+    end
+  end
+end
+
+# ============================================================================
+# Phase 3-4 — per-thread current_scope() tracking + scope_with helper
+# ============================================================================
+#
+# The per-thread current scope handle lives in a canonical compiler-emitted
+# TLS (@__qz_current_scope_handle), accessed via the `current_scope_load`
+# and `current_scope_store` intrinsics. B.7 Phase 4a moved this from a
+# user-side `@thread_local var` to a compiler-emitted symbol so that the
+# compiler runtime (Phase 4b's spawn-time scope inheritance + worker $poll
+# dispatch) can read/write the same TLS as user code without depending on
+# `std/sync/composition/scope.qz` being imported.
+#
+# Two @thread_local module globals stay user-side — the compiler runtime
+# never touches them:
+#
+#   _sw_panicked   — set by _sw_catch when body throws inside scope_with
+#   _sw_msg_int    — raw String pointer captured at the throw site
+#
+# scope_with installs a Throws handler that captures any throw into the
+# two _sw_* globals, returning a sentinel through the with-block; after
+# the with-block exits the helper restores the previous current_scope,
+# auto-cancels s, and re-throws the captured message if any. Save+restore
+# of _sw_panicked / _sw_msg_int around each scope_with call makes nesting
+# correct even when an inner body throws and an outer body catches.
+#
+# When B.8 ships the unified `with`-block dispatcher, `with scope.X do ->
+# body end` desugars to exactly this scope_with sequence — no rewrite of
+# the runtime needed.
+
+@thread_local
+var _sw_panicked = 0
+
+@thread_local
+var _sw_msg_int = 0
+
+## Returns the per-thread current scope. If no scope has been entered on
+## this thread, returns `scope_root()`.
+def current_scope(): Int
+  var h = current_scope_load()
+  if h == 0
+    return scope_root()
+  end
+  return h
+end
+
+# Effect handler: captures any throw inside scope_with's body into the
+# _sw_* globals so the with-block exits cleanly. The handler's return
+# value becomes the with-block's value (-1 = "body threw"); the scope_with
+# wrapper inspects _sw_panicked after the block to decide whether to
+# rethrow.
+def _sw_catch(op_name: Int, argc: Int, argv: Int): Int
+  _sw_panicked = 1
+  _sw_msg_int = load(argv, 0)
+  return -1
+end
+
+## Run `body` with `s` installed as the current scope. On exit (normal OR
+## throw), restores the previous current scope and cancels `s`. If body
+## threw, the captured message is re-thrown after the cleanup so the
+## throw propagates to an outer `with Throws { throw: handler }`. Nested
+## scope_with calls compose: each push/pop pair sees its own captured
+## state.
+def scope_with(s: Int, body: Fn(): Int): Int
+  if s == 0
+    return body()
+  end
+  var prev = current_scope_load()
+  current_scope_store(s)
+  var saved_panicked = _sw_panicked
+  var saved_msg = _sw_msg_int
+  _sw_panicked = 0
+  _sw_msg_int = 0
+  var result = 0
+  with Throws { throw: _sw_catch } do ->
+    result = body()
+    0
+  end
+  current_scope_store(prev)
+  scope_cancel(s)
+  if _sw_panicked == 1
+    var captured_int = _sw_msg_int
+    _sw_panicked = saved_panicked
+    _sw_msg_int = saved_msg
+    throw(as_string(captured_int))
+  end
+  _sw_panicked = saved_panicked
+  _sw_msg_int = saved_msg
+  return result
+end
+
+# ============================================================================
+# Phase 4e.1 — scope-aware blocking primitives: sleep
+# ============================================================================
+#
+# The first primitive in the per-class series that integrates blocking
+# operations with scope cancellation. Wires two guarantees:
+#
+#   1. Deadline clamping: a sleep inside `with scope.timeout(ms) do ... end`
+#      never outlasts the scope's deadline. The effective sleep duration
+#      is min(requested_ms, scope_deadline_remaining_ms). Ships the path
+#      the design memo names: `sleep(ms): clamp to scope's deadline_remaining_ms`.
+#
+#   2. Bounded cancel observation: if the scope is cancelled (explicitly
+#      via `scope_cancel(s)` or proactively via the deadline timer from
+#      Phase 4d), the sleep wakes within ~SCOPE_SLEEP_CHUNK_MS milliseconds
+#      and throws via the unified Throws transport. The mechanism is
+#      cooperative chunk-polling: split the effective sleep into chunks of
+#      at most SCOPE_SLEEP_CHUNK_MS, and call `scope_check` between chunks.
+#
+# A future Phase 4e.2 may add an active wake protocol (waiter list on the
+# scope node + integration with the scheduler's sched_wake) that drops the
+# observation latency to zero. The chunk-poll approach is intentionally
+# stdlib-only and reuses the existing intrinsics (`sched_sleep`, `time_mono_ns`,
+# `scope_check`) so this phase introduces no compiler-source changes.
+#
+# Fast path: when the current scope is root (the common case for code that
+# isn't inside any `scope_with`), we skip the loop entirely and call
+# `sched_sleep(ms)` directly. Root is uncancellable and has no deadline,
+# so the loop's only effects (clamp + check) are no-ops there.
+
+# Maximum chunk size for the cooperative wait loop. Smaller = lower
+# cancel-observation latency, larger = fewer scheduler wakeups for long
+# sleeps. 50ms is a balance: a 60-second sleep wakes 1200 times, a kqueue
+# cost we can afford; a cancel during a 60-second sleep is observed within
+# 50ms which is well under any human-visible latency.
+const SCOPE_SLEEP_CHUNK_MS = 50
+
+## Sleep for up to `ms` milliseconds, observing the current scope's
+## cancellation and deadline. Throws via the unified Throws transport
+## ("cancelled" / "deadline_exceeded" / user-supplied reason) if the scope
+## is cancelled before or during the sleep. Returns normally if the full
+## requested duration elapses without cancellation.
+##
+## Inside `with scope.timeout(ms) do ... end`, this is the canonical sleep
+## helper — it respects the block's deadline. Outside any scope (root),
+## it degrades to `sched_sleep(ms)` and never throws.
+def scope_sleep_ms(ms: Int): Void
+  var s = current_scope()
+  if s == scope_root()
+    sched_sleep(ms)
+    return
+  end
+  scope_check(s)
+  var effective = ms
+  var rem = scope_deadline_remaining_ms(s)
+  if rem >= 0 and rem < ms
+    effective = rem
+  end
+  if effective <= 0
+    scope_check(s)
+    return
+  end
+  # B.7 Phase 4e.8: register as a waiter so scope_cancel walks here and wakes
+  # us via sched_wake (which interrupts our sched_sleep within microseconds).
+  # Re-check cancel after register to close the cancel-during-register race.
+  var self_frame = task_self()
+  _scope_register_waiter(s, self_frame)
+  if scope_is_cancelled(s)
+    _scope_unregister_waiter(s, self_frame)
+    throw(scope_cancel_reason(s))
+  end
+  var start_ns = time_mono_ns()
+  var cancelled = 0
+  while true
+    var elapsed_ms = (time_mono_ns() - start_ns) / 1_000_000
+    if elapsed_ms >= effective
+      break
+    end
+    var remaining = effective - elapsed_ms
+    var chunk = remaining
+    if chunk > SCOPE_SLEEP_CHUNK_MS
+      chunk = SCOPE_SLEEP_CHUNK_MS
+    end
+    sched_sleep(chunk)
+    if scope_is_cancelled(s)
+      cancelled = 1
+      break
+    end
+  end
+  _scope_unregister_waiter(s, self_frame)
+  if cancelled == 1
+    throw(scope_cancel_reason(s))
+  end
+end
+
+# ============================================================================
+# Phase 4e.2 — scope-aware blocking primitives: channel recv / send
+# ============================================================================
+#
+# Mirrors the Phase 4e.1 chunked-poll recipe applied to channels. Two
+# stdlib-only helpers, no compiler-source touch:
+#
+#   scope_recv(ch): Result<Int, Int>   — Ok(value) / Err(0)=closed
+#   scope_send(ch, val): Void
+#
+# Guarantees (sister to scope_sleep_ms's two):
+#
+#   1. Bounded cancel observation: if the current scope is cancelled
+#      (explicit `scope_cancel`, deadline timer from Phase 4d, or
+#      ancestor cascade), the helper wakes within ~SCOPE_SLEEP_CHUNK_MS
+#      and throws via Throws. Channel close is reported as Result::Err(0)
+#      from `scope_recv` — orthogonal to scope cancel.
+#
+#   2. Deadline-aware chunk size: when the scope's `deadline_remaining_ms`
+#      is closer than SCOPE_SLEEP_CHUNK_MS, the wait between polls shrinks
+#      to that remainder (clamped at 1ms minimum) so the deadline fires
+#      within ~1ms slack instead of waiting a full chunk.
+#
+# Closed-channel semantics:
+#
+#   - `scope_recv` on a closed+empty channel returns Result::Err(0) without
+#     throwing. Uses `try_recv_or_closed` so the empty-vs-closed check is
+#     atomic under the channel's mutex (no race vs. a separate
+#     `channel_closed(ch)` query).
+#   - `scope_send` does NOT detect close — `try_send` returns 0 for both
+#     "full" and "closed", and there is no `try_send_or_closed` intrinsic
+#     yet. A scope cancel is the bounded escape; a stale send on a closed
+#     channel waits until either the channel drains (impossible if no one
+#     reads) OR the scope is cancelled. This matches the existing `send`
+#     intrinsic + `async_send` semantics. A `try_send_or_closed` intrinsic
+#     mirroring `try_recv_or_closed` is the right long-term fix; deferred.
+#
+# Fast path: root-scope callers route to a tight blocking loop using the
+# atomic `try_recv_or_closed` (recv) or the existing `send` intrinsic
+# (send), skipping deadline-clamping work. Root is uncancellable and has
+# no deadline, so the per-iter scope_check / chunk math would all be no-ops.
+
+## Receive a value from `ch`, observing the current scope's cancellation
+## and deadline. Returns Result::Ok(value) on success, Result::Err(0) when
+## the channel is closed and empty. Throws via the unified Throws transport
+## ("cancelled" / "deadline_exceeded" / user-supplied reason) if the scope
+## is cancelled before or during the wait. Under root scope, equivalent to
+## a blocking recv that distinguishes closed from value (no throws).
+def scope_recv(ch: Int): Result<Int, Int>
+  var s = current_scope()
+  if s == scope_root()
+    return _scope_recv_root_loop(ch)
+  end
+  scope_check(s)
+  # B.7 Phase 4e.8: active-wake registration around the chunked-poll loop.
+  var self_frame = task_self()
+  _scope_register_waiter(s, self_frame)
+  if scope_is_cancelled(s)
+    _scope_unregister_waiter(s, self_frame)
+    throw(scope_cancel_reason(s))
+  end
+  var result_kind = 0  # 0=pending, 1=ok, 2=closed, 3=cancelled
+  var result_val = 0
+  while result_kind == 0
+    var r = try_recv_or_closed(ch)
+    if r > 0
+      result_kind = 1
+      result_val = load(r, 1)
+    elsif r == -1
+      result_kind = 2
+    else
+      var chunk = SCOPE_SLEEP_CHUNK_MS
+      var rem = scope_deadline_remaining_ms(s)
+      if rem >= 0 and rem < chunk
+        chunk = rem
+      end
+      if chunk < 1
+        chunk = 1
+      end
+      sched_sleep(chunk)
+      if scope_is_cancelled(s)
+        result_kind = 3
+      end
+    end
+  end
+  _scope_unregister_waiter(s, self_frame)
+  if result_kind == 3
+    throw(scope_cancel_reason(s))
+  end
+  if result_kind == 1
+    return Result::Ok(result_val)
+  end
+  return Result::Err(0)
+end
+
+# Tight blocking loop for the root-scope fast path. Equivalent to
+# `recv_safe` from std/channels but inlined here to avoid a stdlib import
+# from this foundation-level module.
+def _scope_recv_root_loop(ch: Int): Result<Int, Int>
+  while true
+    var r = try_recv_or_closed(ch)
+    if r > 0
+      return Result::Ok(load(r, 1))
+    end
+    if r == -1
+      return Result::Err(0)
+    end
+    sched_yield()
+  end
+  return Result::Err(0)
+end
+
+## Send `val` on `ch`, observing the current scope's cancellation and
+## deadline. Returns when the value is accepted by the channel. Throws
+## via the unified Throws transport if the scope is cancelled before or
+## during the wait. Under root scope, equivalent to the blocking `send`
+## intrinsic (no throws). Does not detect channel close; see the Phase
+## 4e.2 module-doc note above.
+def scope_send(ch: Int, val: Int): Void
+  var s = current_scope()
+  if s == scope_root()
+    send(ch, val)
+    return
+  end
+  scope_check(s)
+  # B.7 Phase 4e.8: active-wake registration around the chunked-poll loop.
+  var self_frame = task_self()
+  _scope_register_waiter(s, self_frame)
+  if scope_is_cancelled(s)
+    _scope_unregister_waiter(s, self_frame)
+    throw(scope_cancel_reason(s))
+  end
+  var sent = 0
+  var cancelled = 0
+  while sent == 0 and cancelled == 0
+    var r = try_send(ch, val)
+    if r != 0
+      sent = 1
+    else
+      var chunk = SCOPE_SLEEP_CHUNK_MS
+      var rem = scope_deadline_remaining_ms(s)
+      if rem >= 0 and rem < chunk
+        chunk = rem
+      end
+      if chunk < 1
+        chunk = 1
+      end
+      sched_sleep(chunk)
+      if scope_is_cancelled(s)
+        cancelled = 1
+      end
+    end
+  end
+  _scope_unregister_waiter(s, self_frame)
+  if cancelled == 1
+    throw(scope_cancel_reason(s))
+  end
+end
+
+# ============================================================================
+# Phase 4e.3 — scope-aware blocking primitive: mutex lock
+# ============================================================================
+#
+# Mirrors the Phase 4e.1/4e.2 chunked-poll recipe applied to mutexes. One
+# stdlib-only helper, no compiler-source touch:
+#
+#   scope_lock(m: Int): Int   — returns the mutex's protected value on success
+#
+# Guarantees (sister to scope_sleep_ms's two):
+#
+#   1. Bounded cancel observation: if the current scope is cancelled
+#      (explicit `scope_cancel`, deadline timer from Phase 4d, or
+#      ancestor cascade), the helper wakes within ~SCOPE_SLEEP_CHUNK_MS
+#      and throws via Throws. The chunk-poll loop calls `scope_check`
+#      between every `mutex_try_lock` attempt so cancellation is
+#      observed within one chunk period.
+#
+#   2. Deadline-aware chunk size: when the scope's `deadline_remaining_ms`
+#      is closer than SCOPE_SLEEP_CHUNK_MS, the wait between polls shrinks
+#      to that remainder (clamped at 1ms minimum) so the deadline fires
+#      within ~1ms slack instead of waiting a full chunk.
+#
+# Return value / sentinel contract:
+#
+#   `mutex_try_lock(m)` returns the mutex's stored VALUE (slot offset 64)
+#   on success, and -1 on failure (mutex is held by another thread).
+#   Success is therefore `r != -1`. Do NOT compare to 0 or 1 — the
+#   protected value may legitimately be 0. This matches the contract
+#   documented in feedback_async_mutex_try_lock_contract.md and confirmed
+#   in the Phase 4d deadline implementation.
+#
+# Fast path: root-scope callers route to `mutex_lock(m)` directly —
+# a tight blocking call with no cancellation overhead. Root is
+# uncancellable and has no deadline, so the per-iter scope_check /
+# chunk math would all be no-ops.
+
+## Lock mutex `m`, observing the current scope's cancellation and deadline.
+## Returns the mutex's protected value on success (same as `mutex_lock`).
+## Throws via the unified Throws transport ("cancelled" / "deadline_exceeded"
+## / user-supplied reason) if the scope is cancelled before or during the
+## wait. Under root scope, equivalent to the blocking `mutex_lock` intrinsic
+## (no throws). Success is r != -1; see `feedback_async_mutex_try_lock_contract.md`.
+def scope_lock(m: Int): Int
+  var s = current_scope()
+  if s == scope_root()
+    return mutex_lock(m)
+  end
+  scope_check(s)
+  # B.7 Phase 4e.8: active-wake registration around the chunked-poll loop.
+  var self_frame = task_self()
+  _scope_register_waiter(s, self_frame)
+  if scope_is_cancelled(s)
+    _scope_unregister_waiter(s, self_frame)
+    throw(scope_cancel_reason(s))
+  end
+  var result = -1
+  var cancelled = 0
+  while result == -1 and cancelled == 0
+    var r = mutex_try_lock(m)
+    if r != -1
+      result = r
+    else
+      var chunk = SCOPE_SLEEP_CHUNK_MS
+      var rem = scope_deadline_remaining_ms(s)
+      if rem >= 0 and rem < chunk
+        chunk = rem
+      end
+      if chunk < 1
+        chunk = 1
+      end
+      sched_sleep(chunk)
+      if scope_is_cancelled(s)
+        cancelled = 1
+      end
+    end
+  end
+  _scope_unregister_waiter(s, self_frame)
+  if cancelled == 1
+    throw(scope_cancel_reason(s))
+  end
+  return result
+end
+
+# ============================================================================
+# Phase 4e.4 — scope-aware blocking primitive: rwlock read-lock
+# ============================================================================
+#
+# Mirrors the Phase 4e.1/4e.2/4e.3 chunked-poll recipe applied to rwlock
+# read acquisition. One stdlib-only helper, no compiler-source touch:
+#
+#   scope_rwlock_read(rw: Int): Int   — returns the rwlock's protected value
+#
+# Guarantees (sister to scope_sleep_ms's two):
+#
+#   1. Bounded cancel observation: if the current scope is cancelled
+#      (explicit `scope_cancel`, deadline timer from Phase 4d, or
+#      ancestor cascade), the helper wakes within ~SCOPE_SLEEP_CHUNK_MS
+#      and throws via Throws. The chunk-poll loop calls `scope_check`
+#      between every `rwlock_try_read` attempt so cancellation is
+#      observed within one chunk period.
+#
+#   2. Deadline-aware chunk size: when the scope's `deadline_remaining_ms`
+#      is closer than SCOPE_SLEEP_CHUNK_MS, the wait between polls shrinks
+#      to that remainder (clamped at 1ms minimum) so the deadline fires
+#      within ~1ms slack instead of waiting a full chunk.
+#
+# Return value / sentinel contract:
+#
+#   `rwlock_try_read(rw)` returns the rwlock's stored VALUE on success,
+#   and -1 on failure (a write-lock is held by another thread, making
+#   a new read-lock unsafe). Success is therefore `r != -1`. Do NOT
+#   compare to 0 or 1 — the protected value may legitimately be 0.
+#   This mirrors the `mutex_try_lock` contract documented in
+#   feedback_async_mutex_try_lock_contract.md.
+#
+# Fast path: root-scope callers route to `rwlock_read(rw)` directly —
+# a tight blocking call with no cancellation overhead. Root is
+# uncancellable and has no deadline, so the per-iter scope_check /
+# chunk math would all be no-ops.
+
+## Acquire the read-lock on `rw`, observing the current scope's
+## cancellation and deadline. Returns the rwlock's protected value on
+## success (same as `rwlock_read`). Throws via the unified Throws
+## transport ("cancelled" / "deadline_exceeded" / user-supplied reason)
+## if the scope is cancelled before or during the wait. Under root scope,
+## equivalent to the blocking `rwlock_read` intrinsic (no throws).
+## Success is r != -1; the protected value may legitimately be 0, so
+## do not test r != 0 — test r != -1 (see rwlock_try_read sentinel contract).
+def scope_rwlock_read(rw: Int): Int
+  var s = current_scope()
+  if s == scope_root()
+    return rwlock_read(rw)
+  end
+  scope_check(s)
+  # B.7 Phase 4e.8: active-wake registration around the chunked-poll loop.
+  var self_frame = task_self()
+  _scope_register_waiter(s, self_frame)
+  if scope_is_cancelled(s)
+    _scope_unregister_waiter(s, self_frame)
+    throw(scope_cancel_reason(s))
+  end
+  var result = -1
+  var cancelled = 0
+  while result == -1 and cancelled == 0
+    var r = rwlock_try_read(rw)
+    if r != -1
+      result = r
+    else
+      var chunk = SCOPE_SLEEP_CHUNK_MS
+      var rem = scope_deadline_remaining_ms(s)
+      if rem >= 0 and rem < chunk
+        chunk = rem
+      end
+      if chunk < 1
+        chunk = 1
+      end
+      sched_sleep(chunk)
+      if scope_is_cancelled(s)
+        cancelled = 1
+      end
+    end
+  end
+  _scope_unregister_waiter(s, self_frame)
+  if cancelled == 1
+    throw(scope_cancel_reason(s))
+  end
+  return result
+end
+
+# ============================================================================
+# Phase 4e.5 — scope-aware blocking primitive: rwlock write-lock
+# ============================================================================
+#
+# Mirrors the Phase 4e.1/4e.2/4e.3 chunked-poll recipe applied to rwlock
+# write-locks. One stdlib-only helper, no compiler-source touch:
+#
+#   scope_rwlock_write(rw: Int): Int   — returns the rwlock's protected value
+#                                        on success
+#
+# Guarantees (sister to scope_lock's two):
+#
+#   1. Bounded cancel observation: if the current scope is cancelled
+#      (explicit `scope_cancel`, deadline timer from Phase 4d, or
+#      ancestor cascade), the helper wakes within ~SCOPE_SLEEP_CHUNK_MS
+#      and throws via Throws. The chunk-poll loop calls `scope_check`
+#      between every `rwlock_try_write` attempt so cancellation is
+#      observed within one chunk period.
+#
+#   2. Deadline-aware chunk size: when the scope's `deadline_remaining_ms`
+#      is closer than SCOPE_SLEEP_CHUNK_MS, the wait between polls shrinks
+#      to that remainder (clamped at 1ms minimum) so the deadline fires
+#      within ~1ms slack instead of waiting a full chunk.
+#
+# Return value / sentinel contract:
+#
+#   `rwlock_try_write(rw)` returns the rwlock's stored VALUE on success,
+#   and -1 on failure (a read-lock OR write-lock is held by another thread).
+#   Success is therefore `r != -1`. Do NOT compare to 0 or 1 — the
+#   protected value may legitimately be 0. This matches the -1 sentinel
+#   documented in feedback_async_mutex_try_lock_contract.md (same pattern
+#   as mutex_try_lock). Write acquisition fails when ANY reader OR another
+#   writer holds the lock — stronger requirement than mutex_try_lock, which
+#   only fails when another writer holds it.
+#
+# Fast path: root-scope callers route to `rwlock_write(rw)` directly —
+# a tight blocking call with no cancellation overhead. Root is
+# uncancellable and has no deadline, so the per-iter scope_check /
+# chunk math would all be no-ops.
+
+## Acquire write-lock on `rw`, observing the current scope's cancellation
+## and deadline. Returns the rwlock's protected value on success (same as
+## `rwlock_write`). Caller is responsible for calling
+## `rwlock_write_unlock(rw, new_val)` afterward. Throws via the unified
+## Throws transport ("cancelled" / "deadline_exceeded" / user-supplied reason)
+## if the scope is cancelled before or during the wait. Under root scope,
+## equivalent to the blocking `rwlock_write` intrinsic (no throws).
+## Success sentinel: r != -1. The protected value may legitimately be 0,
+## so do NOT compare to 0 or 1. See `feedback_async_mutex_try_lock_contract.md`.
+def scope_rwlock_write(rw: Int): Int
+  var s = current_scope()
+  if s == scope_root()
+    return rwlock_write(rw)
+  end
+  scope_check(s)
+  # B.7 Phase 4e.8: active-wake registration around the chunked-poll loop.
+  var self_frame = task_self()
+  _scope_register_waiter(s, self_frame)
+  if scope_is_cancelled(s)
+    _scope_unregister_waiter(s, self_frame)
+    throw(scope_cancel_reason(s))
+  end
+  var result = -1
+  var cancelled = 0
+  while result == -1 and cancelled == 0
+    var r = rwlock_try_write(rw)
+    if r != -1
+      result = r
+    else
+      var chunk = SCOPE_SLEEP_CHUNK_MS
+      var rem = scope_deadline_remaining_ms(s)
+      if rem >= 0 and rem < chunk
+        chunk = rem
+      end
+      if chunk < 1
+        chunk = 1
+      end
+      sched_sleep(chunk)
+      if scope_is_cancelled(s)
+        cancelled = 1
+      end
+    end
+  end
+  _scope_unregister_waiter(s, self_frame)
+  if cancelled == 1
+    throw(scope_cancel_reason(s))
+  end
+  return result
+end
+
+# ============================================================================
+# B.8 Phase 5 — Scoped wrapper for owned-scope cancel-on-exit
+# ============================================================================
+#
+# `with scope_owned(s) do bound_s -> body end` installs `s` as the per-thread
+# current scope on entry, restores the previous current scope on exit (normal
+# OR throw via Phase 4b's runtime), and cancels `s` on exit. Equivalent in
+# semantics to `scope_with(s, () -> body)` but expressed in the unified
+# Scoped/`with`-block syntax.
+#
+# Usage:
+#
+#   var s = scope_with_cancel(scope_root())
+#   with scope_owned(s) do bound_s ->
+#     # current_scope() == s inside this block.
+#     # Goroutines spawned here observe `s` as their default scope.
+#     # Throws unwind through Phase 4b's runtime, cancelling `s` along the way.
+#   end
+#   # current_scope() restored to its pre-block value; `s` is cancelled.
+#
+# Why a guard struct rather than a free function: the Scoped contract gives
+# us the throw-safe release_on_throw hook for free (Phase 4b's runtime
+# dispatcher), so this becomes a thin wrapper without re-implementing the
+# throw-catch + rethrow machinery scope_with carries internally.
+#
+# Asymmetry note: release and release_on_throw are identical here. The
+# handoff envisioned a "wait for children + drop" vs "cancel children +
+# wait + drop" split, but child-goroutine waiting lives at a higher layer
+# (supervisor patterns in C.14). Cancelling s already signals every
+# descendant via the cancellation walk; whether the parent waits for
+# children to finish is the caller's responsibility (go-handle joins or
+# supervisor barriers). When C.14 lands the supervisor primitive, its
+# Scoped impl can override release_on_throw with cancel-eagerly semantics.
+
+## A scoped owner-of-a-scope guard. Pushes scope as current_scope on
+## acquire; on release, restores the previous current_scope (saved during
+## acquire) and cancels scope. release_on_throw mirrors release.
+##
+## Field saved_prev is set by acquire and read by release/release_on_throw;
+## it must be 0 at construction (caller obligation; see scope_owned).
+struct ScopeGuard
+  scope: Int
+  saved_prev: Int
+end
+
+extend ScopeGuard with Scoped
+  ## Save the current scope handle on the guard, push @scope as the new
+  ## current scope, and return @scope as the bound value for the body.
+  def acquire(&mut self): Int
+    @saved_prev = current_scope_load()
+    current_scope_store(@scope)
+    return @scope
+  end
+
+  ## On normal block exit: restore the previous current scope, then cancel
+  ## the wrapped scope. Order matters — the cancel walk runs after the
+  ## current_scope pointer has been moved off @scope, so any subsequent
+  ## current_scope() reads see the parent.
+  def release(self, value: Int): Void
+    current_scope_store(@saved_prev)
+    scope_cancel(@scope)
+  end
+
+  ## On exceptional block exit: same as release. Restoring current_scope
+  ## first ensures the outer Throws handler runs in the parent's scope
+  ## context.
+  def release_on_throw(self, value: Int, exc_msg: String): Void
+    current_scope_store(@saved_prev)
+    scope_cancel(@scope)
+  end
+end
+
+## Construct a ScopeGuard for a with-block. Construction is free; the
+## scope push/cancel machinery fires from the guard's acquire/release.
+def scope_owned(s: Int): ScopeGuard = ScopeGuard { scope: s, saved_prev: 0 }
+
+# ============================================================================
+# ScopeCancelSelectable — Selectable wrapper for scope-cancel (C.13 Phase 5)
+# ============================================================================
+
+## A Selectable that observes "scope handle has been cancelled or its
+## deadline has passed". Use as the right-hand side of a `case _ =
+## cancellable(scope) => ...` arm in `select`. When the arm wins,
+## `complete` throws via Throws — control unwinds to the nearest
+## `with Throws { throw: handler } do -> ... end`, never returning to
+## the arm body.
+##
+## **First impl that meaningfully uses register_waker:** the
+## `_scope_register_waiter` substrate from B.7 Phase 4e.8 already
+## tracks parked task frames per scope; adding the wrapper just hooks
+## that machinery into the select dispatcher's wake protocol. Phase 4b
+## active-wake retrofit will call register_waker at park-time so a
+## concurrent `scope_cancel(s)` wakes the parked select. Pre-retrofit,
+## the chunked-poll loop calls `scope_is_cancelled(@scope_handle)` at
+## every poll round.
+struct ScopeCancelSelectable
+  scope_handle: Int
+end
+
+extend ScopeCancelSelectable with Selectable<Int>
+  ## try_poll: lazy-fires deadline (via `scope_is_cancelled`) and
+  ## returns `Some(0)` if the scope is cancelled, `None` otherwise. The
+  ## bound payload (0) is a placeholder; the user's case body never
+  ## observes the binding because `complete` throws first.
+  def try_poll(self): Option<Int>
+    if scope_is_cancelled(@scope_handle)
+      return option_some(0)
+    end
+    return option_none()
+  end
+
+  ## register_waker: install `frame` on the scope's waiter list. When
+  ## `_scope_fire_cancel` walks the list and calls `sched_wake(frame)`,
+  ## the parked select re-polls and observes the cancel. Idempotent;
+  ## handled inside `_scope_register_waiter`.
+  def register_waker(self, frame: Int): Void
+    _scope_register_waiter(@scope_handle, frame)
+  end
+
+  ## unregister_waker: remove `frame` from the waiter list. Always
+  ## called when select abandons this branch (winner won OR select
+  ## itself cancelled). Idempotent.
+  def unregister_waker(self, frame: Int): Void
+    _scope_unregister_waiter(@scope_handle, frame)
+  end
+
+  ## complete: throws via Throws with the scope's cancel reason.
+  ## Control never returns from this call; the arm body's binding is
+  ## thus unobservable in practice. Returns 0 only to satisfy the
+  ## trait's signature shape (`R = Int` per existential erasure).
+  def complete(self): Int
+    throw(scope_cancel_reason(@scope_handle))
+    return 0
+  end
+end
+
+## Wrap a scope handle as a Selectable that fires when the scope is
+## cancelled. Use inside `select { case _ = cancellable(s) => ... }`.
+## The wrapper is free; the scope is unaffected until `complete`
+## fires (which throws and never returns).
+def cancellable(s: Int): ScopeCancelSelectable = ScopeCancelSelectable { scope_handle: s }
+
+# ============================================================================
+# DeadlineSelectable — Selectable wrapper for deadline expiry (C.13 Phase 5)
+# ============================================================================
+
+## A Selectable that observes "the wall-clock has passed an absolute
+## monotonic-ns deadline". Use as the right-hand side of a `case _ =
+## deadline_ms(ms) => ...` arm in `select`. When the arm wins,
+## `complete` throws `"deadline_exceeded"` via Throws — control
+## unwinds; the body's binding is unobservable (same shape as
+## ScopeCancelSelectable).
+##
+## **Phase 4b active-wake (B.7 4e.8 substrate reuse):** register_waker
+## piggybacks on `scope_deadline` — it lazy-creates an internal child
+## scope of `scope_root()` carrying the deadline. The child scope's
+## proactive deadline pthread fires `_scope_fire_deadline_exceeded` at
+## the deadline; that walks the scope's waiter list (where the polling
+## task installed itself in register_waker) and `sched_wake`s every
+## frame. The parked select wakes at microsecond latency. No new
+## scheduler primitives needed — the substrate from B.7 Phase 4d
+## (proactive deadline timer pthread) plus 4e.8 (waiter list +
+## cancel-walk wake) is exactly the right shape; we just borrow it.
+##
+## Trade-off: each fired DeadlineSelectable leaks one scope handle
+## until process exit (no cleanup of the scope after firing). For
+## typical select usage this is single-digit handles; scope_root is the
+## process-wide ancestor and will free everything at exit. If a hot
+## loop reconstructs a fresh DeadlineSelectable each iteration via
+## `deadline_ms(ms)`, the leak grows linearly in iterations — document
+## as a known cost; the right fix is a pooled timer mechanism in a
+## later phase, not a cleanup hook here (cleanup before fire would
+## need atomic disarm + thread-join, and that's substantially more
+## machinery than is justified for the leaked scope-node footprint).
+struct DeadlineSelectable
+  deadline_ns: Int
+  _internal_scope: Int
+end
+
+extend DeadlineSelectable with Selectable<Int>
+  ## try_poll: returns `Some(0)` once `time_mono_ns() >= deadline_ns`,
+  ## `None` otherwise. Bound payload (0) is a placeholder; `complete`
+  ## throws so the body's binding is unobservable.
+  def try_poll(self): Option<Int>
+    if time_mono_ns() >= @deadline_ns
+      return option_some(0)
+    end
+    return option_none()
+  end
+
+  ## register_waker: lazy-create an internal child scope of `scope_root()`
+  ## carrying our absolute deadline; install `frame` on that scope's
+  ## waiter list. The child scope's deadline pthread (B.7 4d) fires
+  ## `_scope_fire_deadline_exceeded` at the deadline → walks waiters →
+  ## `sched_wake(frame)` (B.7 4e.8). Idempotent — second call with the
+  ## same instance reuses the existing scope; `_scope_register_waiter`
+  ## itself is idempotent on (scope, frame) pairs.
+  def register_waker(&mut self, frame: Int): Void
+    if @_internal_scope == 0
+      @_internal_scope = scope_deadline(scope_root(), @deadline_ns)
+    end
+    _scope_register_waiter(@_internal_scope, frame)
+  end
+
+  ## unregister_waker: remove `frame` from the internal scope's waiter
+  ## list. Always called when select abandons this branch. Idempotent.
+  def unregister_waker(self, frame: Int): Void
+    if @_internal_scope != 0
+      _scope_unregister_waiter(@_internal_scope, frame)
+    end
+  end
+
+  ## complete: throws `"deadline_exceeded"` via Throws. Control never
+  ## returns. Returns 0 only to satisfy the trait's signature shape.
+  def complete(self): Int
+    throw("deadline_exceeded")
+    return 0
+  end
+end
+
+## Build a DeadlineSelectable firing `ms` milliseconds from now. The
+## deadline is captured at construction (computed against
+## `time_mono_ns()`); subsequent `try_poll` calls compare current time
+## to the captured absolute deadline.
+def deadline_ms(ms: Int): DeadlineSelectable
+  return DeadlineSelectable { deadline_ns: time_mono_ns() + ms * 1000000, _internal_scope: 0 }
+end
+
+## Build a DeadlineSelectable firing at an absolute monotonic-ns
+## timestamp (matches the unit returned by `time_mono_ns()`). Use this
+## when composing deadlines with scope deadlines or other absolute
+## timestamps.
+def deadline_at_ns(ns: Int): DeadlineSelectable
+  return DeadlineSelectable { deadline_ns: ns, _internal_scope: 0 }
+end

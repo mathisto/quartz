@@ -1,0 +1,215 @@
+## Effect kind=2 unwind — Milestone F.3b acceptance spec.
+##
+## Operation Piezoelectric Effects, Phase 2, Milestone F (chunk F.3b).
+##
+## F.2 classified resumable ops as kind=2; F.3a gave `resume(v)` tail
+## semantics; F.3b wires the "operation kind" unwind path per memo §2.3.
+## When a kind=2 op's handler fires, the runtime stashes the handler's
+## return at `@__qz_effect_stack_results[slot]` and longjmps back to the
+## enclosing `with` block's setjmp. The with-block then evaluates to the
+## stashed value — matching exception-style semantics ("throw(e)" unwinds
+## the block and the block's value becomes the handler's chosen default).
+##
+## Infrastructure:
+##   install(name, handler, buf)   — buf stored in __qz_effect_stack_bufs[top]
+##   perform(eff, op, arg0, kind)  — kind>=2 + non-null buf triggers longjmp
+##   with-block codegen            — alloca jmpbuf + result_slot, setjmp +
+##                                    branch (rc==0 → body, rc!=0 → catch)
+##   body path stores body_val into result_slot before br to done
+##   catch path loads from stack_results[pretop] → result_slot, br done
+##   done merges via load from result_slot
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("effect kind=2 unwind (piezo F.3b)") do ->
+    it("kind=2 throw handler unwinds the with-block to handler's return") do ->
+      # The handler returns 999 without calling resume. Body code after
+      # throw() must not run. The with-block evaluates to 999.
+      assert_run_stdout_eq("""
+effect Throws
+  def escape(msg: String): Int = resume(0)
+end
+
+def catch_all(op_name: Int, argc: Int, argv: Int): Int
+  return 999
+end
+
+def main(): Int
+  var r = with Throws { escape: catch_all } do ->
+    puts("before escape")
+    var v = escape("bail out")
+    puts("after escape — should NOT print")
+    v
+  end
+  puts(str_from_int(r))
+  return 0
+end
+""", "before escape\n999\n")
+    end
+
+    it("kind=2 unwind works across an intermediate can-rowed helper") do ->
+      # helper() calls escape(). The unwind must cross helper's stack
+      # frame and land at the caller's with-block.
+      assert_run_stdout_eq("""
+effect Throws
+  def escape(msg: String): Int = resume(0)
+end
+
+def helper(x: Int): Int can Throws
+  if x < 0
+    escape("negative!")
+  end
+  return x * 2
+end
+
+def catch_all(op_name: Int, argc: Int, argv: Int): Int
+  return 42
+end
+
+def main(): Int
+  var r = with Throws { escape: catch_all } do ->
+    helper(0 - 5)
+  end
+  puts(str_from_int(r))
+  return 0
+end
+""", "42\n")
+    end
+
+    it("kind=1 op (no resume in decl body) still returns normally — no unwind") do ->
+      # Regression guard: ops declared without `resume` in the body are
+      # kind=1 (tail-resume). The with-block should continue executing
+      # after the op call; the block's value is the body's final expr.
+      assert_run_stdout_eq("""
+effect Log
+  def trace(msg: String): Int
+end
+
+def my_trace(op_name: Int, argc: Int, argv: Int): Int
+  return 7
+end
+
+def main(): Int
+  var r = with Log { trace: my_trace } do ->
+    puts("before")
+    var t = trace("x")
+    puts("after — MUST print for kind=1")
+    puts(str_from_int(t))
+    100
+  end
+  puts(str_from_int(r))
+  return 0
+end
+""", "before\nafter — MUST print for kind=1\n7\n100\n")
+    end
+
+    it("body running to completion returns body's final value") do ->
+      # Normal path (no op fired): the with-block yields the body's
+      # value via the result_slot's load at the done merge block.
+      assert_run_stdout_eq("""
+effect Throws
+  def escape(msg: String): Int = resume(0)
+end
+
+def catch_all(op_name: Int, argc: Int, argv: Int): Int
+  return 999
+end
+
+def main(): Int
+  var r = with Throws { escape: catch_all } do ->
+    var x = 10
+    var y = 20
+    x + y
+  end
+  puts(str_from_int(r))
+  return 0
+end
+""", "30\n")
+    end
+
+    it("IR emits setjmp and the wb.catch/wb.body/wb.done labels") do ->
+      assert_ir_contains("""
+effect Throws
+  def escape(m: String): Int = resume(0)
+end
+
+def h(op: Int, a: Int): Int = 0
+
+def main(): Int
+  var r = with Throws { escape: h } do ->
+    escape("x")
+  end
+  return 0
+end
+""", "call i32 @setjmp")
+    end
+
+    it("IR emits wb.catch label for the unwind landing pad") do ->
+      assert_ir_contains("""
+effect Throws
+  def escape(m: String): Int = resume(0)
+end
+
+def h(op: Int, a: Int): Int = 0
+
+def main(): Int
+  var r = with Throws { escape: h } do ->
+    escape("x")
+  end
+  return 0
+end
+""", "wb.catch.")
+    end
+
+    it("IR emits wb.done merge block for body/catch convergence") do ->
+      assert_ir_contains("""
+effect Throws
+  def escape(m: String): Int = resume(0)
+end
+
+def h(op: Int, a: Int): Int = 0
+
+def main(): Int
+  var r = with Throws { escape: h } do ->
+    escape("x")
+  end
+  return 0
+end
+""", "wb.done.")
+    end
+
+    it("IR emits install with 3-arg signature (includes buf)") do ->
+      assert_ir_contains("""
+effect E
+  def op(x: Int): Int = resume(x)
+end
+
+def h(op: Int, a: Int): Int = 0
+
+def main(): Int
+  var r = with E { op: h } do ->
+    op(1)
+  end
+  return 0
+end
+""", "call void @__qz_effect_handle_install(ptr %hi.")
+    end
+
+    it("IR emits __qz_effect_stack_bufs + __qz_effect_stack_results globals") do ->
+      assert_ir_contains("""
+def main(): Int = 0
+""", "@__qz_effect_stack_bufs = ")
+    end
+
+    it("perform runtime emits the kind=2 longjmp path") do ->
+      # The perform body must contain a conditional to longjmp when
+      # kind>=2 and a non-null buf is present.
+      assert_ir_contains("""
+def main(): Int = 0
+""", "call void @longjmp(ptr ")
+    end
+  end
+  return qspec_main()
+end

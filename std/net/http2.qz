@@ -1,0 +1,777 @@
+##! # HTTP/2 Protocol (RFC 9113)
+##!
+##! Frame parser/writer, connection state machine, and server integration
+##! for HTTP/2 over TLS with ALPN negotiation.
+
+import * from bytes
+import std/net/hpack
+
+extern "C" def malloc(size: Int): Int
+extern "C" def free(ptr: Int): Void
+
+# SSL FFI (extern C doesn't cross modules — must redeclare)
+extern "C" def SSL_read(ssl: CPtr, buf: CPtr, num: CInt): CInt
+extern "C" def SSL_write(ssl: CPtr, buf: CPtr, num: CInt): CInt
+extern "C" def SSL_get_error(ssl: CPtr, ret: CInt): CInt
+extern "C" def SSL_peek(ssl: CPtr, buf: CPtr, num: CInt): CInt
+extern "C" def SSL_pending(ssl: CPtr): CInt
+extern "C" def ERR_clear_error(): Void
+extern "C" def SSL_shutdown(ssl: CPtr): CInt
+extern "C" def SSL_free(ssl: CPtr): Void
+extern "C" def close(fd: CInt): CInt
+
+def _H2_SSL_ERROR_WANT_READ(): Int = 2
+def _H2_SSL_ERROR_WANT_WRITE(): Int = 3
+def _H2_SHUT_RDWR(): Int = 2
+
+# ============================================================================
+# Frame Type Constants (RFC 9113 §6)
+# ============================================================================
+
+def H2_DATA(): Int = 0
+def H2_HEADERS(): Int = 1
+def H2_PRIORITY(): Int = 2
+def H2_RST_STREAM(): Int = 3
+def H2_SETTINGS(): Int = 4
+def H2_PUSH_PROMISE(): Int = 5
+def H2_PING(): Int = 6
+def H2_GOAWAY(): Int = 7
+def H2_WINDOW_UPDATE(): Int = 8
+def H2_CONTINUATION(): Int = 9
+
+# ============================================================================
+# Frame Flag Constants
+# ============================================================================
+
+def H2_FLAG_END_STREAM(): Int = 0x1
+def H2_FLAG_ACK(): Int = 0x1
+def H2_FLAG_END_HEADERS(): Int = 0x4
+def H2_FLAG_PADDED(): Int = 0x8
+def H2_FLAG_PRIORITY(): Int = 0x20
+
+# ============================================================================
+# Settings Identifiers (RFC 9113 §6.5.2)
+# ============================================================================
+
+def H2_SETTINGS_HEADER_TABLE_SIZE(): Int = 0x1
+def H2_SETTINGS_ENABLE_PUSH(): Int = 0x2
+def H2_SETTINGS_MAX_CONCURRENT_STREAMS(): Int = 0x3
+def H2_SETTINGS_INITIAL_WINDOW_SIZE(): Int = 0x4
+def H2_SETTINGS_MAX_FRAME_SIZE(): Int = 0x5
+def H2_SETTINGS_MAX_HEADER_LIST_SIZE(): Int = 0x6
+
+# ============================================================================
+# Error Codes (RFC 9113 §7)
+# ============================================================================
+
+def H2_NO_ERROR(): Int = 0x0
+def H2_PROTOCOL_ERROR(): Int = 0x1
+def H2_INTERNAL_ERROR(): Int = 0x2
+def H2_FLOW_CONTROL_ERROR(): Int = 0x3
+def H2_SETTINGS_TIMEOUT(): Int = 0x4
+def H2_STREAM_CLOSED(): Int = 0x5
+def H2_FRAME_SIZE_ERROR(): Int = 0x6
+def H2_REFUSED_STREAM(): Int = 0x7
+def H2_CANCEL(): Int = 0x8
+def H2_COMPRESSION_ERROR(): Int = 0x9
+def H2_CONNECT_ERROR(): Int = 0xa
+def H2_ENHANCE_YOUR_CALM(): Int = 0xb
+def H2_INADEQUATE_SECURITY(): Int = 0xc
+def H2_HTTP_1_1_REQUIRED(): Int = 0xd
+
+# ============================================================================
+# Connection Preface
+# ============================================================================
+
+# Client connection preface: "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" (24 bytes)
+def H2_PREFACE_LEN(): Int = 24
+
+def h2_preface_bytes(): Bytes
+  var b = Bytes { _data: vec_new() }
+  # "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+  var s = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+  var i = 0
+  while i < str_byte_len(s)
+    b.push(str_byte_at(s, i))
+    i = i + 1
+  end
+  return b
+end
+
+# ============================================================================
+# Frame Struct
+# ============================================================================
+
+struct H2Frame
+  length: Int       # 24-bit payload length
+  frame_type: Int   # 8-bit type
+  flags: Int        # 8-bit flags
+  stream_id: Int    # 31-bit stream identifier
+  payload: Bytes    # Raw payload bytes
+end
+
+struct H2Setting
+  id: Int           # 16-bit setting identifier
+  value: Int        # 32-bit setting value
+end
+
+# ============================================================================
+# Frame Parser
+# ============================================================================
+
+## Parse a 9-byte frame header from Bytes at the given position.
+## Returns an H2Frame with payload empty (caller reads payload separately).
+def h2_parse_frame_header(data: Bytes, pos: Int): H2Frame
+  # Byte 0-2: length (24-bit big-endian)
+  var length = shl(data.get(pos), 16) + shl(data.get(pos + 1), 8) + data.get(pos + 2)
+  # Byte 3: type
+  var frame_type = data.get(pos + 3)
+  # Byte 4: flags
+  var flags = data.get(pos + 4)
+  # Byte 5-8: R(1) + stream_id(31) — mask off reserved bit
+  var stream_id = shl(band(data.get(pos + 5), 0x7F), 24) + shl(data.get(pos + 6), 16) + shl(data.get(pos + 7), 8) + data.get(pos + 8)
+  return H2Frame {
+    length: length,
+    frame_type: frame_type,
+    flags: flags,
+    stream_id: stream_id,
+    payload: Bytes { _data: vec_new() }
+  }
+end
+
+## Parse a complete frame (header + payload) from Bytes.
+def h2_parse_frame(data: Bytes, pos: Int): H2Frame
+  var frame = h2_parse_frame_header(data, pos)
+  var payload = Bytes { _data: vec_new() }
+  var i = 0
+  while i < frame.length and (pos + 9 + i) < data.size()
+    payload.push(data.get(pos + 9 + i))
+    i = i + 1
+  end
+  frame.payload = payload
+  return frame
+end
+
+## Total byte size of a frame (header + payload)
+def h2_frame_size(frame: H2Frame): Int = 9 + frame.length
+
+# ============================================================================
+# Frame Serializer
+# ============================================================================
+
+## Serialize an H2Frame to wire-format Bytes.
+def h2_serialize_frame(frame: H2Frame): Bytes
+  var result = Bytes { _data: vec_new() }
+  # Length (24-bit big-endian)
+  result.push(band(shr(frame.length, 16), 0xFF))
+  result.push(band(shr(frame.length, 8), 0xFF))
+  result.push(band(frame.length, 0xFF))
+  # Type
+  result.push(band(frame.frame_type, 0xFF))
+  # Flags
+  result.push(band(frame.flags, 0xFF))
+  # Stream ID (31-bit, R=0)
+  result.push(band(shr(frame.stream_id, 24), 0x7F))
+  result.push(band(shr(frame.stream_id, 16), 0xFF))
+  result.push(band(shr(frame.stream_id, 8), 0xFF))
+  result.push(band(frame.stream_id, 0xFF))
+  # Payload
+  var i = 0
+  while i < frame.payload.size()
+    result.push(frame.payload.get(i))
+    i = i + 1
+  end
+  return result
+end
+
+# ============================================================================
+# Frame Builders
+# ============================================================================
+
+## Build a SETTINGS frame.
+def h2_settings_frame(settings: Vec<H2Setting>, ack: Int): H2Frame
+  var payload = Bytes { _data: vec_new() }
+  if ack == 0
+    var i = 0
+    while i < settings.size
+      var s = settings[i]
+      # Setting ID (16-bit)
+      payload.push(band(shr(s.id, 8), 0xFF))
+      payload.push(band(s.id, 0xFF))
+      # Setting Value (32-bit)
+      payload.push(band(shr(s.value, 24), 0xFF))
+      payload.push(band(shr(s.value, 16), 0xFF))
+      payload.push(band(shr(s.value, 8), 0xFF))
+      payload.push(band(s.value, 0xFF))
+      i = i + 1
+    end
+  end
+  var flags = 0
+  if ack != 0
+    flags = H2_FLAG_ACK()
+  end
+  return H2Frame {
+    length: payload.size(),
+    frame_type: H2_SETTINGS(),
+    flags: flags,
+    stream_id: 0,
+    payload: payload
+  }
+end
+
+## Build a HEADERS frame with encoded header block.
+def h2_headers_frame(stream_id: Int, header_block: Bytes, end_stream: Int, end_headers: Int): H2Frame
+  var flags = 0
+  if end_stream != 0
+    flags = bor(flags, H2_FLAG_END_STREAM())
+  end
+  if end_headers != 0
+    flags = bor(flags, H2_FLAG_END_HEADERS())
+  end
+  return H2Frame {
+    length: header_block.size(),
+    frame_type: H2_HEADERS(),
+    flags: flags,
+    stream_id: stream_id,
+    payload: header_block
+  }
+end
+
+## Build a DATA frame.
+def h2_data_frame(stream_id: Int, data: Bytes, end_stream: Int): H2Frame
+  var flags = 0
+  if end_stream != 0
+    flags = H2_FLAG_END_STREAM()
+  end
+  return H2Frame {
+    length: data.size(),
+    frame_type: H2_DATA(),
+    flags: flags,
+    stream_id: stream_id,
+    payload: data
+  }
+end
+
+## Build a RST_STREAM frame.
+def h2_rst_stream_frame(stream_id: Int, error_code: Int): H2Frame
+  var payload = Bytes { _data: vec_new() }
+  payload.push(band(shr(error_code, 24), 0xFF))
+  payload.push(band(shr(error_code, 16), 0xFF))
+  payload.push(band(shr(error_code, 8), 0xFF))
+  payload.push(band(error_code, 0xFF))
+  return H2Frame {
+    length: 4,
+    frame_type: H2_RST_STREAM(),
+    flags: 0,
+    stream_id: stream_id,
+    payload: payload
+  }
+end
+
+## Build a GOAWAY frame.
+def h2_goaway_frame(last_stream_id: Int, error_code: Int): H2Frame
+  var payload = Bytes { _data: vec_new() }
+  # Last-Stream-ID (31-bit)
+  payload.push(band(shr(last_stream_id, 24), 0x7F))
+  payload.push(band(shr(last_stream_id, 16), 0xFF))
+  payload.push(band(shr(last_stream_id, 8), 0xFF))
+  payload.push(band(last_stream_id, 0xFF))
+  # Error Code (32-bit)
+  payload.push(band(shr(error_code, 24), 0xFF))
+  payload.push(band(shr(error_code, 16), 0xFF))
+  payload.push(band(shr(error_code, 8), 0xFF))
+  payload.push(band(error_code, 0xFF))
+  return H2Frame {
+    length: 8,
+    frame_type: H2_GOAWAY(),
+    flags: 0,
+    stream_id: 0,
+    payload: payload
+  }
+end
+
+## Build a PING frame.
+def h2_ping_frame(opaque_data: Bytes, ack: Int): H2Frame
+  var flags = 0
+  if ack != 0
+    flags = H2_FLAG_ACK()
+  end
+  return H2Frame {
+    length: 8,
+    frame_type: H2_PING(),
+    flags: flags,
+    stream_id: 0,
+    payload: opaque_data
+  }
+end
+
+## Build a WINDOW_UPDATE frame.
+def h2_window_update_frame(stream_id: Int, increment: Int): H2Frame
+  var payload = Bytes { _data: vec_new() }
+  # Window Size Increment (31-bit, R=0)
+  payload.push(band(shr(increment, 24), 0x7F))
+  payload.push(band(shr(increment, 16), 0xFF))
+  payload.push(band(shr(increment, 8), 0xFF))
+  payload.push(band(increment, 0xFF))
+  return H2Frame {
+    length: 4,
+    frame_type: H2_WINDOW_UPDATE(),
+    flags: 0,
+    stream_id: stream_id,
+    payload: payload
+  }
+end
+
+# ============================================================================
+# Settings Parser
+# ============================================================================
+
+## Parse SETTINGS payload into a list of settings.
+def h2_parse_settings(payload: Bytes): Vec<H2Setting>
+  var settings = vec_new<H2Setting>()
+  var pos = 0
+  while pos + 5 < payload.size()
+    var id = shl(payload.get(pos), 8) + payload.get(pos + 1)
+    var value = shl(payload.get(pos + 2), 24) + shl(payload.get(pos + 3), 16) + shl(payload.get(pos + 4), 8) + payload.get(pos + 5)
+    settings.push(H2Setting { id: id, value: value })
+    pos = pos + 6
+  end
+  return settings
+end
+
+# ============================================================================
+# Bytes ↔ Raw Memory Bridge
+# ============================================================================
+
+## Copy raw memory (ptr) into a Bytes value.
+def h2_bytes_from_ptr(ptr: Int, len: Int): Bytes
+  var d = vec_new()
+  var i = 0
+  while i < len
+    d.push(ptr_read_byte(ptr_add(ptr, i)))
+    i = i + 1
+  end
+  return Bytes { _data: d }
+end
+
+## Copy Bytes to a malloc'd buffer. Returns pointer (caller frees).
+def h2_bytes_to_ptr(b: Bytes): Int
+  var buf = malloc(b.size())
+  var i = 0
+  while i < b.size()
+    ptr_write_byte(ptr_add(buf, i), b.get(i))
+    i = i + 1
+  end
+  return buf
+end
+
+## Convert a Bytes value to a String (interpreting as UTF-8/ASCII).
+def h2_bytes_to_string(b: Bytes): String
+  var s = ""
+  var i = 0
+  while i < b.size()
+    s = s + str_from_codepoint(b.get(i))
+    i = i + 1
+  end
+  return s
+end
+
+## Convert a String to Bytes.
+def h2_string_to_bytes(s: String): Bytes
+  var b = Bytes { _data: vec_new() }
+  var i = 0
+  while i < str_byte_len(s)
+    b.push(str_byte_at(s, i))
+    i = i + 1
+  end
+  return b
+end
+
+## Validate connection preface: returns 1 if valid, 0 otherwise.
+def h2_validate_preface(data: Bytes): Int
+  var expected = h2_preface_bytes()
+  if data.size() < H2_PREFACE_LEN()
+    return 0
+  end
+  var i = 0
+  while i < H2_PREFACE_LEN()
+    if data.get(i) != expected.get(i)
+      return 0
+    end
+    i = i + 1
+  end
+  return 1
+end
+
+# ============================================================================
+# Stream States (RFC 9113 §5.1)
+# ============================================================================
+
+def H2_STATE_OPEN(): Int = 1
+def H2_STATE_HALF_CLOSED_REMOTE(): Int = 2
+def H2_STATE_HALF_CLOSED_LOCAL(): Int = 3
+def H2_STATE_CLOSED(): Int = 4
+
+# ============================================================================
+# Default Server Settings
+# ============================================================================
+
+def H2_DEFAULT_HEADER_TABLE_SIZE(): Int = 4096
+def H2_DEFAULT_MAX_CONCURRENT(): Int = 100
+def H2_DEFAULT_INITIAL_WINDOW(): Int = 65535
+def H2_DEFAULT_MAX_FRAME_SIZE(): Int = 16384
+def H2_DEFAULT_MAX_HEADER_LIST(): Int = 8192
+
+## Build the server SETTINGS frame (sent at connection start).
+def h2_server_settings(): H2Frame
+  var settings = vec_new<H2Setting>()
+  settings.push(H2Setting { id: H2_SETTINGS_MAX_CONCURRENT_STREAMS(), value: H2_DEFAULT_MAX_CONCURRENT() })
+  settings.push(H2Setting { id: H2_SETTINGS_INITIAL_WINDOW_SIZE(), value: H2_DEFAULT_INITIAL_WINDOW() })
+  settings.push(H2Setting { id: H2_SETTINGS_MAX_FRAME_SIZE(), value: H2_DEFAULT_MAX_FRAME_SIZE() })
+  settings.push(H2Setting { id: H2_SETTINGS_MAX_HEADER_LIST_SIZE(), value: H2_DEFAULT_MAX_HEADER_LIST() })
+  settings.push(H2Setting { id: H2_SETTINGS_ENABLE_PUSH(), value: 0 })
+  return h2_settings_frame(settings, 0)
+end
+
+# ============================================================================
+# Async TLS I/O for HTTP/2
+# (duplicated from http_server — extern C doesn't cross modules)
+# ============================================================================
+
+def _h2_tls_recv(ssl_ptr: Int, fd: Int, buf: Int, max_bytes: Int): Int
+  var ssl = int_to_cptr(ssl_ptr)
+  while true
+    ERR_clear_error()
+    var n = SSL_read(ssl, buf, max_bytes)
+    if n > 2147483647
+      n = n - 4294967296
+    end
+    if n > 0
+      return n
+    end
+    if n == 0
+      return 0
+    end
+    var err = SSL_get_error(ssl, n)
+    if err == _H2_SSL_ERROR_WANT_READ() or err == _H2_SSL_ERROR_WANT_WRITE()
+      # Check SSL internal buffer before waiting on fd — SSL may have
+      # buffered data from a previous TLS record (critical on Linux
+      # where epoll won't fire for data in SSL's buffer).
+      if SSL_pending(ssl) == 0
+        io_suspend(fd)
+      end
+    else
+      return -1
+    end
+  end
+  return -1
+end
+
+def _h2_tls_recv_timeout(ssl_ptr: Int, fd: Int, buf: Int, max_bytes: Int, timeout_ms: Int): Int
+  if timeout_ms <= 0
+    return _h2_tls_recv(ssl_ptr, fd, buf, max_bytes)
+  end
+  var ssl = int_to_cptr(ssl_ptr)
+  var deadline = time_mono_ns() / 1000000 + timeout_ms
+  while true
+    ERR_clear_error()
+    var n = SSL_read(ssl, buf, max_bytes)
+    if n > 2147483647
+      n = n - 4294967296
+    end
+    if n > 0
+      return n
+    end
+    if n == 0
+      return 0
+    end
+    var err = SSL_get_error(ssl, n)
+    if err == _H2_SSL_ERROR_WANT_READ() or err == _H2_SSL_ERROR_WANT_WRITE()
+      if SSL_pending(ssl) == 0
+        var remaining = deadline - time_mono_ns() / 1000000
+        if remaining <= 0
+          return -2
+        end
+        io_suspend_timeout(fd, remaining, 1)
+        if time_mono_ns() / 1000000 >= deadline
+          return -2
+        end
+      end
+    else
+      return -1
+    end
+  end
+  return -1
+end
+
+def _h2_tls_send_timeout(ssl_ptr: Int, fd: Int, buf: Int, len: Int, timeout_ms: Int): Int
+  var ssl = int_to_cptr(ssl_ptr)
+  var total = 0
+  while total < len
+    ERR_clear_error()
+    var n = SSL_write(ssl, ptr_add(buf, total), len - total)
+    if n > 2147483647
+      n = n - 4294967296
+    end
+    if n > 0
+      total = total + n
+    else
+      var err = SSL_get_error(ssl, n)
+      if err == _H2_SSL_ERROR_WANT_READ() or err == _H2_SSL_ERROR_WANT_WRITE()
+        if timeout_ms > 0
+          var deadline = time_mono_ns() / 1000000 + timeout_ms
+          var remaining = deadline - time_mono_ns() / 1000000
+          if remaining <= 0
+            return -2
+          end
+          io_suspend_timeout(fd, remaining, 4)
+        else
+          io_suspend(fd)
+        end
+      else
+        return -1
+      end
+    end
+  end
+  return total
+end
+
+# ============================================================================
+# Frame I/O over TLS
+# ============================================================================
+
+## Read exactly `total` bytes from TLS. Returns bytes read or <=0 on error.
+def _h2_tls_read_exact(ssl_ptr: Int, fd: Int, buf: Int, total: Int, timeout_ms: Int): Int
+  var done = 0
+  while done < total
+    var n = _h2_tls_recv_timeout(ssl_ptr, fd, ptr_add(buf, done), total - done, timeout_ms)
+    if n <= 0
+      return n
+    end
+    done = done + n
+  end
+  return done
+end
+
+## Read one complete H2 frame from TLS. Returns frame with length=-1 on error.
+def _h2_read_frame(ssl_ptr: Int, fd: Int, timeout_ms: Int, max_frame: Int): H2Frame
+  var err_frame = H2Frame { length: -1, frame_type: 0, flags: 0, stream_id: 0, payload: Bytes { _data: vec_new() } }
+  var hdr_buf = malloc(9)
+  var n = _h2_tls_read_exact(ssl_ptr, fd, hdr_buf, 9, timeout_ms)
+  if n <= 0
+    mem_free(hdr_buf)
+    return err_frame
+  end
+  var hdr_bytes = h2_bytes_from_ptr(hdr_buf, 9)
+  mem_free(hdr_buf)
+  var frame = h2_parse_frame_header(hdr_bytes, 0)
+  if frame.length > max_frame
+    return H2Frame { length: -2, frame_type: 0, flags: 0, stream_id: 0, payload: Bytes { _data: vec_new() } }
+  end
+  if frame.length > 0
+    var pay_buf = malloc(frame.length)
+    var pn = _h2_tls_read_exact(ssl_ptr, fd, pay_buf, frame.length, timeout_ms)
+    if pn <= 0
+      mem_free(pay_buf)
+      return err_frame
+    end
+    var payload = h2_bytes_from_ptr(pay_buf, frame.length)
+    mem_free(pay_buf)
+    return H2Frame {
+      length: frame.length,
+      frame_type: frame.frame_type,
+      flags: frame.flags,
+      stream_id: frame.stream_id,
+      payload: payload
+    }
+  end
+  return frame
+end
+
+## Read frame into pre-allocated pointer, avoiding struct return (safe in async context).
+## Layout: [0]=length, [8]=frame_type, [16]=flags, [24]=stream_id, [32]=payload (Bytes ptr)
+## Returns: 1 on success, 0 on read error, -1 on oversized frame.
+## Read a frame into the caller's 5-slot `out` buffer (`malloc(40)` —
+## 5 × i64). Same slot-index discipline as `_h2s_*` in this file:
+## `store(out, off, val)` is i64-slot-strided, NOT byte-offset, per
+## `cg_intrinsic_memory.qz:79-100`. Slot layout:
+##   [0] length      ([0, length] or -1 on EOF)
+##   [1] frame_type
+##   [2] flags
+##   [3] stream_id
+##   [4] payload     (Bytes via as_int_generic)
+def _h2_read_frame_into(ssl_ptr: Int, fd: Int, timeout_ms: Int, max_frame: Int, out: Int): Int
+  var hdr_buf = malloc(9)
+  var n = _h2_tls_read_exact(ssl_ptr, fd, hdr_buf, 9, timeout_ms)
+  if n <= 0
+    mem_free(hdr_buf)
+    store(out, 0, -1)
+    store(out, 4, as_int_generic(Bytes { _data: vec_new() }))
+    return 0
+  end
+  var hdr_bytes = h2_bytes_from_ptr(hdr_buf, 9)
+  mem_free(hdr_buf)
+  var hdr = h2_parse_frame_header(hdr_bytes, 0)
+  store(out, 0, hdr.length)
+  store(out, 1, hdr.frame_type)
+  store(out, 2, hdr.flags)
+  store(out, 3, hdr.stream_id)
+  if hdr.length > max_frame
+    store(out, 4, as_int_generic(Bytes { _data: vec_new() }))
+    return -1
+  end
+  if hdr.length > 0
+    var pay_buf = malloc(hdr.length)
+    var pn = _h2_tls_read_exact(ssl_ptr, fd, pay_buf, hdr.length, timeout_ms)
+    if pn <= 0
+      mem_free(pay_buf)
+      store(out, 4, as_int_generic(Bytes { _data: vec_new() }))
+      return 0
+    end
+    store(out, 4, as_int_generic(h2_bytes_from_ptr(pay_buf, hdr.length)))
+    mem_free(pay_buf)
+    return 1
+  end
+  store(out, 4, as_int_generic(Bytes { _data: vec_new() }))
+  return 1
+end
+
+## Accessors for _h2_read_frame_into output buffer — slot indices,
+## see _h2_read_frame_into's docstring above for layout.
+def _h2f_length(p: Int): Int = load(p, 0)
+def _h2f_type(p: Int): Int = load(p, 1)
+def _h2f_flags(p: Int): Int = load(p, 2)
+def _h2f_stream_id(p: Int): Int = load(p, 3)
+def _h2f_payload(p: Int): Bytes = as_type<Bytes>(load(p, 4))
+
+## Write a serialized frame to TLS. Returns bytes written or <=0 on error.
+def _h2_write_frame(ssl_ptr: Int, fd: Int, frame: H2Frame, timeout_ms: Int): Int
+  var serialized = h2_serialize_frame(frame)
+  var buf = h2_bytes_to_ptr(serialized)
+  var len = serialized.size()
+  var result = _h2_tls_send_timeout(ssl_ptr, fd, buf, len, timeout_ms)
+  mem_free(buf)
+  return result
+end
+
+# ============================================================================
+# Per-Stream State (malloc'd, tracked in intmap)
+# ============================================================================
+# Layout: 8 i64 slots in a malloc(64) chunk.
+# `store(p, off, val)` / `load(p, off)` are i64-strided (off is a slot index,
+# NOT a byte offset — see cg_intrinsic_memory.qz). Slot indices below.
+#   [0] state         (H2_STREAM_*)
+#   [1] hdr_block_ptr (Bytes via as_int_generic)
+#   [2] body_ptr      (Bytes via as_int_generic)
+#   [3] headers_done  (0/1)
+#   [4] end_stream    (0/1)
+#   [5] send_window
+#   [6] recv_window
+#   [7] window_ch     (channel for WINDOW_UPDATE signals to stream handler)
+
+def _h2s_alloc(initial_window: Int): Int
+  var p = malloc(64)
+  store(p, 0, H2_STATE_OPEN())
+  store(p, 1, as_int_generic(Bytes { _data: vec_new() }))
+  store(p, 2, as_int_generic(Bytes { _data: vec_new() }))
+  store(p, 3, 0)
+  store(p, 4, 0)
+  store(p, 5, initial_window)
+  store(p, 6, initial_window)
+  store(p, 7, channel_new(16))
+  return p
+end
+
+def _h2s_state(p: Int): Int = load(p, 0)
+def _h2s_set_state(p: Int, v: Int): Void = store(p, 0, v)
+def _h2s_hdr_block(p: Int): Bytes = as_type<Bytes>(load(p, 1))
+def _h2s_set_hdr_block(p: Int, b: Bytes): Void = store(p, 1, as_int_generic(b))
+def _h2s_body(p: Int): Bytes = as_type<Bytes>(load(p, 2))
+def _h2s_set_body(p: Int, b: Bytes): Void = store(p, 2, as_int_generic(b))
+def _h2s_headers_done(p: Int): Int = load(p, 3)
+def _h2s_set_headers_done(p: Int): Void = store(p, 3, 1)
+def _h2s_end_stream(p: Int): Int = load(p, 4)
+def _h2s_set_end_stream(p: Int): Void = store(p, 4, 1)
+def _h2s_send_win(p: Int): Int = load(p, 5)
+def _h2s_set_send_win(p: Int, v: Int): Void = store(p, 5, v)
+def _h2s_recv_win(p: Int): Int = load(p, 6)
+def _h2s_set_recv_win(p: Int, v: Int): Void = store(p, 6, v)
+def _h2s_window_ch(p: Int): Int = load(p, 7)
+def _h2s_free(p: Int): Void = mem_free(p)
+
+# ============================================================================
+# Frame Writer Go-Task
+# ============================================================================
+
+## Reads serialized frame Bytes (as Int via as_int_generic) from write_ch,
+## writes to TLS. Exits on receiving 0 (shutdown signal) or write error.
+def _h2_frame_writer(ssl_ptr: Int, fd: Int, write_ch: Int, timeout_ms: Int): Void
+  while true
+    var msg = recv(write_ch)
+    if msg == 0
+      break
+    end
+    var frame_bytes = as_type<Bytes>(msg)
+    var buf = h2_bytes_to_ptr(frame_bytes)
+    var len = frame_bytes.size()
+    var n = _h2_tls_send_timeout(ssl_ptr, fd, buf, len, timeout_ms)
+    mem_free(buf)
+    if n <= 0
+      break
+    end
+  end
+end
+
+# ============================================================================
+# Preface Detection — check if connection is HTTP/2 via SSL_peek
+# ============================================================================
+
+## Peek at first bytes after TLS accept. Returns 1 if HTTP/2 preface detected.
+def h2_detect_preface(ssl_ptr: Int, fd: Int): Int
+  var buf = malloc(24)
+  var ssl = int_to_cptr(ssl_ptr)
+  while true
+    ERR_clear_error()
+    var n = SSL_peek(ssl, buf, 24)
+    if n > 2147483647
+      n = n - 4294967296
+    end
+    if n >= 24
+      # Compare with "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+      var preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+      var matched = 1
+      var i = 0
+      while i < 24
+        if ptr_read_byte(ptr_add(buf, i)) != str_byte_at(preface, i)
+          matched = 0
+          break
+        end
+        i = i + 1
+      end
+      mem_free(buf)
+      return matched
+    end
+    if n > 0
+      # Got some bytes but not 24 — not h2 preface
+      mem_free(buf)
+      return 0
+    end
+    if n == 0
+      mem_free(buf)
+      return 0
+    end
+    # n < 0
+    var err = SSL_get_error(ssl, n)
+    if err == _H2_SSL_ERROR_WANT_READ() or err == _H2_SSL_ERROR_WANT_WRITE()
+      if SSL_pending(ssl) == 0
+        io_suspend(fd)
+      end
+    else
+      mem_free(buf)
+      return 0
+    end
+  end
+  mem_free(buf)
+  return 0
+end
+

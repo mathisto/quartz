@@ -1,0 +1,634 @@
+##! # Exclusivity (Law of Exclusivity) — static access-path checker
+##!
+##! WS4 of the exclusivity-checking saga. Enforces the static half of Quartz's
+##! second-class-borrow discipline (Hylo/Swift mutable-value-semantics model,
+##! Stance 1 — NO lifetimes). Two rules:
+##!
+##!   - **Static exclusivity (QZ0408):** while a `&mut p` borrow is live, no
+##!     other live access (read OR write) to a place OVERLAPPING `p` is allowed,
+##!     and two `&mut` to overlapping places always conflict. For the current
+##!     argument-only borrow surface this is a per-call pairwise overlap test:
+##!     every argument (and the receiver) of a single call is "simultaneously
+##!     live," so `f(&mut x, &mut x)`, `f(&mut x, x)`, etc. conflict.
+##!   - **Non-escape (QZ0409):** a second-class borrow (`&x` / `&mut x`) must not
+##!     escape its call scope — it may not be (a) STORED into a field/heap cell,
+##!     (b) RETURNED, or (c) CAPTURED by an ESCAPING closure. Sub-case (c) shares
+##!     the SAME escape oracle as the mutable capture-by-ref lowering (see
+##!     `esc_lambda_is_escaping` below); a mut-capture into an escaping closure
+##!     IS QZ0409(c).
+##!
+##! ## Diagnostic-only, hard-error mode (D-A: warning-first → flip complete)
+##!
+##! This pass reads the AST and emits QZ0408/QZ0409 as **hard errors** (via
+##! `typecheck_diag::tc_diag_error_at`) — a program with a genuine violation
+##! fails to compile. The warning-first → scan → migrate → flip sequence (WS4)
+##! is complete; the first-party corpus was scanned clean (0 violations) before
+##! this flip, so the self-compile stays green. It NEVER rewrites the tree and
+##! NEVER touches MIR, so the default build stays gate-0 byte-identical (the only
+##! IR delta is the new `define`s for the helpers in this module).
+##!
+##! ## Step 1 scope (base-only places)
+##!
+##! Today `&expr` only preserves a bare-ident operand through CST lowering
+##! (`cst_lower.qz` drops projections), so a `NODE_FUNC_REF` borrow carries only
+##! a base NAME. The `Place` type below is structured for a full projection chain
+##! (Field / IndexConst / IndexDyn) so projected-place checking drops in later
+##! WITHOUT a repaint, but the checker only builds and compares BASE-level places
+##! (`&mut x`) in this step. Projected borrows (`&mut p.f`, `&mut a[i]`) are a
+##! parse/lower surface gap filed against the borrow-expr owner; no first-party
+##! code uses them today.
+##!
+##! @since WS4 (exclusivity-checking-2026-07-03)
+
+import ast
+import nonescaping_hof
+import node_constants
+import typecheck
+import typecheck_util
+import typecheck_diag
+
+# ============================================================================
+# Place — access path (base binding + projection chain)
+# ============================================================================
+
+## Projection-kind tags for a `Place`. A projection descends from a base
+## binding into a piece of its storage.
+##   FIELD      — `.f`   (field name in `proj_names[i]`)
+##   INDEX_CONST — `[k]`  (compile-time int literal in `proj_ints[i]`)
+##   INDEX_DYN  — `[e]`   (non-constant index; the "unknown index" wildcard)
+const PROJ_FIELD = 0
+const PROJ_INDEX_CONST = 1
+const PROJ_INDEX_DYN = 2
+
+## A `Place` names a piece of storage as a base binding plus an ordered list of
+## projections. `base` is the binding NAME (name-keyed, matching `liveness.qz`;
+## sound for the argument-only surface since names are scope-unique post-resolve).
+## `valid == 0` is the "Not-a-Place" sentinel (a call result / literal / temporary
+## that can never alias a named borrow — ignored by the rule).
+##
+## The three `proj_*` vecs are parallel: entry `i` has kind `proj_kinds[i]`, with
+## a field name in `proj_names[i]` (FIELD) or a constant in `proj_ints[i]`
+## (INDEX_CONST); the other slot is unused for that entry. Step 1 only ever
+## produces base-only places (all `proj_*` empty), but the shape is projection-ready.
+struct Place
+  valid: Int
+  base: String
+  proj_kinds: Vec<Int>
+  proj_names: Vec<String>
+  proj_ints: Vec<Int>
+end
+
+## The Not-a-Place sentinel.
+def place_none(): Place
+  return Place {
+    valid: 0,
+    base: "",
+    proj_kinds: vec_new<Int>(),
+    proj_names: vec_new<String>(),
+    proj_ints: vec_new<Int>()
+  }
+end
+
+## A base-only place naming a bare binding `name`.
+def place_base(name: String): Place
+  return Place {
+    valid: 1,
+    base: name,
+    proj_kinds: vec_new<Int>(),
+    proj_names: vec_new<String>(),
+    proj_ints: vec_new<Int>()
+  }
+end
+
+## Is a `NODE_FUNC_REF` node a DATA BORROW (`&x` / `&mut x`) rather than a
+## first-class FUNCTION REFERENCE (`&funcname`)? `NODE_FUNC_REF` (kind 18) is
+## overloaded — the parser emits it for both — so the exclusivity rules (which
+## apply ONLY to second-class data borrows) must tell them apart before treating
+## a node as a borrow.
+##
+## Distinguisher — mirrors MIR lowering (`backend/mir_lower.qz:3248-3256`) and the
+## typecheck NODE_FUNC_REF handler (`middle/typecheck_walk.qz:1633-1668`): a name
+## that resolves to a LOCAL binding/parameter is a data borrow (MIR emits
+## LOAD_VAR); a name that does NOT is a function reference (MIR emits func_ref).
+##   - `int_val == 1` (`&mut x`): ALWAYS a data borrow — you cannot `&mut` a
+##     function — so short-circuit true without a lookup. The overload ambiguity
+##     exists only for the `int_val == 0` (`&name`) case.
+##   - `int_val == 0`: a data borrow IFF `name` names a local binding in the
+##     current function's scope (`tc_lookup_binding_index >= 0`). This runs inside
+##     `tc_function`'s scope bracket (call site `typecheck_walk.qz:5910`, between
+##     the enter/exit at 5835/6218), so the body/param bindings ARE live here —
+##     the same lookup the typecheck handler uses at `typecheck_walk.qz:1668`.
+##
+## A shadowing local (`fn_double = ...` shadowing a top-level `def fn_double`)
+## resolves as a local place → treated as a data borrow, matching MIR lowering
+## (which also prefers the local via `mir_ctx_lookup_var`).
+def excl_func_ref_is_data_borrow(s: ast::AstStorage, node: Int, tc: TypecheckState): Int
+  # `&mut x` is unambiguously a data borrow — no function can be mut-borrowed.
+  if ast::ast_get_int_val(s, node) == 1
+    return 1
+  end
+  # `&name`: a data borrow iff the name is a local binding/parameter (a Place);
+  # otherwise it is a first-class function reference (not a Place).
+  var name = ast::ast_get_str1(s, node)
+  if typecheck_util::tc_lookup_binding_index(tc, name) >= 0
+    return 1
+  end
+  return 0
+end
+
+## Build a `Place` from an lvalue AST node, walking its spine down to the base
+## binding. Returns the Not-a-Place sentinel for anything that does not bottom
+## out at a named binding (a call result, a literal, a temporary).
+##
+## Step 1: only `NODE_IDENT` (base) and a DATA-BORROW `NODE_FUNC_REF` (`&x`/`&mut x`,
+## whose str1 IS the base name) produce a valid place. A function-reference
+## `NODE_FUNC_REF` (`&funcname`) is NOT a Place — it is a first-class value that
+## legitimately escapes — and folds to the Not-a-Place sentinel. Field/index spines
+## are wired for the projection-ready future but not reachable from today's borrow
+## surface (the operand collapses to a base name before it reaches here), so they
+## are walked defensively and fold to a base-only place.
+def place_from_lvalue(s: ast::AstStorage, node: Int, tc: TypecheckState): Place
+  if node <= 0
+    return place_none()
+  end
+  if node >= ast::ast_node_count(s)
+    return place_none()
+  end
+  var kind = ast::ast_get_kind(s, node)
+
+  # Bare identifier — the base case.
+  if kind == node_constants::NODE_IDENT
+    return place_base(ast::ast_get_str1(s, node))
+  end
+
+  # `NODE_FUNC_REF` is overloaded: a DATA BORROW (`&x`/`&mut x`) whose str1 IS the
+  # base name (a base-only place — the projection is already lost at lowering), OR
+  # a first-class FUNCTION REFERENCE (`&funcname`) which is NOT a Place and escapes
+  # legally. Only the data-borrow form produces a place.
+  if kind == node_constants::NODE_FUNC_REF
+    if excl_func_ref_is_data_borrow(s, node, tc) == 1
+      return place_base(ast::ast_get_str1(s, node))
+    end
+    return place_none()
+  end
+
+  # WS4 Step 0 — a PROJECTED data-borrow `&mut p.f` / `&p.f` / `&mut a[i]` lowers
+  # to NODE_BORROW carrying the full operand place-expression (a NODE_FIELD_ACCESS
+  # / NODE_INDEX subtree) in `left`. Build the place FROM that operand so the
+  # projection (Field / IndexConst / IndexDyn) is preserved — this is the whole
+  # point of NODE_BORROW over the base-only NODE_FUNC_REF: `&mut p.f` vs `&mut p.g`
+  # are DISJOINT, `&mut a[i]` is an IndexDyn wildcard.
+  if kind == node_constants::NODE_BORROW
+    return place_from_lvalue(s, ast::ast_get_left(s, node), tc)
+  end
+
+  # Field access `obj.f` — build place(obj), then push Field(f). (Projection-
+  # ready; not reachable from the Step-1 borrow surface.)
+  if kind == node_constants::NODE_FIELD_ACCESS
+    var base_place = place_from_lvalue(s, ast::ast_get_left(s, node), tc)
+    if base_place.valid == 0
+      return place_none()
+    end
+    base_place.proj_kinds.push(PROJ_FIELD)
+    base_place.proj_names.push(ast::ast_get_str1(s, node))
+    base_place.proj_ints.push(0)
+    return base_place
+  end
+
+  # Index access `a[e]` — build place(a), then push IndexConst(k) if `e` is an
+  # int literal, else IndexDyn.
+  if kind == node_constants::NODE_INDEX
+    var base_place = place_from_lvalue(s, ast::ast_get_left(s, node), tc)
+    if base_place.valid == 0
+      return place_none()
+    end
+    var idx = ast::ast_get_right(s, node)
+    if idx > 0 and idx < ast::ast_node_count(s) and ast::ast_get_kind(s, idx) == node_constants::NODE_INT_LIT
+      base_place.proj_kinds.push(PROJ_INDEX_CONST)
+      base_place.proj_names.push("")
+      base_place.proj_ints.push(ast::ast_get_int_val(s, idx))
+    else
+      base_place.proj_kinds.push(PROJ_INDEX_DYN)
+      base_place.proj_names.push("")
+      base_place.proj_ints.push(0)
+    end
+    return base_place
+  end
+
+  # Anything else bottoms out at a non-place → Not-a-Place.
+  return place_none()
+end
+
+## Do two single projections MATCH (per the §4.2 lattice)?
+##   Field(a)      matches Field(b)      ⟺ a == b
+##   IndexConst(i) matches IndexConst(j) ⟺ i == j
+##   IndexDyn      matches ANY index proj (conservative wildcard)
+##   Field(_)      NEVER matches Index*   (different storage shape)
+def place_proj_matches(ka: Int, na: String, ia: Int, kb: Int, nb: String, ib: Int): Int
+  if ka == PROJ_FIELD and kb == PROJ_FIELD
+    return 1 if na.eq(nb)
+    return 0
+  end
+  # Field never matches an index projection (different storage shape).
+  if ka == PROJ_FIELD or kb == PROJ_FIELD
+    return 0
+  end
+  # Both are index projections here. A dynamic index is a wildcard.
+  if ka == PROJ_INDEX_DYN or kb == PROJ_INDEX_DYN
+    return 1
+  end
+  # Both are constant indices — match iff the constants are equal.
+  return 1 if ia == ib
+  return 0
+end
+
+## Is `p` a PREFIX of `q` (`p ⊑ q`)? True iff same base, `len(p.proj) <=
+## len(q.proj)`, and every projection of `p` matches `q`'s at the same depth.
+## Two invalid/Not-a-Place places are never in a prefix relation.
+def place_is_prefix(p: Place, q: Place): Int
+  return 0 if p.valid == 0
+  return 0 if q.valid == 0
+  return 0 if p.base.eq(q.base) == false
+  var pn = p.proj_kinds.size
+  var qn = q.proj_kinds.size
+  return 0 if pn > qn
+  for i in 0..pn
+    var matched = place_proj_matches(p.proj_kinds[i], p.proj_names[i], p.proj_ints[i], q.proj_kinds[i], q.proj_names[i], q.proj_ints[i])
+    return 0 if matched == 0
+  end
+  return 1
+end
+
+## Do two places OVERLAP? True iff one is a prefix of the other — i.e. one names
+## storage contained in / containing the other. Disjoint siblings (`self.f` vs
+## `self.g`, `a[0]` vs `a[1]`, `x` vs `y`) do NOT overlap.
+def place_overlap(p: Place, q: Place): Int
+  return 1 if place_is_prefix(p, q) == 1
+  return 1 if place_is_prefix(q, p) == 1
+  return 0
+end
+
+# ============================================================================
+# Escape oracle (shared with the mutable capture-by-ref lowering)
+# ============================================================================
+
+## Is the lambda `lam_node`, appearing as argument `arg_idx` of the call
+## `call_node`, in an ESCAPING position? Returns 1 (escaping) unless the call's
+## callee method name is on the non-escape whitelist
+## (`nonescaping_hof::hof_name_is_nonescaping`).
+##
+## This is the unified escape oracle wrapping the leaf whitelist: everything not
+## a synchronous stdlib-HOF argument (a `go`/`spawn` target, a stored closure, an
+## argument to a non-whitelisted callee, a channel/Future send) is conservatively
+## ESCAPING. A borrow captured into an escaping lambda is QZ0409(c).
+def esc_lambda_is_escaping(s: ast::AstStorage, call_node: Int, lam_node: Int, arg_idx: Int): Int
+  var callee = ast::ast_get_left(s, call_node)
+  if callee <= 0
+    return 1
+  end
+  if callee >= ast::ast_node_count(s)
+    return 1
+  end
+  var callee_kind = ast::ast_get_kind(s, callee)
+  var method_name = ""
+  if callee_kind == node_constants::NODE_FIELD_ACCESS
+    # UFCS method call `recv.method(...)` — method name is str1 of the callee.
+    method_name = ast::ast_get_str1(s, callee)
+  elsif callee_kind == node_constants::NODE_IDENT
+    # Plain call `f(...)` — free function name.
+    method_name = ast::ast_get_str1(s, callee)
+  else
+    return 1
+  end
+  return 0 if nonescaping_hof::hof_name_is_nonescaping(method_name) == 1
+  return 1
+end
+
+# ============================================================================
+# QZ0408 — static exclusivity conflict (per-call pairwise overlap)
+# ============================================================================
+
+## Classify an argument expression as an ACCESS on a place. Returns via the two
+## out-vecs a single (place, is_modify) pair when the argument names a borrow of
+## a place (a `&x`/`&mut x`), or a plain place read (a bare ident / field / index
+## in argument position). Non-place arguments contribute nothing.
+##
+## For Step 1's base-only borrow surface an argument is either:
+##   - `NODE_FUNC_REF` &mut x  → Modify on place(x)
+##   - `NODE_FUNC_REF` &x      → Read   on place(x)
+##   - a bare place expression → Read   on place(expr)  (plain arg aliasing a borrow)
+def excl_arg_access(s: ast::AstStorage, arg: Int, out_places: Vec<Place>, out_modify: Vec<Int>, tc: TypecheckState): Void
+  if arg <= 0
+    return
+  end
+  if arg >= ast::ast_node_count(s)
+    return
+  end
+  var kind = ast::ast_get_kind(s, arg)
+  if kind == node_constants::NODE_FUNC_REF
+    # A function-reference `&funcname` is not a Place — `place_from_lvalue`
+    # returns Not-a-Place for it, so `p.valid == 0` and it contributes nothing.
+    var p = place_from_lvalue(s, arg, tc)
+    if p.valid == 1
+      out_places.push(p)
+      # int_val: 1 = &mut (Modify), 0 = & (Read)
+      if ast::ast_get_int_val(s, arg) == 1
+        out_modify.push(1)
+      else
+        out_modify.push(0)
+      end
+    end
+    return
+  end
+  # WS4 Step 0 — a PROJECTED borrow `&mut p.f` / `&p.f` / `&mut a[i]` (NODE_BORROW).
+  # `place_from_lvalue` builds the PROJECTED place from the operand; int_val
+  # (1 = &mut → Modify, 0 = & → Read) drives the access classification exactly as
+  # for a base NODE_FUNC_REF borrow, but now at field/index precision.
+  if kind == node_constants::NODE_BORROW
+    var pb = place_from_lvalue(s, arg, tc)
+    if pb.valid == 1
+      out_places.push(pb)
+      if ast::ast_get_int_val(s, arg) == 1
+        out_modify.push(1)
+      else
+        out_modify.push(0)
+      end
+    end
+    return
+  end
+  # A plain place expression passed alongside a borrow can still alias it (the
+  # `f(&mut x, x)` case). Record it as a Read.
+  if kind == node_constants::NODE_IDENT or kind == node_constants::NODE_FIELD_ACCESS or kind == node_constants::NODE_INDEX
+    var p = place_from_lvalue(s, arg, tc)
+    if p.valid == 1
+      out_places.push(p)
+      out_modify.push(0)
+    end
+  end
+end
+
+## Check a single call expression for a static exclusivity conflict among its
+## arguments (+ receiver, which for UFCS is the callee's base object). Emits
+## QZ0408 (hard error) on the first conflicting pair: overlapping places where at
+## least one side is a Modify AND at least one side is a `&mut` long-term modify.
+def excl_check_call(s: ast::AstStorage, call_node: Int, tc: TypecheckState): Void
+  var places = vec_new<Place>()
+  var modifies = vec_new<Int>()
+  var has_mut = 0
+
+  # Receiver of a UFCS method call `recv.method(args)` — recv is a live access
+  # for the duration of the call, so it participates in the pairwise test.
+  var callee = ast::ast_get_left(s, call_node)
+  if callee > 0 and callee < ast::ast_node_count(s)
+    if ast::ast_get_kind(s, callee) == node_constants::NODE_FIELD_ACCESS
+      var recv = ast::ast_get_left(s, callee)
+      var recv_place = place_from_lvalue(s, recv, tc)
+      if recv_place.valid == 1
+        places.push(recv_place)
+        modifies.push(0)
+      end
+    end
+  end
+
+  # Each argument contributes an access.
+  var args = ast::ast_get_children(s, call_node)
+  if args != 0
+    var arg_count = vec_size(args)
+    for i in 0..arg_count
+      var arg = args[i]
+      if arg > 0 and arg < ast::ast_node_count(s)
+        var arg_k = ast::ast_get_kind(s, arg)
+        # A `&mut` (base NODE_FUNC_REF OR projected NODE_BORROW) is the long-term
+        # modify that arms the pairwise-overlap test.
+        if arg_k == node_constants::NODE_FUNC_REF or arg_k == node_constants::NODE_BORROW
+          if ast::ast_get_int_val(s, arg) == 1
+            has_mut = 1
+          end
+        end
+      end
+      excl_arg_access(s, arg, places, modifies, tc)
+    end
+  end
+
+  # A conflict requires at least one &mut (long-term modify) in the call. Without
+  # one, two reads coexist freely and nothing to check.
+  if has_mut == 0
+    return
+  end
+
+  # Pairwise overlap test — order-independent, no fixpoint.
+  var n = places.size
+  for i in 0..n
+    for j in 0..n
+      if j > i
+        var pi = places[i]
+        var pj = places[j]
+        if place_overlap(pi, pj) == 1
+          # Conflict iff at least one side is a Modify. (has_mut already ensured
+          # a &mut exists in this call; overlap + a modify on either side is the
+          # exclusivity violation.)
+          if modifies[i] == 1 or modifies[j] == 1
+            typecheck_diag::tc_diag_error_at(s, call_node, "QZ0408: overlapping access to `#{pi.base}` — a `&mut` borrow here conflicts with another access to an overlapping path in this call; take one borrow, finish, then the other")
+            return
+          end
+        end
+      end
+    end
+  end
+end
+
+# ============================================================================
+# QZ0409 — escaping second-class borrow
+# ============================================================================
+
+## Walk an expression subtree looking for a borrow expression (`&x`/`&mut x`)
+## and emit QZ0409 with the given message tail if one is found directly (a borrow
+## reaching a store target / a return value). Only the DIRECT-borrow case is
+## checked in Step 1 (a borrow flowing through an intermediate local is a dataflow
+## extension filed for a later step). Returns 1 if a borrow was reported.
+def excl_report_borrow_in(s: ast::AstStorage, node: Int, tail: String, tc: TypecheckState): Int
+  if node <= 0
+    return 0
+  end
+  if node >= ast::ast_node_count(s)
+    return 0
+  end
+  # Only a DATA-BORROW `NODE_FUNC_REF` (`&x`/`&mut x`) is a second-class borrow
+  # subject to the non-escape rule. A function-reference `&funcname` is a
+  # first-class value whose store/return/capture is LEGAL — skip it.
+  if ast::ast_get_kind(s, node) == node_constants::NODE_FUNC_REF
+    if excl_func_ref_is_data_borrow(s, node, tc) == 1
+      typecheck_diag::tc_diag_error_at(s, node, "QZ0409: escaping second-class borrow of `#{ast::ast_get_str1(s, node)}` — #{tail}; keep the borrow call-scoped or pass by value")
+      return 1
+    end
+  end
+  # WS4 Step 0 — a PROJECTED borrow `&mut p.f` / `&mut a[i]` (NODE_BORROW) is a
+  # second-class borrow too; storing/returning it escapes just as a base borrow
+  # does. Report against the borrowed base binding.
+  if ast::ast_get_kind(s, node) == node_constants::NODE_BORROW
+    var bp = place_from_lvalue(s, node, tc)
+    if bp.valid == 1
+      typecheck_diag::tc_diag_error_at(s, node, "QZ0409: escaping second-class borrow of `#{bp.base}` — #{tail}; keep the borrow call-scoped or pass by value")
+      return 1
+    end
+  end
+  return 0
+end
+
+## The exclusivity walk over a function body. Recurses the whole AST, driving:
+##   - QZ0408 at every call expression (per-call pairwise overlap).
+##   - QZ0409(a) a borrow stored into a field/index cell.
+##   - QZ0409(b) a borrow returned.
+##   - QZ0409(c) a borrow captured into an ESCAPING closure (a `&mut x`/`&x`
+##     appearing free inside a lambda passed to a non-whitelisted callee).
+##
+## Diagnostic-only: reads nodes and emits hard errors; never mutates the tree.
+def excl_walk(s: ast::AstStorage, node: Int, tc: TypecheckState): Void
+  if node <= 0
+    return
+  end
+  if node >= ast::ast_node_count(s)
+    return
+  end
+  var kind = ast::ast_get_kind(s, node)
+
+  # --- Call: run the pairwise QZ0408 check, then handle escaping-lambda args
+  # (QZ0409(c)), then recurse into callee + args.
+  if kind == node_constants::NODE_CALL
+    excl_check_call(s, node, tc)
+    var args = ast::ast_get_children(s, node)
+    if args != 0
+      var arg_count = vec_size(args)
+      for i in 0..arg_count
+        var arg = args[i]
+        if arg > 0 and arg < ast::ast_node_count(s)
+          if ast::ast_get_kind(s, arg) == node_constants::NODE_LAMBDA
+            if esc_lambda_is_escaping(s, node, arg, i) == 1
+              excl_check_escaping_lambda(s, arg, tc)
+            end
+          end
+        end
+      end
+    end
+    excl_walk(s, ast::ast_get_left(s, node), tc)
+    if args != 0
+      var arg_count2 = vec_size(args)
+      for i in 0..arg_count2
+        excl_walk(s, args[i], tc)
+      end
+    end
+    return
+  end
+
+  # --- QZ0409(a): a borrow stored into a field / index cell.
+  if kind == node_constants::NODE_FIELD_ASSIGN
+    excl_report_borrow_in(s, ast::ast_get_extra(s, node), "it is stored into a field", tc)
+    excl_walk(s, ast::ast_get_left(s, node), tc)
+    excl_walk(s, ast::ast_get_extra(s, node), tc)
+    return
+  end
+  if kind == node_constants::NODE_INDEX_ASSIGN
+    excl_report_borrow_in(s, ast::ast_get_extra(s, node), "it is stored into an array element", tc)
+    excl_walk(s, ast::ast_get_left(s, node), tc)
+    excl_walk(s, ast::ast_get_right(s, node), tc)
+    excl_walk(s, ast::ast_get_extra(s, node), tc)
+    return
+  end
+
+  # --- QZ0409(b): a borrow returned.
+  if kind == node_constants::NODE_RETURN
+    var val = ast::ast_get_left(s, node)
+    excl_report_borrow_in(s, val, "it is returned", tc)
+    excl_walk(s, val, tc)
+    return
+  end
+
+  # --- Everything else: recurse into all child slots generically.
+  excl_walk(s, ast::ast_get_left(s, node), tc)
+  excl_walk(s, ast::ast_get_right(s, node), tc)
+  excl_walk(s, ast::ast_get_extra(s, node), tc)
+  var children = ast::ast_get_children(s, node)
+  if children != 0
+    var count = vec_size(children)
+    for i in 0..count
+      excl_walk(s, children[i], tc)
+    end
+  end
+end
+
+## QZ0409(c): a borrow captured by an ESCAPING closure. Walk the lambda body for
+## any `&x`/`&mut x` borrow expression and report it. This is the SAME soundness
+## condition as the mutable capture-by-ref lowering (the closure must not outlive
+## the caller's frame), routed through the same `esc_lambda_is_escaping` oracle.
+def excl_check_escaping_lambda(s: ast::AstStorage, lam_node: Int, tc: TypecheckState): Void
+  if lam_node <= 0
+    return
+  end
+  if lam_node >= ast::ast_node_count(s)
+    return
+  end
+  var body = ast::ast_get_right(s, lam_node)
+  excl_walk_escaping_body(s, body, tc)
+end
+
+## Recursive helper for QZ0409(c): report every direct borrow expr found inside
+## an escaping lambda body. Kept separate from `excl_walk` so the QZ0408/store/
+## return checks (which are lambda-body-agnostic) are not re-run against the
+## nested scope — only the escaping-capture rule applies here.
+def excl_walk_escaping_body(s: ast::AstStorage, node: Int, tc: TypecheckState): Void
+  if node <= 0
+    return
+  end
+  if node >= ast::ast_node_count(s)
+    return
+  end
+  # Only a DATA-BORROW `NODE_FUNC_REF` captured into an escaping closure is
+  # QZ0409(c). A function-reference `&funcname` captured into a closure is a
+  # legal first-class value capture — skip it.
+  if ast::ast_get_kind(s, node) == node_constants::NODE_FUNC_REF
+    if excl_func_ref_is_data_borrow(s, node, tc) == 1
+      typecheck_diag::tc_diag_error_at(s, node, "QZ0409: escaping second-class borrow of `#{ast::ast_get_str1(s, node)}` — it is captured by an escaping closure; keep the borrow call-scoped or pass by value")
+    end
+    return
+  end
+  # WS4 Step 0 — a PROJECTED borrow `&mut p.f` captured by an escaping closure is
+  # QZ0409(c) just as a base borrow is. The operand subtree holds only the
+  # field/index place (no nested borrow), so report and return.
+  if ast::ast_get_kind(s, node) == node_constants::NODE_BORROW
+    var eb = place_from_lvalue(s, node, tc)
+    if eb.valid == 1
+      typecheck_diag::tc_diag_error_at(s, node, "QZ0409: escaping second-class borrow of `#{eb.base}` — it is captured by an escaping closure; keep the borrow call-scoped or pass by value")
+    end
+    return
+  end
+  excl_walk_escaping_body(s, ast::ast_get_left(s, node), tc)
+  excl_walk_escaping_body(s, ast::ast_get_right(s, node), tc)
+  excl_walk_escaping_body(s, ast::ast_get_extra(s, node), tc)
+  var children = ast::ast_get_children(s, node)
+  if children != 0
+    var count = vec_size(children)
+    for i in 0..count
+      excl_walk_escaping_body(s, children[i], tc)
+    end
+  end
+end
+
+# ============================================================================
+# Entry point
+# ============================================================================
+
+## Per-function exclusivity pass. Called from `tc_function` right after the
+## QZ0407 block, once per function, with the same `AstStorage` + func handle.
+## Runs the static access-path/overlap analysis (QZ0408) and the non-escape
+## analysis (QZ0409) over the body, emitting the QZ04xx family as HARD ERRORS.
+##
+## Diagnostic-only — reads the AST and emits hard errors; it does NOT rewrite
+## anything, so the pass is gate-0 byte-identical (the only IR delta is the new
+## `define`s for this module's helpers).
+def excl_check_function(s: ast::AstStorage, func: Int, tc: TypecheckState): Void
+  return if func <= 0
+  return if func >= ast::ast_node_count(s)
+  return if ast::ast_get_kind(s, func) != node_constants::NODE_FUNCTION
+  var body = ast::ast_get_right(s, func)
+  excl_walk(s, body, tc)
+end

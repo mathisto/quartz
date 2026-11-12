@@ -1,0 +1,134 @@
+## Regression spec for SYNC_RECV_WORKER_STARVATION Cause B (closed 2026-04-30).
+##
+## When a user-level helper that calls `recv` is called from a goroutine,
+## PASS 0.99b auto-promotes the helper to a `$poll` (colorless dispatch).
+## Inside that nested `$poll`, the recv-async-rewrite parks a frame so a
+## later sync `send` can wake it via `__qz_sched_wake`. Pre-fix, the rewrite
+## parked `self` (the inner $poll's local frame), but the scheduler tracks
+## tasks by the top-level frame the worker last set @__qz_current_frame to;
+## waking the inner frame re-polled the helper standalone and never
+## resumed the outer task$poll, so the receiver hung forever.
+##
+## Post-fix, the rewrite parks `task_self()` (= @__qz_current_frame), the
+## top-level task frame the worker is currently driving — wake reenqueues
+## the right task, the worker re-polls task$poll, and the helper resumes.
+
+import * from qspec
+import * from std/sync/exclusion/semaphore
+
+# Module-level globals for the test bodies
+var g_done = atomic_new(0)
+var g_max_concurrent = atomic_new(0)
+var g_current = atomic_new(0)
+
+# A user-defined wrapper around recv/send. Per PASS 0.99b auto-promotion
+# this becomes a $poll function when called from a goroutine.
+def my_acquire(ch: Int): Void
+  recv(ch)
+end
+
+def my_release(ch: Int): Void
+  send(ch, 1)
+end
+
+def wrap_task(ch: Int): Int
+  my_acquire(ch)
+  sched_yield()
+  my_release(ch)
+  atomic_add(g_done, 1)
+  return 0
+end
+
+def test_user_wrapper_3_tasks_1_permit_1_worker(): Void
+  g_done = atomic_new(0)
+  var ch = channel_new(1)
+  send(ch, 1)
+  sched_init(1)
+  var h1 = go wrap_task(ch)
+  var h2 = go wrap_task(ch)
+  var h3 = go wrap_task(ch)
+  await h1
+  await h2
+  await h3
+  sched_shutdown()
+  puts("done=#{atomic_load(g_done)}")
+end
+
+# Same wrapper shape, more workers, more contention.
+def test_user_wrapper_6_tasks_2_permits_4_workers(): Void
+  g_done = atomic_new(0)
+  var ch = channel_new(2)
+  send(ch, 1)
+  send(ch, 1)
+  sched_init(4)
+  var handles = vec_new()
+  var i = 0
+  while i < 6
+    handles.push(go wrap_task(ch))
+    i += 1
+  end
+  i = 0
+  while i < 6
+    await handles[i]
+    i += 1
+  end
+  sched_shutdown()
+  puts("done=#{atomic_load(g_done)}")
+end
+
+# std/sync semaphore — the canonical Cause B repro from the bug doc.
+def sem_task(sem: Int): Int
+  semaphore_acquire(sem)
+  var cur = atomic_add(g_current, 1)
+  var max = atomic_load(g_max_concurrent)
+  if cur + 1 > max
+    atomic_store(g_max_concurrent, cur + 1)
+  end
+  sched_yield()
+  sched_yield()
+  atomic_sub(g_current, 1)
+  semaphore_release(sem)
+  return 0
+end
+
+def test_semaphore_rate_limiting(): Void
+  g_max_concurrent = atomic_new(0)
+  g_current = atomic_new(0)
+  var sem = semaphore_new(2)
+  sched_init(4)
+  var handles = vec_new()
+  var i = 0
+  while i < 6
+    handles.push(go sem_task(sem))
+    i += 1
+  end
+  i = 0
+  while i < 6
+    await handles[i]
+    i += 1
+  end
+  sched_shutdown()
+  var max = atomic_load(g_max_concurrent)
+  if max <= 2
+    puts("rate_limited")
+  else
+    puts("exceeded:#{to_str(max)}")
+  end
+end
+
+def main(): Int
+  describe("nested-poll recv park (SYNC_RECV_WORKER_STARVATION Cause B regression)") do ->
+    it("3 tasks contending 1-permit channel through user wrapper completes") do ->
+      assert_output("done=3\n", test_user_wrapper_3_tasks_1_permit_1_worker)
+    end
+
+    it("6 tasks contending 2-permit channel through user wrapper completes under multi-worker") do ->
+      assert_output("done=6\n", test_user_wrapper_6_tasks_2_permits_4_workers)
+    end
+
+    it("std/sync semaphore enforces permit count under 6-task / 2-permit / 4-worker contention") do ->
+      assert_output("rate_limited\n", test_semaphore_rate_limiting)
+    end
+  end
+  return qspec_main()
+end

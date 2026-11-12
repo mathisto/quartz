@@ -1,0 +1,241 @@
+import * from qspec
+
+# ============================================================================
+# sched_park / sched_wake — scheduler park/wake primitives
+# ============================================================================
+
+# Shared globals for inter-task communication
+var g_parked_frame = 0   # atomic: stores parked task's frame pointer
+var g_result = 0         # atomic: tracks completion
+var g_wake_order = 0     # atomic: tracks wake order (for multi-task test)
+
+# --- Test 1: Park a task, wake it from another task ---
+
+def park_worker(): Int
+  # Store our frame pointer so the waker can find us
+  var frame = task_frame()
+  atomic_store(g_parked_frame, frame)
+  # Park — we'll be suspended until woken
+  sched_park()
+  # If we get here, we were successfully woken
+  atomic_add(g_result, 1)
+  return 0
+end
+
+def wake_worker(): Int
+  # Spin until the parked task has stored its frame
+  var frame = 0
+  while frame == 0
+    frame = atomic_load(g_parked_frame)
+    sched_yield()
+  end
+  # Wake the parked task
+  sched_wake(frame)
+  atomic_add(g_result, 10)
+  return 0
+end
+
+def test_park_wake_roundtrip(): Int
+  g_parked_frame = atomic_new(0)
+  g_result = atomic_new(0)
+  sched_init(2)
+  var h1 = go park_worker()
+  var h2 = go wake_worker()
+  await h1
+  await h2
+  sched_shutdown()
+  # park_worker adds 1, wake_worker adds 10 → result should be 11
+  return atomic_load(g_result)
+end
+
+# --- Test 2: Park N tasks, wake them all ---
+
+var g_frames = 0         # Vec<Int> of parked frames (protected by mutex)
+var g_frame_count = 0    # atomic: number of parked frames stored
+var g_woken_count = 0    # atomic: number of tasks that resumed after park
+
+def multi_park_worker(id: Int): Int
+  var frame = task_frame()
+  # Store frame into shared vec via atomic index
+  var idx = atomic_add(g_frame_count, 1)
+  # Use a simple array: store at slot = parked_frames_base + idx
+  var base = atomic_load(g_frames)
+  store(base, idx, frame)
+  # Park
+  sched_park()
+  # Woken — record completion
+  atomic_add(g_woken_count, 1)
+  return 0
+end
+
+def multi_wake_worker(count: Int): Int
+  # Wait until all tasks have parked
+  while atomic_load(g_frame_count) < count
+    sched_yield()
+  end
+  # Wake all parked tasks in reverse order.
+  # Race: multi_park_worker increments g_frame_count BEFORE it stores the
+  # frame at its reserved slot. Waking on count==N is therefore necessary
+  # but not sufficient — slot i may still be 0 (malloc-returned zero page
+  # from alloc()). Wait per-slot until the store is visible before waking.
+  # Without this loop, sched_wake(0) crashes in __qz_sched_wake's load of
+  # frame[5] at byte offset 40 (uncovered by the Apr 15 scheduler stress).
+  var base = atomic_load(g_frames)
+  var i = count - 1
+  while i >= 0
+    var frame = 0
+    while frame == 0
+      frame = load(base, i)
+      if frame == 0
+        sched_yield()
+      end
+    end
+    sched_wake(frame)
+    i = i - 1
+  end
+  return 0
+end
+
+def test_park_n_wake_all(): Int
+  g_frame_count = atomic_new(0)
+  g_woken_count = atomic_new(0)
+  # Allocate a simple array for n frame pointers (8 bytes each).
+  var n = 4
+  g_frames = atomic_new(as_int(mem_alloc(n * 8)))
+  sched_init(6)
+  var handles = vec_new()
+  var i = 0
+  while i < n
+    handles.push(go multi_park_worker(i))
+    i = i + 1
+  end
+  var waker = go multi_wake_worker(n)
+  i = 0
+  while i < n
+    await handles[i]
+    i = i + 1
+  end
+  await waker
+  sched_shutdown()
+  return atomic_load(g_woken_count)
+end
+
+# --- Test 3: Producer-consumer with park/wake ---
+
+var g_pc_value = 0       # atomic: the produced value
+var g_pc_ready = 0       # atomic: 1 when value is ready
+var g_pc_consumer_frame = 0  # atomic: consumer's frame for wake
+
+def pc_consumer(): Int
+  # Store our frame and park, waiting for producer
+  var frame = task_frame()
+  atomic_store(g_pc_consumer_frame, frame)
+  sched_park()
+  # Woken — read the value
+  return atomic_load(g_pc_value)
+end
+
+def pc_producer(): Int
+  # Wait until consumer is parked
+  var frame = 0
+  while frame == 0
+    frame = atomic_load(g_pc_consumer_frame)
+    sched_yield()
+  end
+  # Produce a value
+  atomic_store(g_pc_value, 42)
+  atomic_store(g_pc_ready, 1)
+  # Wake the consumer
+  sched_wake(frame)
+  return 0
+end
+
+def test_producer_consumer(): Int
+  g_pc_value = atomic_new(0)
+  g_pc_ready = atomic_new(0)
+  g_pc_consumer_frame = atomic_new(0)
+  sched_init(2)
+  var consumer = go pc_consumer()
+  var producer = go pc_producer()
+  await producer
+  var result = await consumer
+  sched_shutdown()
+  return result
+end
+
+# --- Test 4: Park and wake same task multiple times ---
+
+var g_bounce_partner_frame = 0
+var g_bounce_count = 0
+
+def bouncer_a(): Int
+  var i = 0
+  while i < 3
+    # Store frame and park
+    atomic_store(g_bounce_partner_frame, task_frame())
+    sched_park()
+    # Woken — increment
+    atomic_add(g_bounce_count, 1)
+    i = i + 1
+  end
+  return 0
+end
+
+def bouncer_b(): Int
+  var i = 0
+  while i < 3
+    # Wait for partner to park
+    var frame = 0
+    while frame == 0
+      frame = atomic_load(g_bounce_partner_frame)
+      sched_yield()
+    end
+    # Clear and wake
+    atomic_store(g_bounce_partner_frame, 0)
+    sched_wake(frame)
+    # Small delay to let partner run
+    sched_yield()
+    sched_yield()
+    i = i + 1
+  end
+  return 0
+end
+
+def test_repeated_park_wake(): Int
+  g_bounce_partner_frame = atomic_new(0)
+  g_bounce_count = atomic_new(0)
+  # Needs extra worker for spin-park: parker blocks one worker while waker runs on another.
+  # During the re-park window after wake, the original worker may still be processing
+  # the task's completion path, so a third worker absorbs the re-enqueue.
+  sched_init(4)
+  var ha = go bouncer_a()
+  var hb = go bouncer_b()
+  await ha
+  await hb
+  sched_shutdown()
+  return atomic_load(g_bounce_count)
+end
+
+# --- Main ---
+
+def main(): Int
+  describe("sched_park / sched_wake") do ->
+    it("park/wake round-trip: one task parks, another wakes it") do ->
+      assert_eq(test_park_wake_roundtrip(), 11)
+    end
+
+    it("park N tasks, wake them all") do ->
+      assert_eq(test_park_n_wake_all(), 4)
+    end
+
+    it("producer-consumer via park/wake") do ->
+      assert_eq(test_producer_consumer(), 42)
+    end
+
+    it("repeated park/wake on same task") do ->
+      assert_eq(test_repeated_park_wake(), 3)
+    end
+  end
+
+  return qspec_main()
+end

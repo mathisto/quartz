@@ -1,0 +1,337 @@
+## std/core/crypto/hkdf — Pure-Quartz HKDF-BLAKE2s (RFC 5869 over RFC 7693)
+##
+## NET.1 Phase 2 native-primitive replacement, third after HChaCha20 + BLAKE2s.
+## Was a thin FFI shim around HACL\* `Hacl_HKDF_*_blake2s_32`; now a full
+## RFC 5869 / RFC 2104 implementation in Quartz built on top of native
+## `blake2s_256`. This swap drops `Hacl_HKDF.c`, `Hacl_HMAC.c`, and the
+## `Hacl_Hash_Blake2{s,b}` / SHA / MD5 family from the build entirely —
+## HMAC-BLAKE2s was the last reach into HACL's hash-dispatch surface.
+##
+## HKDF is a two-step extract-then-expand KDF over HMAC. For BLAKE2s:
+##
+##   PRK     = HMAC-BLAKE2s(salt, IKM)              (32 bytes)
+##   T(0)    = ""
+##   T(i)    = HMAC-BLAKE2s(PRK, T(i-1) || info || i)   (i is 1 byte, i ≥ 1)
+##   OKM     = T(1) || T(2) || ... || T(N)          (truncated to len)
+##   N       = ceil(len / 32),  L_max = 255 * 32 = 8160 bytes
+##
+## HMAC-BLAKE2s itself is RFC 2104 over an unkeyed BLAKE2s primitive — NOT
+## BLAKE2's keyed mode (those are different MAC constructions; Noise + WG
+## both spell HMAC-BLAKE2s). Block size B = 64 (BLAKE2s block); output L = 32.
+##
+##   K'   = H(K)              if len(K) > B,  else K  (then zero-pad to B)
+##   HMAC = H((K' xor opad) || H((K' xor ipad) || M))
+##
+## Wire-level validation (per design memo "gated by Wycheproof + interop"):
+##   - 4 KAT vectors in `crypto:smoke` covering: short / empty-salt-empty-info
+##     (RFC 5869 §2.2 zero-fill) / long-key-and-salt (HMAC K'=H(K) branch) /
+##     application-style inputs. Reference values computed offline against
+##     Python `hmac.new(salt, ikm, hashlib.blake2s)`.
+##   - wg:smoke 48/48 stays green (Noise IKpsk2 chain fully exercised).
+##   - cross-impl interop with wireguard-go stays green (proves
+##     bit-for-bit compatibility on the actual handshake wire).
+##
+## All buffers are caller-owned (ptr, len) pairs — typically `malloc`'d from
+## `std/ffi/socket`. PRK buffer must be exactly 32 bytes; OKM buffer at least
+## `len` bytes (1..8160).
+##
+## See:
+## - RFC 5869 https://datatracker.ietf.org/doc/html/rfc5869 (HKDF)
+## - RFC 2104 https://datatracker.ietf.org/doc/html/rfc2104 (HMAC)
+## - docs/design/CRYPTO_STDLIB_DESIGN.md "Phase 2 native-primitive plan"
+
+import * from ffi/socket  # malloc/free/memcpy/memset
+import std/core/crypto/blake2s  # blake2s_256
+import * from std/core/crypto/secret  # Secret<Int> + secret_(wrap|unwrap)_ptr (NET.4.1 B)
+
+# =============================================================================
+# HMAC-BLAKE2s (RFC 2104) — file-private; HKDF is the only consumer in tree.
+#
+# Layout: B = 64 (BLAKE2s block size), L = 32 (BLAKE2s digest size).
+# =============================================================================
+
+# Pad/hash the user-supplied key into a 64-byte K'. Per RFC 2104:
+#   if len(key) > B:  K' = H(key)            (32 bytes, then zero-pad to 64)
+#   if len(key) ≤ B:  K' = key || zeros      (zero-pad to 64)
+# `out64` must point to 64 zero-able bytes.
+def _hmac_prep_key(out64: Int, key: Int, key_len: Int): Void
+  memset(out64, 0, 64)
+  if key_len > 64
+    # Hash overlong keys; trailing 32 bytes of out64 stay zero.
+    blake2s_256(key, key_len, out64)
+  elsif key_len > 0
+    memcpy(out64, key, key_len)
+  end
+end
+
+## HMAC-BLAKE2s — single-shot, file-private. Writes 32 bytes of MAC into `out`.
+##
+## Standard two-pass HMAC over BLAKE2s:
+##   H((K' xor opad) || H((K' xor ipad) || M))
+##
+## Allocates two malloc buffers per call; for HKDF-Expand's HMAC chain this
+## means up to 255 calls × 2 allocs each. Acceptable for WG (handshake-rate;
+## a handshake triggers ~6 HKDF calls each ~1 expand round). If profiling
+## shows this is hot, the obvious win is precomputed inner/outer states
+## (RFC 2104 §6) — but we leave that until measured.
+def _hmac_blake2s(out: Int, key: Int, key_len: Int, msg: Int, msg_len: Int): Void
+  var k_prime = malloc(64)
+  _hmac_prep_key(k_prime, key, key_len)
+
+  # inner = (K' xor 0x36) || msg
+  var inner = malloc(64 + msg_len)
+  var i = 0
+  while i < 64
+    ptr_write_byte(inner + i, ptr_read_byte(k_prime + i) ^ 54)  # 0x36
+    i += 1
+  end
+  if msg_len > 0
+    memcpy(inner + 64, msg, msg_len)
+  end
+
+  var inner_hash = malloc(32)
+  blake2s_256(inner, 64 + msg_len, inner_hash)
+  free(inner)
+
+  # outer = (K' xor 0x5C) || inner_hash
+  var outer = malloc(96)
+  i = 0
+  while i < 64
+    ptr_write_byte(outer + i, ptr_read_byte(k_prime + i) ^ 92)  # 0x5C
+    i += 1
+  end
+  memcpy(outer + 64, inner_hash, 32)
+  free(inner_hash)
+
+  blake2s_256(outer, 96, out)
+  free(outer)
+  free(k_prime)
+end
+
+# =============================================================================
+# HKDF-Extract / HKDF-Expand (RFC 5869) — public API.
+# =============================================================================
+
+## HKDF-Extract step. Compresses (salt, IKM) into a 32-byte pseudorandom
+## key (PRK). For BLAKE2s the PRK is exactly hash size = 32 bytes.
+##
+## Per RFC 5869 §2.2, when no salt is provided the salt defaults to a string
+## of HashLen zeros (32 zeros for BLAKE2s). Pass `salt=0, salt_len=0` for
+## that case; the PRK then degrades to HMAC(0...0, IKM).
+##
+## NET.4.1 B: `ikm` carries the `Secret<Int>` discipline. `salt` is the
+## RFC 5869 §3.1 public-by-design slot (an "ideally pseudorandom but not
+## secret" input); leaving it `Int` matches the spec. Callers using HKDF
+## as a chain-of-secrets construction (Noise's `_mix_key`, where the
+## chain_key bytes flow into the salt slot) treat that as a contract-level
+## "secret material entering a public-typed slot" event — see
+## `std/crypto/noise.qz` for the convention. `prk` is the extract output;
+## per the convention in `std/core/crypto/secret.qz`'s "Output convention"
+## section, output buffers are `Int` and the caller wraps after the call.
+##
+## - prk:      32-byte output buffer.
+## - salt:     salt bytes (or 0 if salt_len==0).
+## - salt_len: 0 (default to 32 zeros) or the actual salt length.
+## - ikm:      input keying material.
+## - ikm_len:  IKM length in bytes (may be 0).
+def hkdf_extract_blake2s(prk: Int, salt: Int, salt_len: Int, ikm: Secret<Int>, ikm_len: Int): Void
+  var ikm_raw = secret_unwrap(ikm)
+  if salt_len == 0
+    var zsalt = malloc(32)
+    memset(zsalt, 0, 32)
+    _hmac_blake2s(prk, zsalt, 32, ikm_raw, ikm_len)
+    free(zsalt)
+  else
+    _hmac_blake2s(prk, salt, salt_len, ikm_raw, ikm_len)
+  end
+end
+
+## HKDF-Expand step. Stretches a 32-byte PRK into `len` output bytes (OKM)
+## using `info` as the application-specific context separator.
+##
+## Maximum `len` is 255 * hash_size = 255 * 32 = 8160 bytes (RFC 5869 §2.3).
+## Caller is responsible for staying within that bound.
+##
+## NET.4.1 B: `prk` carries the `Secret<Int>` discipline; one unwrap at the
+## top of the function. `okm` is the output buffer and stays `Int` per the
+## output convention — caller wraps the result before threading it on as
+## secret material.
+##
+## - okm:      output buffer of at least `len` bytes.
+## - prk:      32-byte PRK from `hkdf_extract_blake2s`.
+## - info:     context separator (or 0 if info_len==0).
+## - info_len: info length in bytes (may be 0).
+## - len:      number of OKM bytes to emit (1..8160).
+def hkdf_expand_blake2s(okm: Int, prk: Secret<Int>, info: Int, info_len: Int, len: Int): Void
+  if len == 0
+    return
+  end
+
+  # HMAC input buffer: T(prev) (32 bytes for i ≥ 2) || info || counter (1 byte).
+  # Cap = 32 + info_len + 1; same buffer reused across counter iterations.
+  var buf = malloc(32 + info_len + 1)
+  var t_prev = malloc(32)
+  var t_curr = malloc(32)
+  # One declassification at the top — `_hmac_blake2s` is file-private and
+  # takes the raw key pointer. The Secret<Int> discipline lives on the
+  # public API surface.
+  var prk_raw = secret_unwrap(prk)
+
+  var n = (len + 31) / 32  # ceil(len / 32)
+  var counter = 1
+  var written = 0
+  while counter <= n
+    # Compose HMAC input: T(prev) only when counter > 1.
+    var hmac_in_off = 0
+    if counter > 1
+      memcpy(buf, t_prev, 32)
+      hmac_in_off = 32
+    end
+    if info_len > 0
+      memcpy(buf + hmac_in_off, info, info_len)
+      hmac_in_off = hmac_in_off + info_len
+    end
+    ptr_write_byte(buf + hmac_in_off, counter)
+    hmac_in_off = hmac_in_off + 1
+
+    _hmac_blake2s(t_curr, prk_raw, 32, buf, hmac_in_off)
+
+    # Copy as many bytes of T(i) as fit into the OKM tail.
+    var copy = 32
+    if (len - written) < 32
+      copy = len - written
+    end
+    memcpy(okm + written, t_curr, copy)
+    written = written + copy
+
+    # T(i) becomes T(prev) for the next iteration.
+    memcpy(t_prev, t_curr, 32)
+
+    counter = counter + 1
+  end
+
+  free(buf)
+  free(t_prev)
+  free(t_curr)
+end
+
+# =============================================================================
+# HKDF-SHA-256 (NET.5c.0 — TLS 1.3 cipher suites that bind SHA-256)
+# =============================================================================
+
+import * from std/core/crypto/hmac
+import * from std/core/crypto/sha256
+import * from std/core/crypto/sha384
+
+## HKDF-Extract over SHA-256.  PRK = HMAC-SHA-256(salt, IKM).  If salt_len == 0,
+## RFC 5869 §2.2 mandates a HashLen-zero salt (32 zero bytes).  `prk` must be
+## a 32-byte output buffer.
+def hkdf_extract_sha256(prk: Int, salt: Int, salt_len: Int, ikm: Secret<Int>, ikm_len: Int): Void
+  var ikm_raw = secret_unwrap(ikm)
+  if salt_len == 0
+    var zsalt = malloc(32)
+    memset(zsalt, 0, 32)
+    hmac_sha256(zsalt, 32, ikm_raw, ikm_len, prk)
+    free(zsalt)
+  end
+  if salt_len != 0
+    hmac_sha256(salt, salt_len, ikm_raw, ikm_len, prk)
+  end
+end
+
+## HKDF-Expand over SHA-256. Stretches a 32-byte PRK into `len` OKM bytes.
+## Max `len` = 255 * 32 = 8160 (RFC 5869 §2.3).
+def hkdf_expand_sha256(okm: Int, prk: Secret<Int>, info: Int, info_len: Int, len: Int): Void
+  if len == 0 then return end
+  var buf = malloc(32 + info_len + 1)
+  var t_prev = malloc(32)
+  var t_curr = malloc(32)
+  var prk_raw = secret_unwrap(prk)
+
+  var n = (len + 31) / 32
+  var counter = 1
+  var written = 0
+  while counter <= n
+    var off = 0
+    if counter > 1
+      memcpy(buf, t_prev, 32)
+      off = 32
+    end
+    if info_len > 0
+      memcpy(buf + off, info, info_len)
+      off = off + info_len
+    end
+    ptr_write_byte(buf + off, counter)
+    off = off + 1
+
+    hmac_sha256(prk_raw, 32, buf, off, t_curr)
+
+    var copy = 32
+    if (len - written) < 32
+      copy = len - written
+    end
+    memcpy(okm + written, t_curr, copy)
+    written = written + copy
+    memcpy(t_prev, t_curr, 32)
+    counter = counter + 1
+  end
+
+  free(buf); free(t_prev); free(t_curr)
+end
+
+# =============================================================================
+# HKDF-SHA-384 (TLS_AES_256_GCM_SHA384)
+# =============================================================================
+
+## HKDF-Extract over SHA-384. `prk` is a 48-byte output.
+def hkdf_extract_sha384(prk: Int, salt: Int, salt_len: Int, ikm: Secret<Int>, ikm_len: Int): Void
+  var ikm_raw = secret_unwrap(ikm)
+  if salt_len == 0
+    var zsalt = malloc(48)
+    memset(zsalt, 0, 48)
+    hmac_sha384(zsalt, 48, ikm_raw, ikm_len, prk)
+    free(zsalt)
+  end
+  if salt_len != 0
+    hmac_sha384(salt, salt_len, ikm_raw, ikm_len, prk)
+  end
+end
+
+## HKDF-Expand over SHA-384. Max `len` = 255 * 48 = 12240.
+def hkdf_expand_sha384(okm: Int, prk: Secret<Int>, info: Int, info_len: Int, len: Int): Void
+  if len == 0 then return end
+  var buf = malloc(48 + info_len + 1)
+  var t_prev = malloc(48)
+  var t_curr = malloc(48)
+  var prk_raw = secret_unwrap(prk)
+
+  var n = (len + 47) / 48
+  var counter = 1
+  var written = 0
+  while counter <= n
+    var off = 0
+    if counter > 1
+      memcpy(buf, t_prev, 48)
+      off = 48
+    end
+    if info_len > 0
+      memcpy(buf + off, info, info_len)
+      off = off + info_len
+    end
+    ptr_write_byte(buf + off, counter)
+    off = off + 1
+
+    hmac_sha384(prk_raw, 48, buf, off, t_curr)
+
+    var copy = 48
+    if (len - written) < 48
+      copy = len - written
+    end
+    memcpy(okm + written, t_curr, copy)
+    written = written + copy
+    memcpy(t_prev, t_curr, 48)
+    counter = counter + 1
+  end
+
+  free(buf); free(t_prev); free(t_curr)
+end

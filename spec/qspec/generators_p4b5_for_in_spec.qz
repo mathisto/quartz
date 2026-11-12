@@ -1,0 +1,230 @@
+## Phase 4.B.5 — for-in desugar unification (Stream$next dispatch).
+##
+## Operation Piezoelectric Effects, Phase 4 Path B, Milestone 4.B.5.
+##
+## `for x in gen()` over a `def gen(): impl Iterator<T>` source no
+## longer dispatches to the legacy `__GenState_<name>$next` step
+## function (which doesn't exist post-4.B.4.c because
+## `mir_lower_generator_effect` skips the state-machine emission
+## entirely). Instead, the for-in loop calls `Stream$next` —
+## the consumer-drive entry point in `std/gen.qz` that installs a
+## `with Yield { yield: __qz_gen_yield_capture } do -> step(frame) end`
+## around the generator's `$poll` invocation and returns
+## `Option::Some(v)` / `Option::None`.
+##
+## The for-in routing change is a one-line swap of the next-fn name in
+## `mir_lower_stmt_for`'s generator-call dispatch. The body of
+## `mir_lower_iter::lower_custom_iteration` is reused verbatim: load
+## iter, call next(iter), `option_is_some` → branch to body / exit,
+## body does `option_get` / `option_free` / lower body / jump back.
+##
+## Originally landed under the `--piezo-gen-b` feature flag; the flag
+## was retired in 4.B.6 and Path B is now the sole code path.
+##
+## What this spec pins down:
+##
+##   - `for x in gen()` emits `call ... @<module>$Stream$next(...)` and does
+##     NOT emit `__GenState_<name>$next`. (The synthesized `Stream` type is
+##     module-prefixed for cross-module collision avoidance, so the assertion
+##     matches the prefix-tolerant substring `Stream$next`.)
+##   - Sum / collect over a 3-yield generator under for-in produces the
+##     correct output.
+##   - Two SEQUENTIAL `for x in gen()` loops in the same function each
+##     iterate independently. (Pre-Phase-4.B.5 this also exposed a
+##     pre-existing latent panic-emit slot-mismatch bug in the intrinsic
+##     dispatcher, fixed in the same commit by syncing `cg_ctx_set(out)`
+##     at the top of `cg_emit_intrinsic`.)
+##   - Nested `for a in gen() { for b in gen() ... }` — independent
+##     Stream instances on the inner and outer loop.
+##   - Zero-yield generator iterates zero times.
+##   - Conditional yield + parameterized generator + label/break — for-in
+##     preserves the same loop-target / scope semantics as the legacy
+##     `__GenState_<name>$next` path.
+##   - NODE_IDENT branch: `var s = gen(); for x in s` also routes through
+##     `Stream$next` when the var is typed `impl Iterator<...>`.
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("4.B.5 — for-in desugar via Stream\$next") do ->
+    it("for-in emits call @Stream\$next") do ->
+      assert_ir_contains("""
+def three(): impl Iterator<Int>
+  yield 1
+  yield 2
+  yield 3
+end
+
+def main(): Int
+  for x in three()
+    puts(str_from_int(x))
+  end
+  return 0
+end
+""", "Stream$next")
+    end
+
+    it("for-in does NOT emit __GenState_three\$next") do ->
+      assert_ir_not_contains("""
+def three(): impl Iterator<Int>
+  yield 1
+  yield 2
+  yield 3
+end
+
+def main(): Int
+  for x in three()
+    puts(str_from_int(x))
+  end
+  return 0
+end
+""", "__GenState_three$next")
+    end
+
+    it("for-in over 3-yield generator sums correctly") do ->
+      assert_run_stdout_eq("""
+def three(): impl Iterator<Int>
+  yield 1
+  yield 2
+  yield 3
+end
+
+def main(): Int
+  var sum = 0
+  for x in three()
+    sum = sum + x
+  end
+  puts(str_from_int(sum))
+  return 0
+end
+""", "6\n")
+    end
+
+    it("two sequential for-in loops over generator") do ->
+      assert_run_stdout_eq("""
+def three(): impl Iterator<Int>
+  yield 1
+  yield 2
+  yield 3
+end
+
+def main(): Int
+  for x in three()
+    puts(str_from_int(x))
+  end
+  for y in three()
+    puts(str_from_int(y * 10))
+  end
+  return 0
+end
+""", "1\n2\n3\n10\n20\n30\n")
+    end
+
+    it("nested for-in over independent generator instances") do ->
+      assert_run_stdout_eq("""
+def count3(start: Int): impl Iterator<Int>
+  yield start
+  yield start + 1
+  yield start + 2
+end
+
+def main(): Int
+  var sum = 0
+  for a in count3(10)
+    for b in count3(100)
+      sum = sum + a + b
+    end
+  end
+  puts(str_from_int(sum))
+  return 0
+end
+""", "1008\n")
+    end
+
+    it("zero-yield generator runs body zero times") do ->
+      assert_run_stdout_eq("""
+def empty_gen(): impl Iterator<Int>
+  # no yields
+end
+
+def main(): Int
+  var hits = 0
+  for x in empty_gen()
+    hits = hits + 1
+  end
+  puts(str_from_int(hits))
+  return 0
+end
+""", "0\n")
+    end
+
+    it("parameterized + conditional-yield generator (evens)") do ->
+      assert_run_stdout_eq("""
+def evens_below(n: Int): impl Iterator<Int>
+  var i = 0
+  while i < n
+    if i % 2 == 0
+      yield i
+    end
+    i = i + 1
+  end
+end
+
+def main(): Int
+  var sum = 0
+  for x in evens_below(7)
+    sum = sum + x
+  end
+  puts(str_from_int(sum))
+  return 0
+end
+""", "12\n")
+    end
+
+    it("NODE_IDENT — var bound to gen() then for-in") do ->
+      assert_run_stdout_eq("""
+def three(): impl Iterator<Int>
+  yield 7
+  yield 8
+  yield 9
+end
+
+def main(): Int
+  var s = three()
+  var sum = 0
+  for x in s
+    sum = sum + x
+  end
+  puts(str_from_int(sum))
+  return 0
+end
+""", "24\n")
+    end
+
+    it("break inside for-in over generator exits early") do ->
+      assert_run_stdout_eq("""
+def naturals(): impl Iterator<Int>
+  var i = 1
+  while i < 1000000
+    yield i
+    i = i + 1
+  end
+end
+
+def main(): Int
+  var sum = 0
+  for x in naturals()
+    if x > 5
+      break
+    end
+    sum = sum + x
+  end
+  puts(str_from_int(sum))
+  return 0
+end
+""", "15\n")
+    end
+  end
+  return qspec_main()
+end

@@ -1,0 +1,229 @@
+## QSpec coverage for Phase A.3.d — `@__qz_realloc` wrapper.
+##
+## Phase A.3.c migrated raw `@malloc`/`@free` codegen sites to the
+## `@__qz_alloc`/`@__qz_dealloc` runtime wrappers but missed the 13
+## `@realloc` emission sites across `codegen_runtime.qz`,
+## `cg_intrinsic_sb.qz`, `cg_intrinsic_vec.qz`, `cg_intrinsic_conc_task.qz`,
+## and `cg_intrinsic_regex.qz`. Effect: when a custom `with Alloc { ... }`
+## (or any of B.1–B.4's call-form sugars) wrapped a body that grew a Vec
+## past its initial capacity, the realloc bypassed the user handler and
+## hit libc directly — SIGABRT when the original buffer was arena-backed.
+##
+## A.3.d emits a `@__qz_realloc(ptr old, i64 old_bytes, i64 new_bytes) -> ptr`
+## wrapper and migrates all 13 sites to call it. On the routing path the
+## wrapper decomposes into `alloc(new) + memcpy(min) + dealloc(old)` via
+## the existing two-op Alloc surface — keeping the D1 minimal effect
+## signature (no third op) while ensuring every stdlib growth path
+## respects an installed handler.
+##
+## These tests cover the user-visible behaviors that A.3.d unlocks:
+##
+##   D1. Vec growth past initial cap routes through TestAlloc → arena
+##       absorbs the new buffer (the original B.2 SIGABRT repro).
+##   D2. tracking_alloc_handler observes one alloc + one dealloc per Vec
+##       grow event (proves the alloc+dealloc decomposition fires).
+##   D3. String.concat in a loop drives SB realloc through the handler.
+##   D4. Vec growth under deny_all throws on the realloc — sandboxing
+##       extends to dynamic-container growth, not just user `alloc(N)`.
+##   D5. with_budget refuses Vec growth that would push past the budget
+##       and throws — the realloc is charged at full new-byte cost.
+
+import * from qspec
+import * from qspec/subprocess
+
+# -----------------------------------------------------------------------------
+# D1 — Vec.push past initial capacity inside `with TestAlloc do ... end`
+# routes the realloc'd buffer through the test arena. Pre-A.3.d: SIGABRT
+# (libc realloc walks malloc metadata that the arena pointer doesn't have).
+# Post-A.3.d: alloc-new (via wrapper → arena handler) + memcpy + dealloc-old
+# (no-op for arena handlers). Buffer values survive the realloc.
+# -----------------------------------------------------------------------------
+
+var _VEC_PUSH_THROUGH_TESTALLOC: String = """import std/alloc
+import std/memory
+
+var g_size = 0
+var g_first = 0
+var g_last = 0
+var g_used = 0
+
+def main(): Int
+  with TestAlloc do ->
+    var v = vec_new<Int>()
+    var i = 0
+    while i < 64
+      v.push(i * 7)
+      i += 1
+    end
+    g_size = v.size
+    g_first = v[0]
+    g_last = v[63]
+    g_used = arena_bytes_used(test_alloc_arena_peek())
+  end
+  if g_size == 64 and g_first == 0 and g_last == 441 and g_used > 512
+    puts(\"vec_push_routed\")
+  else
+    puts(\"size=\" + str_from_int(g_size) +
+         \" first=\" + str_from_int(g_first) +
+         \" last=\" + str_from_int(g_last) +
+         \" used=\" + str_from_int(g_used))
+  end
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# D2 — tracking_alloc_handler observes alloc+dealloc decomposition for
+# Vec.push growth. Each `realloc(old, old_b, new_b)` past initial cap
+# fires once-alloc + once-dealloc through the handler. After 64 pushes
+# from default cap=8 (qz_vec_new), the cap doubles 4 times: 8→16→32→64
+# (last grow at push #57 since the trigger is `size >= cap` BEFORE push).
+# Plus the initial vec_new = 2 allocs (header + data). So we expect at
+# minimum 6 allocs (1 vec_new alloc for data + 1 for header + 4 grows)
+# AND at minimum 4 deallocs (one per grow's dealloc-old leg).
+# -----------------------------------------------------------------------------
+
+var _TRACKING_DECOMPOSE: String = """import std/alloc
+
+var g_alloc_count = 0
+var g_dealloc_count = 0
+
+def main(): Int
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    var v = vec_new<Int>()
+    var i = 0
+    while i < 64
+      v.push(i)
+      i += 1
+    end
+    g_alloc_count = alloc_tracking_alloc_count()
+    g_dealloc_count = alloc_tracking_dealloc_count()
+  end
+  # qz_vec_new = 2 allocs (header + initial 8-slot data).
+  # Capacity grows: 8→16→32→64 = 3 grows = +3 alloc + +3 dealloc.
+  # Total: 5 allocs, 3 deallocs. Each grow proves one alloc-new + one
+  # dealloc-old fired through the handler — the wrapper decomposed.
+  if g_alloc_count >= 5 and g_dealloc_count >= 3
+    puts(\"tracking_decompose_observed\")
+  else
+    puts(\"alloc=\" + str_from_int(g_alloc_count) +
+         \" dealloc=\" + str_from_int(g_dealloc_count))
+  end
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# D3 — String concatenation that grows the StringBuilder backing buffer
+# via realloc routes through the handler. `str_from_int` + repeated
+# concat builds a long string; SB doubles cap when need > cap. The
+# tracking handler counts each grow as one alloc + one dealloc.
+# -----------------------------------------------------------------------------
+
+var _STRING_CONCAT_THROUGH_HANDLER: String = """import std/alloc
+
+var g_alloc_count = 0
+var g_dealloc_count = 0
+var g_strlen = 0
+
+def main(): Int
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    var s = \"\"
+    var i = 0
+    while i < 50
+      s = s + str_from_int(i) + \"-\"
+      i += 1
+    end
+    g_strlen = str_byte_len(s)
+    g_alloc_count = alloc_tracking_alloc_count()
+    g_dealloc_count = alloc_tracking_dealloc_count()
+  end
+  if g_strlen > 100 and g_alloc_count > 10
+    puts(\"string_concat_routed\")
+  else
+    puts(\"strlen=\" + str_from_int(g_strlen) +
+         \" alloc=\" + str_from_int(g_alloc_count) +
+         \" dealloc=\" + str_from_int(g_dealloc_count))
+  end
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# D4 — `with Alloc.deny_all` extends to Vec growth. The first push past
+# initial cap triggers realloc → wrapper → alloc(new_bytes) → deny
+# handler → throw. Outer `with Throws { throw: rec }` recovers.
+# -----------------------------------------------------------------------------
+
+var _DENY_REFUSES_GROWTH: String = """import std/alloc
+
+def main(): Int
+  with Alloc.deny_all() do ->
+    var v = vec_new<Int>()
+    var i = 0
+    while i < 32
+      v.push(i)
+      i += 1
+    end
+    puts(\"should_not_print\")
+  end
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# D5 — `with_budget(N)` refuses Vec growth that would push past N. The
+# wrapper charges the FULL new_bytes against the budget (decompose: one
+# alloc(new_bytes) call to the budget handler). With a small budget,
+# the first cap-doubling realloc will exceed it and throw.
+# -----------------------------------------------------------------------------
+
+var _BUDGET_REFUSES_REALLOC: String = """import std/alloc
+
+def main(): Int
+  with Alloc.with_budget(80) do ->
+    var v = vec_new<Int>()
+    var i = 0
+    while i < 32
+      v.push(i)
+      i += 1
+    end
+    puts(\"should_not_print\")
+  end
+  return 0
+end
+"""
+
+def t_vec_push_through_testalloc(): Void = assert_run_stdout_eq(_VEC_PUSH_THROUGH_TESTALLOC, "vec_push_routed\n")
+def t_tracking_decompose(): Void = assert_run_stdout_eq(_TRACKING_DECOMPOSE, "tracking_decompose_observed\n")
+def t_string_concat_through_handler(): Void = assert_run_stdout_eq(_STRING_CONCAT_THROUGH_HANDLER, "string_concat_routed\n")
+def t_deny_refuses_growth(): Void = assert_run_panics(_DENY_REFUSES_GROWTH, "allocation denied")
+def t_budget_refuses_realloc(): Void = assert_run_panics(_BUDGET_REFUSES_REALLOC, "budget exceeded")
+
+def main(): Int
+  describe("Alloc realloc-path coverage (A.3.d)") do ->
+    it("Vec.push past initial cap routes through TestAlloc arena (D1 SIGABRT repro)") do ->
+      t_vec_push_through_testalloc()
+    end
+
+    it("tracking handler observes alloc+dealloc decomposition on Vec growth") do ->
+      t_tracking_decompose()
+    end
+
+    it("String.concat that grows SB via realloc routes through handler") do ->
+      t_string_concat_through_handler()
+    end
+
+    it("with Alloc.deny_all refuses Vec growth — sandboxing extends to realloc") do ->
+      t_deny_refuses_growth()
+    end
+
+    it("with_budget(N) refuses Vec growth past budget — realloc charged at full new_bytes") do ->
+      t_budget_refuses_realloc()
+    end
+  end
+
+  return qspec_main()
+end

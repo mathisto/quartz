@@ -1,0 +1,777 @@
+# NET.3b — ML-KEM-768 internal sanity smoke (Phase 3b.1 surface).
+#
+# Standalone smoke driven from `quake mlkem:smoke`. At this phase we have
+# field arithmetic, NTT/INTT, the ζ table, base-case multiplication, and
+# the two samplers (SampleNTT, SampleCBD_η=2). The full keygen/encaps/decaps
+# round-trip + ACVP KAT lands in Phase 3b.2 / 3b.3 / 3b.4.
+#
+# What this smoke verifies:
+#
+#   ζ-table — first six entries match FIPS 203 reference:
+#     [1, 1729, 2580, 3289, 2642, 630].
+#
+#   Field arithmetic — Barrett reduces correctly through all sign ranges;
+#     mul/add/sub match scalar reference for sampled values.
+#
+#   NTT / INTT — round-trip on a known polynomial (NTT then INTT == identity).
+#
+#   Polynomial mul via NTT — schoolbook product mod (X^256 + 1) matches
+#     INTT(NTT(a) ⋆ NTT(b)) componentwise. This is the strongest single
+#     test of NTT correctness.
+#
+#   SampleCBD_η=2 — range check (every coefficient ∈ {0,1,2,q-2,q-1}), mean
+#     approximately zero (within tolerance over 10K coefficients), bit
+#     determinism (same seed twice → same output).
+#
+#   SampleNTT — range check (all coefficients in [0, q-1]) and determinism
+#     across two calls with identical seed.
+
+import * from ffi/socket
+import * from std/core/crypto/sha3
+import * from std/core/crypto/secret  # Secret<Int> + secret_wrap (NET.4.1)
+import * from std/core/crypto/mlkem
+
+# =============================================================================
+# Test framework — mirrors spec/qz/sha3_smoke.qz
+# =============================================================================
+
+var g_total: Int = 0
+var g_passed: Int = 0
+
+def check_eq_int(label: String, got: Int, want: Int): Void
+  g_total = g_total + 1
+  if got == want
+    g_passed = g_passed + 1
+    puts("OK   " + label)
+    return
+  end
+  puts("FAIL " + label)
+  puts("       got:  " + to_str(got))
+  puts("       want: " + to_str(want))
+end
+
+def check_true(label: String, cond: Int): Void
+  g_total = g_total + 1
+  if cond != 0
+    g_passed = g_passed + 1
+    puts("OK   " + label)
+    return
+  end
+  puts("FAIL " + label)
+end
+
+# =============================================================================
+# Field arithmetic
+# =============================================================================
+
+def test_field(): Void
+  puts("--- Z/3329 field arithmetic ---")
+
+  # Barrett reduces values across signed range to canonical [0, q-1].
+  check_eq_int("_zq_reduce(0) == 0",       _zq_reduce(0),     0)
+  check_eq_int("_zq_reduce(3328) == 3328", _zq_reduce(3328),  3328)
+  check_eq_int("_zq_reduce(3329) == 0",    _zq_reduce(3329),  0)
+  check_eq_int("_zq_reduce(3330) == 1",    _zq_reduce(3330),  1)
+  check_eq_int("_zq_reduce(6658) == 0",    _zq_reduce(6658),  0)
+  check_eq_int("_zq_reduce(-1) == 3328",   _zq_reduce(-1),    3328)
+  check_eq_int("_zq_reduce(-3329) == 0",   _zq_reduce(-3329), 0)
+  check_eq_int("_zq_reduce(11075584 = (q-1)^2)", _zq_reduce(3328 * 3328), (3328 * 3328) % 3329)
+
+  # Add / sub
+  check_eq_int("_zq_add(3328, 1) == 0", _zq_add(3328, 1), 0)
+  check_eq_int("_zq_add(0, 0)    == 0", _zq_add(0, 0), 0)
+  check_eq_int("_zq_sub(0, 1)    == 3328", _zq_sub(0, 1), 3328)
+  check_eq_int("_zq_sub(1, 1)    == 0",    _zq_sub(1, 1), 0)
+  check_eq_int("_zq_sub(0, 3328) == 1",    _zq_sub(0, 3328), 1)
+
+  # Mul vs scalar reference. (1729 = ζ; 17 = ζ_root.)
+  check_eq_int("_zq_mul(17, 17) == 289",   _zq_mul(17, 17), 289)
+  check_eq_int("_zq_mul(17, 1)  == 17",    _zq_mul(17, 1),  17)
+  check_eq_int("_zq_mul(0, 1729) == 0",    _zq_mul(0, 1729), 0)
+  # 128 * 3303 mod 3329 = 422784 mod 3329 = ?
+  # 422784 / 3329 = 127, 127*3329 = 422783, remainder 1. (Sanity: 128 * 3303 ≡ 1 mod q.)
+  check_eq_int("_zq_mul(128, 3303) == 1 (128^-1 == 3303)", _zq_mul(128, 3303), 1)
+end
+
+# =============================================================================
+# ζ-table sanity
+# =============================================================================
+
+def test_zeta_table(): Void
+  puts("")
+  puts("--- ζ-table first entries ---")
+  check_eq_int("ζ[0] == 1",    _zeta(0),    1)
+  check_eq_int("ζ[1] == 1729", _zeta(1),    1729)
+  check_eq_int("ζ[2] == 2580", _zeta(2),    2580)
+  check_eq_int("ζ[3] == 3289", _zeta(3),    3289)
+  check_eq_int("ζ[4] == 2642", _zeta(4),    2642)
+  check_eq_int("ζ[5] == 630",  _zeta(5),    630)
+  # ζ[127] reference (BitRev7(127) = 127 = 0x7F): 17^127 mod 3329.
+  # Cross-check by direct exponentiation here.
+  var expected_127 = 1
+  var i = 0
+  while i < 127
+    expected_127 = (expected_127 * 17) % 3329
+    i += 1
+  end
+  check_eq_int("ζ[127] matches 17^127 mod q", _zeta(127), expected_127)
+end
+
+# =============================================================================
+# NTT / INTT round-trip
+# =============================================================================
+#
+# Initialise a non-trivial polynomial, run NTT then INTT, expect the original.
+# The "non-trivial" choice matters: an all-zero or all-one input is a poor
+# witness (NTT of zero is zero, NTT of constant is sparse). Use a polynomial
+# with coefficients 1,2,...,256 mod q.
+
+def fill_ramp(p: Int): Void
+  var i = 0
+  while i < 256
+    _poly_set(p, i, (i + 1) % 3329)
+    i += 1
+  end
+end
+
+def fill_constant(p: Int, c: Int): Void
+  var i = 0
+  while i < 256
+    _poly_set(p, i, c)
+    i += 1
+  end
+end
+
+# Lehmer LCG seeded from `seed` for deterministic test fills.
+var _g_lcg_state: Int = 0
+
+def _lcg_init(s: Int): Void
+  _g_lcg_state = s
+end
+
+def _lcg_next(): Int
+  # POSIX-style 31-bit LCG; sufficient for test variability.
+  _g_lcg_state = (_g_lcg_state * 1103515245 + 12345) & 2147483647
+  return _g_lcg_state
+end
+
+def fill_random_canonical(p: Int, seed: Int): Void
+  _lcg_init(seed)
+  var i = 0
+  while i < 256
+    _poly_set(p, i, _lcg_next() % 3329)
+    i += 1
+  end
+end
+
+def polys_equal(a: Int, b: Int): Int
+  var i = 0
+  while i < 256
+    if _poly_get(a, i) != _poly_get(b, i)
+      return 0
+    end
+    i += 1
+  end
+  return 1
+end
+
+def print_first_diff(label: String, a: Int, b: Int): Void
+  var i = 0
+  var diffs = 0
+  while i < 256
+    if _poly_get(a, i) != _poly_get(b, i)
+      if diffs < 4
+        puts("  " + label + " [" + to_str(i) + "]: got=" + to_str(_poly_get(a, i)) + " want=" + to_str(_poly_get(b, i)))
+      end
+      diffs += 1
+    end
+    i += 1
+  end
+  if diffs > 0
+    puts("  " + label + ": " + to_str(diffs) + " coefficient(s) differ")
+  end
+end
+
+def test_ntt_roundtrip(): Void
+  puts("")
+  puts("--- NTT / INTT round-trip ---")
+
+  var a = _poly_new()
+  var save = _poly_new()
+
+  fill_ramp(a)
+  _poly_copy(save, a)
+  _poly_ntt(a)
+  _poly_intt(a)
+  check_true("ramp poly: INTT(NTT(p)) == p", polys_equal(a, save))
+
+  fill_random_canonical(a, 12345)
+  _poly_copy(save, a)
+  _poly_ntt(a)
+  _poly_intt(a)
+  check_true("lcg-random poly: INTT(NTT(p)) == p", polys_equal(a, save))
+  if polys_equal(a, save) == 0
+    print_first_diff("lcg-roundtrip", a, save)
+  end
+
+  # Constant poly: p[i] = 1729 for all i.
+  fill_constant(a, 1729)
+  _poly_copy(save, a)
+  _poly_ntt(a)
+  _poly_intt(a)
+  check_true("constant poly: INTT(NTT(p)) == p", polys_equal(a, save))
+
+  _poly_free(a)
+  _poly_free(save)
+end
+
+# =============================================================================
+# Polynomial multiplication via NTT vs schoolbook reference
+# =============================================================================
+#
+# In R_q = Z_q[X]/(X^256 + 1), polynomial multiplication is:
+#   1. Convolve a and b to get a 511-coefficient product.
+#   2. Reduce mod X^256 + 1: for k in 256..511, prod[k-256] -= prod[k].
+# We compute that scalar reference here and compare against the NTT path.
+
+def schoolbook_mul(dst: Int, a: Int, b: Int): Void
+  # First compute the unreduced product as 511 coefficients in a scratch.
+  var prod = malloc(511 * 8)
+  memset(prod, 0, 511 * 8)
+  var i = 0
+  while i < 256
+    var ai = _poly_get(a, i)
+    if ai != 0
+      var j = 0
+      while j < 256
+        var bj = _poly_get(b, j)
+        # prod[i + j] += ai * bj, reduced mod q to keep values bounded.
+        var cur = _slot_get_i64(prod, (i + j) * 8)
+        _slot_set_i64(prod, (i + j) * 8, _zq_add(cur, _zq_mul(ai, bj)))
+        j += 1
+      end
+    end
+    i += 1
+  end
+  # Reduce mod X^256 + 1: for k in 256..511, prod[k - 256] -= prod[k].
+  var k = 256
+  while k < 511
+    var sub = _slot_get_i64(prod, k * 8)
+    if sub != 0
+      var idx = k - 256
+      var cur = _slot_get_i64(prod, idx * 8)
+      _slot_set_i64(prod, idx * 8, _zq_sub(cur, sub))
+    end
+    k += 1
+  end
+  # Copy first 256 into dst.
+  var m = 0
+  while m < 256
+    _poly_set(dst, m, _slot_get_i64(prod, m * 8))
+    m += 1
+  end
+  free(prod)
+end
+
+def test_poly_mul_via_ntt(): Void
+  puts("")
+  puts("--- poly_mul via NTT vs schoolbook (ground truth) ---")
+
+  var a = _poly_new()
+  var b = _poly_new()
+  var ref = _poly_new()
+  var got = _poly_new()
+  var a_ntt = _poly_new()
+  var b_ntt = _poly_new()
+
+  fill_random_canonical(a, 314159)
+  fill_random_canonical(b, 271828)
+
+  # Schoolbook reference.
+  schoolbook_mul(ref, a, b)
+
+  # NTT path: a_ntt = NTT(a); b_ntt = NTT(b); got = INTT(basemul(a_ntt, b_ntt)).
+  _poly_copy(a_ntt, a)
+  _poly_copy(b_ntt, b)
+  _poly_ntt(a_ntt)
+  _poly_ntt(b_ntt)
+  _poly_basemul(got, a_ntt, b_ntt)
+  _poly_intt(got)
+
+  check_true("INTT(NTT(a) ⋆ NTT(b)) == schoolbook(a, b)", polys_equal(got, ref))
+  if polys_equal(got, ref) == 0
+    print_first_diff("dense-mul", got, ref)
+  end
+
+  # Also confirm with sparse a (single nonzero coefficient).
+  _poly_zero(a)
+  _poly_set(a, 5, 17)
+  fill_random_canonical(b, 42)
+  schoolbook_mul(ref, a, b)
+  _poly_copy(a_ntt, a)
+  _poly_copy(b_ntt, b)
+  _poly_ntt(a_ntt)
+  _poly_ntt(b_ntt)
+  _poly_basemul(got, a_ntt, b_ntt)
+  _poly_intt(got)
+  check_true("sparse a * dense b: NTT path == schoolbook", polys_equal(got, ref))
+
+  _poly_free(a); _poly_free(b); _poly_free(ref); _poly_free(got); _poly_free(a_ntt); _poly_free(b_ntt)
+end
+
+# =============================================================================
+# SampleCBD_η=2 — range, mean, determinism
+# =============================================================================
+
+def test_sample_cbd(): Void
+  puts("")
+  puts("--- SampleCBD_η=2 ---")
+
+  # Determinism: same σ + N gives same poly.
+  var sigma = malloc(32)
+  memset(sigma, 0, 32)
+  var i = 0
+  while i < 32
+    ptr_write_byte(sigma + i, i + 1)   # 1..32
+    i += 1
+  end
+
+  var p1 = _poly_new()
+  var p2 = _poly_new()
+  _sample_cbd_from_seed(p1, sigma, 0)
+  _sample_cbd_from_seed(p2, sigma, 0)
+  check_true("same σ, same N → same poly", polys_equal(p1, p2))
+
+  _sample_cbd_from_seed(p2, sigma, 1)
+  check_true("same σ, different N → different poly", 1 - polys_equal(p1, p2))
+
+  # Range: coefficients must be in {0, 1, 2, q-2, q-1} (canonical reduction
+  # of {-2, -1, 0, 1, 2}).
+  var range_ok = 1
+  i = 0
+  while i < 256
+    var c = _poly_get(p1, i)
+    if c != 0 and c != 1 and c != 2 and c != 3327 and c != 3328
+      range_ok = 0
+    end
+    i += 1
+  end
+  check_true("all coefficients in {0,1,2,3327,3328}", range_ok)
+
+  # Mean check: aggregate across many CBD draws. Treat 3327→-2, 3328→-1.
+  # Expected mean = 0. With ~5000 coefficients tolerance ±0.05 of integers.
+  var total = 0
+  var count = 0
+  var n_byte = 0
+  while n_byte < 20    # 20 polys × 256 coeffs = 5120 samples
+    _sample_cbd_from_seed(p2, sigma, n_byte)
+    var j = 0
+    while j < 256
+      var c = _poly_get(p2, j)
+      if c == 3328 then c = -1 end
+      if c == 3327 then c = -2 end
+      total = total + c
+      count = count + 1
+      j += 1
+    end
+    n_byte += 1
+  end
+  # |total| < 256 across 5120 samples is a very loose 2σ-ish check.
+  var abs_total = total
+  if abs_total < 0 then abs_total = 0 - abs_total end
+  check_true("CBD samples mean near zero (|sum| < 256 over 5120 draws)", (abs_total < 256))
+
+  free(sigma)
+  _poly_free(p1); _poly_free(p2)
+end
+
+# =============================================================================
+# SampleNTT — range + determinism
+# =============================================================================
+
+def test_sample_ntt(): Void
+  puts("")
+  puts("--- SampleNTT (rejection sampler) ---")
+
+  var rho = malloc(32)
+  memset(rho, 0, 32)
+  var i = 0
+  while i < 32
+    ptr_write_byte(rho + i, 255 - i)
+    i += 1
+  end
+
+  var p1 = _poly_new()
+  var p2 = _poly_new()
+  _sample_ntt_for_matrix(p1, rho, 0, 0)
+  _sample_ntt_for_matrix(p2, rho, 0, 0)
+  check_true("same ρ, same (j,i) → same poly", polys_equal(p1, p2))
+
+  _sample_ntt_for_matrix(p2, rho, 0, 1)
+  check_true("same ρ, different i → different poly", 1 - polys_equal(p1, p2))
+
+  # Range: every coefficient must be in [0, q-1] = [0, 3328].
+  var range_ok = 1
+  i = 0
+  while i < 256
+    var c = _poly_get(p1, i)
+    if c < 0 or c >= 3329
+      range_ok = 0
+    end
+    i += 1
+  end
+  check_true("all coefficients in [0, 3328]", range_ok)
+
+  free(rho)
+  _poly_free(p1); _poly_free(p2)
+end
+
+# =============================================================================
+# Compress / Decompress unit tests
+# =============================================================================
+
+def test_compress_decompress(): Void
+  puts("")
+  puts("--- Compress_d / Decompress_d ---")
+
+  # d=1: message bit round-trip.
+  #   Decompress_1(0) = 0; Decompress_1(1) = 1665. Compress_1 of either: matches.
+  check_eq_int("Decompress_1(0) == 0",     _decompress(0, 1),     0)
+  check_eq_int("Decompress_1(1) == 1665",  _decompress(1, 1),     1665)
+  check_eq_int("Compress_1(Decompress_1(0)) == 0", _compress(_decompress(0, 1), 1), 0)
+  check_eq_int("Compress_1(Decompress_1(1)) == 1", _compress(_decompress(1, 1), 1), 1)
+  check_eq_int("Compress_1(0) == 0",       _compress(0, 1),       0)
+  check_eq_int("Compress_1(1665) == 1",    _compress(1665, 1),    1)
+  check_eq_int("Compress_1(3328) == 0",    _compress(3328, 1),    0)   # round to 2 mod 2 = 0
+
+  # d=4: Decompress(Compress(x)) is close to x for d_v=4.
+  # FIPS 203 §4.2.1 guarantees |x − Decompress_d(Compress_d(x))| ≤ ⌈q/2^(d+1)⌉
+  # which is 105 for d=4. We just confirm round-trip of a small set.
+  check_eq_int("Decompress_4(0) == 0",     _decompress(0, 4),     0)
+  check_eq_int("Decompress_4(15) == 3121", _decompress(15, 4),    3121)
+  check_eq_int("Compress_4(0) == 0",       _compress(0, 4),       0)
+  check_eq_int("Compress_4(3328) == 0",    _compress(3328, 4),    0)   # round-to-q == 0 mod 16
+
+  # d=10: same property, tighter bound (~2).
+  check_eq_int("Decompress_10(0) == 0",    _decompress(0, 10),    0)
+  check_eq_int("Compress_10(0) == 0",      _compress(0, 10),      0)
+  check_eq_int("Compress_10(3328) == 0",   _compress(3328, 10),   0)
+end
+
+# =============================================================================
+# ByteEncode / ByteDecode round-trip
+# =============================================================================
+
+def test_byte_encode_decode(): Void
+  puts("")
+  puts("--- ByteEncode_d / ByteDecode_d ---")
+
+  var p = _poly_new()
+  var p2 = _poly_new()
+
+  # d=1: pack-unpack of a "message" poly (256 bits → 32 bytes → 256 bits).
+  var i = 0
+  while i < 256
+    _poly_set(p, i, i & 1)   # alternating 0, 1
+    i += 1
+  end
+  var buf = malloc(384)        # max needed (d=12)
+  _byte_encode(buf, p, 1)
+  _byte_decode(p2, buf, 1)
+  check_true("d=1: encode-decode round-trip", polys_equal(p, p2))
+
+  # d=4: pack-unpack of [0..15] cycled.
+  i = 0
+  while i < 256
+    _poly_set(p, i, i & 15)
+    i += 1
+  end
+  _byte_encode(buf, p, 4)
+  _byte_decode(p2, buf, 4)
+  check_true("d=4: encode-decode round-trip", polys_equal(p, p2))
+
+  # d=10: pack-unpack of [0..1023] cycled.
+  i = 0
+  while i < 256
+    _poly_set(p, i, i * 4)     # in [0, 1020], fits in 10 bits
+    i += 1
+  end
+  _byte_encode(buf, p, 10)
+  _byte_decode(p2, buf, 10)
+  check_true("d=10: encode-decode round-trip", polys_equal(p, p2))
+
+  # d=12: pack-unpack of canonical Z_q values.
+  fill_random_canonical(p, 7)
+  _byte_encode(buf, p, 12)
+  _byte_decode(p2, buf, 12)
+  check_true("d=12: encode-decode round-trip", polys_equal(p, p2))
+
+  free(buf)
+  _poly_free(p); _poly_free(p2)
+end
+
+# =============================================================================
+# K-PKE round-trip (the load-bearing test of 3b.2)
+# =============================================================================
+
+def fill_bytes_lcg(buf: Int, len: Int, seed: Int): Void
+  _lcg_init(seed)
+  var i = 0
+  while i < len
+    ptr_write_byte(buf + i, _lcg_next() & 255)
+    i += 1
+  end
+end
+
+def test_k_pke_roundtrip(): Void
+  puts("")
+  puts("--- K-PKE.KeyGen / Encrypt / Decrypt round-trip ---")
+
+  var d_seed = malloc(32)
+  var m_in   = malloc(32)
+  var r_seed = malloc(32)
+  var ek_pke = malloc(1184)
+  var dk_pke = malloc(1152)
+  var c_buf  = malloc(1088)
+  var m_out  = malloc(32)
+
+  # Five independent (d, m, r) triples. Decryption failure probability for
+  # K-PKE alone is ~2^-138 per call, so all five should succeed unconditionally.
+  var iter = 0
+  while iter < 5
+    fill_bytes_lcg(d_seed, 32, 1000 + iter)
+    fill_bytes_lcg(m_in,   32, 2000 + iter)
+    fill_bytes_lcg(r_seed, 32, 3000 + iter)
+
+    _k_pke_keygen(ek_pke, dk_pke, d_seed)
+    _k_pke_encrypt(c_buf, ek_pke, m_in, r_seed)
+    _k_pke_decrypt(m_out, dk_pke, c_buf)
+
+    # Compare m_in to m_out byte-by-byte.
+    var ok = 1
+    var i = 0
+    while i < 32
+      if ptr_read_byte(m_in + i) != ptr_read_byte(m_out + i)
+        ok = 0
+      end
+      i += 1
+    end
+    check_true("iter " + to_str(iter) + ": Decrypt(Encrypt(m)) == m", ok)
+    iter += 1
+  end
+
+  # Determinism: same d_seed → same (ek, dk).
+  fill_bytes_lcg(d_seed, 32, 99)
+  _k_pke_keygen(ek_pke, dk_pke, d_seed)
+  var ek2 = malloc(1184)
+  var dk2 = malloc(1152)
+  _k_pke_keygen(ek2, dk2, d_seed)
+  var ek_eq = 1
+  var dk_eq = 1
+  var k = 0
+  while k < 1184
+    if ptr_read_byte(ek_pke + k) != ptr_read_byte(ek2 + k) then ek_eq = 0 end
+    k += 1
+  end
+  k = 0
+  while k < 1152
+    if ptr_read_byte(dk_pke + k) != ptr_read_byte(dk2 + k) then dk_eq = 0 end
+    k += 1
+  end
+  check_true("KeyGen: same d_seed → same ek", ek_eq)
+  check_true("KeyGen: same d_seed → same dk", dk_eq)
+
+  # Determinism: same (ek, m, r_seed) → same ciphertext.
+  fill_bytes_lcg(m_in,   32, 12345)
+  fill_bytes_lcg(r_seed, 32, 67890)
+  _k_pke_encrypt(c_buf, ek_pke, m_in, r_seed)
+  var c2 = malloc(1088)
+  _k_pke_encrypt(c2, ek_pke, m_in, r_seed)
+  var c_eq = 1
+  k = 0
+  while k < 1088
+    if ptr_read_byte(c_buf + k) != ptr_read_byte(c2 + k) then c_eq = 0 end
+    k += 1
+  end
+  check_true("Encrypt: same (ek, m, r) → same c", c_eq)
+  free(c2); free(ek2); free(dk2)
+
+  free(d_seed); free(m_in); free(r_seed)
+  free(ek_pke); free(dk_pke); free(c_buf); free(m_out)
+end
+
+# =============================================================================
+# ML-KEM round-trip (FO-wrapped IND-CCA2 KEM)
+# =============================================================================
+
+def ss_equal(a: Int, b: Int): Int
+  var i = 0
+  while i < 32
+    if ptr_read_byte(a + i) != ptr_read_byte(b + i) then return 0 end
+    i += 1
+  end
+  return 1
+end
+
+def test_mlkem_internal_roundtrip(): Void
+  puts("")
+  puts("--- ML-KEM.Encaps_internal / Decaps_internal round-trip ---")
+
+  var d_seed = malloc(32)
+  var z_seed = malloc(32)
+  var m_seed = malloc(32)
+  var ek = malloc(1184)
+  var dk = malloc(2400)
+  var ct = malloc(1088)
+  var ss_a = malloc(32)
+  var ss_b = malloc(32)
+
+  # Five deterministic (d, z, m) triples. Same as K-PKE smoke seed offset
+  # so we exercise different randomness from the K-PKE round-trip test.
+  var iter = 0
+  while iter < 5
+    fill_bytes_lcg(d_seed, 32, 4000 + iter)
+    fill_bytes_lcg(z_seed, 32, 5000 + iter)
+    fill_bytes_lcg(m_seed, 32, 6000 + iter)
+
+    _mlkem_keygen_internal(ek, dk, d_seed, z_seed)
+    var rc1 = _mlkem_encaps_internal(ct, ss_a, ek, m_seed)
+    var rc2 = _mlkem_decaps_internal(ss_b, ct, dk)
+    check_true("iter " + to_str(iter) + ": Encaps_internal rc==1", rc1)
+    check_true("iter " + to_str(iter) + ": Decaps_internal rc==1", rc2)
+    check_true("iter " + to_str(iter) + ": ss_encaps == ss_decaps", ss_equal(ss_a, ss_b))
+    iter += 1
+  end
+
+  free(d_seed); free(z_seed); free(m_seed)
+  free(ek); free(dk); free(ct); free(ss_a); free(ss_b)
+end
+
+def test_mlkem_topelvel_roundtrip(): Void
+  puts("")
+  puts("--- ML-KEM (top-level randomised) round-trip ×100 ---")
+
+  var ek = malloc(1184)
+  var dk = malloc(2400)
+  var ct = malloc(1088)
+  var ss_a = malloc(32)
+  var ss_b = malloc(32)
+
+  var n_ok = 0
+  var iter = 0
+  while iter < 100
+    mlkem768_keygen(ek, dk)
+    var rc1 = mlkem768_encaps(ct, ss_a, ek)
+    # NET.4.1: dk is freshly-generated secret material; wrap at the boundary.
+    var rc2 = mlkem768_decaps(ss_b, ct, secret_wrap(dk))
+    if rc1 == 1 and rc2 == 1 and ss_equal(ss_a, ss_b) == 1
+      n_ok += 1
+    end
+    iter += 1
+  end
+  check_eq_int("100 iterations: all ss_encaps == ss_decaps", n_ok, 100)
+
+  free(ek); free(dk); free(ct); free(ss_a); free(ss_b)
+end
+
+def test_mlkem_tamper_rejection(): Void
+  puts("")
+  puts("--- ML-KEM tamper rejection (implicit reject via J(z ∥ c)) ---")
+
+  var d_seed = malloc(32)
+  var z_seed = malloc(32)
+  var m_seed = malloc(32)
+  var ek = malloc(1184)
+  var dk = malloc(2400)
+  var ct = malloc(1088)
+  var ct_tampered = malloc(1088)
+  var ss_a = malloc(32)
+  var ss_b = malloc(32)
+  var ss_c = malloc(32)
+  var ss_d = malloc(32)
+
+  fill_bytes_lcg(d_seed, 32, 7777)
+  fill_bytes_lcg(z_seed, 32, 8888)
+  fill_bytes_lcg(m_seed, 32, 9999)
+
+  _mlkem_keygen_internal(ek, dk, d_seed, z_seed)
+  _mlkem_encaps_internal(ct, ss_a, ek, m_seed)
+
+  # Clean decap returns the encaps ss.
+  _mlkem_decaps_internal(ss_b, ct, dk)
+  check_true("clean: ss_decaps == ss_encaps", ss_equal(ss_a, ss_b))
+
+  # Tamper the ciphertext: flip the low bit of byte 0.
+  memcpy(ct_tampered, ct, 1088)
+  ptr_write_byte(ct_tampered, ptr_read_byte(ct_tampered) ^ 1)
+  _mlkem_decaps_internal(ss_c, ct_tampered, dk)
+  check_true("tampered ct[0]: ss_decaps != ss_encaps", 1 - ss_equal(ss_a, ss_c))
+
+  # Tampered decaps is deterministic: same tampered ct → same (implicit) ss.
+  _mlkem_decaps_internal(ss_d, ct_tampered, dk)
+  check_true("tampered ct: implicit ss is deterministic", ss_equal(ss_c, ss_d))
+
+  # Tamper a different position: flip the high bit of byte 500.
+  memcpy(ct_tampered, ct, 1088)
+  ptr_write_byte(ct_tampered + 500, ptr_read_byte(ct_tampered + 500) ^ 128)
+  _mlkem_decaps_internal(ss_c, ct_tampered, dk)
+  check_true("tampered ct[500]: ss_decaps != ss_encaps", 1 - ss_equal(ss_a, ss_c))
+
+  free(d_seed); free(z_seed); free(m_seed)
+  free(ek); free(dk); free(ct); free(ct_tampered)
+  free(ss_a); free(ss_b); free(ss_c); free(ss_d)
+end
+
+def test_mlkem_modulus_check(): Void
+  puts("")
+  puts("--- ML-KEM encapsulation-key modulus check ---")
+
+  var d_seed = malloc(32)
+  var z_seed = malloc(32)
+  var m_seed = malloc(32)
+  var ek = malloc(1184)
+  var dk = malloc(2400)
+  var ct = malloc(1088)
+  var ss = malloc(32)
+
+  fill_bytes_lcg(d_seed, 32, 11111)
+  fill_bytes_lcg(z_seed, 32, 22222)
+  fill_bytes_lcg(m_seed, 32, 33333)
+
+  _mlkem_keygen_internal(ek, dk, d_seed, z_seed)
+
+  # Valid ek: encaps succeeds.
+  check_eq_int("valid ek: encaps returns 1", _mlkem_encaps_internal(ct, ss, ek, m_seed), 1)
+
+  # Tamper ek to encode a coefficient ≥ q. The simplest patch is to set
+  # the first 12 bits of the byte-encoded t̂[0] coefficient to 0xFFF (4095),
+  # which exceeds q = 3329. ByteEncode_12 stores coefficient 0 in bytes 0..1
+  # (low byte) + low 4 bits of byte 1; we overwrite both.
+  ptr_write_byte(ek,     255)
+  ptr_write_byte(ek + 1, 15 | (ptr_read_byte(ek + 1) & 240))
+  check_eq_int("malformed ek: encaps returns 0", _mlkem_encaps_internal(ct, ss, ek, m_seed), 0)
+
+  free(d_seed); free(z_seed); free(m_seed)
+  free(ek); free(dk); free(ct); free(ss)
+end
+
+def main(): Int
+  test_field()
+  test_zeta_table()
+  test_ntt_roundtrip()
+  test_poly_mul_via_ntt()
+  test_sample_cbd()
+  test_sample_ntt()
+  test_compress_decompress()
+  test_byte_encode_decode()
+  test_k_pke_roundtrip()
+  test_mlkem_internal_roundtrip()
+  test_mlkem_topelvel_roundtrip()
+  test_mlkem_tamper_rejection()
+  test_mlkem_modulus_check()
+
+  puts("")
+  puts(to_str(g_passed) + "/" + to_str(g_total) + " checks green")
+  if g_passed == g_total then return 0 end
+  return 1
+end

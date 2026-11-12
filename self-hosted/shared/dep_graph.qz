@@ -1,0 +1,506 @@
+##! Dependency Graph — Module dependency tracking for incremental compilation
+##!
+##! Tracks which modules depend on which, enabling efficient invalidation
+##! when source files change. Uses reverse adjacency for "who depends on X?"
+##! queries and Kahn's algorithm for deterministic topological sort.
+##!
+##! Edge semantics: depgraph_add_dep(A, B) means "A depends on B" (A imports B).
+##! When B changes, A needs recompilation. The reverse adjacency from B gives
+##! all modules that need recompilation when B changes.
+##!
+##! @since 5.26.0
+
+import content_hash
+import file_io
+
+# ============================================================================
+# Graph state — parallel vectors (matches codebase convention)
+# ============================================================================
+
+var _dg_names = vec_new<String>()         # Module names
+var _dg_paths = vec_new<String>()         # Source file paths
+var _dg_content_hashes = vec_new<String>()
+var _dg_interface_hashes = vec_new<String>()
+var _dg_deps = vec_new()                  # Adjacency: _dg_deps[i] = Vec<Int> of dependencies
+var _dg_rev_deps = vec_new()              # Reverse adjacency: _dg_rev_deps[i] = Vec<Int> of dependents
+var _dg_ast_stores = vec_new<Int>()       # AST store handle per module (0 until parsed)
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+## Reset the dependency graph to empty state.
+def depgraph_new(): Void
+  _dg_names = vec_new<String>()
+  _dg_paths = vec_new<String>()
+  _dg_content_hashes = vec_new<String>()
+  _dg_interface_hashes = vec_new<String>()
+  _dg_deps = vec_new()
+  _dg_rev_deps = vec_new()
+  _dg_ast_stores = vec_new<Int>()
+end
+
+## Add a module node to the graph. Returns its index.
+## If the module already exists, updates its path and returns the existing index.
+def depgraph_add_node(name: String, path: String): Int
+  var idx = depgraph_find_node(name)
+  if idx >= 0
+    _dg_paths[idx] = path
+    return idx
+  end
+  var new_idx = _dg_names.size
+  _dg_names.push(name)
+  _dg_paths.push(path)
+  _dg_content_hashes.push("")
+  _dg_interface_hashes.push("")
+  _dg_deps.push(vec_new())
+  _dg_rev_deps.push(vec_new())
+  _dg_ast_stores.push(0)
+  return new_idx
+end
+
+## Record the AST store handle for a module (called after parse).
+def depgraph_set_ast_store(name: String, ast_store: Int): Void
+  var idx = depgraph_find_node(name)
+  if idx >= 0
+    _dg_ast_stores[idx] = ast_store
+  end
+end
+
+## Look up a module's source path by its AST store handle.
+## Returns "" if no module with that ast_store is registered.
+def depgraph_path_for_ast_store(ast_store: Int): String
+  if ast_store == 0
+    return ""
+  end
+  for i in 0.._dg_ast_stores.size
+    if _dg_ast_stores[i] == ast_store
+      return _dg_paths[i]
+    end
+  end
+  return ""
+end
+
+## Look up a module's dep-graph name by its AST store handle.
+## Returns "" if no module with that ast_store is registered.
+## Unlike the function-mangling prefix (struct name for impl methods,
+## short name for free functions), this returns the canonical import-path
+## name the dep graph was keyed with.
+def depgraph_name_for_ast_store(ast_store: Int): String
+  if ast_store == 0
+    return ""
+  end
+  for i in 0.._dg_ast_stores.size
+    if _dg_ast_stores[i] == ast_store
+      return _dg_names[i]
+    end
+  end
+  return ""
+end
+
+## Look up a module's AST store handle by its canonical name.
+## Returns 0 (the parallel-init sentinel) when the module is absent or
+## hasn't been parsed yet.
+def depgraph_get_ast_store(name: String): Int
+  var idx = depgraph_find_node(name)
+  if idx < 0
+    return 0
+  end
+  return _dg_ast_stores[idx]
+end
+
+## Find a module by name. Returns index or -1 if not found.
+def depgraph_find_node(name: String): Int
+  for i in 0.._dg_names.size
+    if _dg_names[i].eq(name)
+      return i
+    end
+  end
+  return -1
+end
+
+## Add a dependency edge: "from" depends on "to" (from imports to).
+## Both modules must already exist in the graph.
+def depgraph_add_dep(from_name: String, to_name: String): Void
+  var from_idx = depgraph_find_node(from_name)
+  var to_idx = depgraph_find_node(to_name)
+  if from_idx < 0
+    return
+  end
+  if to_idx < 0
+    return
+  end
+  # Check for duplicate edge
+  var deps = _dg_deps[from_idx]
+  for j in 0..vec_size(deps)
+    if vec_get(deps, j) == to_idx
+      return
+    end
+  end
+  vec_push(deps, to_idx)
+  var rev = _dg_rev_deps[to_idx]
+  vec_push(rev, from_idx)
+end
+
+## Get the number of modules in the graph.
+def depgraph_node_count(): Int = _dg_names.size
+
+## Get the name of a module by index.
+def depgraph_get_name(idx: Int): String
+  if idx < 0
+    return ""
+  end
+  if idx >= _dg_names.size
+    return ""
+  end
+  return _dg_names[idx]
+end
+
+## Get the path of a module by index.
+def depgraph_get_path(idx: Int): String
+  if idx < 0
+    return ""
+  end
+  if idx >= _dg_paths.size
+    return ""
+  end
+  return _dg_paths[idx]
+end
+
+## Set the content hash for a module.
+def depgraph_set_content_hash(name: String, hash: String): Void
+  var idx = depgraph_find_node(name)
+  if idx >= 0
+    _dg_content_hashes[idx] = hash
+  end
+end
+
+## Get the content hash for a module.
+def depgraph_get_content_hash(name: String): String
+  var idx = depgraph_find_node(name)
+  if idx < 0
+    return ""
+  end
+  return _dg_content_hashes[idx]
+end
+
+## Set the interface hash for a module.
+def depgraph_set_interface_hash(name: String, hash: String): Void
+  var idx = depgraph_find_node(name)
+  if idx >= 0
+    _dg_interface_hashes[idx] = hash
+  end
+end
+
+## Get the interface hash for a module.
+def depgraph_get_interface_hash(name: String): String
+  var idx = depgraph_find_node(name)
+  if idx < 0
+    return ""
+  end
+  return _dg_interface_hashes[idx]
+end
+
+## Get all module paths in the graph.
+def depgraph_get_all_paths(): Vec<String>
+  var result = vec_new<String>()
+  for i in 0.._dg_paths.size
+    result.push(_dg_paths[i])
+  end
+  return result
+end
+
+## Get all module names in the graph.
+def depgraph_get_all_names(): Vec<String>
+  var result = vec_new<String>()
+  for i in 0.._dg_names.size
+    result.push(_dg_names[i])
+  end
+  return result
+end
+
+## Get all content hashes (parallel with names).
+def depgraph_get_all_content_hashes(): Vec<String>
+  var result = vec_new<String>()
+  for i in 0.._dg_content_hashes.size
+    result.push(_dg_content_hashes[i])
+  end
+  return result
+end
+
+## Get all interface hashes (parallel with names).
+def depgraph_get_all_interface_hashes(): Vec<String>
+  var result = vec_new<String>()
+  for i in 0.._dg_interface_hashes.size
+    result.push(_dg_interface_hashes[i])
+  end
+  return result
+end
+
+## Compute the transitive dependents of a set of changed module names.
+## Uses BFS through reverse adjacency. Returns all modules that need
+## recompilation (including the changed modules themselves).
+def depgraph_invalidate(changed: Vec<String>): Vec<String>
+  var result = vec_new<String>()
+  var visited = vec_new()
+  # Initialize visited to 0 for all nodes
+  for i in 0.._dg_names.size
+    visited.push(0)
+  end
+  # BFS queue (indices)
+  var queue = vec_new()
+  # Seed with changed modules
+  for ci in 0..changed.size
+    var idx = depgraph_find_node(changed[ci])
+    if idx >= 0
+      if visited[idx] == 0
+        visited[idx] = 1
+        queue.push(idx)
+        result.push(_dg_names[idx])
+      end
+    end
+  end
+  # BFS through reverse adjacency
+  var qi = 0
+  while qi < queue.size
+    var cur = queue[qi]
+    var rev = _dg_rev_deps[cur]
+    for ri in 0..vec_size(rev)
+      var dep_idx = vec_get(rev, ri)
+      if visited[dep_idx] == 0
+        visited[dep_idx] = 1
+        queue.push(dep_idx)
+        result.push(_dg_names[dep_idx])
+      end
+    end
+    qi += 1
+  end
+  return result
+end
+
+## Compute transitive dependents with early cutoff.
+## For each changed module, if its interface hash matches the previous interface
+## hash, its dependents are NOT added to the recompile set (early cutoff).
+## prev_interface_hashes is a parallel vector with _dg_names for previous hashes.
+def depgraph_invalidate_with_cutoff(changed: Vec<String>, prev_iface_hashes: Vec<String>): Vec<String>
+  var result = vec_new<String>()
+  var visited = vec_new()
+  for i in 0.._dg_names.size
+    visited.push(0)
+  end
+  var queue = vec_new()
+  # Track whether each queue entry is a seed (directly changed) module.
+  # Seed modules always propagate to dependents — MIR may inline their bodies
+  # into dependent modules, so a body-only change still requires recompilation
+  # of direct dependents even if the interface hash didn't change.
+  var queue_is_seed = vec_new()
+  # Seed with changed modules
+  for ci in 0..changed.size
+    var idx = depgraph_find_node(changed[ci])
+    if idx >= 0
+      if visited[idx] == 0
+        visited[idx] = 1
+        queue.push(idx)
+        queue_is_seed.push(1)
+        result.push(_dg_names[idx])
+      end
+    end
+  end
+  # BFS with early cutoff
+  var qi = 0
+  while qi < queue.size
+    var cur = queue[qi]
+    var is_seed = queue_is_seed[qi]
+    # Check early cutoff: if current module's interface hash is same as previous,
+    # do not propagate to dependents. BUT: seed modules (directly changed) always
+    # propagate to their direct dependents because MIR constant-folds/inlines
+    # function bodies across module boundaries.
+    var cutoff = 0
+    if is_seed == 0
+      var cur_iface = _dg_interface_hashes[cur]
+      var prev_iface = ""
+      if cur < prev_iface_hashes.size
+        prev_iface = prev_iface_hashes[cur]
+      end
+      if str_byte_len(cur_iface) > 0
+        if str_byte_len(prev_iface) > 0
+          if cur_iface == prev_iface
+            cutoff = 1
+          end
+        end
+      end
+    end
+    if cutoff == 0
+      var rev = _dg_rev_deps[cur]
+      for ri in 0..vec_size(rev)
+        var dep_idx = vec_get(rev, ri)
+        if visited[dep_idx] == 0
+          visited[dep_idx] = 1
+          queue.push(dep_idx)
+          queue_is_seed.push(0)
+          result.push(_dg_names[dep_idx])
+        end
+      end
+    end
+    qi += 1
+  end
+  return result
+end
+
+## Topological sort using Kahn's algorithm.
+## Returns module names in dependency order (dependencies before dependents).
+def depgraph_topo_sort(): Vec<String>
+  var n = _dg_names.size
+  if n == 0
+    return vec_new<String>()
+  end
+  # Compute in-degrees (how many modules does each depend on?)
+  var in_degree = vec_new()
+  var i = 0
+  while i < n
+    var deps = _dg_deps[i]
+    in_degree.push(vec_size(deps))
+    i += 1
+  end
+  # Queue: start with nodes that have no dependencies
+  var queue = vec_new()
+  i = 0
+  while i < n
+    if in_degree[i] == 0
+      queue.push(i)
+    end
+    i += 1
+  end
+  var result = vec_new<String>()
+  var qi = 0
+  while qi < queue.size
+    var cur = queue[qi]
+    result.push(_dg_names[cur])
+    # For each module that depends on cur (reverse deps), decrease in-degree
+    var rev = _dg_rev_deps[cur]
+    for ri in 0..vec_size(rev)
+      var dep_idx = vec_get(rev, ri)
+      in_degree[dep_idx] = in_degree[dep_idx] - 1
+      if in_degree[dep_idx] == 0
+        queue.push(dep_idx)
+      end
+    end
+    qi += 1
+  end
+  return result
+end
+
+## Save the dependency graph to a file.
+## Format: one line per module: name|path|content_hash|interface_hash|dep1,dep2,...
+def depgraph_save(filepath: String): Void
+  var out = ""
+  for i in 0.._dg_names.size
+    out = "#{out}#{_dg_names[i]}"
+    out = "#{out}|"
+    out = "#{out}#{_dg_paths[i]}"
+    out = "#{out}|"
+    out = "#{out}#{_dg_content_hashes[i]}"
+    out = "#{out}|"
+    out = "#{out}#{_dg_interface_hashes[i]}"
+    out = "#{out}|"
+    # Serialize dependency names (comma-separated)
+    var deps = _dg_deps[i]
+    var j = 0
+    while j < vec_size(deps)
+      if j > 0
+        out = "#{out},"
+      end
+      var dep_idx = vec_get(deps, j)
+      out = "#{out}#{_dg_names[dep_idx]}"
+      j += 1
+    end
+    out = "#{out}\n"
+  end
+  var _w = fio_write(filepath, out)
+end
+
+## Load a dependency graph from a file.
+## Returns 1 on success, 0 on failure.
+def depgraph_load(filepath: String): Int
+  var data = ""
+  if fio_exists(filepath)
+    data = fio_read(filepath)
+  end
+  if str_byte_len(data) == 0
+    return 0
+  end
+  # Reset graph
+  depgraph_new()
+  var lines = str_split(data, "\n")
+  # First pass: add all nodes
+  var i = 0
+  while i < lines.size
+    var line = lines[i]
+    if str_byte_len(line) > 0
+      var parts = str_split(line, "|")
+      if parts.size >= 4
+        var name = parts[0]
+        var path = parts[1]
+        var chash = parts[2]
+        var ihash = parts[3]
+        var idx = depgraph_add_node(name, path)
+        _dg_content_hashes[idx] = chash
+        _dg_interface_hashes[idx] = ihash
+      end
+    end
+    i += 1
+  end
+  # Second pass: add edges
+  i = 0
+  while i < lines.size
+    var line = lines[i]
+    if str_byte_len(line) > 0
+      var parts = str_split(line, "|")
+      if parts.size >= 5
+        var from_name = parts[0]
+        var dep_str = parts[4]
+        if str_byte_len(dep_str) > 0
+          var dep_names = str_split(dep_str, ",")
+          for j in 0..dep_names.size
+            var dep_name = dep_names[j]
+            if str_byte_len(dep_name) > 0
+              depgraph_add_dep(from_name, dep_name)
+            end
+          end
+        end
+      end
+    end
+    i += 1
+  end
+  return 1
+end
+
+## Get the list of direct dependencies for a module.
+def depgraph_get_deps(name: String): Vec<String>
+  var result = vec_new<String>()
+  var idx = depgraph_find_node(name)
+  if idx < 0
+    return result
+  end
+  var deps = _dg_deps[idx]
+  for i in 0..vec_size(deps)
+    var dep_idx = vec_get(deps, i)
+    result.push(_dg_names[dep_idx])
+  end
+  return result
+end
+
+## Get the list of direct dependents (reverse deps) for a module.
+def depgraph_get_dependents(name: String): Vec<String>
+  var result = vec_new<String>()
+  var idx = depgraph_find_node(name)
+  if idx < 0
+    return result
+  end
+  var rev = _dg_rev_deps[idx]
+  for i in 0..vec_size(rev)
+    var dep_idx = vec_get(rev, i)
+    result.push(_dg_names[dep_idx])
+  end
+  return result
+end

@@ -1,0 +1,168 @@
+## scope-aware sleep (B.7 Phase 4e.1)
+##
+## scope_sleep_ms(ms) is the first scope-integrated blocking primitive.
+## It clamps the requested duration to the scope's deadline_remaining_ms
+## and observes scope cancellation within SCOPE_SLEEP_CHUNK_MS via
+## cooperative chunk-polling between calls to sched_sleep.
+##
+## Contract:
+##   1. Under root scope, scope_sleep_ms(ms) is equivalent to sched_sleep(ms)
+##      (no clamp, no throw — root is uncancellable).
+##   2. Under a scope with a deadline closer than the requested sleep,
+##      the actual sleep duration is bounded by the deadline + chunk_size.
+##   3. If the scope is already cancelled at entry, scope_sleep_ms throws
+##      immediately (no sched_sleep call).
+##   4. If the scope's deadline fires during the sleep (proactive timer
+##      from Phase 4d), scope_sleep_ms wakes within ~chunk_size ms and
+##      throws "deadline_exceeded".
+##   5. ms <= 0 with an uncancelled scope returns immediately without
+##      throwing.
+##   6. A scope with a far-future deadline (>> ms) lets scope_sleep_ms
+##      sleep the full requested duration without throwing.
+
+import * from qspec
+import * from std/sync/composition/scope
+import * from std/throws
+
+# Capture for handler-driven assertions.
+var sss_caught_msg = ""
+var sss_caught_count = 0
+
+def sss_capture(op_name: Int, argc: Int, argv: Int): Int
+  sss_caught_msg = as_type<String>(load(argv, 0))
+  sss_caught_count += 1
+  return 0
+end
+
+def is_in_range(v: Int, lo: Int, hi: Int): Int
+  if v >= lo and v <= hi
+    return 1
+  end
+  return 0
+end
+
+# Test bodies — kept module-level so closure shapes stay simple.
+var sss_elapsed_ms = 0
+
+def sss_sleep_500_inside(): Int
+  scope_sleep_ms(500)
+  return 0
+end
+
+def sss_sleep_50_inside(): Int
+  scope_sleep_ms(50)
+  return 0
+end
+
+def sss_sleep_0_inside(): Int
+  scope_sleep_ms(0)
+  return 0
+end
+
+def sss_sleep_neg_inside(): Int
+  scope_sleep_ms(-5)
+  return 0
+end
+
+def main(): Int
+  describe("scope_sleep_ms (B.7 Phase 4e.1)") do ->
+
+    it("under root scope, sleeps for the requested duration without throwing") do ->
+      var start_ns = time_mono_ns()
+      scope_sleep_ms(50)
+      var elapsed_ms = (time_mono_ns() - start_ns) / 1_000_000
+      # Allow a wide upper bound for CI jitter; lower bound is tight.
+      assert_eq(is_in_range(elapsed_ms, 45, 300), 1)
+    end
+
+    it("under a far-future deadline, sleeps the full requested duration") do ->
+      sss_caught_count = 0
+      var start_ns = time_mono_ns()
+      var s = scope_timeout(scope_root(), 5_000)
+      with Throws { throw: sss_capture } do ->
+        scope_with(s, sss_sleep_50_inside)
+        0
+      end
+      var elapsed_ms = (time_mono_ns() - start_ns) / 1_000_000
+      assert_eq(sss_caught_count, 0)
+      assert_eq(is_in_range(elapsed_ms, 45, 300), 1)
+    end
+
+    it("clamps to scope deadline + observes deadline_exceeded throw") do ->
+      sss_caught_msg = ""
+      sss_caught_count = 0
+      var start_ns = time_mono_ns()
+      var s = scope_timeout(scope_root(), 50)
+      with Throws { throw: sss_capture } do ->
+        scope_with(s, sss_sleep_500_inside)
+        0
+      end
+      var elapsed_ms = (time_mono_ns() - start_ns) / 1_000_000
+      # Sleep was supposed to be 500ms; deadline cuts it to ~50ms; chunk
+      # granularity adds up to ~50ms of slack.
+      assert_eq(is_in_range(elapsed_ms, 45, 300), 1)
+      assert_eq(sss_caught_count, 1)
+      assert_eq_str(sss_caught_msg, "deadline_exceeded")
+    end
+
+    it("throws immediately when scope is already cancelled at entry") do ->
+      sss_caught_msg = ""
+      sss_caught_count = 0
+      var s = scope_with_cancel(scope_root())
+      scope_cancel_with(s, "preflight")
+      var start_ns = time_mono_ns()
+      with Throws { throw: sss_capture } do ->
+        scope_with(s, sss_sleep_500_inside)
+        0
+      end
+      var elapsed_ms = (time_mono_ns() - start_ns) / 1_000_000
+      # No sched_sleep should run; only the entry scope_check fires.
+      assert_eq(is_in_range(elapsed_ms, 0, 50), 1)
+      assert_eq(sss_caught_count, 1)
+      assert_eq_str(sss_caught_msg, "preflight")
+    end
+
+    it("ms == 0 returns immediately under an uncancelled scope without throwing") do ->
+      sss_caught_count = 0
+      var start_ns = time_mono_ns()
+      var s = scope_timeout(scope_root(), 5_000)
+      with Throws { throw: sss_capture } do ->
+        scope_with(s, sss_sleep_0_inside)
+        0
+      end
+      var elapsed_ms = (time_mono_ns() - start_ns) / 1_000_000
+      assert_eq(sss_caught_count, 0)
+      assert_eq(is_in_range(elapsed_ms, 0, 50), 1)
+    end
+
+    it("negative ms is treated as 0 — returns immediately without throwing") do ->
+      sss_caught_count = 0
+      var start_ns = time_mono_ns()
+      var s = scope_timeout(scope_root(), 5_000)
+      with Throws { throw: sss_capture } do ->
+        scope_with(s, sss_sleep_neg_inside)
+        0
+      end
+      var elapsed_ms = (time_mono_ns() - start_ns) / 1_000_000
+      assert_eq(sss_caught_count, 0)
+      assert_eq(is_in_range(elapsed_ms, 0, 50), 1)
+    end
+
+    it("preserves user-supplied cancel reason set before scope_sleep_ms") do ->
+      # If the scope was cancelled with a custom reason before entry,
+      # scope_sleep_ms throws THAT reason — not the generic "cancelled".
+      sss_caught_msg = ""
+      sss_caught_count = 0
+      var s = scope_with_cancel(scope_root())
+      scope_cancel_with(s, "user kicked it")
+      with Throws { throw: sss_capture } do ->
+        scope_with(s, sss_sleep_500_inside)
+        0
+      end
+      assert_eq(sss_caught_count, 1)
+      assert_eq_str(sss_caught_msg, "user kicked it")
+    end
+
+  end
+  return qspec_main()
+end

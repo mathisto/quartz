@@ -1,0 +1,257 @@
+## Parser hang recovery — regression tests for defensive advance on error paths.
+##
+## The parser's primary error reporter `ps_error` deliberately does NOT advance
+## the token stream (many callers want to report an error at the current token
+## then recover locally). But some code paths combined `ps_error` with a silent
+## fall-through that then reached a deeper parser that also failed to advance,
+## producing an infinite loop on malformed input.
+##
+## Two concrete forms triggered the loop:
+##   (a) `@bogus def main() = 0` — unknown attribute fell through to
+##       `ps_parse_struct` on a non-struct token, which looped in the field loop.
+##   (b) `extern "C"\ndef foo()` — newline between the cconv string and `def`
+##       left `def` unconsumed; the parameter-parse loop never advanced.
+##
+## Both inputs now compile to a clean diagnostic and a non-zero exit. The spec
+## wraps the compiler invocation in a shell `timeout 5` so a regression
+## (genuine hang) surfaces as exit 124/137 rather than hanging the test run.
+
+import * from qspec
+
+## Run the compiler on `source`, bounded by `timeout_secs`. Returns
+## (exit_code, stderr_content). A hang surfaces as exit_code == 124
+## (timeout's own exit) or 137 (SIGKILL'd by timeout), either way not 0
+## and not matching our expected diagnostic.
+def _compile_bounded(source: String, timeout_secs: Int): String
+  var compiler = getenv("QUARTZ_COMPILER")
+  if str_byte_len(compiler) == 0
+    return "QUARTZ_COMPILER_NOT_SET"
+  end
+  var std_path = getenv("QUARTZ_STD")
+  var pid = getpid()
+  var src_path = "/tmp/_qspec_hang_#{pid}.qz"
+  var err_path = "/tmp/_qspec_hang_#{pid}.err"
+  write_file(src_path, source)
+
+  var cmd = "timeout #{timeout_secs} #{compiler} --no-cache"
+  if str_byte_len(std_path) > 0
+    cmd = "#{cmd} -I #{std_path}"
+  end
+  cmd = "#{cmd} #{src_path} > /dev/null 2> #{err_path}"
+
+  var raw = system(cmd)
+  var signaled = band(raw, 127)
+  var exit_code = 0
+  if signaled != 0
+    exit_code = 128 + signaled
+  else
+    exit_code = band(shr(raw, 8), 255)
+  end
+
+  var err_content = read_file(err_path)
+  file_delete(src_path)
+  file_delete(err_path)
+
+  return "exit=#{exit_code}|stderr=#{err_content}"
+end
+
+def _bogus_attribute_src(): String = """
+@bogus
+def main(): Int
+  return 0
+end
+"""
+
+def _bogus_attribute_cluster_src(): String = """
+@bogus @also_bogus
+def main(): Int
+  return 0
+end
+"""
+
+def _bogus_attribute_then_extern_src(): String = """
+@bogus
+extern "C" def puts(s: CPtr<U8>): Int
+
+def main(): Int
+  return 0
+end
+"""
+
+def _multiline_extern_src(): String = """
+extern "C"
+def main(): Int
+  return 0
+end
+"""
+
+def _multiline_extern_with_body_src(): String = """
+extern "preserve_most"
+def main(): Int
+  return 0
+end
+"""
+
+## Brace-delimited struct *body* — `struct X { ... }`. Before the QZ0102
+## fix, the `{` left `ps_expect_newline_or_end` and the field while-loop with
+## a non-advancing cursor, so the loop spun forever pushing garbage fields
+## (~3 GB RSS, never terminated). This is the GENERIC_STRUCT_TYPECHECK_HANG
+## case — misfiled as a generics bug; the real trigger is the braced body,
+## generic or not.
+def _braced_struct_plain_src(): String = """
+struct Box { inner: Int }
+def main(): Int
+  return 0
+end
+"""
+
+def _braced_struct_generic_src(): String = """
+struct Secret<T> { inner: T }
+def main(): Int
+  return 0
+end
+"""
+
+## Multi-field + nested braces in a field default — exercises the
+## balanced-brace recovery skip (`_ps_skip_balanced_braces`).
+def _braced_struct_multifield_src(): String = """
+struct Point { x: Int, y: Int }
+def main(): Int
+  return 0
+end
+"""
+
+## Positive control: the canonical end-delimited generic struct must still
+## compile cleanly (exit 0) — the fix rejects only the braced body, never
+## the legitimate form.
+def _end_form_generic_struct_src(): String = """
+struct Box<T>
+  inner: T
+end
+def main(): Int
+  b: Box<Int> = Box<Int> { inner: 7 }
+  return b.inner
+end
+"""
+
+## Leading-operator line continuation — `^` starts the continuation line.
+## Quartz ends a statement at the newline, so this is a misplaced binary
+## operator. MULTILINE_BINARY_OPERATOR: used to be a silent miscompile
+## (the `^ 3` line was parsed and discarded → wrong result); now QZ0103.
+def _leading_operator_src(): String = """
+def chain(): Int
+  var y = 1
+    ^ 2
+    ^ 4
+  return y
+end
+def main(): Int
+  puts(to_str(chain()))
+  return 0
+end
+"""
+
+## Positive control: TRAILING-operator continuation (operator ends the line)
+## is the canonical multi-line idiom and must keep compiling + computing
+## correctly. 1 ^ 2 ^ 4 = 7.
+def _trailing_operator_src(): String = """
+def chain(): Int
+  var y = 1 ^
+    2 ^
+    4
+  return y
+end
+def main(): Int
+  puts(to_str(chain()))
+  return 0
+end
+"""
+
+def main(): Int
+  describe("parser hang recovery — unknown attribute") do ->
+    it("@bogus does not hang the parser") do ->
+      # Should terminate quickly AND surface the "Unknown attribute" message.
+      var result = _compile_bounded(_bogus_attribute_src(), 5)
+      assert_eq(str_contains(result, "Unknown attribute"), true)
+      # Anti-regression: 124 = timeout's exit code when the child didn't
+      # die within the bound. If we see it, the hang is back.
+      assert_eq(str_contains(result, "exit=124"), false)
+      assert_eq(str_contains(result, "exit=137"), false)
+    end
+
+    it("back-to-back bogus attributes do not hang") do ->
+      var result = _compile_bounded(_bogus_attribute_cluster_src(), 5)
+      assert_eq(str_contains(result, "Unknown attribute"), true)
+      assert_eq(str_contains(result, "exit=124"), false)
+    end
+
+    it("bogus attribute preceding a valid extern does not hang") do ->
+      var result = _compile_bounded(_bogus_attribute_then_extern_src(), 5)
+      assert_eq(str_contains(result, "Unknown attribute"), true)
+      assert_eq(str_contains(result, "exit=124"), false)
+    end
+  end
+
+  describe("parser hang recovery — multi-line extern header") do ->
+    it("extern \"C\" on its own line above def does not hang") do ->
+      # Before the fix, the newline between `"C"` and `def` left `def`
+      # unconsumed and the parameter-parse while-loop spun forever on
+      # a non-advancing ps_expect chain.
+      var result = _compile_bounded(_multiline_extern_src(), 5)
+      # Either compiles clean (exit=0) or errors cleanly (exit=1) —
+      # never hangs.
+      assert_eq(str_contains(result, "exit=124"), false)
+      assert_eq(str_contains(result, "exit=137"), false)
+    end
+
+    it("extern \"preserve_most\" on its own line does not hang") do ->
+      var result = _compile_bounded(_multiline_extern_with_body_src(), 5)
+      assert_eq(str_contains(result, "exit=124"), false)
+      assert_eq(str_contains(result, "exit=137"), false)
+    end
+  end
+
+  describe("parser hang recovery — brace-delimited struct body (QZ0102)") do ->
+    it("struct X { inner: Int } errors cleanly, does not hang") do ->
+      var result = _compile_bounded(_braced_struct_plain_src(), 5)
+      assert_eq(str_contains(result, "QZ0102"), true)
+      assert_eq(str_contains(result, "exit=124"), false)
+      assert_eq(str_contains(result, "exit=137"), false)
+    end
+
+    it("generic struct Secret<T> { inner: T } errors cleanly, does not hang") do ->
+      var result = _compile_bounded(_braced_struct_generic_src(), 5)
+      assert_eq(str_contains(result, "QZ0102"), true)
+      assert_eq(str_contains(result, "exit=124"), false)
+    end
+
+    it("multi-field braced body recovers via balanced-brace skip") do ->
+      var result = _compile_bounded(_braced_struct_multifield_src(), 5)
+      assert_eq(str_contains(result, "QZ0102"), true)
+      assert_eq(str_contains(result, "exit=124"), false)
+    end
+
+    it("end-delimited generic struct still compiles (positive control)") do ->
+      var result = _compile_bounded(_end_form_generic_struct_src(), 5)
+      assert_eq(str_contains(result, "exit=0"), true)
+      assert_eq(str_contains(result, "QZ0102"), false)
+    end
+  end
+
+  describe("multi-line binary operator (QZ0103)") do ->
+    it("leading-operator continuation errors with QZ0103, not silent") do ->
+      var result = _compile_bounded(_leading_operator_src(), 5)
+      assert_eq(str_contains(result, "QZ0103"), true)
+      assert_eq(str_contains(result, "exit=124"), false)
+    end
+
+    it("trailing-operator continuation compiles + computes correctly") do ->
+      # 1 ^ 2 ^ 4 = 7 — proves the canonical multi-line idiom still works.
+      var result = _compile_bounded(_trailing_operator_src(), 5)
+      assert_eq(str_contains(result, "exit=0"), true)
+      assert_eq(str_contains(result, "QZ0103"), false)
+    end
+  end
+
+  return qspec_main()
+end

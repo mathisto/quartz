@@ -1,0 +1,210 @@
+## QSpec coverage for Alloc-effect codegen routing (Phase A.3.b/A.3.c/A.7).
+##
+## Locks in:
+##   - Every `mem_alloc`/`mem_free` (and every codegen `@malloc`/`@free`
+##     site under the A.3.c sweep) routes through the
+##     `@__qz_alloc`/`@__qz_dealloc` wrapper.
+##   - The wrapper body checks the `@__qz_alloc_in_handler` TLS bypass
+##     flag and routes through
+##     `__qz_effect_perform(@__qz_eff_name_alloc, ...)` when not in a
+##     handler — calls become observable from `with Alloc { ... } do
+##     body end` blocks.
+##   - The bypass-during-handler TLS flag is set by `__qz_effect_perform`
+##     around the matched-handler call so handlers that themselves
+##     allocate do not infinite-recurse.
+##
+## Phase A.7 deleted the `--alloc-routing` flag — routing is the only
+## mode. The previous off-mode tests have been retired.
+##
+## **A.3.c byte-semantics**: `mem_alloc(N)` allocates N BYTES (was N
+## slots × 8). All `mem_alloc`/`alloc` calls in this spec sized in
+## byte-counts — 8 bytes per i64 slot.
+##
+## **A.3.c scope expansion**: with the unified `@__qz_alloc` wrapper,
+## EVERY allocation in compiled code (vec_new, str_concat, sb_*, map_*,
+## channels, etc.) routes through the same funnel.
+
+import * from qspec
+
+# IR-shape source: tiny program with one mem_alloc + mem_free call.
+# A.3.c: mem_alloc(8) for one i64 slot under byte semantics.
+var _IR_SRC: String = """def main(): Int
+  var p = mem_alloc(8)
+  store(p, 0, 17)
+  var v = load(p, 0)
+  mem_free(p)
+  return v
+end
+"""
+
+# Behavior source: tracking handler counts intercepted alloc/dealloc ops.
+# Post A.7: routing is always on, so the tracking handler ALWAYS sees
+# the calls.
+var _COUNT_SRC: String = """import std/alloc
+
+var calls = 0
+
+def tracking_alloc(op: Int, argc: Int, argv: Int): Int
+  calls = calls + 1
+  return default_alloc_handler(op, argc, argv)
+end
+
+def tracking_dealloc(op: Int, argc: Int, argv: Int): Int
+  return default_dealloc_handler(op, argc, argv)
+end
+
+def do_work(): Void
+  # A.3.c byte-semantics: 16 bytes = two i64 slots.
+  var p = mem_alloc(16)
+  store(p, 0, 1)
+  store(p, 1, 2)
+  mem_free(p)
+end
+
+def main(): Int
+  with Alloc { alloc: tracking_alloc, dealloc: tracking_dealloc } do ->
+    do_work()
+  end
+  if calls > 0
+    puts(\"intercepted\")
+  else
+    puts(\"bypassed\")
+  end
+  return 0
+end
+"""
+
+# Reentrant handler: calls `mem_alloc` inside the handler body. Without
+# the bypass-during-handler TLS flag this would infinite-recurse via
+# the perform machinery picking up the same handler again.
+var _REENTRANT_SRC: String = """import std/alloc
+
+var calls = 0
+var inner_size = 0
+
+def reentrant_alloc(op: Int, argc: Int, argv: Int): Int
+  calls = calls + 1
+  # Allocate INSIDE the handler. Without bypass, this routes back
+  # through the perform machinery, picks up our handler again, and
+  # infinite-loops. With bypass, this sees @__qz_alloc_in_handler == 1
+  # and the wrapper takes the direct @malloc branch, breaking the cycle.
+  # A.3.c byte-semantics: mem_alloc(8) = one i64 slot.
+  var sink = mem_alloc(8)
+  store(sink, 0, load(argv, 0))
+  inner_size = load(sink, 0)
+  mem_free(sink)
+  return default_alloc_handler(op, argc, argv)
+end
+
+def reentrant_dealloc(op: Int, argc: Int, argv: Int): Int
+  return default_dealloc_handler(op, argc, argv)
+end
+
+def do_work(): Void
+  var p = mem_alloc(8)
+  store(p, 0, 42)
+  mem_free(p)
+end
+
+def main(): Int
+  with Alloc { alloc: reentrant_alloc, dealloc: reentrant_dealloc } do ->
+    do_work()
+  end
+  if calls > 0
+    puts(\"reentrant_ok\")
+  else
+    puts(\"no_intercept\")
+  end
+  return 0
+end
+"""
+
+# A.3.c universal coverage: post per-file migration sweep, EVERY codegen
+# `@malloc`/`@free` call site funnels through `@__qz_alloc`/`@__qz_dealloc`
+# (including qz_vec_new, qz_str_concat, qz_map_*, channel/mutex/sb/regex/
+# binary/etc. helpers). The bypass-flag is 0 at user-code call sites, so
+# every allocation routes via perform. A tracking handler installed at
+# module scope captures all of them.
+#
+# This source uses Vec and String operations in the wrapped body and
+# asserts the handler counted strictly more than 1 alloc — proving
+# coverage extends beyond just `mem_alloc`/`mem_free` into stdlib-
+# internal helpers (the "headline insight" of the design memo).
+var _COVERAGE_SRC: String = """import std/alloc
+
+var alloc_calls = 0
+var dealloc_calls = 0
+
+def cov_alloc(op: Int, argc: Int, argv: Int): Int
+  alloc_calls = alloc_calls + 1
+  return default_alloc_handler(op, argc, argv)
+end
+
+def cov_dealloc(op: Int, argc: Int, argv: Int): Int
+  dealloc_calls = dealloc_calls + 1
+  return default_dealloc_handler(op, argc, argv)
+end
+
+def do_work(): Void
+  # vec_new + multiple pushes — internal qz_vec_new allocates header
+  # + data, pushes that exceed capacity trigger qz_vec_grow which
+  # allocates a new (larger) data buffer.
+  var v = vec_new<Int>()
+  v.push(10)
+  v.push(20)
+  v.push(30)
+  v.push(40)
+  v.push(50)
+  v.push(60)
+  v.push(70)
+  v.push(80)
+  v.push(90)
+  v.push(100)
+  # String concat — qz_str_concat allocates a new buffer.
+  var s1 = \"hello\".concat(\" world\")
+  var s2 = s1.concat(\"!\")
+  var s3 = s2.concat(\" again\")
+end
+
+def main(): Int
+  with Alloc { alloc: cov_alloc, dealloc: cov_dealloc } do ->
+    do_work()
+  end
+  if alloc_calls > 1
+    puts(\"covered_many\")
+  else
+    puts(\"covered_few\")
+  end
+  return 0
+end
+"""
+
+def main(): Int
+  describe("Alloc-effect codegen routing (A.3.b/A.3.c/A.7)") do ->
+    it("mem_alloc emits a call to the @__qz_alloc wrapper") do ->
+      assert_ir_contains(_IR_SRC, "call ptr @__qz_alloc")
+    end
+
+    it("wrapper body routes through __qz_effect_perform with the in-handler bypass flag") do ->
+      assert_ir_contains(_IR_SRC, "@__qz_eff_name_alloc, ptr @__qz_eff_op_alloc")
+      assert_ir_contains(_IR_SRC, "@__qz_alloc_in_handler")
+    end
+
+    it("mem_alloc/mem_free hit a user-installed Alloc handler") do ->
+      assert_run_stdout_eq(_COUNT_SRC, "intercepted\n")
+    end
+
+    it("reentrant handler that allocates does not infinite-recurse") do ->
+      assert_run_stdout_eq(_REENTRANT_SRC, "reentrant_ok\n")
+    end
+
+    it("Vec/String/Map internals respect Alloc handler (A.3.c coverage)") do ->
+      # Post per-file migration sweep, EVERY codegen `@malloc`/`@free`
+      # site funnels through the wrapper. Tracking handler should
+      # observe many allocations (header + data + grow + buckets +
+      # entry slots + concat buffer ...).
+      assert_run_stdout_eq(_COVERAGE_SRC, "covered_many\n")
+    end
+  end
+  return qspec_main()
+end

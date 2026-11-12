@@ -1,0 +1,251 @@
+## std/net/wireguard/timers - WireGuard timer state machine
+##
+## Per-peer timer state + tick driver. The driver is **caller-clocked**: the
+## host invokes `wg_timers_tick(t, now_ms)` periodically (typically every
+## ~1s) and acts on the returned bit-flag actions. This makes the same code
+## work in userspace (driven by a goroutine + `time_mono_ns()/1_000_000`) and
+## in the freestanding unikernel (driven by the LAPIC tick + a tick counter).
+##
+## Per WG paper §6.5, six time-driven events shape the protocol's lifecycle:
+##
+##   REKEY_AFTER_TIME    120s — initiator: kick a new handshake
+##   REKEY_TIMEOUT         5s — initiator: resend MSG_INITIATION (no response yet)
+##   REKEY_ATTEMPT_TIME   90s — initiator: give up; drop peer state
+##   KEEPALIVE_TIMEOUT    10s — both: send a 0-byte data packet (peer is idle)
+##   REJECT_AFTER_TIME   180s — both: stop using the session, zeroize keys
+##   REKEY_AFTER_MESSAGES 2^60 — already enforced in transport.qz at encrypt
+##
+## A seventh event lives in transport.qz (REKEY_AFTER_MESSAGES — message
+## counter wall) since it's keyed to the per-direction send_counter rather
+## than wall time.
+##
+## Action bit flags are returned by `wg_timers_tick`. The caller does the
+## work corresponding to each set flag and then calls the matching lifecycle
+## hook to update the state, which suppresses re-firing on the next tick.
+##
+## **Multi-session concern (deferred to Step 2.4 device.qz):** Production WG
+## maintains "previous", "current", and "next" sessions per peer to handle
+## the rekey overlap window. PeerTimers tracks ONE session — it represents
+## the *current* session and the in-flight handshake (if any). The
+## peer-table layer composes timers across session generations.
+
+import * from ffi/socket  # malloc/free/memset
+
+# =============================================================================
+# Time constants (milliseconds)
+# =============================================================================
+
+def WG_REKEY_AFTER_TIME_MS(): Int = 120000
+def WG_REKEY_TIMEOUT_MS(): Int = 5000
+def WG_REKEY_ATTEMPT_TIME_MS(): Int = 90000
+def WG_KEEPALIVE_TIMEOUT_MS(): Int = 10000
+def WG_REJECT_AFTER_TIME_MS(): Int = 180000
+
+# =============================================================================
+# Action bit flags
+# =============================================================================
+
+def WG_ACTION_REKEY(): Int = 1
+def WG_ACTION_RETRANSMIT_HANDSHAKE(): Int = 2
+def WG_ACTION_GIVE_UP_HANDSHAKE(): Int = 4
+def WG_ACTION_SEND_KEEPALIVE(): Int = 8
+def WG_ACTION_REJECT_SESSION(): Int = 16
+
+# =============================================================================
+# PeerTimers
+# =============================================================================
+
+## Per-peer timing state. All times are millisecond timestamps from a
+## monotonic clock (caller's choice — `time_mono_ns()/1_000_000` for hosted,
+## a LAPIC tick counter for the unikernel). Zero means "unset / no event".
+##
+## Field semantics:
+##   session_established_ms     — when the current Session went live; 0 if
+##                                no session
+##   is_initiator               — 1 if this side initiated the latest
+##                                handshake; only initiators auto-rekey
+##   last_recv_ms               — last successful transport-data receive
+##   last_keepalive_sent_ms     — last keepalive packet send (deduplicates
+##                                the SEND_KEEPALIVE flag fire)
+##   handshake_attempt_started_ms — first MSG_INITIATION send timestamp for
+##                                  the current rekey attempt; 0 if no
+##                                  attempt is in flight
+##   last_handshake_send_ms     — most recent MSG_INITIATION send (for
+##                                retransmit timing)
+struct PeerTimers
+  session_established_ms: Int
+  is_initiator: Int
+  last_recv_ms: Int
+  last_keepalive_sent_ms: Int
+  handshake_attempt_started_ms: Int
+  last_handshake_send_ms: Int
+end
+
+def wg_timers_new(): PeerTimers
+  return PeerTimers {
+    session_established_ms: 0,
+    is_initiator: 0,
+    last_recv_ms: 0,
+    last_keepalive_sent_ms: 0,
+    handshake_attempt_started_ms: 0,
+    last_handshake_send_ms: 0
+  }
+end
+
+# =============================================================================
+# Lifecycle hooks — caller invokes these after acting on tick flags or upon
+# external events (handshake send/recv, session install, data send/recv).
+# =============================================================================
+
+## Initiator: about to send MSG_INITIATION (first attempt of an attempt
+## sequence). Records both the attempt-start (drives GIVE_UP at +90s) and
+## the most-recent-send (drives RETRANSMIT at +5s).
+def wg_timers_handshake_started(t: PeerTimers, now: Int): PeerTimers
+  return PeerTimers {
+    session_established_ms: t.session_established_ms,
+    is_initiator: t.is_initiator,
+    last_recv_ms: t.last_recv_ms,
+    last_keepalive_sent_ms: t.last_keepalive_sent_ms,
+    handshake_attempt_started_ms: now,
+    last_handshake_send_ms: now
+  }
+end
+
+## Initiator: resent MSG_INITIATION (5s elapsed without response). Bumps
+## the most-recent-send timestamp; attempt_started_ms is preserved to keep
+## the GIVE_UP deadline anchored to the first try.
+def wg_timers_handshake_retransmitted(t: PeerTimers, now: Int): PeerTimers
+  return PeerTimers {
+    session_established_ms: t.session_established_ms,
+    is_initiator: t.is_initiator,
+    last_recv_ms: t.last_recv_ms,
+    last_keepalive_sent_ms: t.last_keepalive_sent_ms,
+    handshake_attempt_started_ms: t.handshake_attempt_started_ms,
+    last_handshake_send_ms: now
+  }
+end
+
+## Both sides: a fresh Session is now live. Clears any in-flight handshake
+## attempt (we just succeeded) and sets the established timestamp. Per WG
+## paper §6.5, the handshake completion itself counts as "activity" for the
+## purposes of KEEPALIVE_TIMEOUT — anchor `last_recv_ms` to `now` so a
+## newly-established session doesn't immediately want a keepalive.
+def wg_timers_session_established(t: PeerTimers, now: Int, is_initiator: Int): PeerTimers
+  return PeerTimers {
+    session_established_ms: now,
+    is_initiator: is_initiator,
+    last_recv_ms: now,
+    last_keepalive_sent_ms: t.last_keepalive_sent_ms,
+    handshake_attempt_started_ms: 0,
+    last_handshake_send_ms: 0
+  }
+end
+
+## Both sides: session has been zeroized + dropped. Wipes session state but
+## keeps last_recv (for any in-flight rekey lifecycle).
+def wg_timers_session_dropped(t: PeerTimers): PeerTimers
+  return PeerTimers {
+    session_established_ms: 0,
+    is_initiator: 0,
+    last_recv_ms: t.last_recv_ms,
+    last_keepalive_sent_ms: t.last_keepalive_sent_ms,
+    handshake_attempt_started_ms: t.handshake_attempt_started_ms,
+    last_handshake_send_ms: t.last_handshake_send_ms
+  }
+end
+
+## Initiator: handshake gave up (90s of failure). Wipes pending state.
+def wg_timers_handshake_dropped(t: PeerTimers): PeerTimers
+  return PeerTimers {
+    session_established_ms: t.session_established_ms,
+    is_initiator: t.is_initiator,
+    last_recv_ms: t.last_recv_ms,
+    last_keepalive_sent_ms: t.last_keepalive_sent_ms,
+    handshake_attempt_started_ms: 0,
+    last_handshake_send_ms: 0
+  }
+end
+
+## Both sides: a transport-data packet was successfully received from peer
+## (NOT including handshake messages). Re-arms the keepalive timer.
+def wg_timers_data_recv(t: PeerTimers, now: Int): PeerTimers
+  return PeerTimers {
+    session_established_ms: t.session_established_ms,
+    is_initiator: t.is_initiator,
+    last_recv_ms: now,
+    last_keepalive_sent_ms: t.last_keepalive_sent_ms,
+    handshake_attempt_started_ms: t.handshake_attempt_started_ms,
+    last_handshake_send_ms: t.last_handshake_send_ms
+  }
+end
+
+## Both sides: a keepalive packet was sent. Suppresses repeated SEND_KEEPALIVE
+## flags until KEEPALIVE_TIMEOUT_MS elapses again without a peer response.
+def wg_timers_keepalive_sent(t: PeerTimers, now: Int): PeerTimers
+  return PeerTimers {
+    session_established_ms: t.session_established_ms,
+    is_initiator: t.is_initiator,
+    last_recv_ms: t.last_recv_ms,
+    last_keepalive_sent_ms: now,
+    handshake_attempt_started_ms: t.handshake_attempt_started_ms,
+    last_handshake_send_ms: t.last_handshake_send_ms
+  }
+end
+
+# =============================================================================
+# Tick — examine state vs `now`, return action bit-flags
+# =============================================================================
+
+## Examine the current timer state at wall-time `now` and return a bitmask
+## of actions the caller should perform. Multiple flags can be set in a
+## single tick (e.g., REKEY + SEND_KEEPALIVE on a long-idle session).
+##
+## The function is **side-effect-free** — it does not mutate `t`. The caller
+## acts on each set flag and updates state via the lifecycle hooks; the next
+## tick will then suppress flags whose preconditions no longer hold.
+##
+## Ordering note (per WG paper §6.5):
+##   - REJECT_SESSION (180s) and REKEY (120s) can both fire if a session
+##     established 180s ago has had no rekey kicked off. Caller's policy
+##     decides what to do — typical behavior is honor REKEY first (start a
+##     new handshake) then REJECT (drop the old session) on the next tick
+##     after handshake_started runs.
+##   - RETRANSMIT (5s) and GIVE_UP (90s) cannot both meaningfully fire — by
+##     90s, retransmit has fired ~17 times already; the caller's role is
+##     just to wipe state on GIVE_UP.
+def wg_timers_tick(t: PeerTimers, now: Int): Int
+  var actions = 0
+
+  if t.session_established_ms > 0
+    var age = now - t.session_established_ms
+
+    if age >= WG_REJECT_AFTER_TIME_MS()
+      actions = actions | WG_ACTION_REJECT_SESSION()
+    end
+
+    if age >= WG_REKEY_AFTER_TIME_MS() and t.is_initiator == 1 and
+       t.handshake_attempt_started_ms == 0
+      actions = actions | WG_ACTION_REKEY()
+    end
+
+    var last_active = t.last_recv_ms
+    if t.last_keepalive_sent_ms > last_active
+      last_active = t.last_keepalive_sent_ms
+    end
+    if (now - last_active) >= WG_KEEPALIVE_TIMEOUT_MS()
+      actions = actions | WG_ACTION_SEND_KEEPALIVE()
+    end
+  end
+
+  if t.last_handshake_send_ms > 0 and
+     (now - t.last_handshake_send_ms) >= WG_REKEY_TIMEOUT_MS()
+    actions = actions | WG_ACTION_RETRANSMIT_HANDSHAKE()
+  end
+
+  if t.handshake_attempt_started_ms > 0 and
+     (now - t.handshake_attempt_started_ms) >= WG_REKEY_ATTEMPT_TIME_MS()
+    actions = actions | WG_ACTION_GIVE_UP_HANDSHAKE()
+  end
+
+  return actions
+end

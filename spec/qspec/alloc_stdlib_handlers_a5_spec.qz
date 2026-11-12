@@ -1,0 +1,457 @@
+## QSpec coverage for the Phase A.5 stdlib Alloc handler library.
+##
+## Locks in:
+##   - **arena_alloc_handler / arena_dealloc_handler** route alloc()
+##     through `arena_alloc(handle, size)`; dealloc is a no-op (arena
+##     frees in bulk via destroy/reset).
+##   - **counter_alloc_handler / counter_dealloc_handler** track total
+##     allocated bytes; throw via Throws when the next request would
+##     exceed budget.
+##   - **deny_alloc_handler / deny_dealloc_handler** refuse every alloc
+##     via Throws (sandbox semantics); dealloc is permitted.
+##   - **tracking_alloc_handler / tracking_dealloc_handler** count ops +
+##     total bytes; forward to the default backing allocator.
+##   - **D5 lock-in**: refusal is via `throw(msg)` from std/throws —
+##     handler-throws compose with the runtime-blessed default Throws
+##     handler (process exits 66 + diagnostic message on stderr) when
+##     no user `with Throws` frame is installed.
+##
+## Out of scope (deferred to Phase B / A.6):
+##   - Per-handler closure-style state (multiple concurrent arenas).
+##     A.5 uses module-global state with `alloc_set_*` setters; B.1
+##     introduces `with Alloc.in_arena(arena) do ... end` ergonomics.
+##   - User-recovery via `with Throws { throw: rec } do ... end` after
+##     a refusal — the perform machinery's bypass-flag restore is
+##     skipped on longjmp-out-of-handler, leaving subsequent allocs
+##     bypassing the user's Alloc handler. Documented in std/alloc.qz;
+##     fix is a setjmp/cleanup block in `__qz_effect_perform`.
+##
+## NOTE on triple-quoted snippet strings: `"""..."""` interpolates
+## `#{...}` at SPEC compile time, not subprocess runtime. Snippets
+## below build runtime output via `str_from_int` + concat instead of
+## interpolation to keep variables in-snippet.
+
+import * from qspec
+import * from qspec/subprocess
+
+# -----------------------------------------------------------------------------
+# Arena handler (3 tests).
+# -----------------------------------------------------------------------------
+
+var _ARENA_BASIC: String = """import std/alloc
+
+# Capture user-visible totals inside the with-block; report OUTSIDE so
+# str_from_int/concat allocations from puts() route through the blessed
+# default rather than the arena handler. Post Phase A.7 every allocation
+# is routed; the user-handler scope must end before formatting if the
+# byte count is being asserted exactly.
+var g_sum = 0
+var g_bytes = 0
+
+def main(): Int
+  var ar = arena_new()
+  alloc_set_arena(ar)
+  with Alloc { alloc: arena_alloc_handler, dealloc: arena_dealloc_handler } do ->
+    var p1 = alloc(8)
+    store(p1, 0, 11)
+    var p2 = alloc(8)
+    store(p2, 0, 22)
+    var p3 = alloc(8)
+    store(p3, 0, 33)
+    g_sum = load(p1, 0) + load(p2, 0) + load(p3, 0)
+    g_bytes = arena_bytes_used(ar)
+  end
+  puts(\"sum=\" + str_from_int(g_sum) + \" bytes_used=\" + str_from_int(g_bytes))
+  arena_destroy(ar)
+  return 0
+end
+"""
+
+var _ARENA_RESET_REUSE: String = """import std/alloc
+
+# A.7: capture phase byte counters inside the with-block; format and
+# print AFTER it exits so str_from_int/concat allocs route to the
+# blessed default and don't perturb arena bytes_used.
+var g_b1 = 0
+var g_b2 = 0
+var g_b3 = 0
+
+def main(): Int
+  var ar = arena_new()
+  alloc_set_arena(ar)
+  with Alloc { alloc: arena_alloc_handler, dealloc: arena_dealloc_handler } do ->
+    var p = alloc(64)
+    g_b1 = arena_bytes_used(ar)
+    arena_reset(ar)
+    g_b2 = arena_bytes_used(ar)
+    var q = alloc(32)
+    g_b3 = arena_bytes_used(ar)
+  end
+  puts(\"first_alloc bytes=\" + str_from_int(g_b1))
+  puts(\"after_reset bytes=\" + str_from_int(g_b2))
+  puts(\"second_alloc bytes=\" + str_from_int(g_b3))
+  arena_destroy(ar)
+  return 0
+end
+"""
+
+var _ARENA_DEALLOC_NOOP: String = """import std/alloc
+
+# A.7: capture before/after byte counters inside; format outside.
+var g_before = 0
+var g_after = 0
+
+def main(): Int
+  var ar = arena_new()
+  alloc_set_arena(ar)
+  with Alloc { alloc: arena_alloc_handler, dealloc: arena_dealloc_handler } do ->
+    var p = alloc(16)
+    g_before = arena_bytes_used(ar)
+    dealloc(p)
+    g_after = arena_bytes_used(ar)
+  end
+  puts(\"before=\" + str_from_int(g_before) + \" after=\" + str_from_int(g_after))
+  arena_destroy(ar)
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# Counter handler (5 tests).
+# -----------------------------------------------------------------------------
+
+var _COUNTER_UNDER_BUDGET: String = """import std/alloc
+
+def main(): Int
+  alloc_set_budget(256)
+  with Alloc { alloc: counter_alloc_handler, dealloc: counter_dealloc_handler } do ->
+    var p1 = alloc(64)
+    var p2 = alloc(64)
+    dealloc(p1)
+    dealloc(p2)
+  end
+  puts(\"used=\" + str_from_int(alloc_get_used()) + \" budget=\" + str_from_int(alloc_get_budget()))
+  return 0
+end
+"""
+
+var _COUNTER_OVER_BUDGET: String = """import std/alloc
+
+def main(): Int
+  alloc_set_budget(50)
+  with Alloc { alloc: counter_alloc_handler, dealloc: counter_dealloc_handler } do ->
+    var p1 = alloc(40)
+    var p2 = alloc(40)
+    dealloc(p2)
+    dealloc(p1)
+  end
+  return 0
+end
+"""
+
+var _COUNTER_DEALLOC_NO_DECREMENT: String = """import std/alloc
+
+# A.7: capture used counters inside; format outside.
+var g_a = 0
+var g_d = 0
+
+def main(): Int
+  alloc_set_budget(1024)
+  with Alloc { alloc: counter_alloc_handler, dealloc: counter_dealloc_handler } do ->
+    var p = alloc(100)
+    g_a = alloc_get_used()
+    dealloc(p)
+    g_d = alloc_get_used()
+  end
+  puts(\"after_alloc=\" + str_from_int(g_a) + \" after_dealloc=\" + str_from_int(g_d))
+  return 0
+end
+"""
+
+var _COUNTER_RESET_VIA_SET_BUDGET: String = """import std/alloc
+
+def main(): Int
+  alloc_set_budget(1024)
+  with Alloc { alloc: counter_alloc_handler, dealloc: counter_dealloc_handler } do ->
+    var p = alloc(500)
+    dealloc(p)
+  end
+  var first_used = alloc_get_used()
+  alloc_set_budget(2048)
+  var after_reset = alloc_get_used()
+  puts(\"first=\" + str_from_int(first_used) + \" after_reset=\" + str_from_int(after_reset))
+  return 0
+end
+"""
+
+var _COUNTER_EXACT_LIMIT: String = """import std/alloc
+
+# A.7: capture used counter inside; format outside.
+var g_used = 0
+
+def main(): Int
+  alloc_set_budget(100)
+  with Alloc { alloc: counter_alloc_handler, dealloc: counter_dealloc_handler } do ->
+    var p = alloc(100)
+    dealloc(p)
+    g_used = alloc_get_used()
+  end
+  puts(\"ok used=\" + str_from_int(g_used))
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# Deny handler (3 tests).
+# -----------------------------------------------------------------------------
+
+var _DENY_THROWS_ON_ALLOC: String = """import std/alloc
+
+def main(): Int
+  with Alloc { alloc: deny_alloc_handler, dealloc: deny_dealloc_handler } do ->
+    var p = alloc(8)
+    dealloc(p)
+  end
+  return 0
+end
+"""
+
+var _DENY_DEALLOC_PERMITTED: String = """import std/alloc
+
+def main(): Int
+  var p = alloc(16)
+  store(p, 0, 99)
+  with Alloc { alloc: deny_alloc_handler, dealloc: deny_dealloc_handler } do ->
+    dealloc(p)
+  end
+  puts(\"dealloc_ok\")
+  return 0
+end
+"""
+
+var _DENY_VEC_PUSH_INTERCEPTED: String = """import std/alloc
+
+def main(): Int
+  with Alloc { alloc: deny_alloc_handler, dealloc: deny_dealloc_handler } do ->
+    var v = vec_new<Int>()
+    v.push(1)
+  end
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# Tracking handler (4 tests).
+# -----------------------------------------------------------------------------
+
+var _TRACKING_BASIC: String = """import std/alloc
+
+def main(): Int
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    var p1 = alloc(32)
+    var p2 = alloc(64)
+    dealloc(p1)
+    dealloc(p2)
+  end
+  puts(\"a=\" + str_from_int(alloc_tracking_alloc_count()) + \" d=\" + str_from_int(alloc_tracking_dealloc_count()) + \" bytes=\" + str_from_int(alloc_tracking_total_bytes()))
+  return 0
+end
+"""
+
+var _TRACKING_RESET: String = """import std/alloc
+
+def main(): Int
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    var p = alloc(100)
+    dealloc(p)
+  end
+  var first = alloc_tracking_alloc_count()
+  alloc_reset_tracking()
+  var after_reset = alloc_tracking_alloc_count()
+  puts(\"first=\" + str_from_int(first) + \" after_reset=\" + str_from_int(after_reset))
+  return 0
+end
+"""
+
+var _TRACKING_NO_BEHAVIOR_CHANGE: String = """import std/alloc
+
+def main(): Int
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    var p = alloc(8)
+    store(p, 0, 12345)
+    var v = load(p, 0)
+    dealloc(p)
+    puts(\"value=\" + str_from_int(v))
+  end
+  return 0
+end
+"""
+
+var _TRACKING_VEC_INTERNAL: String = """import std/alloc
+
+def main(): Int
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    var v = vec_new<Int>()
+    v.push(1)
+    v.push(2)
+    v.push(3)
+  end
+  if alloc_tracking_alloc_count() > 1
+    puts(\"observed_internals\")
+  else
+    puts(\"only_user_visible\")
+  end
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# Composition (3 tests).
+# -----------------------------------------------------------------------------
+
+var _USER_THROWS_RECOVERS: String = """import std/alloc
+
+def my_throws(op_name: Int, argc: Int, argv: Int): Int
+  puts(\"caught\")
+  return 7
+end
+
+def main(): Int
+  with Throws { throw: my_throws } do ->
+    with Alloc { alloc: deny_alloc_handler, dealloc: deny_dealloc_handler } do ->
+      var p = alloc(8)
+    end
+  end
+  return 0
+end
+"""
+
+var _NESTED_HANDLERS: String = """import std/alloc
+
+def main(): Int
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    var pre_inner = alloc(16)
+    dealloc(pre_inner)
+    with Alloc { alloc: deny_alloc_handler, dealloc: deny_dealloc_handler } do ->
+      var p = alloc(8)
+    end
+  end
+  return 0
+end
+"""
+
+var _COUNTER_THEN_TRACKING: String = """import std/alloc
+
+def main(): Int
+  alloc_set_budget(1024)
+  with Alloc { alloc: counter_alloc_handler, dealloc: counter_dealloc_handler } do ->
+    var p = alloc(100)
+    dealloc(p)
+  end
+  var counter_used = alloc_get_used()
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    var p = alloc(50)
+    dealloc(p)
+  end
+  puts(\"counter=\" + str_from_int(counter_used) + \" tracking=\" + str_from_int(alloc_tracking_total_bytes()))
+  return 0
+end
+"""
+
+def main(): Int
+  describe("Alloc stdlib handler library (Phase A.5)") do ->
+
+    # ---- Arena handler ---------------------------------------------------
+
+    it("arena_alloc_handler routes alloc() through arena_alloc") do ->
+      # Three alloc(8) under 16-byte arena alignment = 3 × 16 = 48 bytes.
+      assert_run_stdout_eq(_ARENA_BASIC, "sum=66 bytes_used=48\n")
+    end
+
+    it("arena_reset releases bytes_used; subsequent alloc reuses arena") do ->
+      assert_run_stdout_eq(_ARENA_RESET_REUSE,
+        "first_alloc bytes=64\nafter_reset bytes=0\nsecond_alloc bytes=32\n")
+    end
+
+    it("arena_dealloc_handler is a no-op — bytes_used unchanged") do ->
+      assert_run_stdout_eq(_ARENA_DEALLOC_NOOP, "before=16 after=16\n")
+    end
+
+    # ---- Counter handler -------------------------------------------------
+
+    it("counter under budget — alloc + dealloc; used accumulates") do ->
+      assert_run_stdout_eq(_COUNTER_UNDER_BUDGET, "used=128 budget=256\n")
+    end
+
+    it("counter over budget — throw via Throws → exit 66 + stderr msg") do ->
+      assert_run_panics(_COUNTER_OVER_BUDGET, "budget exceeded")
+    end
+
+    it("counter dealloc does NOT decrement used (cumulative semantics)") do ->
+      assert_run_stdout_eq(_COUNTER_DEALLOC_NO_DECREMENT,
+        "after_alloc=100 after_dealloc=100\n")
+    end
+
+    it("alloc_set_budget resets the used counter") do ->
+      assert_run_stdout_eq(_COUNTER_RESET_VIA_SET_BUDGET,
+        "first=500 after_reset=0\n")
+    end
+
+    it("counter alloc at exact budget limit — succeeds (>, not >=)") do ->
+      assert_run_stdout_eq(_COUNTER_EXACT_LIMIT, "ok used=100\n")
+    end
+
+    # ---- Deny handler ----------------------------------------------------
+
+    it("deny_alloc_handler throws on any alloc → exit 66") do ->
+      assert_run_panics(_DENY_THROWS_ON_ALLOC, "allocation denied")
+    end
+
+    it("deny_dealloc_handler permits dealloc of pre-existing memory") do ->
+      assert_run_stdout_eq(_DENY_DEALLOC_PERMITTED, "dealloc_ok\n")
+    end
+
+    it("deny intercepts internal Vec allocations") do ->
+      assert_run_panics(_DENY_VEC_PUSH_INTERCEPTED, "allocation denied")
+    end
+
+    # ---- Tracking handler ------------------------------------------------
+
+    it("tracking counts user-visible alloc + dealloc + bytes") do ->
+      assert_run_stdout_eq(_TRACKING_BASIC, "a=2 d=2 bytes=96\n")
+    end
+
+    it("alloc_reset_tracking zeroes the counters") do ->
+      assert_run_stdout_eq(_TRACKING_RESET, "first=1 after_reset=0\n")
+    end
+
+    it("tracking is observation-only — alloc/dealloc behave normally") do ->
+      assert_run_stdout_eq(_TRACKING_NO_BEHAVIOR_CHANGE, "value=12345\n")
+    end
+
+    it("tracking observes internal allocations") do ->
+      assert_run_stdout_eq(_TRACKING_VEC_INTERNAL, "observed_internals\n")
+    end
+
+    # ---- Composition -----------------------------------------------------
+
+    it("user with Throws frame catches handler-throw (D5 composition)") do ->
+      assert_run_stdout_eq(_USER_THROWS_RECOVERS, "caught\n")
+    end
+
+    it("nested with Alloc — innermost handler wins") do ->
+      assert_run_panics(_NESTED_HANDLERS, "allocation denied")
+    end
+
+    it("sequential counter then tracking scopes have independent state") do ->
+      assert_run_stdout_eq(_COUNTER_THEN_TRACKING, "counter=100 tracking=50\n")
+    end
+  end
+  return qspec_main()
+end

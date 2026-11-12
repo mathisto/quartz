@@ -1,0 +1,1011 @@
+## std/bench — Statistical benchmarking framework.
+##
+## Phase C.8 (2026-05-02). Lifts the warmup + median/p25/p75 + Mann-
+## Whitney U regression-detection patterns from `tools/sched_bench.qz`
+## and `tools/bench_history.qz` into a reusable, importable API. Uses
+## the Profile (A.6) effect's `prof_span_*` substrate for outer-run
+## timing events; inner-loop iteration timing uses bare `time_mono_ns()`
+## to avoid effect-perform overhead in the hot path.
+##
+## Statistics are integer-only (nanosecond resolution). Float-typed
+## stats (variance/stddev) use fixed-point integer math: stddev is
+## reported as ns × 100 to preserve two decimal digits without floats.
+##
+## Example:
+##
+##   import std/bench
+##
+##   def my_workload(): Int
+##     var sum = 0
+##     for i in 0..1000
+##       sum = sum + i * i
+##     end
+##     return sum
+##   end
+##
+##   def main(): Int
+##     var cfg = bench_config_default("sum_squares")
+##     var result = bench_run(cfg, my_workload)
+##     bench_emit_human(result)
+##     bench_emit_json(result)
+##     return 0
+##   end
+##
+## API surface:
+##
+##   bench_config_default(name)                 → BenchConfig (3 warmup, 10 iters)
+##   bench_config_quick(name)                   → BenchConfig (1 warmup, 5 iters)
+##   bench_config_precise(name)                 → BenchConfig (5 warmup, 30 iters)
+##   bench_config_with_iters(name, w, i)        → BenchConfig (custom)
+##   bench_run(cfg, fn)                         → BenchResult
+##   bench_emit_human(result)                   → Void   (stderr summary)
+##   bench_emit_json(result)                    → Void   (stdout BENCHJSON line)
+##   bench_compare(baseline, current)           → BenchComparison
+##   bench_emit_compare(comparison)             → Void   (stderr diff)
+##
+## Lower-level statistics:
+##
+##   bench_mean(values)                         → Int    (ns)
+##   bench_median(values)                       → Int    (ns)
+##   bench_percentile(values, n_x100)           → Int    (ns; n_x100 = e.g. 9500 for p95)
+##   bench_stddev_x100(values)                  → Int    (ns × 100)
+##   bench_iqr(values)                          → Int    (ns)
+##   bench_filter_outliers_mad(values)          → Vec<Int> (with extreme MAD outliers removed)
+##   bench_mann_whitney_u(xs, ys)               → Int    (-1 = improvement, 0 = noise, 1 = regression)
+
+import math
+import std/profile
+import io/file
+
+## ---- Configuration ----
+
+## How a single bench run is parameterized. `unit` is a free-form
+## string ("ns_per_iter", "ops_per_sec", "bytes") that propagates into
+## JSON output for downstream consumers.
+struct BenchConfig
+  name: String
+  unit: String
+  warmup_iters: Int
+  measure_iters: Int
+  reject_outliers: Bool
+end
+
+## Default profile: 3 warmup + 10 measured iters, "ns_per_iter" unit,
+## MAD-based outlier rejection ON.
+def bench_config_default(name: String): BenchConfig
+  return BenchConfig {
+    name: name,
+    unit: "ns_per_iter",
+    warmup_iters: 3,
+    measure_iters: 10,
+    reject_outliers: true
+  }
+end
+
+## Quick profile: 1 warmup + 5 measured iters. Use during interactive
+## development when you want fast feedback over rigor.
+def bench_config_quick(name: String): BenchConfig
+  return BenchConfig {
+    name: name,
+    unit: "ns_per_iter",
+    warmup_iters: 1,
+    measure_iters: 5,
+    reject_outliers: true
+  }
+end
+
+## Precise profile: 5 warmup + 30 measured iters. Use for headline
+## numbers, regression CI, or when comparing to a baseline.
+def bench_config_precise(name: String): BenchConfig
+  return BenchConfig {
+    name: name,
+    unit: "ns_per_iter",
+    warmup_iters: 5,
+    measure_iters: 30,
+    reject_outliers: true
+  }
+end
+
+## Custom profile. Use when the workload's intrinsic noise floor or
+## warmup behavior doesn't match the defaults.
+def bench_config_with_iters(name: String, warmup: Int, measure: Int): BenchConfig
+  return BenchConfig {
+    name: name,
+    unit: "ns_per_iter",
+    warmup_iters: warmup,
+    measure_iters: measure,
+    reject_outliers: true
+  }
+end
+
+## ---- Result ----
+
+## Output of one bench_run. `values` is the post-outlier-rejection
+## sample vector — `n_iters_observed` is the configured measure_iters,
+## `n_outliers_removed` is observed - values.size. All time stats are
+## ns; stddev_x100 is ns × 100.
+struct BenchResult
+  name: String
+  unit: String
+  values: Vec<Int>
+  mean: Int
+  median: Int
+  p95: Int
+  p99: Int
+  min: Int
+  max: Int
+  stddev_x100: Int
+  iqr: Int
+  n_iters_observed: Int
+  n_outliers_removed: Int
+end
+
+## ---- Statistics primitives ----
+
+## Sort a Vec<Int> ascending. Insertion sort — measure_iters is small
+## (default 10, max 30 typical) so O(N²) is fine.
+def _bench_sort_asc(vals: Vec<Int>): Vec<Int>
+  var sorted = vec_new<Int>()
+  var n = vals.size
+  for i in 0..n
+    sorted.push(vals[i])
+  end
+  var i = 1
+  while i < n
+    var key = sorted[i]
+    var j = i - 1
+    while j >= 0 and sorted[j] > key
+      sorted[j + 1] = sorted[j]
+      j = j - 1
+    end
+    sorted[j + 1] = key
+    i = i + 1
+  end
+  return sorted
+end
+
+## Arithmetic mean (integer truncation).
+def bench_mean(values: Vec<Int>): Int
+  var n = values.size
+  if n == 0
+    return 0
+  end
+  var sum = 0
+  for v in values
+    sum = sum + v
+  end
+  return sum / n
+end
+
+## Median. For even N, returns lower-middle (no averaging — keeps
+## semantics integer-clean). Caller can compute (lower + upper) / 2 if
+## desired.
+def bench_median(values: Vec<Int>): Int
+  var n = values.size
+  if n == 0
+    return 0
+  end
+  var sorted = _bench_sort_asc(values)
+  if n % 2 == 1
+    return sorted[n / 2]
+  end
+  return (sorted[n / 2 - 1] + sorted[n / 2]) / 2
+end
+
+## Percentile by linear-interpolation (ish): pick the value at index
+## `(n - 1) * p / 10000` rounded down. p is expressed as basis-points-
+## of-percentile (9500 = p95, 9900 = p99) to avoid floats while still
+## allowing fractional percentiles. n=1 returns the single value;
+## n=0 returns 0.
+def bench_percentile(values: Vec<Int>, p_x100: Int): Int
+  var n = values.size
+  if n == 0
+    return 0
+  end
+  if n == 1
+    return values[0]
+  end
+  var sorted = _bench_sort_asc(values)
+  var idx = (n - 1) * p_x100 / 10000
+  if idx < 0
+    idx = 0
+  end
+  if idx >= n
+    idx = n - 1
+  end
+  return sorted[idx]
+end
+
+## Population standard deviation × 100 (preserves 2 decimal digits via
+## fixed-point). Uses integer-square-root for the final radical.
+## Reported as ns × 100 — divide by 100 to get whole-ns stddev.
+def bench_stddev_x100(values: Vec<Int>): Int
+  var n = values.size
+  if n < 2
+    return 0
+  end
+  var mean = bench_mean(values)
+  var sum_sq = 0
+  for v in values
+    var d = v - mean
+    sum_sq = sum_sq + d * d
+  end
+  var var_int = sum_sq / n
+  ## Multiply by 10000 BEFORE the sqrt so the result already carries
+  ## the ×100 factor (sqrt(x*10000) = sqrt(x)*100).
+  return _bench_isqrt(var_int * 10000)
+end
+
+## Integer square root via Newton's method. Returns floor(sqrt(x)).
+def _bench_isqrt(x: Int): Int
+  if x < 2
+    return x
+  end
+  var r = x
+  var prev = 0
+  ## Iterate until r stops decreasing. ~30 iters max for any i64.
+  while r != prev
+    prev = r
+    r = (r + x / r) / 2
+  end
+  return r
+end
+
+## Interquartile range (p75 - p25). Useful for visualizing spread
+## without stddev's outlier sensitivity.
+def bench_iqr(values: Vec<Int>): Int
+  var p25 = bench_percentile(values, 2500)
+  var p75 = bench_percentile(values, 7500)
+  return p75 - p25
+end
+
+## ---- Outlier rejection (MAD-based) ----
+##
+## Median Absolute Deviation: for each value, |v - median|. Sort those
+## deviations and take their median (= MAD). A value is an outlier if
+## its deviation exceeds 3 * MAD (equivalent to ~2σ for normal data,
+## but more robust to actual outliers since it doesn't square them).
+## See https://en.wikipedia.org/wiki/Median_absolute_deviation
+##
+## Returns a NEW Vec<Int> with outliers removed. Empty input → empty
+## output. n < 3 → input returned unchanged (rejection meaningless).
+
+def bench_filter_outliers_mad(values: Vec<Int>): Vec<Int>
+  var n = values.size
+  if n < 3
+    var copy = vec_new<Int>()
+    for v in values
+      copy.push(v)
+    end
+    return copy
+  end
+  var med = bench_median(values)
+  ## Build deviation array
+  var devs = vec_new<Int>()
+  for v in values
+    var d = v - med
+    if d < 0
+      d = 0 - d
+    end
+    devs.push(d)
+  end
+  var mad = bench_median(devs)
+  ## If MAD is 0 (all values identical to median), no outliers possible.
+  if mad == 0
+    var copy = vec_new<Int>()
+    for v in values
+      copy.push(v)
+    end
+    return copy
+  end
+  ## Keep values within 3 * MAD of median.
+  var threshold = mad * 3
+  var kept = vec_new<Int>()
+  for v in values
+    var d = v - med
+    if d < 0
+      d = 0 - d
+    end
+    if d <= threshold
+      kept.push(v)
+    end
+  end
+  return kept
+end
+
+## ---- Run helpers ----
+
+## Compute min and max in one pass.
+def _bench_min(values: Vec<Int>): Int
+  var n = values.size
+  if n == 0
+    return 0
+  end
+  var m = values[0]
+  for v in values
+    if v < m
+      m = v
+    end
+  end
+  return m
+end
+
+def _bench_max(values: Vec<Int>): Int
+  var n = values.size
+  if n == 0
+    return 0
+  end
+  var m = values[0]
+  for v in values
+    if v > m
+      m = v
+    end
+  end
+  return m
+end
+
+## Run `fn` once and return elapsed ns. Discards the function's return
+## value — caller wraps if it needs the return for verification.
+def _bench_time_one(fn: Fn(): Int): Int
+  var t0 = time_mono_ns()
+  fn()
+  return time_mono_ns() - t0
+end
+
+## Run a workload and use its RETURN VALUE as the sample (no timing).
+## Use this when the function itself produces the metric (a throughput
+## rate in ops/sec, a memory delta in bytes, a count of completed
+## operations, etc.). Same warmup / measure / outlier-rejection
+## semantics as bench_run.
+def bench_run_values(cfg: BenchConfig, fn: Fn(): Int): BenchResult
+  var span = prof_span_begin(cfg.name)
+
+  for i in 0..cfg.warmup_iters
+    fn()
+  end
+
+  var raw = vec_new<Int>()
+  for i in 0..cfg.measure_iters
+    raw.push(fn())
+  end
+
+  prof_span_end(span, cfg.name)
+
+  var values = raw
+  var n_outliers_removed = 0
+  if cfg.reject_outliers
+    values = bench_filter_outliers_mad(raw)
+    n_outliers_removed = raw.size - values.size
+  end
+
+  return BenchResult {
+    name: cfg.name,
+    unit: cfg.unit,
+    values: values,
+    mean: bench_mean(values),
+    median: bench_median(values),
+    p95: bench_percentile(values, 9500),
+    p99: bench_percentile(values, 9900),
+    min: _bench_min(values),
+    max: _bench_max(values),
+    stddev_x100: bench_stddev_x100(values),
+    iqr: bench_iqr(values),
+    n_iters_observed: cfg.measure_iters,
+    n_outliers_removed: n_outliers_removed
+  }
+end
+
+## Run a workload under a config and produce a BenchResult. Discards
+## warmup iterations, measures `cfg.measure_iters` iters, optionally
+## filters MAD outliers, computes stats. The outer run is bracketed
+## with a `prof_span` so `--memory-stats` / `--progress` shows it on
+## the timeline. Sample values are elapsed nanoseconds per call.
+def bench_run(cfg: BenchConfig, fn: Fn(): Int): BenchResult
+  var span = prof_span_begin(cfg.name)
+
+  ## Warmup — discard.
+  for i in 0..cfg.warmup_iters
+    _bench_time_one(fn)
+  end
+
+  ## Measured iterations.
+  var raw = vec_new<Int>()
+  for i in 0..cfg.measure_iters
+    raw.push(_bench_time_one(fn))
+  end
+
+  prof_span_end(span, cfg.name)
+
+  ## Optional outlier rejection.
+  var values = raw
+  var n_outliers_removed = 0
+  if cfg.reject_outliers
+    values = bench_filter_outliers_mad(raw)
+    n_outliers_removed = raw.size - values.size
+  end
+
+  return BenchResult {
+    name: cfg.name,
+    unit: cfg.unit,
+    values: values,
+    mean: bench_mean(values),
+    median: bench_median(values),
+    p95: bench_percentile(values, 9500),
+    p99: bench_percentile(values, 9900),
+    min: _bench_min(values),
+    max: _bench_max(values),
+    stddev_x100: bench_stddev_x100(values),
+    iqr: bench_iqr(values),
+    n_iters_observed: cfg.measure_iters,
+    n_outliers_removed: n_outliers_removed
+  }
+end
+
+## ---- Output formatting ----
+
+## Format a ns value into a compact human-readable form.
+def _bench_fmt_ns(ns: Int): String
+  if ns >= 1000000000
+    var sec = ns / 1000000000
+    var rem = (ns % 1000000000) / 100000000
+    return "#{sec}.#{rem}s"
+  end
+  if ns >= 1000000
+    var ms = ns / 1000000
+    var rem = (ns % 1000000) / 100000
+    return "#{ms}.#{rem}ms"
+  end
+  if ns >= 1000
+    var us = ns / 1000
+    var rem = (ns % 1000) / 100
+    return "#{us}.#{rem}μs"
+  end
+  return "#{ns}ns"
+end
+
+## Emit a one-line human-readable summary on stderr.
+def bench_emit_human(r: BenchResult): Void
+  var stddev_ns = r.stddev_x100 / 100
+  var stddev_pct = 0
+  if r.median > 0
+    stddev_pct = stddev_ns * 100 / r.median
+  end
+  eprint("[bench] #{r.name}: ")
+  eprint("median=#{_bench_fmt_ns(r.median)} ")
+  eprint("mean=#{_bench_fmt_ns(r.mean)} ")
+  eprint("p95=#{_bench_fmt_ns(r.p95)} ")
+  eprint("p99=#{_bench_fmt_ns(r.p99)} ")
+  eprint("stddev=#{_bench_fmt_ns(stddev_ns)} (#{stddev_pct}%) ")
+  eprint("min=#{_bench_fmt_ns(r.min)} max=#{_bench_fmt_ns(r.max)} ")
+  eprint("n=#{r.values.size}/#{r.n_iters_observed}")
+  if r.n_outliers_removed > 0
+    eprint(" (-#{r.n_outliers_removed} outliers)")
+  end
+  eprint("\n")
+end
+
+## Emit one BENCHJSON line on stdout. Format extends the existing
+## sched_bench shape with mean, p95, p99, stddev_x100, iqr, min, max,
+## outliers_removed. Existing consumers (`tools/bench_history.qz`)
+## continue reading median/p25/p75/values; new consumers can pick up
+## the richer fields. p25/p75 are computed on demand.
+def bench_emit_json(r: BenchResult): Void
+  var p25 = bench_percentile(r.values, 2500)
+  var p75 = bench_percentile(r.values, 7500)
+  var sb = sb_new()
+  sb_append(sb, "BENCHJSON:{\"v\":2,\"name\":\"")
+  sb_append(sb, r.name)
+  sb_append(sb, "\",\"unit\":\"")
+  sb_append(sb, r.unit)
+  sb_append(sb, "\",\"iters\":")
+  sb_append(sb, r.n_iters_observed.to_s())
+  sb_append(sb, ",\"outliers_removed\":")
+  sb_append(sb, r.n_outliers_removed.to_s())
+  sb_append(sb, ",\"values\":[")
+  for i in 0..r.values.size
+    if i > 0
+      sb_append(sb, ",")
+    end
+    sb_append(sb, r.values[i].to_s())
+  end
+  sb_append(sb, "],\"mean\":")
+  sb_append(sb, r.mean.to_s())
+  sb_append(sb, ",\"median\":")
+  sb_append(sb, r.median.to_s())
+  sb_append(sb, ",\"p25\":")
+  sb_append(sb, p25.to_s())
+  sb_append(sb, ",\"p75\":")
+  sb_append(sb, p75.to_s())
+  sb_append(sb, ",\"p95\":")
+  sb_append(sb, r.p95.to_s())
+  sb_append(sb, ",\"p99\":")
+  sb_append(sb, r.p99.to_s())
+  sb_append(sb, ",\"min\":")
+  sb_append(sb, r.min.to_s())
+  sb_append(sb, ",\"max\":")
+  sb_append(sb, r.max.to_s())
+  sb_append(sb, ",\"stddev_x100\":")
+  sb_append(sb, r.stddev_x100.to_s())
+  sb_append(sb, ",\"iqr\":")
+  sb_append(sb, r.iqr.to_s())
+  sb_append(sb, "}")
+  puts(sb_to_string(sb))
+end
+
+## ---- A/B comparison ----
+
+## Result of comparing a current BenchResult against a baseline. `verdict`
+## is -1 = improvement, 0 = noise, 1 = regression. `pct_change_x100` is
+## (current.median - baseline.median) * 10000 / baseline.median, so 250
+## == +2.50%, -150 == -1.50%. Lower-is-better units (ns_per_iter, etc)
+## treat positive pct_change as regression; higher-is-better units
+## (ops_per_sec, msgs_per_sec, etc) flip the sign.
+struct BenchComparison
+  name: String
+  unit: String
+  baseline_median: Int
+  current_median: Int
+  pct_change_x100: Int
+  verdict: Int
+  mw_significant: Bool
+end
+
+## Mann-Whitney U test (integer arithmetic). Lifted from
+## tools/bench_history.qz. Compares two sample distributions; returns
+## -1 = ys better than xs, 0 = no significant difference, 1 = xs
+## better than ys. Threshold 1.96σ (p < 0.05). Requires n ≥ 5 per
+## sample.
+def bench_mann_whitney_u(xs: Vec<Int>, ys: Vec<Int>): Int
+  var n1 = xs.size
+  var n2 = ys.size
+  if n1 < 5 or n2 < 5
+    return 0
+  end
+  var u = 0
+  for i in 0..n1
+    for j in 0..n2
+      if xs[i] > ys[j]
+        u = u + 1
+      end
+    end
+  end
+  var u2 = u * 2
+  var mean_u2 = n1 * n2
+  var diff = u2 - mean_u2
+  var diff_sq = diff * diff
+  var sigma_sq_4 = n1 * n2 * (n1 + n2 + 1) / 3
+  ## (1.96)² ≈ 3.8416 — scale by 10000 to keep integer math
+  var threshold = sigma_sq_4 * 38416 / 10000
+  if diff_sq > threshold
+    if u2 > mean_u2
+      return 1
+    end
+    return -1
+  end
+  return 0
+end
+
+## Are smaller numbers "better" for this unit? ns_per_iter, ms,
+## bytes_per_task → yes. ops_per_sec, msgs_per_sec, items_per_sec → no.
+def _bench_unit_lower_is_better(unit: String): Bool
+  if unit.eq("ops_per_sec")
+    return false
+  end
+  if unit.eq("msgs_per_sec")
+    return false
+  end
+  if unit.eq("items_per_sec")
+    return false
+  end
+  if unit.eq("tasks_per_sec")
+    return false
+  end
+  if unit.eq("wakes_per_sec")
+    return false
+  end
+  if unit.eq("efficiency_x1000")
+    return false
+  end
+  return true
+end
+
+## Compare current run against a baseline. Significance threshold is a
+## combination of: percent change ≥ 5% AND Mann-Whitney U significant
+## at p < 0.05. Either condition alone is "noise" — both must agree.
+def bench_compare(baseline: BenchResult, current: BenchResult): BenchComparison
+  var lower_better = _bench_unit_lower_is_better(current.unit)
+  var pct_x100 = 0
+  if baseline.median > 0
+    pct_x100 = (current.median - baseline.median) * 10000 / baseline.median
+  end
+  var u = bench_mann_whitney_u(baseline.values, current.values)
+  var mw_sig = false
+  if u != 0
+    mw_sig = true
+  end
+  var verdict = 0
+  ## abs(pct) >= 500 = 5%
+  var abs_pct = pct_x100
+  if abs_pct < 0
+    abs_pct = 0 - abs_pct
+  end
+  if mw_sig and abs_pct >= 500
+    if lower_better
+      if pct_x100 > 0
+        verdict = 1
+      end
+      if pct_x100 < 0
+        verdict = -1
+      end
+    end
+    if lower_better == false
+      if pct_x100 > 0
+        verdict = -1
+      end
+      if pct_x100 < 0
+        verdict = 1
+      end
+    end
+  end
+  return BenchComparison {
+    name: current.name,
+    unit: current.unit,
+    baseline_median: baseline.median,
+    current_median: current.median,
+    pct_change_x100: pct_x100,
+    verdict: verdict,
+    mw_significant: mw_sig
+  }
+end
+
+## ---- Test helpers (synthesize + capture-emit) ----
+##
+## std/bench is a library, not an effect — so "test handler factories"
+## here are utility functions that downstream test code (specs that
+## verify bench-using code) can use to build synthetic BenchResults
+## without actually running anything, and to capture emit output
+## without writing to stdout/stderr. Sister to the effect-test-handler
+## factory shapes in std/random + std/cache + std/profile + std/quake.
+
+## Build a BenchResult directly from a sample vector. Computes the
+## same derived stats `bench_run` / `bench_run_values` would compute,
+## but skips warmup/measure cycles entirely. Use when testing code
+## that consumes BenchResults (comparison logic, emit shape, etc.)
+## without paying the cost of running real workloads.
+def bench_synthesize(name: String, unit: String, values: Vec<Int>): BenchResult
+  return BenchResult {
+    name: name,
+    unit: unit,
+    values: values,
+    mean: bench_mean(values),
+    median: bench_median(values),
+    p95: bench_percentile(values, 9500),
+    p99: bench_percentile(values, 9900),
+    min: _bench_min(values),
+    max: _bench_max(values),
+    stddev_x100: bench_stddev_x100(values),
+    iqr: bench_iqr(values),
+    n_iters_observed: values.size,
+    n_outliers_removed: 0
+  }
+end
+
+## Format the human-readable summary of `r` into a String, returning
+## the rendered text. Sister to bench_emit_human (which writes to
+## stderr). Use in specs that want to assert on emit shape without
+## stdout/stderr capture.
+def bench_format_human(r: BenchResult): String
+  var stddev_ns = r.stddev_x100 / 100
+  var stddev_pct = 0
+  if r.median > 0
+    stddev_pct = stddev_ns * 100 / r.median
+  end
+  var sb = sb_new()
+  sb_append(sb, "[bench] ")
+  sb_append(sb, r.name)
+  sb_append(sb, ": median=")
+  sb_append(sb, _bench_fmt_ns(r.median))
+  sb_append(sb, " mean=")
+  sb_append(sb, _bench_fmt_ns(r.mean))
+  sb_append(sb, " p95=")
+  sb_append(sb, _bench_fmt_ns(r.p95))
+  sb_append(sb, " p99=")
+  sb_append(sb, _bench_fmt_ns(r.p99))
+  sb_append(sb, " stddev=")
+  sb_append(sb, _bench_fmt_ns(stddev_ns))
+  sb_append(sb, " (")
+  sb_append(sb, stddev_pct.to_s())
+  sb_append(sb, "%) min=")
+  sb_append(sb, _bench_fmt_ns(r.min))
+  sb_append(sb, " max=")
+  sb_append(sb, _bench_fmt_ns(r.max))
+  sb_append(sb, " n=")
+  sb_append(sb, r.values.size.to_s())
+  sb_append(sb, "/")
+  sb_append(sb, r.n_iters_observed.to_s())
+  if r.n_outliers_removed > 0
+    sb_append(sb, " (-")
+    sb_append(sb, r.n_outliers_removed.to_s())
+    sb_append(sb, " outliers)")
+  end
+  return sb_to_string(sb)
+end
+
+## Build the JSON line for `r` and return it as a String (sister to
+## bench_emit_json). Convenient for test code that wants to capture
+## the JSON shape and assert against it without filesystem or stdout.
+def bench_format_json_str(r: BenchResult): String
+  var sb = sb_new()
+  bench_format_json(r, sb)
+  return sb_to_string(sb)
+end
+
+## ---- File I/O for JSONL persistence ----
+##
+## A baseline file is one BENCHJSON line per bench result. Multiple
+## results from one run produce multiple lines (sb file is JSONL, not
+## a JSON array). Result names (the `name` field) are the join key —
+## comparing two files matches results pairwise by name.
+
+## Append one result as a BENCHJSON line to `path`. Creates the file
+## if it doesn't exist. The leading `BENCHJSON:` prefix is preserved
+## so the file is grep-compatible with stdout streams.
+def bench_save_to_file(path: String, r: BenchResult): Void
+  var sb = sb_new()
+  bench_format_json(r, sb)
+  sb_append(sb, "\n")
+  file_append(path, sb_to_string(sb))
+end
+
+## Build the BENCHJSON line for `r` into `sb`. Internal helper so
+## bench_emit_json (stdout) and bench_save_to_file (file append) share
+## one codepath. Caller adds the trailing newline.
+def bench_format_json(r: BenchResult, sb: Int): Void
+  var p25 = bench_percentile(r.values, 2500)
+  var p75 = bench_percentile(r.values, 7500)
+  sb_append(sb, "BENCHJSON:{\"v\":2,\"name\":\"")
+  sb_append(sb, r.name)
+  sb_append(sb, "\",\"unit\":\"")
+  sb_append(sb, r.unit)
+  sb_append(sb, "\",\"iters\":")
+  sb_append(sb, r.n_iters_observed.to_s())
+  sb_append(sb, ",\"outliers_removed\":")
+  sb_append(sb, r.n_outliers_removed.to_s())
+  sb_append(sb, ",\"values\":[")
+  for i in 0..r.values.size
+    if i > 0
+      sb_append(sb, ",")
+    end
+    sb_append(sb, r.values[i].to_s())
+  end
+  sb_append(sb, "],\"mean\":")
+  sb_append(sb, r.mean.to_s())
+  sb_append(sb, ",\"median\":")
+  sb_append(sb, r.median.to_s())
+  sb_append(sb, ",\"p25\":")
+  sb_append(sb, p25.to_s())
+  sb_append(sb, ",\"p75\":")
+  sb_append(sb, p75.to_s())
+  sb_append(sb, ",\"p95\":")
+  sb_append(sb, r.p95.to_s())
+  sb_append(sb, ",\"p99\":")
+  sb_append(sb, r.p99.to_s())
+  sb_append(sb, ",\"min\":")
+  sb_append(sb, r.min.to_s())
+  sb_append(sb, ",\"max\":")
+  sb_append(sb, r.max.to_s())
+  sb_append(sb, ",\"stddev_x100\":")
+  sb_append(sb, r.stddev_x100.to_s())
+  sb_append(sb, ",\"iqr\":")
+  sb_append(sb, r.iqr.to_s())
+  sb_append(sb, "}")
+end
+
+## ---- JSONL field extraction (lightweight, no full JSON parser) ----
+##
+## Mirrors the manual-extraction approach in `tools/bench_history.qz`.
+## Avoids depending on `std/json` so std/bench stays small and the
+## emit ↔ parse pair is symmetric (we control the shape on both sides).
+
+def _bench_json_find(haystack: String, needle: String): Int
+  match str_byte_find(haystack, needle)
+    Some(pos) => return pos
+    None => return -1
+  end
+end
+
+def _bench_json_find_from(haystack: String, needle: String, start: Int): Int
+  var sub = str_slice(haystack, start, str_byte_len(haystack))
+  match str_byte_find(sub, needle)
+    Some(pos) => return start + pos
+    None => return -1
+  end
+end
+
+## Extract a string value: looks for `"key":"...."` and returns the
+## inner string. Empty string on miss.
+def bench_json_get_str(line: String, key: String): String
+  var search = str_concat(str_concat("\"", key), "\":\"")
+  var pos = _bench_json_find(line, search)
+  if pos < 0
+    return ""
+  end
+  var start = pos + str_byte_len(search)
+  var end_pos = _bench_json_find_from(line, "\"", start)
+  if end_pos < 0
+    return ""
+  end
+  return str_slice(line, start, end_pos)
+end
+
+## Extract an integer value: looks for `"key":NNN` and returns NNN. 0
+## on miss.
+def bench_json_get_int(line: String, key: String): Int
+  var search = str_concat(str_concat("\"", key), "\":")
+  var pos = _bench_json_find(line, search)
+  if pos < 0
+    return 0
+  end
+  var start = pos + str_byte_len(search)
+  var len = str_byte_len(line)
+  var end_pos = start
+  while end_pos < len
+    var ch = str_byte_at(line, end_pos)
+    if (ch >= '0' and ch <= '9') or ch == '-'
+      end_pos = end_pos + 1
+    else
+      break
+    end
+  end
+  if end_pos == start
+    return 0
+  end
+  return str_to_int(str_slice(line, start, end_pos))
+end
+
+## Extract an integer array: `"key":[a,b,c]` → Vec<Int>. Empty Vec on
+## miss.
+def bench_json_get_int_array(line: String, key: String): Vec<Int>
+  var result = vec_new<Int>()
+  var search = str_concat(str_concat("\"", key), "\":[")
+  var pos = _bench_json_find(line, search)
+  if pos < 0
+    return result
+  end
+  var start = pos + str_byte_len(search)
+  var len = str_byte_len(line)
+  var j = start
+  var num_start = j
+  while j < len
+    var ch = str_byte_at(line, j)
+    if ch == ',' or ch == ']'
+      if j > num_start
+        var s = str_slice(line, num_start, j)
+        result.push(str_to_int(s))
+      end
+      num_start = j + 1
+      if ch == ']'
+        break
+      end
+    end
+    j = j + 1
+  end
+  return result
+end
+
+## Parse one BENCHJSON line into a BenchResult. Strips an optional
+## leading `BENCHJSON:` prefix. Caller must check the returned name —
+## a missing or unparseable line yields a result with empty name and
+## zero everything (use `result.name.eq("")` to detect failure).
+def bench_parse_json_line(line: String): BenchResult
+  ## Strip BENCHJSON: prefix if present.
+  var src = line
+  if str_starts_with(line, "BENCHJSON:")
+    src = str_slice(line, 10, str_byte_len(line))
+  end
+  var values = bench_json_get_int_array(src, "values")
+  return BenchResult {
+    name: bench_json_get_str(src, "name"),
+    unit: bench_json_get_str(src, "unit"),
+    values: values,
+    mean: bench_json_get_int(src, "mean"),
+    median: bench_json_get_int(src, "median"),
+    p95: bench_json_get_int(src, "p95"),
+    p99: bench_json_get_int(src, "p99"),
+    min: bench_json_get_int(src, "min"),
+    max: bench_json_get_int(src, "max"),
+    stddev_x100: bench_json_get_int(src, "stddev_x100"),
+    iqr: bench_json_get_int(src, "iqr"),
+    n_iters_observed: bench_json_get_int(src, "iters"),
+    n_outliers_removed: bench_json_get_int(src, "outliers_removed")
+  }
+end
+
+## Read all BENCHJSON-shaped lines from a file and parse them into a
+## Vec<BenchResult>. Lines without a parseable name are skipped (so
+## the file can interleave human-readable [bench] lines with BENCHJSON
+## lines without confusing the parser).
+def bench_load_from_file(path: String): Vec<BenchResult>
+  var results = vec_new<BenchResult>()
+  var content = read_file(path)
+  if str_byte_len(content) == 0
+    return results
+  end
+  var lines = str_split(content, "\n")
+  for line in lines
+    if str_byte_len(line) > 5
+      ## Look for either "BENCHJSON:..." or bare {"v":2,"name":...}
+      ## (the parser strips BENCHJSON: anyway; bare form is the
+      ## stripped persisted form).
+      var has_prefix = str_starts_with(line, "BENCHJSON:")
+      var has_v2 = str_starts_with(line, "{\"v\":2")
+      if has_prefix or has_v2
+        var r = bench_parse_json_line(line)
+        if str_byte_len(r.name) > 0
+          results.push(r)
+        end
+      end
+    end
+  end
+  return results
+end
+
+## Find the first result in `results` whose name matches `name`.
+## Returns a sentinel result with empty name on miss — caller checks
+## `result.name.eq("")`.
+def bench_find_by_name(results: Vec<BenchResult>, name: String): BenchResult
+  for r in results
+    if str_eq(r.name, name)
+      return r
+    end
+  end
+  return BenchResult {
+    name: "",
+    unit: "",
+    values: vec_new<Int>(),
+    mean: 0,
+    median: 0,
+    p95: 0,
+    p99: 0,
+    min: 0,
+    max: 0,
+    stddev_x100: 0,
+    iqr: 0,
+    n_iters_observed: 0,
+    n_outliers_removed: 0
+  }
+end
+
+## Emit a one-line comparison summary on stderr.
+def bench_emit_compare(c: BenchComparison): Void
+  var pct_whole = c.pct_change_x100 / 100
+  var pct_frac = c.pct_change_x100 % 100
+  if pct_frac < 0
+    pct_frac = 0 - pct_frac
+  end
+  var sign = "+"
+  if c.pct_change_x100 < 0
+    sign = "-"
+    if pct_whole < 0
+      pct_whole = 0 - pct_whole
+    end
+  end
+  var tag = "[bench-cmp] "
+  if c.verdict == 1
+    tag = "[bench-cmp REGRESSION] "
+  end
+  if c.verdict == -1
+    tag = "[bench-cmp IMPROVED] "
+  end
+  eprint(tag)
+  eprint(c.name)
+  eprint(": ")
+  eprint(_bench_fmt_ns(c.baseline_median))
+  eprint(" → ")
+  eprint(_bench_fmt_ns(c.current_median))
+  eprint(" (#{sign}#{pct_whole}.#{pct_frac}%)")
+  if c.mw_significant
+    eprint(" [p<0.05]")
+  end
+  eprint("\n")
+end

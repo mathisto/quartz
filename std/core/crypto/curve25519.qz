@@ -1,0 +1,955 @@
+## std/core/crypto/curve25519 — Pure-Quartz X25519 (RFC 7748)
+##
+## NET.1 Phase 2 Step 2.16 — seventh and final native crypto primitive.
+## Replaces `Hacl_Curve25519_51_*` and drops the last C dependency
+## (`Hacl_Curve25519_51.c` + `Lib_Memzero0.c`) from the build. With this
+## step HACL\* leaves the build entirely.
+##
+## Algorithm: x-coordinate-only Montgomery ladder over Curve25519
+## (the Montgomery curve y² = x³ + 486662·x² + x over GF(2²⁵⁵−19)).
+## The ladder runs 251 iterations over the clamped scalar (per RFC 7748
+## §5) plus 3 trailing doublings, each iteration is a constant-time
+## conditional swap + a fused add-and-double point operation.
+##
+## Field representation: 5 × 51-bit limbs in i64 storage.
+##   value = limb[0] + limb[1]·2⁵¹ + limb[2]·2¹⁰² + limb[3]·2¹⁵³ + limb[4]·2²⁰⁴
+## The "3-bit-loose" form (each limb ≤ 2⁵⁴) lets us defer carrying across
+## several adds; the multiply-then-carry pass renormalizes. This is the
+## representation `dalek-cryptography/curve25519-dalek` uses for its u64
+## backend, derived in turn from HACL\*'s `Hacl_Bignum25519_51` design.
+##
+## Multiplication: 5 input limbs × 5 input limbs = 25 partial 64×64→128
+## products, summed into 5 × u128 accumulators with the 19× scaling
+## applied to the f2[1..4] limbs (because 2²⁵⁵ ≡ 19 mod p folds limbs
+## above bit 255 back into the low end). Carry propagation runs once
+## across the 5 limbs, with the final wrap-around carry folded into
+## limb 0 via *19 and one more carry step.
+##
+## Quartz's Int is i64; there is no native u128. We use the Phase 1
+## Step 1.4 intrinsics:
+##   widening_mul_lo(a, b)        — low 64 bits of u64×u64
+##   widening_mul_hi(a, b)        — high 64 bits of u64×u64
+##   carrying_add_sum(a, b, c)    — (a + b + c) mod 2⁶⁴
+##   carrying_add_carry(a, b, c)  — overflow flag of (a + b + c)
+##   borrowing_sub_*              — companion subtract pair (unused here)
+## A u128 accumulator is two i64 locals (acc_lo, acc_hi). Since the
+## maximum input limb is ≤ 2⁵⁴ and the maximum product is ≤ 2⁵⁴·2⁵⁹ ≈
+## 2¹¹³, the sum-of-five accumulator fits in 2¹¹⁵ — comfortably inside
+## a u128 with the high half ≤ 2⁵¹.
+##
+## Constant-time discipline:
+##   - cswap uses an arithmetic mask (`mask = 0 - bit`) and XOR-trio,
+##     never branches on the swap bit.
+##   - The conditional final reduction in `_f51_store_felem` builds an
+##     all-ones-or-zero mask via subtle helpers and subtracts a masked p.
+##   - All multiply/square/add/sub/mul1 are straight-line code with no
+##     data-dependent branches.
+##   - The ladder iterates a fixed 251 steps; the inversion chain is a
+##     fixed sequence of 264 squarings + 11 multiplies (Fermat's little
+##     theorem with the standard Curve25519 addition chain).
+##
+## Validation:
+##   - RFC 7748 §6.1 single-step Diffie-Hellman vector (Alice + Bob).
+##   - RFC 7748 §5.2 single-step scalarmult vectors (two cases).
+##   - RFC 7748 §5.2 iterated form (1-iter; 1000-iter and 1M-iter omitted
+##     to keep the smoke test quick — the 1-iter case alone exercises
+##     a complete ladder + encode and would catch any limb-arithmetic
+##     bug instantly).
+##   - wg:smoke 48/48 stays green (every WG handshake derives ≥ 4 ECDH
+##     shared secrets through this code path).
+##   - Cross-impl interop with wireguard-go stays green.
+##
+## See:
+## - RFC 7748 §5 (X25519 algorithm)
+## - dalek-cryptography/curve25519-dalek/src/backend/serial/u64/field.rs
+##   (5×51-bit u64 backend reference)
+## - HACL\* Hacl_Bignum25519_51 / Hacl_Curve25519_51 (cross-validated
+##   against during dev; the F\* bound proofs are the load-bearing
+##   piece — we mirror their carry-chain structure)
+## - docs/design/CRYPTO_STDLIB_DESIGN.md (Phase 2 native-primitive plan)
+
+import * from ffi/socket          # malloc/free/memcpy/memset/ptr_*
+import std/core/crypto/subtle     # ct_select_int
+import * from std/core/crypto/secret  # Secret<Int> + secret_unwrap (NET.4.1)
+
+# =============================================================================
+# Field-element memory layout helpers
+# =============================================================================
+# A field element ("felem") is a 5×8-byte (40-byte) buffer. Limb i lives at
+# byte offset i*8 and is accessed as a little-endian i64 via ptr_read_i64 /
+# ptr_write_i64. The buffer is caller-owned (malloc'd by point operations).
+
+def _f51_alloc(): Int = malloc(40)
+
+def _f51_free(p: Int): Void
+  free(p)
+end
+
+# 8-byte little-endian read/write. ffi/socket exports ptr_read_byte but not
+# ptr_read_i64; rather than pull in ffi/event for one helper, inline the
+# 8-byte form here. Limb values fit in i64 with bit patterns preserved
+# across the round-trip — what we read back is what we wrote.
+#
+# The OR chain is written on a single logical line so that Quartz's
+# leading-`|` continuation-drop bug doesn't bite (see
+# feedback_leading_plus_continuation_drops.md — same issue affects `|`).
+def _f51_load(p: Int, i: Int): Int
+  var q = p + i * 8
+  var b0 = ptr_read_byte(q)
+  var b1 = ptr_read_byte(q + 1)
+  var b2 = ptr_read_byte(q + 2)
+  var b3 = ptr_read_byte(q + 3)
+  var b4 = ptr_read_byte(q + 4)
+  var b5 = ptr_read_byte(q + 5)
+  var b6 = ptr_read_byte(q + 6)
+  var b7 = ptr_read_byte(q + 7)
+  var r = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+  r = r | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+  return r
+end
+
+def _f51_store(p: Int, i: Int, v: Int): Void
+  var q = p + i * 8
+  ptr_write_byte(q,     v & 255)
+  ptr_write_byte(q + 1, (v >> 8) & 255)
+  ptr_write_byte(q + 2, (v >> 16) & 255)
+  ptr_write_byte(q + 3, (v >> 24) & 255)
+  ptr_write_byte(q + 4, (v >> 32) & 255)
+  ptr_write_byte(q + 5, (v >> 40) & 255)
+  ptr_write_byte(q + 6, (v >> 48) & 255)
+  ptr_write_byte(q + 7, (v >> 56) & 255)
+end
+
+def _f51_copy(dst: Int, src: Int): Void
+  _f51_store(dst, 0, _f51_load(src, 0))
+  _f51_store(dst, 1, _f51_load(src, 1))
+  _f51_store(dst, 2, _f51_load(src, 2))
+  _f51_store(dst, 3, _f51_load(src, 3))
+  _f51_store(dst, 4, _f51_load(src, 4))
+end
+
+def _f51_set_zero(p: Int): Void
+  _f51_store(p, 0, 0)
+  _f51_store(p, 1, 0)
+  _f51_store(p, 2, 0)
+  _f51_store(p, 3, 0)
+  _f51_store(p, 4, 0)
+end
+
+def _f51_set_one(p: Int): Void
+  _f51_store(p, 0, 1)
+  _f51_store(p, 1, 0)
+  _f51_store(p, 2, 0)
+  _f51_store(p, 3, 0)
+  _f51_store(p, 4, 0)
+end
+
+# Mask for 51-bit limb extraction.
+def _MASK51(): Int = 2251799813685247    # 2^51 - 1 = 0x7ffffffffffff
+
+# 8 × p_limb_0 = 8 × (2^51 - 19) = 2^54 - 152 = 0x3fffffffffff68
+def _BIAS_LIMB0(): Int = 18014398509481832
+
+# 8 × p_limb_i (i=1..4) = 8 × (2^51 - 1) = 2^54 - 8 = 0x3ffffffffffff8
+def _BIAS_LIMBN(): Int = 18014398509481976
+
+# Wide bias for _f51_fsub_2x: 16 × p_limb (double the 8p bias). Used when the
+# subtrahend f2 is itself the output of a prior fsub (limbs ≤ 2^54 ≈ the 8p
+# bias), which would let the 8p bias dip a limb slightly negative. Doubling
+# the bias lifts the floor from ~0 to ~2^54 — safely positive.
+# 16 × p_limb_0 = 2 × 18014398509481832
+def _BIAS2_LIMB0(): Int = 36028797018963664
+# 16 × p_limb_i (i=1..4) = 2 × 18014398509481976
+def _BIAS2_LIMBN(): Int = 36028797018963952
+
+# =============================================================================
+# Byte-level u64 read/write (little-endian) — felem encode/decode entry points
+# =============================================================================
+
+def _read_u64_le(p: Int): Int
+  var b0 = ptr_read_byte(p)
+  var b1 = ptr_read_byte(p + 1)
+  var b2 = ptr_read_byte(p + 2)
+  var b3 = ptr_read_byte(p + 3)
+  var b4 = ptr_read_byte(p + 4)
+  var b5 = ptr_read_byte(p + 5)
+  var b6 = ptr_read_byte(p + 6)
+  var b7 = ptr_read_byte(p + 7)
+  var r = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+  r = r | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+  return r
+end
+
+def _write_u64_le(p: Int, v: Int): Void
+  ptr_write_byte(p,     v & 255)
+  ptr_write_byte(p + 1, (v >> 8) & 255)
+  ptr_write_byte(p + 2, (v >> 16) & 255)
+  ptr_write_byte(p + 3, (v >> 24) & 255)
+  ptr_write_byte(p + 4, (v >> 32) & 255)
+  ptr_write_byte(p + 5, (v >> 40) & 255)
+  ptr_write_byte(p + 6, (v >> 48) & 255)
+  ptr_write_byte(p + 7, (v >> 56) & 255)
+end
+
+# =============================================================================
+# Field arithmetic — fadd / fsub / fmul1 (scalar mul) / fmul / fsqr / finv
+# =============================================================================
+
+## out = f1 + f2  (limb-wise, may exceed 51 bits)
+def _f51_fadd(out: Int, f1: Int, f2: Int): Void
+  _f51_store(out, 0, _f51_load(f1, 0) + _f51_load(f2, 0))
+  _f51_store(out, 1, _f51_load(f1, 1) + _f51_load(f2, 1))
+  _f51_store(out, 2, _f51_load(f1, 2) + _f51_load(f2, 2))
+  _f51_store(out, 3, _f51_load(f1, 3) + _f51_load(f2, 3))
+  _f51_store(out, 4, _f51_load(f1, 4) + _f51_load(f2, 4))
+end
+
+## out = f1 - f2 mod p  (computed as f1 + 8p - f2 to stay non-negative;
+## the bias lifts each limb by 8·p_limb so we never go below zero, and
+## the resulting 5-limb representation is mathematically congruent to
+## (f1 - f2) mod p — the high-bit carry from the bias falls off when
+## the next multiply renormalizes through the *19 wrap.)
+def _f51_fsub(out: Int, f1: Int, f2: Int): Void
+  _f51_store(out, 0, _f51_load(f1, 0) + _BIAS_LIMB0() - _f51_load(f2, 0))
+  _f51_store(out, 1, _f51_load(f1, 1) + _BIAS_LIMBN() - _f51_load(f2, 1))
+  _f51_store(out, 2, _f51_load(f1, 2) + _BIAS_LIMBN() - _f51_load(f2, 2))
+  _f51_store(out, 3, _f51_load(f1, 3) + _BIAS_LIMBN() - _f51_load(f2, 3))
+  _f51_store(out, 4, _f51_load(f1, 4) + _BIAS_LIMBN() - _f51_load(f2, 4))
+end
+
+## out = f1 - f2 mod p, WIDE-BIAS variant (adds 16p instead of 8p).
+## Use this — not `_f51_fsub` — when f2 is the result of a prior `_f51_fsub`
+## or any other non-canonical operation whose limbs can reach ≈ 2⁵⁴. The 8p
+## bias in `_f51_fsub` is only sized for canonical-magnitude f2 (≤ 2⁵¹) and
+## would dip a limb negative against a ≈2⁵⁴ subtrahend, breaking `_f51_fmul`'s
+## carry chain. The 16p bias here keeps every limb safely positive
+## (floor ≈ 2*bias - f2_max ≈ 2⁵⁵ - 2⁵⁴ ≈ 2⁵⁴). Cost: output limbs are one
+## bit larger (≤ 2⁵⁶ vs ≤ 2⁵⁵), still well within fmul's safe input range.
+def _f51_fsub_2x(out: Int, f1: Int, f2: Int): Void
+  _f51_store(out, 0, _f51_load(f1, 0) + _BIAS2_LIMB0() - _f51_load(f2, 0))
+  _f51_store(out, 1, _f51_load(f1, 1) + _BIAS2_LIMBN() - _f51_load(f2, 1))
+  _f51_store(out, 2, _f51_load(f1, 2) + _BIAS2_LIMBN() - _f51_load(f2, 2))
+  _f51_store(out, 3, _f51_load(f1, 3) + _BIAS2_LIMBN() - _f51_load(f2, 3))
+  _f51_store(out, 4, _f51_load(f1, 4) + _BIAS2_LIMBN() - _f51_load(f2, 4))
+end
+
+## out = f1 * scalar mod p, where scalar is a small (≤ 2¹⁷) constant.
+## Used for the *121665 step in the Montgomery ladder. No wide-multiply
+## needed because each f1 limb ≤ 2⁵⁴ × 2¹⁷ = 2⁷¹ — but that's > i64.
+## Split: limb × scalar produces a 64-bit-or-larger result. Since
+## scalar ≤ 121665 < 2¹⁷, a single 51-bit limb × scalar fits in i64
+## (2⁵⁴ × 2¹⁷ = 2⁷¹ — overflows). So we DO need widening_mul. Use it.
+def _f51_fmul1(out: Int, f1: Int, scalar: Int): Void
+  var f10 = _f51_load(f1, 0)
+  var f11 = _f51_load(f1, 1)
+  var f12 = _f51_load(f1, 2)
+  var f13 = _f51_load(f1, 3)
+  var f14 = _f51_load(f1, 4)
+
+  # Each limb × scalar → (lo, hi). hi is at most 2⁷¹ / 2⁶⁴ ≈ 2⁷ = 128.
+  var w0_lo = widening_mul_lo(f10, scalar)
+  var w0_hi = widening_mul_hi(f10, scalar)
+  var w1_lo = widening_mul_lo(f11, scalar)
+  var w1_hi = widening_mul_hi(f11, scalar)
+  var w2_lo = widening_mul_lo(f12, scalar)
+  var w2_hi = widening_mul_hi(f12, scalar)
+  var w3_lo = widening_mul_lo(f13, scalar)
+  var w3_hi = widening_mul_hi(f13, scalar)
+  var w4_lo = widening_mul_lo(f14, scalar)
+  var w4_hi = widening_mul_hi(f14, scalar)
+
+  # Carry propagation (5 limbs + final wrap×19).
+  var tmp0 = w0_lo & _MASK51()
+  var c0_lo = ((w0_lo >> 51) & 8191) | (w0_hi << 13)   # bits 51..114 — fits i64
+
+  var s1 = carrying_add_sum(w1_lo, c0_lo, 0)
+  var c_carry = carrying_add_carry(w1_lo, c0_lo, 0)
+  var s1_hi = w1_hi + c_carry
+  var tmp1 = s1 & _MASK51()
+  var c1_lo = ((s1 >> 51) & 8191) | (s1_hi << 13)
+
+  var s2 = carrying_add_sum(w2_lo, c1_lo, 0)
+  c_carry = carrying_add_carry(w2_lo, c1_lo, 0)
+  var s2_hi = w2_hi + c_carry
+  var tmp2 = s2 & _MASK51()
+  var c2_lo = ((s2 >> 51) & 8191) | (s2_hi << 13)
+
+  var s3 = carrying_add_sum(w3_lo, c2_lo, 0)
+  c_carry = carrying_add_carry(w3_lo, c2_lo, 0)
+  var s3_hi = w3_hi + c_carry
+  var tmp3 = s3 & _MASK51()
+  var c3_lo = ((s3 >> 51) & 8191) | (s3_hi << 13)
+
+  var s4 = carrying_add_sum(w4_lo, c3_lo, 0)
+  c_carry = carrying_add_carry(w4_lo, c3_lo, 0)
+  var s4_hi = w4_hi + c_carry
+  var tmp4 = s4 & _MASK51()
+  var c4_lo = ((s4 >> 51) & 8191) | (s4_hi << 13)
+
+  var l0 = tmp0 + c4_lo * 19
+  var c5 = l0 >> 51
+  _f51_store(out, 0, l0 & _MASK51())
+  _f51_store(out, 1, tmp1 + c5)
+  _f51_store(out, 2, tmp2)
+  _f51_store(out, 3, tmp3)
+  _f51_store(out, 4, tmp4)
+end
+
+## out = f1 * f2 mod p — the 5×51 schoolbook multiply with 2²⁵⁵ ≡ 19
+## reduction folded into the multiply step (the f2[1..4]·19 precomputes).
+def _f51_fmul(out: Int, f1: Int, f2: Int): Void
+  var f10 = _f51_load(f1, 0)
+  var f11 = _f51_load(f1, 1)
+  var f12 = _f51_load(f1, 2)
+  var f13 = _f51_load(f1, 3)
+  var f14 = _f51_load(f1, 4)
+  var f20 = _f51_load(f2, 0)
+  var f21 = _f51_load(f2, 1)
+  var f22 = _f51_load(f2, 2)
+  var f23 = _f51_load(f2, 3)
+  var f24 = _f51_load(f2, 4)
+
+  # Pre-scale f2[1..4] by 19. Each f2[i] ≤ 2⁵⁴, so f2[i]·19 ≤ 2⁵⁸·³⁷
+  # — fits in i64 with bit 63 clear.
+  var t1 = f21 * 19
+  var t2 = f22 * 19
+  var t3 = f23 * 19
+  var t4 = f24 * 19
+
+  # 5 × u128 accumulators.
+  # o_i = sum of f1[j] * (f2[i-j] or t_{i-j+5}) for j=0..4 (mod 5 with wrap×19).
+  # Below we expand the inner loop fully and apply each fma via:
+  #   p_lo = widening_mul_lo(a, b); p_hi = widening_mul_hi(a, b)
+  #   acc_lo' = carrying_add_sum(acc_lo, p_lo, 0)
+  #   acc_hi' = acc_hi + p_hi + carrying_add_carry(acc_lo, p_lo, 0)
+
+  # ---- o0 = f10·f20 + f11·t4 + f12·t3 + f13·t2 + f14·t1 -------------------
+  var o0_lo = widening_mul_lo(f10, f20)
+  var o0_hi = widening_mul_hi(f10, f20)
+
+  var p_lo = widening_mul_lo(f11, t4)
+  var p_hi = widening_mul_hi(f11, t4)
+  var s = carrying_add_sum(o0_lo, p_lo, 0)
+  o0_hi = o0_hi + p_hi + carrying_add_carry(o0_lo, p_lo, 0)
+  o0_lo = s
+
+  p_lo = widening_mul_lo(f12, t3)
+  p_hi = widening_mul_hi(f12, t3)
+  s = carrying_add_sum(o0_lo, p_lo, 0)
+  o0_hi = o0_hi + p_hi + carrying_add_carry(o0_lo, p_lo, 0)
+  o0_lo = s
+
+  p_lo = widening_mul_lo(f13, t2)
+  p_hi = widening_mul_hi(f13, t2)
+  s = carrying_add_sum(o0_lo, p_lo, 0)
+  o0_hi = o0_hi + p_hi + carrying_add_carry(o0_lo, p_lo, 0)
+  o0_lo = s
+
+  p_lo = widening_mul_lo(f14, t1)
+  p_hi = widening_mul_hi(f14, t1)
+  s = carrying_add_sum(o0_lo, p_lo, 0)
+  o0_hi = o0_hi + p_hi + carrying_add_carry(o0_lo, p_lo, 0)
+  o0_lo = s
+
+  # ---- o1 = f10·f21 + f11·f20 + f12·t4 + f13·t3 + f14·t2 ------------------
+  var o1_lo = widening_mul_lo(f10, f21)
+  var o1_hi = widening_mul_hi(f10, f21)
+
+  p_lo = widening_mul_lo(f11, f20)
+  p_hi = widening_mul_hi(f11, f20)
+  s = carrying_add_sum(o1_lo, p_lo, 0)
+  o1_hi = o1_hi + p_hi + carrying_add_carry(o1_lo, p_lo, 0)
+  o1_lo = s
+
+  p_lo = widening_mul_lo(f12, t4)
+  p_hi = widening_mul_hi(f12, t4)
+  s = carrying_add_sum(o1_lo, p_lo, 0)
+  o1_hi = o1_hi + p_hi + carrying_add_carry(o1_lo, p_lo, 0)
+  o1_lo = s
+
+  p_lo = widening_mul_lo(f13, t3)
+  p_hi = widening_mul_hi(f13, t3)
+  s = carrying_add_sum(o1_lo, p_lo, 0)
+  o1_hi = o1_hi + p_hi + carrying_add_carry(o1_lo, p_lo, 0)
+  o1_lo = s
+
+  p_lo = widening_mul_lo(f14, t2)
+  p_hi = widening_mul_hi(f14, t2)
+  s = carrying_add_sum(o1_lo, p_lo, 0)
+  o1_hi = o1_hi + p_hi + carrying_add_carry(o1_lo, p_lo, 0)
+  o1_lo = s
+
+  # ---- o2 = f10·f22 + f11·f21 + f12·f20 + f13·t4 + f14·t3 -----------------
+  var o2_lo = widening_mul_lo(f10, f22)
+  var o2_hi = widening_mul_hi(f10, f22)
+
+  p_lo = widening_mul_lo(f11, f21)
+  p_hi = widening_mul_hi(f11, f21)
+  s = carrying_add_sum(o2_lo, p_lo, 0)
+  o2_hi = o2_hi + p_hi + carrying_add_carry(o2_lo, p_lo, 0)
+  o2_lo = s
+
+  p_lo = widening_mul_lo(f12, f20)
+  p_hi = widening_mul_hi(f12, f20)
+  s = carrying_add_sum(o2_lo, p_lo, 0)
+  o2_hi = o2_hi + p_hi + carrying_add_carry(o2_lo, p_lo, 0)
+  o2_lo = s
+
+  p_lo = widening_mul_lo(f13, t4)
+  p_hi = widening_mul_hi(f13, t4)
+  s = carrying_add_sum(o2_lo, p_lo, 0)
+  o2_hi = o2_hi + p_hi + carrying_add_carry(o2_lo, p_lo, 0)
+  o2_lo = s
+
+  p_lo = widening_mul_lo(f14, t3)
+  p_hi = widening_mul_hi(f14, t3)
+  s = carrying_add_sum(o2_lo, p_lo, 0)
+  o2_hi = o2_hi + p_hi + carrying_add_carry(o2_lo, p_lo, 0)
+  o2_lo = s
+
+  # ---- o3 = f10·f23 + f11·f22 + f12·f21 + f13·f20 + f14·t4 ----------------
+  var o3_lo = widening_mul_lo(f10, f23)
+  var o3_hi = widening_mul_hi(f10, f23)
+
+  p_lo = widening_mul_lo(f11, f22)
+  p_hi = widening_mul_hi(f11, f22)
+  s = carrying_add_sum(o3_lo, p_lo, 0)
+  o3_hi = o3_hi + p_hi + carrying_add_carry(o3_lo, p_lo, 0)
+  o3_lo = s
+
+  p_lo = widening_mul_lo(f12, f21)
+  p_hi = widening_mul_hi(f12, f21)
+  s = carrying_add_sum(o3_lo, p_lo, 0)
+  o3_hi = o3_hi + p_hi + carrying_add_carry(o3_lo, p_lo, 0)
+  o3_lo = s
+
+  p_lo = widening_mul_lo(f13, f20)
+  p_hi = widening_mul_hi(f13, f20)
+  s = carrying_add_sum(o3_lo, p_lo, 0)
+  o3_hi = o3_hi + p_hi + carrying_add_carry(o3_lo, p_lo, 0)
+  o3_lo = s
+
+  p_lo = widening_mul_lo(f14, t4)
+  p_hi = widening_mul_hi(f14, t4)
+  s = carrying_add_sum(o3_lo, p_lo, 0)
+  o3_hi = o3_hi + p_hi + carrying_add_carry(o3_lo, p_lo, 0)
+  o3_lo = s
+
+  # ---- o4 = f10·f24 + f11·f23 + f12·f22 + f13·f21 + f14·f20 ---------------
+  var o4_lo = widening_mul_lo(f10, f24)
+  var o4_hi = widening_mul_hi(f10, f24)
+
+  p_lo = widening_mul_lo(f11, f23)
+  p_hi = widening_mul_hi(f11, f23)
+  s = carrying_add_sum(o4_lo, p_lo, 0)
+  o4_hi = o4_hi + p_hi + carrying_add_carry(o4_lo, p_lo, 0)
+  o4_lo = s
+
+  p_lo = widening_mul_lo(f12, f22)
+  p_hi = widening_mul_hi(f12, f22)
+  s = carrying_add_sum(o4_lo, p_lo, 0)
+  o4_hi = o4_hi + p_hi + carrying_add_carry(o4_lo, p_lo, 0)
+  o4_lo = s
+
+  p_lo = widening_mul_lo(f13, f21)
+  p_hi = widening_mul_hi(f13, f21)
+  s = carrying_add_sum(o4_lo, p_lo, 0)
+  o4_hi = o4_hi + p_hi + carrying_add_carry(o4_lo, p_lo, 0)
+  o4_lo = s
+
+  p_lo = widening_mul_lo(f14, f20)
+  p_hi = widening_mul_hi(f14, f20)
+  s = carrying_add_sum(o4_lo, p_lo, 0)
+  o4_hi = o4_hi + p_hi + carrying_add_carry(o4_lo, p_lo, 0)
+  o4_lo = s
+
+  # ---- Carry propagation across the 5 (lo, hi) pairs. -------------------
+  # tmp_i = o_i & MASK51 ; c_i = o_i >> 51 (treating as u128)
+  # In limb form: c_lo = ((o_lo >> 51) & 0x1FFF) | (o_hi << 13)
+  #               c_hi = o_hi >> 51       — almost always 0 in our bounds
+  # We track c_hi via 'c_carry' from the next add below.
+  var tmp0 = o0_lo & _MASK51()
+  var c_lo = ((o0_lo >> 51) & 8191) | (o0_hi << 13)
+
+  var sum1 = carrying_add_sum(o1_lo, c_lo, 0)
+  var carry = carrying_add_carry(o1_lo, c_lo, 0)
+  var sum1_hi = o1_hi + carry
+  var tmp1 = sum1 & _MASK51()
+  c_lo = ((sum1 >> 51) & 8191) | (sum1_hi << 13)
+
+  var sum2 = carrying_add_sum(o2_lo, c_lo, 0)
+  carry = carrying_add_carry(o2_lo, c_lo, 0)
+  var sum2_hi = o2_hi + carry
+  var tmp2 = sum2 & _MASK51()
+  c_lo = ((sum2 >> 51) & 8191) | (sum2_hi << 13)
+
+  var sum3 = carrying_add_sum(o3_lo, c_lo, 0)
+  carry = carrying_add_carry(o3_lo, c_lo, 0)
+  var sum3_hi = o3_hi + carry
+  var tmp3 = sum3 & _MASK51()
+  c_lo = ((sum3 >> 51) & 8191) | (sum3_hi << 13)
+
+  var sum4 = carrying_add_sum(o4_lo, c_lo, 0)
+  carry = carrying_add_carry(o4_lo, c_lo, 0)
+  var sum4_hi = o4_hi + carry
+  var tmp4 = sum4 & _MASK51()
+  c_lo = ((sum4 >> 51) & 8191) | (sum4_hi << 13)
+
+  # Wrap the final carry into limb 0 via *19 (= 2²⁵⁵ mod p). c_lo·19 fits
+  # in u64 by F\*'s tightened bounds. One more carry into limb 1 finishes
+  # the renormalization.
+  #
+  # Critical: `l0` may have bit 63 set when c_lo·19 is large (≈ 2⁶³), so
+  # `l0 >> 51` (Quartz's ashr) sign-extends and yields a negative i64.
+  # We want UNSIGNED shift semantics — l0 / 2⁵¹ as u64 fits in 13 bits.
+  # Mask with 0x1FFF to recover the unsigned-shift value.
+  var l0 = tmp0 + c_lo * 19
+  var c5 = (l0 >> 51) & 8191
+  _f51_store(out, 0, l0 & _MASK51())
+  _f51_store(out, 1, tmp1 + c5)
+  _f51_store(out, 2, tmp2)
+  _f51_store(out, 3, tmp3)
+  _f51_store(out, 4, tmp4)
+end
+
+## out = f * f mod p — currently dispatches to fmul with f1 == f2.
+## A standalone optimized squaring would save ~30% of multiplies in the
+## ladder (squaring has fewer distinct partial products), but the
+## simpler form is correct-by-construction and well within
+## handshake-throughput budgets. Optimization is a follow-up.
+def _f51_fsqr(out: Int, f: Int): Void
+  _f51_fmul(out, f, f)
+end
+
+## Constant-time conditional swap of two felems.
+## bit ∈ {0, 1}; mask = -bit (all-ones if bit==1, all-zeros if bit==0).
+## For each limb pair (a, b):
+##   delta = mask & (a ^ b)
+##   a' = a ^ delta ; b' = b ^ delta
+## When bit=0, delta=0, no change. When bit=1, delta=a^b, swaps a and b.
+def _f51_cswap(bit: Int, pa: Int, pb: Int): Void
+  var mask = 0 - bit
+  var i = 0
+  while i < 5
+    var a = _f51_load(pa, i)
+    var b = _f51_load(pb, i)
+    var d = mask & (a ^ b)
+    _f51_store(pa, i, a ^ d)
+    _f51_store(pb, i, b ^ d)
+    i = i + 1
+  end
+end
+
+## Decode a 32-byte little-endian buffer into a felem. Top bit of byte 31
+## is masked off per RFC 7748 §5 ("the high bit of the public key is
+## ignored" — the curve is defined modulo 2²⁵⁵−19, so any input ≥ 2²⁵⁵
+## reduces to the same point as input mod 2²⁵⁵).
+def _f51_load_felem(out: Int, p: Int): Void
+  var u0 = _read_u64_le(p)
+  var u1 = _read_u64_le(p + 8)
+  var u2 = _read_u64_le(p + 16)
+  var u3 = _read_u64_le(p + 24) & 9223372036854775807     # clear top bit (2^63 - 1)
+  # Repack 4 × 64-bit (256 bits) into 5 × 51-bit:
+  #   limb0 = u0 & 2^51 - 1
+  #   limb1 = (u0 >> 51) | (u1 << 13)  & 2^51 - 1
+  #   limb2 = (u1 >> 38) | (u2 << 26)  & 2^51 - 1
+  #   limb3 = (u2 >> 25) | (u3 << 39)  & 2^51 - 1
+  #   limb4 = (u3 >> 12)               & 2^51 - 1
+  # The masks on (u0/u1/u2 >> N) prevent ashr sign-extension from tainting
+  # the OR with the next limb.
+  var l0 = u0 & _MASK51()
+  var l1 = (((u0 >> 51) & 8191) | (u1 << 13)) & _MASK51()
+  var l2 = (((u1 >> 38) & 67108863) | (u2 << 26)) & _MASK51()
+  var l3 = (((u2 >> 25) & 549755813887) | (u3 << 39)) & _MASK51()
+  var l4 = (u3 >> 12) & _MASK51()
+  _f51_store(out, 0, l0)
+  _f51_store(out, 1, l1)
+  _f51_store(out, 2, l2)
+  _f51_store(out, 3, l3)
+  _f51_store(out, 4, l4)
+end
+
+## Encode a felem into 32 LE bytes. Runs a final carry chain, then
+## conditionally subtracts p (constant-time via subtle helpers) to land
+## in the canonical [0, p) representation, then repacks 5×51-bit into
+## 4×64-bit and writes 32 bytes.
+def _f51_store_felem(out_32: Int, f: Int): Void
+  var f0 = _f51_load(f, 0)
+  var f1 = _f51_load(f, 1)
+  var f2 = _f51_load(f, 2)
+  var f3 = _f51_load(f, 3)
+  var f4 = _f51_load(f, 4)
+
+  # Carry chain: bring all limbs into [0, 2⁵¹).
+  var c = f0 >> 51
+  f0 = f0 & _MASK51()
+  f1 = f1 + c
+  c = f1 >> 51
+  f1 = f1 & _MASK51()
+  f2 = f2 + c
+  c = f2 >> 51
+  f2 = f2 & _MASK51()
+  f3 = f3 + c
+  c = f3 >> 51
+  f3 = f3 & _MASK51()
+  f4 = f4 + c
+  c = f4 >> 51
+  f4 = f4 & _MASK51()
+  # Wrap into limb 0 via ×19, one more carry.
+  f0 = f0 + c * 19
+  c = f0 >> 51
+  f0 = f0 & _MASK51()
+  f1 = f1 + c
+  # Now f ∈ [0, 2·p) — a single conditional subtract of p brings it to
+  # canonical form.
+  #
+  # HACL\*-style mask: f >= p iff f0 >= (2⁵¹-19) AND f1..f4 are all (2⁵¹-1).
+  # (If any of f1..f4 is below max, then f < 2⁵⁵−small ≤ p < f impossible
+  #  given f < 2·p ≤ 2²⁵⁶, so the upper-limb-equality test is the only
+  #  way f reaches the [p, 2p) range that needs reducing.)
+  #
+  # m_ge_a(a, b) = ((b - 1) - a) >> 63: returns -1 (all ones) if a >= b,
+  # else 0 — works because i64 ashr propagates the sign bit.
+  var m0 = (2251799813685228 - f0) >> 63                # -1 if f0 >= 2^51-19
+  var m1 = ct_eq_int(f1, 2251799813685247)
+  var m2 = ct_eq_int(f2, 2251799813685247)
+  var m3 = ct_eq_int(f3, 2251799813685247)
+  var m4 = ct_eq_int(f4, 2251799813685247)
+  var mask = m0 & m1 & m2 & m3 & m4
+
+  var r0 = f0 - (mask & 2251799813685229)
+  var r1 = f1 - (mask & 2251799813685247)
+  var r2 = f2 - (mask & 2251799813685247)
+  var r3 = f3 - (mask & 2251799813685247)
+  var r4 = f4 - (mask & 2251799813685247)
+
+  # Repack 5×51-bit to 4×64-bit:
+  #   u0 = r0      | r1 << 51
+  #   u1 = r1 >> 13 | r2 << 38
+  #   u2 = r2 >> 26 | r3 << 25
+  #   u3 = r3 >> 39 | r4 << 12
+  var u0 = r0 | (r1 << 51)
+  var u1 = ((r1 >> 13) & 274877906943) | (r2 << 38)         # 0x3F_FFFF_FFFF
+  var u2 = ((r2 >> 26) & 33554431) | (r3 << 25)             # 0x01FF_FFFF
+  var u3 = ((r3 >> 39) & 4095) | (r4 << 12)                 # 0x0FFF
+  _write_u64_le(out_32,      u0)
+  _write_u64_le(out_32 + 8,  u1)
+  _write_u64_le(out_32 + 16, u2)
+  _write_u64_le(out_32 + 24, u3)
+end
+
+## Multiplicative inverse: out = f^(p-2) mod p, computed via the
+## fixed Curve25519 addition chain (Bernstein's classic 254-square /
+## 11-multiply chain — same one HACL\* and dalek use).
+##
+## p - 2 = 2²⁵⁵ - 21 has bit pattern 0b111...111101011 (250 ones, then
+## 0101 0 then 1 then 1 then 0 — actually let me state it as: every bit
+## set except bits 1 and 4). The chain below implements the equivalent
+## of Itoh-Tsujii via a small set of windowed exponents.
+def _f51_finv(out: Int, z: Int): Void
+  # Working felems on the heap. Match HACL's t1[20U] layout:
+  #   a = t1[0..5)   z^(2^1 - 1) intermediate
+  #   b = t1[5..10)  larger window
+  #   c = t1[10..15) accumulator for final
+  #   t = t1[15..20) per-step temp
+  var a = _f51_alloc()
+  var b = _f51_alloc()
+  var c = _f51_alloc()
+  var t = _f51_alloc()
+
+  # 2^1: a = z^2
+  _f51_fsqr(a, z)
+  # 2^3: t = a^4 = z^8
+  _f51_fsqr(t, a)
+  _f51_fsqr(t, t)
+  # b = t * z = z^9
+  _f51_fmul(b, t, z)
+  # a = b * a = z^11
+  _f51_fmul(a, b, a)
+  # t = a^2 = z^22
+  _f51_fsqr(t, a)
+  # b = t * b = z^31 = z^(2^5 - 1)
+  _f51_fmul(b, t, b)
+  # t = b^(2^5) = z^((2^5-1)*2^5)
+  _f51_fsqr(t, b)
+  var i = 0
+  while i < 4
+    _f51_fsqr(t, t)
+    i = i + 1
+  end
+  # b = t * b = z^(2^10 - 1)
+  _f51_fmul(b, t, b)
+  # t = b^(2^10) → z^((2^10-1)*2^10) ; then c = t*b = z^(2^20-1)
+  _f51_fsqr(t, b)
+  i = 0
+  while i < 9
+    _f51_fsqr(t, t)
+    i = i + 1
+  end
+  _f51_fmul(c, t, b)
+  # t = c^(2^20)
+  _f51_fsqr(t, c)
+  i = 0
+  while i < 19
+    _f51_fsqr(t, t)
+    i = i + 1
+  end
+  # t = t * c = z^(2^40 - 1)
+  _f51_fmul(t, t, c)
+  # t = t^(2^10) = z^((2^40-1) * 2^10)
+  i = 0
+  while i < 10
+    _f51_fsqr(t, t)
+    i = i + 1
+  end
+  # b = t * b = z^(2^50 - 1)
+  _f51_fmul(b, t, b)
+  # t = b^(2^50)
+  _f51_fsqr(t, b)
+  i = 0
+  while i < 49
+    _f51_fsqr(t, t)
+    i = i + 1
+  end
+  # c = t * b = z^(2^100 - 1)
+  _f51_fmul(c, t, b)
+  # t = c^(2^100)
+  _f51_fsqr(t, c)
+  i = 0
+  while i < 99
+    _f51_fsqr(t, t)
+    i = i + 1
+  end
+  # t = t * c = z^(2^200 - 1)
+  _f51_fmul(t, t, c)
+  # t = t^(2^50) = z^((2^200-1) * 2^50)
+  i = 0
+  while i < 50
+    _f51_fsqr(t, t)
+    i = i + 1
+  end
+  # t = t * b = z^(2^250 - 1)
+  _f51_fmul(t, t, b)
+  # t = t^(2^5) ; final exponent is z^(2^250-1)·2^5 = z^((p-1) - (2^5 - 2^5·(2^250-1))) — landed on the right form once we multiply by a (=z^11):
+  i = 0
+  while i < 5
+    _f51_fsqr(t, t)
+    i = i + 1
+  end
+  # out = t * a = z^(p - 2)
+  _f51_fmul(out, t, a)
+
+  _f51_free(a)
+  _f51_free(b)
+  _f51_free(c)
+  _f51_free(t)
+end
+
+# =============================================================================
+# Point operations — Montgomery x-only ladder
+# =============================================================================
+# A Montgomery x-only point is the pair (x, z) representing the affine
+# x-coordinate x/z. We carry two such points through the ladder:
+#   nq    = current (point at index k after step k)
+#   nq_p1 = nq + base_point (running difference)
+# After 251 steps the bit-pattern of the scalar selects between nq and
+# nq_p1 at each iteration via cswap; nq accumulates the result.
+
+## Combined "add and double" — computes nq' = 2·nq and nq_p1' = nq + nq_p1
+## using the standard Montgomery x-only formulas. Constant-time.
+##
+## Inputs (all 5-limb felem buffers):
+##   q     — base point's affine x (40 bytes; the difference between
+##           nq and nq_p1 is always q, by construction).
+##   nq    — 80-byte: x2 (offset 0) || z2 (offset 40)
+##   nq_p1 — 80-byte: x3 (offset 0) || z3 (offset 40)
+def _point_add_and_double(q: Int, nq: Int, nq_p1: Int): Void
+  var x2 = nq
+  var z2 = nq + 40
+  var x3 = nq_p1
+  var z3 = nq_p1 + 40
+
+  var a = _f51_alloc()
+  var b = _f51_alloc()
+  var c = _f51_alloc()
+  var d = _f51_alloc()
+  var aa = _f51_alloc()
+  var bb = _f51_alloc()
+  var dda = _f51_alloc()
+  var cb = _f51_alloc()
+  var e = _f51_alloc()
+
+  # a = x2 + z2 ; b = x2 - z2
+  _f51_fadd(a, x2, z2)
+  _f51_fsub(b, x2, z2)
+  # c = x3 + z3 ; d = x3 - z3
+  _f51_fadd(c, x3, z3)
+  _f51_fsub(d, x3, z3)
+  # da = d * a ; cb = c * b
+  _f51_fmul(dda, d, a)
+  _f51_fmul(cb, c, b)
+  # x3' = (da + cb)^2  ; z3' = q · (da - cb)^2
+  _f51_fadd(c, dda, cb)
+  _f51_fsub(d, dda, cb)
+  _f51_fsqr(x3, c)
+  _f51_fsqr(z3, d)
+  _f51_fmul(z3, z3, q)
+  # aa = a^2 ; bb = b^2
+  _f51_fsqr(aa, a)
+  _f51_fsqr(bb, b)
+  # x2' = aa * bb
+  _f51_fmul(x2, aa, bb)
+  # e = aa - bb
+  _f51_fsub(e, aa, bb)
+  # z2' = e * (aa + 121665·e)
+  _f51_fmul1(c, e, 121665)
+  _f51_fadd(c, c, aa)
+  _f51_fmul(z2, e, c)
+
+  _f51_free(a)
+  _f51_free(b)
+  _f51_free(c)
+  _f51_free(d)
+  _f51_free(aa)
+  _f51_free(bb)
+  _f51_free(dda)
+  _f51_free(cb)
+  _f51_free(e)
+end
+
+## Read scalar bit at position `pos` (0 = LSB of byte 0; 255 = MSB of byte 31).
+def _scalar_bit(scalar: Int, pos: Int): Int
+  var byte = ptr_read_byte(scalar + (pos / 8))
+  return (byte >> (pos % 8)) & 1
+end
+
+## Montgomery ladder: out = scalar · base_point, where base_point's
+## x-coordinate is in `init_point` (40-byte felem) and the result lands
+## as a Montgomery x-only point in `out` (80-byte: x || z, both 40 bytes).
+##
+## Standard 251-bit ladder: bit 254 always-set after clamping (we set it
+## ourselves below), bits 253..3 iterated, bits 2..0 are zero (also via
+## clamping) so we run 3 trailing doublings instead of ladder steps.
+def _montgomery_ladder(out: Int, scalar: Int, init_point: Int): Void
+  # `out` is an 80-byte buffer used directly as nq (x2 (0..40) || z2 (40..80)).
+  # nqp1 is a freshly-allocated 80-byte buffer for (x3 || z3).
+  var nq = out
+  var nqp1 = malloc(80)
+
+  _f51_set_one(nq)               # x2 = 1
+  _f51_set_zero(nq + 40)         # z2 = 0
+  _f51_copy(nqp1, init_point)    # x3 = init_point
+  _f51_set_one(nqp1 + 40)        # z3 = 1
+
+  # Right-to-left bit walk over scalar[bit 254..0]. Bit 255 is always 0
+  # after RFC 7748 §5 clamping, so we start at 254. `swap` tracks whether
+  # the previous iteration left (nq, nqp1) swapped, so we cswap on
+  # (swap XOR bit_now) to collapse the prior un-swap and current swap
+  # into one operation (HACL\*'s + dalek's optimization).
+  var swap = 0
+  var i = 254
+  while i >= 0
+    var bit = _scalar_bit(scalar, i)
+    var sw = swap ^ bit
+    _f51_cswap(sw, nq, nqp1)
+    _f51_cswap(sw, nq + 40, nqp1 + 40)
+    _point_add_and_double(init_point, nq, nqp1)
+    swap = bit
+    i = i - 1
+  end
+  # Final cswap to undo the last in-flight swap state.
+  _f51_cswap(swap, nq, nqp1)
+  _f51_cswap(swap, nq + 40, nqp1 + 40)
+
+  free(nqp1)
+end
+
+## Finalize: x = x2 / z2 = x2 · z2^(-1). Then encode to 32 LE bytes.
+def _encode_point(out_32: Int, point: Int): Void
+  var x = point
+  var z = point + 40
+  var z_inv = _f51_alloc()
+  var result = _f51_alloc()
+  _f51_finv(z_inv, z)
+  _f51_fmul(result, x, z_inv)
+  _f51_store_felem(out_32, result)
+  _f51_free(z_inv)
+  _f51_free(result)
+end
+
+# =============================================================================
+# Public API
+# =============================================================================
+
+## Compute X25519 scalar multiplication: out = priv · pub  (32-byte buffers).
+## Per RFC 7748 §5: clamp the scalar (clear bottom 3 bits of byte 0,
+## clear top bit of byte 31, set bit 6 of byte 31), decode the public
+## point (mask off top bit of byte 31), run the Montgomery ladder,
+## encode the resulting x-coordinate to 32 LE bytes.
+##
+## NET.4.1 — `priv` carries the `Secret<Int>` (CPtr) discipline. Callers
+## must `secret_wrap(raw_priv_ptr)` at the construction site; the
+## unwrap below is the audit-greppable declassification point.
+def x25519_scalarmult(out: Int, priv: Secret<Int>, pub: Int): Void
+  # Clamp scalar into a private 32-byte working copy (don't mutate caller's
+  # buffer — WireGuard's session key derivation reuses the same priv
+  # across multiple ECDH operations within one handshake).
+  var scalar = malloc(32)
+  memcpy(scalar, secret_unwrap(priv), 32)
+  var b0 = ptr_read_byte(scalar)
+  ptr_write_byte(scalar, b0 & 248)               # clear low 3 bits
+  var b31 = ptr_read_byte(scalar + 31)
+  ptr_write_byte(scalar + 31, (b31 & 127) | 64)  # clear bit 7, set bit 6
+
+  # Decode public point.
+  var init_point = _f51_alloc()
+  _f51_load_felem(init_point, pub)
+
+  # Run ladder. Result lands as Montgomery (x, z) in `point`.
+  var point = malloc(80)
+  _montgomery_ladder(point, scalar, init_point)
+
+  _encode_point(out, point)
+
+  # Wipe scratch (best-effort — zeroize.qz exists for callers who care).
+  memset(scalar, 0, 32)
+  free(scalar)
+  free(point)
+  _f51_free(init_point)
+end
+
+## Derive X25519 public key from a 32-byte private key: pub = priv · G,
+## where G is the curve basepoint (x = 9). NET.4.1 — `priv` carries the
+## strict-newtype boundary; it threads through unchanged to scalarmult.
+def x25519_secret_to_public(pub: Int, priv: Secret<Int>): Void
+  # Basepoint as a 32-byte LE buffer: just byte 0 = 9, rest zero.
+  var basepoint = malloc(32)
+  memset(basepoint, 0, 32)
+  ptr_write_byte(basepoint, 9)
+  x25519_scalarmult(pub, priv, basepoint)
+  free(basepoint)
+end
+
+## ECDH-style shared-secret derivation with all-zero output rejection.
+## Returns 1 if the shared secret is non-zero (valid), 0 if all-zero
+## (small-subgroup attack or malicious peer pubkey — reject). NET.4.1
+## — `priv` carries the strict-newtype boundary; threads to scalarmult.
+def x25519_ecdh(out: Int, priv: Secret<Int>, pub: Int): Int
+  x25519_scalarmult(out, priv, pub)
+  # Constant-time all-zero check. OR all 32 bytes; if result is 0,
+  # output is the all-zero point.
+  var acc = 0
+  var i = 0
+  while i < 32
+    acc = acc | ptr_read_byte(out + i)
+    i = i + 1
+  end
+  # acc == 0 → reject (return 0). acc != 0 → accept (return 1).
+  return ((acc | (0 - acc)) >> 63) & 1
+end
+
+
+def __probe_set_one(p: Int): Void = _f51_set_one(p)
+def __probe_set_zero(p: Int): Void = _f51_set_zero(p)
+def __probe_copy(dst: Int, src: Int): Void = _f51_copy(dst, src)
+def __probe_cswap(bit: Int, pa: Int, pb: Int): Void = _f51_cswap(bit, pa, pb)

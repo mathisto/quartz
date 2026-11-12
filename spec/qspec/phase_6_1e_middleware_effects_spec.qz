@@ -1,0 +1,261 @@
+## Phase 6.1.e — middleware-as-effect-stack acceptance spec.
+##
+## Operation Piezoelectric Effects, Phase 6 (user-tool dogfooding),
+## subphase 6.1.e.
+##
+## Validates the migration of `_static_handle_request` (the body of
+## `with_static`) from direct `read_file`/`file_exists` intrinsic calls
+## to the `FileIo` effect (`fio_read`/`fio_exists`). The runtime
+## default-handler chain (Phase 5.4.b) preserves production behavior:
+## when no user handler is installed, fio_read forwards to read_file,
+## fio_exists forwards to file_exists. With a user `with FileIo { … }`
+## install, the static-file-serving middleware satisfies its file
+## reads from the user's handler — the test-mockability win the design
+## memo H1 hypothesis promised.
+##
+## What this spec covers:
+## - **FileIo mock injection**: `with FileIo { fio_read: fixture,
+##   fio_exists: predicate } do -> _static_handle_request(...) end`
+##   serves in-memory content with no real filesystem involvement.
+## - **Falls-through under denied existence**: when fio_exists returns
+##   0 for the requested path, the wrapped handler runs (no file
+##   served, normal request flow continues).
+## - **R3 ordering equivalence (Log)**: `with Log { emit: cap } do ->
+##   with_logging(h)(req) end` captures the access-log lines through
+##   the outer install — request/response arrows flow through Log
+##   regardless of nesting depth.
+## - **Composition**: `with FileIo { … } do -> with Log { … } do ->
+##   _static_handle_request(...) end end` stacks cleanly. Both the
+##   FileIo mock (file content) and the Log capture (request arrows
+##   if with_logging wraps) fire under the request path.
+##
+## What this spec does NOT cover (filed for follow-on):
+## - Live HTTP server with concurrent client load running through
+##   the migrated middleware — same port-allocation fragility filed
+##   under 6.1.c / 6.1.d. Filed as a Tier 4 integration spec.
+## - `with_cors` effect-ification — synchronous header injection has
+##   no I/O surface to mock, so no migration was performed. A future
+##   `CorsConfig` parameter is filed under 6.1.f.
+## - `with_logging` per-request `with Log` install (would shadow outer
+##   user customization per the body-wrap-shadows-outer-customization
+##   pattern; intentionally avoided).
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("middleware-as-effect-stack (Phase 6.1.e)") do ->
+
+    it("with_static reads files via FileIo effect (default handler)") do ->
+      # Sanity: the migration didn't break the default path. Write a
+      # real file, exercise _static_handle_request, observe served
+      # content. The `with FileIo` install is omitted, so both
+      # fio_exists and fio_read fall through to the runtime default
+      # handler which forwards to libc.
+      assert_run_stdout_eq("""
+import std/net/http_server
+
+def fallback(req: Request): Response
+  return text_response("FALLBACK")
+end
+
+def main(): Int
+  write_file("/tmp/_qspec_p61e_default.txt", "DEFAULT CONTENT")
+  var req = Request {
+    method: "GET", path: "/static/_qspec_p61e_default.txt",
+    query_string: "", body: "",
+    raw_path: "/static/_qspec_p61e_default.txt",
+    header_keys: vec_new<String>(), header_vals: vec_new<String>(),
+    params: map_new(), query: map_new(), context: map_new()
+  }
+  var resp = _static_handle_request("/static", "/tmp", fallback, req)
+  puts(str_from_int(resp.status))
+  puts(resp.body)
+  return 0
+end
+""", "200\nDEFAULT CONTENT\n")
+    end
+
+    it("with FileIo mock — fio_read serves in-memory fixture") do ->
+      # The headline migration test: a user handler intercepts
+      # fio_read AND fio_exists. _static_handle_request runs without
+      # touching the real filesystem. This is the test-fixture pattern
+      # the design memo promised.
+      assert_run_stdout_eq("""
+import std/net/http_server
+import std/file_io
+
+def mock_exists(op_name: Int, argc: Int, argv: Int): Int
+  var path = as_string(load(argv, 0))
+  if path == "/var/www/index.html"
+    return 1
+  end
+  return 0
+end
+
+def mock_read(op_name: Int, argc: Int, argv: Int): Int
+  var path = as_string(load(argv, 0))
+  if path == "/var/www/index.html"
+    return as_int("<h1>FIXTURE</h1>")
+  end
+  return as_int("")
+end
+
+def fallback(req: Request): Response
+  return text_response("FALLBACK")
+end
+
+def main(): Int
+  var req = Request {
+    method: "GET", path: "/index.html",
+    query_string: "", body: "",
+    raw_path: "/index.html",
+    header_keys: vec_new<String>(), header_vals: vec_new<String>(),
+    params: map_new(), query: map_new(), context: map_new()
+  }
+  with FileIo { fio_read: mock_read, fio_exists: mock_exists } do ->
+    var resp = _static_handle_request("/", "/var/www", fallback, req)
+    puts(str_from_int(resp.status))
+    puts(resp.body)
+  end
+  return 0
+end
+""", "200\n<h1>FIXTURE</h1>\n")
+    end
+
+    it("with FileIo { fio_exists: deny_all } falls through to wrapped handler") do ->
+      # When the mock denies the file's existence, the wrapped handler
+      # runs. Confirms _static_handle_request honors its falls-through
+      # contract under FileIo overrides.
+      assert_run_stdout_eq("""
+import std/net/http_server
+import std/file_io
+
+def deny_all(op_name: Int, argc: Int, argv: Int): Int = 0
+
+def fallback(req: Request): Response
+  return text_response("FALLBACK FIRED")
+end
+
+def main(): Int
+  var req = Request {
+    method: "GET", path: "/static/missing.txt",
+    query_string: "", body: "",
+    raw_path: "/static/missing.txt",
+    header_keys: vec_new<String>(), header_vals: vec_new<String>(),
+    params: map_new(), query: map_new(), context: map_new()
+  }
+  with FileIo { fio_exists: deny_all } do ->
+    var resp = _static_handle_request("/static", "/tmp", fallback, req)
+    puts(resp.body)
+  end
+  return 0
+end
+""", "FALLBACK FIRED\n")
+    end
+
+    it("with_logging routes access-log lines through outer Log install (R3)") do ->
+      # H2 ordering equivalence: an outer `with Log { emit: cap } do
+      # -> with_logging(h)(req) end` captures the request/response
+      # arrows. Confirms the Log effect installed at the outer scope
+      # is the one that fires when log::raw is performed inside
+      # with_logging — top-down handler scan finds the outer install
+      # because no inner install shadows it.
+      assert_run_stdout_eq("""
+import std/net/http_server
+import std/log
+
+def cap(op_name: Int, argc: Int, argv: Int): Int
+  var msg = as_string(load(argv, 0))
+  puts("captured: " + msg)
+  return 0
+end
+
+def h(req: Request): Response
+  return text_response("ok")
+end
+
+def main(): Int
+  var req = Request {
+    method: "GET", path: "/about",
+    query_string: "", body: "",
+    raw_path: "/about",
+    header_keys: vec_new<String>(), header_vals: vec_new<String>(),
+    params: map_new(), query: map_new(), context: map_new()
+  }
+  with Log { emit: cap } do ->
+    var wrapped = with_logging(h)
+    var resp = wrapped(req)
+    puts("status: " + str_from_int(resp.status))
+  end
+  return 0
+end
+""", "captured: >> GET /about\ncaptured: << 200\nstatus: 200\n")
+    end
+
+    it("composition: outer FileIo + outer Log both fire under one request") do ->
+      # The full middleware-as-effect-stack demo. Outer Log captures
+      # all log emits; outer FileIo serves in-memory fixtures; the
+      # request flows through with_logging(static_handler) and both
+      # effects fire. This is the H2 readability-and-composability
+      # claim made concrete: stacking effects at the OUTER scope
+      # works regardless of which middleware uses which effect
+      # internally.
+      assert_run_stdout_eq("""
+import std/net/http_server
+import std/file_io
+import std/log
+
+def log_cap(op_name: Int, argc: Int, argv: Int): Int
+  var msg = as_string(load(argv, 0))
+  puts("LOG: " + msg)
+  return 0
+end
+
+def fio_exists_mock(op_name: Int, argc: Int, argv: Int): Int
+  var path = as_string(load(argv, 0))
+  if path == "/files/data.txt"
+    return 1
+  end
+  return 0
+end
+
+def fio_read_mock(op_name: Int, argc: Int, argv: Int): Int
+  var path = as_string(load(argv, 0))
+  if path == "/files/data.txt"
+    return as_int("HELLO FROM FIXTURE")
+  end
+  return as_int("")
+end
+
+def fallback(req: Request): Response
+  return text_response("not found")
+end
+
+def static_handler(req: Request): Response
+  return _static_handle_request("/", "/files", fallback, req)
+end
+
+def main(): Int
+  var req = Request {
+    method: "GET", path: "/data.txt",
+    query_string: "", body: "",
+    raw_path: "/data.txt",
+    header_keys: vec_new<String>(), header_vals: vec_new<String>(),
+    params: map_new(), query: map_new(), context: map_new()
+  }
+  with FileIo { fio_read: fio_read_mock, fio_exists: fio_exists_mock } do ->
+    with Log { emit: log_cap } do ->
+      var wrapped = with_logging(static_handler)
+      var resp = wrapped(req)
+      puts("body: " + resp.body)
+    end
+  end
+  return 0
+end
+""", "LOG: >> GET /data.txt\nLOG: << 200\nbody: HELLO FROM FIXTURE\n")
+    end
+
+  end
+  return qspec_main()
+end

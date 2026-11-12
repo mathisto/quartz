@@ -1,0 +1,1120 @@
+##! qzmod_remap — Phase 1.4.b: producer→consumer ptype-ID remap helper.
+##!
+##! ## Why we need this
+##!
+##! Producer compiles emit `.qzmod` files containing a TYPES section that
+##! mirrors the producer's `tc.ptype_*` arena verbatim. Sig/field blobs
+##! reference type IDs by producer-global numbering (`PTYPE_BASE + i`).
+##! The consumer's `tc.ptype_*` arena is a separate scheme (its own
+##! interner, indexed differently). To consume a producer's ptype, the
+##! consumer must walk the TYPES section, re-create each entry in its
+##! own arena, and remember the mapping `producer_ptype_idx →
+##! consumer_type_id`.
+##!
+##! ## Scope after Phase 1.4.b.1
+##!
+##! This helper handles:
+##!   - Primitive args (`tid < 1000`) pass through verbatim.
+##!   - PTYPE backreferences (`tid >= PTYPE_BASE`) resolve via the
+##!     in-progress remap table; only references to already-built slots
+##!     are valid (well-formed TYPES is topologically sorted).
+##!   - TYPE_STRUCT / TYPE_ENUM ptypes: arg1 is remapped as a type ID
+##!     (it's the inner generic type); the consumer ptype is then
+##!     stamped with the producer's identity name via `tc_ptype_set_name`
+##!     (e.g. "Point", "Stream"). Cross-module struct/enum resolution
+##!     during inject (Phase 1.4.c) keys off this name.
+##!   - TYPE_FUNCTION ptypes: arg1 is the producer fn_id; the helper
+##!     reads the annotation from `hit.fn_type_annotations[arg1]` and
+##!     re-interns via `tc_register_fn_type` to get a consumer-local
+##!     fn_id. If the consumer hasn't seen this annotation yet (e.g.
+##!     stricter fn-type modes that don't typecheck the producer's
+##!     source independently), the helper registers a new entry with
+##!     param_count=0 + return_type=0 — Phase 1.4.b.2 will ship the
+##!     full param_count / return_type / param_types blobs if cross-
+##!     process fn types need accurate signatures.
+##!
+##! Advisory miss (returns `ok=0`) only on shapes the encoder still
+##! cannot represent:
+##!   - Any arg in the derived-base range (`1000 <= tid < PTYPE_BASE`)
+##!     OTHER than newtypes — union / record / intersection / forall /
+##!     protocol bases. These have their own registries the encoder
+##!     doesn't ship.
+##!   - INC.1.9: newtypes (TYPE_NEWTYPE_BASE..TYPE_UNION_BASE) ARE now
+##!     remapped via `newtype_remap`, a Vec<Int> threaded through
+##!     tc_inject_qzmod indexed by `producer_id - TYPE_NEWTYPE_BASE`.
+##!     Caller accumulates across hits (dep-graph order) so cross-module
+##!     newtype references resolve via earlier-injected hits' Step 5.
+##!   - A forward PTYPE reference (`PTYPE_BASE + i` where `i >= current_slot`)
+##!     — well-formed TYPES is topologically sorted; a forward ref is a
+##!     corruption indicator.
+##!   - TYPE_FUNCTION ptype whose producer fn_id is out of range for the
+##!     shipped `hit.fn_type_annotations` (missing fn_type registry).
+##!
+##! Advisory-miss policy follows design Principle #6 (the cache is
+##! advisory). On miss, the consumer-side caller — Phase 1.4.c
+##! `tc_inject_qzmod` — skips the inject for this hit and falls through
+##! to source compile silently.
+
+import typecheck_util
+import typecheck_registry
+import qzmod_load
+import type_constants
+import string_intern
+import * from str_compat
+
+# =============================================================================
+# QzmodRemapResult — output of `qzmod_build_ptype_remap`.
+#
+# `remap[i]` is the consumer's type ID for the producer's ptype slot `i`.
+# Length matches `hit.types_tag.size` on success.
+# =============================================================================
+
+struct QzmodRemapResult
+  ok: Int                # 1 = built remap, 0 = advisory miss
+  error_reason: String   # diagnostic; empty on success
+  remap: Vec<Int>        # producer ptype_idx → consumer type ID
+end
+
+## Construct an advisory-miss result with the given diagnostic.
+def qzmod_remap_miss(reason: String): QzmodRemapResult
+  return QzmodRemapResult { ok: 0, error_reason: reason, remap: vec_new() }
+end
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+## Remap a single producer-global type ID to a consumer type ID using
+## the in-progress remap table for PTYPE backreferences. Returns the
+## consumer type ID on success, or `-1` if the ID can't be safely
+## remapped (caller treats as advisory miss).
+##
+## Encoding rule (design § 5):
+##   0 <= tid < 1000              -> primitive / well-known; passthrough.
+##   1000 <= tid < PTYPE_BASE     -> derived-base; not yet shippable.
+##   tid >= PTYPE_BASE            -> remap[producer_idx]; producer_idx
+##                                   must be < current_slot.
+def _qzmod_remap_arg(producer_id: Int, remap: Vec<Int>, current_slot: Int, ur: QzmodUnionRecordRemap): Int
+  if producer_id < 0
+    return -1
+  end
+  if producer_id < 1000
+    return producer_id
+  end
+  # D3-container — union / record VALUE band nested in a ptype arg
+  # (Vec<Int|String> stores the union band id in arg1; Map<K,{record}> stores
+  # the record band id in arg2). Consult the per-hit union/record remap built
+  # in tc_inject_qzmod Step 1 (before this ptype walk); -1 (advisory-miss) if
+  # the producer didn't ship this band id's signature (older cache /
+  # non-constructible shape), identical to _qzmod_inject_remap_blob_id's band
+  # handling. Range stops at TYPE_RECORD_BASE+1000 (3999) — intersection
+  # (4000+) and PTYPE (forall / protocol) stay -1 below.
+  if producer_id >= type_constants::TYPE_UNION_BASE and producer_id < type_constants::TYPE_RECORD_BASE + 1000
+    return _qzmod_union_record_lookup(producer_id, ur)
+  end
+  # B.15d/N3.1 step-4a-2 — per-struct nominal ids (STRUCT_TYPE_BASE+idx) are
+  # producer-LOCAL (registration order), so they are not portable across the
+  # qzmod cache. Ship them as the module-invariant generic-struct wildcard
+  # (TYPE_STRUCT) so cross-module ptype args resolve exactly as before the
+  # tc_parse_type flip. Full cross-module nominal identity (ship the name +
+  # name-resolve on inject) is 4a-3. See design §11.13.
+  if producer_id >= type_constants::STRUCT_TYPE_BASE and producer_id < type_constants::PTYPE_BASE
+    return type_constants::TYPE_STRUCT
+  end
+  if producer_id < type_constants::PTYPE_BASE
+    return -1
+  end
+  var producer_idx = producer_id - type_constants::PTYPE_BASE
+  if producer_idx >= current_slot
+    return -1
+  end
+  return remap[producer_idx]
+end
+
+## Phase 1.4.c.2.b — does this ptype base tag use arg2 as a struct_idx
+## discriminator (+1)? Producer-local struct_idx values can't cross
+## process boundaries, so for these tags the remap path looks up the
+## consumer's struct_idx by `ptype_names[i]` instead of passing arg2
+## through verbatim. Tags must mirror `typecheck.qz`'s `tc_make_ptype`
+## call sites: TYPE_VEC (lines 1339, 1367), TYPE_SLICE (1400),
+## TYPE_SLICE_MUT (1426).
+def _qzmod_is_struct_idx_arg2_tag(tag: Int): Int
+  if tag == type_constants::TYPE_VEC
+    return 1
+  end
+  if tag == type_constants::TYPE_SLICE
+    return 1
+  end
+  if tag == type_constants::TYPE_SLICE_MUT
+    return 1
+  end
+  return 0
+end
+
+# =============================================================================
+# Public entry point
+# =============================================================================
+
+## Walk the producer's TYPES section in order, recreate each parametric
+## type in the consumer's `tc.ptype_*` arena via `tc_make_ptype`, and
+## return a `QzmodRemapResult` whose `remap[i]` is the consumer type ID
+## for the producer's ptype slot `i`.
+##
+## Returns ok=0 on the first entry the narrow Phase 1.4.b helper can't
+## safely reproduce (see file header). Caller treats as advisory miss.
+def qzmod_build_ptype_remap(tc: TypecheckState, hit: QzmodLoadResult, ur: QzmodUnionRecordRemap): QzmodRemapResult
+  var n = hit.types_tag.size
+  var remap = vec_new()
+  for _ri in 0..n
+    remap.push(0)
+  end
+
+  for i in 0..n
+    var tag = hit.types_tag[i]
+    var a1 = hit.types_arg1[i]
+    var a2 = hit.types_arg2[i]
+    var slot_name = ""
+    if i < hit.ptype_names.size
+      slot_name = hit.ptype_names[i]
+    end
+
+    var consumer_id = 0
+
+    if tag == type_constants::TYPE_FUNCTION
+      # TYPE_FUNCTION arg1 is a producer fn_id; re-intern via the
+      # consumer's fn_type registry by annotation. The encoder ships
+      # `hit.fn_type_annotations` indexed by producer fn_id; if the slot
+      # is out of range, the encoder failed to ship the registry (older
+      # producer or corruption).
+      if a1 < 0 or a1 >= hit.fn_type_annotations.size
+        return qzmod_remap_miss("Phase 1.4.b.1 advisory miss: TYPES[#{i}] TYPE_FUNCTION fn_id #{a1} out of fn_type_annotations range #{hit.fn_type_annotations.size}")
+      end
+      var annotation = hit.fn_type_annotations[a1]
+      var consumer_fn_id = typecheck_registry::tc_register_fn_type(tc, annotation, 0, 0)
+      # arg2 for TYPE_FUNCTION is currently 0 (not load-bearing in
+      # producer construction; pass through verbatim).
+      consumer_id = typecheck::tc_make_ptype(tc, tag, consumer_fn_id, a2)
+    else
+      var consumer_a1 = _qzmod_remap_arg(a1, remap, i, ur)
+      if consumer_a1 < 0
+        return qzmod_remap_miss("Phase 1.4.b.1 advisory miss: TYPES[#{i}] arg1 unmappable (raw #{a1})")
+      end
+
+      # Phase 1.4.c.2.b — TYPE_VEC/SLICE/SLICE_MUT carry the element
+      # struct/enum's struct_idx (+1) in arg2 to disambiguate
+      # `Vec<Point>` from `Vec<Triple>`. Producer-local struct_idx
+      # values don't round-trip cross-process — pre-register caller
+      # (compile()'s Phase 4.0 pre-pass via tc_inject_qzmod) ensures
+      # the consumer's tc.registry has the named struct/enum by the
+      # time we hit this branch, so we can resolve arg2 by name via
+      # `tc_lookup_struct` / `tc_lookup_enum`. The standard remap path
+      # (passthrough for small ints / ptype lookup for PTYPE_BASE+ ids)
+      # is the fallback when no name is available.
+      var consumer_a2 = 0
+      var arg2_resolved = 0
+      if a2 != 0 and str_byte_len(slot_name) > 0 and _qzmod_is_struct_idx_arg2_tag(tag)
+        var sres = typecheck_registry::tc_lookup_struct(tc, slot_name)
+        if sres.is_found() == 1
+          consumer_a2 = sres.unwrap() + 1
+          arg2_resolved = 1
+        else
+          var eres = typecheck_registry::tc_lookup_enum(tc, slot_name)
+          if eres.is_found() == 1
+            consumer_a2 = eres.unwrap() + 1
+            arg2_resolved = 1
+          end
+        end
+      end
+      if arg2_resolved == 0 and a2 != 0
+        consumer_a2 = _qzmod_remap_arg(a2, remap, i, ur)
+        if consumer_a2 < 0
+          return qzmod_remap_miss("Phase 1.4.b.1 advisory miss: TYPES[#{i}] arg2 unmappable (raw #{a2})")
+        end
+      end
+
+      consumer_id = typecheck::tc_make_ptype(tc, tag, consumer_a1, consumer_a2)
+    end
+
+    # Stamp the consumer ptype with the producer's identity name
+    # (TYPE_STRUCT/TYPE_ENUM struct/enum name, Stream tag, Vec<Point>
+    # element name, …). Empty strings are fine — `tc_make_ptype` already
+    # pushed "" so no-op semantics hold.
+    if str_byte_len(slot_name) > 0
+      typecheck::tc_ptype_set_name(tc, consumer_id, slot_name)
+    end
+
+    remap[i] = consumer_id
+  end
+
+  return QzmodRemapResult { ok: 1, error_reason: "", remap: remap }
+end
+
+# =============================================================================
+# Phase 1.4.c.1 — full inject body
+# =============================================================================
+#
+# `tc_inject_qzmod` is the consumer-side counterpart of
+# `qzmod_emit::qzmod_emit_module`. It populates `tc.registry` from a
+# `QzmodLoadResult` so that the consumer's downstream typecheck +
+# typecheck-bodies + MIR + codegen passes find the imported module's
+# decls already registered.
+#
+# Phase 1.4.c.1 scope (mirror of Phase 4.0a/d/e/f, NOT 4.0b/c):
+#   - structs (with remapped field types + type_params + field_annotations)
+#   - enums (with remapped variant payloads + type_params + variant_anns)
+#   - type aliases (string passthrough)
+#   - newtypes (string passthrough + type_id allocation)
+#   - effect decls (with remapped op return / param types)
+#   - funcs (with remapped param types + return type)
+#
+# Deliberately skipped:
+#   - traits (method_sigs are integer handles to producer-local arrays —
+#     non-portable; will revisit in 1.4.c.2 or 1.4.d).
+#   - impls (cross-module name attribution — revisit in 1.4.c.2).
+#   - consts / globals (Phase 1.1 ships names only; real type plumbing
+#     pending).
+#
+# Returns 1 on success (inject completed; caller should tag-skip this
+# module's AST entries in Phase 4.0a/d/e/f and Phase 4.1). Returns 0 on
+# advisory miss (any remap failure or unshippable shape); caller leaves
+# the AST-path to register the module from scratch.
+#
+# Per design Principle #6 (cache is advisory) every failure mode is
+# silent — no panics, no exits.
+
+## Remap a producer-global type ID for blob entries (struct fields, enum
+## payloads, func sigs, effect op types). Unlike `_qzmod_remap_arg`,
+## blob entries can reference any TYPES slot (no forward-ref rule;
+## TYPES walked first).
+##
+##   0 <= tid < 1000                          -> primitive; passthrough.
+##   1000 <= tid < TYPE_UNION_BASE (2000)     -> newtype; consult `newtype_remap`
+##                                               (INC.1.9). -1 if unmapped.
+##   TYPE_UNION_BASE <= tid < PTYPE_BASE      -> union / record /
+##                                               intersection / forall /
+##                                               protocol — advisory-miss.
+##   tid >= PTYPE_BASE                        -> remap[idx]; idx must be
+##                                               in range.
+##
+## `newtype_remap` is indexed by `producer_id - TYPE_NEWTYPE_BASE` and
+## carries consumer-side newtype IDs. Slots may be -1 (uninitialized) —
+## treated as advisory-miss.
+##
+## Returns -1 on unmappable.
+## D3 — producer→consumer remap for the union / record VALUE band
+## (TYPE_UNION_BASE..TYPE_RECORD_BASE+1000). Two parallel-vec maps
+## (`producer_ids` → `consumer_ids`) built once per hit from the shipped
+## `union_sig_*` / `record_sig_*` tables by re-interning each structural
+## signature in the consumer's registry. Mirrors the newtype_remap idea but
+## keyed by the full band id (band ids aren't a dense 0-based index), and
+## per-hit rather than cross-hit-threaded — each shipped signature belongs to
+## the SAME producer module whose blobs reference the id, so re-interning it
+## locally yields the id the blob needs. Re-interning is idempotent, so a
+## signature already present in the consumer resolves to its existing id.
+struct QzmodUnionRecordRemap
+  union_producer_ids: Vec<Int>
+  union_consumer_ids: Vec<Int>
+  record_producer_ids: Vec<Int>
+  record_consumer_ids: Vec<Int>
+end
+
+## Build the union/record band remap for one hit by re-interning every
+## shipped structural signature into `tc`'s registry.
+def _qzmod_build_union_record_remap(tc: TypecheckState, hit: QzmodLoadResult): QzmodUnionRecordRemap
+  var union_prod = vec_new<Int>()
+  var union_cons = vec_new<Int>()
+  var record_prod = vec_new<Int>()
+  var record_cons = vec_new<Int>()
+
+  for ui in 0..hit.union_sig_ids.size
+    var producer_id = hit.union_sig_ids[ui]
+    var members = ""
+    if ui < hit.union_sig_members.size
+      members = hit.union_sig_members[ui]
+    end
+    # Split the pipe-joined member string back into parts (respecting <>{}
+    # nesting) and re-intern via tc_register_union → consumer band id.
+    var parts = typecheck_registry::tc_split_type_union(members)
+    var consumer_id = typecheck_registry::tc_register_union(tc, parts)
+    union_prod.push(producer_id)
+    union_cons.push(consumer_id)
+  end
+
+  for ri in 0..hit.record_sig_ids.size
+    var producer_id = hit.record_sig_ids[ri]
+    var field_names = vec_new<String>()
+    var field_types = vec_new<String>()
+    _qzmod_decode_record_sig(hit, ri, field_names, field_types)
+    # Re-intern via tc_register_record (interns by canonical signature →
+    # existing id if already present) → consumer band id.
+    var consumer_id = typecheck_registry::tc_register_record(tc, field_names, field_types)
+    record_prod.push(producer_id)
+    record_cons.push(consumer_id)
+  end
+
+  return QzmodUnionRecordRemap {
+    union_producer_ids: union_prod,
+    union_consumer_ids: union_cons,
+    record_producer_ids: record_prod,
+    record_consumer_ids: record_cons
+  }
+end
+
+## Decode one record-sig blob slot into parallel field-name / field-type
+## strvecs. Blob layout per record: [n_fields, name_idx_0, type_idx_0, ...]
+## with both indices resolving through the strings pool. Out-of-range /
+## corrupt entries decode to "" (advisory-tolerant, no crash).
+def _qzmod_decode_record_sig(hit: QzmodLoadResult, ri: Int, field_names_out: Vec<String>, field_types_out: Vec<String>): Void
+  if ri >= hit.record_sig_off.size
+    return
+  end
+  var off = hit.record_sig_off[ri]
+  if off < 0 or off >= hit.record_sig_blob.size
+    return
+  end
+  var n_fields = hit.record_sig_blob[off]
+  for fi in 0..n_fields
+    var name_slot = off + 1 + 2 * fi
+    var type_slot = name_slot + 1
+    var fname = ""
+    var ftype = ""
+    if name_slot < hit.record_sig_blob.size
+      var nidx = hit.record_sig_blob[name_slot]
+      if nidx >= 0 and nidx < hit.strings.size
+        fname = hit.strings[nidx]
+      end
+    end
+    if type_slot < hit.record_sig_blob.size
+      var tidx = hit.record_sig_blob[type_slot]
+      if tidx >= 0 and tidx < hit.strings.size
+        ftype = hit.strings[tidx]
+      end
+    end
+    field_names_out.push(fname)
+    field_types_out.push(ftype)
+  end
+end
+
+## D3 — look up a producer band id in the union/record remap. Returns the
+## consumer band id, or -1 if the producer didn't ship this id's signature
+## (advisory-miss — pre-D3 behavior for the band).
+def _qzmod_union_record_lookup(producer_id: Int, ur: QzmodUnionRecordRemap): Int
+  if producer_id >= type_constants::TYPE_UNION_BASE and producer_id < type_constants::TYPE_RECORD_BASE
+    for i in 0..ur.union_producer_ids.size
+      if ur.union_producer_ids[i] == producer_id
+        return ur.union_consumer_ids[i]
+      end
+    end
+    return -1
+  end
+  if producer_id >= type_constants::TYPE_RECORD_BASE and producer_id < type_constants::TYPE_RECORD_BASE + 1000
+    for i in 0..ur.record_producer_ids.size
+      if ur.record_producer_ids[i] == producer_id
+        return ur.record_consumer_ids[i]
+      end
+    end
+    return -1
+  end
+  return -1
+end
+
+def _qzmod_inject_remap_blob_id(producer_id: Int, remap: Vec<Int>, newtype_remap: Vec<Int>, ur: QzmodUnionRecordRemap): Int
+  if producer_id < 0
+    return -1
+  end
+  if producer_id < 1000
+    return producer_id
+  end
+  if producer_id < type_constants::TYPE_UNION_BASE
+    # INC.1.9 — newtype slice of the derived-base range. Consult
+    # newtype_remap; -1 if the producer didn't ship this newtype or the
+    # consumer hasn't registered it yet (a deferred hit could repair it).
+    var nt_idx = producer_id - type_constants::TYPE_NEWTYPE_BASE
+    if nt_idx < 0 or nt_idx >= newtype_remap.size
+      return -1
+    end
+    var mapped = newtype_remap[nt_idx]
+    if mapped < 0
+      return -1
+    end
+    return mapped
+  end
+  # D3 — union / record VALUE band. Consult the per-hit union/record remap
+  # built from the shipped structural-signature tables; -1 (advisory-miss,
+  # pre-D3 behavior) when the producer didn't ship this band id's signature
+  # (older `.qzmod` cache, or a shape outside the constructible-value scope).
+  # INTERSECTION (TYPE_INTERSECTION_BASE=4000) + the PTYPE band
+  # (forall / protocol) stay advisory-miss: an all-record intersection is
+  # already a plain TYPE_RECORD id (rides the record path), and mixed /
+  # bound-only intersections + forall / protocol aren't constructible values.
+  if producer_id < type_constants::TYPE_RECORD_BASE + 1000
+    return _qzmod_union_record_lookup(producer_id, ur)
+  end
+  # B.15d/N3.1 step-4a-2 — per-struct nominal ids (STRUCT_TYPE_BASE+idx) are
+  # producer-LOCAL; ship struct-typed blob entries (func sigs, struct fields,
+  # enum payloads) as the module-invariant generic-struct wildcard TYPE_STRUCT
+  # so they remap exactly as bare structs did before the flip. 4a-3 ships the
+  # name for full cross-module nominal identity. See design §11.13.
+  if producer_id >= type_constants::STRUCT_TYPE_BASE and producer_id < type_constants::PTYPE_BASE
+    return type_constants::TYPE_STRUCT
+  end
+  if producer_id < type_constants::PTYPE_BASE
+    return -1
+  end
+  var idx = producer_id - type_constants::PTYPE_BASE
+  if idx >= remap.size
+    return -1
+  end
+  return remap[idx]
+end
+
+## Decode + remap one struct's fields blob slot.
+##
+## Returns a `Vec<Int>` of consumer-space field type IDs, OR an empty
+## Vec on advisory miss. Caller distinguishes via the `ok` out-parameter
+## (Vec<Int>'s `out_ok`: 1 = ok, 0 = miss).
+def _qzmod_inject_decode_struct_fields(
+  hit: QzmodLoadResult,
+  si: Int,
+  remap: Vec<Int>,
+  newtype_remap: Vec<Int>,
+  ur: QzmodUnionRecordRemap,
+  field_names_out: Vec<String>,
+  field_types_out: Vec<Int>
+): Int
+  if si >= hit.struct_fields_off.size
+    return 0
+  end
+  var off = hit.struct_fields_off[si]
+  if off >= hit.struct_fields_blob.size
+    return 0
+  end
+  var n_fields = hit.struct_fields_blob[off]
+  # is_linear at off+1 — read by caller via hit.struct_fields_blob[off+1].
+  for fi in 0..n_fields
+    var name_slot = off + 2 + 2 * fi
+    var type_slot = name_slot + 1
+    if type_slot >= hit.struct_fields_blob.size
+      return 0
+    end
+    var name_idx = hit.struct_fields_blob[name_slot]
+    var fname = ""
+    if name_idx >= 0 and name_idx < hit.strings.size
+      fname = hit.strings[name_idx]
+    end
+    field_names_out.push(fname)
+    var producer_t = hit.struct_fields_blob[type_slot]
+    var consumer_t = _qzmod_inject_remap_blob_id(producer_t, remap, newtype_remap, ur)
+    if consumer_t < 0
+      return 0
+    end
+    field_types_out.push(consumer_t)
+  end
+  return 1
+end
+
+## Decode + remap one enum's variants blob slot.
+##
+## Blob layout per enum (Phase 1.4.c.2.b — supersedes broken Phase 1.1
+## flat layout):
+##   [n_variants,
+##    name_idx_0, n_payloads_0, payload_type_0_0, ...,
+##    name_idx_1, n_payloads_1, payload_type_1_0, ...,
+##    ...]
+##
+## Returns 1 on success, 0 on advisory miss. `variant_payloads_out` is
+## populated with one inner `Vec<Int>` per variant — matching
+## `tc.registry.enum_variant_payloads`'s `Vec<Vec<Int>>` shape.
+def _qzmod_inject_decode_enum_variants(
+  hit: QzmodLoadResult,
+  ei: Int,
+  remap: Vec<Int>,
+  newtype_remap: Vec<Int>,
+  ur: QzmodUnionRecordRemap,
+  variant_names_out: Vec<String>,
+  variant_payloads_out: Vec<Vec<Int>>
+): Int
+  if ei >= hit.enum_variants_off.size
+    return 0
+  end
+  var off = hit.enum_variants_off[ei]
+  if off >= hit.enum_variants_blob.size
+    return 0
+  end
+  var n_variants = hit.enum_variants_blob[off]
+  var cur = off + 1
+  for _vi in 0..n_variants
+    if cur >= hit.enum_variants_blob.size
+      return 0
+    end
+    var name_idx = hit.enum_variants_blob[cur]
+    cur = cur + 1
+    var nm = ""
+    if name_idx >= 0 and name_idx < hit.strings.size
+      nm = hit.strings[name_idx]
+    end
+    variant_names_out.push(nm)
+    if cur >= hit.enum_variants_blob.size
+      return 0
+    end
+    var n_payloads = hit.enum_variants_blob[cur]
+    cur = cur + 1
+    var v_payloads = vec_new<Int>()
+    for _pi in 0..n_payloads
+      if cur >= hit.enum_variants_blob.size
+        return 0
+      end
+      var producer_t = hit.enum_variants_blob[cur]
+      var consumer_t = _qzmod_inject_remap_blob_id(producer_t, remap, newtype_remap, ur)
+      if consumer_t < 0
+        return 0
+      end
+      v_payloads.push(consumer_t)
+      cur = cur + 1
+    end
+    variant_payloads_out.push(v_payloads)
+  end
+  return 1
+end
+
+## Decode + remap one func's sig blob slot.
+##
+## Blob layout per func:
+##   [n_params, return_type_id, required_count, param_type_0, ...]
+##
+## Returns 1 on success, 0 on advisory miss.
+def _qzmod_inject_decode_func_sig(
+  hit: QzmodLoadResult,
+  fi: Int,
+  remap: Vec<Int>,
+  newtype_remap: Vec<Int>,
+  ur: QzmodUnionRecordRemap,
+  param_types_out: Vec<Int>,
+  return_type_out: Vec<Int>,    # single-cell vec to return-by-ref
+  required_count_out: Vec<Int>  # same
+): Int
+  if fi >= hit.func_sig_off.size
+    return 0
+  end
+  var off = hit.func_sig_off[fi]
+  if off + 2 >= hit.func_sig_blob.size
+    return 0
+  end
+  var n_params = hit.func_sig_blob[off]
+  var producer_ret = hit.func_sig_blob[off + 1]
+  var required = hit.func_sig_blob[off + 2]
+  var consumer_ret = _qzmod_inject_remap_blob_id(producer_ret, remap, newtype_remap, ur)
+  if consumer_ret < 0
+    return 0
+  end
+  return_type_out.push(consumer_ret)
+  required_count_out.push(required)
+  for pi in 0..n_params
+    var slot = off + 3 + pi
+    if slot >= hit.func_sig_blob.size
+      return 0
+    end
+    var producer_p = hit.func_sig_blob[slot]
+    var consumer_p = _qzmod_inject_remap_blob_id(producer_p, remap, newtype_remap, ur)
+    if consumer_p < 0
+      return 0
+    end
+    param_types_out.push(consumer_p)
+  end
+  return 1
+end
+
+## Decode + remap effect declarations.
+##
+## Blob layout per effect:
+##   [n_ops, name_idx, kind, return_type, n_params, param_type_0, ..., next_op...]
+##
+## Walks all effects, registering each via `tc_register_effect_decl`.
+## Returns 1 on full success, 0 on first advisory miss.
+def _qzmod_inject_effects(hit: QzmodLoadResult, tc: TypecheckState, remap: Vec<Int>, newtype_remap: Vec<Int>, ur: QzmodUnionRecordRemap): Int
+  for ei in 0..hit.effect_names.size
+    if ei >= hit.effect_ops_off.size
+      return 0
+    end
+    var off = hit.effect_ops_off[ei]
+    if off >= hit.effect_ops_blob.size
+      return 0
+    end
+    var n_ops = hit.effect_ops_blob[off]
+    var op_names = vec_new<String>()
+    var op_kinds = vec_new<Int>()
+    var op_param_types = vec_new<Vec<Int>>()
+    var op_return_types = vec_new<Int>()
+    var cur = off + 1
+    for _oi in 0..n_ops
+      if cur + 3 >= hit.effect_ops_blob.size
+        return 0
+      end
+      var name_idx = hit.effect_ops_blob[cur]
+      var kind = hit.effect_ops_blob[cur + 1]
+      var producer_ret = hit.effect_ops_blob[cur + 2]
+      var n_params = hit.effect_ops_blob[cur + 3]
+      var op_name = ""
+      if name_idx >= 0 and name_idx < hit.strings.size
+        op_name = hit.strings[name_idx]
+      end
+      var consumer_ret = _qzmod_inject_remap_blob_id(producer_ret, remap, newtype_remap, ur)
+      if consumer_ret < 0
+        return 0
+      end
+      var params = vec_new<Int>()
+      cur = cur + 4
+      for _pi in 0..n_params
+        if cur >= hit.effect_ops_blob.size
+          return 0
+        end
+        var producer_p = hit.effect_ops_blob[cur]
+        var consumer_p = _qzmod_inject_remap_blob_id(producer_p, remap, newtype_remap, ur)
+        if consumer_p < 0
+          return 0
+        end
+        params.push(consumer_p)
+        cur = cur + 1
+      end
+      op_names.push(op_name)
+      op_kinds.push(kind)
+      op_return_types.push(consumer_ret)
+      op_param_types.push(params)
+    end
+    var _eidx = typecheck_registry::tc_register_effect_decl(tc, hit.effect_names[ei], op_names, op_kinds, op_param_types, op_return_types)
+  end
+  return 1
+end
+
+## Public entry — inject a single `QzmodLoadResult` into `tc.registry`.
+##
+## `newtype_remap` is an in-out Vec<Int> indexed by `producer_id -
+## TYPE_NEWTYPE_BASE`. Caller (compile() Phase 4.0) allocates ONCE and
+## passes the same vec to every hit in dep-graph order. Each hit's Step
+## 5 extends the vec with its own newtypes so later hits (which import
+## the earlier module) can resolve cross-module newtype references in
+## their func_sig_blob / struct_fields_blob / enum_variants_blob /
+## effect_ops_blob. Pre-INC.1.9 the producer didn't ship newtype IDs at
+## all → newtype-typed sigs returned advisory-miss → ~17 self-hosted
+## compiler modules force-recompiled on every warm build.
+##
+## Spec tests pass `vec_new<Int>()` per hit — single-module hits don't
+## reference cross-module newtypes, so per-hit accumulation suffices.
+##
+## Returns 1 on success (caller may tag-skip this module's AST entries),
+## 0 on advisory miss (caller leaves AST-path to handle the module).
+def tc_inject_qzmod(tc: TypecheckState, hit: QzmodLoadResult, newtype_remap: Vec<Int>): Int
+  if hit.ok == 0
+    return 0
+  end
+
+  # Step 0 — pre-register struct / enum names with empty bodies. Required
+  # by Phase 1.4.c.2.b: `qzmod_build_ptype_remap` resolves
+  # TYPE_VEC/SLICE/SLICE_MUT arg2 (struct_idx + 1) by name lookup against
+  # `tc.registry`, so the named struct/enum must be registered BEFORE
+  # the remap walks the TYPES section. Bodies are filled in below via
+  # `tc_update_struct_fields` / `tc_update_enum_variants`. Cross-module
+  # references resolve thanks to the resolver's post-order hit traversal
+  # (deps inject first); same-module references resolve thanks to
+  # ordering within this Step 0 (names registered before remap runs).
+  for si in 0..hit.struct_names.size
+    var sname = hit.struct_names[si]
+    var sres = typecheck_registry::tc_lookup_struct(tc, sname)
+    if sres.is_found() == 0
+      typecheck_registry::tc_register_struct(
+        tc, sname, vec_new<String>(), vec_new<Int>(),
+        "", vec_new<String>(), 0, vec_new<Int>()
+      )
+    end
+  end
+  for ei in 0..hit.enum_names.size
+    var ename = hit.enum_names[ei]
+    var eres = typecheck_registry::tc_lookup_enum(tc, ename)
+    if eres.is_found() == 0
+      typecheck_registry::tc_register_enum(
+        tc, ename, vec_new<String>(), vec_new<Int>(),
+        "", vec_new<String>()
+      )
+    end
+  end
+
+  # Step 1 (D3 / D3-container) — build the union / record VALUE band remap by
+  # re-interning every shipped structural signature into this consumer's
+  # registry. Runs BEFORE the ptype remap (Step 2) so `_qzmod_remap_arg` can
+  # resolve a container-NESTED band id (Vec<Int|String> stores the union band
+  # id in a ptype arg slot), and before the blob decodes (Steps 2/3/6/7/8) so
+  # `_qzmod_inject_remap_blob_id` can resolve band ids that reference a
+  # returned / passed / stored union or record value. Re-interning is a pure
+  # idempotent register-or-return-existing with no dependency on the ptype
+  # arena being walked, so building `ur` first is order-safe. Empty tables
+  # (older `.qzmod` cache or a module with no cross-module structural value)
+  # yield an empty remap → band ids advisory-miss, exactly the pre-D3 behavior.
+  var ur = _qzmod_build_union_record_remap(tc, hit)
+
+  # Step 2 — walk TYPES + build producer→consumer ptype remap. Threads `ur`
+  # so nested band ids in ptype arg slots resolve to consumer-space.
+  var remap_res = qzmod_build_ptype_remap(tc, hit, ur)
+  if remap_res.ok == 0
+    return 0
+  end
+  var remap = remap_res.remap
+
+  # Step 2 — structs. Field types are remapped through `remap`. The slot
+  # was pre-registered in Step 0; we update the body in place rather than
+  # pushing a duplicate.
+  for si in 0..hit.struct_names.size
+    var field_names = vec_new<String>()
+    var field_types = vec_new<Int>()
+    var ok = _qzmod_inject_decode_struct_fields(hit, si, remap, newtype_remap, ur, field_names, field_types)
+    if ok == 0
+      return 0
+    end
+    var is_linear = 0
+    if si < hit.struct_fields_off.size
+      var off = hit.struct_fields_off[si]
+      if off + 1 < hit.struct_fields_blob.size
+        is_linear = hit.struct_fields_blob[off + 1]
+      end
+    end
+    var type_params = ""
+    if si < hit.struct_type_params.size
+      type_params = hit.struct_type_params[si]
+    end
+    var field_annotations = vec_new<String>()
+    if si < hit.struct_field_annotations.size
+      field_annotations = hit.struct_field_annotations[si]
+    end
+    var sres = typecheck_registry::tc_lookup_struct(tc, hit.struct_names[si])
+    if sres.is_found() == 1
+      typecheck_registry::tc_update_struct_fields(
+        tc, sres.unwrap(), field_names, field_types,
+        type_params, field_annotations, is_linear
+      )
+    end
+  end
+
+  # Step 3 — enums. Variant payloads are remapped through `remap`. Same
+  # pre-register-then-update pattern as Step 2.
+  for ei in 0..hit.enum_names.size
+    var variant_names = vec_new<String>()
+    var variant_payloads = vec_new<Vec<Int>>()
+    var ok = _qzmod_inject_decode_enum_variants(hit, ei, remap, newtype_remap, ur, variant_names, variant_payloads)
+    if ok == 0
+      return 0
+    end
+    var type_params = ""
+    if ei < hit.enum_type_params.size
+      type_params = hit.enum_type_params[ei]
+    end
+    # Phase 1.4.c.2.b — variant_field_annotations is 3-D (per-variant
+    # × per-payload-field). `hit.enum_variant_field_annotations[ei]`
+    # is now a `Vec<Vec<String>>` decoded by `_qzmod_load_anns_3d`.
+    # Heap-untyped, so the Vec<String> declaration on the load result
+    # holds the same handle either way.
+    var variant_anns = vec_new<Vec<String>>()
+    if ei < hit.enum_variant_field_annotations.size
+      var loose = hit.enum_variant_field_annotations[ei]
+      variant_anns = loose
+    end
+    var eres = typecheck_registry::tc_lookup_enum(tc, hit.enum_names[ei])
+    if eres.is_found() == 1
+      typecheck_registry::tc_update_enum_variants(
+        tc, eres.unwrap(), variant_names, variant_payloads,
+        type_params, variant_anns
+      )
+    end
+  end
+
+  # Step 4 — type aliases (string passthrough).
+  for ai in 0..hit.type_alias_names.size
+    var aliased = ""
+    if ai < hit.type_alias_targets.size
+      aliased = hit.type_alias_targets[ai]
+    end
+    typecheck::tc_register_type_alias(tc, hit.type_alias_names[ai], aliased)
+  end
+
+  # Step 5 — newtypes. Register consumer-side, then extend `newtype_remap`
+  # so cross-module func sigs / struct fields / enum payloads / effect
+  # ops referencing this newtype's producer-global ID can resolve.
+  #
+  # INC.1.9 — `hit.newtype_type_ids[ni]` carries the producer-global ID
+  # (TYPE_NEWTYPE_BASE + producer_global_idx). The consumer's
+  # `tc_register_newtype` mints a consumer-side ID (TYPE_NEWTYPE_BASE +
+  # consumer_global_idx). We map producer_idx → consumer_id by name,
+  # which round-trips because `tc.registry.newtype_names` carries the
+  # same module-prefixed names ("string_intern$InternId", etc.) the
+  # producer used.
+  for ni in 0..hit.newtype_names.size
+    var nt_name = hit.newtype_names[ni]
+    var wrapped = ""
+    if ni < hit.newtype_wrapped.size
+      wrapped = hit.newtype_wrapped[ni]
+    end
+    # STRICT_NEWTYPES_QZMOD — thread the per-newtype strict flag through
+    # the cross-module inject path. Missing entry (older `.qzmod` files
+    # or modules without any `@strict` newtype) defaults to 0 (loose),
+    # so pre-MINOR=1 caches stay consistent with their original semantics.
+    var nt_strict = 0
+    if ni < hit.newtype_strict_flags.size
+      nt_strict = hit.newtype_strict_flags[ni]
+    end
+    typecheck::tc_register_newtype(tc, nt_name, wrapped, nt_strict)
+    if ni < hit.newtype_type_ids.size
+      var producer_id = hit.newtype_type_ids[ni]
+      var producer_idx = producer_id - type_constants::TYPE_NEWTYPE_BASE
+      var consumer_id = typecheck::tc_lookup_newtype_id(tc, nt_name)
+      if producer_idx >= 0 and consumer_id > 0
+        # Grow newtype_remap to fit producer_idx, padding empty slots
+        # with -1 (advisory-miss marker for unmapped IDs).
+        while newtype_remap.size <= producer_idx
+          newtype_remap.push(-1)
+        end
+        newtype_remap[producer_idx] = consumer_id
+      end
+    end
+  end
+
+  # Step 6 — effect declarations (remapped op return / param types).
+  var eff_ok = _qzmod_inject_effects(hit, tc, remap, newtype_remap, ur)
+  if eff_ok == 0
+    return 0
+  end
+
+  # Step 7 — funcs (with effect rows, Phase 1.4.c.3).
+  #
+  # Decode each sig + register via `tc_register_function`. If the func
+  # carried a `can`-row at producer time (state >= 1), re-create the row
+  # consumer-side: labels re-intern via `string_intern::intern_id` to
+  # produce intern IDs that match the consumer's other use sites; open
+  # rows (state==2) allocate a fresh erv tail (`tc_erv_fresh`) since
+  # the producer's erv id isn't portable across processes.
+  #
+  # Advisory miss: any sig decode failure returns 0 (caller leaves
+  # AST-path to handle the module from scratch). Empty label slot for
+  # state==0 is the explicit untracked case — the slot keeps
+  # `func_effect_row_idx[fidx] = -1` from `tc_register_function`'s
+  # default.
+  for fi in 0..hit.func_names.size
+    var fname = hit.func_names[fi]
+    var param_types = vec_new<Int>()
+    var return_type_out = vec_new<Int>()
+    var required_count_out = vec_new<Int>()
+    var sig_ok = _qzmod_inject_decode_func_sig(hit, fi, remap, newtype_remap, ur, param_types, return_type_out, required_count_out)
+    if sig_ok == 0
+      return 0
+    end
+    var return_type = return_type_out[0]
+    var required_count = required_count_out[0]
+    typecheck_registry::tc_register_function(tc, fname, param_types, return_type, required_count)
+    var fidx = typecheck_registry::tc_lookup_function_index(tc, fname)
+    if fidx < 0
+      return 0
+    end
+
+    # Phase 1.4.c.3 — restore the AST-path's per-function string fields
+    # (return + param annotations, param names, generics). Without
+    # these, cross-module UFCS calls lose struct/enum identity at the
+    # call site and surface as QZ0200 type mismatches.
+    if fi < hit.func_return_annotations.size
+      var _ra = hit.func_return_annotations[fi]
+      if fidx < tc.registry.func_return_annotations.size
+        tc.registry.func_return_annotations[fidx] = _ra
+      end
+    end
+    if fi < hit.func_param_annotations.size
+      var _pa = hit.func_param_annotations[fi]
+      if fidx < tc.registry.func_param_annotations.size
+        tc.registry.func_param_annotations[fidx] = _pa
+      end
+    end
+    if fi < hit.func_param_names.size
+      var _pn = hit.func_param_names[fi]
+      if fidx < tc.registry.func_param_names.size
+        tc.registry.func_param_names[fidx] = _pn
+      end
+    end
+    if fi < hit.func_type_params.size
+      var _tp = hit.func_type_params[fi]
+      if fidx < tc.registry.func_type_params.size
+        tc.registry.func_type_params[fidx] = _tp
+      end
+    end
+    if fi < hit.func_type_param_bounds.size
+      var _tpb = hit.func_type_param_bounds[fi]
+      if fidx < tc.registry.func_type_param_bounds.size
+        tc.registry.func_type_param_bounds[fidx] = _tpb
+      end
+    end
+    # Rebuild the Vec<Int> for Fn-typed param annotations. Empty
+    # string slots push 0 (non-Fn param sentinel matching the
+    # AST-path's behavior).
+    if fi < hit.func_param_fn_anns_starts.size and fi < hit.func_param_fn_anns_counts.size
+      var _fn_start = hit.func_param_fn_anns_starts[fi]
+      var _fn_count = hit.func_param_fn_anns_counts[fi]
+      var _fn_vec = vec_new<Int>()
+      for _j in 0.._fn_count
+        var _slot = _fn_start + _j
+        var _s = ""
+        if _slot < hit.func_param_fn_anns.size
+          _s = hit.func_param_fn_anns[_slot]
+        end
+        if str_byte_len(_s) > 0
+          _fn_vec.push(as_int(_s))
+        else
+          _fn_vec.push(0)
+        end
+      end
+      if fidx < tc.registry.func_param_fn_annotations.size
+        tc.registry.func_param_fn_annotations[fidx] = _fn_vec
+      end
+    end
+
+    var state = 0
+    if fi < hit.func_effect_state.size
+      state = hit.func_effect_state[fi]
+    end
+    if state >= 1
+      var label_strs = vec_new<String>()
+      if fi < hit.func_effect_labels.size
+        label_strs = hit.func_effect_labels[fi]
+      end
+      var label_ids = vec_new<Int>()
+      for li in 0..label_strs.size
+        label_ids.push(string_intern::intern_id(tc.interner, label_strs[li]))
+      end
+      var tail_var = -1
+      if state == 2
+        tail_var = typecheck_util::tc_erv_fresh(tc)
+      end
+      var row_id = typecheck_registry::tc_row_new(tc, label_ids, tail_var)
+      typecheck_registry::tc_set_func_effect_row(tc, fidx, row_id)
+    end
+  end
+
+  # Step 8 — traits. Mirror of AST-path Phase 4.0b
+  # (`typecheck::tc_register_trait_def`). The encoder ships per-trait:
+  #   - name + type_params + super_traits (from Phase 1.4.c.0)
+  #   - methods blob with the Phase 1.4.d layout
+  #     `[n_methods, name_idx_0, default_0, n_params_0, return_type_0, p0_0, ..., name_idx_1, ...]`
+  #
+  # Reconstruct the consumer's `Vec<Vec<Int>>` method_sigs (heap shape
+  # `[param_types_handle, return_type]` per method) directly. Type IDs
+  # in the blob are producer-global; remap through the same path used
+  # by funcs / structs / enums. Effect rows on trait methods stay
+  # untracked here (defaults to -1 per method via `tc_register_trait`'s
+  # `empty_rows` push). P3.F.3 polymorphic-row trait methods aren't
+  # round-tripped in Phase 1.4.d — the producer hasn't shipped them.
+  #
+  # Idempotency: skip when a trait by this name is already registered
+  # (e.g. a builtin trait Drop/Iterator/AsyncIterator, or a re-export
+  # via two hit modules).
+  for ti in 0..hit.trait_names.size
+    var tname = hit.trait_names[ti]
+    var tres = typecheck_registry::tc_lookup_trait(tc, tname)
+    if tres.is_found() == 1
+      # Already registered (builtin or earlier hit). Skip.
+    else
+      if ti >= hit.trait_methods_off.size
+        return 0
+      end
+      var off = hit.trait_methods_off[ti]
+      if off < 0 or off >= hit.trait_methods_blob.size
+        return 0
+      end
+      var n_methods = hit.trait_methods_blob[off]
+      var method_names = vec_new<String>()
+      var method_sigs = vec_new()
+      var method_defaults = vec_new<Int>()
+      var cur = off + 1
+      for _mi in 0..n_methods
+        if cur + 3 >= hit.trait_methods_blob.size
+          return 0
+        end
+        var name_idx = hit.trait_methods_blob[cur]
+        var def_flag = hit.trait_methods_blob[cur + 1]
+        var n_params = hit.trait_methods_blob[cur + 2]
+        var producer_ret = hit.trait_methods_blob[cur + 3]
+        var mname = ""
+        if name_idx >= 0 and name_idx < hit.strings.size
+          mname = hit.strings[name_idx]
+        end
+        method_names.push(mname)
+        method_defaults.push(def_flag)
+        var consumer_ret = _qzmod_inject_remap_blob_id(producer_ret, remap, newtype_remap, ur)
+        if consumer_ret < 0
+          return 0
+        end
+        cur = cur + 4
+        var param_types = vec_new<Int>()
+        for _pi in 0..n_params
+          if cur >= hit.trait_methods_blob.size
+            return 0
+          end
+          var producer_p = hit.trait_methods_blob[cur]
+          var consumer_p = _qzmod_inject_remap_blob_id(producer_p, remap, newtype_remap, ur)
+          if consumer_p < 0
+            return 0
+          end
+          param_types.push(consumer_p)
+          cur = cur + 1
+        end
+        # Build the consumer-side sig as `[param_types, return_type]`
+        # — same heap shape `tc_register_trait_def` produces from the
+        # AST path (typecheck.qz:3017).
+        var sig = [param_types, consumer_ret]
+        method_sigs.push(sig)
+      end
+      var super_traits = ""
+      if ti < hit.trait_super_traits.size
+        super_traits = hit.trait_super_traits[ti]
+      end
+      var type_params = ""
+      if ti < hit.trait_type_params.size
+        type_params = hit.trait_type_params[ti]
+      end
+      typecheck_registry::tc_register_trait(tc, tname, method_names, method_sigs, method_defaults, super_traits, type_params)
+    end
+  end
+
+  # Step 9 — impls. Mirror of AST-path Phase 4.0c
+  # (`typecheck::tc_register_impl_block` → `tc_register_impl`).
+  #
+  # The encoder ships per-impl `[trait_name_idx, for_type_idx]` pairs;
+  # `impls_off[i]` is the offset of impl i in the blob. Method names
+  # are NOT shipped (the field exists on `tc.registry.impl_method_names`
+  # but has no live readers in self-hosted as of 1.4.d). Consumer
+  # passes `vec_new<String>()`.
+  #
+  # Impl method functions themselves (mangled `<for_type>$<method>`)
+  # are registered via Step 7 (funcs) — `typecheck_registry::tc_register_function`.
+  # This step only records the trait→type relationship for trait-bound
+  # dispatch + super-trait validation.
+  #
+  # Idempotency: `tc_register_impl` itself is idempotent via
+  # `g_impl_trait_name_ids` / `g_impl_for_type_ids` dedup.
+  for ii in 0..hit.impls_off.size
+    var ioff = hit.impls_off[ii]
+    if ioff < 0 or ioff + 1 >= hit.impls_blob.size
+      return 0
+    end
+    var trait_idx = hit.impls_blob[ioff]
+    var for_type_idx = hit.impls_blob[ioff + 1]
+    var trait_name = ""
+    if trait_idx >= 0 and trait_idx < hit.strings.size
+      trait_name = hit.strings[trait_idx]
+    end
+    var for_type = ""
+    if for_type_idx >= 0 and for_type_idx < hit.strings.size
+      for_type = hit.strings[for_type_idx]
+    end
+    if str_byte_len(trait_name) > 0 and str_byte_len(for_type) > 0
+      typecheck_registry::tc_register_impl(tc, trait_name, for_type, vec_new<String>())
+    end
+  end
+
+  # Extern fns / consts / globals still flow through the AST-path
+  # unchanged (deferred — `extern fn`s have no body to cache;
+  # consts/globals are Phase 1.1 names-only).
+  return 1
+end

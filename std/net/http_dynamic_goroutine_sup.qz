@@ -1,0 +1,984 @@
+## std/net/http_dynamic_goroutine_sup — Dynamic goroutine supervisor for
+## per-connection HTTP server lifecycle (D.11 Phase 2 chunk 2b).
+##
+## Spawn-on-demand supervisor specialized for goroutines (not actor inboxes).
+## Admission-sensitive callers use four explicit steps:
+##   1. `http_dyn_gsup_reserve(sup)` under the supervisor lock,
+##   2. `http_dyn_gsup_claim(sup, reservation)` under the same lock,
+##   3. construct the task only after the claim succeeds,
+##   4. publish the claim exactly once, or explicitly abort it.
+##
+## **Why a new primitive and not `DynamicSupervisor` (std/actor.qz)?**
+##
+## `DynamicSupervisor` is designed for homogeneous actor populations —
+## a single `spawn_fn: Fn(): Int` that returns a fresh actor inbox.
+## HTTP connections aren't homogeneous (each carries its own fd) and
+## aren't actors (they block on socket reads, not inbox messages, so
+## the actor-loop pattern doesn't fit; see the D.11 design memo Phase
+## 1 entry for the architectural rationale + the
+## `ConnectionHandler` trait that replaced the original
+## `actor ConnectionActor` design).
+##
+## This module provides the right shape: dynamic per-call body, no
+## actor inbox, tracked-then-GC'd task handles. Modeled on
+## `DynamicSupervisor`'s active-wake pattern (`waiter_register(handle,
+## watcher_frame)` so the watcher wakes on any child's completion),
+## adapted for task handles instead of channel close-events.
+##
+## **What this supervisor does NOT do (intentional, per Cowboy):**
+##
+##   - **No restart-on-crash.** Connection crashes are not recoverable
+##     — peer state is gone. Per the D.11 design memo open question
+##     #2, the default is no-restart, with a `ConnectionRestartStrategy`
+##     knob coming in a later phase if users want opt-in
+##     restart-on-handler-throw. A `with Throws` wrapper inside the
+##     body wrapper silently swallows throws so the task still
+##     completes cleanly (the slot GCs); future work routes the throw
+##     into a strategy.
+##
+##   - **No backoff.** Connections are spawned exactly when accepted;
+##     accept-rate limiting is the listener's concern (via
+##     `max_connections` in `HttpServerConfig`).
+##
+##   - **No per-child telemetry.** `spawn_count` and `completion_count`
+##     are coarse counters; fine-grained per-connection observability
+##     belongs in the connection lifecycle hooks
+##     (`ConnectionHandler.on_open` / `on_terminate`).
+##
+## **How completed slots are reclaimed.** The watcher is the idle fallback,
+## but publication also reconciles completed children under the same lock before
+## allocating its slot. Completed tombstones are therefore reused even when
+## traffic arrives faster than the watcher's 100ms park. Storage is bounded by
+## simultaneously non-done/publishing children plus one just-published child;
+## it does not grow with total traffic.
+##
+## Pairs with `tcp_acceptable` (D.11 Phase 2a) for the accept arm and
+## the unified `select` keep-alive loop (D.11 Phase 2c) for the
+## per-connection body. The full wiring lives in `http_serve_supervised`
+## (D.11 Phase 2c, in `std/net/http_server.qz`).
+
+import * from time
+import * from std/throws
+import * from std/sync/exclusion/spinlock
+
+@cfg(not: os: "unknown")
+def _hdgs_lock_new(): Int = mutex_new(0)
+
+@cfg(os: "unknown")
+def _hdgs_lock_new(): Int = spinlock_new()
+
+@cfg(not: os: "unknown")
+def _hdgs_lock(lock: Int): Void = mutex_lock(lock)
+
+@cfg(os: "unknown")
+def _hdgs_lock(lock: Int): Void = spinlock_lock(lock)
+
+@cfg(not: os: "unknown")
+def _hdgs_unlock(lock: Int): Void = mutex_unlock(lock, 0)
+
+@cfg(os: "unknown")
+def _hdgs_unlock(lock: Int): Void = spinlock_unlock(lock)
+
+## Watcher park budget (ms). Same shape as `SUPERVISOR_PARK_MS` in
+## actor.qz — a long-poll fallback when the active-wake doesn't fire.
+## Set higher (100ms vs 50ms) than DynamicSupervisor since GC of
+## completed slots is lower-urgency than restart-on-crash. Inlined as
+## a function rather than `const` so the qualified-import path
+## (http_server.qz → http_dynamic_goroutine_sup) reliably emits the
+## value (the wildcard-vs-qualified const-dedup edge case
+## [[feedback-resolver-wildcard-qualified-dedup]] drops const storage
+## under some cross-module paths).
+def _hdgs_park_ms(): Int = 100
+
+## Tombstone marker for a completed task slot. Task handles are heap
+## pointers (always non-zero); 0 is reliably distinguishable. Matches
+## the `ACTOR_TERMINATED_SENTINEL = -1` pattern in actor.qz but uses 0
+## here since we're keying on "is this slot live?" not "is this slot
+## actor-managed?". The watcher writes 0; `alive()` / `stop()`'s
+## snapshot skip 0-slots. Inlined as a function — see _hdgs_park_ms
+## for the rationale.
+def _hdgs_tombstone(): Int = 0
+
+## State slot 0 of a task struct; -1 means "done". Same constant the
+## FutureSelectable.try_poll uses (see std/sync/composition/awaitable.qz).
+## Inlined as a function — see _hdgs_park_ms for the rationale.
+def _hdgs_task_state_done(): Int = 0 - 1
+
+## Default bounded drain deadline (ms) for `stop()`. A supervisor created
+## without an explicit `set_drain_timeout` still cannot hang — `stop()`
+## drains for at most this long, then returns and lets the process exit.
+## Matches `HttpServerConfig.shutdown_timeout_ms`'s default; the serve
+## loops override it from config. Inlined — see _hdgs_park_ms.
+def _hdgs_default_drain_ms(): Int = 5000
+
+## Poll quantum (ms) for `stop()`'s bounded drain. `stop()` polls each
+## in-flight task's state every quantum until done or the deadline. Small
+## enough that drain latency is dominated by the tasks themselves, not the
+## poll; on the all-done fast path the inner loop never sleeps at all.
+## Inlined — see _hdgs_park_ms.
+def _hdgs_drain_poll_ms(): Int = 5
+
+## Process-unique reservation identities prevent a token issued by one
+## supervisor from accidentally matching a reservation in another supervisor.
+var _hdgs_reservation_ids = atomic_new(0)
+
+## Active publication identities are process-wide so the same Future cannot be
+## registered with two supervisors. Tombstones are reused on completion, keeping
+## this registry bounded by peak simultaneous published tasks.
+var _hdgs_active_tasks = vec_new<Int>()
+var _hdgs_active_tasks_lock = mutex_new(0)
+
+def _hdgs_reservation_free(): Int = 0
+def _hdgs_reservation_available(): Int = 1
+def _hdgs_reservation_claimed(): Int = 2
+def _hdgs_reservation_publishing(): Int = 3
+
+def _hdgs_active_task_claim(t: Int): Int
+  mutex_lock(_hdgs_active_tasks_lock)
+  var free_slot = 0 - 1
+  var i = 0
+  while i < _hdgs_active_tasks.size
+    if _hdgs_active_tasks[i] == t
+      mutex_unlock(_hdgs_active_tasks_lock, 0)
+      return 0
+    end
+    if _hdgs_active_tasks[i] == 0 and free_slot < 0
+      free_slot = i
+    end
+    i = i + 1
+  end
+  if free_slot >= 0
+    _hdgs_active_tasks[free_slot] = t
+  else
+    _hdgs_active_tasks.push(t)
+  end
+  mutex_unlock(_hdgs_active_tasks_lock, 0)
+  return 1
+end
+
+## Caller holds `_hdgs_active_tasks_lock`.
+def _hdgs_active_task_release_locked(t: Int): Void
+  var i = 0
+  while i < _hdgs_active_tasks.size
+    if _hdgs_active_tasks[i] == t
+      _hdgs_active_tasks[i] = 0
+      i = _hdgs_active_tasks.size
+    else
+      i = i + 1
+    end
+  end
+end
+
+## Active ownership release is idempotent and deliberately separate from the
+## supervisor lock. Unlocking any Quartz mutex notifies waiter/scheduler state,
+## so nesting this lock under `children_lock` can strand the supervisor lock in
+## completion callbacks.
+def _hdgs_active_task_release(t: Int): Void
+  mutex_lock(_hdgs_active_tasks_lock)
+  _hdgs_active_task_release_locked(t)
+  mutex_unlock(_hdgs_active_tasks_lock, 0)
+end
+
+## Dynamic goroutine supervisor. One instance per `http_serve_supervised`
+## listener; tracks the in-flight per-connection goroutines. Normal Quartz
+## structs currently have reference semantics, so the caller, watcher, and
+## concurrent spawners share this state without a representation annotation.
+struct HttpDynamicGoroutineSup
+  ## In-flight task handles. Tombstoned slots are reused by publication.
+  children: Vec<Int>
+  ## Guards `children` and `spawn_count` / `completion_count` against
+  ## concurrent `spawn_one` / watcher / `alive()` / `stop()` access.
+  children_lock: Int
+  ## Task handle of the GC watcher goroutine.
+  watcher: Int
+  ## Reservation token identities are separate from reusable slot state.
+  reservations: Vec<Int>
+  reservation_states: Vec<Int>
+  ## Set by `stop()`. The watcher exits on its next iteration when
+  ## observed; subsequent `spawn_one` returns 0 (the sup is closed).
+  done: Int
+  ## Total `spawn_one` calls that succeeded (i.e., before `stop`).
+  spawn_count: Int
+  ## Total goroutines whose completion a publisher or watcher has claimed and
+  ## tombstoned.
+  completion_count: Int
+  ## Available plus claimed reservations not yet published or released.
+  pending_reservations: Int
+  ## Claims whose caller may be constructing a Future. Stop closes new admission
+  ## but cannot invalidate these; bounded drain includes their reconciliation.
+  pending_constructors: Int
+  ## Injectable admission ceiling used to exercise exhaustion without wrapping
+  ## the process-global token source. Production instances use signed Int max.
+  reservation_token_limit: Int
+  ## Exact application-level admission cap. 0 means unlimited. Reservation checks
+  ## live children plus pending reservations atomically under `children_lock`.
+  max_children: Int
+  ## Bounded drain budget (ms) consulted by `stop()`. `stop()` waits at
+  ## most this long for in-flight goroutines, then returns so the caller
+  ## (and the process) can proceed — a connection parked in a long read
+  ## that never observes shutdown can never wedge `stop()` forever. 0 means
+  ## no graceful wait; negative inputs are normalized to 0. Defaults to
+  ## `_hdgs_default_drain_ms()`; `http_dyn_gsup_set_drain_timeout` overrides
+  ## it (the serve loops set it from `HttpServerConfig.shutdown_timeout_ms`).
+  drain_timeout_ms: Int
+end
+
+## Claim every completed child while holding only `children_lock`. Tombstoning
+## is the exact-once completion claim; active ownership and waiter edges are
+## reconciled after the caller releases the supervisor lock.
+def _http_dyn_gsup_reclaim_done_locked(sup: HttpDynamicGoroutineSup): Vec<Int>
+  var completed = vec_new<Int>()
+  var i = 0
+  while i < sup.children.size
+    var t = sup.children[i]
+    if t != _hdgs_tombstone() and load(t, 0) == _hdgs_task_state_done()
+      sup.children[i] = _hdgs_tombstone()
+      sup.completion_count = sup.completion_count + 1
+      completed.push(t)
+    end
+    i = i + 1
+  end
+  return completed
+end
+
+## Caller holds `children_lock`. Keep this scan in a synchronous helper: loops
+## in the async watcher receive cooperative preemption points, which must never
+## park the watcher while it owns the supervisor lock.
+def _http_dyn_gsup_live_locked(sup: HttpDynamicGoroutineSup): Int
+  var live = 0
+  var i = 0
+  while i < sup.children.size
+    if sup.children[i] != _hdgs_tombstone()
+      live = live + 1
+    end
+    i = i + 1
+  end
+  return live
+end
+
+def _http_dyn_gsup_finalize_completed(completed: Vec<Int>, watcher: Int): Void
+  var i = 0
+  while i < completed.size
+    _hdgs_active_task_release(completed[i])
+    waiter_unregister(completed[i], watcher)
+    i = i + 1
+  end
+end
+
+## Default Throws handler for the body wrapper — silently swallows
+## throws so the task still reaches state == -1 (done). Future work:
+## route into a `ConnectionRestartStrategy` knob (D.11 design memo
+## open question #2). For v1, swallowing matches Cowboy's
+## "temporary children, no restart" default for HTTP connections.
+def _http_dyn_gsup_swallow(op_name: Int, argc: Int, argv: Int): Int
+  return 0
+end
+
+## Body wrapper. Catches any escaping throw so the surrounding
+## supervisor's tracking sees a normal completion. Runs as the actual
+## goroutine body via `async _http_dyn_gsup_body_wrapper(body)`.
+def _http_dyn_gsup_body_wrapper(body: Fn(): Int): Int
+  with Throws { throw: _http_dyn_gsup_swallow } do ->
+    body()
+  end
+  return 0
+end
+
+## Watcher goroutine. Periodically scans the children Vec, tombstones
+## slots whose task has completed (state == -1), and increments
+## `completion_count`. After stop closes admission, it remains alive until all
+## accepted publications reconcile and every child is tombstoned.
+##
+## Active-wake: `spawn_one` calls `waiter_register(task, watcher_frame)`
+## for each new spawn — when the task completes, the scheduler walks
+## the waiter table and wakes us. The `sched_sleep` fallback below is
+## a long-poll safety net (mirrors `SUPERVISOR_PARK_MS` in actor.qz).
+def _http_dyn_gsup_watcher(sup: HttpDynamicGoroutineSup): Int
+  while true
+    _hdgs_lock(sup.children_lock)
+    var completed = _http_dyn_gsup_reclaim_done_locked(sup)
+    var live = _http_dyn_gsup_live_locked(sup)
+    var should_exit = 0
+    if sup.done == 1 and live == 0 and sup.pending_reservations == 0 and sup.pending_constructors == 0
+      sup.done = 2
+      should_exit = 1
+    end
+    var watcher = sup.watcher
+    _hdgs_unlock(sup.children_lock)
+    _http_dyn_gsup_finalize_completed(completed, watcher)
+    if should_exit == 1
+      return 0
+    end
+    sched_sleep(_hdgs_park_ms())
+  end
+  return 0
+end
+
+## Construct a new dynamic goroutine supervisor. Spawns the watcher
+## goroutine immediately; no children until `spawn_one` is called.
+@cfg(not: os: "unknown")
+def http_dyn_gsup_new(): HttpDynamicGoroutineSup
+  var sup = HttpDynamicGoroutineSup {
+    children: vec_new<Int>(),
+    children_lock: _hdgs_lock_new(),
+    watcher: 0,
+    reservations: vec_new<Int>(),
+    reservation_states: vec_new<Int>(),
+    done: 0,
+    spawn_count: 0,
+    completion_count: 0,
+    pending_reservations: 0,
+    pending_constructors: 0,
+    reservation_token_limit: 9223372036854775807,
+    max_children: 0,
+    drain_timeout_ms: _hdgs_default_drain_ms(),
+  }
+  var task = async _http_dyn_gsup_watcher(sup)
+  sup.watcher = task
+  sched_spawn(task)
+  return sup
+end
+
+## Freestanding (`x86_64-unknown-none-elf`) variant — D.11 Phase 8b.2.b
+## Path B. The hosted version spawns a watcher goroutine via
+## `async _http_dyn_gsup_watcher(sup) + sched_spawn(task)`, which
+## triggers `__Future_*$poll` wrapper synthesis (PASS 1.2a) referencing
+## hosted-only TLS-equivalent globals (@__qz_io_pending_sleep_ms,
+## @__qz_current_frame, @__qz_sched_fuel) that the freestanding
+## `pthread/wrapper-dead-code` tripwire test EXPLICITLY rejects
+## stubbing. In freestanding we skip the watcher Future; connection bodies use
+## `kern_go_closure_hi` and kernel task-state conventions, so there are no hosted
+## Future handles for this module to GC. The
+## supervisor structure stays for spawn_count/completion_count
+## telemetry parity with the hosted shape. `watcher = 0` and
+## `done = 0` mean stop() is a no-op.
+@cfg(os: "unknown")
+def http_dyn_gsup_new(): HttpDynamicGoroutineSup
+  return HttpDynamicGoroutineSup {
+    children: vec_new<Int>(),
+    children_lock: _hdgs_lock_new(),
+    watcher: 0,
+    reservations: vec_new<Int>(),
+    reservation_states: vec_new<Int>(),
+    done: 0,
+    spawn_count: 0,
+    completion_count: 0,
+    pending_reservations: 0,
+    pending_constructors: 0,
+    reservation_token_limit: 9223372036854775807,
+    max_children: 0,
+    drain_timeout_ms: _hdgs_default_drain_ms(),
+  }
+end
+
+## Reserve admission without granting construction ownership. Returns a
+## process-unique supervisor-owned token, or 0 after stop/exhaustion. The token
+## must be claimed before Future construction.
+def http_dyn_gsup_reserve(sup: HttpDynamicGoroutineSup): Int
+  _hdgs_lock(sup.children_lock)
+  if sup.done != 0
+    _hdgs_unlock(sup.children_lock)
+    return 0
+  end
+  if sup.max_children > 0
+    var admitted = sup.pending_reservations
+    var ci = 0
+    while ci < sup.children.size
+      var child = sup.children[ci]
+      if child != _hdgs_tombstone() and load(child, 0) != _hdgs_task_state_done()
+        admitted = admitted + 1
+      end
+      ci = ci + 1
+    end
+    if admitted >= sup.max_children
+      _hdgs_unlock(sup.children_lock)
+      return 0
+    end
+  end
+  var current = atomic_load(_hdgs_reservation_ids)
+  var reservation = 0
+  var searching = 1
+  while searching == 1
+    if current < 0 or current >= sup.reservation_token_limit or current == 9223372036854775807
+      searching = 0
+    else
+      var next = current + 1
+      if atomic_cas(_hdgs_reservation_ids, current, next)
+        reservation = next
+        searching = 0
+      else
+        current = atomic_load(_hdgs_reservation_ids)
+      end
+    end
+  end
+  if reservation == 0
+    _hdgs_unlock(sup.children_lock)
+    return 0
+  end
+  var slot = 0 - 1
+  var i = 0
+  while i < sup.reservation_states.size
+    if sup.reservation_states[i] == _hdgs_reservation_free()
+      slot = i
+      i = sup.reservation_states.size
+    else
+      i = i + 1
+    end
+  end
+  if slot >= 0
+    sup.reservations[slot] = reservation
+    sup.reservation_states[slot] = _hdgs_reservation_available()
+  else
+    sup.reservations.push(reservation)
+    sup.reservation_states.push(_hdgs_reservation_available())
+  end
+  sup.pending_reservations = sup.pending_reservations + 1
+  _hdgs_unlock(sup.children_lock)
+  return reservation
+end
+
+## Atomically transfer an available reservation to a constructor. Claims are not
+## invalidated by stop and must be published or aborted exactly once.
+def http_dyn_gsup_claim(sup: HttpDynamicGoroutineSup, reservation: Int): Int
+  if reservation <= 0
+    return 0
+  end
+  _hdgs_lock(sup.children_lock)
+  if sup.done != 0
+    _hdgs_unlock(sup.children_lock)
+    return 0
+  end
+  var i = 0
+  while i < sup.reservations.size
+    if sup.reservations[i] == reservation and sup.reservation_states[i] == _hdgs_reservation_available()
+      sup.reservation_states[i] = _hdgs_reservation_claimed()
+      sup.pending_constructors = sup.pending_constructors + 1
+      _hdgs_unlock(sup.children_lock)
+      return 1
+    end
+    i = i + 1
+  end
+  _hdgs_unlock(sup.children_lock)
+  return 0
+end
+
+## Release one available reservation. Claimed, invalid, foreign, consumed, and
+## already released identities fail closed.
+def http_dyn_gsup_release(sup: HttpDynamicGoroutineSup, reservation: Int): Int
+  if reservation <= 0
+    return 0
+  end
+  _hdgs_lock(sup.children_lock)
+  var i = 0
+  while i < sup.reservations.size
+    if sup.reservations[i] == reservation and sup.reservation_states[i] == _hdgs_reservation_available()
+      sup.reservations[i] = 0
+      sup.reservation_states[i] = _hdgs_reservation_free()
+      sup.pending_reservations = sup.pending_reservations - 1
+      _hdgs_unlock(sup.children_lock)
+      return 1
+    end
+    i = i + 1
+  end
+  _hdgs_unlock(sup.children_lock)
+  return 0
+end
+
+## Abort one claimed constructor. Publishing claims cannot be aborted out from
+## under waiter registration. Every successful claim decrements exactly once via
+## this function or successful publication.
+def http_dyn_gsup_abort_claim(sup: HttpDynamicGoroutineSup, reservation: Int): Int
+  if reservation <= 0
+    return 0
+  end
+  _hdgs_lock(sup.children_lock)
+  var i = 0
+  while i < sup.reservations.size
+    if sup.reservations[i] == reservation and sup.reservation_states[i] == _hdgs_reservation_claimed()
+      sup.reservations[i] = 0
+      sup.reservation_states[i] = _hdgs_reservation_free()
+      sup.pending_reservations = sup.pending_reservations - 1
+      sup.pending_constructors = sup.pending_constructors - 1
+      if sup.done == 1 and sup.watcher == 0 and sup.pending_constructors == 0
+        sup.done = 2
+      end
+      _hdgs_unlock(sup.children_lock)
+      return 1
+    end
+    i = i + 1
+  end
+  _hdgs_unlock(sup.children_lock)
+  return 0
+end
+
+## Construct the Throws-isolated task used by publish. Future construction may
+## eagerly poll and execute `body`; admission-sensitive callers must invoke this
+## only after `http_dyn_gsup_claim` succeeds.
+@cfg(not: os: "unknown")
+def http_dyn_gsup_task(body: Fn(): Int): Int
+  return async _http_dyn_gsup_body_wrapper(body)
+end
+
+## Publish a constructed hosted task against one claimed reservation. Invalid,
+## available-but-unclaimed, foreign, released, used, and duplicate active task
+## identities fail closed. Rejection leaves both claim and task with the caller;
+## the caller must explicitly abort the claim and retains the Future handle.
+@cfg(not: os: "unknown")
+def http_dyn_gsup_publish(sup: HttpDynamicGoroutineSup, reservation: Int, t: Int): Int
+  if reservation <= 0 or t == 0
+    return 0
+  end
+  _hdgs_lock(sup.children_lock)
+  var slot = 0 - 1
+  var i = 0
+  while i < sup.reservations.size
+    if sup.reservations[i] == reservation and sup.reservation_states[i] == _hdgs_reservation_claimed()
+      slot = i
+      i = sup.reservations.size
+    else
+      i = i + 1
+    end
+  end
+  if slot < 0
+    _hdgs_unlock(sup.children_lock)
+    return 0
+  end
+  # Prevent an external abort while active ownership and waiter registration
+  # execute outside the supervisor lock. Stop still sees a pending constructor.
+  sup.reservation_states[slot] = _hdgs_reservation_publishing()
+  var watcher = sup.watcher
+  _hdgs_unlock(sup.children_lock)
+
+  # No supervisor lock may be held here: active-lock unlock and waiter APIs can
+  # enter completion/scheduler callbacks. Active claim remains the process-wide
+  # duplicate-publication arbiter.
+  if _hdgs_active_task_claim(t) == 0
+    _hdgs_lock(sup.children_lock)
+    sup.reservation_states[slot] = _hdgs_reservation_claimed()
+    _hdgs_unlock(sup.children_lock)
+    return 0
+  end
+  waiter_register(t, watcher)
+  _hdgs_lock(sup.children_lock)
+  # Reconcile before choosing a slot so watcher latency cannot turn completed
+  # traffic into child Vec growth. This lock also arbitrates watcher reclamation.
+  var completed = _http_dyn_gsup_reclaim_done_locked(sup)
+  var child_slot = 0 - 1
+  i = 0
+  while i < sup.children.size
+    if sup.children[i] == _hdgs_tombstone()
+      child_slot = i
+      i = sup.children.size
+    else
+      i = i + 1
+    end
+  end
+  if child_slot >= 0
+    sup.children[child_slot] = t
+  else
+    sup.children.push(t)
+  end
+  sup.reservations[slot] = 0
+  sup.reservation_states[slot] = _hdgs_reservation_free()
+  sup.pending_reservations = sup.pending_reservations - 1
+  sup.pending_constructors = sup.pending_constructors - 1
+  sup.spawn_count = sup.spawn_count + 1
+  _hdgs_unlock(sup.children_lock)
+  _http_dyn_gsup_finalize_completed(completed, watcher)
+  sched_spawn(t)
+  return t
+end
+
+## Claim before Future construction, then publish. A newly constructed Future has
+## a unique identity; if construction fails, the claim is explicitly aborted.
+@cfg(not: os: "unknown")
+def http_dyn_gsup_spawn_reserved(sup: HttpDynamicGoroutineSup, reservation: Int, body: Fn(): Int): Int
+  if http_dyn_gsup_claim(sup, reservation) == 0
+    return 0
+  end
+  var t = http_dyn_gsup_task(body)
+  if t == 0
+    http_dyn_gsup_abort_claim(sup, reservation)
+    return 0
+  end
+  var published = http_dyn_gsup_publish(sup, reservation, t)
+  if published == 0
+    http_dyn_gsup_abort_claim(sup, reservation)
+  end
+  return published
+end
+
+## Compatibility API for an already-created Future. Eager construction may have
+## run before entry. Rejection returns 0 and leaves the Future explicitly owned by
+## the caller; this function never disposes or silently consumes the handle.
+@cfg(not: os: "unknown")
+def http_dyn_gsup_spawn_task(sup: HttpDynamicGoroutineSup, t: Int): Int
+  var reservation = http_dyn_gsup_reserve(sup)
+  if reservation == 0
+    return 0
+  end
+  if http_dyn_gsup_claim(sup, reservation) == 0
+    http_dyn_gsup_release(sup, reservation)
+    return 0
+  end
+  var published = http_dyn_gsup_publish(sup, reservation, t)
+  if published == 0
+    http_dyn_gsup_abort_claim(sup, reservation)
+  end
+  return published
+end
+
+## Compatibility convenience API. Callers that require a hard side-effect
+## boundary must use reserve -> claim -> task -> publish explicitly: evaluating arguments
+## before this function is entered may already construct or pre-poll a Future,
+## and this API cannot undo those effects. Internally, accounting still routes
+## through reserve -> claim -> construct -> publish.
+@cfg(not: os: "unknown")
+def http_dyn_gsup_spawn_one(sup: HttpDynamicGoroutineSup, body: Fn(): Int): Int
+  var reservation = http_dyn_gsup_reserve(sup)
+  if reservation == 0
+    return 0
+  end
+  return http_dyn_gsup_spawn_reserved(sup, reservation, body)
+end
+
+## Kernel-side concurrent spawn — `kern_go_closure_hi` lives in
+## tools/baremetal/hello_x86.qz and trampolines the closure into a
+## freshly-allocated HIGH-PRIORITY task with the closure value stashed
+## in TASK_USER_ARG. The C helper `__qz_invoke_closure` (libc_stubs.c)
+## dispatches the tagged-pointer closure to its underlying fn(env) or
+## plain fn().
+##
+## The `_hi` variant routes the new task to the global high-priority
+## ring so per-conn HTTP handlers stay ahead of bulk demo-task load
+## on the normal rings — closes the soul-page-vs-spawn-30K starvation
+## case where the supervised loop's wake gets queued behind tens of
+## thousands of yield_now()-ing demo bodies.
+##
+## Closes [[feedback-soul7-prod-supervised-hang]] (concurrent spawn)
+## and [[feedback-supervised-vs-demo-task-starvation]] (priority lane).
+@cfg(os: "unknown")
+extern "C" def kern_go_closure_hi(closure: Int): Int
+
+## Freestanding variant — D.11 Phase 8b.2.b Path B, completed via the
+## D.11 8b.2.c follow-up (2026-05-25): spawns the body as a real kernel
+## goroutine via `kern_go_closure`. The body runs inside the Throws-
+## swallowing wrapper for handler-crash isolation parity with the
+## hosted shape (the wrapper is a plain Quartz fn, so spawning the
+## wrapper closure is equivalent to spawning body).
+##
+## Returns the new task handle on success (stored in `sup.children` for
+## stop() drain), or 0 if `sup` is closed or the kernel task pool is
+## exhausted (load-shed: peer retransmits the SYN, eventually a slot
+## frees).
+@cfg(os: "unknown")
+def http_dyn_gsup_spawn_reserved(sup: HttpDynamicGoroutineSup, reservation: Int, body: Fn(): Int): Int
+  if http_dyn_gsup_claim(sup, reservation) == 0
+    return 0
+  end
+  _hdgs_lock(sup.children_lock)
+  var slot = 0 - 1
+  var i = 0
+  while i < sup.reservations.size
+    if sup.reservations[i] == reservation and sup.reservation_states[i] == _hdgs_reservation_claimed()
+      slot = i
+      i = sup.reservations.size
+    else
+      i = i + 1
+    end
+  end
+  if slot < 0
+    _hdgs_unlock(sup.children_lock)
+    return 0
+  end
+  # Kernel enqueue makes the closure runnable immediately. Publish ownership
+  # first so an external abort cannot free the accepted connection underneath it.
+  sup.reservation_states[slot] = _hdgs_reservation_publishing()
+  _hdgs_unlock(sup.children_lock)
+
+  var t = kern_go_closure_hi(-> _http_dyn_gsup_body_wrapper(body))
+  if t == 0
+    _hdgs_lock(sup.children_lock)
+    if slot >= sup.reservations.size or sup.reservations[slot] != reservation or sup.reservation_states[slot] != _hdgs_reservation_publishing()
+      _hdgs_unlock(sup.children_lock)
+      panic("http_dyn_gsup: publishing rollback invariant violated")
+      return 0
+    end
+    sup.reservation_states[slot] = _hdgs_reservation_claimed()
+    _hdgs_unlock(sup.children_lock)
+    http_dyn_gsup_abort_claim(sup, reservation)
+    return 0
+  end
+  _hdgs_lock(sup.children_lock)
+  if slot >= sup.reservations.size or sup.reservations[slot] != reservation or sup.reservation_states[slot] != _hdgs_reservation_publishing()
+    _hdgs_unlock(sup.children_lock)
+    panic("http_dyn_gsup: successful publication invariant violated")
+    return t
+  end
+  sup.reservations[slot] = 0
+  sup.reservation_states[slot] = _hdgs_reservation_free()
+  sup.pending_reservations = sup.pending_reservations - 1
+  sup.pending_constructors = sup.pending_constructors - 1
+  # Track only spawn_count (telemetry); skip the children Vec push.
+  # Hosted's watcher GCs completed slots via load(t, 0) == -1 (hosted
+  # Future state convention); the freestanding kernel task struct uses
+  # TASK_STATE 0..4 at slot 0 (DEAD == 4) which never matches -1. Until
+  # the freestanding watcher lands (or _hdgs_task_state_done() is split
+  # per-@cfg), pushing every spawn would grow children unbounded. The
+  # default kernel config has max_connections=0, so http_dyn_gsup_alive
+  # is never consulted; stop() is a no-op (no clean kernel shutdown
+  # path); completion_count stays 0 in freestanding (filed forward as
+  # part of the same followup that adds the watcher).
+  sup.spawn_count = sup.spawn_count + 1
+  if sup.done == 1 and sup.pending_constructors == 0
+    sup.done = 2
+  end
+  _hdgs_unlock(sup.children_lock)
+  return t
+end
+
+@cfg(os: "unknown")
+def http_dyn_gsup_spawn_one(sup: HttpDynamicGoroutineSup, body: Fn(): Int): Int
+  var reservation = http_dyn_gsup_reserve(sup)
+  if reservation == 0
+    return 0
+  end
+  return http_dyn_gsup_spawn_reserved(sup, reservation, body)
+end
+
+## Count of currently-in-flight goroutines (task state != done, slot
+## not tombstoned). O(N) scan under children_lock — for telemetry +
+## max_connections gating, not for hot-loop use.
+def http_dyn_gsup_alive(sup: HttpDynamicGoroutineSup): Int
+  _hdgs_lock(sup.children_lock)
+  var alive = 0
+  var i = 0
+  var n = sup.children.size
+  while i < n
+    var t = sup.children[i]
+    if t != _hdgs_tombstone()
+      if load(t, 0) != _hdgs_task_state_done()
+        alive = alive + 1
+      end
+    end
+    i = i + 1
+  end
+  _hdgs_unlock(sup.children_lock)
+  return alive
+end
+
+## Override the bounded drain budget (ms) consulted by `stop()`. 0 means no
+## graceful wait; negative values are normalized to 0. The serve loops pass
+## the remaining portion of `HttpServerConfig.shutdown_timeout_ms` immediately
+## before stopping.
+def http_dyn_gsup_set_drain_timeout(sup: HttpDynamicGoroutineSup, ms: Int): Void
+  var normalized = ms
+  if normalized < 0
+    normalized = 0
+  end
+  _hdgs_lock(sup.children_lock)
+  sup.drain_timeout_ms = normalized
+  _hdgs_unlock(sup.children_lock)
+end
+
+## Set the exact connection-child admission cap. Reservations, claimed
+## constructors, and live published children share this one locked limit.
+def http_dyn_gsup_set_max_children(sup: HttpDynamicGoroutineSup, max_children: Int): Void
+  var normalized = max_children
+  if normalized < 0
+    normalized = 0
+  end
+  _hdgs_lock(sup.children_lock)
+  sup.max_children = normalized
+  _hdgs_unlock(sup.children_lock)
+end
+
+def http_dyn_gsup_is_stopping(sup: HttpDynamicGoroutineSup): Int
+  _hdgs_lock(sup.children_lock)
+  var stopping = 0
+  if sup.done != 0
+    stopping = 1
+  end
+  _hdgs_unlock(sup.children_lock)
+  return stopping
+end
+
+## Synchronous graceful shutdown with a bounded drain. Sets `done = 1` to close
+## admission and releases only unclaimed reservations. Claimed constructors stay
+## valid and are included in the same bounded wait until they publish or abort.
+## The supported server lifecycle stops every supervisor before beginning global
+## graceful scheduler drain; arbitrary concurrent external drain remains parked
+## scheduler API work.
+##
+## **Why bounded.** The original `stop()` did an unconditional `await` on
+## every child, which blocks forever if a per-connection goroutine never
+## reaches `done` — e.g. an idle keep-alive connection parked in a long
+## socket read that doesn't observe the shutdown flag until its
+## `read_timeout_ms` elapses (or never, if the read deadline is 0). On the
+## `http_serve_supervised` SIGTERM path that hung `stop()` indefinitely, so
+## `systemctl restart` could not rebind the listen socket and required a
+## manual SIGKILL (see docs/bugs/HOSTED_SUPERVISED_SHUTDOWN_DRAIN_HANGS.md
+## §A). A bounded drain guarantees `stop()` returns: it gives in-flight
+## work up to the deadline to finish cleanly, then stops waiting and lets
+## the caller contain the remaining scheduler work before exit. Current forced
+## scheduler shutdown does not unwind suspended coroutine frames, so this path
+## does not claim their destructors, waiters, or owned FDs were cleaned up. This
+## mirrors Go's
+## `http.Server.Shutdown(ctx)` (drain until the context deadline, then
+## return) and nginx's `worker_shutdown_timeout`.
+##
+## Connections still parked past the deadline are not force-closed here —
+## they die with the process. Promptly interrupting their parked reads
+## (tracking each fd and `shutdown(2)`-ing it on stop, the way Go closes
+## idle connections) is a follow-up; see the bug doc §A "Fix shapes".
+@cfg(not: os: "unknown")
+def http_dyn_gsup_stop(sup: HttpDynamicGoroutineSup): Void
+  _hdgs_lock(sup.children_lock)
+  if sup.done == 2
+    _hdgs_unlock(sup.children_lock)
+    return
+  end
+  sup.done = 1
+  var ri = 0
+  while ri < sup.reservations.size
+    if sup.reservation_states[ri] == _hdgs_reservation_available()
+      sup.reservations[ri] = 0
+      sup.reservation_states[ri] = _hdgs_reservation_free()
+      sup.pending_reservations = sup.pending_reservations - 1
+    end
+    ri = ri + 1
+  end
+  var drain_timeout_ms = sup.drain_timeout_ms
+  var w = sup.watcher
+  _hdgs_unlock(sup.children_lock)
+  var now_ms = time_mono_ns() / 1000000
+  var deadline_ms = now_ms
+  if drain_timeout_ms > 0
+    var max_int = 9223372036854775807
+    if drain_timeout_ms > max_int - now_ms
+      deadline_ms = max_int
+    else
+      deadline_ms = now_ms + drain_timeout_ms
+    end
+  end
+  var timed_out = 0
+  while timed_out == 0 and load(w, 0) != _hdgs_task_state_done()
+    if (time_mono_ns() / 1000000) >= deadline_ms
+      timed_out = 1
+    else
+      sched_sleep(_hdgs_drain_poll_ms())
+    end
+  end
+  if timed_out == 1
+    return
+  end
+  # The watcher normally tombstones every slot before returning. Reconcile once
+  # more after its task is done so inline-polled test contexts observe the same
+  # exact counters as worker-scheduled execution.
+  _hdgs_lock(sup.children_lock)
+  var completed = _http_dyn_gsup_reclaim_done_locked(sup)
+  _hdgs_unlock(sup.children_lock)
+  _http_dyn_gsup_finalize_completed(completed, w)
+end
+
+## Freestanding variant — close admission and release only available
+## reservations. Already-claimed kernel constructors retain publication rights.
+@cfg(os: "unknown")
+def http_dyn_gsup_stop(sup: HttpDynamicGoroutineSup): Void
+  _hdgs_lock(sup.children_lock)
+  if sup.done == 2
+    _hdgs_unlock(sup.children_lock)
+    return
+  end
+  sup.done = 1
+  var ri = 0
+  while ri < sup.reservations.size
+    if sup.reservation_states[ri] == _hdgs_reservation_available()
+      sup.reservations[ri] = 0
+      sup.reservation_states[ri] = _hdgs_reservation_free()
+      sup.pending_reservations = sup.pending_reservations - 1
+    end
+    ri = ri + 1
+  end
+  if sup.pending_constructors == 0
+    sup.done = 2
+  end
+  _hdgs_unlock(sup.children_lock)
+end
+
+## Cumulative count of successful `spawn_one` calls over the
+## supervisor's lifetime. Useful for / : access rate telemetry.
+def http_dyn_gsup_spawn_count(sup: HttpDynamicGoroutineSup): Int
+  _hdgs_lock(sup.children_lock)
+  var count = sup.spawn_count
+  _hdgs_unlock(sup.children_lock)
+  return count
+end
+
+## Cumulative count of goroutines reclaimed as completed (tombstoned).
+## Publication reconciles before allocation; the watcher handles idle periods.
+def http_dyn_gsup_completion_count(sup: HttpDynamicGoroutineSup): Int
+  _hdgs_lock(sup.children_lock)
+  var count = sup.completion_count
+  _hdgs_unlock(sup.children_lock)
+  return count
+end
+
+## Whether construction published a watcher handle. Avoids unsynchronized
+## external reads of the watcher field.
+def http_dyn_gsup_has_watcher(sup: HttpDynamicGoroutineSup): Int
+  _hdgs_lock(sup.children_lock)
+  var present = 0
+  if sup.watcher != 0
+    present = 1
+  end
+  _hdgs_unlock(sup.children_lock)
+  return present
+end
+
+## Focused protocol observability. These report allocated reusable slots, not
+## lifetime totals, so bounded-storage regressions can be asserted directly.
+def http_dyn_gsup_reservation_storage(sup: HttpDynamicGoroutineSup): Int
+  _hdgs_lock(sup.children_lock)
+  var count = sup.reservations.size
+  _hdgs_unlock(sup.children_lock)
+  return count
+end
+
+def http_dyn_gsup_child_storage(sup: HttpDynamicGoroutineSup): Int
+  _hdgs_lock(sup.children_lock)
+  var count = sup.children.size
+  _hdgs_unlock(sup.children_lock)
+  return count
+end
+
+## Process-wide active publication ownership, exposed with the other focused
+## protocol observability so lifecycle tests can prove all task identities left.
+def http_dyn_gsup_active_task_count(): Int
+  mutex_lock(_hdgs_active_tasks_lock)
+  var count = 0
+  var i = 0
+  while i < _hdgs_active_tasks.size
+    if _hdgs_active_tasks[i] != 0
+      count = count + 1
+    end
+    i = i + 1
+  end
+  mutex_unlock(_hdgs_active_tasks_lock, 0)
+  return count
+end
+
+def http_dyn_gsup_pending_constructors(sup: HttpDynamicGoroutineSup): Int
+  _hdgs_lock(sup.children_lock)
+  var count = sup.pending_constructors
+  _hdgs_unlock(sup.children_lock)
+  return count
+end
+
+## Test-only exhaustion injection. A non-negative ceiling at or below the current
+## global token prevents admission without incrementing or wrapping the source.
+def http_dyn_gsup_set_token_limit_for_test(sup: HttpDynamicGoroutineSup, limit: Int): Void
+  _hdgs_lock(sup.children_lock)
+  sup.reservation_token_limit = limit
+  _hdgs_unlock(sup.children_lock)
+end

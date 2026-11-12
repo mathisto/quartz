@@ -1,0 +1,563 @@
+## std/tui/widgets/spark.qz — sparkline widget (octant-blitter-backed).
+##
+## Renders a rolling buffer of integer samples as a height-multi-cell
+## chart. Each cell is a 2 × 4 sub-pixel grid (Unicode 17 octants), so
+## a 1-cell-tall sparkline already has 4 vertical levels and a 2-cell
+## sparkline has 8 — sub-cell precision the block-character sparklines
+## in btop/htop don't reach.
+##
+## Default sample density is sub-pixel: capacity = width_cells * 2,
+## one sample per pixel column. The newest sample anchors at the right
+## edge; the buffer pads on the left until full. After capacity is
+## reached, every push drops the oldest sample, scrolling the chart
+## one pixel column to the left.
+##
+## Auto-scale (default) tracks the running [min, max] across the
+## visible buffer. Apps that want stable Y axes (CPU 0..100, memory
+## 0..total_bytes) call `spark_with_range(s, min, max)` to fix the
+## scale and disable auto.
+##
+## Rendering returns a `\n`-joined String of `height_cells` rows; the
+## consumer drops it into a plane, layout cell, or `term_write`. Style
+## is uncoloured by design — the consumer wraps with `Style.render`
+## or paints per-row via the theme. Per-column tinting (gradient by
+## value bucket) is filed for v0.2 — Phase 2 polish for VIGIL.
+##
+## ### Buffer model
+##
+## Sparkline buffers are ephemeral; the value object holds the current
+## window only. There's no "rolling baseline" semantics here — that
+## belongs to a separate `Anomaly` value object (Phase 2 of VIGIL).
+##
+## ### Why integers
+##
+## Phase 1 ships Int-only. CPU%, RSS bytes, packets/sec, IOPS — all
+## naturally integer. Float values can be pre-scaled by the caller
+## (e.g. multiply load average by 100). A Float variant lands when a
+## consumer needs sub-unit precision; it's a separate widget rather
+## than a generic-over-T parameterisation because the auto-scale
+## arithmetic differs.
+##
+## @since 5.28.x
+
+import std/tui/octant as oc
+import std/string
+
+# ============================================================
+# Public type
+# ============================================================
+
+## Spark — value-object sparkline. Immutable; every mutator returns
+## a new struct.
+##
+## Fields:
+##   - values: rolling window of samples, oldest first. Capped at
+##             `capacity` (push drops the head once full).
+##   - capacity: max samples retained. Default = width_cells * 2 so
+##               every pixel column carries an independent sample.
+##   - width_cells, height_cells: render footprint in cells. Pixel
+##                                grid is (width_cells * 2) wide ×
+##                                (height_cells * 4) tall.
+##   - auto_scale: when true, render uses min/max of the live buffer.
+##                 When false, render uses fixed_min/fixed_max.
+##   - fixed_min, fixed_max: scale endpoints when auto_scale is off.
+##                           Ignored otherwise but preserved across
+##                           toggles so consumers can flip back and
+##                           forth without re-supplying the range.
+##   - quality: octant glyph quality tier. Default Octant (Unicode 17,
+##              full subpixel). Quadrant/Half/Ascii degrade the
+##              vertical-resolution lookup but don't change cell
+##              footprint.
+struct Spark
+  values:       Vec<Int>
+  capacity:     Int
+  width_cells:  Int
+  height_cells: Int
+  auto_scale:   Bool
+  fixed_min:    Int
+  fixed_max:    Int
+  quality:      oc::OctantQuality
+end
+
+# ============================================================
+# Constructors + builders
+# ============================================================
+
+## Build a fresh Spark with `width_cells × height_cells` cell footprint
+## and capacity = width_cells * 2 (sub-pixel density). Auto-scale is
+## on; fixed_min/fixed_max default to (0, 100) so a consumer that
+## flips to fixed scale without setting a range gets a sensible
+## CPU-percent default rather than a degenerate (0, 0) range.
+def spark_new(width_cells: Int, height_cells: Int): Spark
+  var w = width_cells
+  if w < 1
+    w = 1
+  end
+  var h = height_cells
+  if h < 1
+    h = 1
+  end
+  return Spark {
+    values:       vec_new<Int>(),
+    capacity:     w * 2,
+    width_cells:  w,
+    height_cells: h,
+    auto_scale:   true,
+    fixed_min:    0,
+    fixed_max:    100,
+    quality:      oc::OctantQuality::Octant
+  }
+end
+
+## Override capacity (independent of width). Useful when the consumer
+## wants chunkier bars (capacity = width_cells, one sample per cell)
+## or finer-than-subpixel temporal resolution (capacity > width * 2,
+## downsampled at render). Capacity < 1 clamps to 1.
+def spark_with_capacity(s: Spark, capacity: Int): Spark
+  var c = capacity
+  if c < 1
+    c = 1
+  end
+  # Truncate existing values from the head if shrinking below the
+  # current buffer length. Keep the newest c samples.
+  var src = s.values
+  var trimmed = vec_new<Int>()
+  var skip = src.size - c
+  if skip < 0
+    skip = 0
+  end
+  var i = skip
+  while i < src.size
+    trimmed.push(src[i])
+    i += 1
+  end
+  return Spark {
+    values:       trimmed,
+    capacity:     c,
+    width_cells:  s.width_cells,
+    height_cells: s.height_cells,
+    auto_scale:   s.auto_scale,
+    fixed_min:    s.fixed_min,
+    fixed_max:    s.fixed_max,
+    quality:      s.quality
+  }
+end
+
+## Pin a fixed Y-axis range and disable auto-scale. Values outside
+## [min, max] clamp at render time. min == max degenerate; render
+## emits an all-empty buffer (defensive).
+def spark_with_range(s: Spark, min_v: Int, max_v: Int): Spark
+  return Spark {
+    values:       s.values,
+    capacity:     s.capacity,
+    width_cells:  s.width_cells,
+    height_cells: s.height_cells,
+    auto_scale:   false,
+    fixed_min:    min_v,
+    fixed_max:    max_v,
+    quality:      s.quality
+  }
+end
+
+## Toggle auto-scale. When turning off without first calling
+## `spark_with_range`, the existing fixed_min/fixed_max are used.
+def spark_with_auto_scale(s: Spark, on: Bool): Spark
+  return Spark {
+    values:       s.values,
+    capacity:     s.capacity,
+    width_cells:  s.width_cells,
+    height_cells: s.height_cells,
+    auto_scale:   on,
+    fixed_min:    s.fixed_min,
+    fixed_max:    s.fixed_max,
+    quality:      s.quality
+  }
+end
+
+## Override the octant quality tier. `Quadrant` is the safest fallback
+## for terminals with patchy Unicode 17 support.
+def spark_with_quality(s: Spark, q: oc::OctantQuality): Spark
+  return Spark {
+    values:       s.values,
+    capacity:     s.capacity,
+    width_cells:  s.width_cells,
+    height_cells: s.height_cells,
+    auto_scale:   s.auto_scale,
+    fixed_min:    s.fixed_min,
+    fixed_max:    s.fixed_max,
+    quality:      q
+  }
+end
+
+## Override the cell-grid width. Useful for responsive layouts that
+## redistribute display real estate per render — the buffer's sample
+## history is preserved; only the render footprint changes. Width <
+## 1 clamps to 1.
+def spark_with_width(s: Spark, w: Int): Spark
+  var nw = w
+  if nw < 1
+    nw = 1
+  end
+  return Spark {
+    values:       s.values,
+    capacity:     s.capacity,
+    width_cells:  nw,
+    height_cells: s.height_cells,
+    auto_scale:   s.auto_scale,
+    fixed_min:    s.fixed_min,
+    fixed_max:    s.fixed_max,
+    quality:      s.quality
+  }
+end
+
+## Override the cell-grid height. Same semantics as spark_with_width.
+def spark_with_height(s: Spark, h: Int): Spark
+  var nh = h
+  if nh < 1
+    nh = 1
+  end
+  return Spark {
+    values:       s.values,
+    capacity:     s.capacity,
+    width_cells:  s.width_cells,
+    height_cells: nh,
+    auto_scale:   s.auto_scale,
+    fixed_min:    s.fixed_min,
+    fixed_max:    s.fixed_max,
+    quality:      s.quality
+  }
+end
+
+## Append `value` and drop the oldest if at capacity. Returns a fresh
+## Spark; the original is untouched. Caller-typical use:
+##
+##   var s2 = spark_push(s, current_cpu_pct)
+def spark_push(s: Spark, value: Int): Spark
+  var src = s.values
+  var next = vec_new<Int>()
+  var start = 0
+  if src.size >= s.capacity
+    start = src.size - s.capacity + 1
+  end
+  var i = start
+  while i < src.size
+    next.push(src[i])
+    i += 1
+  end
+  next.push(value)
+  return Spark {
+    values:       next,
+    capacity:     s.capacity,
+    width_cells:  s.width_cells,
+    height_cells: s.height_cells,
+    auto_scale:   s.auto_scale,
+    fixed_min:    s.fixed_min,
+    fixed_max:    s.fixed_max,
+    quality:      s.quality
+  }
+end
+
+## Drop every retained sample. Configuration (capacity, scale,
+## quality) is preserved.
+def spark_clear(s: Spark): Spark
+  return Spark {
+    values:       vec_new<Int>(),
+    capacity:     s.capacity,
+    width_cells:  s.width_cells,
+    height_cells: s.height_cells,
+    auto_scale:   s.auto_scale,
+    fixed_min:    s.fixed_min,
+    fixed_max:    s.fixed_max,
+    quality:      s.quality
+  }
+end
+
+# ============================================================
+# Accessors (small)
+# ============================================================
+
+## Number of samples currently retained.
+def spark_size(s: Spark): Int = s.values.size
+
+## Newest sample, or `default` if buffer is empty.
+def spark_latest_or(s: Spark, default: Int): Int
+  var v = s.values
+  if v.size == 0
+    return default
+  end
+  return v[v.size - 1]
+end
+
+## Buffer minimum (auto-scale lower endpoint). Returns 0 when empty.
+def spark_min(s: Spark): Int
+  var v = s.values
+  if v.size == 0
+    return 0
+  end
+  var m = v[0]
+  var i = 1
+  while i < v.size
+    if v[i] < m
+      m = v[i]
+    end
+    i += 1
+  end
+  return m
+end
+
+## Buffer maximum (auto-scale upper endpoint). Returns 0 when empty.
+def spark_max(s: Spark): Int
+  var v = s.values
+  if v.size == 0
+    return 0
+  end
+  var m = v[0]
+  var i = 1
+  while i < v.size
+    if v[i] > m
+      m = v[i]
+    end
+    i += 1
+  end
+  return m
+end
+
+## Pth-percentile of the buffer, where `p` is in [0, 100]. Returns 0
+## when empty. Implementation sorts a copy and picks the index — fine
+## for typical buffer sizes (≤ a few hundred). Use this for anomaly
+## hinting ("current > p95 → highlight unusual"), baseline thresholds,
+## or any "where does the current sample sit in the recent window"
+## logic. Caller does no additional sort/copy work.
+def spark_percentile(s: Spark, p: Int): Int
+  var src = s.values
+  if src.size == 0
+    return 0
+  end
+  var pclamp = p
+  if pclamp < 0
+    pclamp = 0
+  end
+  if pclamp > 100
+    pclamp = 100
+  end
+  # Copy + insertion-sort.
+  var sorted = vec_new<Int>()
+  var i = 0
+  while i < src.size
+    sorted.push(src[i])
+    i += 1
+  end
+  var k = 1
+  while k < sorted.size
+    var j = k
+    while j > 0 and sorted[j] < sorted[j - 1]
+      var tmp = sorted[j]
+      sorted[j] = sorted[j - 1]
+      sorted[j - 1] = tmp
+      j -= 1
+    end
+    k += 1
+  end
+  # Pick the index (rounded down). For p=100, return the max.
+  var idx = pclamp * (sorted.size - 1) / 100
+  if idx < 0
+    idx = 0
+  end
+  if idx >= sorted.size
+    idx = sorted.size - 1
+  end
+  return sorted[idx]
+end
+
+# ============================================================
+# View
+# ============================================================
+
+## Resolve the active scale endpoints. Returns (min, max). Auto-scale
+## inflates a single-distinct-value buffer to (v, v+1) to avoid a
+## degenerate division-by-zero in the height map.
+def _spark_resolve_scale(s: Spark): Vec<Int>
+  var out = vec_new<Int>()
+  var lo = 0
+  var hi = 0
+  if s.auto_scale
+    lo = spark_min(s)
+    hi = spark_max(s)
+  else
+    lo = s.fixed_min
+    hi = s.fixed_max
+  end
+  if hi <= lo
+    hi = lo + 1
+  end
+  out.push(lo)
+  out.push(hi)
+  return out
+end
+
+## Compute the filled-pixel height for `value` against [lo, hi] over
+## a `pixel_h`-tall column. Result is in [0, pixel_h]; values outside
+## the scale clamp.
+def _spark_height_for(value: Int, lo: Int, hi: Int, pixel_h: Int): Int
+  if value <= lo
+    return 0
+  end
+  if value >= hi
+    return pixel_h
+  end
+  return (value - lo) * pixel_h / (hi - lo)
+end
+
+## Build the octant blitter and stamp every visible sample's column.
+## Right-aligned: when count < pixel_w, the leftmost (pixel_w - count)
+## columns stay empty.
+def _spark_build_blitter(s: Spark): oc::OctantBlitter
+  var pixel_w = s.width_cells * 2
+  var pixel_h = s.height_cells * 4
+  var b = oc::octant_blitter_new(pixel_w, pixel_h)
+  var v = s.values
+  var count = v.size
+  if count == 0
+    return b
+  end
+  var scale = _spark_resolve_scale(s)
+  var lo = scale[0]
+  var hi = scale[1]
+  # Right-align: the newest sample (index count-1) anchors at pixel
+  # column pixel_w-1. Each sample occupies `pixel_w / capacity` pixel
+  # columns when capacity <= pixel_w (chunky), or 1 pixel column with
+  # downsampling-via-max when capacity > pixel_w (high-frequency).
+  #
+  # Visible-pixels math: rightmost `count * pixel_w / capacity` pixels
+  # carry data; left of that pads empty until the buffer fills up.
+  var visible_pixels = count * pixel_w / s.capacity
+  if visible_pixels > pixel_w
+    visible_pixels = pixel_w
+  end
+  var px = 0
+  while px < pixel_w
+    var from_right = pixel_w - 1 - px
+    if from_right < visible_pixels
+      # Map this pixel column to the sample range it covers, anchored
+      # to the newest end of the buffer. samples_back_X = how many
+      # samples (counting back from newest) this pixel covers.
+      var samples_back_lo = from_right * s.capacity / pixel_w
+      var samples_back_hi = (from_right + 1) * s.capacity / pixel_w - 1
+      if samples_back_hi < samples_back_lo
+        samples_back_hi = samples_back_lo
+      end
+      var sample_hi = count - 1 - samples_back_lo
+      var sample_lo = count - 1 - samples_back_hi
+      if sample_lo < 0
+        sample_lo = 0
+      end
+      if sample_hi >= count
+        sample_hi = count - 1
+      end
+      if sample_hi >= 0 and sample_lo <= sample_hi
+        # Take the max over the covered range — preserves spikes
+        # under aggressive downsampling.
+        var peak = v[sample_lo]
+        var k = sample_lo + 1
+        while k <= sample_hi
+          if v[k] > peak
+            peak = v[k]
+          end
+          k += 1
+        end
+        var fh = _spark_height_for(peak, lo, hi, pixel_h)
+        # Bottom-anchored: bar grows up from the floor.
+        var py = pixel_h - 1
+        var remaining = fh
+        while remaining > 0
+          b = oc::octant_set(b, px, py, true)
+          py -= 1
+          remaining -= 1
+        end
+      end
+    end
+    px += 1
+  end
+  return b
+end
+
+## Render the sparkline as a `\n`-joined String. Output is
+## `height_cells` lines tall and `width_cells` cells wide; each line
+## contains `width_cells` octant glyphs. Style is uncoloured — wrap
+## the result with `Style.render` or paint per-row via the theme.
+##
+## Empty buffer renders an all-empty grid (every cell = U+0020 space).
+def spark_view(s: Spark): String
+  var b = _spark_build_blitter(s)
+  var sb = sb_new()
+  var cy = 0
+  while cy < s.height_cells
+    var cx = 0
+    while cx < s.width_cells
+      var pat = oc::octant_pattern_at(b, cx, cy)
+      sb_append(sb, _spark_glyph_for(pat, s.quality))
+      cx += 1
+    end
+    if cy < s.height_cells - 1
+      sb_append(sb, "\n")
+    end
+    cy += 1
+  end
+  return sb_to_string(sb)
+end
+
+## Glyph dispatch — mirrors octant.qz's _glyph_for but stays in this
+## module to avoid pulling on a private helper. Same dispatch logic.
+def _spark_glyph_for(pat: Int, q: oc::OctantQuality): String
+  if q is Octant
+    return oc::codepoint_to_utf8(oc::octant_codepoint(pat))
+  end
+  if q is Quadrant
+    return oc::codepoint_to_utf8(oc::octant_codepoint(_spark_quad_collapse(pat)))
+  end
+  if q is Half
+    return oc::codepoint_to_utf8(oc::octant_codepoint(_spark_half_collapse(pat)))
+  end
+  # Ascii: any-on → '#', off → ' '
+  if pat == 0
+    return " "
+  end
+  return "#"
+end
+
+## Quadrant collapse: re-pack 8 octant bits into 4 quadrant bits
+## projected back into the octant pattern slots so the codepoint
+## table maps onto a quadrant-clean pattern (U+2598..U+259F range).
+##
+## Quadrant packing: UL=any of {bit0,bit2}, UR=any of {bit1,bit3},
+## LL=any of {bit4,bit6}, LR=any of {bit5,bit7}. Re-emit as the
+## fully-vertical octant pattern that picks up that quadrant glyph
+## (the codepoint table reuses U+2598..U+259F for these patterns).
+def _spark_quad_collapse(pat: Int): Int
+  var p = 0
+  if (pat & 0x05) != 0
+    p = p | 0x05
+  end
+  if (pat & 0x0A) != 0
+    p = p | 0x0A
+  end
+  if (pat & 0x50) != 0
+    p = p | 0x50
+  end
+  if (pat & 0xA0) != 0
+    p = p | 0xA0
+  end
+  return p
+end
+
+## Half collapse: project 8 bits onto 2 (upper / lower half).
+def _spark_half_collapse(pat: Int): Int
+  var p = 0
+  if (pat & 0x0F) != 0
+    p = p | 0x0F
+  end
+  if (pat & 0xF0) != 0
+    p = p | 0xF0
+  end
+  return p
+end

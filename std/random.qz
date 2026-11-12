@@ -1,0 +1,286 @@
+# Random — Standard Library
+#
+# Clean API for random number generation, wrapping the built-in
+# xoshiro256** PRNG with higher-level helpers.
+#
+# Example:
+#   import random
+#   rand_seed(42)
+#   var n = rand_range_op(1, 100)
+#   var f = rand_float()
+#
+# Operation Piezoelectric Effects, Phase A.8 (post-audit roadmap,
+# 2026-05-01) — declares the `Random` effect with 4 ops covering the
+# deterministic xoshiro256** stream and the OS-backed CSPRNG. Default
+# handler (inline IR in codegen_runtime.qz) forwards to the existing
+# `qz_rand_*` runtime helpers; user-installed `with Random {...}`
+# blocks override per the standard handler-stack top-down scan. The
+# `rand_seed` / `rand_range` / `rand_float` / `crypto_rand_int`
+# intrinsics remain as the runtime symbols backing the default;
+# Phase 2-3 migrate stdlib + spec callsites to the effect ops.
+
+import math
+
+effect Random
+  ## Seed the deterministic PRNG (splitmix64 → xoshiro256**). Test
+  ## handlers may ignore.
+  def rand_seed_op(seed: Int): Void
+
+  ## Uniform i64 from the deterministic PRNG. Default forwards to
+  ## `qz_rand_int`. Output is implementation-defined for non-
+  ## deterministic handlers.
+  def rand_int_op(): Int
+
+  ## Uniform Int in [lo, hi). Default forwards to `qz_rand_range`
+  ## (modulo reduction; biased for non-power-of-2 spans — matches the
+  ## existing intrinsic semantics).
+  def rand_range_op(lo: Int, hi: Int): Int
+
+  ## Cryptographically-secure i64 from the OS RNG (`getrandom(2)` on
+  ## Linux, `arc4random_buf` on macOS). Security boundary — handlers
+  ## that override should preserve the "no inspection / no seeding"
+  ## contract.
+  def rand_crypto_op(): Int
+end
+
+## Random boolean (50/50).
+def random_bool(): Int
+  return rand_range_op(0, 2)
+end
+
+## Fisher-Yates in-place shuffle on a Vec.
+def random_shuffle(v: Vec<Int>): Void
+  var i = v.size - 1
+  while i > 0
+    var j = rand_range_op(0, i + 1)
+    var tmp = v[i]
+    v[i] = v[j]
+    v[j] = tmp
+    i -= 1
+  end
+end
+
+## Pick a random element from a Vec. Returns 0 for empty.
+def random_choice(v: Vec<Int>): Int
+  var n = v.size
+  if n == 0
+    return 0
+  end
+  return v[rand_range_op(0, n)]
+end
+
+## Sample k elements without replacement. Returns new Vec.
+def random_sample(v: Vec<Int>, k: Int): Vec<Int>
+  var n = v.size
+  var result = vec_new()
+  # Clone into temp for partial shuffle
+  var temp = vec_new()
+  for i in 0..n
+    temp.push(v[i])
+  end
+  # Partial Fisher-Yates
+  var count = math_min(k, n)
+  for i in 0..count
+    var j = rand_range_op(i, n)
+    var tmp = vec_get(temp, i)
+    vec_set(temp, i, vec_get(temp, j))
+    vec_set(temp, j, tmp)
+    result.push(vec_get(temp, i))
+  end
+  return result
+end
+
+## ---- Test-handler factories (Phase A.8 Pass 4) ----
+##
+## Three pre-built handlers for hermetic spec testing, scoped runtime
+## configuration, and PRNG-call debugging. Install via
+## `with Random { rand_int_op: handler, ... } do ... end` exactly like
+## the default handler. Each is a single dispatcher function (same
+## `(op_name, argc, argv): Int` ABI) so it can be bound to any
+## combination of the 4 ops.
+
+## Seeded PRNG with state independent of the global `qz_rand_int`
+## state. Owns module-level xoshiro256\*\* state derived via splitmix64
+## from a user-controlled seed. Calling `random_seeded_reset(s)`
+## reinitializes the local stream; subsequent op calls inside a
+## `with Random { ... }` block produce a reproducible sequence
+## without polluting any other PRNG that the program-under-test may
+## also be using.
+##
+## Usage:
+##   random_seeded_reset(42)
+##   with Random {
+##     rand_int_op: random_seeded_handler,
+##     rand_range_op: random_seeded_handler
+##   } do ->
+##     # Body sees the seeded local stream; the global qz_rand_int
+##     # state is untouched.
+##   end
+
+var _rs_s0 = 0
+var _rs_s1 = 0
+var _rs_s2 = 0
+var _rs_s3 = 0
+
+# splitmix64 step — mixes a counter value into a fresh state slot.
+# Mirrors the inline-IR seed body in codegen_runtime.qz so seeded
+# handler stays consistent with the default xoshiro256** seeding.
+def _rs_splitmix64_step(z_in: Int): Int
+  var z = z_in + 7640891576956012809
+  var a = bxor(z, shr(z, 30))
+  var b = a * -4658895280553007687
+  var c = bxor(b, shr(b, 27))
+  var d = c * -7723592293110705685
+  return bxor(d, shr(d, 31))
+end
+
+## Reset the seeded handler's local PRNG state. Call before installing
+## `random_seeded_handler` to start a deterministic stream.
+def random_seeded_reset(seed: Int): Void
+  var z1 = seed + 7640891576956012809
+  var z2 = z1 + 7640891576956012809
+  var z3 = z2 + 7640891576956012809
+  _rs_s0 = _rs_splitmix64_step(seed)
+  _rs_s1 = _rs_splitmix64_step(z1)
+  _rs_s2 = _rs_splitmix64_step(z2)
+  _rs_s3 = _rs_splitmix64_step(z3)
+end
+
+# xoshiro256** next: rotl(s1*5, 7)*9 + state mix.
+def _rs_next(): Int
+  var s1x5 = _rs_s1 * 5
+  var rotl = bor(shl(s1x5, 7), shr(s1x5, 57))
+  var result = rotl * 9
+  var t = shl(_rs_s1, 17)
+  var s2a = bxor(_rs_s2, _rs_s0)
+  var s3a = bxor(_rs_s3, _rs_s1)
+  var s1a = bxor(_rs_s1, s2a)
+  var s0a = bxor(_rs_s0, s3a)
+  var s2b = bxor(s2a, t)
+  var s3b = bor(shl(s3a, 45), shr(s3a, 19))
+  _rs_s0 = s0a
+  _rs_s1 = s1a
+  _rs_s2 = s2b
+  _rs_s3 = s3b
+  return result
+end
+
+def random_seeded_handler(op_name: Int, argc: Int, argv: Int): Int
+  var op = as_string(op_name)
+  if op.eq("rand_seed_op")
+    var seed = load(argv, 0)
+    random_seeded_reset(seed)
+    return 0
+  end
+  if op.eq("rand_int_op")
+    return _rs_next()
+  end
+  if op.eq("rand_range_op")
+    var lo = load(argv, 0)
+    var hi = load(argv, 1)
+    var span = hi - lo
+    if span == 0
+      return lo
+    end
+    var r = _rs_next()
+    # Mask sign bit; modulo reduce. Same biased shape as qz_rand_range.
+    var r_abs = band(r, 9223372036854775807)
+    return lo + (r_abs % span)
+  end
+  if op.eq("rand_crypto_op")
+    # Crypto is non-deterministic by contract — even seeded handler
+    # forwards to the OS CSPRNG so security tests don't accidentally
+    # use a deterministic source.
+    return crypto_rand_int()
+  end
+  return 0
+end
+
+## Returns a fixed value for every op regardless of args. Configure
+## via `random_constant_set(v)`. Used to simulate worst-case bias in
+## algorithms that depend on PRNG uniformity (e.g., assert that
+## `random_shuffle` doesn't crash when the PRNG always returns 0).
+##
+## Usage:
+##   random_constant_set(0)
+##   with Random {
+##     rand_int_op: random_constant_handler,
+##     rand_range_op: random_constant_handler
+##   } do ->
+##     # All PRNG ops return 0 (or whatever was set)
+##   end
+
+var _rc_value = 0
+
+## Set the constant value returned by `random_constant_handler`.
+def random_constant_set(v: Int): Void
+  _rc_value = v
+end
+
+def random_constant_handler(op_name: Int, argc: Int, argv: Int): Int
+  var op = as_string(op_name)
+  if op.eq("rand_seed_op")
+    return 0
+  end
+  return _rc_value
+end
+
+## Tracing wrapper: appends each `(op, args)` tuple to a module-level
+## trace log AND forwards to the default behavior so the underlying
+## semantics are preserved. Useful for asserting "the test exercised
+## these PRNG-dependent code paths."
+##
+## Usage:
+##   random_capture_reset()
+##   with Random {
+##     rand_int_op: random_capture_handler,
+##     rand_range_op: random_capture_handler,
+##     rand_seed_op: random_capture_handler,
+##     rand_crypto_op: random_capture_handler
+##   } do ->
+##     # Code under trace
+##   end
+##   var entries = random_capture_log()
+##   for e in entries; puts(e); end
+
+var _rcap_log = vec_new<String>()
+
+## Reset the capture log for cross-test isolation.
+def random_capture_reset(): Void
+  _rcap_log = vec_new<String>()
+end
+
+## Read the accumulated capture log. Each entry is one
+## `op:args` summary, in call order.
+def random_capture_log(): Vec<String> = _rcap_log
+
+def random_capture_handler(op_name: Int, argc: Int, argv: Int): Int
+  var op = as_string(op_name)
+  var entry = ""
+  if op.eq("rand_seed_op")
+    entry = "rand_seed_op #{load(argv, 0)}"
+    _rcap_log.push(entry)
+    rand_seed(load(argv, 0))
+    return 0
+  end
+  if op.eq("rand_int_op")
+    entry = "rand_int_op"
+    _rcap_log.push(entry)
+    return rand_int()
+  end
+  if op.eq("rand_range_op")
+    var lo = load(argv, 0)
+    var hi = load(argv, 1)
+    entry = "rand_range_op #{lo} #{hi}"
+    _rcap_log.push(entry)
+    return rand_range(lo, hi)
+  end
+  if op.eq("rand_crypto_op")
+    entry = "rand_crypto_op"
+    _rcap_log.push(entry)
+    return crypto_rand_int()
+  end
+  entry = "unknown #{op}"
+  _rcap_log.push(entry)
+  return 0
+end

@@ -1,0 +1,200 @@
+##! # niche — extra-inhabitant query + single-payload enum layout decision
+##!
+##! Part of the B.10 value-types epic, **Phase 4** (see
+##! `docs/design/MEMORY_MODEL_V3.md` §14). The machinery that makes `Option<T>`
+##! zero-cost for niche-bearing payloads: a single dataless variant (`None`) reuses
+##! an *invalid* bit-pattern of the payload instead of paying a separate tag word.
+##! `Option<&T>` / `Option<Bool>` / `Option<NonZero>` then cost `sizeof(payload)`,
+##! not `sizeof(payload) + 8` — the precondition for flipping the default off the
+##! i64-existential model and for B.15 (mandatory `Option`).
+##!
+##! **N0 (this commit) is the pure decision core + data model only.** It operates
+##! over plain type-name strings + small ints so it is unit-testable standalone (no
+##! `MirContext`/`MirProgram`) — see `spec/qspec/niche_spec.qz`. It is **NOT wired
+##! into codegen**: every enum still emits today's tag-at-offset-0 layout
+##! (`mir_lower.qz`, `mir_get_enum_tag`), so this commit is zero-IR-diff /
+##! fixpoint-trivial (the Phase-0-style keystone). N1 wires `enum_layout` into the
+##! ~5 discriminant sites (construction, `mir_get_enum_tag`, match, payload-bind,
+##! `is_some`/`is_none`) so that later phases change only THIS query, not every site.
+##!
+##! Soundness rule (§14.6): a niche source must be non-null/invalid *regardless of
+##! `nil`*. `Bool` (only 0/1 valid) and borrows `&T`/`&mut T` (never null) qualify
+##! today. `CPtr` does NOT — FFI null is a legitimate sentinel and must stay
+##! representable; `type_niche(CPtr)` is always none. The big surface — `Option<any
+##! boxed T>` via the null niche — is co-dependent with B.15 (because `nil`=`0`
+##! collides with the `None` niche over boxed types) and lands in N3, not here.
+##!
+##! @see layout the scalar width/representation authority (Phase 0+)
+##! @see abi_classify the sibling pure classifier (Phase 3 C-ABI), same idiom
+##! @since 5.25.0-alpha
+
+# ============================================================================
+# NicheInfo — a contiguous run of invalid bit-patterns of a type
+# ============================================================================
+# Positional record [start, count] (the `layout_desc`/`abi_info` idiom — no new
+# struct type to round-trip through the qzmod cache). `count == 0` means "no
+# niche". `start` is the first invalid value; the run is [start, start+count).
+# A contiguous run is sufficient for v1 (Swift/Rust both effectively reserve a
+# run); scattered spare-bit niches are a Phase-4 follow-on (§14.3).
+
+## Build a NicheInfo describing the run [start, start+count) of invalid patterns.
+def niche_new(start: Int, count: Int): Vec = [start, count]
+
+## The empty niche — the type occupies every bit-pattern of its size.
+def niche_none(): Vec = [0, 0]
+
+## First invalid value (meaningful only when niche_has == 1).
+def niche_start(n: Vec): Int = n[0]
+
+## Number of invalid values available to host dataless discriminants.
+def niche_count(n: Vec): Int = n[1]
+
+## 1 if the type has at least one extra inhabitant.
+def niche_has(n: Vec): Int
+  return 1 if n[1] > 0
+  return 0
+end
+
+# ============================================================================
+# type_niche — the extra-inhabitant query
+# ============================================================================
+
+## 1 if `type_name` is a borrow type (`&T` / `&mut T`). Borrows are non-null by
+## construction (you cannot form a null borrow), so `0` is an extra inhabitant.
+def niche_is_borrow(type_name: String): Int
+  return 1 if type_name.starts_with("&")
+  return 0
+end
+
+## The extra-inhabitant run of a type — the bit-patterns it provably never holds.
+## N0 delivers only the **sound-regardless-of-`nil`** sources (§14.6):
+##   - `Bool`  — i8-represented, only {0,1} valid ⇒ niche {2 .. 255}  (254 values)
+##   - `&T`/`&mut T` — never null ⇒ niche {0}                         (1 value)
+## Everything else is `none` for N0: a full-width integer (`Int`/`I64`/`U64`) has
+## no invalid pattern; `CPtr` is deliberately never niched (FFI-nullable sentinel);
+## `NonZero`/range-refined ints and unused-enum-tags are N2; the boxed-pointer null
+## niche is N3 (B.15-gated). Pure + total — same input always same output.
+def type_niche(type_name: String): Vec
+  return niche_new(2, 254) if type_name == "Bool"
+  return niche_new(0, 1) if niche_is_borrow(type_name) == 1
+  # NonZero (N2) — invariant `value != 0`, so `0` is an extra inhabitant ⇒ niche
+  # {0,1} (a BOTTOM niche, at 0 — handled by the range-membership discriminant,
+  # see mir_get_enum_tag_niche). Sound regardless of `nil`: NonZero is nominally
+  # distinct from Int, so neither a bare `0` nor `nil` (an Int) can reach a
+  # NonZero slot; the only producers (`nonzero_new`/`nonzero_new_unchecked`) keep
+  # 0 out. Contrast the boxed-pointer null niche (N3), co-dependent with B.15.
+  return niche_new(0, 1) if type_name == "NonZero"
+  return niche_none()
+end
+
+# ============================================================================
+# enum_layout — the single-payload-enum layout decision (the SoT router)
+# ============================================================================
+# The one place that decides niche-vs-tag for an enum. N1+ routes every
+# discriminant site through this so generalizing niches (N2) touches only the
+# query, never the call sites. Pure over the enum's *shape* (no MirContext): the
+# N1 adapter extracts (payload-variant count, dataless-variant count, the single
+# payload type) from the enum registry and calls this.
+
+## Today's representation: a full-word tag at offset 0, payload at 1..N.
+const ENUM_LAYOUT_SPILL = 0
+
+## Niche representation: no tag/alloc — the payload IS the enum value; dataless
+## variants occupy the payload's extra inhabitants (ascending, declaration order).
+const ENUM_LAYOUT_NICHE = 1
+
+## Multi-payload niche (Swift-parity, RFC docs/design/ENUM_NICHE_MULTIPAYLOAD.md):
+## ≥2 payload-carrying variants whose payloads share COMMON spare bits (the low
+## alignment bits of uniformly-boxed pointers). The discriminant (declaration
+## index) packs into the common low spare bits of the one payload word: variant i
+## ⇒ `payload_ptr | i`; read tag = `value & mask`, payload = `value & ~mask`. No
+## tag word, no alloc. M1 scope = exactly TWO boxed-pointer payload variants
+## (`Result<&A,&B>`-shaped); everything else SPILLs. `niche_start` (reused slot)
+## carries the common low-zero spare-bit COUNT for this kind.
+const ENUM_LAYOUT_NICHE_MULTI = 2
+
+## Build an enum-layout decision [kind, niche_start, dataless_used].
+def enum_layout_new(kind: Int, niche_start: Int, dataless_used: Int): Vec
+  return [kind, niche_start, dataless_used]
+end
+
+## ENUM_LAYOUT_SPILL or ENUM_LAYOUT_NICHE.
+def enum_layout_kind(l: Vec): Int = l[0]
+
+## First niche value used for a dataless variant (variant i ⇒ niche_start + i,
+## ascending in declaration order). Meaningful only for ENUM_LAYOUT_NICHE.
+def enum_layout_niche_start(l: Vec): Int = l[1]
+
+## How many dataless variants the niche hosts (== dataless count when NICHE).
+def enum_layout_dataless_used(l: Vec): Int = l[2]
+
+## Decide the layout of a single-payload enum (§14.3). NICHE iff: exactly one
+## payload-bearing variant, at least one dataless variant, and the payload type
+## has at least as many extra inhabitants as there are dataless variants. Anything
+## else — multi-payload, zero dataless (no Option-shape), or a no-niche payload
+## (`Option<Int>`) — SPILLs to today's tag layout, byte-identical.
+def enum_layout(payload_variant_count: Int, dataless_variant_count: Int, payload_type: String): Vec
+  if payload_variant_count == 1 and dataless_variant_count >= 1
+    var n = type_niche(payload_type)
+    var avail = niche_count(n)
+    if avail >= dataless_variant_count
+      var start = niche_start(n)
+      return enum_layout_new(ENUM_LAYOUT_NICHE, start, dataless_variant_count)
+    end
+  end
+  return enum_layout_new(ENUM_LAYOUT_SPILL, 0, 0)
+end
+
+# ============================================================================
+# enum_layout_multi — the multi-payload (≥2 data variant) niche-vs-spill router
+# ============================================================================
+# Pure (string + int inputs, no MirContext): the ctx-dependent spare-bit inputs
+# (`common_low_zero`, `common_extra_count`) are computed in mir.qz
+# (`mir_multi_enum_common_spare`) and PASSED IN — preserving this module's
+# string-purity for the qzmod round-trip, exactly as N3's dataless-enum scaffold
+# kept the ctx-aware variant-count query in mir.qz (RFC §2.3 / ratification Q4).
+#
+# M1 verdict (RFC §6 Phase M1 / §8 go-no-go): NICHE_MULTI iff —
+#   - EXACTLY 2 payload-carrying variants (the M1 first increment — N-variant is M2),
+#   - common_low_zero ≥ 1 (the 2 variants need 1 tag bit; uniformly-boxed ⇒ 3),
+#   - 2^common_low_zero ≥ V (the common low spare bits ALONE name every variant —
+#     v1 requires the spare bits to hold the WHOLE tag; partial scatter is deferred),
+#   - V = payload_count + dataless_count ≤ 8 (the 3-bit ceiling).
+# Anything else SPILLs (correct, not a gap): {Int,Int}/{Box,Int} (common_low_zero=0),
+# >2 payload variants (M2+), >8 variants. CONSERVATIVE — when in any doubt, SPILL
+# (false-negative is fine; a false-positive niche is a soundness hole). `niche_start`
+# carries `common_low_zero` (the spare-bit count) for the construct/read sites.
+
+## How many total variants the 3-bit M1 ceiling admits (2^3). >8 ⇒ SPILL.
+const NICHE_MULTI_MAX_VARIANTS = 8
+
+## Decide the layout of a multi-payload enum (RFC §2). `payload_variant_count` =
+## number of payload-carrying variants; `dataless_variant_count` = number of
+## payload-less variants; `common_low_zero` = the spare low alignment bits shared
+## by ALL payload words (0 if any payload is a scalar); `common_extra_count` =
+## intersected whole-value extra inhabitants (unused in M1 — reserved for M3
+## dataless-in-zero-word). Returns [kind, common_low_zero, V] (V = total variants).
+def enum_layout_multi(payload_variant_count: Int, dataless_variant_count: Int, common_low_zero: Int, common_extra_count: Int): Vec
+  # M1: exactly two payload variants; enum-niche 3a widens this to N payload
+  # variants (≥2). Single-payload enums keep their dedicated enum_layout path, so
+  # this clamps `>= 2` (NOT `>= 1`) — partition discipline. Eligibility for the
+  # N>2 case is gated upstream (mir_multi_enum_common_spare); a non-eligible enum
+  # returns SPILL there before reaching this router, so widening here is inert at
+  # gate=0. The capacity check below (2^common_low_zero >= v, v <= 8) is general.
+  if payload_variant_count >= 2
+    var v = payload_variant_count + dataless_variant_count
+    if common_low_zero >= 1 and v <= NICHE_MULTI_MAX_VARIANTS
+      # The common low spare bits must name every variant WHOLE (no scatter in v1).
+      var capacity = 1
+      var bi = 0
+      while bi < common_low_zero
+        capacity = capacity * 2
+        bi = bi + 1
+      end
+      if capacity >= v
+        return enum_layout_new(ENUM_LAYOUT_NICHE_MULTI, common_low_zero, v)
+      end
+    end
+  end
+  return enum_layout_new(ENUM_LAYOUT_SPILL, 0, 0)
+end

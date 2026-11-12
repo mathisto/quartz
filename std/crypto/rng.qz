@@ -1,0 +1,209 @@
+## std/crypto/rng - Cryptographic random number generation
+##
+## Two layers:
+##   1. `entropy_fill(buf, len)` — pulls `len` bytes directly from the OS
+##      RNG via `getentropy(3)`. Cross-platform (macOS 10.12+, Linux glibc
+##      2.25+, FreeBSD 12+, OpenBSD). Loops in 256-byte chunks because
+##      that's the per-call limit imposed by every implementation.
+##
+##   2. `Rng` struct + `rng_new` / `rng_fill` / `rng_destroy` — a userspace
+##      DRBG built on HKDF-BLAKE2s, seeded from `entropy_fill`. State is a
+##      32-byte PRK; each `rng_fill` call expands the PRK to produce
+##      output + the next-state PRK in one HKDF-Expand pass, then advances
+##      the state. Forward-secure: leaking the current PRK does not reveal
+##      past output.
+##
+## When to use which:
+## - For one-shot entropy needs (key generation, single nonce), call
+##   `entropy_fill` directly. Simplest, no state to manage.
+## - For repeated calls (per-packet nonces, scratch entropy in tight loops),
+##   keep an `Rng` around — it's faster than per-call OS syscalls and
+##   doesn't hammer the kernel's entropy pool.
+##
+## See `docs/design/CRYPTO_STDLIB_DESIGN.md` "Phase 1, Step 1.5".
+
+import std/core/crypto/hkdf
+import * from std/core/crypto/secret  # Secret<Int> + secret_(wrap|unwrap)_ptr (NET.4.1 B)
+import std/core/crypto/zeroize
+import * from ffi/socket  # for malloc/free, memcpy
+
+# =============================================================================
+# OS entropy source
+# =============================================================================
+
+## Read up to 256 bytes of cryptographically-secure randomness from the OS.
+## Returns 0 on success, -1 on failure. Caller must check.
+##
+## C signature:
+##   int getentropy(void *buf, size_t buflen);
+extern "C" def getentropy(buf: CPtr, buflen: CSize): CInt
+
+## Fill `buf` with `len` bytes of OS-supplied entropy. Loops in 256-byte
+## chunks because that's the per-call cap on every platform we target.
+## Panics on getentropy failure — callers cannot continue safely with
+## degraded entropy. (If you're hitting this, your kernel's RNG is broken
+## or your process has been jailed without /dev/urandom.)
+def entropy_fill(buf: Int, len: Int): Void
+  var pos = 0
+  while pos < len
+    var chunk = len - pos
+    if chunk > 256
+      chunk = 256
+    end
+    var rc = getentropy(buf + pos, chunk)
+    if rc != 0
+      panic("entropy_fill: getentropy failed (kernel RNG unavailable?)")
+    end
+    pos += chunk
+  end
+end
+
+# =============================================================================
+# DRBG over HKDF-BLAKE2s
+# =============================================================================
+
+## Cryptographic RNG state. Hold one of these for the lifetime of any
+## component that needs random bytes; each call to `rng_fill` rekeys
+## the internal PRK so leaking state at time T doesn't reveal output
+## generated before T (forward secrecy).
+##
+## After use, call `rng_destroy` to wipe the PRK. Don't `free()` directly.
+struct Rng
+  prk: Int  # malloc'd 32-byte buffer holding the current PRK
+end
+
+## Initialize a fresh RNG. Pulls 64 bytes of OS entropy, runs HKDF-Extract
+## to compress them into the 32-byte PRK seed, and zeroizes the entropy
+## buffer before returning.
+def rng_new(): Rng
+  var seed = malloc(64)
+  entropy_fill(seed, 64)
+  var prk = malloc(32)
+  # Empty salt → HKDF-Extract treats it as 32 zero bytes (RFC 5869 §3.1).
+  # NET.4.1 B: the seed bytes are the live entropy from the OS RNG —
+  # wrap at the HKDF boundary.
+  hkdf_extract_blake2s(prk, 0, 0, secret_wrap(seed), 64)
+  zeroize(seed, 64)
+  free(seed)
+  return Rng { prk: prk }
+end
+
+## Fill `buf` with `len` bytes of cryptographically-strong randomness.
+## Each call expands the current PRK into (output || new_PRK) and replaces
+## the state. For len > 8128 bytes, loops in chunks (HKDF-Expand has an
+## RFC 5869 §2.3 cap of 255 * hashlen = 8160 bytes per Expand call; we
+## reserve 32 of those for the rekey).
+def rng_fill(r: Rng, buf: Int, len: Int): Void
+  var pos = 0
+  while pos < len
+    var chunk = len - pos
+    if chunk > 8128
+      chunk = 8128
+    end
+    var block = malloc(chunk + 32)
+    # Empty info — domain separation is via the PRK chain alone.
+    # NET.4.1 B: the DRBG state PRK is secret; wrap at the HKDF boundary.
+    hkdf_expand_blake2s(block, secret_wrap(r.prk), 0, 0, chunk + 32)
+    memcpy(buf + pos, block, chunk)
+    memcpy(r.prk, block + chunk, 32)
+    zeroize(block, chunk + 32)
+    free(block)
+    pos += chunk
+  end
+end
+
+## Wipe the PRK and free the state buffer. After this, the Rng value
+## must not be used. (Quartz doesn't yet have linear-types-style use-after-
+## destroy detection — see docs/design/CRYPTO_STDLIB_DESIGN.md "Secret<T>"
+## roadmap.)
+def rng_destroy(r: Rng): Void
+  zeroize(r.prk, 32)
+  free(r.prk)
+end
+
+# =============================================================================
+# Hardware RNG (x86_64 only) — for the unikernel and any other freestanding
+# context where getentropy(3) doesn't exist
+# =============================================================================
+##
+## The `rdrand_64` / `rdseed_64` intrinsics return Int with the success flag
+## in bit 63 (high) and 63 bits of randomness in bits 0..62 (the low 63 bits
+## of the hardware register). Caller masks the flag bit and retries on
+## failure. One bit per call is dropped to make room for the flag — the loss
+## is irrelevant because output flows through HKDF-Extract, which condenses
+## any input ≥ k bits to a k-bit PRK. See `docs/design/WIREGUARD_UNIKERNEL_DESIGN.md`
+## "Entropy source for the unikernel".
+##
+## RDSEED reads from the silicon's true-entropy reservoir; RDRAND reads from
+## a CTR-DRBG seeded from the same reservoir. Under load RDSEED fails more
+## often (smaller reservoir, slower refill), so we try RDSEED first up to the
+## retry budget then fall back to RDRAND. Both failing means the CPU lacks
+## hardware RNG (no Ivy Bridge+ for RDRAND, no Broadwell+ for RDSEED) — at
+## that point we cannot safely produce keys, and panic.
+
+const HW_RNG_OK_BIT_MASK = 9223372036854775807  # 2^63 - 1, masks bit 63 to extract value
+const HW_RNG_RETRY_BUDGET = 10                  # Intel-recommended
+
+## Pull a single 63-bit random sample from the x86 hardware RNG.
+## Tries RDSEED (true entropy) first, falls back to RDRAND (whitened DRBG)
+## if RDSEED is exhausted. Panics if both retry budgets are exhausted —
+## indicates the CPU lacks hardware RNG support, which is fatal for any
+## key-generating workload.
+def __hw_rng_get_64(): Int
+  var n = 0
+  while n < HW_RNG_RETRY_BUDGET
+    var r = rdseed_64()
+    if r < 0   # bit 63 set = ok flag (signed-int interpretation)
+      return r & HW_RNG_OK_BIT_MASK
+    end
+    n = n + 1
+  end
+  n = 0
+  while n < HW_RNG_RETRY_BUDGET
+    var r = rdrand_64()
+    if r < 0
+      return r & HW_RNG_OK_BIT_MASK
+    end
+    n = n + 1
+  end
+  panic("hw_rng: RDSEED and RDRAND both exhausted (CPU lacks hardware RNG support?)")
+end
+
+## Fill `buf` with `len` bytes of cryptographically-secure randomness from
+## the x86 hardware RNG. Each `__hw_rng_get_64` call yields 63 bits; we
+## extract 7 unbiased bytes per call (bits 0..55), skipping the partially-
+## biased 8th byte where bit 63 is forced to 0. Slightly wasteful (12.5%
+## fewer bits used per call) but easy to reason about and the hardware RNG
+## is fast enough that the overhead is invisible.
+##
+## Use only on x86_64 freestanding (or x86_64 hosts where you want to
+## bypass POSIX entropy). Calling this on aarch64 emits IR referencing
+## `@llvm.x86.rdrand.64` which the linker rejects.
+def entropy_fill_hw(buf: Int, len: Int): Void
+  var pos = 0
+  while pos < len
+    var r = __hw_rng_get_64()
+    var i = 0
+    while i < 7 and pos < len
+      volatile_store<U8>(buf + pos, r & 255)
+      r = shr(r, 8)
+      pos = pos + 1
+      i = i + 1
+    end
+  end
+end
+
+## Initialize a fresh RNG seeded from the x86 hardware RNG instead of
+## getentropy(3). Used by the unikernel and other freestanding contexts
+## where POSIX is unavailable. Userspace callers should prefer `rng_new`,
+## which works cross-architecture.
+def rng_new_hw(): Rng
+  var seed = malloc(64)
+  entropy_fill_hw(seed, 64)
+  var prk = malloc(32)
+  # NET.4.1 B: hardware-RNG seed bytes are secret; wrap at HKDF boundary.
+  hkdf_extract_blake2s(prk, 0, 0, secret_wrap(seed), 64)
+  zeroize(seed, 64)
+  free(seed)
+  return Rng { prk: prk }
+end

@@ -1,0 +1,163 @@
+## Phase 6.1.b — http_server.qz init-error Throws migration acceptance spec.
+##
+## Operation Piezoelectric Effects, Phase 6 (user-tool dogfooding),
+## subphase 6.1.b commit 1.
+##
+## Validates the migration of bind/listen/socket/kqueue/kevent failure
+## sites in std/net/http_server.qz from `log::error("..."); close(fd);
+## return 1` to typed `throw(http_error_format(HttpError::X))` via the
+## `Throws` effect declared in std/throws.qz.
+##
+## Effect surface:
+## - `enum HttpError` with five init-failure variants:
+##     SocketCreateFailed, BindFailed(Int), ListenFailed,
+##     KqueueCreateFailed, KeventWaitFailed.
+##     (BindFailed uses a tuple variant; struct-shape `{ port: Int }`
+##     triggers a compiler memory blowup in this module — see
+##     docs/bugs/STRUCT_VARIANT_IN_HEAVY_IMPORT_MODULE_BLOWUP.md.)
+## - `def http_error_format(e: HttpError): String` — pattern-matches the
+##   variant and produces the same diagnostic string the old log::error
+##   call site used to emit.
+## - Init-failure paths: `close(server_fd); throw(http_error_format(...))`.
+##   Resource cleanup runs BEFORE the throw so unwind doesn't leak fds.
+##
+## Default-handler semantics:
+## - The runtime-blessed Throws default (Phase 6.1.b prep, 7df8b805)
+##   reads argv[0] as a String and writes its bytes + newline to stderr,
+##   then exits 66. So `throw(http_error_format(HttpError::BindFailed(1)))`
+##   with no user handler installed prints "Failed to bind to port 1\n"
+##   on stderr and exits 66 — identical diagnostic to the old log::error
+##   path, just delivered via the effect substrate.
+## - User handler: `with Throws { throw: my_h } do -> http_serve(1, h) end`
+##   receives argv[0] = the formatted string, can decode + redirect.
+##
+## TLS-specific variants (SslContextCreateFailed et al.) ship in commit 3
+## per design memo R2 — TLS unwind paths interact with OpenSSL state and
+## want their own audited migration.
+##
+## What this spec does NOT cover (filed for follow-on):
+## - Per-request effect-frame isolation (1000-fiber stress) — Phase 6.1.c.
+## - TLS init throws — Phase 6.1.b commit 2.
+## - Live bind-to-privileged-port subprocess integration — fragile across
+##   CI environments where tests might run as root or with capabilities;
+##   the runtime path is exercised via direct throw tests below.
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("http_server init-error Throws migration (Phase 6.1.b)") do ->
+
+    it("std/net/http_server compiles with std/throws dependency") do ->
+      # Empty main that imports http_server. If the migration broke the
+      # import graph (missing std/throws, name collision, duplicate
+      # effect Throws declaration), this would fail to compile. Exit 0
+      # = the import + module init runs cleanly, including std/throws's
+      # effect declaration registration.
+      assert_run_exits("""
+import std/net/http_server
+
+def main(): Int
+  return 0
+end
+""", 0)
+    end
+
+    it("HttpError enum + http_error_format produce expected diagnostic strings") do ->
+      # Pure logic test: each variant maps to its diagnostic string. No
+      # subprocess server needed; this exercises the format function in
+      # isolation so any future variant addition catches a missing arm.
+      # (KqueueCreateFailed/KeventWaitFailed deleted in D.11 Phase 3b
+      # alongside the kqueue-based plain-HTTP server bodies.)
+      assert_run_stdout_eq("""
+import std/net/http_server
+
+def main(): Int
+  puts(http_error_format(HttpError::SocketCreateFailed))
+  puts(http_error_format(HttpError::BindFailed(8080)))
+  puts(http_error_format(HttpError::ListenFailed))
+  return 0
+end
+""", "Failed to create socket\nFailed to bind to port 8080\nFailed to listen\n")
+    end
+
+    it("default Throws handler exits 66 with the actual message on stderr") do ->
+      # End-to-end through the runtime default: throw a formatted
+      # HttpError with no user handler installed. The Phase 6.1.b prep
+      # (7df8b805) made the default extract argv[0] as a String and
+      # write its bytes; this test asserts the migration's diagnostic
+      # quality is preserved across the puts→log→throw rewrite.
+      assert_run_exits("""
+import std/net/http_server
+
+def main(): Int
+  throw(http_error_format(HttpError::BindFailed(1)))
+  return 0
+end
+""", 66)
+    end
+
+    it("default Throws handler writes the formatted bind message to stderr") do ->
+      assert_run_stderr_contains("""
+import std/net/http_server
+
+def main(): Int
+  throw(http_error_format(HttpError::BindFailed(1)))
+  return 0
+end
+""", "Failed to bind to port 1")
+    end
+
+    it("custom `with Throws` overrides the default — handler captures the message") do ->
+      # The whole point of the migration: substituting handlers without
+      # editing http_server.qz. The user installs a stdout-printing
+      # handler; the default stderr+exit-66 handler is shadowed; the
+      # captured message reaches stdout, and the program continues
+      # past the with-block (handler returns 1, exit 0 from main).
+      assert_run_stdout_eq("""
+import std/net/http_server
+
+def cap(op_name: Int, argc: Int, argv: Int): Int
+  puts("captured: " + as_string(load(argv, 0)))
+  return 1
+end
+
+def main(): Int
+  with Throws { throw: cap } do ->
+    throw(http_error_format(HttpError::ListenFailed))
+  end
+  return 0
+end
+""", "captured: Failed to listen\n")
+    end
+
+    it("HttpError variant pattern-matching works for user code") do ->
+      # User code should be able to match on HttpError variants to
+      # branch on failure mode. Phase 6.1.b's typed surface enables
+      # this; today users would just see opaque return-1 codes.
+      assert_run_stdout_eq("""
+import std/net/http_server
+
+def classify(e: HttpError): String
+  match e
+    SocketCreateFailed => "socket"
+    BindFailed(port) => "bind:" + str_from_int(port)
+    ListenFailed => "listen"
+    SslContextCreateFailed => "ctx"
+    SslCertLoadFailed(path) => "cert:" + path
+    SslKeyLoadFailed(path) => "key:" + path
+    SslKeyMismatch => "mismatch"
+  end
+end
+
+def main(): Int
+  puts(classify(HttpError::BindFailed(80)))
+  puts(classify(HttpError::ListenFailed))
+  puts(classify(HttpError::SocketCreateFailed))
+  return 0
+end
+""", "bind:80\nlisten\nsocket\n")
+    end
+  end
+  return qspec_main()
+end

@@ -1,0 +1,645 @@
+##! qzmod_format — Constants + path/header helpers for `.qzmod` module artifacts.
+##!
+##! Design memo: `docs/design/QZMOD_FORMAT.md`.
+##!
+##! v1 ships a multi-file directory per module under
+##! `.quartz-cache/<compiler_hash[:16]>/<module_safe_name>/` with:
+##!   - `header.txt`: text version, hashes, dep table
+##!   - `*.bin`:      Vec<Int>/Vec<String> payloads via vec_save / strvec_save
+##!
+##! All header lines and filenames are deterministic. No timestamps,
+##! no PIDs, no absolute paths — content hashing requires it.
+
+import file_io
+import content_hash
+import * from str_compat
+
+# =============================================================================
+# Format version constants
+# =============================================================================
+#
+# SemVer-shaped: MAJOR bumps break readers (renamed fields, changed encoding in
+# mandatory sections); MINOR bumps are additive (new sections, new optional
+# fields with default values). EXPERIMENTAL=1 marks pre-stable formats; v1
+# ships with EXPERIMENTAL=0 once the round-trip qspec passes.
+
+def qzmod_major(): Int = 1
+# MINOR=2 (D3) — additive union/record structural-signature tables so a
+# union / record VALUE crossing a module boundary (post-termification these
+# are constructible values that can be returned / passed / stored) can have
+# its producer-space type id in the TYPE_UNION_BASE..TYPE_RECORD_BASE band
+# remapped into the consumer's registry. Older readers ignore the new
+# sections (unknown filename = section absent); older `.qzmod` caches lack
+# them and decode as empty tables → the remap falls back to the pre-D3
+# advisory-miss for band ids, so both directions stay backward-compatible.
+def qzmod_minor(): Int = 2
+def qzmod_experimental(): Int = 0
+
+## Magic / format-name line emitted as line 1 of `header.txt`. Distinct from
+## MAJOR so readers can reject random files cleanly before parsing further.
+def qzmod_magic_line(): String = "QZMOD-V1"
+
+# =============================================================================
+# Cache root + module directory paths
+# =============================================================================
+
+## Root cache directory inside the project. All `.qzmod` directories live under
+## `<project_root>/.quartz-cache/`. Matches the existing build_cache.qz
+## convention; can share a parent with the Tier 0/1/2 LLVM IR fragment cache.
+def qzmod_cache_root(project_root: String): String
+  # Honor the active --cache-dir (set at compile() entry) so qzmod shares the
+  # build_cache root and stays isolated per-invocation. Falls back to the
+  # historical `<project_root>/.quartz-cache` default only when unset (drivers
+  # that never call qzmod_active_cache_dir_set). A relative cache_dir (e.g.
+  # ".quartz-cache-qspec" or "/tmp/x") is used as-is — it resolves against cwd,
+  # exactly as build_cache::cache_open does, so the two never diverge.
+  var active = _g_qzmod_active_cache_dir
+  if str_byte_len(active) > 0
+    return active
+  end
+  if str_byte_len(project_root) == 0
+    return ".quartz-cache"
+  end
+  return "#{project_root}/.quartz-cache"
+end
+
+## Per-compiler-binary subdirectory. Keeps multiple in-flight compiler
+## versions (working copy + golden + previous-stage) from clobbering each
+## other during `quake guard` cycles. Hash is truncated to 16 hex chars
+## (64 bits — plenty of separation between concurrent compilers; full FNV-1a
+## output IS 16 chars so this is a no-op today, kept explicit for when SHA-256
+## arrives in v2).
+def qzmod_compiler_shard(compiler_hash: String): String
+  if str_byte_len(compiler_hash) <= 16
+    return compiler_hash
+  end
+  return str_byte_slice(compiler_hash, 0, 16)
+end
+
+## Convert a module name (e.g. `std/sync/channel`, `self-hosted/middle/typecheck`)
+## into a filesystem-safe directory name with `/` → `__`. Single-segment names
+## pass through unchanged.
+def qzmod_module_safe_name(module_name: String): String
+  return str_replace(module_name, "/", "__")
+end
+
+## Full directory path for a module's `.qzmod` artifact:
+##   <project_root>/.quartz-cache/<compiler_hash[:16]>/<module_safe_name>/
+def qzmod_module_dir(project_root: String, compiler_hash: String, module_name: String): String
+  var root = qzmod_cache_root(project_root)
+  var shard = qzmod_compiler_shard(compiler_hash)
+  var safe = qzmod_module_safe_name(module_name)
+  return "#{root}/#{shard}/#{safe}"
+end
+
+## Path to a specific section file within a module's `.qzmod` directory.
+def qzmod_section_path(module_dir: String, section_filename: String): String
+  return "#{module_dir}/#{section_filename}"
+end
+
+## Path to the header.txt for a module's `.qzmod`. Always present in a valid
+## artifact directory; absence means the artifact doesn't exist (cache miss).
+def qzmod_header_path(module_dir: String): String
+  return "#{module_dir}/header.txt"
+end
+
+# =============================================================================
+# Compiler binary content hash — the cache version key
+# =============================================================================
+#
+# Memoized at first call. Quartz invocations run as a single process, so the
+# binary's content can't change mid-run. The hash IS the cache version: when
+# `quake guard` produces a new binary, every cached `.qzmod` is auto-invalidated
+# because its `header.txt` records a stale compiler_hash. No format-version
+# field to forget to bump.
+#
+# Bootstrap recipe (from agent 4's research):
+#   Phase 5.0f.d.2.b2 attempt 1 failed to discover this — we conflated
+#   per-compile and per-process state. .qzmod sidesteps the problem entirely
+#   by keying the cache on the binary that produced it; a different binary
+#   reads as a different cache namespace.
+#
+# argv(0) gives the executable path (proven path: `detect_stdlib_path` in
+# quartz.qz uses the same source). Hash the binary's content at that path.
+
+var _g_qzmod_compiler_hash: String = ""
+
+def qzmod_compiler_hash(): String
+  if str_byte_len(_g_qzmod_compiler_hash) > 0
+    return _g_qzmod_compiler_hash
+  end
+  var binary = argv(0)
+  var hash = ""
+  if fio_exists(binary)
+    hash = content_hash::content_hash_file(binary)
+  end
+  if str_byte_len(hash) == 0
+    # Fall back to a sentinel so consumers can detect "no hash available"
+    # without crashing. Cache writes that include this sentinel are dead
+    # weight but won't collide with a real binary's hash.
+    hash = "0000000000000000"
+  end
+  _g_qzmod_compiler_hash = hash
+  return hash
+end
+
+## For testing / `quake guard` validation: reset the memoized hash so the next
+## call recomputes from argv(0). Production code should never need this.
+def qzmod_compiler_hash_reset(): Void
+  _g_qzmod_compiler_hash = ""
+end
+
+# =============================================================================
+# Canonical flags
+# =============================================================================
+#
+# Cache key includes the set of compiler flags that affect codegen output.
+# Canonicalized to a deterministic string so two semantically equivalent
+# invocations (e.g. `-O 0` vs `--no-opt`) hash identically.
+
+def qzmod_canonical_flags(target: String, debug_mode: Int, no_opt: Int, overflow_check: Int, exclusivity_check: Int): String
+  var sb = ""
+  sb = "#{sb}target=#{target}\n"
+  sb = "#{sb}debug=#{debug_mode}\n"
+  sb = "#{sb}noopt=#{no_opt}\n"
+  sb = "#{sb}overflow=#{overflow_check}\n"
+  sb = "#{sb}exclusivity=#{exclusivity_check}\n"
+  return sb
+end
+
+# =============================================================================
+# Active-compile flags hash
+# =============================================================================
+#
+# The encoder records `flags_hash` (hash of canonical_flags) in header.txt
+# (line 8). The consumer needs to compare against ITS OWN current flags_hash
+# to reject a cache entry produced under a different target / debug / noopt /
+# overflow config. Without this gate, a native compile's `.qzmod` for e.g.
+# `std/ffi/socket` gets read by a follow-on cross-compile to Windows, and
+# the cached MIR — which under native target only contains the POSIX `@cfg`
+# overloads — drops the Windows variant of `socket_init_once`, `socket_close`,
+# etc. The whole-program "quick-check" at compile() entry already includes
+# target in its sentinel; this layer mirrors that discipline.
+#
+# Set once per compile() entry from quartz.qz; read by the resolver when
+# probing the per-module cache. Memoized as a process-global to avoid
+# re-hashing on every module lookup.
+
+var _g_qzmod_active_flags_hash: String = ""
+
+# D.11 Phase 7 / B.5d.1 — raw target triple, separate from the flags hash.
+# mir_lower's PASS 1.3 (Future wrapper auto-synthesis) reads this to gate
+# wrapper emission on freestanding (kernel uses go_fn + seeded stacks,
+# never the Future-poll machinery — wrappers are dead code that pulls in
+# hosted runtime symbols at link). Set at compile() entry next to the
+# flags hash so a single setter call covers both concerns.
+var _g_qzmod_active_target: String = ""
+
+def qzmod_active_flags_set(target: String, debug_mode: Int, no_opt: Int, overflow_check: Int, exclusivity_check: Int): Void
+  var flags_str = qzmod_canonical_flags(target, debug_mode, no_opt, overflow_check, exclusivity_check)
+  _g_qzmod_active_flags_hash = content_hash::content_hash(flags_str)
+  _g_qzmod_active_target = target
+end
+
+def qzmod_active_flags_hash(): String = _g_qzmod_active_flags_hash
+
+def qzmod_active_target(): String = _g_qzmod_active_target
+
+# Active build-cache directory for the current compile, mirroring the
+# `--cache-dir` flag (build_cache::cache_get_dir()). Set at compile() entry.
+# Before this existed, qzmod_cache_root hardcoded `<project_root>/.quartz-cache`,
+# so the qzmod MIR/type cache IGNORED --cache-dir and always lived in
+# `.quartz-cache` — cross-contaminating every compile with whatever the last
+# `quake build` (or another --cache-dir invocation) left there. That silently
+# dropped wildcard-imported modules (terminal/socket) from spec compiles when
+# `.quartz-cache` held stale entries, and defeated the per-worker cache
+# isolation the --cache-dir flag promises. Now qzmod shares the active
+# --cache-dir, so build_cache and qzmod stay in lockstep.
+var _g_qzmod_active_cache_dir: String = ""
+
+def qzmod_active_cache_dir_set(cache_dir: String): Void
+  _g_qzmod_active_cache_dir = cache_dir
+end
+
+def qzmod_active_cache_dir(): String = _g_qzmod_active_cache_dir
+
+## For testing / drivers that call compile() more than once with different
+## flags. quartz.qz always calls qzmod_active_flags_set at compile() entry,
+## so the reset is rarely needed in practice.
+def qzmod_active_flags_reset(): Void
+  _g_qzmod_active_flags_hash = ""
+  _g_qzmod_active_target = ""
+end
+
+# =============================================================================
+# Header (header.txt) format
+# =============================================================================
+#
+# Line-based text. Single-purpose, no nesting, easy to diff. Stable across
+# editor reformatting (each field on its own line, no whitespace tolerance
+# inside lines).
+#
+#   Line 1:  QZMOD-V1
+#   Line 2:  <MAJOR>
+#   Line 3:  <MINOR>
+#   Line 4:  <EXPERIMENTAL>
+#   Line 5:  <compiler_hash>
+#   Line 6:  <source_hash>
+#   Line 7:  <output_hash>
+#   Line 8:  <canonical_flags hash>     # canonical_flags hashed for compactness
+#   Line 9:  <n_deps>
+#   Line 10..10+n_deps-1:  <dep_module_name>|<dep_interface_hash>
+#
+# canonical_flags is hashed (not stored verbatim) so consumers can compare with
+# their own canonical_flags hash directly. Storing verbatim flags wastes bytes
+# and invites bikeshedding over format.
+
+struct QzmodHeader
+  is_valid: Int                       # 0 = parse error or wrong magic
+  major: Int
+  minor: Int
+  experimental: Int
+  compiler_hash: String
+  source_hash: String
+  output_hash: String
+  flags_hash: String
+  dep_names: Vec<String>              # parallel to dep_iface_hashes
+  dep_iface_hashes: Vec<String>
+end
+
+## Construct an empty / invalid header (returned on parse failure).
+def qzmod_header_invalid(): QzmodHeader
+  return QzmodHeader {
+    is_valid: 0,
+    major: 0,
+    minor: 0,
+    experimental: 0,
+    compiler_hash: "",
+    source_hash: "",
+    output_hash: "",
+    flags_hash: "",
+    dep_names: vec_new<String>(),
+    dep_iface_hashes: vec_new<String>()
+  }
+end
+
+## Serialize a header to its on-disk text form. Caller writes the result to
+## `<module_dir>/header.txt`.
+def qzmod_header_format(compiler_hash: String, source_hash: String, output_hash: String, flags_hash: String, dep_names: Vec<String>, dep_iface_hashes: Vec<String>): String
+  var sb = ""
+  sb = "#{sb}#{qzmod_magic_line()}\n"
+  sb = "#{sb}#{qzmod_major().to_s()}\n"
+  sb = "#{sb}#{qzmod_minor().to_s()}\n"
+  sb = "#{sb}#{qzmod_experimental().to_s()}\n"
+  sb = "#{sb}#{compiler_hash}\n"
+  sb = "#{sb}#{source_hash}\n"
+  sb = "#{sb}#{output_hash}\n"
+  sb = "#{sb}#{flags_hash}\n"
+  sb = "#{sb}#{dep_names.size.to_s()}\n"
+  for i in 0..dep_names.size
+    var name = dep_names[i]
+    var hash = ""
+    if i < dep_iface_hashes.size
+      hash = dep_iface_hashes[i]
+    end
+    sb = "#{sb}#{name}|#{hash}\n"
+  end
+  return sb
+end
+
+## Parse a header.txt content. Returns a QzmodHeader with is_valid=1 on
+## success, is_valid=0 on any structural error (wrong magic, malformed
+## numbers, dep count mismatch, etc.). Per design principle #6 ("cache is
+## advisory"), parse failures fall through to recompile silently — they're
+## logged at the call site, not raised here.
+def qzmod_header_parse(content: String): QzmodHeader
+  if str_byte_len(content) == 0
+    return qzmod_header_invalid()
+  end
+  var lines = str_split(content, "\n")
+  if lines.size < 9
+    return qzmod_header_invalid()
+  end
+  if not lines[0].eq(qzmod_magic_line())
+    return qzmod_header_invalid()
+  end
+  var major = str_to_int(lines[1])
+  var minor = str_to_int(lines[2])
+  var experimental = str_to_int(lines[3])
+  if major != qzmod_major()
+    # MAJOR mismatch is the explicit "reader can't handle this" signal.
+    # Caller should treat it as a clean cache miss + recompile.
+    return qzmod_header_invalid()
+  end
+  var compiler_hash = lines[4]
+  var source_hash = lines[5]
+  var output_hash = lines[6]
+  var flags_hash = lines[7]
+  var n_deps = str_to_int(lines[8])
+  if n_deps < 0
+    return qzmod_header_invalid()
+  end
+  # Expect n_deps additional non-empty lines after line 8.
+  # `str_split` may produce a trailing empty entry from the final "\n";
+  # accept either lines.size == 9 + n_deps or lines.size == 9 + n_deps + 1.
+  var expected_min = 9 + n_deps
+  if lines.size < expected_min
+    return qzmod_header_invalid()
+  end
+  var dep_names = vec_new<String>()
+  var dep_iface_hashes = vec_new<String>()
+  for di in 0..n_deps
+    var dep_line = lines[9 + di]
+    var sep = __char_index(dep_line, '|')
+    if sep <= 0
+      return qzmod_header_invalid()
+    end
+    var name = str_byte_slice(dep_line, 0, sep)
+    var hash = str_byte_slice(dep_line, sep + 1, str_byte_len(dep_line))
+    dep_names.push(name)
+    dep_iface_hashes.push(hash)
+  end
+  return QzmodHeader {
+    is_valid: 1,
+    major: major,
+    minor: minor,
+    experimental: experimental,
+    compiler_hash: compiler_hash,
+    source_hash: source_hash,
+    output_hash: output_hash,
+    flags_hash: flags_hash,
+    dep_names: dep_names,
+    dep_iface_hashes: dep_iface_hashes
+  }
+end
+
+# =============================================================================
+# Section filenames (the on-disk vocabulary)
+# =============================================================================
+#
+# Each section gets a stable filename. New sections in MINOR bumps add new
+# filenames; readers that don't know a name skip it (= section absent). This
+# is the additive-evolution discipline TASTy's section IDs encode in binary.
+#
+# Grouped by tag from `docs/design/QZMOD_FORMAT.md` § 4.3.
+
+# Phase 1 mandatory sections — minimum needed for a consumer to typecheck
+# against an imported module's signatures.
+def qzmod_file_strings(): String = "strings.bin"
+def qzmod_file_types_tag(): String = "types_tag.bin"
+def qzmod_file_types_arg1(): String = "types_arg1.bin"
+def qzmod_file_types_arg2(): String = "types_arg2.bin"
+def qzmod_file_types_args_blob(): String = "types_args_blob.bin"
+def qzmod_file_structs_name(): String = "structs_name.bin"
+def qzmod_file_structs_fields_blob(): String = "structs_fields_blob.bin"
+def qzmod_file_structs_fields_off(): String = "structs_fields_off.bin"
+def qzmod_file_enums_name(): String = "enums_name.bin"
+def qzmod_file_enums_variants_blob(): String = "enums_variants_blob.bin"
+def qzmod_file_enums_variants_off(): String = "enums_variants_off.bin"
+def qzmod_file_funcs_name(): String = "funcs_name.bin"
+def qzmod_file_funcs_sig_blob(): String = "funcs_sig_blob.bin"
+def qzmod_file_funcs_sig_off(): String = "funcs_sig_off.bin"
+def qzmod_file_traits_name(): String = "traits_name.bin"
+def qzmod_file_traits_methods_blob(): String = "traits_methods_blob.bin"
+def qzmod_file_traits_methods_off(): String = "traits_methods_off.bin"
+def qzmod_file_impls_blob(): String = "impls_blob.bin"
+def qzmod_file_impls_off(): String = "impls_off.bin"
+def qzmod_file_effects_name(): String = "effects_name.bin"
+def qzmod_file_effects_ops_blob(): String = "effects_ops_blob.bin"
+def qzmod_file_effects_ops_off(): String = "effects_ops_off.bin"
+def qzmod_file_consts_name(): String = "consts_name.bin"
+def qzmod_file_consts_type(): String = "consts_type.bin"
+def qzmod_file_globals_name(): String = "globals_name.bin"
+def qzmod_file_globals_type(): String = "globals_type.bin"
+def qzmod_file_newtypes_name(): String = "newtypes_name.bin"
+def qzmod_file_newtypes_wrapped(): String = "newtypes_wrapped.bin"
+def qzmod_file_newtypes_type_id(): String = "newtypes_type_id.bin"
+# STRICT_NEWTYPES_QZMOD (MINOR=1) — parallel to newtypes_name carrying the
+# per-newtype `@strict` flag (1 = strict, 0 = loose). Written only when at
+# least one newtype in the module is strict (gated like funcs_effect_state),
+# so the output_hash stays byte-identical for modules that opt out of the
+# attribute entirely. Absent file => consumer defaults every slot to 0/loose.
+def qzmod_file_newtypes_strict(): String = "newtypes_strict.bin"
+def qzmod_file_type_aliases_name(): String = "type_aliases_name.bin"
+def qzmod_file_type_aliases_target(): String = "type_aliases_target.bin"
+
+# D3 (MINOR=2) — union / record structural-signature tables. Anonymous
+# structural types (union `A | B`, record `{ x: Int }`) carry no named-decl
+# section; they surface only as raw type ids in the band
+# TYPE_UNION_BASE(2000)..TYPE_RECORD_BASE(3000)..TYPE_RECORD_BASE+1000 inside
+# func-sig / struct-field / enum-payload / effect-op blobs. The producer
+# ships, for exactly the band ids THIS module's blobs reference (closure-
+# bounded, like the ptype TYPES ship), the structural signature so the
+# consumer can re-intern each in its own registry and remap the id.
+#
+# `union_sig_ids.bin`  — Vec<Int>, producer-global union id (TYPE_UNION_BASE
+#                        + producer_union_idx) per shipped entry.
+# `union_sig_members.bin` — strvec parallel to union_sig_ids: the pipe-joined
+#                        member annotation string (verbatim from
+#                        `union_member_strings`, e.g. "Int|String").
+# `record_sig_ids.bin` — Vec<Int>, producer-global record id (TYPE_RECORD_BASE
+#                        + producer_record_idx) per shipped entry.
+# `record_sig_blob.bin` / `record_sig_off.bin` — per-record field list.
+#                        Blob layout per record: [n_fields, name_idx_0,
+#                        type_idx_0, ...] with name/type strings pool-interned.
+#                        `off[i]` is the start of record-sig i in the blob.
+# All five are written only when the module references at least one band id
+# (empty => omitted => byte-identical output_hash for the common case).
+def qzmod_file_union_sig_ids(): String = "union_sig_ids.bin"
+def qzmod_file_union_sig_members(): String = "union_sig_members.bin"
+def qzmod_file_record_sig_ids(): String = "record_sig_ids.bin"
+def qzmod_file_record_sig_blob(): String = "record_sig_blob.bin"
+def qzmod_file_record_sig_off(): String = "record_sig_off.bin"
+
+# Phase 1.4.b.1 — ptype identity + fn_type registry.
+#
+# `types_names.bin` is a strvec parallel to `types_tag.bin` carrying the
+# per-ptype identity string set via `tc_ptype_set_name` (e.g. "Point",
+# "Stream"). Empty slots are stored as "".
+#
+# `fn_type_annotations.bin` is the producer's fn_type registry serialized
+# as a strvec of annotation strings (the canonical Fn(T)->U form). Indexed
+# by producer fn_id; consumers re-intern by annotation via
+# `tc_register_fn_type` to recover their own fn_id.
+def qzmod_file_types_names(): String = "types_names.bin"
+def qzmod_file_fn_type_annotations(): String = "fn_type_annotations.bin"
+
+# Phase 1.4.c.0 — generic / sub-trait / annotation enrichment.
+#
+# Required so `tc_inject_qzmod` can reproduce a struct/enum/trait verbatim
+# (the AST-path captures all of these; without them inject diverges).
+#
+# `*_type_params.bin` — strvec parallel to the matching `*_name.bin` file
+# carrying the comma-separated type-parameter string ("" for non-generic
+# decls, "T" or "K, V" for generics).
+#
+# `traits_super_traits.bin` — strvec parallel to `traits_name.bin` with the
+# "+"-separated super-trait names ("" when none).
+#
+# `structs_field_anns_blob.bin` / `structs_field_anns_off.bin` —
+# per-struct annotation lists. Blob layout per slot:
+#   [n_fields, pool_idx_0, pool_idx_1, ..., pool_idx_{n-1}]
+# `enums_variant_anns_blob.bin` / `enums_variant_anns_off.bin` — same
+# shape but per-enum (parallel to variant_names).
+def qzmod_file_structs_type_params(): String = "structs_type_params.bin"
+def qzmod_file_enums_type_params(): String = "enums_type_params.bin"
+def qzmod_file_traits_type_params(): String = "traits_type_params.bin"
+def qzmod_file_traits_super_traits(): String = "traits_super_traits.bin"
+def qzmod_file_structs_field_anns_blob(): String = "structs_field_anns_blob.bin"
+def qzmod_file_structs_field_anns_off(): String = "structs_field_anns_off.bin"
+def qzmod_file_enums_variant_anns_blob(): String = "enums_variant_anns_blob.bin"
+def qzmod_file_enums_variant_anns_off(): String = "enums_variant_anns_off.bin"
+
+# Phase 1.4.c.3 — per-function effect rows.
+#
+# `funcs_effect_state.bin` — Vec<Int> parallel to funcs_name. Tri-state:
+#   0 = untracked (no `can` clause)
+#   1 = closed row (labels only, no tail)
+#   2 = open row (labels + fresh tail at consume time)
+# `funcs_effect_labels_blob.bin` / `funcs_effect_labels_off.bin` — per-func
+# label list (2-D, layout shared with `_qzmod_emit_anns_2d`):
+#   [n_labels, pool_idx_0, pool_idx_1, ...]
+# Offsets table is parallel to funcs_name. Empty inner list for untracked
+# entries (state==0) emits the zero-length sentinel — parallel-array
+# invariant is preserved without a separate present-flag.
+def qzmod_file_funcs_effect_state(): String = "funcs_effect_state.bin"
+def qzmod_file_funcs_effect_labels_blob(): String = "funcs_effect_labels_blob.bin"
+def qzmod_file_funcs_effect_labels_off(): String = "funcs_effect_labels_off.bin"
+
+# Phase 1.4.c.3 — per-function string annotations.
+#
+# Strvec sections parallel to `funcs_name.bin`. Round-tripping these is
+# load-bearing because the AST-path's `tc_register_function_signature_named`
+# uses them for struct/enum name disambiguation at call sites:
+# `func_return_annotations[i]` lets `x.method()` infer "the method returns
+# a Col" instead of just "the method returns a Struct"; `func_param_annotations[i]`
+# does the same for parameter types. Without these, UFCS chains like
+# `Col.spinner_named("dots").magenta()` lose track of the receiver's struct
+# identity and surface as QZ0200 element-type mismatches.
+#
+# `funcs_param_fn_annotations.bin` is a strvec carrying the per-param Fn(...)
+# annotations (one string per parameter, empty when the param isn't Fn-typed).
+# Stored as comma-separated per-function entries via `<func>|<param0>|<param1>`-
+# style row encoding wouldn't survive interior commas in nested generics;
+# instead the section uses a flat strvec with the per-function ranges in
+# `funcs_param_fn_annotations_off.bin` (offset + count per func).
+def qzmod_file_funcs_return_annotations(): String = "funcs_return_annotations.bin"
+def qzmod_file_funcs_param_annotations(): String = "funcs_param_annotations.bin"
+def qzmod_file_funcs_param_names(): String = "funcs_param_names.bin"
+def qzmod_file_funcs_type_params(): String = "funcs_type_params.bin"
+def qzmod_file_funcs_type_param_bounds(): String = "funcs_type_param_bounds.bin"
+def qzmod_file_funcs_param_fn_anns(): String = "funcs_param_fn_anns.bin"
+def qzmod_file_funcs_param_fn_anns_off(): String = "funcs_param_fn_anns_off.bin"
+
+# Phase 2+ sections — declared here so MAJOR doesn't bump when they land.
+def qzmod_file_decl_fingerprints(): String = "decl_fingerprints.bin"
+def qzmod_file_mir_bodies(): String = "mir_bodies.bin"
+# Per-function start-offset table into mir_bodies.bin (INC.1.2). Parallel
+# to mir_bodies_name.bin; slot i holds the int offset where function i's
+# record begins. -1 marks "no body shipped" (consumer falls back to MIR
+# lowering for that function — design memo `QZMOD_MIR_BODIES.md` §4.2).
+def qzmod_file_mir_bodies_off(): String = "mir_bodies_off.bin"
+# Per-function name table (INC.1.2). Strvec parallel to mir_bodies_off.
+# Carries every shipped MirFunc's name — including synthetic lambdas
+# (`__lambda_<N>`) and iter closures, which don't appear in funcs_name.
+# This decouples MIR-body shipping from the typecheck-signature surface.
+def qzmod_file_mir_bodies_name(): String = "mir_bodies_name.bin"
+def qzmod_file_source_positions(): String = "source_positions.bin"
+def qzmod_file_doc_strings(): String = "doc_strings.bin"
+
+## Canonical ORDER of section files for hashing the output_hash. Any change
+## to this list is a MAJOR bump. Files that don't exist for a particular
+## module are skipped during hashing (their absence is the encoding).
+def qzmod_section_files_canonical(): Vec<String>
+  var v = vec_new<String>()
+  v.push(qzmod_file_strings())
+  v.push(qzmod_file_types_tag())
+  v.push(qzmod_file_types_arg1())
+  v.push(qzmod_file_types_arg2())
+  v.push(qzmod_file_types_args_blob())
+  v.push(qzmod_file_structs_name())
+  v.push(qzmod_file_structs_fields_blob())
+  v.push(qzmod_file_structs_fields_off())
+  v.push(qzmod_file_enums_name())
+  v.push(qzmod_file_enums_variants_blob())
+  v.push(qzmod_file_enums_variants_off())
+  v.push(qzmod_file_funcs_name())
+  v.push(qzmod_file_funcs_sig_blob())
+  v.push(qzmod_file_funcs_sig_off())
+  v.push(qzmod_file_traits_name())
+  v.push(qzmod_file_traits_methods_blob())
+  v.push(qzmod_file_traits_methods_off())
+  v.push(qzmod_file_impls_blob())
+  v.push(qzmod_file_impls_off())
+  v.push(qzmod_file_effects_name())
+  v.push(qzmod_file_effects_ops_blob())
+  v.push(qzmod_file_effects_ops_off())
+  v.push(qzmod_file_consts_name())
+  v.push(qzmod_file_consts_type())
+  v.push(qzmod_file_globals_name())
+  v.push(qzmod_file_globals_type())
+  v.push(qzmod_file_newtypes_name())
+  v.push(qzmod_file_newtypes_wrapped())
+  v.push(qzmod_file_type_aliases_name())
+  v.push(qzmod_file_type_aliases_target())
+  v.push(qzmod_file_types_names())
+  v.push(qzmod_file_fn_type_annotations())
+  v.push(qzmod_file_structs_type_params())
+  v.push(qzmod_file_enums_type_params())
+  v.push(qzmod_file_traits_type_params())
+  v.push(qzmod_file_traits_super_traits())
+  v.push(qzmod_file_structs_field_anns_blob())
+  v.push(qzmod_file_structs_field_anns_off())
+  v.push(qzmod_file_enums_variant_anns_blob())
+  v.push(qzmod_file_enums_variant_anns_off())
+  v.push(qzmod_file_funcs_effect_state())
+  v.push(qzmod_file_funcs_effect_labels_blob())
+  v.push(qzmod_file_funcs_effect_labels_off())
+  v.push(qzmod_file_funcs_return_annotations())
+  v.push(qzmod_file_funcs_param_annotations())
+  v.push(qzmod_file_funcs_param_names())
+  v.push(qzmod_file_funcs_type_params())
+  v.push(qzmod_file_funcs_type_param_bounds())
+  v.push(qzmod_file_funcs_param_fn_anns())
+  v.push(qzmod_file_funcs_param_fn_anns_off())
+  # INC.1.2 — MIR body shipping. Three parallel files: variable-length
+  # blob, per-function offset table, and per-function name strvec.
+  v.push(qzmod_file_mir_bodies())
+  v.push(qzmod_file_mir_bodies_off())
+  v.push(qzmod_file_mir_bodies_name())
+  # INC.1.9 — newtype producer-global type ID (TYPE_NEWTYPE_BASE + i).
+  # Parallel to newtypes_name. Lets the consumer build a producer→consumer
+  # remap for the 1000..TYPE_UNION_BASE range so func sigs that reference
+  # newtypes (AstNodeId, TypeId, MirReg, MirLabel, InternId) inject cleanly.
+  v.push(qzmod_file_newtypes_type_id())
+  # STRICT_NEWTYPES_QZMOD (MINOR=1) — per-newtype `@strict` flag (1/0),
+  # parallel to newtypes_name. Optional / additive: absent file =>
+  # all-loose default, preserving byte-identical output_hash for modules
+  # that have no `@strict` newtypes.
+  v.push(qzmod_file_newtypes_strict())
+  # D3 (MINOR=2) — union / record structural-signature tables. Append-only
+  # at the tail so a module that ships none of them hashes byte-identically
+  # to a pre-D3 emit (they're skipped when absent), and older readers that
+  # don't know these filenames simply never hash them.
+  v.push(qzmod_file_union_sig_ids())
+  v.push(qzmod_file_union_sig_members())
+  v.push(qzmod_file_record_sig_ids())
+  v.push(qzmod_file_record_sig_blob())
+  v.push(qzmod_file_record_sig_off())
+  return v
+end
+
+## Compute the output_hash for a module directory by hashing the concatenation
+## of every existing section file's content, in canonical order. Skips files
+## that don't exist (their absence = section omitted, which is a valid state).
+def qzmod_compute_output_hash(module_dir: String): String
+  var files = qzmod_section_files_canonical()
+  var hashes = vec_new<String>()
+  for i in 0..files.size
+    var path = "#{module_dir}/#{files[i]}"
+    if fio_exists(path)
+      hashes.push(content_hash::content_hash_file(path))
+    end
+  end
+  return content_hash::content_hash_combine(hashes)
+end

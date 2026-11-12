@@ -1,0 +1,243 @@
+## Operation Piezoelectric Effects — Milestone D integration spec.
+##
+## Milestone D closes the gap between "the typechecker understands
+## effects" (Milestone C) and "effects run end-to-end." This spec is
+## the cold-start acceptance test: it exercises every layer D touched
+## — runtime dispatch (D.1), MIR perform-op (D.2), handle install /
+## uninstall (D.3), default main-handler injection (D.4), user handler
+## expressions (D.5), first-op-arg threading (D.5b), and the std/log
+## stdlib pilot (D.7) — from realistic end-user programs.
+##
+## If this spec is green, algebraic effects in Quartz are observably
+## alive: a program can declare an effect, `can`-annotate callees,
+## narrow rows inside `with` blocks, install user handlers that
+## override blessed defaults, and see the exact argument that was
+## passed to the op. Stdlib `std/log` participates without any
+## extra ceremony thanks to cross-module effect registration (D.7).
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("Milestone D end-to-end (piezo D.1-D.7)") do ->
+    it("default Throws handler fires when no with-block installed") do ->
+      # D.4 default main-handler injection catches unhandled throws.
+      assert_run_exits("""
+effect Throws
+  def throw(msg: String): Int
+end
+
+def main(): Int = throw("boom")
+""", 66)
+    end
+
+    it("user Throws handler overrides default (exits 0, visible stdout)") do ->
+      # D.5 user handler + D.5b arg threading in one shot.
+      assert_run_stdout_eq("""
+effect Throws
+  def throw(msg: String): Int
+end
+
+def capture(op_name: Int, argc: Int, argv: Int): Int
+  var s = as_string(load(argv, 0))
+  puts(s)
+  return 0
+end
+
+def main(): Int
+  with Throws { throw: capture } do ->
+    throw("hello from user handler")
+  end
+  return 0
+end
+""", "hello from user handler\n")
+    end
+
+    it("can-rowed intermediate callers thread effects to the handler") do ->
+      # risky() has `can Throws`; with-block covers Throws; main() has
+      # no effect row but typechecks because the handler claim narrows.
+      assert_run_stdout_eq("""
+effect Throws
+  def throw(msg: String): Int
+end
+
+def risky(reason: String): Int can Throws
+  var formatted = "risky: "
+  formatted = formatted + reason
+  return throw(formatted)
+end
+
+def cap(op_name: Int, argc: Int, argv: Int): Int
+  var s = as_string(load(argv, 0))
+  puts(s)
+  return 0
+end
+
+def main(): Int
+  with Throws { throw: cap } do ->
+    risky("disk full")
+  end
+  return 0
+end
+""", "risky: disk full\n")
+    end
+
+    it("nested user handlers shadow then restore") do ->
+      assert_run_stdout_eq("""
+effect Throws
+  def throw(msg: String): Int
+end
+
+def outer_h(op_name: Int, argc: Int, argv: Int): Int
+  var s = as_string(load(argv, 0))
+  puts("outer saw: " + s)
+  return 0
+end
+
+def inner_h(op_name: Int, argc: Int, argv: Int): Int
+  var s = as_string(load(argv, 0))
+  puts("inner saw: " + s)
+  return 0
+end
+
+def main(): Int
+  with Throws { throw: outer_h } do ->
+    with Throws { throw: inner_h } do ->
+      throw("inside")
+    end
+    throw("between")
+  end
+  return 0
+end
+""", "inner saw: inside\nouter saw: between\n")
+    end
+
+    it("std/log integrates cleanly — severity prefixes reach handler") do ->
+      assert_run_stdout_eq("""
+import std/log
+
+def cap(op_name: Int, argc: Int, argv: Int): Int
+  var s = as_string(load(argv, 0))
+  puts(s)
+  return 0
+end
+
+def main(): Int
+  with Log { emit: cap } do ->
+    log::info("starting up")
+    log::warn("disk 80 percent")
+    log::error("configuration missing")
+  end
+  return 0
+end
+""", "[INFO] starting up\n[WARN] disk 80 percent\n[ERROR] configuration missing\n")
+    end
+
+    it("Log + Throws can coexist in one program with different handlers") do ->
+      # Two installs stack independently — Log handler handles emit,
+      # Throws handler handles throw, each fires without interfering
+      # with the other.
+      assert_run_stdout_eq("""
+import std/log
+
+effect Throws
+  def throw(msg: String): Int
+end
+
+def log_cap(op_name: Int, argc: Int, argv: Int): Int
+  var s = as_string(load(argv, 0))
+  puts("L:" + s)
+  return 0
+end
+
+def throw_cap(op_name: Int, argc: Int, argv: Int): Int
+  var s = as_string(load(argv, 0))
+  puts("T:" + s)
+  return 0
+end
+
+def main(): Int
+  with Log { emit: log_cap } do ->
+    with Throws { throw: throw_cap } do ->
+      log::info("ready")
+      throw("oops")
+      log::warn("after throw")
+    end
+  end
+  return 0
+end
+""", "L:[INFO] ready\nT:oops\nL:[WARN] after throw\n")
+    end
+
+    it("after with-block exits, default handler returns to top of stack") do ->
+      # D.3 uninstall correctness: throw inside the `with` hits the
+      # user handler (prints to stdout); throw after the with exits
+      # the block and hits the default Throws handler (exit 66 +
+      # stderr).
+      assert_run_exits("""
+effect Throws
+  def throw(msg: String): Int
+end
+
+def cap(op_name: Int, argc: Int, argv: Int): Int
+  var s = as_string(load(argv, 0))
+  puts(s)
+  return 0
+end
+
+def main(): Int
+  with Throws { throw: cap } do ->
+    throw("captured")
+  end
+  throw("default catches this")
+  return 0
+end
+""", 66)
+    end
+
+    it("runtime globals + init call are emitted at module level") do ->
+      # Regression gate: D.1's runtime + D.4's init call must appear
+      # on every compile. Swap-in any minimal program and confirm the
+      # dispatch infrastructure is live.
+      assert_ir_contains("""
+def main(): Int = 0
+""", "@__qz_effect_stack_top = internal thread_local global i64 0")
+    end
+
+    it("per-call op dispatch appears (direct handler call — G.2 static fast path)") do ->
+      # Piezo G.2: lexically-resolved performs call the handler fn
+      # directly; the runtime `__qz_effect_perform` is still emitted
+      # (see "runtime dispatch infrastructure is emitted" above) and
+      # invoked on dynamic-dispatch paths, but this lexical op site
+      # bypasses the scan loop.
+      assert_ir_contains("""
+effect Bell
+  def ring(): Int
+end
+
+def handler(op_name: Int, argc: Int, argv: Int): Int = 0
+
+def main(): Int
+  with Bell { ring: handler } do ->
+    ring()
+  end
+  return 0
+end
+""", "call i64 @handler(ptr ")
+    end
+
+    it("QZ0611 still fires for non-blessed effects without handler coverage") do ->
+      # Regression gate: blessed-set relaxation (Throws + Log) must
+      # not accidentally absorb user-declared effects. Custom effects
+      # still need explicit `can` rows or `with` blocks.
+      assert_compile_error("""
+effect Custom
+  def op(): Int
+end
+
+def main(): Int = op()
+""", "QZ0611")
+    end
+  end
+  return qspec_main()
+end

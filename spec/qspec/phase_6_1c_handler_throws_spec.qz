@@ -1,0 +1,246 @@
+## Phase 6.1.c — Per-request `with Throws` install + handler-side throws.
+##
+## Operation Piezoelectric Effects, Phase 6 (user-tool dogfooding),
+## subphase 6.1.c commit 3 (handler-throws integration).
+##
+## Validates the per-request effect-frame install at the handler-invocation
+## boundary in std/net/http_server.qz. Each framework entry point now
+## wraps `handler(req)` in `_invoke_handler_safely(handler, req)`, which
+## opens a `with Throws { throw: _http_request_throws_handler } do ->
+## handler(req) end`. The framework handler converts the thrown
+## diagnostic String into a 500 Internal Server Error Response — so a
+## handler that does `throw("oops")` (or has a deeper callee with
+## `can Throws` that throws) produces a 500 response to the client
+## INSTEAD of crashing the whole server through the runtime's blessed
+## default Throws handler (which exits 66).
+##
+## Why this requires the kind=2 prep (commit 2): the `with Throws`
+## install only correctly converts a throw to a 500 if `throw` is
+## kind=2 (unwind-style). Under kind=1 (continuation-style), the
+## handler runs but execution continues past the throw site, which
+## frequently produces undefined behavior in user handler code that
+## structured the throw as an early-exit. Commit 2 added `= resume(0)`
+## to std/throws.qz's throw op decl, making it kind=2.
+##
+## Coverage:
+## - Direct call to `_invoke_handler_safely` exercises the wrap shape;
+##   the substrate-isolation property is already covered by
+##   phase_6_1c_concurrent_effect_frames_spec.qz (1000-fiber stress).
+## - A real subprocess HTTP server with concurrent curl clients is
+##   filed as a Tier 4 integration spec — port allocation in the qspec
+##   subprocess harness is fragile across environments.
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("handler-side throws → 500 conversion (Phase 6.1.c)") do ->
+
+    it("normal handler return: status passes through unchanged") do ->
+      assert_run_stdout_eq("""
+import std/net/http_server
+
+def good(req: Request): Response
+  return text_response("hello")
+end
+
+def make_req(): Request
+  return Request {
+    method: "GET",
+    path: "/",
+    query_string: "",
+    body: "",
+    raw_path: "/",
+    header_keys: vec_new<String>(),
+    header_vals: vec_new<String>(),
+    params: map_new(),
+    query: map_new(),
+    context: map_new()
+  }
+end
+
+def main(): Int
+  var resp = _invoke_handler_safely(good, make_req())
+  puts("status=" + str_from_int(resp.status))
+  puts("body=" + resp.body)
+  return 0
+end
+""", "status=200\nbody=hello\n")
+    end
+
+    it("handler throws: framework converts to 500 with thrown message in body") do ->
+      assert_run_stdout_eq("""
+import std/net/http_server
+import std/throws
+
+def bad(req: Request): Response can Throws
+  throw("intentional handler error")
+  return text_response("unreachable")
+end
+
+def make_req(): Request
+  return Request {
+    method: "GET",
+    path: "/",
+    query_string: "",
+    body: "",
+    raw_path: "/",
+    header_keys: vec_new<String>(),
+    header_vals: vec_new<String>(),
+    params: map_new(),
+    query: map_new(),
+    context: map_new()
+  }
+end
+
+def main(): Int
+  var resp = _invoke_handler_safely(bad, make_req())
+  puts("status=" + str_from_int(resp.status))
+  puts("body=" + resp.body)
+  return 0
+end
+""", "status=500\nbody=500 Internal Server Error: intentional handler error\n")
+    end
+
+    it("deeper callee with `can Throws` propagates through the per-request frame") do ->
+      # Verifies the install really intercepts at the handler boundary,
+      # not just direct throws in the handler. A library function with
+      # `can Throws` deep in the call tree throws; the framework's
+      # per-request install catches it at the boundary.
+      assert_run_stdout_eq("""
+import std/net/http_server
+import std/throws
+
+def db_lookup(id: Int): String can Throws
+  if id < 0
+    throw("not found")
+  end
+  return "row-" + str_from_int(id)
+end
+
+def serve(req: Request): Response can Throws
+  var name = db_lookup(-1)
+  return text_response(name)
+end
+
+def make_req(): Request
+  return Request {
+    method: "GET",
+    path: "/",
+    query_string: "",
+    body: "",
+    raw_path: "/",
+    header_keys: vec_new<String>(),
+    header_vals: vec_new<String>(),
+    params: map_new(),
+    query: map_new(),
+    context: map_new()
+  }
+end
+
+def main(): Int
+  var resp = _invoke_handler_safely(serve, make_req())
+  puts("status=" + str_from_int(resp.status))
+  puts("body=" + resp.body)
+  return 0
+end
+""", "status=500\nbody=500 Internal Server Error: not found\n")
+    end
+
+    it("server keeps running across multiple throwing+normal handler invocations") do ->
+      # Critical regression: kind=2 unwind via setjmp/longjmp must NOT
+      # leave any state corrupted. Loop alternating throw + normal calls;
+      # confirm each call independently returns the right status. The
+      # 6.1.b user-Throws handler test only exercised single-throw.
+      assert_run_stdout_eq("""
+import std/net/http_server
+import std/throws
+
+var g_ctr = 0
+
+def alternating(req: Request): Response can Throws
+  g_ctr = g_ctr + 1
+  if g_ctr % 2 == 1
+    throw("boom-" + str_from_int(g_ctr))
+  end
+  return text_response("ok-" + str_from_int(g_ctr))
+end
+
+def make_req(): Request
+  return Request {
+    method: "GET",
+    path: "/",
+    query_string: "",
+    body: "",
+    raw_path: "/",
+    header_keys: vec_new<String>(),
+    header_vals: vec_new<String>(),
+    params: map_new(),
+    query: map_new(),
+    context: map_new()
+  }
+end
+
+def main(): Int
+  var sb = sb_new()
+  for i in 0..6
+    var r = _invoke_handler_safely(alternating, make_req())
+    sb_append(sb, str_from_int(r.status))
+    sb_append(sb, ":")
+    sb_append(sb, r.body)
+    sb_append(sb, "\n")
+  end
+  puts(sb_to_string(sb))
+  return 0
+end
+""", "500:500 Internal Server Error: boom-1\n200:ok-2\n500:500 Internal Server Error: boom-3\n200:ok-4\n500:500 Internal Server Error: boom-5\n200:ok-6\n\n")
+    end
+
+    it("custom outer `with Throws` does NOT shadow the per-request install") do ->
+      # Sanity check: a user who installs their own `with Throws` AROUND
+      # the framework call does not affect the framework's per-request
+      # install. The framework install is INSIDE _invoke_handler_safely,
+      # pushed onto the stack above the user's outer install. Per the
+      # H-delegate top-down scan, the framework's install matches the
+      # throw first. So the throw → 500 conversion still wins.
+      assert_run_stdout_eq("""
+import std/net/http_server
+import std/throws
+
+def outer_h(op_name: Int, argc: Int, argv: Int): Int
+  puts("OUTER:" + as_string(load(argv, 0)))
+  return 0
+end
+
+def bad(req: Request): Response can Throws
+  throw("escape attempt")
+  return text_response("unreachable")
+end
+
+def make_req(): Request
+  return Request {
+    method: "GET",
+    path: "/",
+    query_string: "",
+    body: "",
+    raw_path: "/",
+    header_keys: vec_new<String>(),
+    header_vals: vec_new<String>(),
+    params: map_new(),
+    query: map_new(),
+    context: map_new()
+  }
+end
+
+def main(): Int
+  var resp = with Throws { throw: outer_h } do ->
+    _invoke_handler_safely(bad, make_req())
+  end
+  puts("status=" + str_from_int(resp.status))
+  return 0
+end
+""", "status=500\n")
+    end
+  end
+  return qspec_main()
+end

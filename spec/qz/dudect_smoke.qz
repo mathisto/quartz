@@ -1,0 +1,580 @@
+# NET.4.2 — dudect real-primitive smoke
+#
+# Runs `dudect_assert_ct` against in-tree constant-time primitives.
+# These all SHOULD pass — they're the load-bearing CT helpers the
+# crypto stdlib relies on. The smoke is a defense against future
+# refactors silently breaking constant-time discipline.
+#
+# Coverage:
+#
+#   subtle::ct_eq_bytes (1184 B) — ML-KEM ciphertext-class comparison
+#                                  the implicit-reject path relies on.
+#   subtle::ct_eq_bytes (16 B)   — Poly1305 tag-class comparison.
+#   subtle::ct_select_int (×128) — pure-ALU branchless select, batched.
+#   curve25519 _f51_cswap        — XOR-cswap in the Montgomery x-only
+#                                  ladder. Bit value driven by the
+#                                  secret scalar; must not leak which
+#                                  bits were set.
+#   ed25519 _sc_reduce_64        — 64-byte → 32-byte scalar reduce mod L
+#                                  (TweetNaCl modL port). Drives signing
+#                                  on every Ed25519 sign call.
+#   mlkem768_decaps              — FIPS 203 FO implicit-reject path.
+#   aes_encrypt_block AES-128    — keysched + bitsliced encrypt; key-class.
+#                                  Catches a leak in either the key schedule
+#                                  (BearSSL _aes_keysched_words / SubWord) or
+#                                  the bitsliced sbox / mix-columns path.
+#   aes_encrypt_block AES-256    — same kernel, 14-round schedule; key-class.
+#   aes_gcm_encrypt AES-128      — full AEAD; plaintext-class. Covers GCTR
+#                                  + GHASH (Karatsuba bmul64 + reduction)
+#                                  + tag XOR against attacker-controlled
+#                                  plaintext bytes.
+#   aes_gcm_encrypt AES-128      — full AEAD; key-class. GHASH's H value is
+#                                  AES_E(K, 0) — key-derived — so GHASH's
+#                                  data-dependent multiply path is being
+#                                  driven by a secret-derived multiplier.
+#                                  This entry catches leaks in _bmul64 /
+#                                  _ghash_mul_inplace against secret H bits.
+#
+# Each test pushes N_SAMPLES_PRIM measurements; we then assert
+# max|t| < dudect_t_threshold_leak() (5.0). With time_mono_ns()'s
+# ~20-50 ns syscall noise floor we batch tiny ops (ct_select_int) into
+# 128-call windows so the per-window cost (~256 ns) sits clear of
+# noise. Larger primitives time individually.
+#
+# Wall budget: ~3-5s total at N_SAMPLES_PRIM = 20000.
+
+import * from ffi/socket
+import * from std/core/crypto/subtle
+import * from std/core/crypto/curve25519
+import * from std/core/crypto/ed25519   # _sc_reduce_64
+import * from std/core/crypto/mlkem
+import * from std/core/crypto/aes       # aes_keysched / aes_encrypt_block
+import * from std/core/crypto/aes_gcm   # aes_gcm_encrypt
+import * from std/core/crypto/secret    # Secret<Int> for mlkem dk + AES key
+import * from std/crypto/dudect
+
+var g_total: Int = 0
+var g_passed: Int = 0
+
+def check_prim(label: String, got: Int): Void
+  g_total = g_total + 1
+  if got == 0
+    g_passed = g_passed + 1
+    puts("OK   " + label)
+    return
+  end
+  puts("FAIL " + label)
+end
+
+const N_SAMPLES_PRIM = 20000
+
+# =============================================================================
+# subtle::ct_eq_bytes — 1184 byte (ML-KEM ciphertext) class comparison
+# =============================================================================
+#
+# Two classes:
+#   0 — secret and input both zeros (full match)
+#   1 — secret all zeros, input is random bytes (full mismatch)
+# A correct ct_eq_bytes walks all 1184 bytes either way; the timing
+# must not depend on which class is in flight.
+
+const PRIM_LEN_MLKEM_CT = 1184
+
+def run_prim_ct_eq_bytes_mlkem(): Int
+  var ctx = dudect_new()
+  var secret = malloc(PRIM_LEN_MLKEM_CT)
+  var input = malloc(PRIM_LEN_MLKEM_CT)
+  memset(secret, 0, PRIM_LEN_MLKEM_CT)
+  var rng = dudect_rng_new(0x1d4d77da6dd2c4c5)
+
+  var i = 0
+  while i < N_SAMPLES_PRIM
+    var c = i % 2
+    if c == 0
+      memset(input, 0, PRIM_LEN_MLKEM_CT)
+    end
+    if c != 0
+      dudect_rng_fill(rng, input, PRIM_LEN_MLKEM_CT)
+    end
+
+    var t0 = time_mono_ns()
+    ct_eq_bytes(secret, input, PRIM_LEN_MLKEM_CT)
+    var t1 = time_mono_ns()
+    dudect_push(ctx, t1 - t0, c)
+    i = i + 1
+  end
+
+  free(secret); free(input)
+  return dudect_assert_ct("ct_eq_bytes len=1184 (ML-KEM ct)",
+                          ctx, dudect_t_threshold_leak())
+end
+
+# =============================================================================
+# subtle::ct_eq_bytes — 16 byte (Poly1305 tag) class comparison
+# =============================================================================
+
+const PRIM_LEN_POLY1305 = 16
+
+def run_prim_ct_eq_bytes_poly(): Int
+  var ctx = dudect_new()
+  var secret = malloc(PRIM_LEN_POLY1305)
+  var input = malloc(PRIM_LEN_POLY1305)
+  memset(secret, 0, PRIM_LEN_POLY1305)
+  var rng = dudect_rng_new(0x3f8e2c1b5a7d9e4f)
+
+  # Tag-class comparison: 16 bytes is below the time_mono_ns noise
+  # floor. Batch 256 calls per timed window so per-window cost is
+  # ~50-100 µs, well above syscall noise.
+  var i = 0
+  while i < N_SAMPLES_PRIM
+    var c = i % 2
+    if c == 0
+      memset(input, 0, PRIM_LEN_POLY1305)
+    end
+    if c != 0
+      dudect_rng_fill(rng, input, PRIM_LEN_POLY1305)
+    end
+
+    var t0 = time_mono_ns()
+    var j = 0
+    while j < 256
+      ct_eq_bytes(secret, input, PRIM_LEN_POLY1305)
+      j = j + 1
+    end
+    var t1 = time_mono_ns()
+    dudect_push(ctx, t1 - t0, c)
+    i = i + 1
+  end
+
+  free(secret); free(input)
+  return dudect_assert_ct("ct_eq_bytes len=16 ×256 (Poly1305 tag)",
+                          ctx, dudect_t_threshold_leak())
+end
+
+# =============================================================================
+# subtle::ct_select_int — pure-ALU branchless select, batched ×128
+# =============================================================================
+#
+# Two classes drive the mask:
+#   0 — mask = 0 (select b)
+#   1 — mask = -1 (select a)
+# The select is a 4-op ALU sequence (xor / and / xor) — must not leak
+# which input was picked.
+
+def run_prim_ct_select_int(): Int
+  var ctx = dudect_new()
+  var rng = dudect_rng_new(0xa1b2c3d4e5f60718)
+
+  var i = 0
+  while i < N_SAMPLES_PRIM
+    var c = i % 2
+    var mask = 0 - c   # class 0 → 0, class 1 → -1 (all-ones)
+    var a = dudect_rng_next(rng)
+    var b = dudect_rng_next(rng)
+
+    var t0 = time_mono_ns()
+    var j = 0
+    while j < 128
+      ct_select_int(mask, a, b)
+      j = j + 1
+    end
+    var t1 = time_mono_ns()
+    dudect_push(ctx, t1 - t0, c)
+    i = i + 1
+  end
+
+  return dudect_assert_ct("ct_select_int ×128",
+                          ctx, dudect_t_threshold_leak())
+end
+
+# =============================================================================
+# curve25519 _f51_cswap — Montgomery-ladder bit-driven swap
+# =============================================================================
+#
+# Two classes drive the swap bit:
+#   0 — bit = 0, mask = 0 (no swap; XOR sequence still runs)
+#   1 — bit = 1, mask = -1 (swap; XOR sequence runs identically)
+# The whole 5-limb XOR sequence executes regardless; timing must not
+# depend on the bit. (The lambdified `bit ∈ {0,1}` argument is the
+# i-th bit of the secret scalar in real Montgomery laddering; a leak
+# here would let an attacker recover scalar bits.)
+# Batch 64 calls per window to clear noise floor — each cswap is ~5
+# limb XORs, ~10 ns of work.
+
+def run_prim_f51_cswap(): Int
+  var ctx = dudect_new()
+  var pa = malloc(40)   # 5 × i64 = 40 bytes
+  var pb = malloc(40)
+  var rng = dudect_rng_new(0x6c8e1d3f7a2b4c5e)
+  # Pre-randomize the limbs so the XOR work isn't trivially zero on
+  # equal-buffer inputs.
+  dudect_rng_fill(rng, pa, 40)
+  dudect_rng_fill(rng, pb, 40)
+
+  var i = 0
+  while i < N_SAMPLES_PRIM
+    var c = i % 2
+
+    var t0 = time_mono_ns()
+    var j = 0
+    while j < 64
+      __probe_cswap(c, pa, pb)
+      j = j + 1
+    end
+    var t1 = time_mono_ns()
+    dudect_push(ctx, t1 - t0, c)
+    i = i + 1
+  end
+
+  free(pa); free(pb)
+  return dudect_assert_ct("curve25519 _f51_cswap ×64",
+                          ctx, dudect_t_threshold_leak())
+end
+
+# =============================================================================
+# ed25519 _sc_reduce_64 — 64-byte → 32-byte scalar reduction mod L
+# =============================================================================
+#
+# Ported from TweetNaCl's `modL` in 2026-05-22 (NET.4 follow-up); replaces
+# the original shift-and-subtract long-division which branched on
+# `_bn_cmp(x, l64, 64) >= 0`.  All loop bounds are public constants;
+# constant-time discipline relies on the byte-level limb arithmetic
+# producing a uniform code path regardless of input bytes.
+#
+# Two classes mirror the original audit smoke:
+#   0 — in_64 = all zeros (the trivial fixed-point).
+#   1 — in_64 = all 0xFF  (drives every limb's reduction work to peak).
+# Before the rewrite max|t| ≈ 1052 at N=10000.  After: must be < 5.
+
+const N_SAMPLES_SC = 10000
+
+def run_prim_sc_reduce_64(): Int
+  var ctx = dudect_new()
+  var in_64 = malloc(64)
+  var out_32 = malloc(32)
+
+  var i = 0
+  while i < N_SAMPLES_SC
+    var c = i % 2
+    if c == 0
+      memset(in_64, 0, 64)
+    end
+    if c != 0
+      memset(in_64, 0xFF, 64)
+    end
+
+    var t0 = time_mono_ns()
+    _sc_reduce_64(out_32, in_64)
+    var t1 = time_mono_ns()
+    dudect_push(ctx, t1 - t0, c)
+    i = i + 1
+  end
+
+  free(in_64); free(out_32)
+  return dudect_assert_ct("ed25519 _sc_reduce_64 (64B → 32B mod L)",
+                          ctx, dudect_t_threshold_leak())
+end
+
+# =============================================================================
+# ML-KEM-768 mlkem_decaps — valid vs tampered ciphertext (FO implicit-reject)
+# =============================================================================
+#
+# The FIPS 203 FO transform's implicit-reject path uses
+# `subtle::ct_eq_bytes` to compare the input ciphertext against the
+# re-encapsulated ciphertext from the candidate shared secret.
+# The branch is supposed to be constant-time — valid and tampered
+# inputs should produce identical decaps timings. A leak would let an
+# adversary distinguish "tampered" from "rejected-with-implicit-K-bar"
+# externally, weakening the FO bound.
+#
+# Two classes:
+#   0 — original ciphertext (valid; the K-true branch is taken).
+#   1 — tampered ciphertext (1 random bit flipped; the implicit-reject
+#       K̄ branch is taken).
+# The harness times mlkem768_decaps end-to-end; the ct_eq_bytes leg
+# is one of many costs inside but it's the load-bearing CT-discipline
+# step for the FO bound.
+#
+# Each decaps is ~2 ms, so this runs at a far lower sample count than
+# the per-primitive tests. N=2000 → ~4-8 s wall.
+
+const N_SAMPLES_MLKEM = 2000
+
+def run_prim_mlkem_decaps(): Int
+  var ctx = dudect_new()
+
+  # One-time setup: keygen → encaps → save (ek, dk, ct_valid, ss_valid).
+  # Then build a tampered ct that decaps must implicit-reject.
+  var ek = malloc(MLKEM768_EK_BYTES())
+  var dk = malloc(MLKEM768_DK_SEED_BYTES())
+  var ct_valid = malloc(MLKEM768_CT_BYTES())
+  var ct_tampered = malloc(MLKEM768_CT_BYTES())
+  var ss_buf = malloc(MLKEM768_SS_BYTES())
+  var ss_out = malloc(MLKEM768_SS_BYTES())
+
+  mlkem768_keygen(ek, dk)
+  mlkem768_encaps(ct_valid, ss_buf, ek)
+  # Tamper: copy and flip one bit in the middle of the ciphertext.
+  memcpy(ct_tampered, ct_valid, MLKEM768_CT_BYTES())
+  var mid = MLKEM768_CT_BYTES() / 2
+  var orig = ptr_read_byte(ct_tampered + mid)
+  ptr_write_byte(ct_tampered + mid, orig ^ 1)
+
+  var i = 0
+  while i < N_SAMPLES_MLKEM
+    var c = i % 2
+    var ct_in = ct_valid
+    if c != 0
+      ct_in = ct_tampered
+    end
+
+    var t0 = time_mono_ns()
+    mlkem768_decaps(ss_out, ct_in, secret_wrap(dk))
+    var t1 = time_mono_ns()
+    dudect_push(ctx, t1 - t0, c)
+    i = i + 1
+  end
+
+  free(ek); free(dk); free(ct_valid); free(ct_tampered)
+  free(ss_buf); free(ss_out)
+  return dudect_assert_ct("mlkem768_decaps valid-vs-tampered",
+                          ctx, dudect_t_threshold_leak())
+end
+
+# =============================================================================
+# AES-128 keysched + encrypt — key-class
+# =============================================================================
+#
+# Two classes drive the AES-128 key bytes:
+#   0 — key = all zeros (canonical-trivial input).
+#   1 — key = freshly-drawn random bytes per measurement.
+# Plaintext is a fixed random 16-byte block, shared across both classes,
+# so the only varying input is the key. The timed window encloses BOTH
+# the keysched and the single-block encrypt — a leak in either kernel
+# (SubWord lookups inside _aes_keysched_words, or the bitsliced sbox /
+# mix-columns) would show up as a per-class timing skew.
+#
+# A single encrypt is ~5 µs; N=10000 → ~50 ms wall.
+
+const N_SAMPLES_AES = 10000
+const AES128_KEY_BYTES = 16
+const AES256_KEY_BYTES = 32
+const AES_BLOCK_BYTES = 16
+
+def run_prim_aes128_encrypt_key_class(): Int
+  var ctx = dudect_new()
+  var key_zero = malloc(AES128_KEY_BYTES)
+  var key_rand = malloc(AES128_KEY_BYTES)
+  var pt = malloc(AES_BLOCK_BYTES)
+  var ct = malloc(AES_BLOCK_BYTES)
+  var rk = malloc(aes_round_keys_size(AES128_KEY_BYTES))
+  var rng = dudect_rng_new(0x4a1f9c3e7b5d2086)
+
+  memset(key_zero, 0, AES128_KEY_BYTES)
+  dudect_rng_fill(rng, pt, AES_BLOCK_BYTES)  # fixed-random plaintext
+
+  var i = 0
+  while i < N_SAMPLES_AES
+    var c = i % 2
+    if c != 0
+      dudect_rng_fill(rng, key_rand, AES128_KEY_BYTES)
+    end
+    var key_ptr = key_zero
+    if c != 0 then key_ptr = key_rand end
+
+    var t0 = time_mono_ns()
+    var nr = aes_keysched(rk, secret_wrap(key_ptr), AES128_KEY_BYTES)
+    aes_encrypt_block(nr, rk, pt, ct)
+    var t1 = time_mono_ns()
+    dudect_push(ctx, t1 - t0, c)
+    i = i + 1
+  end
+
+  free(key_zero); free(key_rand); free(pt); free(ct); free(rk)
+  return dudect_assert_ct("aes_encrypt_block AES-128 (keysched+encrypt) key-class",
+                          ctx, dudect_t_threshold_leak())
+end
+
+# =============================================================================
+# AES-256 keysched + encrypt — key-class
+# =============================================================================
+#
+# Same protocol as AES-128; the AES-256 schedule runs SubWord more often
+# (every 4th word vs every 4th for 128 — actually 2× the schedule depth
+# at 14 rounds), so a SubWord-level leak would show up here even if it
+# stayed under the noise floor at AES-128. Worth a separate entry.
+
+def run_prim_aes256_encrypt_key_class(): Int
+  var ctx = dudect_new()
+  var key_zero = malloc(AES256_KEY_BYTES)
+  var key_rand = malloc(AES256_KEY_BYTES)
+  var pt = malloc(AES_BLOCK_BYTES)
+  var ct = malloc(AES_BLOCK_BYTES)
+  var rk = malloc(aes_round_keys_size(AES256_KEY_BYTES))
+  var rng = dudect_rng_new(0x7e2d8a1c4f6093b5)
+
+  memset(key_zero, 0, AES256_KEY_BYTES)
+  dudect_rng_fill(rng, pt, AES_BLOCK_BYTES)
+
+  var i = 0
+  while i < N_SAMPLES_AES
+    var c = i % 2
+    if c != 0
+      dudect_rng_fill(rng, key_rand, AES256_KEY_BYTES)
+    end
+    var key_ptr = key_zero
+    if c != 0 then key_ptr = key_rand end
+
+    var t0 = time_mono_ns()
+    var nr = aes_keysched(rk, secret_wrap(key_ptr), AES256_KEY_BYTES)
+    aes_encrypt_block(nr, rk, pt, ct)
+    var t1 = time_mono_ns()
+    dudect_push(ctx, t1 - t0, c)
+    i = i + 1
+  end
+
+  free(key_zero); free(key_rand); free(pt); free(ct); free(rk)
+  return dudect_assert_ct("aes_encrypt_block AES-256 (keysched+encrypt) key-class",
+                          ctx, dudect_t_threshold_leak())
+end
+
+# =============================================================================
+# AES-128-GCM end-to-end — plaintext-class
+# =============================================================================
+#
+# Fixed random key, fixed random IV, fixed 16 B AAD. Two classes drive
+# the 256 B plaintext:
+#   0 — plaintext = all zeros.
+#   1 — plaintext = freshly-drawn random bytes per measurement.
+# Each measurement runs a full aes_gcm_encrypt: keysched → H = AES_E(K, 0)
+# → ek_j0 → GCTR (16 blocks) → GHASH over (AAD || CT || lengths) → tag
+# XOR. The data-dependent paths are: GCTR XORs CT with keystream (CT),
+# and GHASH multiplies each 128-bit block into the accumulator via the
+# Karatsuba bmul64. Plaintext-class measures whether attacker-controlled
+# bytes induce a timing skew anywhere on that path.
+#
+# ~30 µs per call; N=10000 → ~300 ms wall.
+
+const N_SAMPLES_GCM = 10000
+const GCM_PT_BYTES = 256
+const GCM_AAD_BYTES = 16
+const GCM_IV_BYTES = 12
+const GCM_TAG_BYTES = 16
+
+def run_prim_aes_gcm_pt_class(): Int
+  var ctx = dudect_new()
+  var key = malloc(AES128_KEY_BYTES)
+  var iv = malloc(GCM_IV_BYTES)
+  var aad = malloc(GCM_AAD_BYTES)
+  var pt_zero = malloc(GCM_PT_BYTES)
+  var pt_rand = malloc(GCM_PT_BYTES)
+  var out = malloc(GCM_PT_BYTES)
+  var tag = malloc(GCM_TAG_BYTES)
+  var rng = dudect_rng_new(0x5b9e3d7f2c4a1860)
+
+  # Fixed-random per-run key, IV, AAD. Re-randomized plaintext on class 1.
+  dudect_rng_fill(rng, key, AES128_KEY_BYTES)
+  dudect_rng_fill(rng, iv, GCM_IV_BYTES)
+  dudect_rng_fill(rng, aad, GCM_AAD_BYTES)
+  memset(pt_zero, 0, GCM_PT_BYTES)
+
+  var i = 0
+  while i < N_SAMPLES_GCM
+    var c = i % 2
+    if c != 0
+      dudect_rng_fill(rng, pt_rand, GCM_PT_BYTES)
+    end
+    var pt_ptr = pt_zero
+    if c != 0 then pt_ptr = pt_rand end
+
+    var t0 = time_mono_ns()
+    aes_gcm_encrypt(out, tag, pt_ptr, GCM_PT_BYTES, aad, GCM_AAD_BYTES,
+                    secret_wrap(key), AES128_KEY_BYTES, iv)
+    var t1 = time_mono_ns()
+    dudect_push(ctx, t1 - t0, c)
+    i = i + 1
+  end
+
+  free(key); free(iv); free(aad); free(pt_zero); free(pt_rand)
+  free(out); free(tag)
+  return dudect_assert_ct("aes_gcm_encrypt AES-128 256 B plaintext-class",
+                          ctx, dudect_t_threshold_leak())
+end
+
+# =============================================================================
+# AES-128-GCM end-to-end — key-class
+# =============================================================================
+#
+# Fixed random plaintext / AAD / IV. Two classes drive the AES-128 key:
+#   0 — key = all zeros.
+#   1 — key = freshly-drawn random bytes per measurement.
+# Distinct from the raw-block key-class tests above: here we also exercise
+# GHASH whose H = AES_E(K, 0) is key-derived. The _bmul64 Karatsuba +
+# reduction path multiplies the accumulator by H every 128-bit block; a
+# multiplier-bit-dependent timing leak inside _bmul64 (e.g. if the integer
+# multiply weren't CT on the host CPU — it always is on x86_64/ARM64 since
+# ~2010, but the contract is explicit) would show up here even though the
+# raw-block tests stay green.
+
+def run_prim_aes_gcm_key_class(): Int
+  var ctx = dudect_new()
+  var key_zero = malloc(AES128_KEY_BYTES)
+  var key_rand = malloc(AES128_KEY_BYTES)
+  var iv = malloc(GCM_IV_BYTES)
+  var aad = malloc(GCM_AAD_BYTES)
+  var pt = malloc(GCM_PT_BYTES)
+  var out = malloc(GCM_PT_BYTES)
+  var tag = malloc(GCM_TAG_BYTES)
+  var rng = dudect_rng_new(0x1c8f4a6b3e7d5092)
+
+  memset(key_zero, 0, AES128_KEY_BYTES)
+  dudect_rng_fill(rng, iv, GCM_IV_BYTES)
+  dudect_rng_fill(rng, aad, GCM_AAD_BYTES)
+  dudect_rng_fill(rng, pt, GCM_PT_BYTES)  # fixed-random plaintext
+
+  var i = 0
+  while i < N_SAMPLES_GCM
+    var c = i % 2
+    if c != 0
+      dudect_rng_fill(rng, key_rand, AES128_KEY_BYTES)
+    end
+    var key_ptr = key_zero
+    if c != 0 then key_ptr = key_rand end
+
+    var t0 = time_mono_ns()
+    aes_gcm_encrypt(out, tag, pt, GCM_PT_BYTES, aad, GCM_AAD_BYTES,
+                    secret_wrap(key_ptr), AES128_KEY_BYTES, iv)
+    var t1 = time_mono_ns()
+    dudect_push(ctx, t1 - t0, c)
+    i = i + 1
+  end
+
+  free(key_zero); free(key_rand); free(iv); free(aad); free(pt)
+  free(out); free(tag)
+  return dudect_assert_ct("aes_gcm_encrypt AES-128 256 B key-class",
+                          ctx, dudect_t_threshold_leak())
+end
+
+# =============================================================================
+# Driver
+# =============================================================================
+
+def main(): Int
+  puts("--- dudect real-primitive smoke ---")
+
+  check_prim("ct_eq_bytes len=1184",            run_prim_ct_eq_bytes_mlkem())
+  check_prim("ct_eq_bytes len=16 ×256",         run_prim_ct_eq_bytes_poly())
+  check_prim("ct_select_int ×128",              run_prim_ct_select_int())
+  check_prim("curve25519 _f51_cswap ×64",       run_prim_f51_cswap())
+  check_prim("ed25519 _sc_reduce_64",           run_prim_sc_reduce_64())
+  check_prim("mlkem768_decaps valid-vs-tampered", run_prim_mlkem_decaps())
+  check_prim("aes_encrypt_block AES-128 key-class", run_prim_aes128_encrypt_key_class())
+  check_prim("aes_encrypt_block AES-256 key-class", run_prim_aes256_encrypt_key_class())
+  check_prim("aes_gcm_encrypt 256B plaintext-class", run_prim_aes_gcm_pt_class())
+  check_prim("aes_gcm_encrypt 256B key-class",  run_prim_aes_gcm_key_class())
+
+  puts("")
+  puts(to_str(g_passed) + "/" + to_str(g_total) + " primitive checks green")
+  if g_passed == g_total then return 0 end
+  return 1
+end

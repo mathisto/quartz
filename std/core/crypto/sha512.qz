@@ -1,0 +1,454 @@
+## std/core/crypto/sha512 — Pure-Quartz SHA-512 (FIPS 180-4)
+##
+## NET.2 prerequisite. Ed25519's keygen / sign / verify all run their inputs
+## through SHA-512 — the 32-byte seed is hashed to derive the clamped scalar
+## and prefix, the nonce r is SHA-512(prefix || msg) mod L, the challenge k
+## is SHA-512(R || A || msg) mod L. SHA-512 is also a free win once the
+## ARX-over-u64 substrate exists: NET.3 (ML-KEM hybrid) needs SHA-3-256/512
+## and SHAKE128/256 — those are different primitives but share the
+## "ptr-buffer, byte-LE I/O, malloc'd state" pattern with this file.
+##
+## Implementation notes:
+##
+## - The compression function is straight FIPS 180-4 §6.4. 80-round message
+##   schedule (W[0..15] = block words; W[t] = σ₁(W[t-2]) + W[t-7] + σ₀(W[t-15])
+##   + W[t-16] for t in 16..80). Then the inner-round update on (a..h).
+##
+## - Quartz `>>` is arithmetic shift right (ashr). u64 rotate-right and the
+##   `SHR` in σ₀/σ₁ both need a logical-shift, which we synthesise as
+##   `(x >> n) & ((1 << (64 - n)) - 1)` — the mask zeros out any
+##   sign-extended 1s in the upper n bits. Same pattern curve25519.qz uses for
+##   its `(s >> 51) & 8191` carry extraction.
+##
+## - K constants ship as a 640-byte lazily-initialised table (80 entries × 8
+##   bytes, little-endian). Mirrors the way blake2s.qz handles its SIGMA
+##   table. Could be 80 `def _K_NN(): Int = ...` calls but the compression
+##   loop would have to fan out into a switch; the table lookup is cleaner.
+##
+## - All buffers are caller-owned. Output buffer must hold ≥ 64 bytes.
+##
+## Validation gates:
+##
+## - FIPS 180-4 §D.4 test vectors (empty, "abc", 56-byte ABC-string, long
+##   block). All four land in `spec/qspec/sha512_spec.qz`.
+## - Cross-impl: `printf 'abc' | openssl dgst -sha512` must agree.
+## - Streaming = one-shot equivalence (an `sha512` of N bytes equals
+##   `sha512_new` + `sha512_update` × k chunks + `sha512_finalize`).
+##
+## See:
+## - FIPS 180-4 https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf §6.4
+## - docs/design/ED25519_DESIGN.md "SHA-512 internals"
+
+import * from ffi/socket  # malloc/free/memcpy/memset, ptr_read_byte/ptr_write_byte
+
+# =============================================================================
+# u64 ARX helpers
+# =============================================================================
+
+# Logical shift right (zero-fill). Quartz `>>` is ashr; mask off the upper
+# n bits so a set bit-63 doesn't sign-extend into them.
+# Caller guarantees n in [1, 63].
+def _u64_lsr(x: Int, n: Int): Int
+  return (x >> n) & ((1 << (64 - n)) - 1)
+end
+
+# Right-rotate u64 by n in [1, 63].
+def _u64_rotr(x: Int, n: Int): Int
+  return _u64_lsr(x, n) | (x << (64 - n))
+end
+
+# Read 8 bytes at p as a big-endian u64. SHA-512 reads its message block in
+# big-endian (FIPS 180-4 §3.1 — bytes 0..7 of an octet sequence map to the
+# high..low bits of the first u64).
+def _u64_read_be(p: Int): Int
+  var b0 = ptr_read_byte(p)
+  var b1 = ptr_read_byte(p + 1)
+  var b2 = ptr_read_byte(p + 2)
+  var b3 = ptr_read_byte(p + 3)
+  var b4 = ptr_read_byte(p + 4)
+  var b5 = ptr_read_byte(p + 5)
+  var b6 = ptr_read_byte(p + 6)
+  var b7 = ptr_read_byte(p + 7)
+  return (b0 << 56) | (b1 << 48) | (b2 << 40) | (b3 << 32) | (b4 << 24) | (b5 << 16) | (b6 << 8) | b7
+end
+
+# Write u64 v to p as 8 bytes, big-endian — used to emit the digest.
+def _u64_write_be(p: Int, v: Int): Void
+  ptr_write_byte(p,     _u64_lsr(v, 56) & 255)
+  ptr_write_byte(p + 1, _u64_lsr(v, 48) & 255)
+  ptr_write_byte(p + 2, _u64_lsr(v, 40) & 255)
+  ptr_write_byte(p + 3, _u64_lsr(v, 32) & 255)
+  ptr_write_byte(p + 4, _u64_lsr(v, 24) & 255)
+  ptr_write_byte(p + 5, _u64_lsr(v, 16) & 255)
+  ptr_write_byte(p + 6, _u64_lsr(v, 8)  & 255)
+  ptr_write_byte(p + 7, v & 255)
+end
+
+# Read/write u64 LE — used internally for the K table and chain state buffer.
+def _u64_read_le(p: Int): Int
+  var b0 = ptr_read_byte(p)
+  var b1 = ptr_read_byte(p + 1)
+  var b2 = ptr_read_byte(p + 2)
+  var b3 = ptr_read_byte(p + 3)
+  var b4 = ptr_read_byte(p + 4)
+  var b5 = ptr_read_byte(p + 5)
+  var b6 = ptr_read_byte(p + 6)
+  var b7 = ptr_read_byte(p + 7)
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+end
+
+def _u64_write_le(p: Int, v: Int): Void
+  ptr_write_byte(p,     v & 255)
+  ptr_write_byte(p + 1, _u64_lsr(v, 8)  & 255)
+  ptr_write_byte(p + 2, _u64_lsr(v, 16) & 255)
+  ptr_write_byte(p + 3, _u64_lsr(v, 24) & 255)
+  ptr_write_byte(p + 4, _u64_lsr(v, 32) & 255)
+  ptr_write_byte(p + 5, _u64_lsr(v, 40) & 255)
+  ptr_write_byte(p + 6, _u64_lsr(v, 48) & 255)
+  ptr_write_byte(p + 7, _u64_lsr(v, 56) & 255)
+end
+
+# =============================================================================
+# Constants — IV (FIPS 180-4 §5.3.5) and K (§4.2.3)
+# =============================================================================
+
+# IV: first 64 bits of the fractional parts of the square roots of the first
+# 8 primes.
+def _IV_0(): Int = 7640891576956012808    # 0x6a09e667f3bcc908
+def _IV_1(): Int = -4942790177534073029   # 0xbb67ae8584caa73b
+def _IV_2(): Int = 4354685564936845355    # 0x3c6ef372fe94f82b
+def _IV_3(): Int = -6534734903238641935   # 0xa54ff53a5f1d36f1
+def _IV_4(): Int = 5840696475078001361    # 0x510e527fade682d1
+def _IV_5(): Int = -7276294671716946913   # 0x9b05688c2b3e6c1f
+def _IV_6(): Int = 2270897969802886507    # 0x1f83d9abfb41bd6b
+def _IV_7(): Int = 6620516959819538809    # 0x5be0cd19137e2179
+
+# K: first 64 bits of the fractional parts of the cube roots of the first
+# 80 primes. Stored as a lazily-initialised 640-byte LE table indexed by
+# round (0..79).
+var _k_table: Int = 0
+
+def _ensure_k_table(): Int
+  if _k_table != 0
+    return _k_table
+  end
+  var t = malloc(640)
+  _u64_write_le(t + 0   * 8, 4794697086780616226)    # 0x428a2f98d728ae22
+  _u64_write_le(t + 1   * 8, 8158064640168781261)    # 0x7137449123ef65cd
+  _u64_write_le(t + 2   * 8, -5349999486874862801)   # 0xb5c0fbcfec4d3b2f
+  _u64_write_le(t + 3   * 8, -1606136188198331460)   # 0xe9b5dba58189dbbc
+  _u64_write_le(t + 4   * 8, 4131703408338449720)    # 0x3956c25bf348b538
+  _u64_write_le(t + 5   * 8, 6480981068601479193)    # 0x59f111f1b605d019
+  _u64_write_le(t + 6   * 8, -7908458776815382629)   # 0x923f82a4af194f9b
+  _u64_write_le(t + 7   * 8, -6116909921290321640)   # 0xab1c5ed5da6d8118
+  _u64_write_le(t + 8   * 8, -2880145864133508542)   # 0xd807aa98a3030242
+  _u64_write_le(t + 9   * 8, 1334009975649890238)    # 0x12835b0145706fbe
+  _u64_write_le(t + 10  * 8, 2608012711638119052)    # 0x243185be4ee4b28c
+  _u64_write_le(t + 11  * 8, 6128411473006802146)    # 0x550c7dc3d5ffb4e2
+  _u64_write_le(t + 12  * 8, 8268148722764581231)    # 0x72be5d74f27b896f
+  _u64_write_le(t + 13  * 8, -9160688886553864527)   # 0x80deb1fe3b1696b1
+  _u64_write_le(t + 14  * 8, -7215885187991268811)   # 0x9bdc06a725c71235
+  _u64_write_le(t + 15  * 8, -4495734319001033068)   # 0xc19bf174cf692694
+  _u64_write_le(t + 16  * 8, -1973867731355612462)   # 0xe49b69c19ef14ad2
+  _u64_write_le(t + 17  * 8, -1171420211273849373)   # 0xefbe4786384f25e3
+  _u64_write_le(t + 18  * 8, 1135362057144423861)    # 0x0fc19dc68b8cd5b5
+  _u64_write_le(t + 19  * 8, 2597628984639134821)    # 0x240ca1cc77ac9c65
+  _u64_write_le(t + 20  * 8, 3308224258029322869)    # 0x2de92c6f592b0275
+  _u64_write_le(t + 21  * 8, 5365058923640841347)    # 0x4a7484aa6ea6e483
+  _u64_write_le(t + 22  * 8, 6679025012923562964)    # 0x5cb0a9dcbd41fbd4
+  _u64_write_le(t + 23  * 8, 8573033837759648693)    # 0x76f988da831153b5
+  _u64_write_le(t + 24  * 8, -7476448914759557205)   # 0x983e5152ee66dfab
+  _u64_write_le(t + 25  * 8, -6327057829258317296)   # 0xa831c66d2db43210
+  _u64_write_le(t + 26  * 8, -5763719355590565569)   # 0xb00327c898fb213f
+  _u64_write_le(t + 27  * 8, -4658551843659510044)   # 0xbf597fc7beef0ee4
+  _u64_write_le(t + 28  * 8, -4116276920077217854)   # 0xc6e00bf33da88fc2
+  _u64_write_le(t + 29  * 8, -3051310485924567259)   # 0xd5a79147930aa725
+  _u64_write_le(t + 30  * 8, 489312712824947311)     # 0x06ca6351e003826f
+  _u64_write_le(t + 31  * 8, 1452737877330783856)    # 0x142929670a0e6e70
+  _u64_write_le(t + 32  * 8, 2861767655752347644)    # 0x27b70a8546d22ffc
+  _u64_write_le(t + 33  * 8, 3322285676063803686)    # 0x2e1b21385c26c926
+  _u64_write_le(t + 34  * 8, 5560940570517711597)    # 0x4d2c6dfc5ac42aed
+  _u64_write_le(t + 35  * 8, 5996557281743188959)    # 0x53380d139d95b3df
+  _u64_write_le(t + 36  * 8, 7280758554555802590)    # 0x650a73548baf63de
+  _u64_write_le(t + 37  * 8, 8532644243296465576)    # 0x766a0abb3c77b2a8
+  _u64_write_le(t + 38  * 8, -9096487096722542874)   # 0x81c2c92e47edaee6
+  _u64_write_le(t + 39  * 8, -7894198246740708037)   # 0x92722c851482353b
+  _u64_write_le(t + 40  * 8, -6719396339535248540)   # 0xa2bfe8a14cf10364
+  _u64_write_le(t + 41  * 8, -6333637450476146687)   # 0xa81a664bbc423001
+  _u64_write_le(t + 42  * 8, -4446306890439682159)   # 0xc24b8b70d0f89791
+  _u64_write_le(t + 43  * 8, -4076793802049405392)   # 0xc76c51a30654be30
+  _u64_write_le(t + 44  * 8, -3345356375505022440)   # 0xd192e819d6ef5218
+  _u64_write_le(t + 45  * 8, -2983346525034927856)   # 0xd69906245565a910
+  _u64_write_le(t + 46  * 8, -860691631967231958)    # 0xf40e35855771202a
+  _u64_write_le(t + 47  * 8, 1182934255886127544)    # 0x106aa07032bbd1b8
+  _u64_write_le(t + 48  * 8, 1847814050463011016)    # 0x19a4c116b8d2d0c8
+  _u64_write_le(t + 49  * 8, 2177327727835720531)    # 0x1e376c085141ab53
+  _u64_write_le(t + 50  * 8, 2830643537854262169)    # 0x2748774cdf8eeb99
+  _u64_write_le(t + 51  * 8, 3796741975233480872)    # 0x34b0bcb5e19b48a8
+  _u64_write_le(t + 52  * 8, 4115178125766777443)    # 0x391c0cb3c5c95a63
+  _u64_write_le(t + 53  * 8, 5681478168544905931)    # 0x4ed8aa4ae3418acb
+  _u64_write_le(t + 54  * 8, 6601373596472566643)    # 0x5b9cca4f7763e373
+  _u64_write_le(t + 55  * 8, 7507060721942968483)    # 0x682e6ff3d6b2b8a3
+  _u64_write_le(t + 56  * 8, 8399075790359081724)    # 0x748f82ee5defb2fc
+  _u64_write_le(t + 57  * 8, 8693463985226723168)    # 0x78a5636f43172f60
+  _u64_write_le(t + 58  * 8, -8878714635349349518)   # 0x84c87814a1f0ab72
+  _u64_write_le(t + 59  * 8, -8302665154208450068)   # 0x8cc702081a6439ec
+  _u64_write_le(t + 60  * 8, -8016688836872298968)   # 0x90befffa23631e28
+  _u64_write_le(t + 61  * 8, -6606660893046293015)   # 0xa4506cebde82bde9
+  _u64_write_le(t + 62  * 8, -4685533653050689259)   # 0xbef9a3f7b2c67915
+  _u64_write_le(t + 63  * 8, -4147400797238176981)   # 0xc67178f2e372532b
+  _u64_write_le(t + 64  * 8, -3880063495543823972)   # 0xca273eceea26619c
+  _u64_write_le(t + 65  * 8, -3348786107499101689)   # 0xd186b8c721c0c207
+  _u64_write_le(t + 66  * 8, -1523767162380948706)   # 0xeada7dd6cde0eb1e
+  _u64_write_le(t + 67  * 8, -757361751448694408)    # 0xf57d4f7fee6ed178
+  _u64_write_le(t + 68  * 8, 500013540394364858)     # 0x06f067aa72176fba
+  _u64_write_le(t + 69  * 8, 748580250866718886)     # 0x0a637dc5a2c898a6
+  _u64_write_le(t + 70  * 8, 1242879168328830382)    # 0x113f9804bef90dae
+  _u64_write_le(t + 71  * 8, 1977374033974150939)    # 0x1b710b35131c471b
+  _u64_write_le(t + 72  * 8, 2944078676154940804)    # 0x28db77f523047d84
+  _u64_write_le(t + 73  * 8, 3659926193048069267)    # 0x32caab7b40c72493
+  _u64_write_le(t + 74  * 8, 4368137639120453308)    # 0x3c9ebe0a15c9bebc
+  _u64_write_le(t + 75  * 8, 4836135668995329356)    # 0x431d67c49c100d4c
+  _u64_write_le(t + 76  * 8, 5532061633213252278)    # 0x4cc5d4becb3e42b6
+  _u64_write_le(t + 77  * 8, 6448918945643986474)    # 0x597f299cfc657e2a
+  _u64_write_le(t + 78  * 8, 6902733635092675308)    # 0x5fcb6fab3ad6faec
+  _u64_write_le(t + 79  * 8, 7801388544844847127)    # 0x6c44198c4a475817
+  _k_table = t
+  return t
+end
+
+def _K(round: Int): Int = _u64_read_le(_k_table + round * 8)
+
+# =============================================================================
+# Round functions (FIPS 180-4 §4.1.3)
+# =============================================================================
+
+# Ch(x, y, z) = (x ∧ y) ⊕ (¬x ∧ z) — bit-wise multiplex on x.
+def _Ch(x: Int, y: Int, z: Int): Int = (x & y) ^ ((~x) & z)
+
+# Maj(x, y, z) = (x ∧ y) ⊕ (x ∧ z) ⊕ (y ∧ z)
+def _Maj(x: Int, y: Int, z: Int): Int = (x & y) ^ (x & z) ^ (y & z)
+
+# Σ₀(x) = ROTR²⁸(x) ⊕ ROTR³⁴(x) ⊕ ROTR³⁹(x)
+def _BigSigma0(x: Int): Int = _u64_rotr(x, 28) ^ _u64_rotr(x, 34) ^ _u64_rotr(x, 39)
+
+# Σ₁(x) = ROTR¹⁴(x) ⊕ ROTR¹⁸(x) ⊕ ROTR⁴¹(x)
+def _BigSigma1(x: Int): Int = _u64_rotr(x, 14) ^ _u64_rotr(x, 18) ^ _u64_rotr(x, 41)
+
+# σ₀(x) = ROTR¹(x) ⊕ ROTR⁸(x) ⊕ SHR⁷(x) — SHR is logical (zero-fill).
+def _SmallSigma0(x: Int): Int = _u64_rotr(x, 1) ^ _u64_rotr(x, 8) ^ _u64_lsr(x, 7)
+
+# σ₁(x) = ROTR¹⁹(x) ⊕ ROTR⁶¹(x) ⊕ SHR⁶(x)
+def _SmallSigma1(x: Int): Int = _u64_rotr(x, 19) ^ _u64_rotr(x, 61) ^ _u64_lsr(x, 6)
+
+# =============================================================================
+# Compression — process one 128-byte block into the 64-byte chain state.
+# =============================================================================
+
+# h points to 8 u64 = 64 bytes of chain state (mutated in place).
+# block points to 16 u64 = 128 bytes of message data (read-only).
+def _compress(h: Int, block: Int): Void
+  var w = malloc(640)   # 80 u64 message schedule
+
+  # W[0..16] = block[0..16] big-endian → little-endian storage (we read back
+  # via _u64_read_le inside the loop so internal endianness is hidden).
+  var i = 0
+  while i < 16
+    _u64_write_le(w + i * 8, _u64_read_be(block + i * 8))
+    i += 1
+  end
+
+  # W[t] = σ₁(W[t-2]) + W[t-7] + σ₀(W[t-15]) + W[t-16] for t in 16..80
+  i = 16
+  while i < 80
+    var w_m2  = _u64_read_le(w + (i - 2)  * 8)
+    var w_m7  = _u64_read_le(w + (i - 7)  * 8)
+    var w_m15 = _u64_read_le(w + (i - 15) * 8)
+    var w_m16 = _u64_read_le(w + (i - 16) * 8)
+    var wi = _SmallSigma1(w_m2) + w_m7 + _SmallSigma0(w_m15) + w_m16
+    _u64_write_le(w + i * 8, wi)
+    i += 1
+  end
+
+  # Initialize working vars from chain state.
+  var a = _u64_read_le(h + 0)
+  var b = _u64_read_le(h + 8)
+  var c = _u64_read_le(h + 16)
+  var d = _u64_read_le(h + 24)
+  var e = _u64_read_le(h + 32)
+  var f = _u64_read_le(h + 40)
+  var g = _u64_read_le(h + 48)
+  var hh = _u64_read_le(h + 56)
+
+  # 80 rounds.
+  var t = 0
+  while t < 80
+    var t1 = hh + _BigSigma1(e) + _Ch(e, f, g) + _K(t) + _u64_read_le(w + t * 8)
+    var t2 = _BigSigma0(a) + _Maj(a, b, c)
+    hh = g
+    g = f
+    f = e
+    e = d + t1
+    d = c
+    c = b
+    b = a
+    a = t1 + t2
+    t += 1
+  end
+
+  # Compute the i'th intermediate hash value H(i) and write back.
+  _u64_write_le(h + 0,  _u64_read_le(h + 0)  + a)
+  _u64_write_le(h + 8,  _u64_read_le(h + 8)  + b)
+  _u64_write_le(h + 16, _u64_read_le(h + 16) + c)
+  _u64_write_le(h + 24, _u64_read_le(h + 24) + d)
+  _u64_write_le(h + 32, _u64_read_le(h + 32) + e)
+  _u64_write_le(h + 40, _u64_read_le(h + 40) + f)
+  _u64_write_le(h + 48, _u64_read_le(h + 48) + g)
+  _u64_write_le(h + 56, _u64_read_le(h + 56) + hh)
+
+  free(w)
+end
+
+# =============================================================================
+# Streaming API
+# =============================================================================
+#
+# Context layout (208 bytes total):
+#
+#   offset 0..64    chain state h (8 LE u64s, stored LE for fast read/write)
+#   offset 64..192  partial block buffer (up to 128 bytes)
+#   offset 192..200 buffer length (Int — bytes currently in partial buffer)
+#   offset 200..208 total length in bytes (Int — bytes hashed including
+#                                          the partial buffer; capped at i64)
+#
+# SHA-512's spec calls for a 128-bit total-bit-length pad. We only support
+# total byte-lengths up to 2^60 (i64 / 8 bytes/bit) — anyone hashing more
+## than an exabyte through a single context can file a follow-up.
+
+def _SHA512_CTX_SIZE(): Int = 208
+def _OFF_H(): Int = 0
+def _OFF_BUF(): Int = 64
+def _OFF_BUFLEN(): Int = 192
+def _OFF_TOTALLEN(): Int = 200
+
+def _ctx_buflen(ctx: Int): Int = _u64_read_le(ctx + _OFF_BUFLEN())
+def _ctx_set_buflen(ctx: Int, v: Int): Void = _u64_write_le(ctx + _OFF_BUFLEN(), v)
+def _ctx_totallen(ctx: Int): Int = _u64_read_le(ctx + _OFF_TOTALLEN())
+def _ctx_set_totallen(ctx: Int, v: Int): Void = _u64_write_le(ctx + _OFF_TOTALLEN(), v)
+
+## Allocate and initialise a streaming SHA-512 context. Returns the context
+## pointer; callers must finalise (which frees) or free explicitly.
+def sha512_new(): Int
+  _ensure_k_table()
+  var ctx = malloc(_SHA512_CTX_SIZE())
+  memset(ctx, 0, _SHA512_CTX_SIZE())
+  var h = ctx + _OFF_H()
+  _u64_write_le(h + 0,  _IV_0())
+  _u64_write_le(h + 8,  _IV_1())
+  _u64_write_le(h + 16, _IV_2())
+  _u64_write_le(h + 24, _IV_3())
+  _u64_write_le(h + 32, _IV_4())
+  _u64_write_le(h + 40, _IV_5())
+  _u64_write_le(h + 48, _IV_6())
+  _u64_write_le(h + 56, _IV_7())
+  return ctx
+end
+
+## Feed `input_len` bytes of `input` into the streaming hash.
+def sha512_update(ctx: Int, input: Int, input_len: Int): Void
+  var h = ctx + _OFF_H()
+  var buf = ctx + _OFF_BUF()
+  var buflen = _ctx_buflen(ctx)
+  _ctx_set_totallen(ctx, _ctx_totallen(ctx) + input_len)
+
+  var src = input
+  var remaining = input_len
+
+  # Top up the partial buffer if it's non-empty and we have data.
+  if buflen > 0
+    var want = 128 - buflen
+    if want > remaining
+      want = remaining
+    end
+    memcpy(buf + buflen, src, want)
+    buflen = buflen + want
+    src = src + want
+    remaining = remaining - want
+    if buflen == 128
+      _compress(h, buf)
+      buflen = 0
+    end
+  end
+
+  # Process full blocks directly from the input buffer.
+  while remaining >= 128
+    _compress(h, src)
+    src = src + 128
+    remaining = remaining - 128
+  end
+
+  # Stash the tail in the partial buffer.
+  if remaining > 0
+    memcpy(buf + buflen, src, remaining)
+    buflen = buflen + remaining
+  end
+
+  _ctx_set_buflen(ctx, buflen)
+end
+
+## Finalise: pad, mix in length, emit 64-byte digest into `output`. Frees ctx.
+def sha512_finalize(ctx: Int, output: Int): Void
+  var h = ctx + _OFF_H()
+  var buf = ctx + _OFF_BUF()
+  var buflen = _ctx_buflen(ctx)
+  var total_bytes = _ctx_totallen(ctx)
+
+  # Append 0x80; pad with zeros so the final 16 bytes of the last block carry
+  # the message length in bits as a 128-bit big-endian integer. The high 64
+  # bits of that length are always zero in our impl (we cap totallen at i64).
+  ptr_write_byte(buf + buflen, 128)   # 0x80
+  buflen = buflen + 1
+
+  if buflen > 112
+    # Not enough room for the length field in this block — zero-fill to 128,
+    # compress, then start a fresh block for the length suffix.
+    memset(buf + buflen, 0, 128 - buflen)
+    _compress(h, buf)
+    buflen = 0
+  end
+
+  # Zero-fill up to byte 112; bytes 112..128 hold the 128-bit BE length.
+  memset(buf + buflen, 0, 112 - buflen)
+
+  # High 64 bits of bit-length = 0 (we cap at i64-bytes; i64 × 8 < 2^67 but
+  # the high half is *strictly* zero only if total_bytes < 2^61. Anyone
+  # hashing > 2 EB through one context is on their own.)
+  _u64_write_be(buf + 112, 0)
+  # Low 64 bits: total_bits = total_bytes * 8. SHA-512 spec is bits;
+  # we cap at i64 / 8 by construction of the streaming API.
+  _u64_write_be(buf + 120, total_bytes << 3)
+
+  _compress(h, buf)
+
+  # Emit digest big-endian (FIPS 180-4 §6.4.2 step 4 — the 64-byte hash is
+  # the chain state H₀ ‖ H₁ ‖ … ‖ H₇ as 8 big-endian u64s).
+  var i = 0
+  while i < 8
+    _u64_write_be(output + i * 8, _u64_read_le(h + i * 8))
+    i += 1
+  end
+
+  free(ctx)
+end
+
+# =============================================================================
+# One-shot API
+# =============================================================================
+
+## Compute the 64-byte SHA-512 digest of `input` (`input_len` bytes) into
+## `output`. Output buffer must be at least 64 bytes.
+def sha512(input: Int, input_len: Int, output: Int): Void
+  var ctx = sha512_new()
+  sha512_update(ctx, input, input_len)
+  sha512_finalize(ctx, output)
+end

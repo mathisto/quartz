@@ -1,0 +1,704 @@
+## std/core/crypto/aes — Pure-Quartz constant-time AES-128 / AES-256 (FIPS 197)
+##
+## NET.5a.1 — first half of the AES-GCM substrate gap called out in
+## `docs/design/TLS_1_3_DESIGN.md`. AES is the only crypto primitive NET.1-4
+## left unimplemented; without it `TLS_AES_128_GCM_SHA256` and
+## `TLS_AES_256_GCM_SHA384` (RFC 8446 §B.4 cipher-suites mandatory for
+## interop) cannot be offered. NET.5a.2 wired this into AES-GCM; NET.5a.3
+## added the dudect smoke; the present file ships the cipher proper.
+##
+## ## Why bitsliced (and not a T-table port)
+##
+## A tabulated AES is faster (~5 cycles/byte) but the S-box lookups leak
+## under cache-timing attacks (Bernstein 2005, Osvik-Shamir-Tromer 2006).
+## Modern portable CT AES uses bitslicing — Käsper-Schwabe 2009 (CHES) for
+## the SIMD case, Adomnicai-Peyrin 2020 (CHES) for "fixsliced" (lane layout
+## stable across rounds, fewer state rotations). BearSSL's `aes_ct64` is the
+## canonical scalar-portable reference: 4 parallel blocks held in 8 × 64-bit
+## lanes, ~25 cycles/byte on i64, all gates constant-time at the Boyar-
+## Peralta S-box layer.
+##
+## This file is a clean-room port of BearSSL `aes_ct64.c` + `aes_ct64_enc.c`
+## (Pornin, MIT). Public-domain identical algorithm; comments tag where the
+## Quartz expression diverges (sign-vs-unsigned, ashr-vs-lsr).
+##
+## ## Layout summary
+##
+## A bitsliced AES state holds 4 blocks (64 bytes total) in 8 × 64-bit lanes
+## `q[0..8]`. After `_aes_ortho` (the "orthogonalize" transpose), lane `q[i]`
+## holds bit-`i` across all 64 bytes. The S-box is then 113 logic gates on
+## the 8 lanes (no per-byte branch). ShiftRows is a within-lane byte
+## permutation. MixColumns is XORs + a rotate-right-16. Add-round-key is 8
+## XORs against the expanded round-key lanes.
+##
+## Key schedule produces:
+##   - compact form (16 bytes / round = 2 × u64 per round) — internal-only
+##   - expanded form (64 bytes / round = 8 × u64 per round) — caller-visible
+## The caller allocates `aes_round_keys_size(key_len)` bytes for the
+## expanded form and passes the pointer to `aes_keysched` + `aes_encrypt_*`.
+##
+## ## Public API (NET.5a.1)
+##
+##   def aes_round_keys_size(key_len: Int): Int      # byte size for caller alloc
+##   def aes_keysched(round_keys: Int,
+##                    key: Secret<Int>, key_len: Int): Int   # → num_rounds | 0
+##   def aes_encrypt_block(num_rounds: Int, round_keys: Int,
+##                         in: Int, out: Int): Void
+##
+## Decrypt is deliberately not shipped — TLS 1.3 cipher-suites use AES only
+## via CTR (AES-GCM's keystream path), which requires forward encrypt only.
+## D7: don't add what isn't used. If a future caller (AES-CBC etc.) needs
+## decrypt, port `aes_ct64_dec.c` then.
+##
+## AES-192 is also not shipped: TLS 1.3 has no 192-bit cipher-suite (§B.4).
+##
+## ## Validation
+##
+## `spec/qz/aes_smoke.qz` runs FIPS 197 Appendix B + C (the canonical
+## NIST-published example block) plus NIST CAVS AESAVS variable-key /
+## variable-text vectors for AES-128 and AES-256. Driver task `quake
+## aes:smoke`. NET.5a.2 extends to AES-GCM with the McGrew-Viega vectors
+## (NIST SP 800-38D Appendix B); NET.5a.3 adds dudect entries for
+## `aes_encrypt_block` AES-128/256 (key-class) inside `dudect:smoke`.
+##
+## ## References
+##
+## - FIPS 197 https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.197-upd1.pdf
+## - Boyar, Peralta. *A new combinational logic minimization technique
+##   with applications to cryptology.* https://eprint.iacr.org/2009/191
+## - Pornin. BearSSL `aes_ct64`.
+##   https://www.bearssl.org/gitweb/?p=BearSSL;a=tree;f=src/symcipher
+## - Adomnicai, Peyrin. *Fixslicing AES-like Ciphers.* CHES 2020,
+##   https://eprint.iacr.org/2020/1123
+## - docs/design/TLS_1_3_DESIGN.md "AES + AES-GCM" + "Open question #2"
+
+import * from ffi/socket               # malloc, free, memset, ptr_read_byte, ptr_write_byte
+import * from std/core/crypto/secret   # Secret<Int> + secret_unwrap (NET.4.1)
+
+# =============================================================================
+# u64 / u32 helpers
+# =============================================================================
+#
+# Quartz `>>` is arithmetic (sign-extending); `_u64_lsr` is the logical
+# right-shift we need whenever the operand may have bit-63 set after a
+# wide-mask AND. Lifted from sha3.qz / sha512.qz.
+
+def _u64_lsr(x: Int, n: Int): Int
+  return (x >> n) & ((1 << (64 - n)) - 1)
+end
+
+# u32 logical right-shift. Cheap because mask-to-32 zeros bit 63 first.
+def _u32_lsr(v: Int, n: Int): Int = (v & 4294967295) >> n
+
+def _u32_read_le(p: Int): Int
+  var b0 = ptr_read_byte(p)
+  var b1 = ptr_read_byte(p + 1)
+  var b2 = ptr_read_byte(p + 2)
+  var b3 = ptr_read_byte(p + 3)
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+end
+
+def _u32_write_le(p: Int, v: Int): Void
+  ptr_write_byte(p, v & 255)
+  ptr_write_byte(p + 1, _u32_lsr(v, 8)  & 255)
+  ptr_write_byte(p + 2, _u32_lsr(v, 16) & 255)
+  ptr_write_byte(p + 3, _u32_lsr(v, 24) & 255)
+end
+
+def _u64_read_le(p: Int): Int
+  var b0 = ptr_read_byte(p)
+  var b1 = ptr_read_byte(p + 1)
+  var b2 = ptr_read_byte(p + 2)
+  var b3 = ptr_read_byte(p + 3)
+  var b4 = ptr_read_byte(p + 4)
+  var b5 = ptr_read_byte(p + 5)
+  var b6 = ptr_read_byte(p + 6)
+  var b7 = ptr_read_byte(p + 7)
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+end
+
+def _u64_write_le(p: Int, v: Int): Void
+  ptr_write_byte(p,     v & 255)
+  ptr_write_byte(p + 1, _u64_lsr(v, 8)  & 255)
+  ptr_write_byte(p + 2, _u64_lsr(v, 16) & 255)
+  ptr_write_byte(p + 3, _u64_lsr(v, 24) & 255)
+  ptr_write_byte(p + 4, _u64_lsr(v, 32) & 255)
+  ptr_write_byte(p + 5, _u64_lsr(v, 40) & 255)
+  ptr_write_byte(p + 6, _u64_lsr(v, 48) & 255)
+  ptr_write_byte(p + 7, _u64_lsr(v, 56) & 255)
+end
+
+# Lane access helpers — q is a malloc'd 64-byte buffer holding 8 u64 lanes.
+def _q_get(q: Int, i: Int): Int = _u64_read_le(q + i * 8)
+def _q_set(q: Int, i: Int, v: Int): Void = _u64_write_le(q + i * 8, v)
+
+# =============================================================================
+# Wide bit-pattern constants (i64 signed encoding of the unsigned bit pattern)
+# =============================================================================
+
+# 0x5555_5555_5555_5555 — even lanes
+def _M55(): Int = 6148914691236517205
+# 0xAAAA_AAAA_AAAA_AAAA — odd lanes (negative in i64)
+def _MAA(): Int = -6148914691236517206
+# 0x3333_3333_3333_3333
+def _M33(): Int = 3689348814741910323
+# 0xCCCC_CCCC_CCCC_CCCC (negative)
+def _MCC(): Int = -3689348814741910324
+# 0x0F0F_0F0F_0F0F_0F0F
+def _M0F(): Int = 1085102592571150095
+# 0xF0F0_F0F0_F0F0_F0F0 (negative)
+def _MF0(): Int = -1085102592571150096
+# 0x0000_FFFF_0000_FFFF
+def _M_0000FFFF(): Int = 281470681808895
+# 0x00FF_00FF_00FF_00FF
+def _M_00FF(): Int = 71777214294589695
+# 0x1111_1111_1111_1111
+def _M_1111(): Int = 1229782938247303441
+# 0x2222_2222_2222_2222
+def _M_2222(): Int = 2459565876494606882
+# 0x4444_4444_4444_4444
+def _M_4444(): Int = 4919131752989213764
+# 0x8888_8888_8888_8888 (negative)
+def _M_8888(): Int = -8608480567731124088
+
+# shift_rows masks (per BearSSL aes_ct64_enc.c)
+def _SR_M_0000FFFF(): Int = 65535                       # 0x000000000000FFFF
+def _SR_M_FFF00000(): Int = 4293918720                  # 0x00000000FFF00000
+def _SR_M_000F0000(): Int = 983040                      # 0x00000000000F0000
+def _SR_M_FF0000000000(): Int = 280375465082880         # 0x0000FF0000000000
+def _SR_M_FF00000000(): Int = 1095216660480             # 0x000000FF00000000
+def _SR_M_F000000000000000(): Int = -1152921504606846976  # 0xF000000000000000
+def _SR_M_0FFF000000000000(): Int = 1152640029630136320   # 0x0FFF000000000000
+
+# AES round constants (FIPS 197 §5.2): {01, 02, 04, 08, 10, 20, 40, 80, 1B, 36}.
+# Used in the AES-128 key schedule; the AES-256 schedule reaches index 7
+# (`80`) before stopping, so the last two entries are decorative here but
+# match BearSSL byte-for-byte.
+def _Rcon(i: Int): Int
+  if i == 0 then return 1   end
+  if i == 1 then return 2   end
+  if i == 2 then return 4   end
+  if i == 3 then return 8   end
+  if i == 4 then return 16  end
+  if i == 5 then return 32  end
+  if i == 6 then return 64  end
+  if i == 7 then return 128 end
+  if i == 8 then return 27  end   # 0x1B
+  return 54                        # 0x36
+end
+
+# =============================================================================
+# Bitslice transpose — `_aes_ortho` (BearSSL `br_aes_ct64_ortho`)
+# =============================================================================
+#
+# Three rounds of 1/2/4-wide swaps that transpose an 8×8 bit block in each
+# lane. Self-inverse — applying twice returns the original layout. Used both
+# to enter the bitsliced representation (before SubBytes) and to leave it
+# (before reading out ciphertext bytes).
+
+# SWAPN(cl, ch, s, &x, &y):
+#   a, b = x, y
+#   x = (a & cl) | ((b & cl) << s)
+#   y = ((a & ch) >> s) | (b & ch)
+# Operates by pointer to 8-byte slots inside `q`.
+def _swapn(q: Int, cl: Int, ch: Int, s: Int, ix: Int, iy: Int): Void
+  var a = _q_get(q, ix)
+  var b = _q_get(q, iy)
+  _q_set(q, ix, (a & cl) | ((b & cl) << s))
+  _q_set(q, iy, _u64_lsr(a & ch, s) | (b & ch))
+end
+
+def _aes_ortho(q: Int): Void
+  # SWAP2 — pairs of adjacent bits, mask 0x5555... / 0xAAAA...
+  _swapn(q, _M55(), _MAA(), 1, 0, 1)
+  _swapn(q, _M55(), _MAA(), 1, 2, 3)
+  _swapn(q, _M55(), _MAA(), 1, 4, 5)
+  _swapn(q, _M55(), _MAA(), 1, 6, 7)
+  # SWAP4 — pairs of 2-bit groups, mask 0x3333... / 0xCCCC...
+  _swapn(q, _M33(), _MCC(), 2, 0, 2)
+  _swapn(q, _M33(), _MCC(), 2, 1, 3)
+  _swapn(q, _M33(), _MCC(), 2, 4, 6)
+  _swapn(q, _M33(), _MCC(), 2, 5, 7)
+  # SWAP8 — pairs of 4-bit groups (i.e. nibble swap), 0x0F0F... / 0xF0F0...
+  _swapn(q, _M0F(), _MF0(), 4, 0, 4)
+  _swapn(q, _M0F(), _MF0(), 4, 1, 5)
+  _swapn(q, _M0F(), _MF0(), 4, 2, 6)
+  _swapn(q, _M0F(), _MF0(), 4, 3, 7)
+end
+
+# =============================================================================
+# Block <-> bitslice interleave (BearSSL `interleave_in` / `interleave_out`)
+# =============================================================================
+#
+# A single AES block is 16 bytes = 4 × u32. `interleave_in` packs one block
+# into 2 of the 8 bitsliced lanes (the other 2 blocks fill the remaining
+# lane pairs). `interleave_out` reverses this.
+
+def _aes_interleave_in(q: Int, q_lo_idx: Int, q_hi_idx: Int, w_ptr: Int): Void
+  var x0 = _u32_read_le(w_ptr)
+  var x1 = _u32_read_le(w_ptr + 4)
+  var x2 = _u32_read_le(w_ptr + 8)
+  var x3 = _u32_read_le(w_ptr + 12)
+  x0 = x0 | (x0 << 16)
+  x1 = x1 | (x1 << 16)
+  x2 = x2 | (x2 << 16)
+  x3 = x3 | (x3 << 16)
+  x0 = x0 & _M_0000FFFF()
+  x1 = x1 & _M_0000FFFF()
+  x2 = x2 & _M_0000FFFF()
+  x3 = x3 & _M_0000FFFF()
+  x0 = x0 | (x0 << 8)
+  x1 = x1 | (x1 << 8)
+  x2 = x2 | (x2 << 8)
+  x3 = x3 | (x3 << 8)
+  x0 = x0 & _M_00FF()
+  x1 = x1 & _M_00FF()
+  x2 = x2 & _M_00FF()
+  x3 = x3 & _M_00FF()
+  _q_set(q, q_lo_idx, x0 | (x2 << 8))
+  _q_set(q, q_hi_idx, x1 | (x3 << 8))
+end
+
+def _aes_interleave_out(w_ptr: Int, q0: Int, q1: Int): Void
+  var x0 = q0 & _M_00FF()
+  var x1 = q1 & _M_00FF()
+  var x2 = _u64_lsr(q0, 8) & _M_00FF()
+  var x3 = _u64_lsr(q1, 8) & _M_00FF()
+  x0 = x0 | _u64_lsr(x0, 8)
+  x1 = x1 | _u64_lsr(x1, 8)
+  x2 = x2 | _u64_lsr(x2, 8)
+  x3 = x3 | _u64_lsr(x3, 8)
+  x0 = x0 & _M_0000FFFF()
+  x1 = x1 & _M_0000FFFF()
+  x2 = x2 & _M_0000FFFF()
+  x3 = x3 & _M_0000FFFF()
+  # Truncate to u32 by OR-folding the upper half down.
+  _u32_write_le(w_ptr,      (x0 | _u64_lsr(x0, 16)) & 4294967295)
+  _u32_write_le(w_ptr + 4,  (x1 | _u64_lsr(x1, 16)) & 4294967295)
+  _u32_write_le(w_ptr + 8,  (x2 | _u64_lsr(x2, 16)) & 4294967295)
+  _u32_write_le(w_ptr + 12, (x3 | _u64_lsr(x3, 16)) & 4294967295)
+end
+
+# =============================================================================
+# Boyar-Peralta SubBytes — `_aes_bitslice_sbox`
+# =============================================================================
+#
+# 113 logic gates, all bitwise — no table lookup, no branch on data. The
+# variable names mirror eprint.iacr.org/2009/191 §3 to make line-by-line
+# review against the paper / BearSSL trivial. NOT operator is `~`.
+#
+# Convention from BearSSL: x0..x7 are the INPUT bits with x0 = highest bit;
+# s0..s7 are the OUTPUT bits with s0 = highest bit. Mapping to lanes is
+# x_i = q[7 - i], s_i -> q[7 - i].
+
+def _aes_bitslice_sbox(q: Int): Void
+  var x0 = _q_get(q, 7)
+  var x1 = _q_get(q, 6)
+  var x2 = _q_get(q, 5)
+  var x3 = _q_get(q, 4)
+  var x4 = _q_get(q, 3)
+  var x5 = _q_get(q, 2)
+  var x6 = _q_get(q, 1)
+  var x7 = _q_get(q, 0)
+
+  # --- top linear transformation ---
+  var y14 = x3 ^ x5
+  var y13 = x0 ^ x6
+  var y9  = x0 ^ x3
+  var y8  = x0 ^ x5
+  var t0  = x1 ^ x2
+  var y1  = t0 ^ x7
+  var y4  = y1 ^ x3
+  var y12 = y13 ^ y14
+  var y2  = y1 ^ x0
+  var y5  = y1 ^ x6
+  var y3  = y5 ^ y8
+  var t1  = x4 ^ y12
+  var y15 = t1 ^ x5
+  var y20 = t1 ^ x1
+  var y6  = y15 ^ x7
+  var y10 = y15 ^ t0
+  var y11 = y20 ^ y9
+  var y7  = x7 ^ y11
+  var y17 = y10 ^ y11
+  var y19 = y10 ^ y8
+  var y16 = t0 ^ y11
+  var y21 = y13 ^ y16
+  var y18 = x0 ^ y16
+
+  # --- non-linear section ---
+  var t2  = y12 & y15
+  var t3  = y3 & y6
+  var t4  = t3 ^ t2
+  var t5  = y4 & x7
+  var t6  = t5 ^ t2
+  var t7  = y13 & y16
+  var t8  = y5 & y1
+  var t9  = t8 ^ t7
+  var t10 = y2 & y7
+  var t11 = t10 ^ t7
+  var t12 = y9 & y11
+  var t13 = y14 & y17
+  var t14 = t13 ^ t12
+  var t15 = y8 & y10
+  var t16 = t15 ^ t12
+  var t17 = t4 ^ t14
+  var t18 = t6 ^ t16
+  var t19 = t9 ^ t14
+  var t20 = t11 ^ t16
+  var t21 = t17 ^ y20
+  var t22 = t18 ^ y19
+  var t23 = t19 ^ y21
+  var t24 = t20 ^ y18
+
+  var t25 = t21 ^ t22
+  var t26 = t21 & t23
+  var t27 = t24 ^ t26
+  var t28 = t25 & t27
+  var t29 = t28 ^ t22
+  var t30 = t23 ^ t24
+  var t31 = t22 ^ t26
+  var t32 = t31 & t30
+  var t33 = t32 ^ t24
+  var t34 = t23 ^ t33
+  var t35 = t27 ^ t33
+  var t36 = t24 & t35
+  var t37 = t36 ^ t34
+  var t38 = t27 ^ t36
+  var t39 = t29 & t38
+  var t40 = t25 ^ t39
+
+  var t41 = t40 ^ t37
+  var t42 = t29 ^ t33
+  var t43 = t29 ^ t40
+  var t44 = t33 ^ t37
+  var t45 = t42 ^ t41
+  var z0  = t44 & y15
+  var z1  = t37 & y6
+  var z2  = t33 & x7
+  var z3  = t43 & y16
+  var z4  = t40 & y1
+  var z5  = t29 & y7
+  var z6  = t42 & y11
+  var z7  = t45 & y17
+  var z8  = t41 & y10
+  var z9  = t44 & y12
+  var z10 = t37 & y3
+  var z11 = t33 & y4
+  var z12 = t43 & y13
+  var z13 = t40 & y5
+  var z14 = t29 & y2
+  var z15 = t42 & y9
+  var z16 = t45 & y14
+  var z17 = t41 & y8
+
+  # --- bottom linear transformation ---
+  var t46 = z15 ^ z16
+  var t47 = z10 ^ z11
+  var t48 = z5 ^ z13
+  var t49 = z9 ^ z10
+  var t50 = z2 ^ z12
+  var t51 = z2 ^ z5
+  var t52 = z7 ^ z8
+  var t53 = z0 ^ z3
+  var t54 = z6 ^ z7
+  var t55 = z16 ^ z17
+  var t56 = z12 ^ t48
+  var t57 = t50 ^ t53
+  var t58 = z4 ^ t46
+  var t59 = z3 ^ t54
+  var t60 = t46 ^ t57
+  var t61 = z14 ^ t57
+  var t62 = t52 ^ t58
+  var t63 = t49 ^ t58
+  var t64 = z4 ^ t59
+  var t65 = t61 ^ t62
+  var t66 = z1 ^ t63
+  var s0  = t59 ^ t63
+  var s6  = t56 ^ (~t62)
+  var s7  = t48 ^ (~t60)
+  var t67 = t64 ^ t65
+  var s3  = t53 ^ t66
+  var s4  = t51 ^ t66
+  var s5  = t47 ^ t65
+  var s1  = t64 ^ (~s3)
+  var s2  = t55 ^ (~t67)
+
+  _q_set(q, 7, s0)
+  _q_set(q, 6, s1)
+  _q_set(q, 5, s2)
+  _q_set(q, 4, s3)
+  _q_set(q, 3, s4)
+  _q_set(q, 2, s5)
+  _q_set(q, 1, s6)
+  _q_set(q, 0, s7)
+end
+
+# =============================================================================
+# ShiftRows + MixColumns (BearSSL `shift_rows` / `mix_columns`)
+# =============================================================================
+
+def _aes_shift_rows(q: Int): Void
+  # NOTE: keep each OR expression on ONE line. Quartz's parser silently
+  # drops `\n|<expr>` continuation lines (`docs/bugs/MULTILINE_BINARY_
+  # OPERATOR_SILENTLY_DROPPED.md`), discarding all but the first term.
+  var i = 0
+  while i < 8
+    var x = _q_get(q, i)
+    var v = (x & _SR_M_0000FFFF()) | _u64_lsr(x & _SR_M_FFF00000(), 4) | ((x & _SR_M_000F0000()) << 12) | _u64_lsr(x & _SR_M_FF0000000000(), 8) | ((x & _SR_M_FF00000000()) << 8) | _u64_lsr(x & _SR_M_F000000000000000(), 12) | ((x & _SR_M_0FFF000000000000()) << 4)
+    _q_set(q, i, v)
+    i = i + 1
+  end
+end
+
+# 32-bit rotate of a 64-bit lane (swap halves).
+def _rotr32(x: Int): Int = (x << 32) | _u64_lsr(x, 32)
+
+def _aes_mix_columns(q: Int): Void
+  var q0 = _q_get(q, 0)
+  var q1 = _q_get(q, 1)
+  var q2 = _q_get(q, 2)
+  var q3 = _q_get(q, 3)
+  var q4 = _q_get(q, 4)
+  var q5 = _q_get(q, 5)
+  var q6 = _q_get(q, 6)
+  var q7 = _q_get(q, 7)
+
+  var r0 = _u64_lsr(q0, 16) | (q0 << 48)
+  var r1 = _u64_lsr(q1, 16) | (q1 << 48)
+  var r2 = _u64_lsr(q2, 16) | (q2 << 48)
+  var r3 = _u64_lsr(q3, 16) | (q3 << 48)
+  var r4 = _u64_lsr(q4, 16) | (q4 << 48)
+  var r5 = _u64_lsr(q5, 16) | (q5 << 48)
+  var r6 = _u64_lsr(q6, 16) | (q6 << 48)
+  var r7 = _u64_lsr(q7, 16) | (q7 << 48)
+
+  _q_set(q, 0, q7 ^ r7 ^ r0 ^ _rotr32(q0 ^ r0))
+  _q_set(q, 1, q0 ^ r0 ^ q7 ^ r7 ^ r1 ^ _rotr32(q1 ^ r1))
+  _q_set(q, 2, q1 ^ r1 ^ r2 ^ _rotr32(q2 ^ r2))
+  _q_set(q, 3, q2 ^ r2 ^ q7 ^ r7 ^ r3 ^ _rotr32(q3 ^ r3))
+  _q_set(q, 4, q3 ^ r3 ^ q7 ^ r7 ^ r4 ^ _rotr32(q4 ^ r4))
+  _q_set(q, 5, q4 ^ r4 ^ r5 ^ _rotr32(q5 ^ r5))
+  _q_set(q, 6, q5 ^ r5 ^ r6 ^ _rotr32(q6 ^ r6))
+  _q_set(q, 7, q6 ^ r6 ^ r7 ^ _rotr32(q7 ^ r7))
+end
+
+def _aes_add_round_key(q: Int, sk: Int): Void
+  var i = 0
+  while i < 8
+    _q_set(q, i, _q_get(q, i) ^ _q_get(sk, i))
+    i = i + 1
+  end
+end
+
+# =============================================================================
+# Bitsliced encrypt — BearSSL `br_aes_ct64_bitslice_encrypt`
+# =============================================================================
+
+def _aes_bitslice_encrypt(num_rounds: Int, skey: Int, q: Int): Void
+  _aes_add_round_key(q, skey)
+  var u = 1
+  while u < num_rounds
+    _aes_bitslice_sbox(q)
+    _aes_shift_rows(q)
+    _aes_mix_columns(q)
+    _aes_add_round_key(q, skey + u * 64)
+    u = u + 1
+  end
+  _aes_bitslice_sbox(q)
+  _aes_shift_rows(q)
+  _aes_add_round_key(q, skey + num_rounds * 64)
+end
+
+# =============================================================================
+# Key schedule
+# =============================================================================
+#
+# Two-stage construction (BearSSL pattern):
+#
+#   1. `_aes_keysched_words` — classical FIPS 197 §5.2 schedule that walks
+#      the round-key array word-by-word, applying SubBytes via `_sub_word`
+#      at round boundaries. Output is a buffer of `(num_rounds+1)*4` u32s
+#      (44 words for AES-128 = 176 bytes; 60 words for AES-256 = 240 bytes).
+#
+#   2. Pack each round's 4 u32s into one bitsliced lane-pair (q[0], q[4]),
+#      replicated 4× (one copy per AND-with-{0x1111, 0x2222, 0x4444, 0x8888})
+#      so a single ortho call produces the bit pattern that
+#      `_aes_skey_expand` then fans out across 8 lanes per round.
+#
+# Compact form occupies 2 × u64 per round; expanded form 8 × u64 per round.
+# The compact-to-expanded fan-out keeps `add_round_key` a simple XOR.
+
+# Substitute a single u32 (4 bytes) through the AES S-box via the bitsliced
+# kernel. Used by the key-schedule round-rotation step.
+def _sub_word(x: Int): Int
+  var q = malloc(64)
+  memset(q, 0, 64)
+  _u64_write_le(q, x & 4294967295)
+  _aes_ortho(q)
+  _aes_bitslice_sbox(q)
+  _aes_ortho(q)
+  var r = _u64_read_le(q) & 4294967295
+  free(q)
+  return r
+end
+
+# FIPS 197 §5.2 — fill skey_bytes (uint32 LE words) with the classic schedule.
+def _aes_keysched_words(skey_bytes: Int, key_ptr: Int, key_len: Int, num_rounds: Int): Void
+  var nk = key_len / 4
+  var nkf = (num_rounds + 1) * 4
+
+  # Initial: copy key as little-endian u32s into the leading nk slots.
+  var idx = 0
+  while idx < nk
+    _u32_write_le(skey_bytes + idx * 4, _u32_read_le(key_ptr + idx * 4))
+    idx = idx + 1
+  end
+
+  var tmp = _u32_read_le(skey_bytes + (nk - 1) * 4)
+  var i = nk
+  var j = 0
+  var k = 0
+  while i < nkf
+    if j == 0
+      tmp = ((tmp << 24) | _u32_lsr(tmp, 8)) & 4294967295
+      tmp = (_sub_word(tmp) ^ _Rcon(k)) & 4294967295
+    else
+      if (nk > 6) & (j == 4)
+        tmp = _sub_word(tmp)
+      end
+    end
+    tmp = (tmp ^ _u32_read_le(skey_bytes + (i - nk) * 4)) & 4294967295
+    _u32_write_le(skey_bytes + i * 4, tmp)
+    j = j + 1
+    if j == nk
+      j = 0
+      k = k + 1
+    end
+    i = i + 1
+  end
+end
+
+# Compress one round's 4 expanded u32 words into 2 u64 bitsliced lanes
+# (BearSSL keysched body). `comp_skey` is (num_rounds+1) * 2 * 8 bytes.
+def _aes_compress_skey(comp_skey: Int, skey_bytes: Int, num_rounds: Int): Void
+  var nkf = (num_rounds + 1) * 4
+  var i = 0
+  var jj = 0
+  var q = malloc(64)
+  while i < nkf
+    memset(q, 0, 64)
+    _aes_interleave_in(q, 0, 4, skey_bytes + i * 4)
+    var qv0 = _q_get(q, 0)
+    _q_set(q, 1, qv0)
+    _q_set(q, 2, qv0)
+    _q_set(q, 3, qv0)
+    var qv4 = _q_get(q, 4)
+    _q_set(q, 5, qv4)
+    _q_set(q, 6, qv4)
+    _q_set(q, 7, qv4)
+    _aes_ortho(q)
+    # NOTE: single-line OR per MULTILINE_BINARY_OPERATOR_SILENTLY_DROPPED.
+    var c0 = (_q_get(q, 0) & _M_1111()) | (_q_get(q, 1) & _M_2222()) | (_q_get(q, 2) & _M_4444()) | (_q_get(q, 3) & _M_8888())
+    var c1 = (_q_get(q, 4) & _M_1111()) | (_q_get(q, 5) & _M_2222()) | (_q_get(q, 6) & _M_4444()) | (_q_get(q, 7) & _M_8888())
+    _u64_write_le(comp_skey + jj * 8,       c0)
+    _u64_write_le(comp_skey + jj * 8 + 8,   c1)
+    i = i + 4
+    jj = jj + 2
+  end
+  free(q)
+end
+
+# Fan compact (2 lanes) out to expanded (8 lanes) per round.
+def _aes_skey_expand(skey: Int, num_rounds: Int, comp_skey: Int): Void
+  var n = (num_rounds + 1) * 2
+  var u = 0
+  var v = 0
+  while u < n
+    var c = _u64_read_le(comp_skey + u * 8)
+    var x0 = c & _M_1111()
+    var x1 = c & _M_2222()
+    var x2 = c & _M_4444()
+    var x3 = c & _M_8888()
+    x1 = _u64_lsr(x1, 1)
+    x2 = _u64_lsr(x2, 2)
+    x3 = _u64_lsr(x3, 3)
+    # The (x << 4) - x = x * 15 trick spreads one bit out to fill its
+    # nibble — bit set in low nibble of every byte becomes 0xF in that
+    # nibble, otherwise 0. Direct port of BearSSL `aes_ct64.c`.
+    _u64_write_le(skey + v * 8,       (x0 << 4) - x0)
+    _u64_write_le(skey + v * 8 + 8,   (x1 << 4) - x1)
+    _u64_write_le(skey + v * 8 + 16,  (x2 << 4) - x2)
+    _u64_write_le(skey + v * 8 + 24,  (x3 << 4) - x3)
+    u = u + 1
+    v = v + 4
+  end
+end
+
+# =============================================================================
+# Public API
+# =============================================================================
+
+## Byte size of the expanded round-key buffer the caller must allocate
+## before calling `aes_keysched`. Returns 0 for unsupported key lengths
+## (anything other than 16 or 32 — AES-192 deliberately not shipped, see
+## the module docstring).
+def aes_round_keys_size(key_len: Int): Int
+  if key_len == 16 then return 704 end   # 11 rounds * 8 lanes * 8 bytes
+  if key_len == 32 then return 960 end   # 15 rounds * 8 lanes * 8 bytes
+  return 0
+end
+
+## Expand a 16- or 32-byte AES key into the bitsliced round-key form used
+## by `aes_encrypt_block`. Caller owns `round_keys` (size must be at least
+## `aes_round_keys_size(key_len)`).
+##
+## Returns the number of rounds (10 for AES-128, 14 for AES-256), or 0 if
+## the key length is unsupported.
+def aes_keysched(round_keys: Int, key: Secret<Int>, key_len: Int): Int
+  var num_rounds = 0
+  if key_len == 16 then num_rounds = 10 end
+  if key_len == 32 then num_rounds = 14 end
+  if num_rounds == 0 then return 0 end
+
+  var key_ptr = secret_unwrap<Int>(key)
+
+  # Classic schedule -> scratch byte buffer holding (num_rounds+1)*4 u32 LE.
+  var nkf_bytes = (num_rounds + 1) * 16
+  var skey_bytes = malloc(nkf_bytes)
+  _aes_keysched_words(skey_bytes, key_ptr, key_len, num_rounds)
+
+  # Compress to comp_skey (2 u64 per round).
+  var comp_size = (num_rounds + 1) * 2 * 8
+  var comp_skey = malloc(comp_size)
+  _aes_compress_skey(comp_skey, skey_bytes, num_rounds)
+  free(skey_bytes)
+
+  # Fan to expanded form (8 u64 per round) -> caller buffer.
+  _aes_skey_expand(round_keys, num_rounds, comp_skey)
+  free(comp_skey)
+  return num_rounds
+end
+
+## Encrypt a single 16-byte AES block. `round_keys` and `num_rounds` come
+## from `aes_keysched`. `in` and `out` may alias (in-place encryption
+## allowed) — `out` is fully written after `in` is fully read.
+##
+## The internal kernel processes 4 blocks per call; we feed one real block
+## and 3 zero blocks, then read back only the first. NET.5a.2 will add a
+## batched API for AES-CTR keystream where the 4-way batching pays off.
+def aes_encrypt_block(num_rounds: Int, round_keys: Int, in_ptr: Int, out_ptr: Int): Void
+  var q = malloc(64)
+  memset(q, 0, 64)
+
+  # Block 0 -> q[0], q[4].
+  _aes_interleave_in(q, 0, 4, in_ptr)
+  # Blocks 1, 2, 3 -> (q[1], q[5]), (q[2], q[6]), (q[3], q[7]). Already zero.
+
+  _aes_ortho(q)
+  _aes_bitslice_encrypt(num_rounds, round_keys, q)
+  _aes_ortho(q)
+
+  _aes_interleave_out(out_ptr, _q_get(q, 0), _q_get(q, 4))
+  free(q)
+end

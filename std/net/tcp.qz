@@ -1,0 +1,1211 @@
+# std/net/tcp.be - Ergonomic TCP networking (Layer 2 - The Be Way)
+#
+# This is the recommended API for TCP networking in Be.
+# For raw socket access, see std/ffi/socket.
+#
+# Block-scoped close with throw-safety (B.8 Phase 5):
+#   import * from std/net/tcp
+#   with tcp_listener_scoped(tcp_listen("127.0.0.1", 0)) do fd ->
+#     serve_until_done(fd)
+#   end
+#   # implicit tcp_close_listener on every exit, including throw.
+# See TcpStreamGuard / TcpListenerGuard near the bottom of this file.
+#
+# Example - Client:
+#   import std/net/tcp
+#
+#   def main(): Int
+#     match tcp_connect("127.0.0.1", 80)
+#       TcpResult::Ok(conn) => {
+#         tcp_write(conn, "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n")
+#         result = tcp_read(conn, 4096)
+#         match result
+#           ReadResult::Ok(data) => puts(data)
+#           ReadResult::Err(e) => puts(e.message)
+#         end
+#         tcp_close(conn)
+#         0
+#       }
+#       TcpResult::Err(e) => {
+#         puts(e.message)
+#         1
+#       }
+#     end
+#   end
+#
+# Example - Server:
+#   import std/net/tcp
+#
+#   def main(): Int
+#     match tcp_listen(8080)
+#       ListenResult::Ok(server) => {
+#         puts("Listening on port 8080")
+#         while true
+#           match tcp_accept(server)
+#             AcceptResult::Ok(client) => {
+#               tcp_write(client, "HTTP/1.0 200 OK\r\n\r\nHello!")
+#               tcp_close(client)
+#               0
+#             }
+#             AcceptResult::Err(e) => 1
+#           end
+#         end
+#         tcp_close_listener(server)
+#         0
+#       }
+#       ListenResult::Err(e) => {
+#         puts("Listen error")
+#         1
+#       }
+#     end
+#   end
+
+# Import raw socket FFI
+import std/ffi/socket
+import * from std/scoped
+import * from std/selectable
+
+# =============================================================================
+# Freestanding kernel ABI declarations (D.11 Phase 7 / Phase 8a)
+# =============================================================================
+#
+# Bridges the freestanding (`@cfg(os: "unknown")`) bodies of tcp_listen /
+# tcp_close_listener (and, in subsequent steps, tcp_accept / async_tcp_*)
+# to kernel-side definitions in `tools/baremetal/hello_x86.qz`. Top-level
+# `def kern_tcp_*` in that file emits as `@kern_tcp_*` in LLVM (no module
+# mangling), which the linker matches against these declarations.
+#
+# Same mechanism precedented by B.5d's chan_* codegen fork — see
+# `cg_intrinsic_conc_channel.qz` and commit `8bbb4e96`. B.5d went the
+# codegen-rewrite route for high-frequency channel intrinsics; the
+# `extern "C"` route fits tcp_* better because there's no need to
+# specialize per call-site.
+
+@cfg(os: "unknown")
+extern "C" def kern_tcp_listen(port: Int): Int
+
+@cfg(os: "unknown")
+extern "C" def kern_tcp_close_listener(slot_ptr: Int): Int
+
+@cfg(os: "unknown")
+extern "C" def kern_tcp_accept(listener_slot_ptr: Int): Int
+
+@cfg(os: "unknown")
+extern "C" def kern_tcp_read(slot: Int, buf: Int, max_bytes: Int): Int
+
+@cfg(os: "unknown")
+extern "C" def kern_tcp_write(slot: Int, buf: Int, len: Int): Int
+
+@cfg(os: "unknown")
+extern "C" def kern_tcp_close(slot: Int): Int
+
+@cfg(os: "unknown")
+extern "C" def kern_tcp_try_accept(listener_slot_ptr: Int): Int
+
+@cfg(os: "unknown")
+extern "C" def kern_tcp_acceptable_register_waker(listener_slot_ptr: Int, frame: Int): Void
+
+@cfg(os: "unknown")
+extern "C" def kern_tcp_acceptable_unregister_waker(listener_slot_ptr: Int, frame: Int): Void
+
+# =============================================================================
+# Internal helpers for raw memory writes (avoid cross-module struct codegen bug)
+# =============================================================================
+
+def _tcp_write_i32(ptr: Int, val: Int): Void
+  ptr_write_byte(ptr, val & 255)
+  ptr_write_byte(ptr_add(ptr, 1), (val >> 8) & 255)
+  ptr_write_byte(ptr_add(ptr, 2), (val >> 16) & 255)
+  ptr_write_byte(ptr_add(ptr, 3), (val >> 24) & 255)
+end
+
+def _tcp_write_i64(ptr: Int, val: Int): Void
+  _tcp_write_i32(ptr, val & 4294967295)
+  _tcp_write_i32(ptr_add(ptr, 4), (val >> 32) & 4294967295)
+end
+
+# Write the sockaddr_in family field (bytes 0-1). This is the ONLY part of the
+# struct whose layout differs across our hosted targets:
+#   * Linux: sin_family is a 2-byte uint16_t at offset 0 (no sin_len). AF_INET
+#     in host (little-endian) order is the bytes [2, 0].
+#   * macOS/BSD (and the freestanding unikernel, which mirrors the BSD shape):
+#     1-byte sin_len at offset 0 then 1-byte sin_family → [16, 2].
+# sin_port@2 and sin_addr@4 are identical on both, so only this differs.
+@cfg(os: "linux")
+def _tcp_write_sa_family(sa: Int): Void
+  ptr_write_byte(sa, 2)                # sin_family low byte (AF_INET = 2)
+  ptr_write_byte(ptr_add(sa, 1), 0)    # sin_family high byte
+end
+
+@cfg(not: os: "linux")
+def _tcp_write_sa_family(sa: Int): Void
+  ptr_write_byte(sa, 16)               # sin_len = 16 (BSD only)
+  ptr_write_byte(ptr_add(sa, 1), 2)    # sin_family = AF_INET (2)
+end
+
+# Build a raw sockaddr_in struct in allocated memory (16 bytes).
+# port: host byte order — written directly as big-endian (network byte order).
+#   Do NOT pass htons(port) — this function handles byte ordering.
+# Returns: pointer to allocated struct (caller must qz_free)
+def _tcp_make_sockaddr(port: Int, addr_network: Int): Int
+  var sa = mem_alloc(16)
+  memset(sa, 0, 16)
+  _tcp_write_sa_family(sa)                      # bytes 0-1, platform-specific
+  ptr_write_byte(ptr_add(sa, 2), (port >> 8) & 255)  # sin_port high byte (big-endian)
+  ptr_write_byte(ptr_add(sa, 3), port & 255)          # sin_port low byte
+  _tcp_write_i32(ptr_add(sa, 4), addr_network) # sin_addr (already in network order)
+  return sa
+end
+
+# Read the port from a raw sockaddr_in (in network byte order → host byte order)
+def _tcp_read_sockaddr_port(sa: Int): Int
+  var high = ptr_read_byte(ptr_add(sa, 2))
+  var low = ptr_read_byte(ptr_add(sa, 3))
+  return (high << 8) + low
+end
+
+# Write an IP address into sockaddr_in's sin_addr field (offset 4)
+def _tcp_write_sockaddr_addr(sa: Int, addr: Int): Void
+  ptr_write_byte(ptr_add(sa, 4), addr & 255)
+  ptr_write_byte(ptr_add(sa, 5), (addr >> 8) & 255)
+  ptr_write_byte(ptr_add(sa, 6), (addr >> 16) & 255)
+  ptr_write_byte(ptr_add(sa, 7), (addr >> 24) & 255)
+end
+
+# =============================================================================
+# Error Types
+# =============================================================================
+
+# TcpError - Error information for TCP operations
+struct TcpError
+  message: String
+  code: Int        # errno value
+end
+
+# Construct a TcpError
+def tcp_error(msg: String, code: Int): TcpError
+  return TcpError { message: msg, code: code }
+end
+
+# =============================================================================
+# Result Type
+# =============================================================================
+
+# TcpResult - Result type for TCP operations
+enum TcpResult
+  Ok(value: TcpStream)
+  Err(error: TcpError)
+end
+
+# Result type for read operations (returns bytes)
+enum ReadResult
+  Ok(data: String)
+  Err(error: TcpError)
+end
+
+# Result type for write operations (returns bytes written)
+enum WriteResult
+  Ok(bytes: Int)
+  Err(error: TcpError)
+end
+
+# Result type for accept operations
+enum AcceptResult
+  Ok(client: TcpStream)
+  Err(error: TcpError)
+end
+
+# Result type for listen operations
+enum ListenResult
+  Ok(listener: TcpListener)
+  Err(error: TcpError)
+end
+
+# =============================================================================
+# TcpStream - A connected TCP socket
+# =============================================================================
+
+struct TcpStream
+  fd: Int           # File descriptor
+  host: String      # Remote host (for debugging)
+  port: Int         # Remote port
+  connected: Int    # 1 if connected, 0 if closed
+end
+
+# Create a TcpStream from a file descriptor
+def tcp_stream(fd: Int, host: String, port: Int): TcpStream
+  return TcpStream { fd: fd, host: host, port: port, connected: 1 }
+end
+
+# =============================================================================
+# TcpListener - A TCP server socket
+# =============================================================================
+
+struct TcpListener
+  fd: Int           # Listening socket fd (field 0 — matches TcpStream.fd)
+  _host: String     # Padding (field 1 — matches TcpStream.host index)
+  port: Int         # Port we're listening on (field 2 — matches TcpStream.port index)
+  active: Int       # 1 if listening, 0 if closed (field 3)
+end
+# NOTE: _host padding required to work around cross-module field index bug.
+# The compiler uses a global field-name→index map; without this padding,
+# .port resolves to TcpStream's index (2) instead of TcpListener's (1).
+
+# Create a TcpListener from a file descriptor and port
+def tcp_listener(fd: Int, port: Int): TcpListener
+  return TcpListener { fd: fd, _host: "", port: port, active: 1 }
+end
+
+# Workaround for [[feedback-listener-port-cross-struct-field-index]]:
+# direct `listener.port` in a `match Ok(listener) =>` arm misresolves to
+# slot 0 when another in-scope struct (e.g. HttpServerConfig) also has a
+# `port` field at a different slot — the global field-name→index map
+# picks the wrong struct's index. Extracting via a function whose only
+# Listener-ish parameter is `l` localizes the resolution so the field
+# index is correct. Same workaround pattern as [[feedback-resolver-dedup-phase2c-limitations]].
+def tcp_listener_port(l: TcpListener): Int = l.port
+
+# =============================================================================
+# Client API - Tcp.connect()
+# =============================================================================
+
+# Tcp namespace for static methods
+struct Tcp
+  _placeholder: Int  # Be requires at least one field
+end
+
+# Resolve hostname to IPv4 address (network byte order)
+# Returns: IP address as Int (u32 in lower 32 bits), or 0 on failure
+# Handles both hostnames (e.g. "example.com") and literal IPs (e.g. "127.0.0.1")
+#
+# Cross-platform. The hints struct layout (4+4+4+4 leading i32 fields) and
+# the result-struct offsets we read (ai_addr at offset 32; sin_addr in
+# sockaddr_in at offset 4) happen to coincide across:
+#   - macOS:   ai_flags+family+socktype+protocol(i32×4) + ai_addrlen(u32+4-pad)
+#              + ai_canonname(ptr) at 24 + ai_addr(ptr) at 32 + ai_next at 40
+#   - Linux:   same lead, ai_addr at 32 (canonname<->addr order is swapped
+#              but the addr offset stays the same in this hand-laid layout)
+#   - Windows: ADDRINFOA — same lead, ai_addrlen is size_t (8 bytes — no
+#              pad because we're already 16-byte aligned), ai_canonname at
+#              24, ai_addr at 32 (matches!), ai_next at 40
+# Total struct size is 48 bytes on all three. The getaddrinfo extern in
+# std/ffi/socket.qz is declared un-tagged because it lives in ws2_32 on
+# Windows with the same signature as glibc / libsystem on POSIX.
+def resolve_host(hostname: String): Int
+  # Build hints struct: zero-filled, set ai_family=AF_INET, ai_socktype=SOCK_STREAM
+  # macOS addrinfo layout (48 bytes):
+  #   flags(0) family(4) socktype(8) protocol(12) addrlen(16) [pad](20)
+  #   canonname(24) addr(32) next(40)
+  hints = malloc(48)
+  memset(hints, 0, 48)
+  # ai_family = AF_INET (2) at offset 4
+  ptr_write_byte(ptr_add(hints, 4), 2)
+  # ai_socktype = SOCK_STREAM (1) at offset 8
+  ptr_write_byte(ptr_add(hints, 8), 1)
+
+  # Allocate space for result pointer (8 bytes for struct addrinfo*)
+  res_ptr = malloc(8)
+  memset(res_ptr, 0, 8)
+
+  # Call getaddrinfo(hostname, NULL, &hints, &res)
+  host_cstr = string_to_cstr(hostname)
+  null_ptr = int_to_cptr(0)
+  status = getaddrinfo(host_cstr, null_ptr, hints, res_ptr)
+  mem_free(hints)
+
+  if status != 0
+    mem_free(res_ptr)
+    return 0
+  end
+
+  # Read the result pointer (struct addrinfo*)
+  result = ptr_read<Int>(res_ptr)
+  mem_free(res_ptr)
+
+  if result == 0
+    return 0
+  end
+
+  # Read ai_addr from addrinfo at offset 32 (struct sockaddr*)
+  result_cptr = int_to_cptr(result)
+  ai_addr = ptr_read<Int>(ptr_add(result_cptr, 32))
+
+  if ai_addr == 0
+    freeaddrinfo(result_cptr)
+    return 0
+  end
+
+  # Read sin_addr from sockaddr_in at offset 4
+  # macOS sockaddr_in: sin_len(1) + sin_family(1) + sin_port(2) = 4 bytes before sin_addr
+  ai_addr_cptr = int_to_cptr(ai_addr)
+  b0 = ptr_read_byte(ptr_add(ai_addr_cptr, 4))
+  b1 = ptr_read_byte(ptr_add(ai_addr_cptr, 5))
+  b2 = ptr_read_byte(ptr_add(ai_addr_cptr, 6))
+  b3 = ptr_read_byte(ptr_add(ai_addr_cptr, 7))
+  ip_addr = b0 + (b1 << 8) + (b2 << 16) + (b3 << 24)
+
+  freeaddrinfo(result_cptr)
+  ip_addr
+end
+
+# Connect to a remote host:port
+# Returns: TcpResult with connected stream or error
+#
+# Cross-platform: on Windows the initial socket_init_once() lazily fires
+# WSAStartup; all other primitive calls (socket / connect / inet_pton /
+# socket_close) resolve via @cfg-gated externs in std/ffi/socket.qz to
+# the appropriate POSIX or ws2_32 implementation. resolve_host() is
+# POSIX-only (the addrinfo struct layout differs on Windows); on Windows
+# the inet_pton fallback path is the only one taken.
+def tcp_connect(host: String, port: Int): TcpResult
+  socket_init_once()
+
+  # Create socket
+  fd = socket(AF_INET(), SOCK_STREAM(), 0)
+  if fd < 0
+    return TcpResult::Err(tcp_error("Failed to create socket", fd))
+  end
+
+  # Build sockaddr_in using raw memory (avoids cross-module struct codegen bug)
+  var sa = _tcp_make_sockaddr(port, 0)
+
+  # Resolve hostname via DNS (also handles literal IPs)
+  resolved = _tcp_resolve_host_or_zero(host)
+  if resolved != 0
+    _tcp_write_sockaddr_addr(sa, resolved)
+  else
+    # Fallback: try inet_pton for literal IP strings
+    host_cstr = string_to_cstr(host)
+    pton_result = inet_pton(AF_INET(), host_cstr, ptr_add(sa, 4))
+    if pton_result <= 0
+      qz_free(sa)
+      socket_close(fd)
+      return TcpResult::Err(tcp_error("Invalid address", pton_result))
+    end
+  end
+
+  # Connect
+  conn_result = connect(fd, sa, 16)
+  qz_free(sa)
+  if conn_result < 0
+    socket_close(fd)
+    return TcpResult::Err(tcp_error("Connection failed", conn_result))
+  end
+
+  TcpResult::Ok(tcp_stream(fd, host, port))
+end
+
+# Internal helper kept for narrative consistency with how tcp_connect uses
+# it; resolve_host is now cross-platform (see the layout comment on its
+# definition) so this is a straight passthrough on every target. Left as
+# a separate helper in case a target ever needs to opt out without
+# touching tcp_connect.
+def _tcp_resolve_host_or_zero(host: String): Int = resolve_host(host)
+
+# Connect to a remote host:port with a timeout in milliseconds.
+# Uses non-blocking connect + single-fd poll for timeout enforcement.
+#
+# Cross-platform via the socket_* helpers in std/ffi/socket.qz:
+#   - socket_set_nonblock / socket_set_blocking: fcntl(F_SETFL,O_NONBLOCK)
+#     on POSIX, ioctlsocket(FIONBIO,&one|zero) on Windows.
+#   - socket_wait_one: poll() with POSIX pollfd (8 bytes) vs WSAPoll with
+#     WSAPOLLFD (16 bytes, SOCKET fd at offset 0, events at 8).
+#   - socket_last_error: errno on POSIX, WSAGetLastError on Windows.
+#   - POLLOUT(): platform-correct value (4 on POSIX, 0x10 on Windows).
+#
+# Non-blocking connect's "in progress" signal is also platform-specific:
+# POSIX returns EINPROGRESS; Windows returns WSAEWOULDBLOCK. The
+# EWOULDBLOCK alias points at WSAEWOULDBLOCK on Windows so we can match
+# either acceptable code with one comparison vector.
+def tcp_connect_timeout(host: String, port: Int, timeout_ms: Int): TcpResult
+  socket_init_once()
+
+  # Create socket
+  fd = socket(AF_INET(), SOCK_STREAM(), 0)
+  if fd < 0
+    return TcpResult::Err(tcp_error("Failed to create socket", fd))
+  end
+
+  # Build sockaddr_in using raw memory
+  var sa = _tcp_make_sockaddr(port, 0)
+
+  # Resolve hostname
+  resolved = resolve_host(host)
+  if resolved != 0
+    _tcp_write_sockaddr_addr(sa, resolved)
+  else
+    host_cstr = string_to_cstr(host)
+    pton_result = inet_pton(AF_INET(), host_cstr, ptr_add(sa, 4))
+    if pton_result <= 0
+      qz_free(sa)
+      socket_close(fd)
+      return TcpResult::Err(tcp_error("Invalid address", pton_result))
+    end
+  end
+
+  # Flip to non-blocking for the timeout window.
+  socket_set_nonblock(fd)
+
+  # Non-blocking connect
+  conn_result = connect(fd, sa, 16)
+  qz_free(sa)
+
+  if conn_result == 0
+    # Immediate connection (unlikely but possible for localhost)
+    socket_set_blocking(fd)
+    return TcpResult::Ok(tcp_stream(fd, host, port))
+  end
+
+  # Expected "still connecting" codes:
+  #   POSIX:   EINPROGRESS (115 Linux, 36 macOS)
+  #   Windows: WSAEWOULDBLOCK (10035), aliased to EWOULDBLOCK on Windows
+  # Any other error is a real failure.
+  var err = socket_last_error()
+  if err != EINPROGRESS() and err != EWOULDBLOCK()
+    socket_close(fd)
+    return TcpResult::Err(tcp_error("Connection failed", err))
+  end
+
+  # Wait for connection with timeout. POLLOUT signals "writable" — for
+  # a connecting socket this means the connect attempt completed (either
+  # successfully or with an error to be retrieved via SO_ERROR).
+  var wait_result = socket_wait_one(fd, POLLOUT(), timeout_ms)
+
+  if wait_result == 0
+    # Timeout
+    socket_close(fd)
+    return TcpResult::Err(tcp_error("Connection timed out", 0))
+  end
+
+  if wait_result < 0
+    socket_close(fd)
+    return TcpResult::Err(tcp_error("Poll failed", socket_last_error()))
+  end
+
+  # Check for connection error via getsockopt(SO_ERROR). On both
+  # platforms, getsockopt fills a 4-byte int with the pending socket
+  # error (0 = success). SO_ERROR is 4 on POSIX, 0x1007 on Windows;
+  # the constant resolves per-platform via @cfg.
+  var so_error_buf = mem_alloc(4)
+  memset(so_error_buf, 0, 4)
+  var so_error_len_buf = mem_alloc(4)
+  _tcp_write_i32(so_error_len_buf, 4)
+  getsockopt(fd, SOL_SOCKET(), SO_ERROR(), so_error_buf, so_error_len_buf)
+  var so_error = ptr_read_byte(so_error_buf) + (ptr_read_byte(ptr_add(so_error_buf, 1)) << 8) + (ptr_read_byte(ptr_add(so_error_buf, 2)) << 16) + (ptr_read_byte(ptr_add(so_error_buf, 3)) << 24)
+  qz_free(so_error_buf)
+  qz_free(so_error_len_buf)
+  if so_error != 0
+    socket_close(fd)
+    return TcpResult::Err(tcp_error("Connection failed", so_error))
+  end
+
+  # Restore blocking mode so the returned stream behaves like a
+  # vanilla tcp_connect would.
+  socket_set_blocking(fd)
+
+  TcpResult::Ok(tcp_stream(fd, host, port))
+end
+
+# =============================================================================
+# Server API - Tcp.listen()
+# =============================================================================
+
+# Create a listening server socket
+# Returns: ListenResult with TcpListener or error
+@cfg(not: os: "unknown")
+def tcp_listen(port: Int): ListenResult
+  socket_init_once()
+
+  # Create socket
+  fd = socket(AF_INET(), SOCK_STREAM(), 0)
+  if fd < 0
+    return ListenResult::Err(tcp_error("Failed to create socket", fd))
+  end
+
+  # Enable address reuse (use raw memory for optval to avoid addr_of issues)
+  var optval_buf = mem_alloc(4)
+  _tcp_write_i32(optval_buf, 1)
+  setsockopt(fd, SOL_SOCKET(), SO_REUSEADDR(), optval_buf, 4)
+  qz_free(optval_buf)
+
+  # Bind to port using raw sockaddr_in
+  var sa = _tcp_make_sockaddr(port, 0)
+  bind_result = bind(fd, sa, 16)
+  qz_free(sa)
+  if bind_result < 0
+    socket_close(fd)
+    return ListenResult::Err(tcp_error("Bind failed", bind_result))
+  end
+
+  # Listen with backlog of 128
+  listen_result = listen(fd, 128)
+  if listen_result < 0
+    socket_close(fd)
+    return ListenResult::Err(tcp_error("Listen failed", listen_result))
+  end
+
+  # Get actual port (important for ephemeral port 0)
+  var actual_port = port
+  if port == 0
+    var local_sa = mem_alloc(16)
+    memset(local_sa, 0, 16)
+    var addr_len_buf = mem_alloc(4)
+    _tcp_write_i32(addr_len_buf, 16)
+    getsockname(fd, local_sa, addr_len_buf)
+    actual_port = _tcp_read_sockaddr_port(local_sa)
+    qz_free(local_sa)
+    qz_free(addr_len_buf)
+  end
+
+  ListenResult::Ok(tcp_listener(fd, actual_port))
+end
+
+# Freestanding (`@cfg(os: "unknown")`) body — D.11 Phase 8a step 2.
+# fd ≡ kernel listening-table slot ptr. Calls into the kernel-defined
+# `kern_tcp_listen` (`tools/baremetal/hello_x86.qz`) via extern "C"
+# declared below.
+@cfg(os: "unknown")
+def tcp_listen(port: Int): ListenResult
+  var slot = kern_tcp_listen(port)
+  if slot == 0
+    return ListenResult::Err(tcp_error("kern_tcp_listen: table full", 0))
+  end
+  return ListenResult::Ok(tcp_listener(slot, port))
+end
+
+# =============================================================================
+# Stream Operations
+# =============================================================================
+
+# Read up to `max_bytes` from the stream
+def tcp_read(stream: TcpStream, max_bytes: Int): ReadResult
+  if stream.connected == 0
+    return ReadResult::Err(tcp_error("Stream is closed", 0))
+  end
+
+  # Allocate buffer
+  buf = malloc(max_bytes + 1)
+  if buf == 0
+    return ReadResult::Err(tcp_error("Failed to allocate buffer", 0))
+  end
+
+  # Read from socket
+  bytes_read = socket_recv(stream.fd, buf, max_bytes, 0)
+  if bytes_read < 0
+    mem_free(buf)
+    return ReadResult::Err(tcp_error("Read failed", bytes_read))
+  end
+
+  # Null-terminate and convert to proper Quartz string (with length prefix)
+  memset(buf + bytes_read, 0, 1)
+  var data = cstr_to_string(buf)
+  mem_free(buf)
+
+  ReadResult::Ok(data)
+end
+
+# Write data to the stream
+def tcp_write(stream: TcpStream, data: String): WriteResult
+  if stream.connected == 0
+    return WriteResult::Err(tcp_error("Stream is closed", 0))
+  end
+
+  len = str_byte_len(data)
+  data_cstr = string_to_cstr(data)
+  bytes_sent = socket_send(stream.fd, data_cstr, len, 0)
+
+  if bytes_sent < 0
+    return WriteResult::Err(tcp_error("Write failed", bytes_sent))
+  end
+
+  WriteResult::Ok(bytes_sent)
+end
+
+# =============================================================================
+# Non-blocking I/O wrappers
+# =============================================================================
+
+# Set a TcpStream to non-blocking mode.
+# After this, tcp_read_nb / tcp_write_nb return -1 with errno=EAGAIN
+# (or WSAEWOULDBLOCK on Windows — `socket_last_error()` returns the
+# platform-appropriate value) instead of blocking when no data is
+# available. socket_set_nonblock branches on @cfg internally — POSIX
+# fcntl(F_SETFL, O_NONBLOCK) vs Windows ioctlsocket(FIONBIO, &one).
+def tcp_set_nonblocking(stream: TcpStream): Int
+  return socket::socket_set_nonblock(stream.fd)
+end
+
+# Non-blocking read. Returns bytes read, 0 on EOF, or -1 on would-block/error.
+# Check get_errno() == EAGAIN() to distinguish would-block from real errors.
+def tcp_read_nb(stream: TcpStream, buf: Int, max_bytes: Int): Int
+  return socket::socket_recv(stream.fd, buf, max_bytes, 0)
+end
+
+# Non-blocking write. Returns bytes written, or -1 on would-block/error.
+# Check get_errno() == EAGAIN() to distinguish would-block from real errors.
+def tcp_write_nb(stream: TcpStream, buf: Int, len: Int): Int
+  return socket::socket_send(stream.fd, buf, len, 0)
+end
+
+# =============================================================================
+# Async I/O wrappers (uses io_suspend for EventedIo-driven execution)
+# =============================================================================
+
+## Async non-blocking TCP read. Suspends via io_suspend when EAGAIN /
+## WSAEWOULDBLOCK. For use in functions called via `async` and driven by
+## the scheduler. fd must already be in non-blocking mode (via
+## tcp_set_nonblocking).
+##
+## Cross-platform. socket_recv branches POSIX recvfrom vs Windows recv;
+## socket_last_error branches errno vs WSAGetLastError; EAGAIN() resolves
+## per-platform (POSIX errno values vs Windows WSAEWOULDBLOCK=10035 via
+## the alias added to std/ffi/socket.qz). io_suspend(fd) integrates with
+## the scheduler park/wake substrate — kqueue on macOS, epoll on Linux,
+## AFD.SYS on Windows (Phase 5e); only works inside an async $poll
+## context (i.e., called from a go fn()), per its codegen contract.
+##
+## D.11 Phase 8a step 4: split into hosted (POSIX/Windows io_suspend) and
+## freestanding (kernel kern_tcp_read drain of payload-rx ring) branches.
+## The pre-step-4 gate was `@cfg(not: os: "wasi")`; the swap to
+## `@cfg(not: os: "unknown")` is equivalent for the three live hosted
+## targets (macos/linux/windows) and lets the freestanding branch below
+## win on `--target x86_64-unknown-none-elf`.
+@cfg(not: os: "unknown")
+def async_tcp_read(fd: Int, buf: Int, max_bytes: Int): Int
+  while true
+    var n = socket::socket_recv(fd, buf, max_bytes, 0)
+    if n >= 0
+      return n
+    end
+    if socket::socket_last_error() == socket::EAGAIN()
+      io_suspend(fd)
+    else
+      return -1
+    end
+  end
+  return -1
+end
+
+## Freestanding (`@cfg(os: "unknown")`) body — D.11 Phase 8a step 4.
+## fd is the kernel conn slot ptr. Delegates to kern_tcp_read which
+## blocks via chan_recv on the slot's payload-rx signal channel and
+## drains payload bytes from the slot's ring. Returns bytes read, 0 on
+## EOF (peer closed), -1 on bad slot.
+@cfg(os: "unknown")
+def async_tcp_read(fd: Int, buf: Int, max_bytes: Int): Int
+  return kern_tcp_read(fd, buf, max_bytes)
+end
+
+## Async non-blocking TCP write. Suspends via io_suspend when EAGAIN /
+## WSAEWOULDBLOCK. fd must already be in non-blocking mode.
+## Cross-platform — same substrate as async_tcp_read.
+@cfg(not: os: "unknown")
+def async_tcp_write(fd: Int, buf: Int, len: Int): Int
+  while true
+    var n = socket::socket_send(fd, buf, len, 0)
+    if n >= 0
+      return n
+    end
+    if socket::socket_last_error() == socket::EAGAIN()
+      io_suspend(fd)
+    else
+      return -1
+    end
+  end
+  return -1
+end
+
+## Freestanding (`@cfg(os: "unknown")`) body — D.11 Phase 8a step 4.
+## fd is the kernel conn slot ptr. Delegates to kern_tcp_write which
+## piggybacks on the kernel's existing tcp_try_push chunker + RTO
+## machinery, blocks on the slot's tx-done signal channel until all
+## bytes have been ACKed by the peer. Returns `len` on success, 0 on
+## connection close during write, -1 on bad slot.
+@cfg(os: "unknown")
+def async_tcp_write(fd: Int, buf: Int, len: Int): Int
+  return kern_tcp_write(fd, buf, len)
+end
+
+## Async non-blocking TCP accept. Suspends via io_suspend when EAGAIN /
+## WSAEWOULDBLOCK. listener fd must already be in non-blocking mode.
+## Cross-platform — same substrate as async_tcp_read.
+@cfg(not: os: "wasi")
+def async_tcp_accept(listener_fd: Int): Int
+  while true
+    var client_fd = socket::socket_accept(listener_fd, 0, 0)
+    if client_fd >= 0
+      return client_fd
+    end
+    if socket::socket_last_error() == socket::EAGAIN()
+      io_suspend(listener_fd)
+    else
+      return -1
+    end
+  end
+  return -1
+end
+
+# Close the stream
+@cfg(not: os: "unknown")
+def tcp_close(stream: TcpStream): Int
+  if stream.connected
+    shutdown(stream.fd, SHUT_RDWR())
+    socket_close(stream.fd)
+    # Note: Be doesn't have mutability on structs yet
+    # stream.connected = 0
+  end
+  0
+end
+
+# Freestanding (`@cfg(os: "unknown")`) body — D.11 Phase 8a step 4.
+# stream.fd is the kernel conn slot ptr. Delegates to kern_tcp_close
+# which sends FIN + transitions state to FIN_SENT; the kernel TCP
+# state machine finishes the four-way close on subsequent peer ACKs.
+@cfg(os: "unknown")
+def tcp_close(stream: TcpStream): Int
+  return kern_tcp_close(stream.fd)
+end
+
+# Accept a connection on a listening socket
+@cfg(not: os: "unknown")
+def tcp_accept(listener: TcpListener): AcceptResult
+  client_fd = socket_accept(listener.fd, 0, 0)
+  if client_fd < 0
+    return AcceptResult::Err(tcp_error("Accept failed", client_fd))
+  end
+
+  AcceptResult::Ok(tcp_stream(client_fd, "client", 0))
+end
+
+# Freestanding (`@cfg(os: "unknown")`) body — D.11 Phase 8a step 3.
+# Blocks the calling goroutine on the listener's kernel accept channel
+# (allocated in kern_tcp_listen). Returns when tcp_accept_syn pushes a
+# new conn slot onto the channel, or 0 if the listener was closed.
+# The returned `client_fd` is the kernel conn slot ptr — same fd ≡
+# slot ptr convention this whole bridge layer uses.
+@cfg(os: "unknown")
+def tcp_accept(listener: TcpListener): AcceptResult
+  var client_fd = kern_tcp_accept(listener.fd)
+  if client_fd == 0
+    return AcceptResult::Err(tcp_error("Listener closed", 0))
+  end
+  return AcceptResult::Ok(tcp_stream(client_fd, "client", 0))
+end
+
+# Close a listening socket
+@cfg(not: os: "unknown")
+def tcp_close_listener(listener: TcpListener): Int
+  if listener.active
+    socket_close(listener.fd)
+  end
+  0
+end
+
+# Freestanding (`@cfg(os: "unknown")`) body — D.11 Phase 8a step 2.
+# listener.fd is the kernel listening-table slot ptr returned by
+# kern_tcp_listen. Idempotent on already-closed slots.
+@cfg(os: "unknown")
+def tcp_close_listener(listener: TcpListener): Int
+  return kern_tcp_close_listener(listener.fd)
+end
+
+# =============================================================================
+# Convenience Functions
+# =============================================================================
+
+# Check if stream is connected
+def tcp_is_connected(stream: TcpStream): Bool = stream.connected
+
+# Get the file descriptor (for advanced usage)
+def tcp_fd(stream: TcpStream): Int = stream.fd
+
+# Set read/recv timeout in milliseconds
+# Uses raw memory for timeval struct (avoids cross-module struct codegen issue)
+# macOS timeval: { time_t tv_sec (8 bytes), suseconds_t tv_usec (4 bytes) } = 16 bytes
+def tcp_set_timeout(stream: TcpStream, timeout_ms: Int): Int
+  var tv = mem_alloc(16)
+  _tcp_write_i64(tv, timeout_ms / 1000)
+  _tcp_write_i64(ptr_add(tv, 8), (timeout_ms % 1000) * 1000)
+  var result = setsockopt(stream.fd, SOL_SOCKET(), SO_RCVTIMEO(), tv, 16)
+  qz_free(tv)
+  return result
+end
+
+# Set send timeout in milliseconds
+def tcp_set_send_timeout(stream: TcpStream, timeout_ms: Int): Int
+  var tv = mem_alloc(16)
+  _tcp_write_i64(tv, timeout_ms / 1000)
+  _tcp_write_i64(ptr_add(tv, 8), (timeout_ms % 1000) * 1000)
+  var result = setsockopt(stream.fd, SOL_SOCKET(), SO_SNDTIMEO(), tv, 16)
+  qz_free(tv)
+  return result
+end
+
+# Disable Nagle's algorithm (send data immediately)
+def tcp_set_nodelay(stream: TcpStream): Int
+  var opt_buf = mem_alloc(4)
+  _tcp_write_i32(opt_buf, 1)
+  var result = setsockopt(stream.fd, IPPROTO_TCP(), TCP_NODELAY(), opt_buf, 4)
+  qz_free(opt_buf)
+  return result
+end
+
+# Write all bytes, looping on partial sends
+def tcp_write_all(stream: TcpStream, data: String): WriteResult
+  if stream.connected == 0
+    return WriteResult::Err(tcp_error("Stream is closed", 0))
+  end
+
+  var total = str_byte_len(data)
+  data_cstr = string_to_cstr(data)
+  var sent = 0
+  while sent < total
+    var n = socket_send(stream.fd, ptr_add(data_cstr, sent), total - sent, 0)
+    if n < 0
+      return WriteResult::Err(tcp_error("Write failed", n))
+    end
+    sent += n
+  end
+  WriteResult::Ok(sent)
+end
+
+# Read until newline or max_bytes reached
+def tcp_read_line(stream: TcpStream, max_bytes: Int): ReadResult
+  if stream.connected == 0
+    return ReadResult::Err(tcp_error("Stream is closed", 0))
+  end
+
+  var buf = malloc(max_bytes + 1)
+  if buf == 0
+    return ReadResult::Err(tcp_error("Failed to allocate buffer", 0))
+  end
+
+  var pos = 0
+  while pos < max_bytes
+    var one_buf = malloc(1)
+    var n = socket_recv(stream.fd, one_buf, 1, 0)
+    if n <= 0
+      mem_free(one_buf)
+      if pos == 0
+        mem_free(buf)
+        if n == 0
+          return ReadResult::Err(tcp_error("Connection closed", 0))
+        end
+        return ReadResult::Err(tcp_error("Read failed", n))
+      end
+      # Return what we have
+      memset(ptr_add(buf, pos), 0, 1)
+      var data = cstr_to_string(buf)
+      mem_free(buf)
+      mem_free(one_buf)
+      return ReadResult::Ok(data)
+    end
+    var ch = ptr_read_byte(one_buf)
+    ptr_write_byte(ptr_add(buf, pos), ch)
+    pos += 1
+    mem_free(one_buf)
+    if ch == '\n'
+      # Found newline
+      memset(ptr_add(buf, pos), 0, 1)
+      var data = cstr_to_string(buf)
+      mem_free(buf)
+      return ReadResult::Ok(data)
+    end
+  end
+  memset(ptr_add(buf, pos), 0, 1)
+  var data = cstr_to_string(buf)
+  mem_free(buf)
+  ReadResult::Ok(data)
+end
+
+# =============================================================================
+# Concurrent TCP Server — M:N Scheduler Integration
+# =============================================================================
+
+# Concurrent TCP server using the M:N scheduler.
+# Each accepted connection spawns a lightweight task running the handler.
+# The handler receives the client fd and can use async_tcp_read/async_tcp_write
+# for event-driven I/O (they call io_suspend internally).
+#
+# Example - echo server:
+#   tcp_serve(9000) do client_fd ->
+#     var buf = alloc(1024)
+#     var n = async_tcp_read(client_fd, buf, 1024)
+#     while n > 0
+#       async_tcp_write(client_fd, buf, n)
+#       n = async_tcp_read(client_fd, buf, 1024)
+#     end
+#     free(buf)
+#     close(client_fd)
+#     return 0
+#   end
+@cfg(not: os: "wasi")
+def tcp_serve(port: Int, handler: Fn(Int): Int): Int
+  sched_init(0)
+  match tcp_listen(port)
+    Err(e) => {
+      puts("tcp_serve: #{e.message}")
+      return 1
+    }
+    Ok(listener) => {
+      puts("Listening on port #{listener.port}")
+      # Blocking accept loop — main thread only accepts.
+      # Worker threads handle all I/O via the scheduler — kqueue (macOS),
+      # epoll (Linux), AFD.SYS (Windows Phase 5e). socket_set_nonblock
+      # branches POSIX fcntl(F_SETFL, O_NONBLOCK) vs Windows
+      # ioctlsocket(FIONBIO).
+      while true
+        var client_fd = socket::socket_accept(listener.fd, 0, 0)
+        if client_fd >= 0
+          # Set non-blocking so async_tcp_read/write use io_suspend
+          socket::socket_set_nonblock(client_fd)
+          var task = async handler(client_fd)
+          sched_spawn(task)
+        end
+      end
+      socket::socket_close(listener.fd)
+    }
+  end
+  sched_shutdown()
+  return 0
+end
+
+# ============================================================================
+# B.8 Phase 5 — Scoped wrappers for TcpStream + TcpListener
+# ============================================================================
+#
+# `with tcp_stream_scoped(s) do fd -> body end` and
+# `with tcp_listener_scoped(l) do fd -> body end` wrap an existing connection
+# / listener for close-on-scope-exit (normal AND throw-unwind via Phase 4b).
+# The bound value is the underlying fd; callers can use the raw fd
+# intrinsics (read, write, accept, etc.) inside the body, or reconstruct
+# the struct via `tcp_stream(fd, host, port)` if they need the high-level
+# accessors.
+#
+# Asymmetry note: release and release_on_throw both call the corresponding
+# tcp_close*. The handoff envisioned a "shutdown-vs-close" distinction
+# (graceful FIN on normal exit, RST on throw via SO_LINGER=0), but no
+# `tcp_set_so_linger` intrinsic is exposed and the current `tcp_close`
+# already does shutdown(SHUT_RDWR) + close on a connected stream. Apps
+# that want abortive close on throw can wrap a custom guard whose
+# release_on_throw issues setsockopt(SO_LINGER, {1, 0}) before close.
+
+## A scoped TcpStream guard. Wraps an already-opened stream so it is
+## closed (shutdown + close) when the surrounding `with`-block exits.
+struct TcpStreamGuard
+  stream: TcpStream
+end
+
+extend TcpStreamGuard with Scoped
+  ## Returns the stream's fd as the bound value. Body code can either
+  ## use raw fd intrinsics or reconstruct via `tcp_stream(fd, host, port)`.
+  def acquire(self): Int = @stream.fd
+
+  ## Close on normal exit. Delegates to `tcp_close(stream)` which does
+  ## `shutdown(SHUT_RDWR) + close`.
+  def release(self, value: Int): Void
+    var ignore = tcp_close(@stream)
+  end
+
+  ## Close on throw-unwind. Same as release for now; a future "abortive
+  ## close" variant could override here once SO_LINGER is exposed.
+  def release_on_throw(self, value: Int, exc_msg: String): Void
+    var ignore = tcp_close(@stream)
+  end
+end
+
+## Construct a scoped wrapper for an already-opened TcpStream. Construction
+## is free; the actual close fires from the guard's release on block exit.
+def tcp_stream_scoped(stream: TcpStream): TcpStreamGuard
+  return TcpStreamGuard { stream: stream }
+end
+
+## A scoped TcpListener guard. Wraps an already-listening listener so it
+## is closed when the surrounding `with`-block exits.
+struct TcpListenerGuard
+  listener: TcpListener
+end
+
+extend TcpListenerGuard with Scoped
+  ## Returns the listener's fd as the bound value.
+  def acquire(self): Int = @listener.fd
+
+  ## Close the listening socket on normal exit.
+  def release(self, value: Int): Void
+    var ignore = tcp_close_listener(@listener)
+  end
+
+  ## Close the listening socket on throw-unwind. Same as release.
+  def release_on_throw(self, value: Int, exc_msg: String): Void
+    var ignore = tcp_close_listener(@listener)
+  end
+end
+
+## Construct a scoped wrapper for an already-listening TcpListener.
+def tcp_listener_scoped(listener: TcpListener): TcpListenerGuard
+  return TcpListenerGuard { listener: listener }
+end
+
+# =============================================================================
+# Non-blocking I/O for TcpListener
+# =============================================================================
+
+## Set a TcpListener to non-blocking mode. Pairs with `tcp_set_nonblocking`
+## for TcpStream. After this, `socket_accept(listener.fd, 0, 0)` returns
+## -1 with `socket::socket_last_error() == socket::EAGAIN()` when the
+## accept queue is empty instead of blocking the calling thread. Required
+## before composing a listener inside a `select` block via
+## `tcp_acceptable` — the Selectable expects non-blocking semantics so
+## try_poll never blocks the select runtime.
+@cfg(not: os: "unknown")
+def tcp_listener_set_nonblocking(listener: TcpListener): Int
+  return socket::socket_set_nonblock(listener.fd)
+end
+
+## Freestanding (`@cfg(os: "unknown")`) body — D.11 Phase 8a step 5.
+## Kernel TCP is always non-blocking: there is no underlying socket fd
+## with O_NONBLOCK to set, only a slot ptr whose accept_chan is
+## peeked/popped without parking the caller (chan_count + chan_recv in
+## kern_tcp_try_accept). Returns 0 — the call is a structural no-op
+## that lets cross-target callers compile under the same shape.
+@cfg(os: "unknown")
+def tcp_listener_set_nonblocking(listener: TcpListener): Int
+  return 0
+end
+
+# =============================================================================
+# TcpAcceptableSelectable — Selectable wrapper for TCP accept (D.11 Phase 2)
+# =============================================================================
+
+## A Selectable that observes "the listener has a pending connection in
+## the accept queue". Use as the right-hand side of a `case fd =
+## tcp_acceptable(listener_fd) => ...` arm in `select`. The bound value
+## `fd` is the accepted client fd; the caller owns it (typically wraps
+## in `tcp_stream(fd, "client", 0)` + `tcp_stream_scoped` for
+## scope-managed close).
+##
+## **The listener fd MUST already be in non-blocking mode** — call
+## `tcp_listener_set_nonblocking(listener)` (or
+## `socket::socket_set_nonblock(listener.fd)`) before constructing the
+## wrapper. In blocking mode, the first `try_poll` would block the
+## entire select runtime; the wrapper does no flag-setting itself.
+##
+## **v1 cancellation-safety caveat:** `try_poll` is destructive — it
+## calls `socket_accept` and pops the next pending connection off the
+## accept queue, stashing the client fd in the returned `Option<Int>`
+## payload. If two `tcp_acceptable` arms in the SAME select observe the
+## SAME listener, the loser's accept has already happened and the
+## client fd would be leaked (no abort path). For the common case of
+## one listener per arm this is fine. Same shape as `recvable(ch)` /
+## `sendable(ch, v)` — see `channel.qz` for the destructive-poll
+## discussion.
+##
+## **register_waker is a no-op stub (Phase-2 active-wake deferred).**
+## The scheduler does not yet expose an `io_register_waker(fd, frame)`
+## primitive — `io_suspend(fd)` is a blocking intrinsic, not a
+## fire-and-forget waker registration. So `register_waker` is a no-op
+## and select polls all arms at chunk cadence (~10ms typical). The
+## HTTP server accept-latency budget tolerates this easily (request
+## handling dominates wall time by orders of magnitude). Upgrade path:
+## when an `io_register_waker(fd, frame)` intrinsic lands, install it
+## here for sub-ms wake — same shape `SignalSelectable` Phase 5 stub
+## occupies. Tracked in the D.11 design memo bridge work.
+struct TcpAcceptableSelectable
+  listener_fd: Int
+end
+
+## Hosted try_poll body — destructive non-blocking accept via
+## socket_accept on a non-blocking fd. Phase 8a step 5 split this out
+## of the extend block so the freestanding @cfg branch can lower to
+## kern_tcp_try_accept against a kernel slot ptr instead.
+@cfg(not: os: "unknown")
+def _tcp_acceptable_try_poll(listener_fd: Int): Option<Int>
+  var client_fd = socket::socket_accept(listener_fd, 0, 0)
+  if client_fd >= 0
+    return option_some(client_fd)
+  end
+  return option_none()
+end
+
+## Freestanding try_poll body — D.11 Phase 8a step 5. listener_fd is the
+## kernel listening-table entry ptr; kern_tcp_try_accept does
+## chan_count(accept_chan) under CHAN_LOCK and only chan_recvs on a
+## hit. Returns 0 sentinel on empty queue (matches hosted EAGAIN
+## behavior).
+@cfg(os: "unknown")
+def _tcp_acceptable_try_poll(listener_fd: Int): Option<Int>
+  var slot = kern_tcp_try_accept(listener_fd)
+  if slot != 0
+    return option_some(slot)
+  end
+  return option_none()
+end
+
+## Hosted register_waker body — no-op stub. Active-wake on fd-readable
+## requires an `io_register_waker(fd, frame)` intrinsic that doesn't
+## exist yet (filed forward in the design memo). Select falls back to
+## chunked polling at ~10ms cadence, fine for HTTP accept-latency.
+@cfg(not: os: "unknown")
+def _tcp_acceptable_register_waker(listener_fd: Int, frame: Int): Void
+  return
+end
+
+## Freestanding register_waker body — D.11 Phase 8a step 5. Wires into
+## the K8.6 kernel_waiter side-table (B.5c) keyed on the listener's
+## accept_chan ptr. tcp_accept_syn's chan_send calls
+## kernel_waiter_wake_all(accept_chan) after enqueueing the new conn
+## slot — same wake path as KRecvable.register_waker. Sub-ms wake
+## latency, no polling fallback.
+@cfg(os: "unknown")
+def _tcp_acceptable_register_waker(listener_fd: Int, frame: Int): Void
+  kern_tcp_acceptable_register_waker(listener_fd, frame)
+end
+
+@cfg(not: os: "unknown")
+def _tcp_acceptable_unregister_waker(listener_fd: Int, frame: Int): Void
+  return
+end
+
+@cfg(os: "unknown")
+def _tcp_acceptable_unregister_waker(listener_fd: Int, frame: Int): Void
+  kern_tcp_acceptable_unregister_waker(listener_fd, frame)
+end
+
+extend TcpAcceptableSelectable with Selectable<Int>
+  ## try_poll: destructive non-blocking accept. Returns `Some(client_fd)`
+  ## if a connection was accepted, `None` on EAGAIN. The client fd
+  ## lives in the Option's payload; the select runtime extracts it and
+  ## binds to the `case fd = ...` pattern. See the v1 caveat on the
+  ## struct. Body forks per @cfg via _tcp_acceptable_try_poll.
+  def try_poll(self): Option<Int>
+    return _tcp_acceptable_try_poll(@listener_fd)
+  end
+
+  ## register_waker: hosted = no-op (chunked-poll fallback); freestanding
+  ## = wires into kernel_waiter side-table via the listener's accept
+  ## channel. See the per-@cfg helper bodies for the design.
+  def register_waker(self, frame: Int): Void
+    _tcp_acceptable_register_waker(@listener_fd, frame)
+  end
+
+  ## unregister_waker: paired teardown.
+  def unregister_waker(self, frame: Int): Void
+    _tcp_acceptable_unregister_waker(@listener_fd, frame)
+  end
+
+  ## complete: side-effect-only. The destructive accept already happened
+  ## in try_poll (v1 design). Returns 0 — the user's pattern binding is
+  ## set from try_poll's Option payload, not from complete's return.
+  ## See `mir_lower_expr_handlers.qz` op_kind=5 body block.
+  def complete(self): Int
+    return 0
+  end
+end
+
+## Wrap a listener fd as a Selectable for use inside `select`. Construction
+## is free; the listener is unaffected until the select runtime polls
+## the wrapper. The listener fd MUST be in non-blocking mode (see the
+## struct's doc comment).
+def tcp_acceptable(listener_fd: Int): TcpAcceptableSelectable
+  return TcpAcceptableSelectable { listener_fd: listener_fd }
+end

@@ -1,0 +1,244 @@
+## std/tui/widgets/toast.qz — timed self-dismissing overlay.
+##
+## A transient status pop-up. The widget itself is a value object;
+## lifecycle is parent-managed via `Cmd::After`:
+##
+##   on event:
+##     g.toast = toast_new("Played Defend", ToastLevel::Success)
+##     return (g, toast_show_cmd(g.toast, -> FrameMsg::App(ToastExpired)))
+##
+##   on FrameMsg::App(ToastExpired):
+##     g.toast_visible = false
+##
+## The `Cmd::After` returned by `toast_show_cmd` schedules a single
+## message after `ttl_ms` milliseconds; the parent reacts to that
+## message by clearing visibility. Multiple toasts in flight are
+## the parent's problem — pass a sequence number through the expire
+## message and ignore stale ones if last-write-wins isn't enough.
+##
+## Level → colour mapping (when auto_color is true, the default):
+##   Info    → plain
+##   Success → green + bold
+##   Warning → yellow + bold
+##   Error   → red + bold
+##
+## Render path is a composite: a level-derived icon (ℹ / ✓ / ⚠ / ✗
+## for Info / Success / Warning / Error) rendered with the level
+## colour + a space + the message body rendered with the body
+## style. Multi-line messages render the icon on the first line
+## only; subsequent lines start with two spaces of leading padding
+## so message text aligns with line one.
+##
+## @since 5.28.x
+
+import std/tui/runtime as tui
+import std/tui/layout as ly
+import std/tui/widgets/overlay as ov
+import style
+
+# ============================================================
+# Public types
+# ============================================================
+
+## Semantic class for the toast — drives both the colour (when
+## auto_color is on) and the consumer's interpretation of the
+## message.
+enum ToastLevel
+  Info
+  Success
+  Warning
+  Error
+end
+
+## Lifecycle event. Currently only Idle (no decision yet) and
+## Expired (ttl elapsed). Reserved for future lifecycle hooks.
+enum ToastEvent
+  Idle
+  Expired
+end
+
+## Per-slot Style values. The body slot is ignored when auto_color
+## is true (the default); the level-derived colour wins.
+struct ToastStyles
+  body: Style
+end
+
+## Default styles. Plain text — only relevant when the user toggles
+## auto_color off and supplies a custom body Style.
+def toast_styles_default(): ToastStyles
+  return ToastStyles {
+    body: Style.new()
+  }
+end
+
+## Toast widget value object. Immutable — every mutator returns a
+## new struct.
+##
+## `ttl_ms` defaults to 2500ms — long enough to read a short status
+## message, short enough not to clog the screen. Apps with longer
+## or denser content should override via `toast_with_ttl`.
+##
+## `position` defaults to POS_BOTTOM_RIGHT — out of the way of the
+## main view but visible. Override via `toast_with_position` for
+## centered alerts (POS_CENTER) or top-stacked (POS_TOP_RIGHT).
+##
+## When `auto_color` is true, the body Style is computed from the
+## level at render time (see `toast_level_color`) and `styles.body`
+## is ignored.
+struct Toast
+  message:    String
+  level:      ToastLevel
+  ttl_ms:     Int
+  position:   Int                # POS_*
+  auto_color: Bool
+  styles:     ToastStyles
+end
+
+# ============================================================
+# Constructors + builders
+# ============================================================
+
+## Build a new Toast with default ttl (2500ms), bottom-right
+## position, and auto-colour on.
+def toast_new(message: String, level: ToastLevel): Toast
+  return Toast {
+    message:    message,
+    level:      level,
+    ttl_ms:     2500,
+    position:   ov::POS_BOTTOM_RIGHT(),
+    auto_color: true,
+    styles:     toast_styles_default()
+  }
+end
+
+## Replace the time-to-live in milliseconds. Negative or zero
+## values produce an immediately-expired toast (the After thunk
+## still runs but the runtime sleeps for ~0ms first).
+def toast_with_ttl(t: Toast, ttl_ms: Int): Toast
+  return Toast {
+    message: t.message, level: t.level, ttl_ms: ttl_ms,
+    position: t.position, auto_color: t.auto_color, styles: t.styles
+  }
+end
+
+## Replace the overlay anchor (POS_* from std/tui/widgets/overlay).
+def toast_with_position(t: Toast, position: Int): Toast
+  return Toast {
+    message: t.message, level: t.level, ttl_ms: t.ttl_ms,
+    position: position, auto_color: t.auto_color, styles: t.styles
+  }
+end
+
+## Replace the styles wholesale. Leaves auto_color unchanged —
+## callers wanting `styles.body` to take effect should follow with
+## `toast_with_auto_color(t, false)`.
+def toast_with_styles(t: Toast, s: ToastStyles): Toast
+  return Toast {
+    message: t.message, level: t.level, ttl_ms: t.ttl_ms,
+    position: t.position, auto_color: t.auto_color, styles: s
+  }
+end
+
+## Toggle the auto-colour. When off, `styles.body` colours the
+## message text.
+def toast_with_auto_color(t: Toast, on: Bool): Toast
+  return Toast {
+    message: t.message, level: t.level, ttl_ms: t.ttl_ms,
+    position: t.position, auto_color: on, styles: t.styles
+  }
+end
+
+# ============================================================
+# Accessors
+# ============================================================
+
+## Semantic colour for a given level. Exposed for testing and
+## consumers that want the same colour scheme outside the toast
+## (e.g. matching label colours on a related widget).
+def toast_level_color(level: ToastLevel): Int
+  match level
+    ToastLevel::Success => return style::Green()
+    ToastLevel::Warning => return style::Yellow()
+    ToastLevel::Error   => return style::Red()
+    _                   => return style::COLOR_NONE()
+  end
+end
+
+## Semantic icon for a given level. ℹ / ✓ / ⚠ / ✗ for Info /
+## Success / Warning / Error. Exposed for testing and consumers
+## wanting to render the same icon outside the toast.
+def toast_level_icon(level: ToastLevel): String
+  match level
+    ToastLevel::Success => return "✓"
+    ToastLevel::Warning => return "⚠"
+    ToastLevel::Error   => return "✗"
+    _                   => return "ℹ"
+  end
+end
+
+# ============================================================
+# View
+# ============================================================
+
+## Render the toast body — a level-icon prefix followed by the
+## styled message text, padded with a leading and trailing space
+## so the body has visual breathing room inside its border.
+##
+## Multi-line messages (containing `\n`) split into one rendered
+## row per line. Line 0 carries the icon; subsequent lines indent
+## by two spaces so the message text aligns with line 0's body.
+## The border supplied by `toast_overlay` wraps the whole block.
+def toast_view(t: Toast): String
+  # Extract style to a typed local before .render — chained method
+  # calls on struct-field paths of generic-erased structs trip a
+  # codegen bug (feedback_chained_field_access_generic_erases).
+  var s_body: Style = t.styles.body
+  var s_icon: Style = Style.new()
+
+  if t.auto_color
+    var fg = toast_level_color(t.level)
+    if fg == style::COLOR_NONE()
+      s_body = Style.new()
+      s_icon = Style.new()
+    else
+      s_body = Style.new().fg(fg).bold()
+      s_icon = Style.new().fg(fg).bold()
+    end
+  end
+
+  var icon = toast_level_icon(t.level)
+  var lines = str_split(t.message, "\n")
+  var out = vec_new<String>()
+  var i = 0
+  while i < lines.size
+    if i == 0
+      out.push(" " + s_icon.render(icon) + " " + s_body.render(lines[i]) + " ")
+    else
+      out.push("   " + s_body.render(lines[i]) + " ")
+    end
+    i = i + 1
+  end
+  return ly::join_vertical(out)
+end
+
+## Wrap the rendered body in a rounded-border Overlay anchored
+## at the toast's position. Ready for `ov::overlay_compose`.
+def toast_overlay(t: Toast): ov::Overlay
+  return ov::overlay_new(toast_view(t), t.position, ly::BORDER_ROUNDED())
+end
+
+# ============================================================
+# Cmd factory — Cmd::After lifecycle
+# ============================================================
+
+## Produce a Cmd::After that fires `on_expire()` after `t.ttl_ms`
+## milliseconds. The parent stores the toast, makes it visible,
+## and dispatches this Cmd; when the resulting message arrives
+## the parent clears visibility (or whatever cleanup is right).
+##
+## `on_expire` is invoked by the runtime goroutine that owns the
+## After timer. It must be a pure thunk — runtime determinism
+## contract still applies.
+def toast_show_cmd<M>(t: Toast, on_expire: Fn(): tui::FrameMsg<M>): tui::Cmd<M>
+  return tui::Cmd::After(t.ttl_ms, on_expire)
+end

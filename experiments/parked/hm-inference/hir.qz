@@ -1,0 +1,866 @@
+# HIR - High-level IR Desugaring
+# Transforms surface AST into simplified forms:
+# - for loops -> while loops
+# - compound assignments (+=, -=) -> binary + assign
+# - (string interpolation handled at parse time in self-hosted)
+#
+# Uses arena-style AST from frontend/ast.be
+
+import ast
+
+# NodeKind constants - MUST match C's NodeType order (bootstrap/src/ast.h:80-132)
+const NK_INT_LIT = 0
+const NK_BOOL_LIT = 1
+const NK_STRING_LIT = 2
+const NK_SYMBOL_LIT = 3
+const NK_IDENT = 4
+const NK_UNARY = 5
+const NK_BINARY = 6
+const NK_CALL = 7
+const NK_ARRAY = 8
+const NK_MAP_LIT = 9
+const NK_INDEX = 10
+const NK_STRUCT_INIT = 11
+const NK_FIELD_ACCESS = 12
+const NK_SAFE_FIELD_ACCESS = 13
+const NK_TRY_EXPR = 14
+const NK_FUNC_REF = 15
+const NK_LAMBDA = 16
+const NK_RETURN = 17
+const NK_IF = 18
+const NK_WHILE = 19
+const NK_LET = 20
+const NK_ASSIGN = 21
+const NK_INDEX_ASSIGN = 22
+const NK_FIELD_ASSIGN = 23
+const NK_EXPR_STMT = 24
+const NK_BREAK = 25
+const NK_CONTINUE = 26
+const NK_BLOCK = 27
+const NK_PARAM = 28
+const NK_FUNCTION = 29
+const NK_PROGRAM = 30
+const NK_STRUCT_DEF = 31
+const NK_FIELD_DEF = 32
+const NK_ENUM_DEF = 33
+const NK_ENUM_ACCESS = 34
+const NK_MATCH = 35
+const NK_MATCH_ARM = 36
+const NK_WILDCARD = 37
+const NK_INTERP_STRING = 38
+const NK_FOR = 39
+const NK_COMPOUND_ASSIGN = 40
+const NK_LIST_COMP = 41
+const NK_MAP_COMP = 42
+const NK_IMPORT = 43
+const NK_GLOBAL_VAR = 44
+const NK_TRAIT_DEF = 45
+const NK_IMPL_BLOCK = 46
+const NK_EXTERN_FN = 47
+const NK_SPAWN = 48
+const NK_AWAIT = 49
+const NK_SELECT = 50
+const NK_SELECT_ARM = 51
+const NK_DEFER = 52
+const NK_ARENA_BLOCK = 53
+const NK_TRY_CATCH = 54
+const NK_VARIANT_DEF = 55
+const NK_CONST_DECL = 69
+const NK_STATIC_ASSERT = 70
+const NK_TASK_GROUP = 71
+
+# OpKind constants (must match ast.be enum order)
+const OP_LT = 7
+const OP_ADD = 0
+const OP_NIL_COALESCE = 22
+
+# Desugar list comprehension to block with loop
+# [expr for x in iter if cond] becomes:
+# {
+#   var __lc_result = vec_new()
+#   var __lc_idx = 0
+#   while __lc_idx < vec_len(iter)
+#     let x = iter[__lc_idx]
+#     if cond (or true)
+#       vec_push(__lc_result, expr)
+#     end
+#     __lc_idx = __lc_idx + 1
+#   end
+#   __lc_result
+# }
+def desugar_list_comp(src: Int, dst: Int, node: Int): Int
+  var line = ast$ast_get_line(src, node)
+  var col = ast$ast_get_col(src, node)
+  var expr_node = ast$ast_get_left(src, node)
+  var var_name = ast$ast_get_str1(src, node)
+  var iter_node = ast$ast_get_right(src, node)
+  var cond_node = ast$ast_get_extra(src, node)
+  
+  var result_stmts = vec_new()
+  
+  # Check if iter is a range call (__make_range)
+  var iter_kind = ast$ast_get_kind(src, iter_node)
+  var is_range = 0
+  var range_start = 0
+  var range_end = 0
+  
+  if iter_kind == NK_CALL
+    var callee = ast$ast_get_left(src, iter_node)
+    var callee_kind = ast$ast_get_kind(src, callee)
+    if callee_kind == NK_IDENT
+      var callee_name = ast$ast_get_str1(src, callee)
+      if callee_name.eq("__make_range") == 1
+        is_range = 1
+        var args = ast$ast_get_children(src, iter_node)
+        range_start = desugar_to_hir(src, dst, args[0])
+        range_end = desugar_to_hir(src, dst, args[1])
+      end
+    end
+  end
+
+  # var __lc_result = vec_new()
+  var vec_new_callee = ast$ast_ident(dst, "vec_new", line, col)
+  var vec_new_call = ast$ast_call(dst, vec_new_callee, vec_new(), line, col)
+  var let_result = ast$ast_let(dst, "__lc_result", "", vec_new_call, 1, line, col)
+  result_stmts.push(let_result)
+  
+  # var __lc_idx = start (or 0)
+  var start_val = 0
+  if is_range == 1
+    start_val = range_start
+  else
+    start_val = ast$ast_int_lit(dst, 0, line, col)
+  end
+  var let_idx = ast$ast_let(dst, "__lc_idx", "", start_val, 1, line, col)
+  result_stmts.push(let_idx)
+  
+  # If not a range, we need iter_len: var __lc_iter = iter; use vec_len(__lc_iter)
+  var end_val = 0
+  var desugared_iter = 0
+  if is_range == 1
+    end_val = range_end
+  else
+    desugared_iter = desugar_to_hir(src, dst, iter_node)
+    var let_iter = ast$ast_let(dst, "__lc_iter", "", desugared_iter, 0, line, col)
+    result_stmts.push(let_iter)
+    var iter_ref = ast$ast_ident(dst, "__lc_iter", line, col)
+    var len_callee = ast$ast_ident(dst, "vec_len", line, col)
+    var len_args = [iter_ref]
+    end_val = ast$ast_call(dst, len_callee, len_args, line, col)
+  end
+  
+  # while __lc_idx < end
+  var idx_ref = ast$ast_ident(dst, "__lc_idx", line, col)
+  var cond = ast$ast_binary(dst, idx_ref, OP_LT, end_val, line, col)
+  
+  # Build loop body
+  var body_stmts = vec_new()
+  
+  # let x = __lc_idx (for range) or iter[__lc_idx] (for vec)
+  var x_value = 0
+  if is_range == 1
+    x_value = ast$ast_ident(dst, "__lc_idx", line, col)
+  else
+    var iter_ref2 = ast$ast_ident(dst, "__lc_iter", line, col)
+    var idx_ref2 = ast$ast_ident(dst, "__lc_idx", line, col)
+    x_value = ast$ast_index(dst, iter_ref2, idx_ref2, line, col)
+  end
+  var let_x = ast$ast_let(dst, var_name, "", x_value, 0, line, col)
+  body_stmts.push(let_x)
+  
+  # vec_push(__lc_result, expr) - wrapped in if condition if present
+  var desugared_expr = desugar_to_hir(src, dst, expr_node)
+  var result_ref = ast$ast_ident(dst, "__lc_result", line, col)
+  var push_callee = ast$ast_ident(dst, "vec_push", line, col)
+  var push_args = [result_ref, desugared_expr]
+  var push_call = ast$ast_call(dst, push_callee, push_args, line, col)
+  var push_stmt = ast$ast_expr_stmt(dst, push_call, line, col)
+  
+  if cond_node != 0
+    var desugared_cond = desugar_to_hir(src, dst, cond_node)
+    var if_body_stmts = [push_stmt]
+    var if_body = ast$ast_block(dst, if_body_stmts, line, col)
+    var if_stmt = ast$ast_if(dst, desugared_cond, if_body, 0, line, col)
+    body_stmts.push(if_stmt)
+  else
+    body_stmts.push(push_stmt)
+  end
+  
+  # __lc_idx = __lc_idx + 1
+  var idx_ref3 = ast$ast_ident(dst, "__lc_idx", line, col)
+  var one = ast$ast_int_lit(dst, 1, line, col)
+  var increment = ast$ast_binary(dst, idx_ref3, OP_ADD, one, line, col)
+  var inc_stmt = ast$ast_assign(dst, "__lc_idx", increment, line, col)
+  body_stmts.push(inc_stmt)
+  
+  var loop_body = ast$ast_block(dst, body_stmts, line, col)
+  var while_node = ast$ast_while(dst, cond, loop_body, "", line, col)
+  result_stmts.push(while_node)
+  
+  # Final expression: __lc_result
+  var final_ref = ast$ast_ident(dst, "__lc_result", line, col)
+  result_stmts.push(final_ref)
+  
+  return ast$ast_block(dst, result_stmts, line, col)
+end
+
+# Desugar map comprehension to block with loop
+# {k => v for x in iter if cond} becomes:
+# {
+#   var __mc_result = intmap_new()
+#   var __mc_idx = start
+#   while __mc_idx < end
+#     let x = __mc_idx (or iter[__mc_idx])
+#     if cond (or true)
+#       intmap_set(__mc_result, k, v)
+#     end
+#     __mc_idx = __mc_idx + 1
+#   end
+#   __mc_result
+# }
+def desugar_map_comp(src: Int, dst: Int, node: Int): Int
+  var line = ast$ast_get_line(src, node)
+  var col = ast$ast_get_col(src, node)
+  var key_node = ast$ast_get_left(src, node)
+  var val_node = ast$ast_get_right(src, node)
+  var var_name = ast$ast_get_str1(src, node)
+  var iter_node = ast$ast_get_extra(src, node)
+  var cond_children = ast$ast_get_children(src, node)
+  var cond_node = 0
+  if cond_children != 0
+    if cond_children.size > 0
+      cond_node = cond_children[0]
+    end
+  end
+  
+  var result_stmts = vec_new()
+  
+  # Check if iter is a range call (__make_range)
+  var iter_kind = ast$ast_get_kind(src, iter_node)
+  var is_range = 0
+  var range_start = 0
+  var range_end = 0
+  
+  if iter_kind == NK_CALL
+    var callee = ast$ast_get_left(src, iter_node)
+    var callee_kind = ast$ast_get_kind(src, callee)
+    if callee_kind == NK_IDENT
+      var callee_name = ast$ast_get_str1(src, callee)
+      if callee_name.eq("__make_range") == 1
+        is_range = 1
+        var args = ast$ast_get_children(src, iter_node)
+        range_start = desugar_to_hir(src, dst, args[0])
+        range_end = desugar_to_hir(src, dst, args[1])
+      end
+    end
+  end
+
+  # var __mc_result = intmap_new()
+  var map_new_callee = ast$ast_ident(dst, "intmap_new", line, col)
+  var map_new_call = ast$ast_call(dst, map_new_callee, vec_new(), line, col)
+  var let_result = ast$ast_let(dst, "__mc_result", "", map_new_call, 1, line, col)
+  result_stmts.push(let_result)
+  
+  # var __mc_idx = start (or 0)
+  var start_val = 0
+  if is_range == 1
+    start_val = range_start
+  else
+    start_val = ast$ast_int_lit(dst, 0, line, col)
+  end
+  var let_idx = ast$ast_let(dst, "__mc_idx", "", start_val, 1, line, col)
+  result_stmts.push(let_idx)
+  
+  # If not a range, we need iter_len: var __mc_iter = iter; use vec_len(__mc_iter)
+  var end_val = 0
+  var desugared_iter = 0
+  if is_range == 1
+    end_val = range_end
+  else
+    desugared_iter = desugar_to_hir(src, dst, iter_node)
+    var let_iter = ast$ast_let(dst, "__mc_iter", "", desugared_iter, 0, line, col)
+    result_stmts.push(let_iter)
+    var iter_ref = ast$ast_ident(dst, "__mc_iter", line, col)
+    var len_callee = ast$ast_ident(dst, "vec_len", line, col)
+    var len_args = [iter_ref]
+    end_val = ast$ast_call(dst, len_callee, len_args, line, col)
+  end
+  
+  # while __mc_idx < end
+  var idx_ref = ast$ast_ident(dst, "__mc_idx", line, col)
+  var cond = ast$ast_binary(dst, idx_ref, OP_LT, end_val, line, col)
+  
+  # Build loop body
+  var body_stmts = vec_new()
+  
+  # let x = __mc_idx (for range) or iter[__mc_idx] (for vec)
+  var x_value = 0
+  if is_range == 1
+    x_value = ast$ast_ident(dst, "__mc_idx", line, col)
+  else
+    var iter_ref2 = ast$ast_ident(dst, "__mc_iter", line, col)
+    var idx_ref2 = ast$ast_ident(dst, "__mc_idx", line, col)
+    x_value = ast$ast_index(dst, iter_ref2, idx_ref2, line, col)
+  end
+  var let_x = ast$ast_let(dst, var_name, "", x_value, 0, line, col)
+  body_stmts.push(let_x)
+  
+  # intmap_set(__mc_result, key, val) - wrapped in if condition if present
+  var desugared_key = desugar_to_hir(src, dst, key_node)
+  var desugared_val = desugar_to_hir(src, dst, val_node)
+  var result_ref = ast$ast_ident(dst, "__mc_result", line, col)
+  var set_callee = ast$ast_ident(dst, "intmap_set", line, col)
+  var set_args = [result_ref, desugared_key, desugared_val]
+  var set_call = ast$ast_call(dst, set_callee, set_args, line, col)
+  var set_stmt = ast$ast_expr_stmt(dst, set_call, line, col)
+  
+  if cond_node != 0
+    var desugared_cond = desugar_to_hir(src, dst, cond_node)
+    var if_body_stmts = [set_stmt]
+    var if_body = ast$ast_block(dst, if_body_stmts, line, col)
+    var if_stmt = ast$ast_if(dst, desugared_cond, if_body, 0, line, col)
+    body_stmts.push(if_stmt)
+  else
+    body_stmts.push(set_stmt)
+  end
+  
+  # __mc_idx = __mc_idx + 1
+  var idx_ref3 = ast$ast_ident(dst, "__mc_idx", line, col)
+  var one = ast$ast_int_lit(dst, 1, line, col)
+  var increment = ast$ast_binary(dst, idx_ref3, OP_ADD, one, line, col)
+  var inc_stmt = ast$ast_assign(dst, "__mc_idx", increment, line, col)
+  body_stmts.push(inc_stmt)
+  
+  var loop_body = ast$ast_block(dst, body_stmts, line, col)
+  var while_node = ast$ast_while(dst, cond, loop_body, "", line, col)
+  result_stmts.push(while_node)
+  
+  # Final expression: __mc_result
+  var final_ref = ast$ast_ident(dst, "__mc_result", line, col)
+  result_stmts.push(final_ref)
+  
+  return ast$ast_block(dst, result_stmts, line, col)
+end
+
+# Desugar for loop to while loop
+# for i in start..end { body } becomes:
+# { var i = start; while i < end { body; i = i + 1 } }
+def desugar_for(src: Int, dst: Int, node: Int): Int
+  var line = ast$ast_get_line(src, node)
+  var col = ast$ast_get_col(src, node)
+  var var_name = ast$ast_get_str1(src, node)
+  var iter_node = ast$ast_get_left(src, node)
+  var body_node = ast$ast_get_right(src, node)
+
+  # Extract start/end from range expression
+  var iter_kind = ast$ast_get_kind(src, iter_node)
+  var start_val = 0
+  var end_val = 0
+
+  if iter_kind == NK_CALL
+    var callee = ast$ast_get_left(src, iter_node)
+    var callee_kind = ast$ast_get_kind(src, callee)
+    if callee_kind == NK_IDENT
+      var callee_name = ast$ast_get_str1(src, callee)
+      if callee_name.eq("__make_range") == 1
+        var args = ast$ast_get_children(src, iter_node)
+        start_val = desugar_to_hir(src, dst, args[0])
+        end_val = desugar_to_hir(src, dst, args[1])
+      end
+    end
+  end
+
+  # Fallback: if not a recognized range, use iter as start and 0 as end
+  if start_val == 0
+    start_val = desugar_to_hir(src, dst, iter_node)
+    end_val = ast$ast_int_lit(dst, 0, line, col)
+  end
+
+  # Create: var i = start
+  var let_node = ast$ast_let(dst, var_name, "", start_val, 1, line, col)
+
+  # Create: i < end
+  var var_ref = ast$ast_ident(dst, var_name, line, col)
+  var cond = ast$ast_binary(dst, var_ref, OP_LT, end_val, line, col)
+  
+  # Create: i = i + 1
+  var var_ref2 = ast$ast_ident(dst, var_name, line, col)
+  var one = ast$ast_int_lit(dst, 1, line, col)
+  var increment = ast$ast_binary(dst, var_ref2, OP_ADD, one, line, col)
+  var inc_stmt = ast$ast_assign(dst, var_name, increment, line, col)
+  
+  # Add increment to body
+  var body_children = ast$ast_get_children(src, body_node)
+  var new_body_stmts = vec_new()
+  if body_children != 0
+    var len = body_children.size
+    for i in 0..len
+      var child = body_children[i]
+      var desugared_child = desugar_to_hir(src, dst, child)
+      new_body_stmts.push(desugared_child)
+    end
+  end
+  new_body_stmts.push(inc_stmt)
+  var new_body = ast$ast_block(dst, new_body_stmts, line, col)
+  
+  # Create while loop
+  var while_node = ast$ast_while(dst, cond, new_body, "", line, col)
+  
+  # Create block with let + while
+  var result_stmts = [let_node, while_node]
+  return ast$ast_block(dst, result_stmts, line, col)
+end
+
+# Desugar children vec
+def desugar_children(src: Int, dst: Int, children: Vec<Int>): Int
+  if children == 0
+    return 0
+  end
+  var result = vec_new()
+  var len = children.size
+  for i in 0..len
+    var child = children[i]
+    var desugared = desugar_to_hir(src, dst, child)
+    result.push(desugared)
+  end
+  return result
+end
+
+# Main desugaring entry point
+# Takes source AST storage, destination AST storage, and node handle
+# Returns handle to desugared node in destination storage
+def desugar_to_hir(src: Int, dst: Int, node: Int): Int
+  if node < 0
+    return node
+  end
+  
+  var kind = ast$ast_get_kind(src, node)
+  var line = ast$ast_get_line(src, node)
+  var col = ast$ast_get_col(src, node)
+  
+  # For loop -> while loop
+  if kind == NK_FOR
+    return desugar_for(src, dst, node)
+  end
+  
+  # List comprehension -> block with loop
+  if kind == NK_LIST_COMP
+    return desugar_list_comp(src, dst, node)
+  end
+  
+  # Map comprehension -> block with loop
+  if kind == NK_MAP_COMP
+    return desugar_map_comp(src, dst, node)
+  end
+  
+  # Program - desugar all items
+  if kind == NK_PROGRAM
+    var items = ast$ast_get_children(src, node)
+    var new_items = desugar_children(src, dst, items)
+    return ast$ast_program(dst, new_items, line, col)
+  end
+  
+  # Function - desugar body
+  if kind == NK_FUNCTION
+    var name = ast$ast_get_str1(src, node)
+    var ret_type = ast$ast_get_str2(src, node)
+    var params = ast$ast_get_left(src, node)
+    var body = ast$ast_get_right(src, node)
+    var is_private = ast$ast_get_int_val(src, node)
+    var type_params = ast$ast_func_type_params(src, node)
+    var type_param_bounds = ast$ast_func_type_param_bounds(src, node)
+    var new_params = desugar_children(src, dst, params)
+    var new_body = desugar_to_hir(src, dst, body)
+    var new_func = ast$ast_function(dst, name, new_params, ret_type, new_body, is_private, type_params, type_param_bounds, line, col)
+    if ast$ast_func_is_naked(src, node) == 1
+      ast$ast_func_set_naked(dst, new_func)
+    end
+    return new_func
+  end
+  
+  # Block - desugar all statements
+  if kind == NK_BLOCK
+    var stmts = ast$ast_get_children(src, node)
+    var new_stmts = desugar_children(src, dst, stmts)
+    return ast$ast_block(dst, new_stmts, line, col)
+  end
+  
+  # If - desugar condition and branches
+  if kind == NK_IF
+    var cond = ast$ast_get_left(src, node)
+    var then_b = ast$ast_get_right(src, node)
+    var else_b = ast$ast_get_extra(src, node)
+    var new_cond = desugar_to_hir(src, dst, cond)
+    var new_then = desugar_to_hir(src, dst, then_b)
+    var new_else = desugar_to_hir(src, dst, else_b)
+    return ast$ast_if(dst, new_cond, new_then, new_else, line, col)
+  end
+  
+  # While - desugar condition and body
+  if kind == NK_WHILE
+    var cond = ast$ast_get_left(src, node)
+    var body = ast$ast_get_right(src, node)
+    var new_cond = desugar_to_hir(src, dst, cond)
+    var new_body = desugar_to_hir(src, dst, body)
+    var label = ast$ast_get_str1(src, node)
+    return ast$ast_while(dst, new_cond, new_body, label, line, col)
+  end
+  
+  # Let - desugar initializer
+  if kind == NK_LET
+    var name = ast$ast_get_str1(src, node)
+    var type_ann = ast$ast_get_str2(src, node)
+    var value = ast$ast_get_left(src, node)
+    var is_mut = ast$ast_get_int_val(src, node)
+    var new_value = desugar_to_hir(src, dst, value)
+    return ast$ast_let(dst, name, type_ann, new_value, is_mut, line, col)
+  end
+  
+  # Assign - desugar value
+  if kind == NK_ASSIGN
+    var target = ast$ast_get_str1(src, node)
+    var value = ast$ast_get_left(src, node)
+    var new_value = desugar_to_hir(src, dst, value)
+    return ast$ast_assign(dst, target, new_value, line, col)
+  end
+  
+  # Return - desugar value
+  if kind == NK_RETURN
+    var value = ast$ast_get_left(src, node)
+    var new_value = desugar_to_hir(src, dst, value)
+    return ast$ast_return(dst, new_value, line, col)
+  end
+  
+  # Binary - desugar operands
+  if kind == NK_BINARY
+    var left = ast$ast_get_left(src, node)
+    var right = ast$ast_get_right(src, node)
+    var op = ast$ast_get_op(src, node)
+    
+    # Nil coalesce (op 22) desugars to match expression
+    # x ?? default => match x { Option::Some(__nil_coal_v) => __nil_coal_v, Option::None => default }
+    if op == OP_NIL_COALESCE
+      var new_left = desugar_to_hir(src, dst, left)
+      var new_right = desugar_to_hir(src, dst, right)
+      
+      # Create Some pattern: Option::Some(__nil_coal_v)
+      # Pattern: bound_names contains the variable name, payloads=0
+      var pattern_names = [as_int("__nil_coal_v")]
+      var some_pattern = ast$ast_enum_access(dst, "Option", "Some", pattern_names, 0, line, col)
+      
+      # Create Some body: __nil_coal_v (just return the unwrapped value)
+      var some_body = ast$ast_ident(dst, "__nil_coal_v", line, col)
+      
+      # Create Some arm
+      var some_arm = ast$ast_match_arm(dst, some_pattern, 0, some_body, line, col)
+      
+      # Create None pattern: Option::None
+      # Pattern with no bindings
+      var none_pattern = ast$ast_enum_access(dst, "Option", "None", 0, 0, line, col)
+      
+      # Create None arm with default value
+      var none_arm = ast$ast_match_arm(dst, none_pattern, 0, new_right, line, col)
+      
+      # Create match expression
+      var arms = [some_arm, none_arm]
+      return ast$ast_match(dst, new_left, arms, line, col)
+    end
+    
+    var new_left = desugar_to_hir(src, dst, left)
+    var new_right = desugar_to_hir(src, dst, right)
+    return ast$ast_binary(dst, new_left, op, new_right, line, col)
+  end
+  
+  # Unary - desugar operand
+  if kind == NK_UNARY
+    var operand = ast$ast_get_left(src, node)
+    var op = ast$ast_get_op(src, node)
+    var new_operand = desugar_to_hir(src, dst, operand)
+    return ast$ast_unary(dst, op, new_operand, line, col)
+  end
+  
+  # Call - desugar callee and args (preserve type_arg for typed calls)
+  if kind == NK_CALL
+    var callee = ast$ast_get_left(src, node)
+    var args = ast$ast_get_children(src, node)
+    var type_arg = ast$ast_get_type_arg(src, node)
+    var new_callee = desugar_to_hir(src, dst, callee)
+    var new_args = desugar_children(src, dst, args)
+    if type_arg.size > 0
+      return ast$ast_call_with_type_arg(dst, new_callee, type_arg, new_args, line, col)
+    end
+    return ast$ast_call(dst, new_callee, new_args, line, col)
+  end
+  
+  # Index - desugar base and index
+  if kind == NK_INDEX
+    var base = ast$ast_get_left(src, node)
+    var idx = ast$ast_get_right(src, node)
+    var new_base = desugar_to_hir(src, dst, base)
+    var new_idx = desugar_to_hir(src, dst, idx)
+    return ast$ast_index(dst, new_base, new_idx, line, col)
+  end
+  
+  # Field access - desugar base
+  if kind == NK_FIELD_ACCESS
+    var base = ast$ast_get_left(src, node)
+    var field = ast$ast_get_str1(src, node)
+    var new_base = desugar_to_hir(src, dst, base)
+    return ast$ast_field_access(dst, new_base, field, line, col)
+  end
+  
+  # Safe field access - desugar to match expression
+  # x?.field => match x { Option::Some(__safe_nav_v) => Option::Some(__safe_nav_v.field), Option::None => Option::None }
+  if kind == NK_SAFE_FIELD_ACCESS
+    var base = ast$ast_get_left(src, node)
+    var field = ast$ast_get_str1(src, node)
+    var new_base = desugar_to_hir(src, dst, base)
+    
+    # Create Some pattern: Option::Some(__safe_nav_v)
+    # Pattern: bound_names contains the variable name, payloads=0
+    var pattern_names = [as_int("__safe_nav_v")]
+    var some_pattern = ast$ast_enum_access(dst, "Option", "Some", pattern_names, 0, line, col)
+    
+    # Create Some body: Option::Some(__safe_nav_v.field)
+    # Construction: bound_names=0, payloads contains the expression
+    var var_ref = ast$ast_ident(dst, "__safe_nav_v", line, col)
+    var field_access = ast$ast_field_access(dst, var_ref, field, line, col)
+    var body_args = [field_access]
+    var some_body = ast$ast_enum_access(dst, "Option", "Some", 0, body_args, line, col)
+    
+    # Create Some arm
+    var some_arm = ast$ast_match_arm(dst, some_pattern, 0, some_body, line, col)
+    
+    # Create None pattern: Option::None
+    # Pattern with no bindings
+    var none_pattern = ast$ast_enum_access(dst, "Option", "None", 0, 0, line, col)
+    
+    # Create None body: Option::None
+    # Construction with no payloads
+    var none_body = ast$ast_enum_access(dst, "Option", "None", 0, 0, line, col)
+    
+    # Create None arm
+    var none_arm = ast$ast_match_arm(dst, none_pattern, 0, none_body, line, col)
+    
+    # Create match expression
+    var arms = [some_arm, none_arm]
+    return ast$ast_match(dst, new_base, arms, line, col)
+  end
+  
+  # Struct init - desugar field values
+  if kind == NK_STRUCT_INIT
+    var struct_name = ast$ast_get_str1(src, node)
+    var fields = ast$ast_get_children(src, node)
+    var field_names = ast$ast_get_struct_init_field_names(src, node)
+    var new_fields = desugar_children(src, dst, fields)
+    return ast$ast_struct_init(dst, struct_name, new_fields, field_names, line, col)
+  end
+  
+  # Match - desugar subject and arms
+  if kind == NK_MATCH
+    var subject = ast$ast_get_left(src, node)
+    var arms = ast$ast_get_children(src, node)
+    var new_subject = desugar_to_hir(src, dst, subject)
+    var new_arms = desugar_children(src, dst, arms)
+    return ast$ast_match(dst, new_subject, new_arms, line, col)
+  end
+  
+  # Match arm - desugar pattern and body
+  if kind == NK_MATCH_ARM
+    var pattern = ast$ast_get_left(src, node)
+    var body = ast$ast_get_right(src, node)
+    var guard = ast$ast_get_extra(src, node)
+    var new_pattern = desugar_to_hir(src, dst, pattern)
+    var new_body = desugar_to_hir(src, dst, body)
+    var new_guard = desugar_to_hir(src, dst, guard)
+    return ast$ast_match_arm(dst, new_pattern, new_guard, new_body, line, col)
+  end
+  
+  # Expr stmt - desugar expression
+  if kind == NK_EXPR_STMT
+    var expr = ast$ast_get_left(src, node)
+    var new_expr = desugar_to_hir(src, dst, expr)
+    return ast$ast_expr_stmt(dst, new_expr, line, col)
+  end
+  
+  # Lambda - desugar body
+  if kind == NK_LAMBDA
+    var params = ast$ast_get_left(src, node)
+    var body = ast$ast_get_right(src, node)
+    var ret_type = ast$ast_get_str1(src, node)
+    var new_params = desugar_children(src, dst, params)
+    var new_body = desugar_to_hir(src, dst, body)
+    return ast$ast_lambda(dst, new_params, ret_type, new_body, line, col)
+  end
+  
+  # Array - desugar elements
+  if kind == NK_ARRAY
+    var elements = ast$ast_get_children(src, node)
+    var new_elements = desugar_children(src, dst, elements)
+    return ast$ast_array(dst, new_elements, line, col)
+  end
+  
+  # Map literal - desugar key/value pairs
+  if kind == NK_MAP_LIT
+    var keys = ast$ast_get_map_keys(src, node)
+    var values = ast$ast_get_map_values(src, node)
+    var new_keys = desugar_children(src, dst, keys)
+    var new_values = desugar_children(src, dst, values)
+    return ast$ast_map_lit(dst, new_keys, new_values, line, col)
+  end
+  
+  # Leaf nodes - copy directly
+  if kind == NK_INT_LIT
+    var value = ast$ast_get_int_val(src, node)
+    return ast$ast_int_lit(dst, value, line, col)
+  end
+  
+  if kind == NK_BOOL_LIT
+    var value = ast$ast_get_int_val(src, node)
+    return ast$ast_bool_lit(dst, value, line, col)
+  end
+  
+  if kind == NK_STRING_LIT
+    var value = ast$ast_get_str1(src, node)
+    return ast$ast_string_lit(dst, value, line, col)
+  end
+  
+  if kind == NK_SYMBOL_LIT
+    var name = ast$ast_get_str1(src, node)
+    return ast$ast_symbol_lit(dst, name, line, col)
+  end
+  
+  if kind == NK_IDENT
+    var name = ast$ast_get_str1(src, node)
+    return ast$ast_ident(dst, name, line, col)
+  end
+  
+  if kind == NK_BREAK
+    var label = ast$ast_get_str1(src, node)
+    return ast$ast_break(dst, label, line, col)
+  end
+  
+  if kind == NK_CONTINUE
+    var label = ast$ast_get_str1(src, node)
+    return ast$ast_continue(dst, label, line, col)
+  end
+  
+  # Param - copy
+  if kind == NK_PARAM
+    var name = ast$ast_get_str1(src, node)
+    var type_ann = ast$ast_get_str2(src, node)
+    var is_variadic = ast$ast_get_int_val(src, node)
+    var default_val = ast$ast_get_right(src, node)
+    var new_default = 0
+    if default_val != 0
+      new_default = desugar_to_hir(src, dst, default_val)
+    end
+    return ast$ast_param(dst, name, type_ann, is_variadic, new_default, line, col)
+  end
+  
+  # Struct/enum defs - copy with desugared children
+  if kind == NK_STRUCT_DEF
+    var name = ast$ast_get_str1(src, node)
+    var type_params = ast$ast_get_str2(src, node)
+    var is_private = ast$ast_get_int_val(src, node)
+    var repr_c = src[11][node]  # Get repr_c from slot 11 (docs)
+    var packed = src[9][node]   # Get packed from slot 9 (extras)
+    var is_linear = ast$ast_get_right(src, node)
+    var fields = ast$ast_get_children(src, node)
+    var new_fields = desugar_children(src, dst, fields)
+    return ast$ast_struct_def(dst, name, new_fields, type_params, is_private, repr_c, packed, is_linear, line, col)
+  end
+  
+  if kind == NK_FIELD_DEF
+    var name = ast$ast_get_str1(src, node)
+    var type_ann = ast$ast_get_str2(src, node)
+    return ast$ast_field_def(dst, name, type_ann, line, col)
+  end
+  
+  if kind == NK_ENUM_DEF
+    var name = ast$ast_get_str1(src, node)
+    var type_params = ast$ast_get_str2(src, node)
+    var is_private = ast$ast_get_int_val(src, node)
+    var variants = ast$ast_get_children(src, node)
+    var new_variants = desugar_children(src, dst, variants)
+    return ast$ast_enum_def(dst, name, new_variants, type_params, is_private, line, col)
+  end
+  
+  if kind == NK_VARIANT_DEF
+    var name = ast$ast_get_str1(src, node)
+    var fields = ast$ast_get_children(src, node)
+    var new_fields = desugar_children(src, dst, fields)
+    return ast$ast_variant_def(dst, name, new_fields, line, col)
+  end
+  
+  if kind == NK_IMPORT
+    var module_name = ast$ast_get_str1(src, node)
+    var alias = ast$ast_get_str2(src, node)
+    var symbols = ast$ast_get_children(src, node)
+    var is_wildcard = ast$ast_get_int_val(src, node)
+    return ast$ast_import(dst, module_name, alias, symbols, is_wildcard, line, col)
+  end
+  
+  if kind == NK_ENUM_ACCESS
+    var enum_name = ast$ast_get_str1(src, node)
+    var variant = ast$ast_get_str2(src, node)
+    var bound_names = ast$ast_get_bound_names(src, node)
+    var payloads = ast$ast_get_children(src, node)
+    # Desugar payloads (construction args), bound_names stay as-is (just strings)
+    var new_payloads = 0
+    if payloads != 0
+      new_payloads = desugar_children(src, dst, payloads)
+    end
+    return ast$ast_enum_access(dst, enum_name, variant, bound_names, new_payloads, line, col)
+  end
+  
+  # Trait definition - pass through (type checked, no codegen for now)
+  if kind == NK_TRAIT_DEF
+    # Traits are handled by type checker, skip in HIR/codegen
+    # Return a placeholder (empty block) for now
+    var empty_children = vec_new()
+    return ast$ast_block(dst, empty_children, line, col)
+  end
+  
+  # Impl block - pass through (type checked, no codegen for now)
+  if kind == NK_IMPL_BLOCK
+    # Impl blocks are handled by type checker, skip in HIR/codegen
+    # Return a placeholder (empty block) for now
+    var empty_children = vec_new()
+    return ast$ast_block(dst, empty_children, line, col)
+  end
+  
+  # Const declaration - pass through to MIR for const evaluation
+  if kind == NK_CONST_DECL
+    var name = ast$ast_get_str1(src, node)
+    var init = desugar_to_hir(src, dst, ast$ast_get_right(src, node))
+    return ast$ast_const_decl(dst, name, init, line, col)
+  end
+  
+  # Static assert - pass through to MIR for const evaluation
+  if kind == NK_STATIC_ASSERT
+    var cond = desugar_to_hir(src, dst, ast$ast_get_left(src, node))
+    var msg = ast$ast_get_str2(src, node)
+    return ast$ast_static_assert(dst, cond, msg, line, col)
+  end
+  
+  # Task group - recurse into body for desugaring
+  if kind == NK_TASK_GROUP
+    var binding_name = ast$ast_get_str1(src, node)
+    var body = desugar_to_hir(src, dst, ast$ast_get_left(src, node))
+    return ast$ast_task_group(dst, binding_name, body, line, col)
+  end
+
+  # Fallback - return node unchanged (shouldn't happen)
+  puts("HIR: Unknown node kind")
+  print_int(kind)
+  return node
+end
+
+# Convenience function: desugar entire program
+# Creates new AST storage and returns it
+def hir_desugar_program(src: Int, root: Int): Int
+  var dst = ast$ast_new_storage()
+  var new_root = desugar_to_hir(src, dst, root)
+  return dst
+end

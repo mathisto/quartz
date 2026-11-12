@@ -1,0 +1,547 @@
+## std/core/crypto/sha3 — Pure-Quartz SHA-3 family (FIPS 202)
+##
+## NET.3 prerequisite. ML-KEM uses SHAKE128 (for the matrix-A rejection
+## sampler) and SHAKE256 (for the CBD samplers and the implicit-rejection J),
+## plus SHA-3-256 (for H = the ek hash) and SHA-3-512 (for G = the (K, r)
+## split). All four variants live in this file, fed by a single
+## Keccak-f[1600] permutation.
+##
+## Implementation notes:
+##
+## - The state is a 5×5×64-bit grid (1600 bits = 200 bytes), addressed as
+##   25 little-endian u64 lanes A[x,y] with lane index = 5·y + x. We hold
+##   the state as a `malloc(200)` and read/write 8 bytes at a time via
+##   `_u64_read_le` / `_u64_write_le` (lifted from sha512.qz's shape; same
+##   ashr-mask workaround for the lsr).
+##
+## - Each Keccak-f round applies θ, ρ, π, χ, ι in sequence. 24 rounds total.
+##
+## - Sponge construction (FIPS 202 §4): absorb XORs `rate` bytes into the
+##   first `rate` bytes of state and permutes; squeeze reads `rate` bytes,
+##   permutes, repeats. Padding is pad10*1 fused with the function's
+##   domain-separator byte: XOR the domain byte at the next free offset,
+##   XOR 0x80 at the final byte of the rate block, then compress.
+##
+## - Domain separators (FIPS 202 Appendix B.2):
+##     SHA-3-NNN: 0x06 (binary `01_10` LE: suffix `01` then start of pad `1`)
+##     SHAKE-NNN: 0x1F (binary `11111` LE: suffix `1111` then start of pad `1`)
+##
+## - Rate / capacity (FIPS 202 §6):
+##     SHA-3-256 / SHAKE256 share rate=136 bytes, capacity=64 bytes
+##     SHA-3-512               rate=72  bytes, capacity=128
+##     SHAKE128                rate=168 bytes, capacity=32
+##
+## - All buffers are caller-owned; out-buffer first arg, byte-pointer style,
+##   matching the rest of std/core/crypto.
+##
+## Validation gates:
+##
+## - NIST CAVS examples in `spec/qz/sha3_smoke.qz`:
+##   SHA3-256("") / SHA3-256("abc")
+##   SHA3-512("") / SHA3-512("abc")
+##   SHAKE128("", 32) / SHAKE256("", 64)
+##   Streaming = one-shot equivalence on a 1KB random buffer.
+##
+## See:
+## - FIPS 202 https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.202.pdf §3, §4, §6
+## - Keccak specs https://keccak.team/keccak_specs_summary.html
+## - docs/design/MLKEM_DESIGN.md "SHA-3 internals" + "FIPS 202 numerics"
+
+import * from ffi/socket  # malloc/free/memcpy/memset, ptr_read_byte/ptr_write_byte
+
+# =============================================================================
+# u64 ARX helpers — same shape as sha512.qz
+# =============================================================================
+
+# Logical shift right (zero-fill). Quartz `>>` is ashr; mask off the upper
+# n bits so a set bit-63 doesn't sign-extend.
+# Caller guarantees n in [1, 63].
+def _u64_lsr(x: Int, n: Int): Int
+  return (x >> n) & ((1 << (64 - n)) - 1)
+end
+
+# Rotate u64 left by n in [1, 63].
+def _u64_rotl(x: Int, n: Int): Int
+  return (x << n) | _u64_lsr(x, 64 - n)
+end
+
+# Read 8 bytes at p as a little-endian u64 (FIPS 202 §3.1.2 — lanes are LE).
+def _u64_read_le(p: Int): Int
+  var b0 = ptr_read_byte(p)
+  var b1 = ptr_read_byte(p + 1)
+  var b2 = ptr_read_byte(p + 2)
+  var b3 = ptr_read_byte(p + 3)
+  var b4 = ptr_read_byte(p + 4)
+  var b5 = ptr_read_byte(p + 5)
+  var b6 = ptr_read_byte(p + 6)
+  var b7 = ptr_read_byte(p + 7)
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+end
+
+def _u64_write_le(p: Int, v: Int): Void
+  ptr_write_byte(p,     v & 255)
+  ptr_write_byte(p + 1, _u64_lsr(v, 8)  & 255)
+  ptr_write_byte(p + 2, _u64_lsr(v, 16) & 255)
+  ptr_write_byte(p + 3, _u64_lsr(v, 24) & 255)
+  ptr_write_byte(p + 4, _u64_lsr(v, 32) & 255)
+  ptr_write_byte(p + 5, _u64_lsr(v, 40) & 255)
+  ptr_write_byte(p + 6, _u64_lsr(v, 48) & 255)
+  ptr_write_byte(p + 7, _u64_lsr(v, 56) & 255)
+end
+
+# =============================================================================
+# Constants — RC[0..24) round constants + r[x, y] rotation offsets (FIPS 202 §3.2)
+# =============================================================================
+
+# Round constants (ι step). 24 × u64. Lazily initialised LE table.
+var _rc_table: Int = 0
+
+def _ensure_rc_table(): Int
+  if _rc_table != 0
+    return _rc_table
+  end
+  var t = malloc(192)   # 24 × 8 bytes
+  _u64_write_le(t + 0  * 8, 1)                       # 0x0000000000000001
+  _u64_write_le(t + 1  * 8, 32898)                   # 0x0000000000008082
+  _u64_write_le(t + 2  * 8, -9223372036854742902)    # 0x800000000000808A
+  _u64_write_le(t + 3  * 8, -9223372034707259392)    # 0x8000000080008000
+  _u64_write_le(t + 4  * 8, 32907)                   # 0x000000000000808B
+  _u64_write_le(t + 5  * 8, 2147483649)              # 0x0000000080000001
+  _u64_write_le(t + 6  * 8, -9223372034707259263)    # 0x8000000080008081
+  _u64_write_le(t + 7  * 8, -9223372036854743031)    # 0x8000000000008009
+  _u64_write_le(t + 8  * 8, 138)                     # 0x000000000000008A
+  _u64_write_le(t + 9  * 8, 136)                     # 0x0000000000000088
+  _u64_write_le(t + 10 * 8, 2147516425)              # 0x0000000080008009
+  _u64_write_le(t + 11 * 8, 2147483658)              # 0x000000008000000A
+  _u64_write_le(t + 12 * 8, 2147516555)              # 0x000000008000808B
+  _u64_write_le(t + 13 * 8, -9223372036854775669)    # 0x800000000000008B
+  _u64_write_le(t + 14 * 8, -9223372036854742903)    # 0x8000000000008089
+  _u64_write_le(t + 15 * 8, -9223372036854743037)    # 0x8000000000008003
+  _u64_write_le(t + 16 * 8, -9223372036854743038)    # 0x8000000000008002
+  _u64_write_le(t + 17 * 8, -9223372036854775680)    # 0x8000000000000080
+  _u64_write_le(t + 18 * 8, 32778)                   # 0x000000000000800A
+  _u64_write_le(t + 19 * 8, -9223372034707292150)    # 0x800000008000000A
+  _u64_write_le(t + 20 * 8, -9223372034707259263)    # 0x8000000080008081
+  _u64_write_le(t + 21 * 8, -9223372036854742912)    # 0x8000000000008080
+  _u64_write_le(t + 22 * 8, 2147483649)              # 0x0000000080000001
+  _u64_write_le(t + 23 * 8, -9223372034707259384)    # 0x8000000080008008
+  _rc_table = t
+  return t
+end
+
+def _RC(i: Int): Int = _u64_read_le(_rc_table + i * 8)
+
+# Rotation offsets r[x, y] for ρ step, mod 64. FIPS 202 §3.2.2 Table 2.
+# Lane (0,0) is not rotated (r = 0). Indexed as 5·y + x.
+def _rho_offset(x: Int, y: Int): Int
+  var i = 5 * y + x
+  if i == 0  then return 0  end    # (0,0)
+  if i == 1  then return 1  end    # (1,0)
+  if i == 2  then return 62 end    # (2,0)
+  if i == 3  then return 28 end    # (3,0)
+  if i == 4  then return 27 end    # (4,0)
+  if i == 5  then return 36 end    # (0,1)
+  if i == 6  then return 44 end    # (1,1)
+  if i == 7  then return 6  end    # (2,1)
+  if i == 8  then return 55 end    # (3,1)
+  if i == 9  then return 20 end    # (4,1)
+  if i == 10 then return 3  end    # (0,2)
+  if i == 11 then return 10 end    # (1,2)
+  if i == 12 then return 43 end    # (2,2)
+  if i == 13 then return 25 end    # (3,2)
+  if i == 14 then return 39 end    # (4,2)
+  if i == 15 then return 41 end    # (0,3)
+  if i == 16 then return 45 end    # (1,3)
+  if i == 17 then return 15 end    # (2,3)
+  if i == 18 then return 21 end    # (3,3)
+  if i == 19 then return 8  end    # (4,3)
+  if i == 20 then return 18 end    # (0,4)
+  if i == 21 then return 2  end    # (1,4)
+  if i == 22 then return 61 end    # (2,4)
+  if i == 23 then return 56 end    # (3,4)
+  return 14                         # (4,4)
+end
+
+# =============================================================================
+# Keccak-f[1600] permutation
+# =============================================================================
+
+# Read lane A[x, y] from state buffer.
+def _get_lane(state: Int, x: Int, y: Int): Int
+  return _u64_read_le(state + (5 * y + x) * 8)
+end
+
+def _set_lane(state: Int, x: Int, y: Int, v: Int): Void
+  _u64_write_le(state + (5 * y + x) * 8, v)
+end
+
+# One round of Keccak-f[1600]. round_idx in 0..23.
+def _keccak_round(state: Int, round_idx: Int): Void
+  # ----- θ -----
+  # C[x] = A[x,0] ⊕ A[x,1] ⊕ A[x,2] ⊕ A[x,3] ⊕ A[x,4]
+  # D[x] = C[(x-1) mod 5] ⊕ ROTL(C[(x+1) mod 5], 1)
+  # A[x,y] ⊕= D[x]
+  var c = malloc(40)   # 5 × u64
+  var d = malloc(40)
+  var x = 0
+  while x < 5
+    var c_val = _get_lane(state, x, 0) ^ _get_lane(state, x, 1) ^ _get_lane(state, x, 2) ^ _get_lane(state, x, 3) ^ _get_lane(state, x, 4)
+    _u64_write_le(c + x * 8, c_val)
+    x += 1
+  end
+  x = 0
+  while x < 5
+    var xm1 = x - 1
+    if xm1 < 0 then xm1 = 4 end
+    var xp1 = x + 1
+    if xp1 >= 5 then xp1 = 0 end
+    var d_val = _u64_read_le(c + xm1 * 8) ^ _u64_rotl(_u64_read_le(c + xp1 * 8), 1)
+    _u64_write_le(d + x * 8, d_val)
+    x += 1
+  end
+  x = 0
+  while x < 5
+    var d_val = _u64_read_le(d + x * 8)
+    var y = 0
+    while y < 5
+      _set_lane(state, x, y, _get_lane(state, x, y) ^ d_val)
+      y += 1
+    end
+    x += 1
+  end
+  free(c)
+  free(d)
+
+  # ----- ρ then π (fused — read source lane, rotate, write to permuted destination) -----
+  # ρ:   A[x,y] = ROTL(A[x,y], r[x,y])
+  # π:   A'[y, (2x+3y) mod 5] = A[x, y]
+  # We need a scratch buffer because π reads from one position and writes
+  # to another that we may also need to read.
+  var b = malloc(200)
+  x = 0
+  while x < 5
+    var y = 0
+    while y < 5
+      var rotated = _u64_rotl(_get_lane(state, x, y), _rho_offset(x, y))
+      var dst_x = y
+      var dst_y = (2 * x + 3 * y) % 5
+      _u64_write_le(b + (5 * dst_y + dst_x) * 8, rotated)
+      y += 1
+    end
+    x += 1
+  end
+  memcpy(state, b, 200)
+  free(b)
+
+  # ----- χ -----
+  # A[x,y] = A[x,y] ⊕ ((¬A[(x+1) mod 5, y]) ∧ A[(x+2) mod 5, y])
+  # Process row-by-row; cache the row first so the in-place writes don't
+  # corrupt the read pattern.
+  var row = malloc(40)
+  var y = 0
+  while y < 5
+    var xi = 0
+    while xi < 5
+      _u64_write_le(row + xi * 8, _get_lane(state, xi, y))
+      xi += 1
+    end
+    xi = 0
+    while xi < 5
+      var a_x  = _u64_read_le(row + xi * 8)
+      var x_p1 = xi + 1
+      if x_p1 >= 5 then x_p1 = x_p1 - 5 end
+      var x_p2 = xi + 2
+      if x_p2 >= 5 then x_p2 = x_p2 - 5 end
+      var a_p1 = _u64_read_le(row + x_p1 * 8)
+      var a_p2 = _u64_read_le(row + x_p2 * 8)
+      _set_lane(state, xi, y, a_x ^ ((~a_p1) & a_p2))
+      xi += 1
+    end
+    y += 1
+  end
+  free(row)
+
+  # ----- ι -----
+  # A[0,0] ⊕= RC[round_idx]
+  _set_lane(state, 0, 0, _get_lane(state, 0, 0) ^ _RC(round_idx))
+end
+
+# Full 24-round Keccak-f[1600].
+def _keccak_f(state: Int): Void
+  var i = 0
+  while i < 24
+    _keccak_round(state, i)
+    i += 1
+  end
+end
+
+# =============================================================================
+# Sponge context — single unified struct, parameterised by rate + domain
+# =============================================================================
+#
+# Context layout (408 bytes):
+#
+#   offset 0..200      Keccak state (5×5 LE u64 lanes)
+#   offset 200..368    partial block buffer (up to 168 bytes — SHAKE128's rate)
+#   offset 368..376    buflen (Int)        — bytes currently in partial buffer
+#   offset 376..384    rate (Int)          — bytes; 72/136/168
+#   offset 384..392    domain (Int)        — 0x06 (SHA-3) / 0x1F (SHAKE)
+#   offset 392..400    phase (Int)         — 0 absorbing, 1 squeezing
+#   offset 400..408    squeeze_pos (Int)   — bytes consumed from current rate block
+
+def _CTX_SIZE(): Int = 408
+def _OFF_STATE(): Int = 0
+def _OFF_BUF(): Int = 200
+def _OFF_BUFLEN(): Int = 368
+def _OFF_RATE(): Int = 376
+def _OFF_DOMAIN(): Int = 384
+def _OFF_PHASE(): Int = 392
+def _OFF_SQZPOS(): Int = 400
+
+def _ctx_buflen(ctx: Int): Int = _u64_read_le(ctx + _OFF_BUFLEN())
+def _ctx_set_buflen(ctx: Int, v: Int): Void = _u64_write_le(ctx + _OFF_BUFLEN(), v)
+def _ctx_rate(ctx: Int): Int = _u64_read_le(ctx + _OFF_RATE())
+def _ctx_set_rate(ctx: Int, v: Int): Void = _u64_write_le(ctx + _OFF_RATE(), v)
+def _ctx_domain(ctx: Int): Int = _u64_read_le(ctx + _OFF_DOMAIN())
+def _ctx_set_domain(ctx: Int, v: Int): Void = _u64_write_le(ctx + _OFF_DOMAIN(), v)
+def _ctx_phase(ctx: Int): Int = _u64_read_le(ctx + _OFF_PHASE())
+def _ctx_set_phase(ctx: Int, v: Int): Void = _u64_write_le(ctx + _OFF_PHASE(), v)
+def _ctx_sqzpos(ctx: Int): Int = _u64_read_le(ctx + _OFF_SQZPOS())
+def _ctx_set_sqzpos(ctx: Int, v: Int): Void = _u64_write_le(ctx + _OFF_SQZPOS(), v)
+
+# Allocate + zero-initialise a sponge context for the given (rate, domain) pair.
+def _ctx_new(rate: Int, domain: Int): Int
+  _ensure_rc_table()
+  var ctx = malloc(_CTX_SIZE())
+  memset(ctx, 0, _CTX_SIZE())
+  _ctx_set_rate(ctx, rate)
+  _ctx_set_domain(ctx, domain)
+  return ctx
+end
+
+# Absorb `n` bytes from `src` into the sponge. Idempotent on phase=absorbing.
+def _ctx_absorb(ctx: Int, src: Int, n: Int): Void
+  var state = ctx + _OFF_STATE()
+  var buf = ctx + _OFF_BUF()
+  var rate = _ctx_rate(ctx)
+  var buflen = _ctx_buflen(ctx)
+
+  var p = src
+  var remaining = n
+
+  # Top up the partial block buffer.
+  if buflen > 0
+    var want = rate - buflen
+    if want > remaining
+      want = remaining
+    end
+    memcpy(buf + buflen, p, want)
+    buflen = buflen + want
+    p = p + want
+    remaining = remaining - want
+    if buflen == rate
+      # XOR partial buffer into state, permute.
+      var i = 0
+      while i < rate
+        var byte_p = buf + i
+        var lane_idx = i / 8
+        var byte_idx = i - lane_idx * 8
+        var lane_p = state + lane_idx * 8
+        var cur = ptr_read_byte(lane_p + byte_idx)
+        ptr_write_byte(lane_p + byte_idx, cur ^ ptr_read_byte(byte_p))
+        i += 1
+      end
+      _keccak_f(state)
+      buflen = 0
+    end
+  end
+
+  # Process full rate-blocks directly from input.
+  while remaining >= rate
+    var i = 0
+    while i < rate
+      var lane_idx = i / 8
+      var byte_idx = i - lane_idx * 8
+      var lane_p = state + lane_idx * 8
+      var cur = ptr_read_byte(lane_p + byte_idx)
+      ptr_write_byte(lane_p + byte_idx, cur ^ ptr_read_byte(p + i))
+      i += 1
+    end
+    _keccak_f(state)
+    p = p + rate
+    remaining = remaining - rate
+  end
+
+  # Stash the tail.
+  if remaining > 0
+    memcpy(buf + buflen, p, remaining)
+    buflen = buflen + remaining
+  end
+
+  _ctx_set_buflen(ctx, buflen)
+end
+
+# Transition from absorbing to squeezing: apply pad10*1 + domain separator,
+# permute. After this, _ctx_squeeze can be called.
+def _ctx_finalize_absorb(ctx: Int): Void
+  var state = ctx + _OFF_STATE()
+  var buf = ctx + _OFF_BUF()
+  var rate = _ctx_rate(ctx)
+  var domain = _ctx_domain(ctx)
+  var buflen = _ctx_buflen(ctx)
+
+  # Zero-fill the remainder of the partial buffer (it may already have data).
+  memset(buf + buflen, 0, rate - buflen)
+  # XOR the domain-separator byte at the next free offset (start of pad10*1).
+  ptr_write_byte(buf + buflen, ptr_read_byte(buf + buflen) ^ domain)
+  # XOR 0x80 at the last byte of the rate block (trailing pad10*1 bit).
+  ptr_write_byte(buf + rate - 1, ptr_read_byte(buf + rate - 1) ^ 128)
+
+  # Absorb the padded block into state.
+  var i = 0
+  while i < rate
+    var lane_idx = i / 8
+    var byte_idx = i - lane_idx * 8
+    var lane_p = state + lane_idx * 8
+    var cur = ptr_read_byte(lane_p + byte_idx)
+    ptr_write_byte(lane_p + byte_idx, cur ^ ptr_read_byte(buf + i))
+    i += 1
+  end
+  _keccak_f(state)
+
+  _ctx_set_buflen(ctx, 0)
+  _ctx_set_phase(ctx, 1)
+  _ctx_set_sqzpos(ctx, 0)
+end
+
+# Squeeze `n` bytes from the sponge into `out`. May be called repeatedly.
+def _ctx_squeeze(ctx: Int, out: Int, n: Int): Void
+  var state = ctx + _OFF_STATE()
+  var rate = _ctx_rate(ctx)
+  var sqzpos = _ctx_sqzpos(ctx)
+
+  var dst = out
+  var remaining = n
+
+  while remaining > 0
+    if sqzpos >= rate
+      _keccak_f(state)
+      sqzpos = 0
+    end
+    var avail = rate - sqzpos
+    var take = avail
+    if take > remaining
+      take = remaining
+    end
+    # Copy state bytes [sqzpos .. sqzpos+take) into dst.
+    var i = 0
+    while i < take
+      var byte_off = sqzpos + i
+      var lane_idx = byte_off / 8
+      var byte_idx = byte_off - lane_idx * 8
+      ptr_write_byte(dst + i, ptr_read_byte(state + lane_idx * 8 + byte_idx))
+      i += 1
+    end
+    dst = dst + take
+    remaining = remaining - take
+    sqzpos = sqzpos + take
+  end
+
+  _ctx_set_sqzpos(ctx, sqzpos)
+end
+
+# =============================================================================
+# SHA-3-256 — rate 136, output 32 bytes, domain 0x06
+# =============================================================================
+
+def sha3_256_new(): Int = _ctx_new(136, 6)
+
+def sha3_256_update(ctx: Int, input: Int, input_len: Int): Void
+  _ctx_absorb(ctx, input, input_len)
+end
+
+def sha3_256_finalize(ctx: Int, output_32: Int): Void
+  _ctx_finalize_absorb(ctx)
+  _ctx_squeeze(ctx, output_32, 32)
+  free(ctx)
+end
+
+def sha3_256(input: Int, input_len: Int, output_32: Int): Void
+  var ctx = sha3_256_new()
+  sha3_256_update(ctx, input, input_len)
+  sha3_256_finalize(ctx, output_32)
+end
+
+# =============================================================================
+# SHA-3-512 — rate 72, output 64 bytes, domain 0x06
+# =============================================================================
+
+def sha3_512_new(): Int = _ctx_new(72, 6)
+
+def sha3_512_update(ctx: Int, input: Int, input_len: Int): Void
+  _ctx_absorb(ctx, input, input_len)
+end
+
+def sha3_512_finalize(ctx: Int, output_64: Int): Void
+  _ctx_finalize_absorb(ctx)
+  _ctx_squeeze(ctx, output_64, 64)
+  free(ctx)
+end
+
+def sha3_512(input: Int, input_len: Int, output_64: Int): Void
+  var ctx = sha3_512_new()
+  sha3_512_update(ctx, input, input_len)
+  sha3_512_finalize(ctx, output_64)
+end
+
+# =============================================================================
+# SHAKE128 — rate 168, XOF, domain 0x1F
+# =============================================================================
+
+def shake128_new(): Int = _ctx_new(168, 31)
+
+def shake128_absorb(ctx: Int, input: Int, input_len: Int): Void
+  _ctx_absorb(ctx, input, input_len)
+end
+
+def shake128_finalize_absorb(ctx: Int): Void = _ctx_finalize_absorb(ctx)
+
+def shake128_squeeze(ctx: Int, output: Int, output_len: Int): Void
+  _ctx_squeeze(ctx, output, output_len)
+end
+
+def shake128_free(ctx: Int): Void = free(ctx)
+
+def shake128(input: Int, input_len: Int, output: Int, output_len: Int): Void
+  var ctx = shake128_new()
+  shake128_absorb(ctx, input, input_len)
+  shake128_finalize_absorb(ctx)
+  shake128_squeeze(ctx, output, output_len)
+  shake128_free(ctx)
+end
+
+# =============================================================================
+# SHAKE256 — rate 136, XOF, domain 0x1F
+# =============================================================================
+
+def shake256_new(): Int = _ctx_new(136, 31)
+
+def shake256_absorb(ctx: Int, input: Int, input_len: Int): Void
+  _ctx_absorb(ctx, input, input_len)
+end
+
+def shake256_finalize_absorb(ctx: Int): Void = _ctx_finalize_absorb(ctx)
+
+def shake256_squeeze(ctx: Int, output: Int, output_len: Int): Void
+  _ctx_squeeze(ctx, output, output_len)
+end
+
+def shake256_free(ctx: Int): Void = free(ctx)
+
+def shake256(input: Int, input_len: Int, output: Int, output_len: Int): Void
+  var ctx = shake256_new()
+  shake256_absorb(ctx, input, input_len)
+  shake256_finalize_absorb(ctx)
+  shake256_squeeze(ctx, output, output_len)
+  shake256_free(ctx)
+end

@@ -1,0 +1,829 @@
+## Safety Adversarial Tests
+##
+## Cross-cutting tests that probe interactions between move semantics, borrows,
+## lifetimes, NLL, partial moves, and Drop. These tests target the gaps between
+## isolated feature tests — real bugs live at the intersections.
+##
+## Known bugs found during adversarial testing:
+##   1. FIXED: Move+Borrow interaction not checked (tc_move_value, tc_move_on_call)
+##   2. FIXED: Move inside while-loop body not detected (no move state snapshot)
+##   3. FIXED: Re-initialization after move doesn't clear moved state (NODE_LET)
+##   4. FIXED: MIR emits drop for consumed temporaries in expr stmts
+##   5. TRACKED: `def method(): Void = return` in trait def causes compiler hang
+##      (endless def with explicit `return` + Void return type — block form works)
+##
+## Contract:
+##   1. Move+borrow: interaction.
+##   2. Moves in loops.
+##   3. Conditional moves: complex control flow.
+##   4. Borrow+mutation: interactions.
+##   5. Drop+move+return: interaction.
+##   6. Re-initialization after move.
+##   7. Lifetime: scope edge cases.
+##   8. Multi-level borrow + NLL.
+##   9. Parser recovery: hang prevention.
+##   10. Drop: consumed temporaries.
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  # ===========================================================================
+  # Category A: Move + Borrow Interaction
+  # ===========================================================================
+  describe("move+borrow: interaction") do ->
+    it("move of a borrowed value is rejected (QZ1212)") do ->
+      assert_compile_error("""
+        trait Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        struct Res
+          x: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        def consume(r: Res): Int = r.x
+        def main(): Int
+          var a = Res { x: 1 }
+          var r = &a
+          var b = a
+          return 0
+        end
+        """, "QZ1212")
+    end
+
+    it("borrow of a moved value is rejected (QZ1212)") do ->
+      assert_compile_error("""
+        trait Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        struct Res
+          x: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        def consume(r: Res): Int = r.x
+        def main(): Int
+          var a = Res { x: 1 }
+          var b = a
+          var r = &a
+          return 0
+        end
+        """, "QZ1212")
+    end
+
+    it("move after NLL-released borrow is allowed") do ->
+      assert_run_exits("""
+        trait Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        struct Res
+          x: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        def observe(r: Int): Int = r
+        def consume(r: Res): Int = r.x
+        def main(): Int
+          var a = Res { x: 42 }
+          var r = &a
+          var v = r + 0
+          ## r's last use is above — NLL should release the borrow
+          return consume(a)
+        end
+        """, 42)
+    end
+
+    it("&mut borrow then move is rejected") do ->
+      assert_compile_error("""
+        trait Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        struct Res
+          x: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        def consume(r: Res): Int = r.x
+        def main(): Int
+          var a = Res { x: 1 }
+          var r = &mut a
+          var b = a
+          return 0
+        end
+        """, "QZ1212")
+    end
+  end
+
+  # ===========================================================================
+  # Category B: Moves in Loops
+  # ===========================================================================
+  describe("moves in loops") do ->
+    it("move inside while loop body is rejected on second iteration") do ->
+      assert_compile_error("""
+        trait Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        struct Res
+          x: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        def consume(r: Res): Int = r.x
+        def main(): Int
+          var a = Res { x: 1 }
+          var i = 0
+          while i < 3
+            consume(a)
+            i += 1
+          end
+          return 0
+        end
+        """, "QZ1212")
+    end
+
+    it("move before loop, use in loop body is rejected") do ->
+      assert_compile_error("""
+        trait Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        struct Res
+          x: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        def consume(r: Res): Int = r.x
+        def use_res(r: Res): Int = r.x
+        def main(): Int
+          var a = Res { x: 1 }
+          var b = a
+          var i = 0
+          while i < 3
+            use_res(a)
+            i += 1
+          end
+          return 0
+        end
+        """, "QZ1212")
+    end
+
+    it("borrow inside loop, mutation after loop is allowed via NLL") do ->
+      assert_run_exits("""
+        def observe(v: Int): Int = v
+        def main(): Int
+          var x = 10
+          var i = 0
+          while i < 3
+            var r = &x
+            var v = r + 0
+            i += 1
+          end
+          x = 99
+          return x
+        end
+        """, 99)
+    end
+
+    it("borrow created in loop body escapes scope") do ->
+      assert_compile_error("""
+        def main(): Int
+          var r = 0
+          var i = 0
+          while i < 1
+            var local = 42
+            r = &local
+            i += 1
+          end
+          var v = r + 0
+          return v
+        end
+        """, "borrow")
+    end
+  end
+
+  # ===========================================================================
+  # Category C: Conditional Moves with Complex Control Flow
+  # ===========================================================================
+  describe("conditional moves: complex control flow") do ->
+    it("move in both if and else branches is OK") do ->
+      assert_run_exits("""
+        trait Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        struct Res
+          x: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        def consume(r: Res): Int = r.x
+        def main(): Int
+          var a = Res { x: 42 }
+          if 1
+            return consume(a)
+          else
+            return consume(a)
+          end
+        end
+        """, 42)
+    end
+
+    it("move in if-only (no else) is rejected") do ->
+      assert_compile_error("""
+        trait Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        struct Res
+          x: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        def consume(r: Res): Int = r.x
+        def use_res(r: Res): Int = r.x
+        def main(): Int
+          var a = Res { x: 1 }
+          if 1
+            consume(a)
+          end
+          use_res(a)
+          return 0
+        end
+        """, "QZ1214")
+    end
+
+    it("different fields moved in different branches is rejected") do ->
+      assert_compile_error("""
+        trait Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        struct Res
+          x: Int
+          y: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        def consume(v: Int): Int = v
+        def use_res(r: Res): Int = r.x
+        def main(): Int
+          var a = Res { x: 1, y: 2 }
+          if 1
+            consume(a.x)
+          else
+            consume(a.y)
+          end
+          use_res(a)
+          return 0
+        end
+        """, "QZ1216")
+    end
+
+    it("move in nested if preserves correctness") do ->
+      assert_compile_error("""
+        trait Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        struct Res
+          x: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        def consume(r: Res): Int = r.x
+        def use_res(r: Res): Int = r.x
+        def main(): Int
+          var a = Res { x: 1 }
+          if 1
+            if 1
+              consume(a)
+            end
+          end
+          use_res(a)
+          return 0
+        end
+        """, "QZ1214")
+    end
+  end
+
+  # ===========================================================================
+  # Category D: Borrow + Mutation Interaction
+  # ===========================================================================
+  describe("borrow+mutation: interactions") do ->
+    it("mutation between two shared borrows is rejected") do ->
+      assert_compile_error("""
+        def observe(v: Int): Int = v
+        def main(): Int
+          var x = 10
+          var r1 = &x
+          x = 20
+          var r2 = &x
+          return r1 + r2
+        end
+        """, "QZ1209")
+    end
+
+    it("compound assignment while borrowed is rejected") do ->
+      assert_compile_error("""
+        def observe(v: Int): Int = v
+        def main(): Int
+          var x = 10
+          var r = &x
+          x += 5
+          return r + 0
+        end
+        """, "QZ1209")
+    end
+
+    it("reassignment releases old borrow, new borrow OK") do ->
+      assert_run_exits("""
+        def observe(v: Int): Int = v
+        def main(): Int
+          var x = 10
+          var r = &x
+          var v = r + 0
+          x = 20
+          var r2 = &x
+          return r2 + 0
+        end
+        """, 20)
+    end
+
+    it("multiple shared borrows then &mut is rejected") do ->
+      assert_compile_error("""
+        def observe(v: Int): Int = v
+        def main(): Int
+          var x = 10
+          var r1 = &x
+          var r2 = &x
+          var r3 = &mut x
+          return 0
+        end
+        """, "QZ1206")
+    end
+  end
+
+  # ===========================================================================
+  # Category D2: Borrow-local escape via field-store / index-store (QZ1210)
+  # A borrow-local (`var r = &mut x`) that escapes indirectly through a
+  # field store (`b.p = r`) or an index store (`a[i] = r`) is rejected —
+  # the same mechanism as the return-sink QZ1210, extended to these sinks.
+  # Depth-1 only: r must directly name a borrow-local.
+  # ===========================================================================
+  describe("borrow-local escape via field/index store") do ->
+    it("field-store of a borrow-local is rejected (QZ1210)") do ->
+      assert_compile_error("""
+        struct Box
+          p: Int
+        end
+        def stash(b: Box): Void
+          var x = 5
+          var r = &mut x
+          b.p = r
+        end
+        def main(): Int
+          return 0
+        end
+        """, "QZ1210")
+    end
+
+    it("index-store of a borrow-local is rejected (QZ1210)") do ->
+      assert_compile_error("""
+        def stash(a: Vec<Int>): Void
+          var x = 5
+          var r = &mut x
+          a[0] = r
+        end
+        def main(): Int
+          return 0
+        end
+        """, "QZ1210")
+    end
+
+    it("return of a borrow-local is still rejected (QZ1210, unchanged)") do ->
+      assert_compile_error("""
+        def bad(): Int
+          var x = 5
+          var r = &mut x
+          return r
+        end
+        def main(): Int
+          return bad()
+        end
+        """, "QZ1210")
+    end
+
+    it("borrow-local used and dying in-scope, returning a value, compiles") do ->
+      assert_run_exits("""
+        def compute(): Int
+          var x = 5
+          var r = &mut x
+          var v = r + 1
+          return v
+        end
+        def main(): Int
+          return compute()
+        end
+        """, 6)
+    end
+  end
+
+  # ===========================================================================
+  # Category E: Drop + Move + Return Interaction
+  # ===========================================================================
+  describe("drop+move+return: interaction") do ->
+    it("moved value is not double-dropped") do ->
+      assert_run_exits("""
+        var drop_count = 0
+        trait Drop
+          def drop(self: Int): Void
+            drop_count = drop_count + 1
+            return
+          end
+        end
+        struct Res
+          x: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            drop_count = drop_count + 1
+            return
+          end
+        end
+        def consume(r: Res): Int = r.x
+        def main(): Int
+          var a = Res { x: 1 }
+          consume(a)
+          return drop_count
+        end
+        """, 1)
+    end
+
+    it("return transfers ownership, no drop at caller") do ->
+      assert_run_exits("""
+        var drop_count = 0
+        trait Drop
+          def drop(self: Int): Void
+            drop_count = drop_count + 1
+            return
+          end
+        end
+        struct Res
+          x: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            drop_count = drop_count + 1
+            return
+          end
+        end
+        def make(): Res = Res { x: 42 }
+        def main(): Int
+          var r = make()
+          return r.x + drop_count
+        end
+        """, 42)
+    end
+
+    it("droppable in while loop body dropped once per iteration") do ->
+      assert_run_exits("""
+        var drop_count = 0
+        trait Drop
+          def drop(self: Int): Void
+            drop_count = drop_count + 1
+            return
+          end
+        end
+        struct Res
+          x: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            drop_count = drop_count + 1
+            return
+          end
+        end
+        def main(): Int
+          var i = 0
+          while i < 3
+            var r = Res { x: i }
+            i += 1
+          end
+          return drop_count
+        end
+        """, 3)
+    end
+
+    it("break from scope with droppable drops once") do ->
+      assert_run_exits("""
+        var drop_count = 0
+        trait Drop
+          def drop(self: Int): Void
+            drop_count = drop_count + 1
+            return
+          end
+        end
+        struct Res
+          x: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            drop_count = drop_count + 1
+            return
+          end
+        end
+        def main(): Int
+          var i = 0
+          while i < 5
+            var r = Res { x: i }
+            if i == 0
+              break
+            end
+            i += 1
+          end
+          return drop_count
+        end
+        """, 1)
+    end
+
+    it("value not consumed in all match arms drops correctly") do ->
+      assert_run_exits("""
+        var drop_count = 0
+        trait Drop
+          def drop(self: Int): Void
+            drop_count = drop_count + 1
+            return
+          end
+        end
+        struct Res
+          x: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            drop_count = drop_count + 1
+            return
+          end
+        end
+        def main(): Int
+          var a = Res { x: 1 }
+          match 1
+            1 => puts("one")
+            _ => puts("other")
+          end
+          ## a should be dropped at end of function
+          return drop_count
+        end
+        """, 0)
+    end
+  end
+
+  # ===========================================================================
+  # Category F: Re-initialization After Move
+  # ===========================================================================
+  describe("re-initialization after move") do ->
+    it("re-assigned variable is usable after move") do ->
+      assert_run_exits("""
+        trait Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        struct Res
+          x: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        def consume(r: Res): Int = r.x
+        def main(): Int
+          var a = Res { x: 10 }
+          consume(a)
+          a = Res { x: 42 }
+          return consume(a)
+        end
+        """, 42)
+    end
+
+    it("use before re-initialization is still rejected") do ->
+      assert_compile_error("""
+        trait Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        struct Res
+          x: Int
+        end
+        extend Res with Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        def consume(r: Res): Int = r.x
+        def use_res(r: Res): Int = r.x
+        def main(): Int
+          var a = Res { x: 10 }
+          consume(a)
+          use_res(a)
+          a = Res { x: 42 }
+          return 0
+        end
+        """, "QZ1212")
+    end
+  end
+
+  # ===========================================================================
+  # Category G: Scope-Based Lifetime Edge Cases
+  # ===========================================================================
+  describe("lifetime: scope edge cases") do ->
+    it("borrow from outer scope used in inner scope is OK") do ->
+      assert_run_exits("""
+        def observe(v: Int): Int = v
+        def main(): Int
+          var x = 42
+          var r = &x
+          if 1
+            return r + 0
+          end
+          return 0
+        end
+        """, 42)
+    end
+
+    it("return borrow of local is rejected (QZ1210)") do ->
+      assert_compile_error("""
+        def bad(): Int
+          var local = 42
+          return &local
+        end
+        def main(): Int
+          return bad()
+        end
+        """, "QZ1210")
+    end
+
+    it("borrow of function parameter is allowed (outlives callee)") do ->
+      assert_run_exits("""
+        def observe(v: Int): Int
+          var r = &v
+          return r + 0
+        end
+        def main(): Int
+          return observe(42)
+        end
+        """, 42)
+    end
+  end
+
+  # ===========================================================================
+  # Category H: Multi-Level Borrow + NLL
+  # ===========================================================================
+  describe("multi-level borrow + NLL") do ->
+    it("re-borrow released by NLL allows ancestor mutation") do ->
+      assert_run_exits("""
+        def observe(v: Int): Int = v
+        def main(): Int
+          var x = 10
+          var r1 = &x
+          var r2 = &r1
+          var v2 = r2 + 0
+          ## r2 last use above, r1 still live but NLL should handle chain release
+          ## After r2's last use, r1's borrow chain should be unwound
+          var v1 = r1 + 0
+          ## Now r1's last use is here
+          x = 42
+          return x
+        end
+        """, 42)
+    end
+
+    it("re-borrow keeps ancestor protected while live") do ->
+      assert_compile_error("""
+        def observe(v: Int): Int = v
+        def main(): Int
+          var x = 10
+          var r1 = &x
+          var r2 = &r1
+          x = 20
+          var v = r2 + 0
+          return 0
+        end
+        """, "QZ1209")
+    end
+  end
+
+  # ===========================================================================
+  # Category I: Parser Recovery — Compiler Hang Prevention
+  # ===========================================================================
+  describe("parser recovery: hang prevention") do ->
+    it("trait with endless def return does not hang (emits error)") do ->
+      assert_compile_error("""
+        trait Foo
+          def method(): Void = return
+        end
+        def main(): Int
+          return 0
+        end
+        """, "return")
+    end
+
+    it("impl with endless def return does not hang (emits error)") do ->
+      assert_compile_error("""
+        trait Bar
+          def bar(): Void
+        end
+        struct S
+          x: Int
+        end
+        extend S with Bar
+          def bar(): Void = return
+        end
+        def main(): Int
+          return 0
+        end
+        """, "return")
+    end
+  end
+
+  # ===========================================================================
+  # Category J: Drop for Consumed Temporaries
+  # ===========================================================================
+  describe("drop: consumed temporaries") do ->
+    it("temporary struct with Drop in expr stmt is dropped") do ->
+      assert_run_exits("""
+        var drop_count = 0
+        trait Drop
+          def drop(self: Int): Void
+            return
+          end
+        end
+        struct Tmp
+          x: Int
+        end
+        extend Tmp with Drop
+          def drop(self: Int): Void
+            drop_count = drop_count + 1
+            return
+          end
+        end
+        def make_tmp(): Tmp = Tmp { x: 1 }
+        def main(): Int
+          if 1
+            make_tmp()
+          end
+          return drop_count
+        end
+        """, 1)
+    end
+  end
+
+  return qspec_main()
+end

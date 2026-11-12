@@ -1,0 +1,2151 @@
+## NET.1 Phase 1 Step 2.1 smoke test — WireGuard handshake driver.
+##
+## Loopback exercise of `std/net/wireguard/{peer,session,handshake}.qz`:
+##
+##   1. Generate two static keypairs (initiator + responder).
+##   2. Initiator builds a 148-byte MSG_INITIATION with `wg_create_initiation`.
+##   3. Responder consumes it, recovers initiator's pubkey + timestamp +
+##      sender_index.
+##   4. Responder builds a 92-byte MSG_RESPONSE with `wg_create_response`.
+##   5. Initiator consumes it (verifies receiver_index == its local_index).
+##   6. `wg_finalize_session` on both sides produces matching swapped Sessions.
+##   7. AEAD round-trip under the derived transport keys recovers plaintext.
+##
+## Negative paths:
+##   - MAC1 tampering → wg_consume_initiation returns -1.
+##   - Wrong receiver_index in MSG_RESPONSE → wg_consume_response returns -1.
+##   - Wrong type byte → both consume paths return -1.
+##   - PSK mismatch → wg_consume_response returns -1 (msg.empty AEAD fail).
+##
+## Standalone (not qspec): qspec doesn't link extra C libraries — see
+## `quake wg:smoke` for the full build pipeline.
+##
+## Run on success: prints one "PASS:" line per check, exits 0.
+## Run on failure: prints "FAIL: <what>" + diagnostics, exits 1.
+
+import std/core/crypto/chacha20poly1305
+import std/core/crypto/curve25519
+import * from std/core/crypto/secret  # Secret<Int> + secret_wrap (NET.4.1)
+import std/crypto/noise
+import std/crypto/rng
+import std/net/wireguard/peer
+import std/net/wireguard/session
+import std/net/wireguard/handshake
+import std/net/wireguard/transport
+import std/net/wireguard/timers
+import std/net/wireguard/device
+import * from ffi/socket  # malloc/free/memcpy/memset
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def bytes_eq(a: Int, b: Int, len: Int): Int
+  var i = 0
+  while i < len
+    if ptr_read_byte(a + i) != ptr_read_byte(b + i)
+      return 0
+    end
+    i += 1
+  end
+  return 1
+end
+
+# =============================================================================
+# Test cases
+# =============================================================================
+
+## Loopback: a full handshake produces matching swapped transport keys, an
+## AEAD round-trip recovers plaintext, and the Session struct holds the right
+## indices on both sides.
+def test_wg_handshake_loopback(): Int
+  var rng = rng_new()
+
+  # Static keypairs.
+  var i_priv = malloc(32)
+  var i_pub = malloc(32)
+  var r_priv = malloc(32)
+  var r_pub = malloc(32)
+  rng_fill(rng, i_priv, 32)
+  rng_fill(rng, r_priv, 32)
+  x25519_secret_to_public(i_pub, secret_wrap(i_priv))
+  x25519_secret_to_public(r_pub, secret_wrap(r_priv))
+
+  # Shared PSK (zeros for "no PSK" — same on both sides).
+  var psk = malloc(32)
+  memset(psk, 0, 32)
+
+  # Initiator-chosen TAI64N + local index.
+  var ts = malloc(12)
+  memset(ts, 0, 12)
+  var i_local_index = 0xCAFEBABE
+  var r_local_index = 0xDEADBEEF
+
+  # Initiator: build initiation packet.
+  var i_state = noise_handshake_new()
+  var msg_init = malloc(148)
+  var rc1 = wg_create_initiation(i_state, rng, secret_wrap(i_priv), i_pub, r_pub,
+                                 i_local_index, ts, msg_init)
+  if rc1 != 0
+    eputs("FAIL: wg_create_initiation rc=#{rc1}")
+    return 0
+  end
+
+  # Responder: consume initiation. Recovers initiator's pubkey + ts + index.
+  var r_state = noise_handshake_new()
+  var seen_i_pub = malloc(32)
+  var seen_ts = malloc(12)
+  var seen_i_index_buf = malloc(4)
+  var rc2 = wg_consume_initiation(r_state, secret_wrap(r_priv), r_pub, msg_init,
+                                  seen_i_pub, seen_ts, seen_i_index_buf)
+  if rc2 != 0
+    eputs("FAIL: wg_consume_initiation rc=#{rc2}")
+    return 0
+  end
+
+  if bytes_eq(seen_i_pub, i_pub, 32) != 1
+    eputs("FAIL: responder decoded wrong initiator pubkey")
+    return 0
+  end
+
+  # Responder's view of initiator's sender_index (stored LE in 4 bytes).
+  var seen_i_index = ptr_read_byte(seen_i_index_buf) +
+                     (ptr_read_byte(seen_i_index_buf + 1) * 256) +
+                     (ptr_read_byte(seen_i_index_buf + 2) * 65536) +
+                     (ptr_read_byte(seen_i_index_buf + 3) * 16777216)
+  if seen_i_index != i_local_index
+    eputs("FAIL: responder saw sender_index=#{seen_i_index}, expected #{i_local_index}")
+    return 0
+  end
+
+  # Responder: build response packet.
+  var msg_resp = malloc(92)
+  var rc3 = wg_create_response(r_state, rng, seen_i_pub, secret_wrap(psk),
+                               r_local_index, seen_i_index, msg_resp)
+  if rc3 != 0
+    eputs("FAIL: wg_create_response rc=#{rc3}")
+    return 0
+  end
+
+  # Initiator: consume response.
+  var seen_r_index_buf = malloc(4)
+  var rc4 = wg_consume_response(i_state, secret_wrap(i_priv), i_pub, secret_wrap(psk), msg_resp,
+                                i_local_index, seen_r_index_buf)
+  if rc4 != 0
+    eputs("FAIL: wg_consume_response rc=#{rc4}")
+    return 0
+  end
+
+  var seen_r_index = ptr_read_byte(seen_r_index_buf) +
+                     (ptr_read_byte(seen_r_index_buf + 1) * 256) +
+                     (ptr_read_byte(seen_r_index_buf + 2) * 65536) +
+                     (ptr_read_byte(seen_r_index_buf + 3) * 16777216)
+  if seen_r_index != r_local_index
+    eputs("FAIL: initiator saw responder sender_index=#{seen_r_index}, expected #{r_local_index}")
+    return 0
+  end
+
+  # Finalize sessions on both sides.
+  var i_session = wg_finalize_session(i_state, 1, i_local_index, seen_r_index, 100000)
+  var r_session = wg_finalize_session(r_state, 0, r_local_index, seen_i_index, 100000)
+
+  # Verify swapped key match: i_session.t_send == r_session.t_recv,
+  # and i_session.t_recv == r_session.t_send.
+  var ok_split = 0
+  if bytes_eq(session_t_send(i_session), session_t_recv(r_session), 32) == 1 and
+     bytes_eq(session_t_recv(i_session), session_t_send(r_session), 32) == 1
+    ok_split = 1
+    puts("PASS: wg — handshake derives matching swapped Session transport keys")
+  else
+    eputs("FAIL: Session t_send/t_recv split mismatch")
+  end
+
+  # Session identity fields.
+  if i_session.local_index != i_local_index or i_session.peer_index != r_local_index
+    eputs("FAIL: i_session indices wrong")
+    ok_split = 0
+  end
+  if r_session.local_index != r_local_index or r_session.peer_index != i_local_index
+    eputs("FAIL: r_session indices wrong")
+    ok_split = 0
+  end
+
+  # AEAD round-trip: initiator encrypts under its t_send; responder decrypts
+  # under its t_recv (== initiator's t_send).
+  var pt = malloc(64)
+  var idx = 0
+  while idx < 64
+    ptr_write_byte(pt + idx, idx & 255)
+    idx += 1
+  end
+  var ct = malloc(64)
+  var tag = malloc(16)
+  var dec = malloc(64)
+  var nonce = malloc(12)
+  memset(nonce, 0, 12)
+  chacha20poly1305_encrypt(ct, tag, pt, 64, 0, 0, secret_wrap(session_t_send(i_session)), nonce)
+  var dec_rc = chacha20poly1305_decrypt(dec, ct, 64, 0, 0,
+                                        secret_wrap(session_t_recv(r_session)), nonce, tag)
+  var ok_aead = 0
+  if dec_rc == 0 and bytes_eq(pt, dec, 64) == 1
+    ok_aead = 1
+    puts("PASS: wg — Session-keyed AEAD round-trip recovers plaintext")
+  else
+    eputs("FAIL: Session-keyed AEAD round-trip (rc=#{dec_rc})")
+  end
+
+  # Counter helper sanity: first send_counter call returns 0, next returns 1.
+  var c0 = session_next_send_counter(i_session)
+  var c1 = session_next_send_counter(i_session)
+  var ok_counter = 0
+  if c0 == 0 and c1 == 1 and session_send_counter(i_session) == 2
+    ok_counter = 1
+    puts("PASS: wg — session_next_send_counter monotonic from 0")
+  else
+    eputs("FAIL: counter sequence c0=#{c0} c1=#{c1} after=#{session_send_counter(i_session)}")
+  end
+
+  # Cleanup
+  noise_handshake_destroy(i_state)
+  noise_handshake_destroy(r_state)
+  session_destroy(i_session)
+  session_destroy(r_session)
+  rng_destroy(rng)
+  free(i_priv); free(i_pub); free(r_priv); free(r_pub)
+  free(psk); free(ts)
+  free(msg_init); free(msg_resp)
+  free(seen_i_pub); free(seen_ts); free(seen_i_index_buf); free(seen_r_index_buf)
+  free(pt); free(ct); free(tag); free(dec); free(nonce)
+
+  return ok_split & ok_aead & ok_counter
+end
+
+## Tampering with the MAC1 trailer of MSG_INITIATION must cause the responder
+## to drop with -1, before the inner Noise driver gets to run.
+def test_wg_mac1_tampering(): Int
+  var rng = rng_new()
+  var i_priv = malloc(32); var i_pub = malloc(32)
+  var r_priv = malloc(32); var r_pub = malloc(32)
+  rng_fill(rng, i_priv, 32)
+  rng_fill(rng, r_priv, 32)
+  x25519_secret_to_public(i_pub, secret_wrap(i_priv))
+  x25519_secret_to_public(r_pub, secret_wrap(r_priv))
+
+  var ts = malloc(12)
+  memset(ts, 0, 12)
+  var i_state = noise_handshake_new()
+  var msg = malloc(148)
+  wg_create_initiation(i_state, rng, secret_wrap(i_priv), i_pub, r_pub, 0xCAFEBABE, ts, msg)
+
+  # Flip one bit in the MAC1 region [116..132).
+  ptr_write_byte(msg + 120, ptr_read_byte(msg + 120) ^ 1)
+
+  var r_state = noise_handshake_new()
+  var seen_pub = malloc(32)
+  var seen_ts = malloc(12)
+  var seen_idx = malloc(4)
+  var rc = wg_consume_initiation(r_state, secret_wrap(r_priv), r_pub, msg,
+                                 seen_pub, seen_ts, seen_idx)
+
+  var ok = 0
+  if rc != 0
+    ok = 1
+    puts("PASS: wg — responder rejects MAC1-tampered initiation")
+  else
+    eputs("FAIL: responder accepted MAC1-tampered initiation (catastrophic)")
+  end
+
+  noise_handshake_destroy(i_state)
+  noise_handshake_destroy(r_state)
+  rng_destroy(rng)
+  free(i_priv); free(i_pub); free(r_priv); free(r_pub)
+  free(ts); free(msg); free(seen_pub); free(seen_ts); free(seen_idx)
+  return ok
+end
+
+## A response packet whose receiver_index doesn't match the initiator's
+## local_index must be dropped — protects against off-target session inject.
+def test_wg_receiver_index_mismatch(): Int
+  var rng = rng_new()
+  var i_priv = malloc(32); var i_pub = malloc(32)
+  var r_priv = malloc(32); var r_pub = malloc(32)
+  rng_fill(rng, i_priv, 32)
+  rng_fill(rng, r_priv, 32)
+  x25519_secret_to_public(i_pub, secret_wrap(i_priv))
+  x25519_secret_to_public(r_pub, secret_wrap(r_priv))
+
+  var psk = malloc(32); memset(psk, 0, 32)
+  var ts = malloc(12); memset(ts, 0, 12)
+  var i_state = noise_handshake_new()
+  var r_state = noise_handshake_new()
+  var msg_init = malloc(148)
+  var msg_resp = malloc(92)
+
+  wg_create_initiation(i_state, rng, secret_wrap(i_priv), i_pub, r_pub, 0x11111111, ts, msg_init)
+
+  var seen_pub = malloc(32); var seen_ts = malloc(12); var seen_idx_buf = malloc(4)
+  wg_consume_initiation(r_state, secret_wrap(r_priv), r_pub, msg_init, seen_pub, seen_ts, seen_idx_buf)
+  var seen_idx = ptr_read_byte(seen_idx_buf) +
+                 (ptr_read_byte(seen_idx_buf + 1) * 256) +
+                 (ptr_read_byte(seen_idx_buf + 2) * 65536) +
+                 (ptr_read_byte(seen_idx_buf + 3) * 16777216)
+
+  wg_create_response(r_state, rng, seen_pub, secret_wrap(psk), 0x22222222, seen_idx, msg_resp)
+
+  # Initiator passes WRONG expected_local_index.
+  var seen_r_idx = malloc(4)
+  var rc = wg_consume_response(i_state, secret_wrap(i_priv), i_pub, secret_wrap(psk), msg_resp,
+                               0xDEADBEEF, seen_r_idx)
+
+  var ok = 0
+  if rc != 0
+    ok = 1
+    puts("PASS: wg — initiator rejects response with wrong receiver_index")
+  else
+    eputs("FAIL: initiator accepted response with wrong receiver_index")
+  end
+
+  noise_handshake_destroy(i_state); noise_handshake_destroy(r_state)
+  rng_destroy(rng)
+  free(i_priv); free(i_pub); free(r_priv); free(r_pub)
+  free(psk); free(ts); free(msg_init); free(msg_resp)
+  free(seen_pub); free(seen_ts); free(seen_idx_buf); free(seen_r_idx)
+  return ok
+end
+
+## Wrong type byte must be rejected before any cryptographic work.
+def test_wg_msg_type_mismatch(): Int
+  var rng = rng_new()
+  var i_priv = malloc(32); var i_pub = malloc(32)
+  var r_priv = malloc(32); var r_pub = malloc(32)
+  rng_fill(rng, i_priv, 32)
+  rng_fill(rng, r_priv, 32)
+  x25519_secret_to_public(i_pub, secret_wrap(i_priv))
+  x25519_secret_to_public(r_pub, secret_wrap(r_priv))
+
+  var ts = malloc(12); memset(ts, 0, 12)
+  var i_state = noise_handshake_new()
+  var msg = malloc(148)
+  wg_create_initiation(i_state, rng, secret_wrap(i_priv), i_pub, r_pub, 0x11111111, ts, msg)
+
+  # Replace type byte 0x01 with 0x04 (transport-data type — wrong shape).
+  ptr_write_byte(msg, 4)
+
+  var r_state = noise_handshake_new()
+  var seen_pub = malloc(32); var seen_ts = malloc(12); var seen_idx = malloc(4)
+  var rc = wg_consume_initiation(r_state, secret_wrap(r_priv), r_pub, msg, seen_pub, seen_ts, seen_idx)
+
+  var ok = 0
+  if rc != 0
+    ok = 1
+    puts("PASS: wg — responder rejects wrong msg type byte")
+  else
+    eputs("FAIL: responder accepted wrong msg type byte")
+  end
+
+  noise_handshake_destroy(i_state); noise_handshake_destroy(r_state)
+  rng_destroy(rng)
+  free(i_priv); free(i_pub); free(r_priv); free(r_pub)
+  free(ts); free(msg); free(seen_pub); free(seen_ts); free(seen_idx)
+  return ok
+end
+
+## Peer struct: constant-time pubkey equality, PSK zeroed when src=0.
+def test_wg_peer(): Int
+  var rng = rng_new()
+  var pub = malloc(32)
+  rng_fill(rng, pub, 32)
+
+  var ep = endpoint_v4(0x7F000001, 51820)  # 127.0.0.1:51820
+  var p = peer_new(pub, 0, ep)             # PSK=0 → zeroed
+
+  var ok = 1
+  if peer_static_pub_eq(p, pub) != 1
+    eputs("FAIL: peer_static_pub_eq self-compare returned 0")
+    ok = 0
+  end
+
+  # Different pub → 0.
+  var other = malloc(32)
+  rng_fill(rng, other, 32)
+  if peer_static_pub_eq(p, other) != 0
+    eputs("FAIL: peer_static_pub_eq with different pub returned 1")
+    ok = 0
+  end
+
+  # PSK was filled with zeros (src=0 path).
+  var psk_zero = 1
+  var i = 0
+  while i < 32
+    if ptr_read_byte(peer_psk(p) + i) != 0
+      psk_zero = 0
+    end
+    i += 1
+  end
+  if psk_zero != 1
+    eputs("FAIL: peer_new with psk_src=0 did not produce zero PSK")
+    ok = 0
+  end
+
+  # Endpoint stored.
+  if p.endpoint.ip_be != 0x7F000001 or p.endpoint.port != 51820
+    eputs("FAIL: endpoint not stored correctly")
+    ok = 0
+  end
+
+  if endpoint_v4_is_set(endpoint_v4_unset()) != 0
+    eputs("FAIL: endpoint_v4_unset() reports as set")
+    ok = 0
+  end
+  if endpoint_v4_is_set(ep) != 1
+    eputs("FAIL: configured endpoint reports as unset")
+    ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — Peer construct/equality/PSK-zero/endpoint")
+  end
+
+  peer_destroy(p)
+  rng_destroy(rng)
+  free(pub); free(other)
+  return ok
+end
+
+## TAI64N timestamp helper: top 4 bits of byte 0 are 0b0100 (the 2^62 marker),
+## and consecutive calls are monotonic non-decreasing.
+def test_wg_tai64n(): Int
+  var t1 = malloc(12)
+  var t2 = malloc(12)
+  wg_tai64n_now(t1)
+  wg_tai64n_now(t2)
+
+  var top1 = ptr_read_byte(t1)
+  var top4 = (top1 / 16) & 15
+  var ok_marker = 0
+  if top4 == 4
+    ok_marker = 1
+  else
+    eputs("FAIL: TAI64N top-4 bits = #{top4}, expected 4 (0b0100)")
+  end
+
+  # Monotonic: t2 >= t1 byte-by-byte (BE compare).
+  var ok_mono = 1
+  var i = 0
+  while i < 12
+    var a = ptr_read_byte(t1 + i)
+    var b = ptr_read_byte(t2 + i)
+    if b > a
+      i = 12   # t2 strictly greater somewhere — done
+    else
+      if a > b
+        ok_mono = 0
+        i = 12
+      else
+        i += 1
+      end
+    end
+  end
+  if ok_mono != 1
+    eputs("FAIL: TAI64N second call < first call")
+  end
+
+  if ok_marker == 1 and ok_mono == 1
+    puts("PASS: wg — TAI64N marker + monotonic")
+  end
+
+  free(t1); free(t2)
+  return ok_marker & ok_mono
+end
+
+# =============================================================================
+# Step 2.2 — Transport (encrypt/decrypt + RFC 6479 replay)
+# =============================================================================
+
+## Loopback-handshake helper: returns (i_session, r_session) pair for tests
+## that need real, matching transport keys. Builds two static keypairs, runs
+## the wg_create_initiation / wg_consume_initiation / wg_create_response /
+## wg_consume_response sequence, finalizes both sides, frees scratch state.
+## Caller is responsible for `session_destroy` on both returned Sessions.
+struct PairedSessions
+  i: Session
+  r: Session
+end
+
+def make_paired_sessions(): PairedSessions
+  var rng = rng_new()
+  var i_priv = malloc(32); var i_pub = malloc(32)
+  var r_priv = malloc(32); var r_pub = malloc(32)
+  rng_fill(rng, i_priv, 32); rng_fill(rng, r_priv, 32)
+  x25519_secret_to_public(i_pub, secret_wrap(i_priv))
+  x25519_secret_to_public(r_pub, secret_wrap(r_priv))
+  var psk = malloc(32); memset(psk, 0, 32)
+  var ts = malloc(12); memset(ts, 0, 12)
+
+  var i_state = noise_handshake_new()
+  var r_state = noise_handshake_new()
+  var msg_init = malloc(148); var msg_resp = malloc(92)
+  var seen_pub = malloc(32); var seen_ts = malloc(12)
+  var seen_i_idx_buf = malloc(4); var seen_r_idx_buf = malloc(4)
+
+  wg_create_initiation(i_state, rng, secret_wrap(i_priv), i_pub, r_pub, 0xCAFEBABE, ts, msg_init)
+  wg_consume_initiation(r_state, secret_wrap(r_priv), r_pub, msg_init, seen_pub, seen_ts, seen_i_idx_buf)
+  var seen_i_idx = ptr_read_byte(seen_i_idx_buf) +
+                   (ptr_read_byte(seen_i_idx_buf + 1) * 256) +
+                   (ptr_read_byte(seen_i_idx_buf + 2) * 65536) +
+                   (ptr_read_byte(seen_i_idx_buf + 3) * 16777216)
+  wg_create_response(r_state, rng, seen_pub, secret_wrap(psk), 0xDEADBEEF, seen_i_idx, msg_resp)
+  wg_consume_response(i_state, secret_wrap(i_priv), i_pub, secret_wrap(psk), msg_resp, 0xCAFEBABE, seen_r_idx_buf)
+  var seen_r_idx = ptr_read_byte(seen_r_idx_buf) +
+                   (ptr_read_byte(seen_r_idx_buf + 1) * 256) +
+                   (ptr_read_byte(seen_r_idx_buf + 2) * 65536) +
+                   (ptr_read_byte(seen_r_idx_buf + 3) * 16777216)
+
+  var i_session = wg_finalize_session(i_state, 1, 0xCAFEBABE, seen_r_idx, 0)
+  var r_session = wg_finalize_session(r_state, 0, 0xDEADBEEF, seen_i_idx, 0)
+
+  noise_handshake_destroy(i_state)
+  noise_handshake_destroy(r_state)
+  rng_destroy(rng)
+  free(i_priv); free(i_pub); free(r_priv); free(r_pub)
+  free(psk); free(ts); free(msg_init); free(msg_resp)
+  free(seen_pub); free(seen_ts); free(seen_i_idx_buf); free(seen_r_idx_buf)
+
+  return PairedSessions { i: i_session, r: r_session }
+end
+
+## Encrypt N bytes, decrypt them, verify byte-for-byte match in the first N
+## bytes of the (still-padded) decrypted output. Verifies counter advance.
+def test_wg_transport_roundtrip(): Int
+  var ps = make_paired_sessions()
+  var pt = malloc(64)
+  var i = 0
+  while i < 64
+    ptr_write_byte(pt + i, (i * 7) & 255)
+    i += 1
+  end
+
+  var msg = malloc(wg_data_packet_total_len(64))
+  var wlen = wg_encrypt_data_packet(ps.i, pt, 64, msg)
+  var ok = 1
+  if wlen != wg_data_packet_total_len(64)
+    eputs("FAIL: encrypt returned wlen=#{wlen}, expected #{wg_data_packet_total_len(64)}")
+    ok = 0
+  end
+  if session_send_counter(ps.i) != 1
+    eputs("FAIL: send_counter not advanced (got #{session_send_counter(ps.i)})")
+    ok = 0
+  end
+
+  var dec = malloc(wlen - 32)
+  var dlen = wg_decrypt_data_packet(ps.r, msg, wlen, dec)
+  if dlen != 64
+    eputs("FAIL: decrypt returned dlen=#{dlen}, expected 64")
+    ok = 0
+  end
+  if bytes_eq(pt, dec, 64) != 1
+    eputs("FAIL: round-trip plaintext mismatch")
+    ok = 0
+  end
+  if session_last_recv_counter(ps.r) != 0
+    eputs("FAIL: last_recv expected 0 after first packet, got #{session_last_recv_counter(ps.r)}")
+    ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — transport encrypt/decrypt round-trip + counter advance")
+  end
+
+  session_destroy(ps.i); session_destroy(ps.r)
+  free(pt); free(msg); free(dec)
+  return ok
+end
+
+## 14-byte plaintext rounds up to 16-byte AEAD payload; decrypt returns 16
+## bytes where first 14 match original and last 2 are zero.
+def test_wg_transport_padding(): Int
+  var ps = make_paired_sessions()
+  var pt = malloc(14)
+  var i = 0
+  while i < 14
+    ptr_write_byte(pt + i, 0xAB)
+    i += 1
+  end
+
+  var wlen_expected = 16 + 16 + 16  # header + padded(16) + tag
+  var msg = malloc(wlen_expected)
+  var wlen = wg_encrypt_data_packet(ps.i, pt, 14, msg)
+  var ok = 1
+  if wlen != wlen_expected
+    eputs("FAIL: padding wlen=#{wlen}, expected #{wlen_expected}")
+    ok = 0
+  end
+
+  var dec = malloc(16)
+  var dlen = wg_decrypt_data_packet(ps.r, msg, wlen, dec)
+  if dlen != 16
+    eputs("FAIL: padded decrypt dlen=#{dlen}, expected 16")
+    ok = 0
+  end
+  if bytes_eq(pt, dec, 14) != 1
+    eputs("FAIL: padding — original bytes corrupted")
+    ok = 0
+  end
+  if ptr_read_byte(dec + 14) != 0 or ptr_read_byte(dec + 15) != 0
+    eputs("FAIL: padding bytes not zero")
+    ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — transport plaintext zero-padded to 16-byte multiple")
+  end
+
+  session_destroy(ps.i); session_destroy(ps.r)
+  free(pt); free(msg); free(dec)
+  return ok
+end
+
+## Zero-byte plaintext (keepalive): wire is 32 bytes (header + 0 ct + tag).
+def test_wg_transport_keepalive(): Int
+  var ps = make_paired_sessions()
+  var msg = malloc(32)
+  var wlen = wg_encrypt_data_packet(ps.i, 0, 0, msg)
+  var ok = 1
+  if wlen != 32
+    eputs("FAIL: keepalive wlen=#{wlen}, expected 32")
+    ok = 0
+  end
+  var dec = malloc(1)  # caller doesn't need to alloc 0
+  var dlen = wg_decrypt_data_packet(ps.r, msg, 32, dec)
+  if dlen != 0
+    eputs("FAIL: keepalive decrypt dlen=#{dlen}, expected 0")
+    ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — transport keepalive (zero-byte payload)")
+  end
+
+  session_destroy(ps.i); session_destroy(ps.r)
+  free(msg); free(dec)
+  return ok
+end
+
+## Decrypting the same packet twice must reject the second attempt (replay).
+def test_wg_transport_replay(): Int
+  var ps = make_paired_sessions()
+  var pt = malloc(32); memset(pt, 0xC3, 32)
+  var msg = malloc(64)
+  wg_encrypt_data_packet(ps.i, pt, 32, msg)
+
+  var dec = malloc(32)
+  var d1 = wg_decrypt_data_packet(ps.r, msg, 64, dec)
+  var d2 = wg_decrypt_data_packet(ps.r, msg, 64, dec)
+
+  var ok = 0
+  if d1 == 32 and d2 != 32
+    ok = 1
+    puts("PASS: wg — transport replay rejected (#{d2} on second decrypt)")
+  else
+    eputs("FAIL: replay path d1=#{d1} d2=#{d2}")
+  end
+
+  session_destroy(ps.i); session_destroy(ps.r)
+  free(pt); free(msg); free(dec)
+  return ok
+end
+
+## Five packets encrypted in order 0..4; decryption order 4,1,3,0,2 — all
+## within window, all should accept exactly once.
+def test_wg_transport_out_of_order(): Int
+  var ps = make_paired_sessions()
+  var pt = malloc(32); memset(pt, 0xCC, 32)
+
+  var w = 64  # 16 + 32 + 16
+  var msgs = malloc(w * 5)
+  var i = 0
+  while i < 5
+    wg_encrypt_data_packet(ps.i, pt, 32, msgs + (i * w))
+    i += 1
+  end
+
+  var dec = malloc(32)
+  var idx_order = malloc(5)
+  ptr_write_byte(idx_order, 4)
+  ptr_write_byte(idx_order + 1, 1)
+  ptr_write_byte(idx_order + 2, 3)
+  ptr_write_byte(idx_order + 3, 0)
+  ptr_write_byte(idx_order + 4, 2)
+
+  var ok = 1
+  i = 0
+  while i < 5
+    var which = ptr_read_byte(idx_order + i)
+    var dl = wg_decrypt_data_packet(ps.r, msgs + (which * w), w, dec)
+    if dl != 32
+      eputs("FAIL: out-of-order packet #{which} (slot #{i}) returned #{dl}")
+      ok = 0
+    end
+    i += 1
+  end
+  # last_recv should be the highest counter seen so far = 4.
+  if session_last_recv_counter(ps.r) != 4
+    eputs("FAIL: out-of-order last_recv=#{session_last_recv_counter(ps.r)}, expected 4")
+    ok = 0
+  end
+  # Replaying any of them must now reject.
+  var dl_replay = wg_decrypt_data_packet(ps.r, msgs + (2 * w), w, dec)
+  if dl_replay == 32
+    eputs("FAIL: out-of-order replay accepted")
+    ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — transport out-of-order receive (5 packets, replay reject)")
+  end
+
+  session_destroy(ps.i); session_destroy(ps.r)
+  free(pt); free(msgs); free(dec); free(idx_order)
+  return ok
+end
+
+## Tag tampering: flip a byte in the AEAD tag → decrypt rejects, AND the
+## counter is NOT marked in the replay window (so a legitimate retransmission
+## of the same counter would still be accepted). Order-of-operations check.
+def test_wg_transport_tag_tamper(): Int
+  var ps = make_paired_sessions()
+  var pt = malloc(32); memset(pt, 0xAA, 32)
+  var msg = malloc(64)
+  wg_encrypt_data_packet(ps.i, pt, 32, msg)
+
+  # Tamper with tag (last 16 bytes of msg).
+  ptr_write_byte(msg + 48, ptr_read_byte(msg + 48) ^ 1)
+  var dec = malloc(32)
+  var d_bad = wg_decrypt_data_packet(ps.r, msg, 64, dec)
+
+  var ok = 0
+  if d_bad != 32
+    # Repair the tag and verify the same counter still gets through.
+    ptr_write_byte(msg + 48, ptr_read_byte(msg + 48) ^ 1)
+    var d_good = wg_decrypt_data_packet(ps.r, msg, 64, dec)
+    if d_good == 32
+      ok = 1
+      puts("PASS: wg — transport tag-tamper rejected (replay window untouched)")
+    else
+      eputs("FAIL: post-repair decrypt returned #{d_good}")
+    end
+  else
+    eputs("FAIL: tag-tampered packet accepted (#{d_bad})")
+  end
+
+  session_destroy(ps.i); session_destroy(ps.r)
+  free(pt); free(msg); free(dec)
+  return ok
+end
+
+## Wrong type byte must reject before AEAD work.
+def test_wg_transport_type_byte(): Int
+  var ps = make_paired_sessions()
+  var pt = malloc(32); memset(pt, 0x55, 32)
+  var msg = malloc(64)
+  wg_encrypt_data_packet(ps.i, pt, 32, msg)
+  ptr_write_byte(msg, 1)  # wrong type (1 is INITIATION)
+
+  var dec = malloc(32)
+  var rc = wg_decrypt_data_packet(ps.r, msg, 64, dec)
+
+  var ok = 0
+  if rc != 32
+    ok = 1
+    puts("PASS: wg — transport rejects wrong type byte")
+  else
+    eputs("FAIL: wrong type byte accepted")
+  end
+
+  session_destroy(ps.i); session_destroy(ps.r)
+  free(pt); free(msg); free(dec)
+  return ok
+end
+
+## Wrong receiver_index must reject before AEAD work (saves work routing
+## to the wrong session entirely).
+def test_wg_transport_recv_index(): Int
+  var ps = make_paired_sessions()
+  var pt = malloc(32); memset(pt, 0x66, 32)
+  var msg = malloc(64)
+  wg_encrypt_data_packet(ps.i, pt, 32, msg)
+  # Mangle receiver_index: replace with 0xBADC0DE5.
+  ptr_write_byte(msg + 4, 0xE5)
+  ptr_write_byte(msg + 5, 0xC0)
+  ptr_write_byte(msg + 6, 0xAD)
+  ptr_write_byte(msg + 7, 0xB)
+
+  var dec = malloc(32)
+  var rc = wg_decrypt_data_packet(ps.r, msg, 64, dec)
+
+  var ok = 0
+  if rc != 32
+    ok = 1
+    puts("PASS: wg — transport rejects wrong receiver_index")
+  else
+    eputs("FAIL: wrong receiver_index accepted")
+  end
+
+  session_destroy(ps.i); session_destroy(ps.r)
+  free(pt); free(msg); free(dec)
+  return ok
+end
+
+## RFC 6479 sliding-window edge cases via direct calls to
+## session_check_and_set_recv (no AEAD round-trip needed).
+def test_wg_replay_window_edges(): Int
+  var s = session_new_zero(1, 2, 1)
+
+  var ok = 1
+
+  # 1) First receive at counter=0 accepts.
+  if session_check_and_set_recv(s, 0) != 0
+    eputs("FAIL: first receive at counter=0 rejected"); ok = 0
+  end
+  # 2) Same counter again rejects (replay).
+  if session_check_and_set_recv(s, 0) == 0
+    eputs("FAIL: replay of counter=0 accepted"); ok = 0
+  end
+
+  # 3) Out-of-order receive within window: counter=5 then counter=3 both OK.
+  if session_check_and_set_recv(s, 5) != 0
+    eputs("FAIL: counter=5 rejected"); ok = 0
+  end
+  if session_check_and_set_recv(s, 3) != 0
+    eputs("FAIL: out-of-order counter=3 rejected"); ok = 0
+  end
+  if session_check_and_set_recv(s, 3) == 0
+    eputs("FAIL: replay of counter=3 accepted"); ok = 0
+  end
+
+  # 4) Big jump advances window; counters far below the new top reject.
+  # last_recv = 5 → set last to 5000. Counter 5000 - W = 2952. So 2951 must
+  # reject as too old; 2952 must accept (it's the bottom edge of the window
+  # since the check is `last - counter >= W`, equality rejects).
+  if session_check_and_set_recv(s, 5000) != 0
+    eputs("FAIL: big advance to counter=5000 rejected"); ok = 0
+  end
+  if session_check_and_set_recv(s, 2951) == 0
+    eputs("FAIL: counter=2951 (out of window) accepted"); ok = 0
+  end
+  if session_check_and_set_recv(s, 2952) == 0
+    eputs("FAIL: edge counter=2952 (W below top) accepted (expected reject)"); ok = 0
+  end
+  if session_check_and_set_recv(s, 2953) != 0
+    eputs("FAIL: in-window counter=2953 rejected"); ok = 0
+  end
+
+  # 5) Wrap-around: when delta > W, the entire bitmap is cleared. Verify
+  # that a counter just above the bottom of the new window still accepts
+  # even if its bit position collides with a previously-set bit.
+  # last_recv = 5000. Jump to 5000 + 2048 + 100 = 7148 (delta 2148 > W).
+  if session_check_and_set_recv(s, 7148) != 0
+    eputs("FAIL: counter=7148 (delta>W) rejected"); ok = 0
+  end
+  # Now the bitmap was wholly cleared; counter=5101 has bit position
+  # 5101 mod 2048 = 1005, which previously held a 0 bit anyway, but the
+  # important check is that the counter is in window (7148 - 5101 = 2047 < W).
+  if session_check_and_set_recv(s, 5101) != 0
+    eputs("FAIL: in-window-after-clear counter=5101 rejected"); ok = 0
+  end
+
+  # 6) Negative counter (signed wrap from a forged u64 high bit) rejects.
+  if session_check_and_set_recv(s, 0 - 1) == 0
+    eputs("FAIL: negative counter accepted"); ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — replay window edges (replay/window/wrap/negative)")
+  end
+
+  session_destroy(s)
+  return ok
+end
+
+# =============================================================================
+# Step 2.3 — Timers
+# =============================================================================
+
+## Bit `bit` set in `actions`?
+def has_action(actions: Int, bit: Int): Int
+  if (actions & bit) == bit
+    return 1
+  end
+  return 0
+end
+
+## Fresh PeerTimers + tick at any time → no actions (no session, no
+## handshake in flight, nothing to do).
+def test_wg_timers_idle(): Int
+  var t = wg_timers_new()
+  var ok = 1
+  if wg_timers_tick(t, 0) != 0
+    eputs("FAIL: idle tick at t=0 returned non-zero"); ok = 0
+  end
+  if wg_timers_tick(t, 999999999) != 0
+    eputs("FAIL: idle tick at large t returned non-zero"); ok = 0
+  end
+  if ok == 1
+    puts("PASS: wg — timers idle (no session, no handshake → no actions)")
+  end
+  return ok
+end
+
+## Initiator with a session established at t=BASE:
+##   t=BASE+119s — no REKEY yet
+##   t=BASE+120s — REKEY fires
+##   after handshake_started — REKEY suppressed (in flight)
+##
+## Note: tests use BASE=1ms (non-zero) because the lifecycle hooks treat
+## time=0 as "unset" (e.g., session_established_ms > 0 gates the session
+## branch). Real monotonic clocks may start at 0 transiently, but the
+## driver doesn't see now=0 in practice (caller takes a tick AFTER setup).
+def test_wg_timers_rekey(): Int
+  var BASE = 1
+  var t = wg_timers_session_established(wg_timers_new(), BASE, 1)  # initiator
+  var ok = 1
+
+  if has_action(wg_timers_tick(t, BASE + 119000), WG_ACTION_REKEY()) != 0
+    eputs("FAIL: REKEY fired at 119s (too early)"); ok = 0
+  end
+
+  var a120 = wg_timers_tick(t, BASE + 120000)
+  if has_action(a120, WG_ACTION_REKEY()) != 1
+    eputs("FAIL: REKEY did not fire at 120s"); ok = 0
+  end
+
+  # Caller acts: starts a handshake. REKEY should now suppress until
+  # session_established advances or conditions reset.
+  t = wg_timers_handshake_started(t, BASE + 120000)
+  var a121 = wg_timers_tick(t, BASE + 121000)
+  if has_action(a121, WG_ACTION_REKEY()) == 1
+    eputs("FAIL: REKEY re-fired with handshake in flight"); ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — timers REKEY at 120s (initiator only, suppressed in flight)")
+  end
+  return ok
+end
+
+## Responder side with a session: REKEY does not fire (responders don't
+## auto-rekey). REJECT_SESSION and KEEPALIVE still fire normally.
+def test_wg_timers_responder_no_rekey(): Int
+  var BASE = 1
+  var t = wg_timers_session_established(wg_timers_new(), BASE, 0)  # responder
+  var ok = 1
+
+  var a = wg_timers_tick(t, BASE + 120000)
+  if has_action(a, WG_ACTION_REKEY()) == 1
+    eputs("FAIL: responder side fired REKEY at 120s"); ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — timers responders don't auto-REKEY")
+  end
+  return ok
+end
+
+## RETRANSMIT_HANDSHAKE fires 5s after handshake_started (or last
+## retransmit). After retransmit, the timer re-arms relative to last_send.
+def test_wg_timers_retransmit(): Int
+  var BASE = 1
+  var t = wg_timers_handshake_started(wg_timers_new(), BASE)
+  var ok = 1
+
+  if has_action(wg_timers_tick(t, BASE + 4999), WG_ACTION_RETRANSMIT_HANDSHAKE()) == 1
+    eputs("FAIL: RETRANSMIT fired before 5s"); ok = 0
+  end
+  if has_action(wg_timers_tick(t, BASE + 5000), WG_ACTION_RETRANSMIT_HANDSHAKE()) != 1
+    eputs("FAIL: RETRANSMIT did not fire at 5s"); ok = 0
+  end
+
+  t = wg_timers_handshake_retransmitted(t, BASE + 5000)
+  if has_action(wg_timers_tick(t, BASE + 9999), WG_ACTION_RETRANSMIT_HANDSHAKE()) == 1
+    eputs("FAIL: RETRANSMIT fired before re-armed 5s"); ok = 0
+  end
+  if has_action(wg_timers_tick(t, BASE + 10000), WG_ACTION_RETRANSMIT_HANDSHAKE()) != 1
+    eputs("FAIL: RETRANSMIT did not re-fire at 10s"); ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — timers RETRANSMIT_HANDSHAKE at 5s (re-arms after retransmit)")
+  end
+  return ok
+end
+
+## GIVE_UP_HANDSHAKE fires 90s after handshake_started, regardless of
+## retransmits. After handshake_dropped, suppresses.
+def test_wg_timers_give_up(): Int
+  var BASE = 1
+  var t = wg_timers_handshake_started(wg_timers_new(), BASE)
+  t = wg_timers_handshake_retransmitted(t, BASE + 5000)
+  t = wg_timers_handshake_retransmitted(t, BASE + 10000)
+  var ok = 1
+
+  if has_action(wg_timers_tick(t, BASE + 89999), WG_ACTION_GIVE_UP_HANDSHAKE()) == 1
+    eputs("FAIL: GIVE_UP fired before 90s"); ok = 0
+  end
+  if has_action(wg_timers_tick(t, BASE + 90000), WG_ACTION_GIVE_UP_HANDSHAKE()) != 1
+    eputs("FAIL: GIVE_UP did not fire at 90s"); ok = 0
+  end
+
+  t = wg_timers_handshake_dropped(t)
+  if has_action(wg_timers_tick(t, BASE + 90000), WG_ACTION_GIVE_UP_HANDSHAKE()) == 1
+    eputs("FAIL: GIVE_UP re-fired after handshake_dropped"); ok = 0
+  end
+  if has_action(wg_timers_tick(t, BASE + 90000), WG_ACTION_RETRANSMIT_HANDSHAKE()) == 1
+    eputs("FAIL: RETRANSMIT re-fired after handshake_dropped"); ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — timers GIVE_UP_HANDSHAKE at 90s (cleared by handshake_dropped)")
+  end
+  return ok
+end
+
+## SEND_KEEPALIVE fires 10s after last activity (recv or keepalive_sent).
+## data_recv re-arms; keepalive_sent re-arms.
+def test_wg_timers_keepalive(): Int
+  var BASE = 1
+  var t = wg_timers_session_established(wg_timers_new(), BASE, 0)
+  var ok = 1
+
+  # session_established anchored last_recv at BASE; tick at BASE+9999 ⇒
+  # (now - BASE) = 9999 < 10000, no keepalive yet. At BASE+10000, fires.
+  if has_action(wg_timers_tick(t, BASE + 9999), WG_ACTION_SEND_KEEPALIVE()) == 1
+    eputs("FAIL: SEND_KEEPALIVE fired before 10s"); ok = 0
+  end
+  if has_action(wg_timers_tick(t, BASE + 10000), WG_ACTION_SEND_KEEPALIVE()) != 1
+    eputs("FAIL: SEND_KEEPALIVE did not fire at 10s"); ok = 0
+  end
+
+  # data_recv at BASE+5000ms. Now last_active = BASE+5000.
+  t = wg_timers_data_recv(t, BASE + 5000)
+  if has_action(wg_timers_tick(t, BASE + 14999), WG_ACTION_SEND_KEEPALIVE()) == 1
+    eputs("FAIL: SEND_KEEPALIVE fired at 14.999s (only 9.999s since recv)"); ok = 0
+  end
+  if has_action(wg_timers_tick(t, BASE + 15000), WG_ACTION_SEND_KEEPALIVE()) != 1
+    eputs("FAIL: SEND_KEEPALIVE did not fire at 15s after recv at 5s"); ok = 0
+  end
+
+  # keepalive_sent at BASE+15000. Suppress until BASE+25000.
+  t = wg_timers_keepalive_sent(t, BASE + 15000)
+  if has_action(wg_timers_tick(t, BASE + 24999), WG_ACTION_SEND_KEEPALIVE()) == 1
+    eputs("FAIL: SEND_KEEPALIVE fired before re-armed 10s"); ok = 0
+  end
+  if has_action(wg_timers_tick(t, BASE + 25000), WG_ACTION_SEND_KEEPALIVE()) != 1
+    eputs("FAIL: SEND_KEEPALIVE did not fire at 25s"); ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — timers SEND_KEEPALIVE at 10s idle (re-arms on recv + keepalive_sent)")
+  end
+  return ok
+end
+
+## REJECT_SESSION fires at 180s. After session_dropped, suppresses
+## (and also clears KEEPALIVE since session is gone).
+def test_wg_timers_reject_session(): Int
+  var BASE = 1
+  var t = wg_timers_session_established(wg_timers_new(), BASE, 0)
+  var ok = 1
+
+  if has_action(wg_timers_tick(t, BASE + 179999), WG_ACTION_REJECT_SESSION()) == 1
+    eputs("FAIL: REJECT fired before 180s"); ok = 0
+  end
+  if has_action(wg_timers_tick(t, BASE + 180000), WG_ACTION_REJECT_SESSION()) != 1
+    eputs("FAIL: REJECT did not fire at 180s"); ok = 0
+  end
+
+  t = wg_timers_session_dropped(t)
+  if has_action(wg_timers_tick(t, BASE + 200000), WG_ACTION_REJECT_SESSION()) == 1
+    eputs("FAIL: REJECT re-fired after session_dropped"); ok = 0
+  end
+  if has_action(wg_timers_tick(t, BASE + 200000), WG_ACTION_SEND_KEEPALIVE()) == 1
+    eputs("FAIL: KEEPALIVE fired without active session"); ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — timers REJECT_SESSION at 180s (cleared by session_dropped)")
+  end
+  return ok
+end
+
+## At 180s with no rekey kicked off, REKEY and REJECT_SESSION fire in the
+## same tick. Caller's policy: handle REKEY first, REJECT next tick.
+def test_wg_timers_simultaneous(): Int
+  var BASE = 1
+  var t = wg_timers_session_established(wg_timers_new(), BASE, 1)  # initiator
+  var ok = 1
+  var a = wg_timers_tick(t, BASE + 180000)
+
+  if has_action(a, WG_ACTION_REKEY()) != 1
+    eputs("FAIL: simultaneous REKEY missing at 180s"); ok = 0
+  end
+  if has_action(a, WG_ACTION_REJECT_SESSION()) != 1
+    eputs("FAIL: simultaneous REJECT_SESSION missing at 180s"); ok = 0
+  end
+  if has_action(a, WG_ACTION_SEND_KEEPALIVE()) != 1
+    eputs("FAIL: simultaneous SEND_KEEPALIVE missing at 180s (last_recv=BASE, now-last_recv=180s ≥ 10s)"); ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — timers simultaneous REKEY + REJECT_SESSION + KEEPALIVE at 180s")
+  end
+  return ok
+end
+
+# =============================================================================
+# Step 2.4 — Device (peer table + entry points + AllowedIPs routing)
+# =============================================================================
+
+## End-to-end via the Device API: A initiates, B handles + responds, A
+## consumes response, both have live sessions. Then exchange a transport
+## data packet and verify plaintext recovery.
+def test_wg_device_e2e(): Int
+  var dev_a = wg_device_new()
+  var dev_b = wg_device_new()
+
+  # A configures B as a peer with allowed_ips 10.66.0.0/16. B configures A
+  # similarly. Endpoints are placeholders (we don't actually use UDP here).
+  var ips_b = vec_new<AllowedIPv4Cidr>()
+  ips_b.push(cidr_v4(0x0000420A, 16))   # 10.66.0.0/16 (BE: 0a 42 00 00)
+  var ips_a = vec_new<AllowedIPv4Cidr>()
+  ips_a.push(cidr_v4(0x0001420A, 16))
+
+  var peer_b_in_a = wg_device_add_peer(dev_a, wg_device_static_pub(dev_b), 0,
+                                       endpoint_v4(0x0100007F, 51820), ips_b)
+  var peer_a_in_b = wg_device_add_peer(dev_b, wg_device_static_pub(dev_a), 0,
+                                       endpoint_v4(0x0100007F, 51821), ips_a)
+
+  var ok = 1
+
+  # Sanity: lookup_by_pub finds the right peer.
+  var found_b = wg_device_lookup_by_pub(dev_a, wg_device_static_pub(dev_b))
+  if found_b != peer_b_in_a
+    eputs("FAIL: lookup_by_pub returned #{found_b}, expected #{peer_b_in_a}")
+    ok = 0
+  end
+
+  # A → B: initiation
+  var msg_init = malloc(148)
+  var rc1 = wg_device_initiate_handshake(dev_a, peer_b_in_a, msg_init, 1000)
+  if rc1 != 148
+    eputs("FAIL: initiate_handshake rc=#{rc1}"); ok = 0
+  end
+
+  # B handles init → response
+  var msg_resp = malloc(92)
+  var rc2 = wg_device_handle_initiation(dev_b, msg_init, msg_resp, 1000)
+  if rc2 != peer_a_in_b
+    eputs("FAIL: handle_initiation peer_idx=#{rc2}, expected #{peer_a_in_b}")
+    ok = 0
+  end
+  if wg_device_peer_has_session(dev_b, peer_a_in_b) != 1
+    eputs("FAIL: B's peer A has no session after handle_initiation"); ok = 0
+  end
+
+  # A handles response → installs session
+  var rc3 = wg_device_handle_response(dev_a, msg_resp, 1000)
+  if rc3 != peer_b_in_a
+    eputs("FAIL: handle_response peer_idx=#{rc3}, expected #{peer_b_in_a}")
+    ok = 0
+  end
+  if wg_device_peer_has_session(dev_a, peer_b_in_a) != 1
+    eputs("FAIL: A's peer B has no session after handle_response"); ok = 0
+  end
+
+  # Data round-trip: A → B
+  var pt = malloc(64)
+  var i = 0
+  while i < 64
+    ptr_write_byte(pt + i, (i * 11) & 255)
+    i += 1
+  end
+  var data_msg = malloc(96)
+  var data_len = wg_device_send_data(dev_a, peer_b_in_a, pt, 64, data_msg, 1000)
+  if data_len != 96
+    eputs("FAIL: send_data wlen=#{data_len}, expected 96"); ok = 0
+  end
+
+  var dec = malloc(64)
+  var seen_peer = malloc(4)
+  var dlen = wg_device_handle_data(dev_b, data_msg, data_len, dec, seen_peer, 1000)
+  if dlen != 64
+    eputs("FAIL: handle_data dlen=#{dlen}, expected 64"); ok = 0
+  end
+  if bytes_eq(pt, dec, 64) != 1
+    eputs("FAIL: device data round-trip plaintext mismatch"); ok = 0
+  end
+  var seen_idx = ptr_read_byte(seen_peer) +
+                 (ptr_read_byte(seen_peer + 1) * 256) +
+                 (ptr_read_byte(seen_peer + 2) * 65536) +
+                 (ptr_read_byte(seen_peer + 3) * 16777216)
+  if seen_idx != peer_a_in_b
+    eputs("FAIL: handle_data wrote peer_idx=#{seen_idx}, expected #{peer_a_in_b}")
+    ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — device end-to-end (handshake + data round-trip via API)")
+  end
+
+  wg_device_destroy(dev_a)
+  wg_device_destroy(dev_b)
+  free(msg_init); free(msg_resp); free(pt); free(data_msg); free(dec); free(seen_peer)
+  return ok
+end
+
+## CIDR longest-prefix-match: configure two peers with overlapping prefixes;
+## lookup_route returns the more-specific peer.
+def test_wg_device_routing(): Int
+  var d = wg_device_new()
+  var rng = rng_new()
+
+  var pub1 = malloc(32); rng_fill(rng, pub1, 32)
+  var pub2 = malloc(32); rng_fill(rng, pub2, 32)
+  var pub3 = malloc(32); rng_fill(rng, pub3, 32)
+
+  # Peer 1: 10.0.0.0/8 (catch-all in the 10/8 range)
+  var ips1 = vec_new<AllowedIPv4Cidr>()
+  ips1.push(cidr_v4(0x0000000A, 8))
+  var p1 = wg_device_add_peer(d, pub1, 0, endpoint_v4_unset(), ips1)
+
+  # Peer 2: 10.66.0.0/16 (more specific, wins for 10.66.x.y)
+  var ips2 = vec_new<AllowedIPv4Cidr>()
+  ips2.push(cidr_v4(0x0000420A, 16))
+  var p2 = wg_device_add_peer(d, pub2, 0, endpoint_v4_unset(), ips2)
+
+  # Peer 3: 192.168.1.0/24 (different network)
+  var ips3 = vec_new<AllowedIPv4Cidr>()
+  ips3.push(cidr_v4(0x0001A8C0, 24))
+  var p3 = wg_device_add_peer(d, pub3, 0, endpoint_v4_unset(), ips3)
+
+  var ok = 1
+
+  # 10.66.0.5 → peer 2 (longest-prefix-match wins over peer 1's /8)
+  var dst = 0x0500420A
+  var got = wg_device_lookup_route(d, dst)
+  if got != p2
+    eputs("FAIL: route 10.66.0.5 → peer #{got}, expected #{p2}"); ok = 0
+  end
+
+  # 10.10.0.1 → peer 1 (only /8 covers it)
+  dst = 0x01000A0A
+  got = wg_device_lookup_route(d, dst)
+  if got != p1
+    eputs("FAIL: route 10.10.0.1 → peer #{got}, expected #{p1}"); ok = 0
+  end
+
+  # 192.168.1.2 → peer 3
+  dst = 0x0201A8C0
+  got = wg_device_lookup_route(d, dst)
+  if got != p3
+    eputs("FAIL: route 192.168.1.2 → peer #{got}, expected #{p3}"); ok = 0
+  end
+
+  # 8.8.8.8 → no peer (not covered by any allowed_ips)
+  dst = 0x08080808
+  got = wg_device_lookup_route(d, dst)
+  if got != (0 - 1)
+    eputs("FAIL: route 8.8.8.8 → peer #{got}, expected -1"); ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — device AllowedIPs longest-prefix-match routing")
+  end
+
+  wg_device_destroy(d)
+  rng_destroy(rng)
+  free(pub1); free(pub2); free(pub3)
+  return ok
+end
+
+## Handshake replay: same MSG_INITIATION delivered twice with the SAME
+## TAI64N timestamp — second consume must reject (replay defense).
+def test_wg_device_handshake_replay(): Int
+  var dev_a = wg_device_new()
+  var dev_b = wg_device_new()
+
+  var ips = vec_new<AllowedIPv4Cidr>()
+  ips.push(cidr_v4(0, 0))   # default route — match everything
+  wg_device_add_peer(dev_a, wg_device_static_pub(dev_b), 0,
+                     endpoint_v4_unset(), ips)
+  var ips2 = vec_new<AllowedIPv4Cidr>()
+  ips2.push(cidr_v4(0, 0))
+  wg_device_add_peer(dev_b, wg_device_static_pub(dev_a), 0,
+                     endpoint_v4_unset(), ips2)
+
+  var ok = 1
+
+  var msg_init = malloc(148)
+  wg_device_initiate_handshake(dev_a, 0, msg_init, 1000)
+
+  var msg_resp = malloc(92)
+  var first = wg_device_handle_initiation(dev_b, msg_init, msg_resp, 1000)
+  var second = wg_device_handle_initiation(dev_b, msg_init, msg_resp, 1000)
+
+  if first != 0
+    eputs("FAIL: first handle_initiation returned #{first}, expected 0"); ok = 0
+  end
+  if second != (0 - 1)
+    eputs("FAIL: replay handle_initiation returned #{second}, expected -1"); ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — device rejects replayed MSG_INITIATION (TAI64N watermark)")
+  end
+
+  wg_device_destroy(dev_a)
+  wg_device_destroy(dev_b)
+  free(msg_init); free(msg_resp)
+  return ok
+end
+
+# =============================================================================
+# Step 2.7 — Multi-session generations (previous + current + next)
+# =============================================================================
+
+## Run a single A→B handshake and confirm the new session lands in B's
+## `next` slot, not `current`. After A consumes the response, A's session
+## also lives in `next`. has_session (aggregate) is 1 on both sides; the
+## per-slot accessors confirm the placement.
+def test_wg_device_multi_session_install_as_next(): Int
+  var dev_a = wg_device_new()
+  var dev_b = wg_device_new()
+  var ips_b = vec_new<AllowedIPv4Cidr>()
+  ips_b.push(cidr_v4(0, 0))
+  var ips_a = vec_new<AllowedIPv4Cidr>()
+  ips_a.push(cidr_v4(0, 0))
+  var pb = wg_device_add_peer(dev_a, wg_device_static_pub(dev_b), 0,
+                              endpoint_v4_unset(), ips_b)
+  var pa = wg_device_add_peer(dev_b, wg_device_static_pub(dev_a), 0,
+                              endpoint_v4_unset(), ips_a)
+  var ok = 1
+  var msg_init = malloc(148)
+  var msg_resp = malloc(92)
+
+  wg_device_initiate_handshake(dev_a, pb, msg_init, 1000)
+  wg_device_handle_initiation(dev_b, msg_init, msg_resp, 1000)
+  wg_device_handle_response(dev_a, msg_resp, 1000)
+
+  if wg_device_peer_has_next(dev_a, pb) != 1
+    eputs("FAIL: A.next not set after handle_response"); ok = 0
+  end
+  if wg_device_peer_has_current(dev_a, pb) != 0
+    eputs("FAIL: A.current set prematurely (should wait for first send)"); ok = 0
+  end
+  if wg_device_peer_has_next(dev_b, pa) != 1
+    eputs("FAIL: B.next not set after handle_initiation"); ok = 0
+  end
+  if wg_device_peer_has_current(dev_b, pa) != 0
+    eputs("FAIL: B.current set prematurely (should wait for first valid recv)"); ok = 0
+  end
+  if wg_device_peer_has_session(dev_a, pb) != 1
+    eputs("FAIL: aggregate has_session=0 on A despite next being set"); ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — multi-session: handshake installs into `next` (not `current`)")
+  end
+
+  wg_device_destroy(dev_a)
+  wg_device_destroy(dev_b)
+  free(msg_init); free(msg_resp)
+  return ok
+end
+
+## After install-as-next, the first send on the initiator side promotes
+## next → current. The corresponding inbound on the responder also matches
+## `next` and promotes there.
+def test_wg_device_multi_session_promote_on_first_send_recv(): Int
+  var dev_a = wg_device_new()
+  var dev_b = wg_device_new()
+  var ips = vec_new<AllowedIPv4Cidr>()
+  ips.push(cidr_v4(0, 0))
+  var ips2 = vec_new<AllowedIPv4Cidr>()
+  ips2.push(cidr_v4(0, 0))
+  var pb = wg_device_add_peer(dev_a, wg_device_static_pub(dev_b), 0,
+                              endpoint_v4_unset(), ips)
+  var pa = wg_device_add_peer(dev_b, wg_device_static_pub(dev_a), 0,
+                              endpoint_v4_unset(), ips2)
+  var ok = 1
+  var msg_init = malloc(148)
+  var msg_resp = malloc(92)
+
+  wg_device_initiate_handshake(dev_a, pb, msg_init, 1000)
+  wg_device_handle_initiation(dev_b, msg_init, msg_resp, 1000)
+  wg_device_handle_response(dev_a, msg_resp, 1000)
+
+  # Pre-send invariant.
+  if wg_device_peer_has_next(dev_a, pb) != 1 or
+     wg_device_peer_has_current(dev_a, pb) != 0
+    eputs("FAIL: A pre-send state wrong (expected next=1, current=0)"); ok = 0
+  end
+
+  # A sends a 32-byte data packet. wg_device_send_data promotes next→current
+  # before encrypting.
+  var pt = malloc(32)
+  var i = 0
+  while i < 32
+    ptr_write_byte(pt + i, (i * 7) & 255)
+    i += 1
+  end
+  var data_msg = malloc(64)
+  var data_len = wg_device_send_data(dev_a, pb, pt, 32, data_msg, 1100)
+  if data_len != 64
+    eputs("FAIL: send_data returned #{data_len}, expected 64"); ok = 0
+  end
+  if wg_device_peer_has_current(dev_a, pb) != 1
+    eputs("FAIL: A.current not set after first send (promotion failed)"); ok = 0
+  end
+  if wg_device_peer_has_next(dev_a, pb) != 0
+    eputs("FAIL: A.next not cleared after promotion"); ok = 0
+  end
+  if wg_device_peer_has_previous(dev_a, pb) != 0
+    eputs("FAIL: A.previous unexpectedly set (no prior current existed)"); ok = 0
+  end
+
+  # B receives → matches B.next → promotes.
+  var dec = malloc(32)
+  var seen = malloc(4)
+  var dlen = wg_device_handle_data(dev_b, data_msg, data_len, dec, seen, 1100)
+  if dlen != 32
+    eputs("FAIL: handle_data returned #{dlen}, expected 32"); ok = 0
+  end
+  if bytes_eq(pt, dec, 32) != 1
+    eputs("FAIL: round-trip plaintext mismatch"); ok = 0
+  end
+  if wg_device_peer_has_current(dev_b, pa) != 1
+    eputs("FAIL: B.current not set after first recv on next (promotion failed)"); ok = 0
+  end
+  if wg_device_peer_has_next(dev_b, pa) != 0
+    eputs("FAIL: B.next not cleared after recv-promotion"); ok = 0
+  end
+  if wg_device_peer_has_previous(dev_b, pa) != 0
+    eputs("FAIL: B.previous unexpectedly set (no prior current existed)"); ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — multi-session: first send promotes initiator + first recv promotes responder")
+  end
+
+  wg_device_destroy(dev_a)
+  wg_device_destroy(dev_b)
+  free(msg_init); free(msg_resp); free(pt); free(data_msg); free(dec); free(seen)
+  return ok
+end
+
+## Full rekey overlap: handshake_1 establishes S1; data flows on S1.
+## handshake_2 lands S2 in `next` on both sides while S1 stays in `current`.
+## First data round-trip after handshake_2 promotes both ends: previous=S1,
+## current=S2.
+def test_wg_device_multi_session_rekey_overlap(): Int
+  var dev_a = wg_device_new()
+  var dev_b = wg_device_new()
+  var ips = vec_new<AllowedIPv4Cidr>()
+  ips.push(cidr_v4(0, 0))
+  var ips2 = vec_new<AllowedIPv4Cidr>()
+  ips2.push(cidr_v4(0, 0))
+  var pb = wg_device_add_peer(dev_a, wg_device_static_pub(dev_b), 0,
+                              endpoint_v4_unset(), ips)
+  var pa = wg_device_add_peer(dev_b, wg_device_static_pub(dev_a), 0,
+                              endpoint_v4_unset(), ips2)
+  var ok = 1
+  var msg_init = malloc(148)
+  var msg_resp = malloc(92)
+  var pt = malloc(48)
+  var data_msg = malloc(80)
+  var dec = malloc(48)
+  var seen = malloc(4)
+
+  # ---- handshake_1 + data exchange ----
+  wg_device_initiate_handshake(dev_a, pb, msg_init, 1000)
+  wg_device_handle_initiation(dev_b, msg_init, msg_resp, 1000)
+  wg_device_handle_response(dev_a, msg_resp, 1000)
+
+  var i = 0
+  while i < 48
+    ptr_write_byte(pt + i, (i + 1) & 255)
+    i += 1
+  end
+  var l1 = wg_device_send_data(dev_a, pb, pt, 48, data_msg, 1100)
+  if l1 < 0
+    eputs("FAIL: rekey_overlap S1 send failed"); ok = 0
+  end
+  var d1 = wg_device_handle_data(dev_b, data_msg, l1, dec, seen, 1100)
+  if d1 != 48
+    eputs("FAIL: rekey_overlap S1 recv (got #{d1})"); ok = 0
+  end
+  if wg_device_peer_has_current(dev_a, pb) != 1 or
+     wg_device_peer_has_current(dev_b, pa) != 1
+    eputs("FAIL: post-S1 round-trip should have current=1 on both sides"); ok = 0
+  end
+
+  # ---- handshake_2 — overlay S2 in next slots ----
+  wg_device_initiate_handshake(dev_a, pb, msg_init, 2000)
+  wg_device_handle_initiation(dev_b, msg_init, msg_resp, 2000)
+  wg_device_handle_response(dev_a, msg_resp, 2000)
+
+  if wg_device_peer_has_current(dev_a, pb) != 1
+    eputs("FAIL: A.current dropped during rekey (should still hold S1)"); ok = 0
+  end
+  if wg_device_peer_has_next(dev_a, pb) != 1
+    eputs("FAIL: A.next missing after handshake_2"); ok = 0
+  end
+  if wg_device_peer_has_current(dev_b, pa) != 1
+    eputs("FAIL: B.current dropped during rekey (should still hold S1)"); ok = 0
+  end
+  if wg_device_peer_has_next(dev_b, pa) != 1
+    eputs("FAIL: B.next missing after handle_initiation_2"); ok = 0
+  end
+
+  # ---- first round-trip after rekey: promotes both ends ----
+  var l2 = wg_device_send_data(dev_a, pb, pt, 48, data_msg, 2100)
+  if l2 < 0
+    eputs("FAIL: rekey_overlap S2 send failed"); ok = 0
+  end
+  if wg_device_peer_has_previous(dev_a, pb) != 1
+    eputs("FAIL: A should have previous=S1 after promotion"); ok = 0
+  end
+  if wg_device_peer_has_next(dev_a, pb) != 0
+    eputs("FAIL: A.next should clear after promotion"); ok = 0
+  end
+
+  var d2 = wg_device_handle_data(dev_b, data_msg, l2, dec, seen, 2100)
+  if d2 != 48
+    eputs("FAIL: rekey_overlap S2 recv (got #{d2})"); ok = 0
+  end
+  if wg_device_peer_has_previous(dev_b, pa) != 1
+    eputs("FAIL: B should have previous=S1 after recv-promotion"); ok = 0
+  end
+  if wg_device_peer_has_next(dev_b, pa) != 0
+    eputs("FAIL: B.next should clear after recv-promotion"); ok = 0
+  end
+  if bytes_eq(pt, dec, 48) != 1
+    eputs("FAIL: rekey_overlap S2 plaintext mismatch"); ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — multi-session: handshake_2 + first data exchange promotes both ends")
+  end
+
+  wg_device_destroy(dev_a)
+  wg_device_destroy(dev_b)
+  free(msg_init); free(msg_resp); free(pt); free(data_msg); free(dec); free(seen)
+  return ok
+end
+
+## `previous` expires REJECT_AFTER_TIME_MS after its own established_ms.
+## wg_device_peer_gc_stale is the caller-driven hook the unikernel invokes
+## once per peer per tick to bound memory in the long-idle case.
+def test_wg_device_multi_session_previous_gc(): Int
+  var dev_a = wg_device_new()
+  var dev_b = wg_device_new()
+  var ips = vec_new<AllowedIPv4Cidr>()
+  ips.push(cidr_v4(0, 0))
+  var ips2 = vec_new<AllowedIPv4Cidr>()
+  ips2.push(cidr_v4(0, 0))
+  var pb = wg_device_add_peer(dev_a, wg_device_static_pub(dev_b), 0,
+                              endpoint_v4_unset(), ips)
+  var pa = wg_device_add_peer(dev_b, wg_device_static_pub(dev_a), 0,
+                              endpoint_v4_unset(), ips2)
+  var ok = 1
+  var msg_init = malloc(148)
+  var msg_resp = malloc(92)
+  var pt = malloc(16)
+  var data_msg = malloc(48)
+  var dec = malloc(16)
+  var seen = malloc(4)
+
+  # First handshake at S1_ESTABLISHED_MS = 1000. Promote it via a
+  # round-trip so it lives in `current`.
+  wg_device_initiate_handshake(dev_a, pb, msg_init, 1000)
+  wg_device_handle_initiation(dev_b, msg_init, msg_resp, 1000)
+  wg_device_handle_response(dev_a, msg_resp, 1000)
+  wg_device_send_data(dev_a, pb, pt, 16, data_msg, 1000)
+  wg_device_handle_data(dev_b, data_msg, 48, dec, seen, 1000)
+
+  # Second handshake at 2000. Lands in `next`; data round-trip promotes
+  # → A.previous=S1 (established_ms=1000), A.current=S2 (established_ms=2000).
+  wg_device_initiate_handshake(dev_a, pb, msg_init, 2000)
+  wg_device_handle_initiation(dev_b, msg_init, msg_resp, 2000)
+  wg_device_handle_response(dev_a, msg_resp, 2000)
+  wg_device_send_data(dev_a, pb, pt, 16, data_msg, 2000)
+
+  if wg_device_peer_has_previous(dev_a, pb) != 1
+    eputs("FAIL: previous_gc setup — expected previous=1 after rekey"); ok = 0
+  end
+
+  # GC at S1_age = 179s. Below REJECT_AFTER_TIME (180s). previous stays.
+  wg_device_peer_gc_stale(dev_a, pb, 1000 + 179000)
+  if wg_device_peer_has_previous(dev_a, pb) != 1
+    eputs("FAIL: previous reaped too early (179s < 180s)"); ok = 0
+  end
+
+  # GC at S1_age = 180s. previous goes.
+  wg_device_peer_gc_stale(dev_a, pb, 1000 + 180000)
+  if wg_device_peer_has_previous(dev_a, pb) != 0
+    eputs("FAIL: previous not reaped at 180s"); ok = 0
+  end
+  if wg_device_peer_has_current(dev_a, pb) != 1
+    eputs("FAIL: gc_stale incorrectly affected current"); ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — multi-session: gc_stale drops `previous` at REJECT_AFTER_TIME")
+  end
+
+  wg_device_destroy(dev_a)
+  wg_device_destroy(dev_b)
+  free(msg_init); free(msg_resp); free(pt); free(data_msg); free(dec); free(seen)
+  return ok
+end
+
+## A second handshake before either side promotes the first replaces the
+## stale `next` slot. The orphaned session is destroyed (its local_index
+## no longer routes to any peer).
+def test_wg_device_multi_session_handshake_replaces_stale_next(): Int
+  var dev_a = wg_device_new()
+  var dev_b = wg_device_new()
+  var ips = vec_new<AllowedIPv4Cidr>()
+  ips.push(cidr_v4(0, 0))
+  var ips2 = vec_new<AllowedIPv4Cidr>()
+  ips2.push(cidr_v4(0, 0))
+  var pb = wg_device_add_peer(dev_a, wg_device_static_pub(dev_b), 0,
+                              endpoint_v4_unset(), ips)
+  var pa = wg_device_add_peer(dev_b, wg_device_static_pub(dev_a), 0,
+                              endpoint_v4_unset(), ips2)
+  var ok = 1
+  var msg_init = malloc(148)
+  var msg_resp = malloc(92)
+
+  # First handshake — A.next=S1, B.next=S1.
+  wg_device_initiate_handshake(dev_a, pb, msg_init, 1000)
+  wg_device_handle_initiation(dev_b, msg_init, msg_resp, 1000)
+  wg_device_handle_response(dev_a, msg_resp, 1000)
+
+  # Second handshake right away (no send/recv between). This must replace
+  # the stale `next` on both sides — the prior session never proved itself.
+  wg_device_initiate_handshake(dev_a, pb, msg_init, 1100)
+  wg_device_handle_initiation(dev_b, msg_init, msg_resp, 1100)
+  wg_device_handle_response(dev_a, msg_resp, 1100)
+
+  if wg_device_peer_has_next(dev_a, pb) != 1
+    eputs("FAIL: A.next missing after second handshake"); ok = 0
+  end
+  if wg_device_peer_has_current(dev_a, pb) != 0
+    eputs("FAIL: A.current unexpectedly set"); ok = 0
+  end
+  if wg_device_peer_has_previous(dev_a, pb) != 0
+    eputs("FAIL: A.previous unexpectedly set"); ok = 0
+  end
+
+  if wg_device_peer_has_next(dev_b, pa) != 1
+    eputs("FAIL: B.next missing after second handshake"); ok = 0
+  end
+  if wg_device_peer_has_current(dev_b, pa) != 0
+    eputs("FAIL: B.current unexpectedly set"); ok = 0
+  end
+
+  if ok == 1
+    puts("PASS: wg — multi-session: second handshake replaces stale `next`")
+  end
+
+  wg_device_destroy(dev_a)
+  wg_device_destroy(dev_b)
+  free(msg_init); free(msg_resp)
+  return ok
+end
+
+# =============================================================================
+# Entry
+# =============================================================================
+
+# =============================================================================
+# Step 2.9 — Cookie reply (MSG_COOKIEREPLY) + MAC2 helpers
+# =============================================================================
+
+## wg_compute_cookie is deterministic + key-separated:
+##   - same secret + same addr → same cookie (twice)
+##   - diff secret             → diff cookie
+##   - diff addr               → diff cookie
+def test_wg_cookie_compute(): Int
+  var secret_a = malloc(32)
+  var secret_b = malloc(32)
+  memset(secret_a, 0xAA, 32)
+  memset(secret_b, 0xBB, 32)
+
+  var addr1 = malloc(6)  # 4-byte IPv4 || 2-byte port
+  var addr2 = malloc(6)
+  ptr_write_byte(addr1, 192); ptr_write_byte(addr1 + 1, 168); ptr_write_byte(addr1 + 2, 1); ptr_write_byte(addr1 + 3, 10)
+  ptr_write_byte(addr1 + 4, 0xCA); ptr_write_byte(addr1 + 5, 0xFE)
+  ptr_write_byte(addr2, 10); ptr_write_byte(addr2 + 1, 0); ptr_write_byte(addr2 + 2, 0); ptr_write_byte(addr2 + 3, 1)
+  ptr_write_byte(addr2 + 4, 0xCA); ptr_write_byte(addr2 + 5, 0xFE)
+
+  var c1a = malloc(16); var c1b = malloc(16); var c2 = malloc(16); var cB = malloc(16)
+  wg_compute_cookie(c1a, secret_a, addr1, 6)
+  wg_compute_cookie(c1b, secret_a, addr1, 6)
+  wg_compute_cookie(c2, secret_a, addr2, 6)
+  wg_compute_cookie(cB, secret_b, addr1, 6)
+
+  var ok = 0
+  if bytes_eq(c1a, c1b, 16) == 1 and bytes_eq(c1a, c2, 16) == 0 and bytes_eq(c1a, cB, 16) == 0
+    ok = 1
+    puts("PASS: wg_compute_cookie deterministic + secret-/addr-separated")
+  else
+    eputs("FAIL: wg_compute_cookie")
+  end
+
+  free(secret_a); free(secret_b); free(addr1); free(addr2)
+  free(c1a); free(c1b); free(c2); free(cB)
+  return ok
+end
+
+## Cookie reply round-trip + negative paths.
+def test_wg_cookie_reply_roundtrip(): Int
+  var rng = rng_new()
+
+  # Cookie-reply sender = "responder under load" — needs a static keypair.
+  var r_priv = malloc(32); var r_pub = malloc(32)
+  rng_fill(rng, r_priv, 32)
+  x25519_secret_to_public(r_pub, secret_wrap(r_priv))
+
+  # The cookie value the responder wants to teach.
+  var cookie = malloc(16)
+  rng_fill(rng, cookie, 16)
+
+  # Original outbound message's mac1 — used as AEAD aad.
+  var outbound_mac1 = malloc(16)
+  rng_fill(rng, outbound_mac1, 16)
+
+  var our_local_index = 0xDEADBEEF
+
+  var msg = malloc(64)
+  wg_create_cookie_reply(rng, r_pub, cookie, our_local_index, outbound_mac1, msg)
+
+  # Header fields.
+  if ptr_read_byte(msg) != 3
+    eputs("FAIL: cookie reply type byte != 3")
+    return 0
+  end
+
+  # Initiator-side consume — recovers the cookie.
+  var recovered = malloc(16)
+  var rc = wg_consume_cookie_reply(msg, r_pub, our_local_index, outbound_mac1, recovered)
+  var ok_round = 0
+  if rc == 0 and bytes_eq(recovered, cookie, 16) == 1
+    ok_round = 1
+    puts("PASS: cookie reply round-trip recovers cookie")
+  else
+    eputs("FAIL: cookie reply round-trip rc=#{rc}")
+  end
+
+  # Negative: tamper tag → reject.
+  ptr_write_byte(msg + 48, ptr_read_byte(msg + 48) ^ 1)
+  var bad_tag_rc = wg_consume_cookie_reply(msg, r_pub, our_local_index, outbound_mac1, recovered)
+  var ok_tag = 0
+  if bad_tag_rc != 0
+    ok_tag = 1
+    puts("PASS: cookie reply rejects tampered tag")
+  else
+    eputs("FAIL: cookie reply accepted tampered tag (catastrophic)")
+  end
+  ptr_write_byte(msg + 48, ptr_read_byte(msg + 48) ^ 1)  # repair
+
+  # Negative: receiver_index mismatch → reject.
+  var bad_idx_rc = wg_consume_cookie_reply(msg, r_pub, 0x12345678, outbound_mac1, recovered)
+  var ok_idx = 0
+  if bad_idx_rc != 0
+    ok_idx = 1
+    puts("PASS: cookie reply rejects receiver_index mismatch")
+  else
+    eputs("FAIL: cookie reply accepted wrong receiver_index")
+  end
+
+  # Negative: aad mismatch (different outbound_mac1) → reject.
+  var alt_mac1 = malloc(16)
+  rng_fill(rng, alt_mac1, 16)
+  var bad_aad_rc = wg_consume_cookie_reply(msg, r_pub, our_local_index, alt_mac1, recovered)
+  var ok_aad = 0
+  if bad_aad_rc != 0
+    ok_aad = 1
+    puts("PASS: cookie reply rejects mismatched aad (mac1)")
+  else
+    eputs("FAIL: cookie reply accepted wrong aad")
+  end
+
+  # Negative: wrong peer_static_pub → AEAD key mismatch → reject.
+  var alt_pub = malloc(32)
+  rng_fill(rng, alt_pub, 32)
+  var bad_key_rc = wg_consume_cookie_reply(msg, alt_pub, our_local_index, outbound_mac1, recovered)
+  var ok_key = 0
+  if bad_key_rc != 0
+    ok_key = 1
+    puts("PASS: cookie reply rejects wrong peer static pub (XAEAD key)")
+  else
+    eputs("FAIL: cookie reply accepted wrong peer_static_pub")
+  end
+
+  rng_destroy(rng)
+  free(r_priv); free(r_pub); free(cookie); free(outbound_mac1)
+  free(msg); free(recovered); free(alt_mac1); free(alt_pub)
+  return ok_round & ok_tag & ok_idx & ok_aad & ok_key
+end
+
+## wg_compute_mac2 + wg_validate_mac2 + wg_attach_mac2 on a real handshake msg.
+def test_wg_mac2_compute_validate(): Int
+  var rng = rng_new()
+  var i_priv = malloc(32); var i_pub = malloc(32)
+  var r_priv = malloc(32); var r_pub = malloc(32)
+  rng_fill(rng, i_priv, 32); rng_fill(rng, r_priv, 32)
+  x25519_secret_to_public(i_pub, secret_wrap(i_priv))
+  x25519_secret_to_public(r_pub, secret_wrap(r_priv))
+
+  var ts = malloc(12)
+  memset(ts, 0, 12)
+
+  # Build a real MSG_INITIATION (mac2 starts as zeros from wg_create_initiation).
+  var hs = noise_handshake_new()
+  var msg = malloc(148)
+  var rc = wg_create_initiation(hs, rng, secret_wrap(i_priv), i_pub, r_pub, 0xABCDABCD, ts, msg)
+  if rc != 0
+    eputs("FAIL: setup wg_create_initiation rc=#{rc}")
+    return 0
+  end
+
+  # Mac2 starts as zeros — validate against arbitrary cookie should fail.
+  var arb_cookie = malloc(16)
+  memset(arb_cookie, 0xCC, 16)
+  if wg_validate_mac2(msg, 116, arb_cookie) != 0
+    eputs("FAIL: wg_validate_mac2 returned 1 on zero mac2 vs nonzero cookie")
+    return 0
+  end
+
+  # Attach mac2 with a chosen cookie, then validate with the same cookie.
+  wg_attach_mac2(msg, 116, arb_cookie)
+  var ok_attach = wg_validate_mac2(msg, 116, arb_cookie)
+  var ok1 = 0
+  if ok_attach == 1
+    ok1 = 1
+    puts("PASS: wg_attach_mac2 + wg_validate_mac2 round-trip")
+  else
+    eputs("FAIL: wg_validate_mac2 rejected its own wg_attach_mac2")
+  end
+
+  # Validation against a different cookie must fail.
+  var other_cookie = malloc(16)
+  memset(other_cookie, 0xDD, 16)
+  var ok_diff = wg_validate_mac2(msg, 116, other_cookie)
+  var ok2 = 0
+  if ok_diff == 0
+    ok2 = 1
+    puts("PASS: wg_validate_mac2 rejects wrong cookie")
+  else
+    eputs("FAIL: wg_validate_mac2 accepted wrong cookie")
+  end
+
+  # wg_compute_mac2 standalone deterministic + key-separated.
+  var mac_a = malloc(16); var mac_b = malloc(16); var mac_c = malloc(16)
+  wg_compute_mac2(mac_a, msg, 116, msg + 116, arb_cookie)
+  wg_compute_mac2(mac_b, msg, 116, msg + 116, arb_cookie)
+  wg_compute_mac2(mac_c, msg, 116, msg + 116, other_cookie)
+  var ok3 = 0
+  if bytes_eq(mac_a, mac_b, 16) == 1 and bytes_eq(mac_a, mac_c, 16) == 0
+    ok3 = 1
+    puts("PASS: wg_compute_mac2 deterministic + cookie-keyed")
+  else
+    eputs("FAIL: wg_compute_mac2 self-consistency")
+  end
+
+  noise_handshake_destroy(hs)
+  rng_destroy(rng)
+  free(i_priv); free(i_pub); free(r_priv); free(r_pub); free(ts)
+  free(msg); free(arb_cookie); free(other_cookie)
+  free(mac_a); free(mac_b); free(mac_c)
+  return ok1 & ok2 & ok3
+end
+
+# =============================================================================
+# Step 2.10 — Device-level cookie integration + under-load detection
+# =============================================================================
+
+# Build a 4-byte network-order IPv4 + 2-byte port = 6-byte addr buffer.
+def _make_addr_v4(out: Int, ip0: Int, ip1: Int, ip2: Int, ip3: Int, port: Int): Void
+  ptr_write_byte(out, ip0)
+  ptr_write_byte(out + 1, ip1)
+  ptr_write_byte(out + 2, ip2)
+  ptr_write_byte(out + 3, ip3)
+  ptr_write_byte(out + 4, (port >> 8) & 255)
+  ptr_write_byte(out + 5, port & 255)
+end
+
+## End-to-end cookie reply: initiator sends MSG_INITIATION → responder is
+## under load → responder emits MSG_COOKIEREPLY → initiator caches cookie →
+## next MSG_INITIATION carries valid mac2 → responder accepts (no cookie
+## reply needed second time around).
+def test_wg_device_cookie_reply_e2e(): Int
+  var rng = rng_new()
+  var i_priv = malloc(32); var i_pub = malloc(32)
+  var r_priv = malloc(32); var r_pub = malloc(32)
+  rng_fill(rng, i_priv, 32); rng_fill(rng, r_priv, 32)
+  x25519_secret_to_public(i_pub, secret_wrap(i_priv))
+  x25519_secret_to_public(r_pub, secret_wrap(r_priv))
+  var psk = malloc(32); memset(psk, 0, 32)
+
+  # Two devices wired to know each other.
+  var d_init = wg_device_from_keys(i_priv, i_pub)
+  var d_resp = wg_device_from_keys(r_priv, r_pub)
+  var ai = vec_new<AllowedIPv4Cidr>()
+  ai.push(cidr_v4(0, 0))
+  var p_init = wg_device_add_peer(d_init, r_pub, psk, EndpointV4 { ip_be: 0, port: 0 }, ai)
+  var ai2 = vec_new<AllowedIPv4Cidr>()
+  ai2.push(cidr_v4(0, 0))
+  var p_resp = wg_device_add_peer(d_resp, i_pub, psk, EndpointV4 { ip_be: 0, port: 0 }, ai2)
+
+  # Force responder under-load.
+  wg_device_set_under_load(d_resp, 1)
+
+  var src_addr = malloc(6)
+  _make_addr_v4(src_addr, 192, 168, 1, 50, 55555)
+
+  var msg_init = malloc(148)
+  if wg_device_initiate_handshake(d_init, p_init, msg_init, 1000) != 148
+    eputs("FAIL: initiate_handshake")
+    return 0
+  end
+
+  # Responder under load → wants cookie reply.
+  if wg_device_should_cookie_reply(d_resp, msg_init, 116, src_addr, 6, 1000) != 1
+    eputs("FAIL: under-load responder didn't request cookie reply")
+    return 0
+  end
+
+  # Emit cookie reply.
+  var msg_ck = malloc(64)
+  var ck_len = wg_device_emit_cookie_reply(d_resp, msg_init, 116, src_addr, 6, msg_ck, 1000)
+  var ok_emit = 0
+  if ck_len == 64 and ptr_read_byte(msg_ck) == 3
+    ok_emit = 1
+    puts("PASS: under-load responder emits 64-byte MSG_COOKIEREPLY")
+  else
+    eputs("FAIL: emit_cookie_reply len=#{ck_len}")
+  end
+
+  # Initiator consumes cookie reply.
+  var ck_peer = wg_device_handle_cookie_reply(d_init, msg_ck, 64, 1100)
+  var ok_consume = 0
+  if ck_peer == p_init and wg_device_peer_has_fresh_cookie(d_init, p_init, 1100) == 1
+    ok_consume = 1
+    puts("PASS: initiator consumes cookie reply, caches cookie")
+  else
+    eputs("FAIL: handle_cookie_reply ck_peer=#{ck_peer}")
+  end
+
+  # Next MSG_INITIATION — should carry mac2 derived from cached cookie, and
+  # the under-load responder should now accept it (no cookie reply needed).
+  var msg_init2 = malloc(148)
+  if wg_device_initiate_handshake(d_init, p_init, msg_init2, 1200) != 148
+    eputs("FAIL: 2nd initiate_handshake")
+    return 0
+  end
+  # Validate mac2 isn't all zeros now.
+  var nonzero_mac2 = 0
+  var k = 0
+  while k < 16
+    if ptr_read_byte(msg_init2 + 132 + k) != 0
+      nonzero_mac2 = 1
+    end
+    k += 1
+  end
+  var ok_attach = 0
+  if nonzero_mac2 == 1
+    ok_attach = 1
+    puts("PASS: 2nd initiation carries non-zero mac2 (attached from cached cookie)")
+  else
+    eputs("FAIL: 2nd initiation mac2 still zeros")
+  end
+
+  # Under-load responder should NOT request cookie reply for this one.
+  var should2 = wg_device_should_cookie_reply(d_resp, msg_init2, 116, src_addr, 6, 1200)
+  var ok_accept = 0
+  if should2 == 0
+    ok_accept = 1
+    puts("PASS: under-load responder accepts initiation with valid mac2")
+  else
+    eputs("FAIL: responder still requested cookie reply on valid-mac2 initiation")
+  end
+
+  rng_destroy(rng)
+  wg_device_destroy(d_init)
+  wg_device_destroy(d_resp)
+  free(i_priv); free(i_pub); free(r_priv); free(r_pub); free(psk)
+  free(src_addr); free(msg_init); free(msg_ck); free(msg_init2)
+  return ok_emit & ok_consume & ok_attach & ok_accept
+end
+
+## Auto-detection of under-load: 8 inbound handshake notes within 1s should
+## set under_load=1; a fresh window after 1s+ resets the counter and clears
+## the flag.
+def test_wg_device_under_load_auto(): Int
+  var d = wg_device_new()
+  if wg_device_under_load(d) != 0
+    eputs("FAIL: fresh device starts under_load=1")
+    return 0
+  end
+
+  var i = 0
+  while i < 7
+    wg_device_note_handshake_inbound(d, 5000 + i * 50)  # within 1s
+    i += 1
+  end
+  if wg_device_under_load(d) != 0
+    eputs("FAIL: 7 inbound handshakes set under_load (should require 8)")
+    return 0
+  end
+  wg_device_note_handshake_inbound(d, 5400)  # 8th
+  var ok_set = 0
+  if wg_device_under_load(d) == 1
+    ok_set = 1
+    puts("PASS: 8 inbound handshakes / sec sets under_load=1")
+  else
+    eputs("FAIL: 8 inbound handshakes did not set under_load")
+  end
+
+  # Quiet next window → reset.
+  wg_device_note_handshake_inbound(d, 7000)  # 1.6s after window start
+  var ok_clear = 0
+  if wg_device_under_load(d) == 0
+    ok_clear = 1
+    puts("PASS: quiet next window decays under_load to 0")
+  else
+    eputs("FAIL: under_load did not decay")
+  end
+
+  wg_device_destroy(d)
+  return ok_set & ok_clear
+end
+
+## Cookie secret rotation: after WG_COOKIE_REFRESH_TIME_MS the current secret
+## becomes "previous" and a fresh one is generated. Within the 60s grace
+## window after rotation, the previous secret still validates inbound mac2.
+def test_wg_device_cookie_secret_rotation(): Int
+  var d = wg_device_new()
+  # Trigger initial secret materialization.
+  wg_device_rotate_cookie_secret_if_due(d, 1000)
+  # Snapshot.
+  var snap1 = malloc(32)
+  memcpy(snap1, d.cookie_secret, 32)
+  # No rotation if less than 120s elapsed.
+  wg_device_rotate_cookie_secret_if_due(d, 60000)
+  var ok_no_rotate = 1
+  var k = 0
+  while k < 32
+    if ptr_read_byte(snap1 + k) != ptr_read_byte(d.cookie_secret + k)
+      ok_no_rotate = 0
+    end
+    k += 1
+  end
+  if ok_no_rotate == 0
+    eputs("FAIL: cookie secret rotated before 120s")
+    return 0
+  end
+
+  # Force rotation past 120s.
+  wg_device_rotate_cookie_secret_if_due(d, 200000)
+  var differ = 0
+  var prev_eq = 1
+  k = 0
+  while k < 32
+    if ptr_read_byte(snap1 + k) != ptr_read_byte(d.cookie_secret + k)
+      differ = 1
+    end
+    if ptr_read_byte(snap1 + k) != ptr_read_byte(d.prev_cookie_secret + k)
+      prev_eq = 0
+    end
+    k += 1
+  end
+  var ok = 0
+  if differ == 1 and prev_eq == 1
+    ok = 1
+    puts("PASS: cookie secret rotates at 120s; old secret promoted to previous")
+  else
+    eputs("FAIL: rotation: differ=#{differ} prev_eq=#{prev_eq}")
+  end
+
+  wg_device_destroy(d)
+  free(snap1)
+  return ok
+end
+
+def main(): Int
+  puts("=== NET.1 Phase 1 Steps 2.1+2.2+2.3+2.4+2.7+2.9+2.10 — WireGuard full stack smoke ===")
+
+  var loop_ok = test_wg_handshake_loopback()
+  var mac_ok = test_wg_mac1_tampering()
+  var idx_ok = test_wg_receiver_index_mismatch()
+  var typ_ok = test_wg_msg_type_mismatch()
+  var peer_ok = test_wg_peer()
+  var tai_ok = test_wg_tai64n()
+
+  var rt_ok = test_wg_transport_roundtrip()
+  var pad_ok = test_wg_transport_padding()
+  var ka_ok = test_wg_transport_keepalive()
+  var rep_ok = test_wg_transport_replay()
+  var oo_ok = test_wg_transport_out_of_order()
+  var tag_ok = test_wg_transport_tag_tamper()
+  var tt_ok = test_wg_transport_type_byte()
+  var ri_ok = test_wg_transport_recv_index()
+  var win_ok = test_wg_replay_window_edges()
+
+  var ti_idle_ok = test_wg_timers_idle()
+  var ti_rekey_ok = test_wg_timers_rekey()
+  var ti_resp_ok = test_wg_timers_responder_no_rekey()
+  var ti_retx_ok = test_wg_timers_retransmit()
+  var ti_giveup_ok = test_wg_timers_give_up()
+  var ti_ka_ok = test_wg_timers_keepalive()
+  var ti_rej_ok = test_wg_timers_reject_session()
+  var ti_sim_ok = test_wg_timers_simultaneous()
+
+  var dev_e2e_ok = test_wg_device_e2e()
+  var dev_route_ok = test_wg_device_routing()
+  var dev_replay_ok = test_wg_device_handshake_replay()
+
+  var ms_install_ok = test_wg_device_multi_session_install_as_next()
+  var ms_promote_ok = test_wg_device_multi_session_promote_on_first_send_recv()
+  var ms_overlap_ok = test_wg_device_multi_session_rekey_overlap()
+  var ms_gc_ok = test_wg_device_multi_session_previous_gc()
+  var ms_replace_ok = test_wg_device_multi_session_handshake_replaces_stale_next()
+
+  var ck_compute_ok = test_wg_cookie_compute()
+  var ck_round_ok = test_wg_cookie_reply_roundtrip()
+  var ck_mac2_ok = test_wg_mac2_compute_validate()
+
+  var dev_ck_e2e_ok = test_wg_device_cookie_reply_e2e()
+  var dev_ul_ok = test_wg_device_under_load_auto()
+  var dev_rot_ok = test_wg_device_cookie_secret_rotation()
+
+  if loop_ok == 1 and mac_ok == 1 and idx_ok == 1 and typ_ok == 1 and
+     peer_ok == 1 and tai_ok == 1 and rt_ok == 1 and pad_ok == 1 and
+     ka_ok == 1 and rep_ok == 1 and oo_ok == 1 and tag_ok == 1 and
+     tt_ok == 1 and ri_ok == 1 and win_ok == 1 and
+     ti_idle_ok == 1 and ti_rekey_ok == 1 and ti_resp_ok == 1 and
+     ti_retx_ok == 1 and ti_giveup_ok == 1 and ti_ka_ok == 1 and
+     ti_rej_ok == 1 and ti_sim_ok == 1 and
+     dev_e2e_ok == 1 and dev_route_ok == 1 and dev_replay_ok == 1 and
+     ms_install_ok == 1 and ms_promote_ok == 1 and ms_overlap_ok == 1 and
+     ms_gc_ok == 1 and ms_replace_ok == 1 and
+     ck_compute_ok == 1 and ck_round_ok == 1 and ck_mac2_ok == 1 and
+     dev_ck_e2e_ok == 1 and dev_ul_ok == 1 and dev_rot_ok == 1
+    puts("=== ALL GREEN ===")
+    return 0
+  end
+  eputs("=== FAILURES ===")
+  return 1
+end

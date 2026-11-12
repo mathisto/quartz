@@ -1,0 +1,180 @@
+# NET.4.2 — dudect canary smoke
+#
+# Validates the harness itself by running two `ct_eq_bytes` variants
+# against a fixed-vs-random class-A/class-B input pattern:
+#
+#   leaky  — early-exit on first mismatched byte. Class 0 (fixed input
+#            equals secret) walks the full BUF_LEN_CANARY bytes; class 1
+#            (random input differs at byte 0) returns immediately.
+#            Strong timing leak.
+#   honest — `subtle::ct_eq_bytes` — walks all bytes regardless of
+#            content; the canonical constant-time pattern.
+#
+# Expected outcomes:
+#
+#   leaky  → dudect_assert_leak passes (max|t| ≥ 100 — "overwhelming
+#            evidence" per Reparaz §4). Validates the harness can detect
+#            the canonical leak class.
+#   honest → dudect_assert_ct passes (max|t| < 5). Validates no false
+#            positives on a real constant-time primitive.
+#
+# **Why BUF_LEN_CANARY = 4096 instead of e.g. 32**: `time_mono_ns()`
+# resolves at ~20-50 ns / sample on macOS/Linux (`clock_gettime` syscall
+# overhead). A 32-byte comparison's per-call cost (~30 ns) is at the
+# noise floor; the leak signal at 30K samples comes out to ~|t|=14, in
+# the "likely leak" range but not yet "overwhelming." Bumping to 4096
+# bytes makes the leak signal ~100× louder than syscall noise, which is
+# what we need to give the canary a clean PASS against the
+# `dudect_t_threshold_overwhelming` (≥ 100) gate without firing up the
+# `rdtsc` intrinsic. The design memo
+# (`docs/design/SECRET_T_AND_DUDECT_DESIGN.md` §"Time source") flags
+# `rdtsc` as the v1→v2 follow-up if a real-primitive test ever needs
+# finer resolution.
+#
+# Format mirrors spec/qz/ed25519_smoke.qz / spec/qz/wg_smoke.qz so the
+# crypto smoke runners share idiom. Smoke wrapper: `quake dudect:canary`.
+
+import * from ffi/socket
+import * from std/core/crypto/subtle    # honest ct_eq_bytes
+import * from std/crypto/dudect
+
+# Global passed / total trackers (mirrors ed25519_smoke.qz §77).
+var g_total: Int = 0
+var g_passed: Int = 0
+
+def check_canary(label: String, got: Int): Void
+  g_total = g_total + 1
+  if got == 0
+    g_passed = g_passed + 1
+    puts("OK   " + label)
+    return
+  end
+  puts("FAIL " + label)
+end
+
+# =============================================================================
+# leaky_ct_eq — DELIBERATELY broken early-exit comparison
+# =============================================================================
+#
+# This is what NOT to write. We ship it inside the canary spec only so
+# the harness has something with an obvious leak to detect. No callers
+# anywhere else in the tree.
+def leaky_ct_eq(a_ptr: Int, b_ptr: Int, len: Int): Int
+  var i = 0
+  while i < len
+    var ax = ptr_read_byte(a_ptr + i)
+    var bx = ptr_read_byte(b_ptr + i)
+    if ax != bx
+      return 0       # <-- the leak: early exit on first mismatch.
+    end
+    i = i + 1
+  end
+  return 1
+end
+
+# =============================================================================
+# Measurement loops
+# =============================================================================
+#
+# Two-class setup:
+#   class 0 = "fixed input matches secret"  → all 32 bytes equal
+#   class 1 = "random input differs"        → first random byte differs
+#                                              almost surely
+#
+# We give the leaky variant a strong leak signal by using a fixed
+# secret of all-zeros and class-1 inputs that have a randomized leading
+# byte. The honest variant gets the same workload but should produce
+# uniform timing because it never short-circuits.
+
+const N_SAMPLES_CANARY = 30000
+const BUF_LEN_CANARY = 4096   # canary fits comfortably in <1s wall
+
+def run_canary_leaky(): Int
+  var ctx = dudect_new()
+  var secret = malloc(BUF_LEN_CANARY)
+  var input = malloc(BUF_LEN_CANARY)
+  memset(secret, 0, BUF_LEN_CANARY)
+
+  var rng = dudect_rng_new(0x9e3779b97f4a7c15)
+  var i = 0
+  while i < N_SAMPLES_CANARY
+    var c = i % 2
+    if c == 0
+      # Class 0: input == secret. leaky_ct_eq walks all 32 bytes.
+      memset(input, 0, BUF_LEN_CANARY)
+    end
+    if c != 0
+      # Class 1: input differs in the first byte. leaky_ct_eq returns
+      # on iteration ≤ 1 almost always.
+      dudect_rng_fill(rng, input, BUF_LEN_CANARY)
+      # Force differ on byte 0 if it happened to land at 0.
+      ptr_write_byte(input, 0x55)
+    end
+
+    var t0 = time_mono_ns()
+    leaky_ct_eq(secret, input, BUF_LEN_CANARY)
+    var t1 = time_mono_ns()
+    dudect_push(ctx, t1 - t0, c)
+    i = i + 1
+  end
+
+  free(secret); free(input)
+
+  # The canary's job is to PROVE the harness detects this leak. We
+  # require max|t| ≥ 100 ("overwhelming evidence"). Returns 0 on
+  # canary success.
+  return dudect_assert_leak("canary leaky_ct_eq", ctx,
+                            dudect_t_threshold_overwhelming())
+end
+
+def run_canary_honest(): Int
+  var ctx = dudect_new()
+  var secret = malloc(BUF_LEN_CANARY)
+  var input = malloc(BUF_LEN_CANARY)
+  memset(secret, 0, BUF_LEN_CANARY)
+
+  var rng = dudect_rng_new(0x9e3779b97f4a7c15)
+  var i = 0
+  while i < N_SAMPLES_CANARY
+    var c = i % 2
+    if c == 0
+      memset(input, 0, BUF_LEN_CANARY)
+    end
+    if c != 0
+      dudect_rng_fill(rng, input, BUF_LEN_CANARY)
+      ptr_write_byte(input, 0x55)
+    end
+
+    var t0 = time_mono_ns()
+    ct_eq_bytes(secret, input, BUF_LEN_CANARY)
+    var t1 = time_mono_ns()
+    dudect_push(ctx, t1 - t0, c)
+    i = i + 1
+  end
+
+  free(secret); free(input)
+
+  # The honest primitive should not detect a leak. Returns 0 on success.
+  return dudect_assert_ct("canary subtle::ct_eq_bytes", ctx,
+                          dudect_t_threshold_leak())
+end
+
+def main(): Int
+  puts("--- dudect canary ---")
+
+  # First: leaky must trip. If it doesn't, the harness is broken
+  # (or the time source's resolution is too coarse for this workload —
+  # design memo §"Time source" calls that the v1→v2 rdtsc-intrinsic
+  # trigger).
+  check_canary("leaky early-exit detected as leak", run_canary_leaky())
+
+  # Second: honest must NOT trip. False positives would invalidate
+  # the harness for real-primitive validation.
+  check_canary("subtle::ct_eq_bytes detected as constant-time",
+               run_canary_honest())
+
+  puts("")
+  puts(to_str(g_passed) + "/" + to_str(g_total) + " canary checks green")
+  if g_passed == g_total then return 0 end
+  return 1
+end

@@ -1,0 +1,168 @@
+## std/sync/composition/future.qz — Async Combinators for Quartz
+##
+## Higher-level async functions built on top of await, spawn, and
+## the M:N scheduler primitives.
+##
+## Usage:
+##   import * from std/sync/composition/future
+##
+## Functions:
+##   async_all(tasks) -> Vec<Int>     — Await each task, collect results in order
+##   async_race(tasks) -> Int         — Return first completed result (go/async only)
+##   async_map(items, f) -> Vec<Int>  — Spawn f(item) for each, collect in order
+##   async_timeout(f, ms) -> Int      — Run f with timeout, returns Option<Int>
+
+import * from std/sync/communication/channel
+import * from std/sync/composition/scope
+
+## Await each task in order, collecting results into a Vec.
+## Works with any handle type (spawn, async, go).
+def async_all(tasks: Vec<Int>): Vec<Int>
+  var results = vec_new<Int>()
+  var i = 0
+  while i < tasks.size
+    var handle = tasks[i]
+    var result = await handle
+    results.push(result)
+    i = i + 1
+  end
+  return results
+end
+
+## Wait for the first of N async frames to complete.
+## Returns the index of the first completed task.
+## Event-driven: suspends via io_suspend on completion notification pipe.
+## Zero CPU burn while waiting — woken by worker loop when any task finishes.
+def async_select(tasks: Vec<Int>): Int
+  var n = tasks.size
+  # Quick check: any already done?
+  var i = 0
+  while i < n
+    if load(tasks[i], 0) == -1
+      return i
+    end
+    i = i + 1
+  end
+  # None done — register for completion notification and suspend
+  var pipe_rfd = completion_watch_multi(tasks)
+  while true
+    io_suspend(pipe_rfd)
+    var j = 0
+    while j < n
+      if load(tasks[j], 0) == -1
+        completion_unwatch_all(tasks)
+        return j
+      end
+      j = j + 1
+    end
+  end
+  return 0
+end
+
+## Return the result of the first task to complete.
+## Cancels all losing tasks via their cancel tokens (frame[3]).
+## Uses async_select for polling.
+## Caller must ensure sched_init() has been called.
+def async_race(tasks: Vec<Int>): Int
+  var winner_idx = async_select(tasks)
+  var winner = tasks[winner_idx]
+  var result = load(winner, 1)
+  var n = tasks.size
+  var i = 0
+  while i < n
+    if i != winner_idx
+      var loser = tasks[i]
+      var cancel_tok = load(loser, 3)
+      if cancel_tok > 0
+        cancel_token_cancel(cancel_tok)
+      end
+    end
+    i = i + 1
+  end
+  return result
+end
+
+## Apply f to each item in parallel, collect results in order.
+## Spawns OS threads via spawn for maximum compatibility.
+def async_map(items: Vec<Int>, f: Fn(Int): Int): Vec<Int>
+  var tasks = vec_new<Int>()
+  var i = 0
+  while i < items.size
+    var item = items[i]
+    var h = go (-> f(item))
+    tasks.push(h)
+    i = i + 1
+  end
+  return async_all(tasks)
+end
+
+## Run f with a timeout. Returns Option<Int>:
+##   option_some(result) if f completes before timeout_ms
+##   option_none() if timeout fires first
+## Uses a channel + recv_timeout for the deadline mechanism.
+## Note: channel is intentionally not freed — the spawned thread may still
+## send to it after timeout fires. Channel leaks ~200 bytes (acceptable
+## until GC or structured cancellation).
+def async_timeout(f: Fn(): Int, timeout_ms: Int): Int
+  var ch = channel_new(1)
+  go do ->
+    var result = f()
+    send(ch, result)
+    return result
+  end
+  return recv_timeout(ch, timeout_ms)
+end
+
+## Scheduler-integrated timeout: run f as a go-task, race against timer.
+## Returns Option<Int>:
+##   option_some(result) if f completes before timeout_ms
+##   option_none() if timeout fires first
+## Uses go-task + select timeout — does not block the scheduler.
+## Requires scheduler to be active (auto-initialized by go).
+##
+## C.13 Phase 6 migration: uses the unified Selectable form
+## (`recvable(ch)` / `deadline_ms(ms)`) instead of the legacy
+## `recv` / `timeout` arm keywords.
+##
+## `deadline_ms` complete() throws via Throws BEFORE the arm body runs
+## (per the DeadlineSelectable impl). To preserve the Option-returning
+## API, we initialize `result = option_none()` BEFORE the select and
+## install a Throws handler that catches the deadline throw and falls
+## through. The recv arm overrides `result` on success; on deadline,
+## the throw bypasses arm bodies and `result` stays None.
+def _sched_timeout_swallow(op_name: Int, argc: Int, argv: Int): Int
+  return 0
+end
+
+def sched_timeout(f: Fn(): Int, timeout_ms: Int): Int
+  var ch = channel_new(1)
+  go do ->
+    send(ch, f())
+  end
+  var result = option_none()
+  with Throws { throw: _sched_timeout_swallow } do ->
+    select
+      case v = recvable(ch) => result = option_some(v)
+      case _ = deadline_ms(timeout_ms) => 0
+    end
+    0
+  end
+  return result
+end
+
+## Apply f to each item using M:N scheduler, collect results in order.
+## Much lighter than async_map (which spawns OS threads per item).
+## Initializes the scheduler if not already running.
+def sched_map(items: Vec<Int>, f: Fn(Int): Int): Vec<Int>
+  sched_init(0)
+  var tasks = vec_new<Int>()
+  var i = 0
+  while i < items.size
+    var item = items[i]
+    var task = async f(item)
+    sched_spawn(task)
+    tasks.push(task)
+    i = i + 1
+  end
+  return async_all(tasks)
+end

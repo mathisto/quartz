@@ -1,0 +1,129 @@
+##! # Typecheck Diagnostic Bridge
+##!
+##! Routes the `Diag` algebraic effect (declared in `std/diag.qz`) to the
+##! existing TypecheckState-keyed diagnostic accumulator in
+##! `typecheck_util::tc_error`.
+##!
+##! Quartz handlers cannot close over outer state today (handlers are
+##! top-level functions with the standard `(op_name, argc, argv): Int` ABI).
+##! This bridge provides the missing channel: `tc_diag_set(tc)` records the
+##! active TypecheckState in a single global slot; the handler reads that
+##! slot when an op fires and forwards to `tc_error`.
+##!
+##! Phase 5.1 (Operation Piezoelectric Effects · compiler dogfooding).
+##!
+##! ## Setup (call once per compile pass)
+##!
+##! `quartz.qz`'s `compile()` calls `tc_diag_set(tc)` once near the top of
+##! the typecheck phase. The active tc remains valid until the next
+##! `tc_diag_set(tc')` overwrites it (or `tc_diag_clear()` for paranoia).
+##! Per-call wraps no longer need to push/pop — they just install the
+##! handler binding for their dynamic scope:
+##!
+##!   with Diag {
+##!     error: typecheck_diag::tc_diag_error_handler,
+##!     warn: typecheck_diag::tc_diag_warn_handler
+##!   } do ->
+##!     typecheck_walk::tc_program(tc, ast_storage, root)
+##!   end
+##!
+##! ## Why a slot, not a stack
+##!
+##! The original Phase 5.1.0-5.1.6 implementation used a Vec<TypecheckState>
+##! stack with `tc_diag_push` / `tc_diag_pop`. The stack form leaks pushes
+##! when a `with Diag {...} do -> ...end` body returns early via the enclosing
+##! function's `return` — the post-with `pop` never runs. For migrations that
+##! body-wrap a function with multiple early-return paths (e.g., tc_stmt's 35
+##! sites), this leak is unbounded. The single-slot global eliminates the leak
+##! entirely: there's no per-call set/clear, just the one-time set in
+##! compile(). Effect-handler unwind on early return is handled correctly by
+##! Quartz's runtime (verified empirically).
+
+import ast
+import typecheck
+import typecheck_util
+import * from str_compat
+
+# Single-slot home for the active TypecheckState. Vec form (not a scalar)
+# because Quartz top-level vars need an initial value, and Vec<T>'s
+# `vec_new<T>()` is the cheap any-typed default.
+var __tc_diag_active: Vec<TypecheckState> = vec_new<TypecheckState>()
+
+## Set the active diagnostic sink. Idempotent — repeated calls just
+## overwrite the slot. Call once at the top of each compile pass.
+def tc_diag_set(tc: TypecheckState): Void
+  if __tc_diag_active.size == 0
+    __tc_diag_active.push(tc)
+  else
+    __tc_diag_active[0] = tc
+  end
+end
+
+## Clear the active diagnostic sink. Optional — call between compile
+## passes if you want the empty-slot breadcrumb to fire on stale calls.
+def tc_diag_clear(): Void
+  if __tc_diag_active.size > 0
+    __tc_diag_active.pop()
+  end
+end
+
+## Diag.error handler. Effect ABI: `(op_name, argc, argv): Int`.
+## argv layout: [msg: String, line: Int, col: Int]. Forwards to tc_error
+## on the active TypecheckState.
+##
+## If the slot is empty (handler fires with no active TC), writes a
+## stderr breadcrumb and drops the message — typecheck pipelines should
+## always call tc_diag_set(tc) before installing this handler.
+def tc_diag_error_handler(op_name: Int, argc: Int, argv: Int): Int
+  if __tc_diag_active.size == 0
+    eputs("[diag] error fired with no active TC; message dropped")
+    return 0
+  end
+  var tc = __tc_diag_active[0]
+  var msg = as_string(load(argv, 0))
+  var line = load(argv, 1)
+  var col = load(argv, 2)
+  typecheck_util::tc_error(tc, msg, line, col)
+  return 0
+end
+
+## Diag.warn handler — same shape as the error handler but routes to
+## typecheck::tc_warning, which records into the warnings half of
+## tc.errs (separate accumulator from errors).
+def tc_diag_warn_handler(op_name: Int, argc: Int, argv: Int): Int
+  if __tc_diag_active.size == 0
+    eputs("[diag] warn fired with no active TC; message dropped")
+    return 0
+  end
+  var tc = __tc_diag_active[0]
+  var msg = as_string(load(argv, 0))
+  var line = load(argv, 1)
+  var col = load(argv, 2)
+  typecheck::tc_warning(tc, msg, line, col)
+  return 0
+end
+
+## Emit a typecheck error at AST node `h`, capturing both source location
+## and macro-expansion provenance in one call. Bypasses the `Diag` effect
+## because the effect ABI only carries (msg, line, col) — lossy for the
+## expansion_idx. Call this from any tc site that has a node handle and
+## wants the error to render its macro expansion chain. When the node
+## is user source (expansion_idx=0), behaves identically to `error(msg,
+## line, col)`. Macro hygiene retrofit · Tier 2 #8b-followup P2.c.
+def tc_diag_error_at(s: ast::AstStorage, h: Int, msg: String): Void
+  if __tc_diag_active.size == 0
+    eputs("[diag] tc_diag_error_at fired with no active TC; message dropped")
+    return
+  end
+  var tc = __tc_diag_active[0]
+  typecheck_util::tc_error_at(tc, msg, s, h)
+end
+
+def tc_diag_warn_at(s: ast::AstStorage, h: Int, msg: String): Void
+  if __tc_diag_active.size == 0
+    eputs("[diag] tc_diag_warn_at fired with no active TC; message dropped")
+    return
+  end
+  var tc = __tc_diag_active[0]
+  typecheck::tc_warning_at(tc, msg, s, h)
+end

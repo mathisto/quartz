@@ -1,0 +1,126 @@
+## scope-aware rwlock read-lock acquisition (B.7 Phase 4e.4)
+##
+## scope_rwlock_read is the fifth scope-integrated blocking primitive (after
+## scope_sleep_ms in Phase 4e.1, scope_recv/scope_send in Phase 4e.2, and
+## scope_lock in Phase 4e.3). It follows the same chunked-poll-first recipe:
+## under root scope, route to the tight blocking `rwlock_read` call; under a
+## real scope, alternate `rwlock_try_read` with
+## `sched_sleep(min(chunk, deadline_remaining_ms))` and `scope_check` between
+## chunks.
+##
+## Contract:
+##   1. Under root scope, scope_rwlock_read on an uncontended rwlock returns
+##      the protected value without throwing.
+##   2. Under a scope with a generous deadline, scope_rwlock_read on an
+##      uncontended rwlock returns the value without throwing — the try_read
+##      succeeds on the first iteration, never entering the chunk-poll path.
+##   3. Under a scope with a tight deadline, scope_rwlock_read on a write-held
+##      rwlock throws "deadline_exceeded" within ~chunk_size + slack ms. The
+##      scope's deadline timer (Phase 4d) is what fires the deadline.
+##   4. Under a scope already cancelled at entry, scope_rwlock_read throws
+##      immediately with the user-supplied reason (preflight check).
+
+import * from qspec
+import * from std/sync/composition/scope
+import * from std/throws
+
+# Capture for handler-driven assertions.
+var sc_caught_msg = ""
+var sc_caught_count = 0
+
+def sc_capture(op_name: Int, argc: Int, argv: Int): Int
+  sc_caught_msg = as_type<String>(load(argv, 0))
+  sc_caught_count += 1
+  return 0
+end
+
+def is_in_range(v: Int, lo: Int, hi: Int): Int
+  if v >= lo and v <= hi
+    return 1
+  end
+  return 0
+end
+
+# Per-test rwlock slot and result slot — module globals so test bodies can
+# address them without juggling closure capture across `with Throws` boundaries.
+var sc_rw = 0
+var sc_read_val = -1
+
+def sc_read_into_global(): Int
+  var r = scope_rwlock_read(sc_rw)
+  sc_read_val = r
+  return 0
+end
+
+def main(): Int
+  describe("scope_rwlock_read (B.7 Phase 4e.4)") do ->
+
+    it("under root, scope_rwlock_read on uncontended rwlock returns the value") do ->
+      var rw = rwlock_new(42)
+      var r = scope_rwlock_read(rw)
+      assert_eq(r, 42)
+      rwlock_read_unlock(rw)
+    end
+
+    it("under a scope, scope_rwlock_read on uncontended rwlock returns value without throwing") do ->
+      sc_rw = rwlock_new(7)
+      sc_read_val = -1
+      sc_caught_count = 0
+      sc_caught_msg = ""
+      var s = scope_timeout(scope_root(), 5_000)
+      with Throws { throw: sc_capture } do ->
+        scope_with(s, sc_read_into_global)
+        0
+      end
+      assert_eq(sc_caught_count, 0)
+      assert_eq(sc_read_val, 7)
+      rwlock_read_unlock(sc_rw)
+    end
+
+    it("scope_rwlock_read with deadline fires deadline_exceeded on a write-held rwlock") do ->
+      sc_rw = rwlock_new(99)
+      # Hold the write-lock from the test thread — scope_rwlock_read will spin-fail.
+      var held_val = rwlock_write(sc_rw)
+      sc_read_val = -1
+      sc_caught_msg = ""
+      sc_caught_count = 0
+      var start_ns = time_mono_ns()
+      var s = scope_timeout(scope_root(), 50)
+      with Throws { throw: sc_capture } do ->
+        scope_with(s, sc_read_into_global)
+        0
+      end
+      var elapsed_ms = (time_mono_ns() - start_ns) / 1_000_000
+      # Deadline 50ms; chunk granularity adds up to ~50ms of slack.
+      assert_eq(is_in_range(elapsed_ms, 45, 300), 1)
+      assert_eq(sc_caught_count, 1)
+      assert_eq_str(sc_caught_msg, "deadline_exceeded")
+      # Body never reached the success branch.
+      assert_eq(sc_read_val, -1)
+      # Release the held write-lock for cleanup.
+      rwlock_write_unlock(sc_rw, held_val)
+    end
+
+    it("preflight: scope already cancelled at entry throws user reason") do ->
+      sc_rw = rwlock_new(0)
+      sc_read_val = -1
+      sc_caught_msg = ""
+      sc_caught_count = 0
+      var s = scope_with_cancel(scope_root())
+      scope_cancel_with(s, "user_aborted_read")
+      var start_ns = time_mono_ns()
+      with Throws { throw: sc_capture } do ->
+        scope_with(s, sc_read_into_global)
+        0
+      end
+      var elapsed_ms = (time_mono_ns() - start_ns) / 1_000_000
+      # No sched_sleep should run; only the entry scope_check fires.
+      assert_eq(is_in_range(elapsed_ms, 0, 50), 1)
+      assert_eq(sc_caught_count, 1)
+      assert_eq_str(sc_caught_msg, "user_aborted_read")
+      assert_eq(sc_read_val, -1)
+    end
+
+  end
+  return qspec_main()
+end

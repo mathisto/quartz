@@ -1,0 +1,626 @@
+##! # MIR Optimization Pass
+##!
+##! Single-pass, per-block optimizer inspired by Cranelift's acyclic e-graph.
+##! Applied between MIR lowering and LLVM IR codegen.
+##!
+##! Optimizations:
+##! 1. Constant folding    - evaluate const op const at compile time
+##! 2. Algebraic identity  - x+0, x*1, x|0, x<<0, etc. -> x
+##! 3. Annihilator         - x*0, x&0 -> 0; x-x, x^x -> 0
+##! 4. CSE (hashcons)      - deduplicate pure expressions per block
+##! 5. Copy propagation    - forward store->load within a block
+##!
+##! @see mir
+##! @since 1.0.0
+
+import mir
+import op_constants
+import * from str_compat
+
+# ============================================================================
+# Forward map: maps dest_id -> replacement dest_id
+# Uses Map<String, Int> with "#{id}" as key.
+# ============================================================================
+
+## Resolve the final destination ID for a given ID (chase pointers).
+def opt_resolve(fwd: Map<String, Int>, id: Int): Int
+  var current = id
+  var limit = 64
+  while limit > 0
+    var key = "#{current}"
+    if not fwd.has(key)
+      return current
+    end
+    var next = __map_get_raw(fwd, key)
+    if next == current
+      return current
+    end
+    current = next
+    limit -= 1
+  end
+  return current
+end
+
+## Set a forward mapping (from_id -> to_id).
+def opt_fwd_set(fwd: Map<String, Int>, from_id: Int, to_id: Int): Void
+  fwd.set("#{from_id}", to_id)
+end
+
+## Check if an ID has a forward mapping.
+def opt_fwd_has(fwd: Map<String, Int>, id: Int): Int = fwd.has("#{id}")
+
+## Register an instruction by its destination ID.
+## PF3-P1b: typed value map — was `Map<String, Int>` storing `as_int_generic(instr)`
+## (an erased struct handle); a typed `Map<String, MirInstr>` stores the handle
+## directly (no reinterpret, COW-safe at gate-1; map value storage handles the
+## cow ptr per C4.5/C4.6).
+def opt_byid_set(by_id: Map<String, mir::MirInstr>, id: Int, instr: mir::MirInstr): Void
+  by_id.set("#{id}", instr)
+end
+
+## Get an instruction by its destination ID. Callers guard with `opt_byid_has`
+## first, so the key is always present when this is called.
+## NB: the `var hit` split is load-bearing — the chained `by_id.get(k).unwrap()`
+## form types the unwrap result as bare Int (the map-get-unwrap chain loses the
+## value type V), tripping the QZ0215 erased-boxed-slot wall; binding the typed
+## `Option<MirInstr>` first lets `unwrap` resolve to `MirInstr`.
+def opt_byid_get(by_id: Map<String, mir::MirInstr>, id: Int): mir::MirInstr
+  var hit = by_id.get("#{id}")
+  return hit.unwrap()
+end
+
+## Check if an instruction is registered by its destination ID.
+def opt_byid_has(by_id: Map<String, mir::MirInstr>, id: Int): Int = by_id.has("#{id}")
+
+# ============================================================================
+# Per-block optimization
+# ============================================================================
+
+## Optimize a single basic block (local optimizations).
+## Performs CSE, copy propagation, constant folding, and algebraic simplification.
+def opt_block(block: mir::MirBlock, by_id: Map<String, mir::MirInstr>, fwd: Map<String, Int>, overflow_check: Int): Void
+  var instrs = mir::mir_block_get_instructions(block)
+  var count = instrs.size
+
+  # Per-block CSE hashcons: key string -> dest_id
+  var hashcons = map_new<String, Int>()
+
+  # Per-block copy propagation: var_name -> dest_id
+  var var_map = map_new<String, Int>()
+
+  for i in 0..count
+    var instr = instrs[i]
+    var kind = mir::mir_instr_get_kind(instr)
+    var did = mir::mir_instr_get_dest_id(instr)
+
+    # Register instruction in by_id lookup
+    if did >= 0
+      opt_byid_set(by_id, did, instr)
+    end
+
+    # --- BINARY: constant fold, algebraic simplify, CSE ---
+    if kind == mir::MIR_BINARY
+      opt_binary(instr, did, by_id, fwd, hashcons, overflow_check)
+
+    # --- UNARY: CSE ---
+    else
+      if kind == mir::MIR_UNARY
+        var op = mir::mir_instr_get_op(instr)
+        var oid = opt_resolve(fwd, mir::mir_instr_get_operand1(instr))
+        mir::mir_instr_set_operand1(instr, oid)
+        var key = "U:#{op}:#{oid}"
+        if hashcons.has(key)
+          opt_fwd_set(fwd, did, __map_get_raw(hashcons, key))
+        else
+          hashcons.set(key, did)
+        end
+
+      # --- STORE_VAR: update copy propagation map ---
+      else
+        if kind == mir::MIR_STORE_VAR
+          # Resolve the value operand (stored in operand2)
+          var val_id = opt_resolve(fwd, mir::mir_instr_get_operand2(instr))
+          mir::mir_instr_set_operand2(instr, val_id)
+          # Track in copy propagation map (local vars only)
+          var is_global = mir::mir_instr_get_slot1(instr)
+          if is_global == 0
+            var name = mir::mir_instr_get_var_name(instr)
+            var_map.set(name, val_id)
+          end
+
+        # --- LOAD_VAR: copy propagation ---
+        else
+          if kind == mir::MIR_LOAD_VAR
+            var is_global = mir::mir_instr_get_slot1(instr)
+            if is_global == 0
+              var name = mir::mir_instr_get_var_name(instr)
+              if var_map.has(name)
+                opt_fwd_set(fwd, did, __map_get_raw(var_map, name))
+              end
+            end
+
+          # --- Side-effecting / CFG-splitting: clear copy propagation map ---
+          else
+            # Side-effecting instructions invalidate copy-propagation state.
+            # Operand resolution is performed uniformly in pass-2
+            # (opt_resolve_block -> opt_map_value_operands), so pass-1 does
+            # not resolve operands here.
+            #
+            # The effect kinds (PERFORM_OP / HANDLE_INSTALL / HANDLE_UNINSTALL /
+            # EFFECT_POP_N / HANDLE_UNINSTALL_DONE_ONLY) are NOT side-effecting in
+            # the copy-prop sense, but codegen lowers them into multiple LLVM
+            # basic blocks with a `wb.done` MERGE (the setjmp/catch diamond). A
+            # store-then-load forwarded across that merge produces a value that
+            # does not dominate the load (the catch edge never defines it) ->
+            # `opt: Instruction does not dominate all uses`. Copy prop is a
+            # within-a-block optimization; these ops end the dominance region of
+            # the surrounding MIR block, so the var_map must be flushed at them.
+            if kind == mir::MIR_CALL or kind == mir::MIR_INTRINSIC or kind == mir::MIR_CALL_INDIRECT or kind == mir::MIR_STORE or kind == mir::MIR_INLINE_C or kind == mir::MIR_PERFORM_OP or kind == mir::MIR_HANDLE_INSTALL or kind == mir::MIR_HANDLE_UNINSTALL or kind == mir::MIR_EFFECT_POP_N or kind == mir::MIR_HANDLE_UNINSTALL_DONE_ONLY
+              var_map = map_new<String, Int>()
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+# ============================================================================
+# Binary instruction optimization (constant fold, identity, annihilator, CSE)
+# ============================================================================
+
+## Optimize a binary operator instruction.
+## Checks for constant folding opportunities, algebraic identities, annihilators, and CSE.
+def opt_binary(instr: mir::MirInstr, did: Int, by_id: Map<String, mir::MirInstr>, fwd: Map<String, Int>, hashcons: Map<String, Int>, overflow_check: Int): Void
+  var op = mir::mir_instr_get_op(instr)
+  var lid = opt_resolve(fwd, mir::mir_instr_get_operand1(instr))
+  var rid = opt_resolve(fwd, mir::mir_instr_get_operand2(instr))
+
+  # Update operands to resolved values
+  mir::mir_instr_set_operand1(instr, lid)
+  mir::mir_instr_set_operand2(instr, rid)
+
+  # Look up operand instructions
+  var lc = 0
+  var rc = 0
+  var lv = 0
+  var rv = 0
+  if opt_byid_has(by_id, lid)
+    var li = opt_byid_get(by_id, lid)
+    if mir::mir_instr_get_kind(li) == mir::MIR_CONST_INT
+      lc = 1
+      lv = mir::mir_instr_get_int_val(li)
+    end
+  end
+  if opt_byid_has(by_id, rid)
+    var ri = opt_byid_get(by_id, rid)
+    if mir::mir_instr_get_kind(ri) == mir::MIR_CONST_INT
+      rc = 1
+      rv = mir::mir_instr_get_int_val(ri)
+    end
+  end
+
+  # --- Constant folding ---
+  # Suppress folding of the overflow-checked ops (ADD/SUB/MUL) when
+  # `--overflow-check` is active: codegen would emit a trapping
+  # `llvm.s{add,sub,mul}.with.overflow` for the binary op, and folding it to a
+  # constant silently wraps the result and drops the trap (the R3.2 regression on
+  # `overflow_spec` "panics on addition overflow"). Non-trapping binary ops (shifts,
+  # bitwise, div, comparisons) still fold normally. Identity/annihilator/CSE below
+  # are unaffected — they never synthesize a wrapped arithmetic value.
+  var is_overflow_checked_op = op == op_constants::OP_ADD or op == op_constants::OP_SUB or op == op_constants::OP_MUL
+  if lc == 1 and rc == 1 and not (overflow_check == 1 and is_overflow_checked_op)
+    var folded = opt_fold(op, lv, rv)
+    if folded != 0 - 9999999
+      mir::mir_instr_set_kind(instr, mir::MIR_CONST_INT)
+      mir::mir_instr_set_int_val(instr, folded)
+      return
+    end
+  end
+
+  # --- Algebraic identity + annihilator ---
+  var fwd_target = opt_identity(op, lid, rid, lc, rc, lv, rv)
+  if fwd_target >= 0
+    opt_fwd_set(fwd, did, fwd_target)
+    return
+  end
+  if fwd_target == 0 - 2
+    # Annihilator: result is 0
+    mir::mir_instr_set_kind(instr, mir::MIR_CONST_INT)
+    mir::mir_instr_set_int_val(instr, 0)
+    return
+  end
+
+  # --- CSE via hashcons ---
+  var key = "B:#{op}:#{lid}:#{rid}"
+  if hashcons.has(key)
+    opt_fwd_set(fwd, did, __map_get_raw(hashcons, key))
+  else
+    hashcons.set(key, did)
+  end
+end
+
+# ============================================================================
+# Constant folding: returns result or sentinel -9999999 if not foldable
+# ============================================================================
+
+## Fold a constant binary operation.
+## Returns the result, or -9999999 if not foldable.
+def opt_fold(op: Int, lv: Int, rv: Int): Int
+  if op == op_constants::OP_ADD
+    return lv + rv
+  end
+  if op == op_constants::OP_SUB
+    return lv - rv
+  end
+  if op == op_constants::OP_MUL
+    return lv * rv
+  end
+  if op == op_constants::OP_DIV
+    if rv != 0
+      return lv / rv
+    end
+    return 0 - 9999999
+  end
+  if op == op_constants::OP_MOD
+    if rv != 0
+      return lv % rv
+    end
+    return 0 - 9999999
+  end
+  if op == op_constants::OP_SHL
+    return lv << rv
+  end
+  if op == op_constants::OP_SHR
+    return lv >> rv
+  end
+  if op == op_constants::OP_EQ
+    if lv == rv
+      return 1
+    end
+    return 0
+  end
+  if op == op_constants::OP_NE
+    if lv != rv
+      return 1
+    end
+    return 0
+  end
+  if op == op_constants::OP_LT
+    if lv < rv
+      return 1
+    end
+    return 0
+  end
+  if op == op_constants::OP_GT
+    if lv > rv
+      return 1
+    end
+    return 0
+  end
+  if op == op_constants::OP_LE
+    if lv <= rv
+      return 1
+    end
+    return 0
+  end
+  if op == op_constants::OP_GE
+    if lv >= rv
+      return 1
+    end
+    return 0
+  end
+  if op == op_constants::OP_BIT_AND
+    return band(lv, rv)
+  end
+  if op == op_constants::OP_BIT_OR
+    return bor(lv, rv)
+  end
+  if op == op_constants::OP_BIT_XOR
+    return bxor(lv, rv)
+  end
+  return 0 - 9999999
+end
+
+# ============================================================================
+# Algebraic identity/annihilator: returns forwarding target or sentinel
+# Returns: >= 0 means forward did -> result_id
+#          -2 means annihilator (result is constant 0)
+#          -1 means no optimization
+# ============================================================================
+
+## Check for algebraic identities and annihilators.
+## Returns:
+## - >= 0: Forward destination ID (identity)
+## - -2: Annihilator (result is constant 0)
+## - -1: No optimization found
+def opt_identity(op: Int, lid: Int, rid: Int, lc: Int, rc: Int, lv: Int, rv: Int): Int
+  # x + 0, 0 + x
+  if op == op_constants::OP_ADD and rc == 1 and rv == 0
+    return lid
+  end
+  if op == op_constants::OP_ADD and lc == 1 and lv == 0
+    return rid
+  end
+  # x - 0
+  if op == op_constants::OP_SUB and rc == 1 and rv == 0
+    return lid
+  end
+  # x * 1, 1 * x
+  if op == op_constants::OP_MUL and rc == 1 and rv == 1
+    return lid
+  end
+  if op == op_constants::OP_MUL and lc == 1 and lv == 1
+    return rid
+  end
+  # x / 1
+  if op == op_constants::OP_DIV and rc == 1 and rv == 1
+    return lid
+  end
+  # x | 0, 0 | x
+  if op == op_constants::OP_BIT_OR and rc == 1 and rv == 0
+    return lid
+  end
+  if op == op_constants::OP_BIT_OR and lc == 1 and lv == 0
+    return rid
+  end
+  # x ^ 0, 0 ^ x
+  if op == op_constants::OP_BIT_XOR and rc == 1 and rv == 0
+    return lid
+  end
+  if op == op_constants::OP_BIT_XOR and lc == 1 and lv == 0
+    return rid
+  end
+  # x & -1
+  if op == op_constants::OP_BIT_AND and rc == 1 and rv == -1
+    return lid
+  end
+  # x << 0, x >> 0
+  if op == op_constants::OP_SHL and rc == 1 and rv == 0
+    return lid
+  end
+  if op == op_constants::OP_SHR and rc == 1 and rv == 0
+    return lid
+  end
+
+  # --- Annihilator (returns -2) ---
+  # x * 0, 0 * x
+  if op == op_constants::OP_MUL
+    if (rc == 1 and rv == 0) or (lc == 1 and lv == 0)
+      return 0 - 2
+    end
+  end
+  # x & 0, 0 & x
+  if op == op_constants::OP_BIT_AND
+    if (rc == 1 and rv == 0) or (lc == 1 and lv == 0)
+      return 0 - 2
+    end
+  end
+  # x - x
+  if op == op_constants::OP_SUB and lid == rid
+    return 0 - 2
+  end
+  # x ^ x
+  if op == op_constants::OP_BIT_XOR and lid == rid
+    return 0 - 2
+  end
+
+  return -1
+end
+
+# ============================================================================
+# Shared exhaustive operand resolution (A.30)
+# ============================================================================
+#
+# Single source of truth for "which slots of a MIR instruction carry SSA
+# value IDs". The callback `f` receives each value-operand ID and its return
+# value is written back in place, so the same walker serves operand rewriting
+# (forward-map resolution) and operand collection (DCE use-marking — see
+# egraph_opt::eg_collect_used). egraph_opt's pass-2 routes through this too.
+#
+# Pre-A.30 each consumer hand-rolled its own kind dispatch and silently
+# omitted kinds (MIR_PERFORM_OP, MIR_HANDLE_UNINSTALL, MIR_UNION_*, the raw
+# index family, the binary-DSL family, TERM_SWITCH). An omitted use site kept
+# referencing a value whose defining instruction pass-3 had already NOP'd ->
+# `opt: use of undefined value` at codegen. See docs/ROADMAP.md A.30.
+#
+# INVARIANT: every MIR kind that can appear post-mir-lower is handled here.
+# Adding a new MIR_* kind that carries an SSA operand REQUIRES updating this
+# function — the no-operand kinds are listed explicitly so the enumeration is
+# auditably complete.
+
+## Apply `f` to every entry of an instruction's args vector, writing back.
+def opt_map_args(instr: mir::MirInstr, f: Fn(Int): Int): Void
+  var args = mir::mir_instr_get_args(instr)
+  if args == 0
+    return
+  end
+  for a in 0..args.size
+    args.set_unchecked(a, f(args[a]))
+  end
+end
+
+## Apply `f` to every SSA value operand of an instruction, writing results
+## back in place. Exhaustive over all post-mir-lower MIR kinds.
+def opt_map_value_operands(instr: mir::MirInstr, kind: Int, f: Fn(Int): Int): Void
+  # operand1 only
+  if kind == mir::MIR_UNARY or kind == mir::MIR_LOAD or kind == mir::MIR_FIELD_ACCESS or kind == mir::MIR_UNION_TAG or kind == mir::MIR_UNION_UNWRAP or kind == mir::MIR_VEC_DATA_PTR
+    mir::mir_instr_set_operand1(instr, f(mir::mir_instr_get_operand1(instr)))
+    return
+  end
+  # operand2 only (BINARY_UNPACK/PACKED_BITCAST: operand1 is a static layout id)
+  if kind == mir::MIR_STORE_VAR or kind == mir::MIR_BINARY_UNPACK or kind == mir::MIR_PACKED_BITCAST
+    mir::mir_instr_set_operand2(instr, f(mir::mir_instr_get_operand2(instr)))
+    return
+  end
+  # operand1 + operand2
+  if kind == mir::MIR_BINARY or kind == mir::MIR_STORE or kind == mir::MIR_INDEX or kind == mir::MIR_INDEX_RAW or kind == mir::MIR_UNION_WRAP
+    mir::mir_instr_set_operand1(instr, f(mir::mir_instr_get_operand1(instr)))
+    mir::mir_instr_set_operand2(instr, f(mir::mir_instr_get_operand2(instr)))
+    return
+  end
+  # operand1 + operand2 + args
+  if kind == mir::MIR_INDEX_STORE or kind == mir::MIR_INDEX_STORE_RAW
+    mir::mir_instr_set_operand1(instr, f(mir::mir_instr_get_operand1(instr)))
+    mir::mir_instr_set_operand2(instr, f(mir::mir_instr_get_operand2(instr)))
+    opt_map_args(instr, f)
+    return
+  end
+  # args only. BINARY_PACK: operand1 is a static layout id. PERFORM_OP: the
+  # `op` field carries the matching install's dest for label naming, not an
+  # SSA value; slot1/slot2/operand1 are strings or a static kind.
+  if kind == mir::MIR_CALL or kind == mir::MIR_INTRINSIC or kind == mir::MIR_INLINE_C or kind == mir::MIR_PHI or kind == mir::MIR_BINARY_PACK or kind == mir::MIR_PERFORM_OP
+    opt_map_args(instr, f)
+    return
+  end
+  # CALL_INDIRECT: operand1 (fn ptr) + args
+  if kind == mir::MIR_CALL_INDIRECT
+    mir::mir_instr_set_operand1(instr, f(mir::mir_instr_get_operand1(instr)))
+    opt_map_args(instr, f)
+    return
+  end
+  # HANDLE_INSTALL: slot1 carries the initial-state SSA register for
+  # stateful-effect installs (State<S>, Reader<R>, ...), live only when
+  # operand1 == 1. args alternate (op_filter, handler_fn) string pointers —
+  # never SSA values.
+  if kind == mir::MIR_HANDLE_INSTALL
+    if mir::mir_instr_get_operand1(instr) == 1
+      mir::mir_instr_set_slot1(instr, f(mir::mir_instr_get_slot1(instr)))
+    end
+    return
+  end
+  # SELECT: operand1 (cond) + operand2 (true) + slot1 (false)
+  if kind == mir::MIR_SELECT
+    mir::mir_instr_set_operand1(instr, f(mir::mir_instr_get_operand1(instr)))
+    mir::mir_instr_set_operand2(instr, f(mir::mir_instr_get_operand2(instr)))
+    mir::mir_instr_set_slot1(instr, f(mir::mir_instr_get_slot1(instr)))
+    return
+  end
+  # LOAD_OFFSET: slot1 (base pointer)
+  if kind == mir::MIR_LOAD_OFFSET
+    mir::mir_instr_set_slot1(instr, f(mir::mir_instr_get_slot1(instr)))
+    return
+  end
+  # FIELD_ADDR (B.10 §12.9): slot1 (base pointer). slot2 is the field index
+  # and operand1 is the struct-name string — neither is an SSA value.
+  if kind == mir::MIR_FIELD_ADDR
+    mir::mir_instr_set_slot1(instr, f(mir::mir_instr_get_slot1(instr)))
+    return
+  end
+  # HANDLE_UNINSTALL: slot1 (with-block body result value)
+  if kind == mir::MIR_HANDLE_UNINSTALL
+    mir::mir_instr_set_slot1(instr, f(mir::mir_instr_get_slot1(instr)))
+    return
+  end
+  # No SSA value operands: MIR_NOP, MIR_CONST_INT, MIR_CONST_BOOL,
+  # MIR_CONST_STRING, MIR_CONST_FLOAT, MIR_LOAD_VAR (operand1 is a var-name
+  # string), MIR_FUNC_REF, MIR_ALLOC, MIR_ALLOC_STACK, MIR_ADDR_OF (uses
+  # var_name), MIR_HANDLE_UNINSTALL_DONE_ONLY (only label naming + pop count),
+  # MIR_EFFECT_POP_N (effect name + pop count).
+end
+
+## Apply `f` to a block terminator's SSA value operand (if any), in place.
+def opt_map_term_value_operands(block: mir::MirBlock, f: Fn(Int): Int): Void
+  var tk = mir::mir_block_get_term_kind(block)
+  # TERM_RETURN: return value. TERM_BRANCH: condition. TERM_SWITCH: scrutinee.
+  # TERM_JUMP's term_data is a block index; TERM_UNREACHABLE carries none.
+  if tk == mir::TERM_RETURN or tk == mir::TERM_BRANCH or tk == mir::TERM_SWITCH
+    mir::mir_block_set_term_data(block, f(mir::mir_block_get_term_data(block)))
+  end
+end
+
+## Record `id` in the `used` set and return it unchanged — the callback used
+## when `opt_map_value_operands` drives dead-code use-marking.
+def opt_note_used(used: Map<String, Int>, id: Int): Int
+  used.set("#{id}", 1)
+  return id
+end
+
+# ============================================================================
+# Resolve all operands in a block (pass 2)
+# ============================================================================
+
+## Resolve all operands in a block through the final forward map.
+def opt_resolve_block(block: mir::MirBlock, fwd: Map<String, Int>): Void
+  var resolver: Fn(Int): Int = x: Int -> opt_resolve(fwd, x)
+  var instrs = mir::mir_block_get_instructions(block)
+  for i in 0..instrs.size
+    var instr = instrs[i]
+    opt_map_value_operands(instr, mir::mir_instr_get_kind(instr), resolver)
+  end
+  opt_map_term_value_operands(block, resolver)
+end
+
+# ============================================================================
+# NOP forwarded instructions (pass 3)
+# ============================================================================
+
+## NOP out instructions whose result was forwarded.
+## If an instruction's result value is mapped to another value, the instruction is redundant.
+def opt_nop_forwarded(block: mir::MirBlock, fwd: Map<String, Int>): Void
+  var instrs = mir::mir_block_get_instructions(block)
+  for i in 0..instrs.size
+    var instr = instrs[i]
+    var did = mir::mir_instr_get_dest_id(instr)
+    if did >= 0 and opt_fwd_has(fwd, did)
+      mir::mir_instr_set_kind(instr, mir::MIR_NOP)
+    end
+  end
+end
+
+# ============================================================================
+# Optimize one function
+# ============================================================================
+
+## Optimize a single function.
+## Runs 3 passes:
+## 1. Analysis and local optimization
+## 2. Operand resolution
+## 3. Redundant instruction elimination
+def opt_function(func: mir::MirFunc, overflow_check: Int): Void
+  var blocks = mir::mir_func_get_blocks(func)
+  var block_count = blocks.size
+  if block_count == 0
+    return
+  end
+
+  # Function-wide state
+  var by_id = map_new<String, mir::MirInstr>()
+  var fwd = map_new<String, Int>()
+
+  # Pass 1: Per-block analysis and in-place rewrites
+  for b in 0..block_count
+    opt_block(blocks[b], by_id, fwd, overflow_check)
+  end
+
+  # Pass 2: Resolve all operands through final forward map
+  for b in 0..block_count
+    opt_resolve_block(blocks[b], fwd)
+  end
+
+  # Pass 3: NOP instructions whose dest_id was forwarded
+  for b in 0..block_count
+    opt_nop_forwarded(blocks[b], fwd)
+  end
+end
+
+# ============================================================================
+# Entry point: optimize entire program
+# ============================================================================
+
+## Entry point: optimize entire program.
+##
+## `overflow_check` (1 = `--overflow-check` active): when set, constant folding of
+## OP_ADD/OP_SUB/OP_MUL is SUPPRESSED. Folding `const op const` at compile time
+## discards the runtime `llvm.s{add,sub,mul}.with.overflow` trap that codegen would
+## emit for the binary op (`codegen_instr.qz`), silently turning an overflowing
+## program into a wrapping one. The fold is otherwise correct (it computes the same
+## wrapped value the CPU would) but it is unsound under overflow checking. Identity /
+## annihilator / CSE remain enabled — they forward to an existing operand or to 0 and
+## never synthesize a wrapped arithmetic result, so they preserve trap semantics.
+def mir_optimize(prog: mir::MirProgram, overflow_check: Int): Void
+  var funcs = mir::mir_get_functions(prog)
+  for i in 0..funcs.size
+    opt_function(funcs[i], overflow_check)
+  end
+end

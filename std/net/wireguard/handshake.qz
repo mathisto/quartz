@@ -1,0 +1,599 @@
+## std/net/wireguard/handshake - WireGuard handshake driver
+##
+## Wraps the Noise IKpsk2 driver in `std/crypto/noise` to produce the actual
+## 148-byte MSG_INITIATION and 92-byte MSG_RESPONSE packets WireGuard sends
+## on the wire. Adds:
+##
+##   - MAC1 trailer (16 bytes, keyed-BLAKE2s by `mac1_key = Hash(LABEL_MAC1 ||
+##     receiver_static_pub)`); verified on consume.
+##   - MAC2 trailer (16 bytes; zeros in non-cookie mode — Phase 1 doesn't ship
+##     cookie reply DoS defense, deferred to Phase 2).
+##   - Header-field framing: type byte, sender_index, receiver_index extraction
+##     and validation (initiator must see its own local_index echoed back).
+##   - TAI64N timestamp helper (`wg_tai64n_now`) for the initiator to fill
+##     msg.timestamp; the smoke path uses fixed buffers for determinism.
+##
+## Wire layouts (per WG paper §5.4.2 / §5.4.3):
+##
+##   MSG_INITIATION = 148 bytes
+##     [0..116)   msg_α (Noise body — owned by std/crypto/noise)
+##     [116..132) mac1
+##     [132..148) mac2 (zero in non-cookie mode)
+##
+##   MSG_RESPONSE = 92 bytes
+##     [0..60)    msg_α (Noise body)
+##     [60..76)   mac1
+##     [76..92)   mac2 (zero)
+##
+## Higher-layer responsibilities (NOT done here):
+##   - Look up Peer by initiator's static pubkey (Step 2.4 device.qz).
+##   - Reject replayed timestamps per peer (Step 2.4 — track last seen TAI64N
+##     in Peer state and require strict-greater).
+##   - Allocate fresh local_index avoiding collisions across active sessions
+##     (Step 2.4 device.qz).
+##   - Send/receive the 148/92 bytes over UDP (Step 2.4).
+##
+## Error reporting: `0` = success, `-1` = any failure (MAC1 mismatch, AEAD tag
+## mismatch, ECDH yielded zero point, receiver_index mismatch). WG paper §5.1
+## "silence is a virtue" — caller drops the packet without diagnostics.
+##
+## See:
+## - std/crypto/noise (the inner driver)
+## - docs/design/WIREGUARD_UNIKERNEL_DESIGN.md "Noise IKpsk2"
+## - WG paper §5.4 — handshake protocol
+## - https://www.wireguard.com/papers/wireguard.pdf
+
+import std/core/crypto/blake2s
+import std/core/crypto/chacha20poly1305  # xchacha20poly1305_{encrypt,decrypt}
+import * from std/core/crypto/secret  # Secret<Int> + secret_(wrap|unwrap)_ptr (NET.4.1 B)
+import std/core/crypto/subtle
+import std/core/crypto/zeroize
+import std/crypto/noise
+import std/crypto/rng
+import std/ffi/time
+import std/net/wireguard/session
+import * from ffi/socket  # malloc/free/memcpy/memset
+
+# =============================================================================
+# Wire-format constants
+# =============================================================================
+
+def WG_MSG_TYPE_INITIATION(): Int = 1
+def WG_MSG_TYPE_RESPONSE(): Int = 2
+def WG_MSG_TYPE_COOKIEREPLY(): Int = 3
+
+def WG_MSG_INITIATION_LEN(): Int = 148
+def WG_MSG_RESPONSE_LEN(): Int = 92
+def WG_MSG_COOKIEREPLY_LEN(): Int = 64
+
+def WG_MSG_INITIATION_BODY_LEN(): Int = 116
+def WG_MSG_RESPONSE_BODY_LEN(): Int = 60
+
+def WG_MAC_LEN(): Int = 16
+def WG_COOKIE_LEN(): Int = 16
+def WG_XAEAD_NONCE_LEN(): Int = 24
+
+# Cookie freshness window per WG paper §6.5 — initiator stops attaching MAC2
+# after the cached cookie is older than COOKIE_REFRESH_TIME (120 s).
+def WG_COOKIE_REFRESH_TIME_MS(): Int = 120000
+
+# =============================================================================
+# Internal helpers — u32 little-endian header field codec
+# =============================================================================
+
+def _read_u32_le(p: Int): Int
+  var b0 = ptr_read_byte(p)
+  var b1 = ptr_read_byte(p + 1)
+  var b2 = ptr_read_byte(p + 2)
+  var b3 = ptr_read_byte(p + 3)
+  return b0 + (b1 * 256) + (b2 * 65536) + (b3 * 16777216)
+end
+
+def _write_u32_le(p: Int, v: Int): Void
+  ptr_write_byte(p, v & 255)
+  ptr_write_byte(p + 1, (v / 256) & 255)
+  ptr_write_byte(p + 2, (v / 65536) & 255)
+  ptr_write_byte(p + 3, (v / 16777216) & 255)
+end
+
+## Verify the 16-byte MAC1 trailer at `msg + body_len` against a freshly
+## computed MAC1 over `msg[0..body_len)` keyed by `our_static_pub`. Returns
+## 1 on match, 0 on mismatch. Constant-time per `subtle::ct_eq_bytes`.
+def _verify_mac1(msg: Int, body_len: Int, our_static_pub: Int): Int
+  var expected = malloc(16)
+  noise_wg_mac1(expected, msg, body_len, our_static_pub)
+  var ok = ct_eq_bytes(expected, msg + body_len, 16)
+  zeroize(expected, 16)
+  free(expected)
+  return ok
+end
+
+# =============================================================================
+# TAI64N timestamp
+# =============================================================================
+
+## Fill `out_12` with a 12-byte big-endian TAI64N timestamp at the current wall
+## time. WG uses this in MSG_INITIATION to defend against handshake replay —
+## the responder rejects an initiation whose timestamp is not strictly greater
+## than the last one seen from this peer.
+##
+## Format (per WG paper §5.1):
+##   [0..8)   TAI seconds      = 2^62 + Unix_seconds + leap_seconds (37 as of
+##                              2017; we hardcode 37 — within ±1 s does not
+##                              affect monotonicity, which is all WG cares
+##                              about)
+##   [8..12)  Nanoseconds      = sub-second component, big-endian u32
+##
+## Sub-second resolution comes from `gettimeofday(2)` (microseconds, scaled to
+## nanoseconds). On systems where `gettimeofday` is unavailable, the nano
+## field is zero — still monotonic-per-second, which is enough.
+def wg_tai64n_now(out_12: Int): Void
+  var now_unix = time(0)
+
+  # Sub-second piece — gettimeofday writes { tv_sec: Int, tv_usec: Int } (16 bytes).
+  var tv = malloc(16)
+  memset(tv, 0, 16)
+  gettimeofday(tv, 0)
+  var usec = 0
+  var i = 0
+  while i < 8
+    usec = usec + (ptr_read_byte(tv + 8 + i) * _u64_byte_shift(i))
+    i += 1
+  end
+  free(tv)
+  var nanos = usec * 1000
+
+  # TAI seconds = 2^62 + unix + 37 leap seconds.
+  # 2^62 = 0x4000_0000_0000_0000.
+  var tai_lo = (now_unix + 37) & ((1024 * 1024 * 1024 * 1024 * 1024 * 1024) - 1)
+  var tai_hi = (now_unix + 37) / (1024 * 1024 * 1024 * 1024 * 1024 * 1024)
+  # Output big-endian — high byte first.
+  # tai_seconds = (1 << 62) + (now_unix + 37). Top 4 bits of byte 0 = 0b0100.
+  # Build the full 8-byte value byte-by-byte.
+  var top4 = 64 + (tai_hi & 63)         # 0x40 + high 6 bits of (now+37)>>56
+  ptr_write_byte(out_12, top4 & 255)
+  var rest = now_unix + 37
+  var b = 7
+  while b >= 1
+    ptr_write_byte(out_12 + b, rest & 255)
+    rest = rest / 256
+    b -= 1
+  end
+
+  # Nanoseconds — 4 bytes big-endian.
+  ptr_write_byte(out_12 + 8, (nanos / 16777216) & 255)
+  ptr_write_byte(out_12 + 9, (nanos / 65536) & 255)
+  ptr_write_byte(out_12 + 10, (nanos / 256) & 255)
+  ptr_write_byte(out_12 + 11, nanos & 255)
+end
+
+# Helper for byte-shift in TAI64N nano build (i'th byte's place value, LE).
+def _u64_byte_shift(i: Int): Int
+  var v = 1
+  var k = 0
+  while k < i
+    v = v * 256
+    k += 1
+  end
+  return v
+end
+
+# =============================================================================
+# Initiator: create MSG_INITIATION (148 bytes)
+# =============================================================================
+
+## Initiator step 1: build the 148-byte initiation packet on the wire.
+##
+## After this call, `state` holds the post-step-1 chaining/hash; the initiator
+## must keep `state` alive until it receives MSG_RESPONSE and calls
+## `wg_consume_response`.
+##
+## Args:
+## - state: zeroed `HandshakeState` (caller created via `noise_handshake_new`).
+## - rng: cryptographic RNG.
+## - static_priv / static_pub: initiator's long-term keypair (32 + 32).
+## - peer_static_pub: responder's known-a-priori static pubkey (32 bytes).
+## - local_index: u32 — initiator's session handle.
+## - timestamp: 12-byte TAI64N (from `wg_tai64n_now` or fixed for tests).
+## - msg_out: 148-byte output buffer.
+##
+## Returns 0 on success; -1 on ECDH zero-point (peer_static_pub is malformed
+## or attacker-supplied small-subgroup point).
+def wg_create_initiation(
+  state: HandshakeState,
+  rng: Rng,
+  static_priv: Secret<Int>,
+  static_pub: Int,
+  peer_static_pub: Int,
+  local_index: Int,
+  timestamp: Int,
+  msg_out: Int
+): Int
+  var rc = noise_create_initiation(
+    state, rng, static_priv, static_pub, peer_static_pub,
+    local_index, timestamp, msg_out
+  )
+  if rc != 0
+    return 0 - 1
+  end
+
+  # MAC1 over msg_α (116 bytes), key = mac1_key for receiver = peer.
+  noise_wg_mac1(msg_out + 116, msg_out, 116, peer_static_pub)
+
+  # MAC2 = zeros (no cookie reply mode in Phase 1).
+  memset(msg_out + 132, 0, 16)
+  return 0
+end
+
+# =============================================================================
+# Responder: consume MSG_INITIATION
+# =============================================================================
+
+## Responder step 1: parse a 148-byte initiation packet.
+##
+## Verifies MAC1 (1st defense), then runs the Noise driver to recover the
+## initiator's static pubkey + timestamp from the AEAD-encrypted fields.
+##
+## Args:
+## - state: zeroed `HandshakeState`.
+## - static_priv / static_pub: responder's long-term keypair.
+## - msg_in: 148-byte input buffer.
+## - out_peer_static_pub: 32-byte buffer — receives initiator's pubkey (caller
+##                       uses this to look up the Peer + PSK).
+## - out_timestamp: 12-byte buffer — receives initiator's TAI64N (caller checks
+##                  monotonicity against per-peer last-seen).
+## - out_peer_index: 4-byte buffer — receives initiator's sender_index (caller
+##                  echoes it as receiver_index in the response packet).
+##
+## Returns 0 on success; -1 on MAC1/AEAD/ECDH failure or malformed type byte.
+def wg_consume_initiation(
+  state: HandshakeState,
+  static_priv: Secret<Int>,
+  static_pub: Int,
+  msg_in: Int,
+  out_peer_static_pub: Int,
+  out_timestamp: Int,
+  out_peer_index: Int
+): Int
+  # Validate type byte = 0x01.
+  if ptr_read_byte(msg_in) != 1
+    return 0 - 1
+  end
+
+  # MAC1 check — receiver = us, so key derived from our_static_pub.
+  if _verify_mac1(msg_in, 116, static_pub) == 0
+    return 0 - 1
+  end
+
+  # Noise driver decrypts msg.static and msg.timestamp, populates outs.
+  var rc = noise_consume_initiation(
+    state, static_priv, static_pub, msg_in, out_peer_static_pub, out_timestamp
+  )
+  if rc != 0
+    return 0 - 1
+  end
+
+  # Extract sender_index (initiator's local_index) from header.
+  _write_u32_le(out_peer_index, _read_u32_le(msg_in + 4))
+  return 0
+end
+
+# =============================================================================
+# Responder: create MSG_RESPONSE (92 bytes)
+# =============================================================================
+
+## Responder step 2: build the 92-byte response packet.
+##
+## Pre-state: `wg_consume_initiation` ran successfully on `state` immediately
+## prior. Call `wg_finalize_session` after this to derive transport keys.
+##
+## Args:
+## - state: HandshakeState left by `wg_consume_initiation`.
+## - rng: cryptographic RNG.
+## - peer_static_pub: initiator's pubkey (the receiver of this response).
+## - psk: 32-byte buffer — Peer's PSK (zeros for "no PSK").
+## - local_index: u32 — responder's session handle (caller-allocated).
+## - peer_index: u32 — initiator's sender_index (echoed as receiver_index).
+## - msg_out: 92-byte output buffer.
+##
+## Returns 0 on success; -1 on ECDH failure.
+def wg_create_response(
+  state: HandshakeState,
+  rng: Rng,
+  peer_static_pub: Int,
+  psk: Secret<Int>,
+  local_index: Int,
+  peer_index: Int,
+  msg_out: Int
+): Int
+  var rc = noise_create_response(
+    state, rng, peer_static_pub, psk, local_index, peer_index, msg_out
+  )
+  if rc != 0
+    return 0 - 1
+  end
+
+  # MAC1 over 60-byte body, key = mac1_key for receiver = initiator.
+  noise_wg_mac1(msg_out + 60, msg_out, 60, peer_static_pub)
+  memset(msg_out + 76, 0, 16)
+  return 0
+end
+
+# =============================================================================
+# Initiator: consume MSG_RESPONSE
+# =============================================================================
+
+## Initiator step 2: parse the 92-byte response packet and finalize handshake.
+##
+## Verifies type byte, MAC1, that the receiver_index field matches our
+## `expected_local_index` (rejects responses meant for a different session),
+## then runs the Noise driver to verify msg.empty.
+##
+## Args:
+## - state: HandshakeState left by `wg_create_initiation`.
+## - static_priv / static_pub: initiator's long-term keypair.
+## - psk: 32-byte buffer — must equal the responder's PSK or msg.empty fails.
+## - msg_in: 92-byte input buffer.
+## - expected_local_index: u32 — the local_index we put in MSG_INITIATION.
+## - out_peer_index: 4-byte buffer — receives responder's sender_index (caller
+##                  uses it as receiver_index in transport packets).
+##
+## Returns 0 on success; -1 on any failure.
+def wg_consume_response(
+  state: HandshakeState,
+  static_priv: Secret<Int>,
+  static_pub: Int,
+  psk: Secret<Int>,
+  msg_in: Int,
+  expected_local_index: Int,
+  out_peer_index: Int
+): Int
+  if ptr_read_byte(msg_in) != 2
+    return 0 - 1
+  end
+
+  # MAC1 check — receiver = us (initiator), so key derived from our_static_pub.
+  if _verify_mac1(msg_in, 60, static_pub) == 0
+    return 0 - 1
+  end
+
+  # Receiver_index field [8..12) must echo our local_index.
+  if _read_u32_le(msg_in + 8) != expected_local_index
+    return 0 - 1
+  end
+
+  var rc = noise_consume_response(state, static_priv, psk, msg_in)
+  if rc != 0
+    return 0 - 1
+  end
+
+  _write_u32_le(out_peer_index, _read_u32_le(msg_in + 4))
+  return 0
+end
+
+# =============================================================================
+# Both sides: derive transport keys and produce a Session
+# =============================================================================
+
+## After both sides have completed their respective consume calls, derive the
+## per-direction transport keys and bundle them into a `Session`. The caller
+## SHOULD call `noise_handshake_destroy(state)` after this to wipe ephemeral
+## chain material; the returned Session is independent of `state`.
+##
+## Args:
+## - state: HandshakeState in post-handshake configuration.
+## - is_initiator: 1 from initiator side; 0 from responder.
+## - local_index / peer_index: identifying handles (Step 2.4 device.qz uses
+##                            these as table keys).
+## - established_ms: timestamp in milliseconds (for REKEY_AFTER_TIME logic in
+##                  Step 2.3); typically `time_mono_ns() / 1_000_000` at the
+##                  moment the handshake completes.
+def wg_finalize_session(
+  state: HandshakeState,
+  is_initiator: Int,
+  local_index: Int,
+  peer_index: Int,
+  established_ms: Int
+): Session
+  var s = session_new_zero(local_index, peer_index, is_initiator)
+  noise_split(state, is_initiator, session_t_send(s), session_t_recv(s))
+  session_set_established_ms(s, established_ms)
+  return s
+end
+
+# =============================================================================
+# Cookie reply (MSG_COOKIEREPLY type 0x03) — WG paper §5.4.7
+# =============================================================================
+#
+# DoS defense for handshakes. When a responder is "under load," it does NOT
+# fully validate inbound MSG_INITIATION/_RESPONSE packets. Instead, it:
+#   1. Computes a cookie = MAC(τ_R, A_p) where:
+#        τ_R = the responder's per-device cookie secret (rotates every 120 s)
+#        A_p = source IP || port of the inbound packet (6 bytes for IPv4)
+#        MAC = keyed BLAKE2s-128 (16-byte output)
+#   2. If msg.mac2 != MAC(cookie, msg_α || msg.mac1) — i.e., the initiator
+#      did not echo back a valid recent cookie — reply with MSG_COOKIEREPLY
+#      and drop the inbound. The cookie reply teaches the initiator the
+#      cookie value (XAEAD-encrypted under the responder's static pubkey-
+#      derived key + a 24-byte random nonce).
+#   3. Initiator caches the cookie for COOKIE_REFRESH_TIME (120 s) and
+#      attaches MAC2 = MAC(cookie, msg_α || mac1) on subsequent handshake
+#      messages to this peer.
+#
+# Cookie reply wire layout (64 bytes):
+#   [0]      type = 0x03
+#   [1..4)   reserved = 0,0,0
+#   [4..8)   receiver_index — sender_index of the inbound that triggered us
+#   [8..32)  nonce — 24 random bytes (XChaCha20 nonce)
+#   [32..64) encrypted_cookie — XAEAD(K_r, nonce, cookie, M)
+#                              = 16 bytes of cookie + 16 bytes of AEAD tag
+#     where K_r = HASH(LABEL_COOKIE || S_pub_R)  — R = cookie-reply sender
+#           M   = mac1 of the message that triggered the cookie reply
+#                 (used as AEAD additional-authenticated-data)
+
+## Derive the XAEAD key for cookie reply: K = HASH(LABEL_COOKIE || S_pub).
+## Used by both sides — sender derives from own static pub, receiver from
+## the peer's known static pub.
+def _xaead_cookie_key(out_32: Int, static_pub: Int): Void
+  var lbl = malloc(8)
+  ptr_write_byte(lbl, 'c')
+  ptr_write_byte(lbl + 1, 'o')
+  ptr_write_byte(lbl + 2, 'o')
+  ptr_write_byte(lbl + 3, 'k')
+  ptr_write_byte(lbl + 4, 'i')
+  ptr_write_byte(lbl + 5, 'e')
+  ptr_write_byte(lbl + 6, '-')
+  ptr_write_byte(lbl + 7, '-')
+  var tmp = malloc(40)
+  memcpy(tmp, lbl, 8)
+  memcpy(tmp + 8, static_pub, 32)
+  blake2s_256(tmp, 40, out_32)
+  free(tmp)
+  free(lbl)
+end
+
+## Compute the per-source-address cookie value:
+##   cookie = MAC(secret_32, addr_buf)         # keyed BLAKE2s-128
+##
+## - out: 16-byte output buffer.
+## - secret_32: device's current cookie secret (rotates every 120 s — caller
+##              owns rotation; see std/net/wireguard/device.qz).
+## - addr_buf / addr_len: source-address bytes (4-byte IPv4 || 2-byte port = 6).
+def wg_compute_cookie(out: Int, secret_32: Int, addr_buf: Int, addr_len: Int): Void
+  blake2s_keyed(out, 16, addr_buf, addr_len, secret_32, 32)
+end
+
+## Compute MAC2 = MAC(cookie, msg_α || mac1).
+##
+## - out: 16-byte output buffer.
+## - msg_alpha: pointer to msg_α start (initiation: 116 bytes; response: 60).
+## - msg_alpha_len: 116 or 60.
+## - mac1: 16-byte mac1 (caller already computed via noise_wg_mac1).
+## - cookie: 16-byte cached cookie.
+##
+## Caller is responsible for cookie freshness — if the cached cookie is older
+## than COOKIE_REFRESH_TIME, write zeros to the mac2 slot directly instead
+## of calling this helper.
+def wg_compute_mac2(out: Int, msg_alpha: Int, msg_alpha_len: Int, mac1: Int, cookie: Int): Void
+  var tmp_len = msg_alpha_len + 16
+  var tmp = malloc(tmp_len)
+  memcpy(tmp, msg_alpha, msg_alpha_len)
+  memcpy(tmp + msg_alpha_len, mac1, 16)
+  blake2s_keyed(out, 16, tmp, tmp_len, cookie, 16)
+  zeroize(tmp, tmp_len)
+  free(tmp)
+end
+
+## Overwrite MAC2 (msg + body_len + 16) on an already-built handshake packet
+## with a cookie-derived MAC. Convenience wrapper around `wg_compute_mac2`.
+##
+## - msg: pointer to start of MSG_INITIATION/_RESPONSE (148/92 bytes).
+## - body_len: 116 or 60.
+## - cookie: 16-byte cached cookie (must be fresh per caller's clock).
+def wg_attach_mac2(msg: Int, body_len: Int, cookie: Int): Void
+  wg_compute_mac2(msg + body_len + 16, msg, body_len, msg + body_len, cookie)
+end
+
+## Validate the MAC2 trailer of an inbound handshake message against an
+## expected cookie. Used by the responder when "under load."
+##
+## - msg: pointer to start of inbound MSG_INITIATION/_RESPONSE.
+## - body_len: 116 or 60.
+## - expected_cookie: 16-byte cookie we'd have issued for this peer's source.
+##
+## Returns 1 if msg.mac2 equals MAC(expected_cookie, msg_α||mac1); else 0.
+## Constant-time per `subtle::ct_eq_bytes`.
+def wg_validate_mac2(msg: Int, body_len: Int, expected_cookie: Int): Int
+  var expected = malloc(16)
+  wg_compute_mac2(expected, msg, body_len, msg + body_len, expected_cookie)
+  var ok = ct_eq_bytes(expected, msg + body_len + 16, 16)
+  zeroize(expected, 16)
+  free(expected)
+  return ok
+end
+
+## Build a MSG_COOKIEREPLY (64 bytes) on the wire.
+##
+## - rng: cryptographic RNG (24 bytes consumed for the XAEAD nonce).
+## - our_static_pub: 32 bytes — the cookie-reply sender's own static pub.
+## - cookie_16: the cookie we want to teach the initiator (typically derived
+##              from our cookie_secret + the inbound source address).
+## - peer_index: u32 — sender_index from the inbound message (mirrored as
+##              receiver_index in the cookie reply).
+## - inbound_mac1: 16 bytes — mac1 from the message that triggered this reply
+##                 (used as AEAD additional-authenticated-data so the cookie
+##                 is bound to the specific inbound).
+## - msg_out: 64-byte output buffer.
+def wg_create_cookie_reply(
+  rng: Rng,
+  our_static_pub: Int,
+  cookie_16: Int,
+  peer_index: Int,
+  inbound_mac1: Int,
+  msg_out: Int
+): Void
+  # Header: type, reserved, receiver_index.
+  ptr_write_byte(msg_out, 3)
+  ptr_write_byte(msg_out + 1, 0)
+  ptr_write_byte(msg_out + 2, 0)
+  ptr_write_byte(msg_out + 3, 0)
+  _write_u32_le(msg_out + 4, peer_index)
+  # Random 24-byte XAEAD nonce.
+  rng_fill(rng, msg_out + 8, 24)
+  # XAEAD-encrypt cookie under K_r derived from our static pub. NET.4.1 B:
+  # the derived cookie-reply key is secret (binds the cookie ciphertext);
+  # wrap at the XAEAD boundary.
+  var key = malloc(32)
+  _xaead_cookie_key(key, our_static_pub)
+  xchacha20poly1305_encrypt(
+    msg_out + 32,         # ciphertext output (16 bytes)
+    msg_out + 48,         # tag output (16 bytes)
+    cookie_16, 16,
+    inbound_mac1, 16,     # aad
+    secret_wrap(key), msg_out + 8  # XAEAD nonce
+  )
+  zeroize(key, 32)
+  free(key)
+end
+
+## Parse a 64-byte MSG_COOKIEREPLY. Returns 0 on success (out_cookie populated)
+## or -1 on type/index mismatch or AEAD decrypt failure.
+##
+## - msg_in: 64 bytes.
+## - peer_static_pub: 32 bytes — the cookie-reply sender's static pubkey
+##                   (we know it because we configured the peer).
+## - expected_local_index: u32 — the sender_index we put in the original
+##                       handshake message that triggered this reply.
+## - outbound_mac1: 16 bytes — mac1 of the original handshake message (used
+##                  as AEAD aad; must match what the responder saw).
+## - out_cookie: 16-byte output for the recovered cookie.
+def wg_consume_cookie_reply(
+  msg_in: Int,
+  peer_static_pub: Int,
+  expected_local_index: Int,
+  outbound_mac1: Int,
+  out_cookie: Int
+): Int
+  if ptr_read_byte(msg_in) != 3
+    return 0 - 1
+  end
+  if _read_u32_le(msg_in + 4) != expected_local_index
+    return 0 - 1
+  end
+  var key = malloc(32)
+  _xaead_cookie_key(key, peer_static_pub)
+  # NET.4.1 B: same secrecy reading as the encrypt path above.
+  var rc = xchacha20poly1305_decrypt(
+    out_cookie,
+    msg_in + 32, 16,        # ciphertext
+    outbound_mac1, 16,      # aad
+    secret_wrap(key), msg_in + 8,  # XAEAD nonce
+    msg_in + 48             # tag
+  )
+  zeroize(key, 32)
+  free(key)
+  if rc != 0
+    return 0 - 1
+  end
+  return 0
+end

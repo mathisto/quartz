@@ -1,0 +1,94 @@
+## C.13 Phase 5: MutexTrySelectable active-wake smoke.
+##
+## Pre-Phase 5 / pre-MutexTrySelectable: there was no Selectable for
+## mutex try-lock. Manual `while mutex_try_lock(h) == -1; sched_yield(); end`
+## was the only option. Latency: sched_yield cadence (~10ms).
+##
+## Post-Phase 5: `case v = try_lockable(m) => ...` in `select` parks
+## the polling task until mutex_unlock fires
+## __qz_waiter_notify_all(mutex_handle), which wakes the polling
+## frame. Latency: scheduler round-trip (~us, typically < 5ms wall).
+##
+## This test asserts wall-clock unlock→arm-fires latency < 30ms — well
+## below the 50ms typical sched_yield-cadence floor of polling-only
+## designs, proving active-wake fired and was observed.
+##
+## Standalone (not qspec): qspec describe/it lambdas treat `go fn()` as
+## a Future created+polled inline. The worker-blocks-then-unlock pattern
+## can't be expressed there. From `def main()` directly with the right
+## shape, `go` spawns a real goroutine on a worker thread.
+
+import * from std/sync/exclusion/mutex
+import * from std/sync/composition/scope
+
+var m_handle: Int = 0
+var worker_started_ns: Int = 0
+var worker_unlocked_ns: Int = 0
+
+def worker(): Int
+  # Take the lock immediately.
+  mutex_lock(m_handle)
+  worker_started_ns = time_mono_ns()
+  # Hold for 50ms (well under the deadline_ms below, well over the
+  # active-wake latency bound we're asserting).
+  sched_sleep(50)
+  # Release. mutex_unlock codegen calls __qz_waiter_notify_all,
+  # which sched_wake's main's polling frame.
+  worker_unlocked_ns = time_mono_ns()
+  mutex_unlock(m_handle, 99)
+  return 0
+end
+
+def main(): Int
+  var m = mutex(42)
+  m_handle = m.handle
+
+  var w = go worker()
+
+  # Give the worker thread a moment to grab the lock before main races
+  # into the select. Without this, main's first try_poll might win the
+  # lock before the worker even starts.
+  sched_sleep(5)
+
+  var arm_fired_ns = 0
+  var v_observed = 0
+  var deadline_fired = 0
+
+  select
+    case v = try_lockable(m) =>
+      arm_fired_ns = time_mono_ns()
+      v_observed = v
+      # Lock is now held by main. Release it cleanly.
+      mutex_unlock(m.handle, v)
+    case _ = deadline_ms(1000) =>
+      arm_fired_ns = time_mono_ns()
+      deadline_fired = 1
+  end
+
+  if deadline_fired == 1
+    puts("FAIL: deadline_ms(1000) fired before try_lockable — worker either never unlocked or active-wake didn't observe")
+    return 1
+  end
+
+  if v_observed != 99
+    puts("FAIL: expected v=99 (worker's unlock value), got v=#{str_from_int(v_observed)}")
+    return 2
+  end
+
+  # Latency from worker's unlock to main observing the arm fire.
+  # Bound: 30ms. Pre-Phase 5 polling-only floor would be ~10ms+ at best,
+  # but a polling design has no guarantee of seeing the unlock within any
+  # specific window without active-wake.
+  var latency_ms = (arm_fired_ns - worker_unlocked_ns) / 1_000_000
+  if latency_ms < 0
+    puts("FAIL: negative latency #{str_from_int(latency_ms)}ms (clock skew?)")
+    return 3
+  end
+  if latency_ms > 30
+    puts("FAIL: unlock->arm latency #{str_from_int(latency_ms)}ms exceeds 30ms bound (active-wake not firing?)")
+    return 4
+  end
+
+  puts("OK: unlock->arm latency #{str_from_int(latency_ms)}ms (active-wake fired)")
+  return 0
+end

@@ -1,0 +1,400 @@
+# derive.qz - @derive macro expansion for the self-hosted Quartz compiler
+#
+# Expands @derive(Eq, Hash, Show, Clone, Ord) annotations on structs
+# into impl blocks by generating source strings and re-parsing them.
+#
+# Runs as Phase 2.4 — after parsing, before macro expansion.
+#
+# Generated methods use typed params (e.g., `a: Point, b: Point`)
+# to enable dot-syntax field access (e.g., `a.x != b.x`).
+
+import ast
+import lexer
+import cst_parser
+import cst_lower
+import string_intern
+import macro_expand
+import diagnostic
+import compiler_types
+
+# ============================================================================
+# Diagnostic context for structured error output
+# ============================================================================
+
+var _derive_diag_filename = ""
+var _derive_diag_src_lines = vec_new<String>()
+
+def derive_set_diag_context(filename: String, src_lines: Vec<String>): Void
+  _derive_diag_filename = filename
+  _derive_diag_src_lines = src_lines
+end
+
+# ============================================================================
+# Re-parse infrastructure
+# ============================================================================
+
+## Re-parse an impl block source string and clone it into the main AST.
+## Parses into a temporary AST, then extracts the impl block structure
+## and function body, cloning into the destination storage.
+def re_parse_top_level(s: ast::AstStorage, source: String, struct_name: String, line: Int, col: Int): Int
+  # Append a dummy struct def + main so it's a valid program.
+  # The struct def is needed so the parser can resolve the type annotations.
+  var wrapped = str_concat("struct ", str_concat(struct_name, "\n  __dummy: Int\nend\n"))
+  wrapped = str_concat(wrapped, source)
+  wrapped = str_concat(wrapped, "\ndef main(): Int = 0\n")
+
+  # Tokenize
+  var derive_interner = string_intern::intern_global()
+  var lex_result = lexer::lexer_tokenize(wrapped, derive_interner)
+  var types = lex_result.get_types()
+  var lexemes = lex_result.get_lexemes()
+  var lines = lex_result.get_lines()
+  var cols = lex_result.get_cols()
+  var count = lex_result.token_count()
+
+  # Re-parse the @derive expansion via cst_parser -> cst_lower (matching
+  # resolver / main-module routing), covering @derive-generated source.
+  var cst_res = cst_parser::cst_parse_source(wrapped)
+  if cst_res.parser.had_error == 1
+    var cdd = diagnostic::diag_new(diagnostic::DIAG_ERROR, "QZ0520", "failed to re-parse @derive expansion", _derive_diag_filename, line, col)
+    diagnostic::diag_set_source(cdd, _derive_diag_src_lines)
+    diagnostic::diag_emit(cdd)
+    return ast::ast_int_lit(s, 0, line, col)
+  end
+  var ctmp_s = ast::ast_new_storage()
+  var ctmp_root = cst_lower::cst_lower(cst_res.parser.store, cst_res.root, ctmp_s)
+  var ckids = ast::ast_get_children(ctmp_s, ctmp_root)
+  if ckids == 0 or ckids.size < 2
+    return ast::ast_int_lit(s, 0, line, col)
+  end
+  var cimpl = ckids[1]
+  if ast::ast_get_kind(ctmp_s, cimpl) != 51  # NODE_IMPL_BLOCK
+    return ast::ast_int_lit(s, 0, line, col)
+  end
+  var ctrait = ast::ast_get_str1(ctmp_s, cimpl)
+  var cfor = ast::ast_get_str2(ctmp_s, cimpl)
+  var cmethods = ast::ast_get_children(ctmp_s, cimpl)
+  var cnew_methods = vec_new()
+  if cmethods != 0
+    var cmc = cmethods.size
+    for cmi in 0..cmc
+      var cfn = cmethods[cmi]
+      cnew_methods.push(clone_function(ctmp_s, s, cfn, struct_name, line, col))
+    end
+  end
+  return ast::ast_impl_block(s, ctrait, cfor, "", cnew_methods, line, col)
+end
+
+## Clone a NODE_FUNCTION from source storage to destination storage.
+## Builds params with struct type and clones the body via clone_with_unquote.
+def clone_function(src_s: ast::AstStorage, dst_s: ast::AstStorage, h: AstNodeId, struct_name: String, line: Int, col: Int): Int
+  var name = ast::ast_get_str1(src_s, h)
+  var return_type = ast::ast_get_str2(src_s, h)
+
+  # Build params in destination storage with the correct struct type.
+  # Generated functions have these typed signatures:
+  #   eq(a: StructName, b: StructName): Int
+  #   hash(a: StructName): Int
+  #   show(a: StructName): String
+  #   clone(a: StructName): Int
+  #   lt(a: StructName, b: StructName): Int
+  var new_params = vec_new()
+  if name == "op_eq" or name == "op_lt"
+    new_params.push(ast::ast_param(dst_s, "a", struct_name, 0, 0, line, col))
+    new_params.push(ast::ast_param(dst_s, "b", struct_name, 0, 0, line, col))
+  else
+    new_params.push(ast::ast_param(dst_s, "a", struct_name, 0, 0, line, col))
+  end
+
+  # Clone the function body
+  var body = ast::ast_get_right(src_s, h)
+  var new_body = 0
+  if body != 0
+    var empty_params = vec_new()
+    var empty_args = vec_new()
+    new_body = macro_expand::clone_with_unquote(src_s, dst_s, body, empty_params, empty_args, line, col)
+  end
+
+  return ast::ast_function(dst_s, name, new_params, return_type, new_body, 0, "", "", line, col)
+end
+
+# ============================================================================
+# Field type classification
+# ============================================================================
+
+def is_primitive_type(t: String): Int
+  if t == "Int"
+    return 1
+  end
+  if t == "Bool"
+    return 1
+  end
+  if t == "Float"
+    return 1
+  end
+  return 0
+end
+
+def is_string_type(t: String): Int
+  if t == "String"
+    return 1
+  end
+  return 0
+end
+
+# ============================================================================
+# Trait generators — use typed params with dot-syntax field access
+# ============================================================================
+
+def derive_eq(struct_name: String, field_names: Vec<String>, field_types: Vec<String>): String
+  var s = str_concat("extend ", str_concat(struct_name, " with Eq
+"))
+  s = str_concat(s, str_concat("  def op_eq(a: ", str_concat(struct_name, str_concat(", b: ", str_concat(struct_name, "): Bool\n")))))
+  var count = field_names.size
+  for i in 0..count
+    var fname = field_names[i]
+    var ftype = field_types[i]
+    if is_string_type(ftype)
+      s = str_concat(s, str_concat("    if str_eq(a.", str_concat(fname, str_concat(", b.", str_concat(fname, ") == 0\n")))))
+      s = str_concat(s, "      return false\n    end\n")
+    elsif is_primitive_type(ftype)
+      s = str_concat(s, str_concat("    if a.", str_concat(fname, str_concat(" != b.", str_concat(fname, "\n")))))
+      s = str_concat(s, "      return false\n    end\n")
+    else
+      # User-type field: call FieldType$op_eq
+      s = str_concat(s, str_concat("    if not ", str_concat(ftype, str_concat("$op_eq(a.", str_concat(fname, str_concat(", b.", str_concat(fname, ")\n")))))))
+      s = str_concat(s, "      return false\n    end\n")
+    end
+  end
+  s = str_concat(s, "    return true\n  end\nend\n")
+  return s
+end
+
+def derive_hash(struct_name: String, field_names: Vec<String>, field_types: Vec<String>): String
+  var s = str_concat("extend ", str_concat(struct_name, " with Hash
+"))
+  s = str_concat(s, str_concat("  def hash(a: ", str_concat(struct_name, "): Int\n")))
+  s = str_concat(s, "    var h = 17\n")
+  var count = field_names.size
+  for i in 0..count
+    var fname = field_names[i]
+    var ftype = field_types[i]
+    if is_string_type(ftype)
+      s = str_concat(s, str_concat("    h = h * 31 + str_size(a.", str_concat(fname, ")\n")))
+    elsif is_primitive_type(ftype)
+      s = str_concat(s, str_concat("    h = h * 31 + a.", str_concat(fname, "\n")))
+    else
+      s = str_concat(s, str_concat("    h = h * 31 + ", str_concat(ftype, str_concat("$hash(a.", str_concat(fname, ")\n")))))
+    end
+  end
+  s = str_concat(s, "    return h\n  end\nend\n")
+  return s
+end
+
+def derive_show(struct_name: String, field_names: Vec<String>, field_types: Vec<String>): String
+  var s = str_concat("extend ", str_concat(struct_name, " with Show
+"))
+  s = str_concat(s, str_concat("  def show(a: ", str_concat(struct_name, "): String\n")))
+  s = str_concat(s, str_concat("    var s = \"", str_concat(struct_name, "(\"\n")))
+  var count = field_names.size
+  for i in 0..count
+    var fname = field_names[i]
+    var ftype = field_types[i]
+    if i > 0
+      s = str_concat(s, "    s = str_concat(s, \", \")\n")
+    end
+    s = str_concat(s, str_concat("    s = str_concat(s, \"", str_concat(fname, "=\")\n")))
+    if is_string_type(ftype)
+      s = str_concat(s, str_concat("    s = str_concat(s, a.", str_concat(fname, ")\n")))
+    elsif is_primitive_type(ftype)
+      s = str_concat(s, str_concat("    s = str_concat(s, str_from_int(a.", str_concat(fname, "))\n")))
+    else
+      s = str_concat(s, str_concat("    s = str_concat(s, ", str_concat(ftype, str_concat("$show(a.", str_concat(fname, "))\n")))))
+    end
+  end
+  s = str_concat(s, "    s = str_concat(s, \")\")\n")
+  s = str_concat(s, "    return s\n  end\nend\n")
+  return s
+end
+
+def derive_clone(struct_name: String, field_names: Vec<String>, field_types: Vec<String>): String
+  var s = str_concat("extend ", str_concat(struct_name, " with Clone
+"))
+  s = str_concat(s, str_concat("  def clone(a: ", str_concat(struct_name, "): Int\n")))
+  s = str_concat(s, str_concat("    return ", str_concat(struct_name, " { ")))
+  var count = field_names.size
+  for i in 0..count
+    var fname = field_names[i]
+    var ftype = field_types[i]
+    if i > 0
+      s = str_concat(s, ", ")
+    end
+    if is_primitive_type(ftype) or is_string_type(ftype)
+      s = str_concat(s, str_concat(fname, str_concat(": a.", fname)))
+    else
+      s = str_concat(s, str_concat(fname, str_concat(": ", str_concat(ftype, str_concat("$clone(a.", str_concat(fname, ")"))))))
+    end
+  end
+  s = str_concat(s, " }\n  end\nend\n")
+  return s
+end
+
+def derive_ord(struct_name: String, field_names: Vec<String>, field_types: Vec<String>): String
+  var s = str_concat("extend ", str_concat(struct_name, " with Ord
+"))
+  s = str_concat(s, str_concat("  def op_lt(a: ", str_concat(struct_name, str_concat(", b: ", str_concat(struct_name, "): Bool\n")))))
+  var count = field_names.size
+  for i in 0..count
+    var fname = field_names[i]
+    var ftype = field_types[i]
+    if is_string_type(ftype)
+      s = str_concat(s, str_concat("    if str_cmp(a.", str_concat(fname, str_concat(", b.", str_concat(fname, ") < 0\n")))))
+      s = str_concat(s, "      return true\n    end\n")
+      if i < count - 1
+        s = str_concat(s, str_concat("    if str_cmp(a.", str_concat(fname, str_concat(", b.", str_concat(fname, ") > 0\n")))))
+        s = str_concat(s, "      return false\n    end\n")
+      end
+    elsif is_primitive_type(ftype)
+      s = str_concat(s, str_concat("    if a.", str_concat(fname, str_concat(" < b.", str_concat(fname, "\n")))))
+      s = str_concat(s, "      return true\n    end\n")
+      if i < count - 1
+        s = str_concat(s, str_concat("    if a.", str_concat(fname, str_concat(" > b.", str_concat(fname, "\n")))))
+        s = str_concat(s, "      return false\n    end\n")
+      end
+    else
+      s = str_concat(s, str_concat("    if ", str_concat(ftype, str_concat("$op_lt(a.", str_concat(fname, str_concat(", b.", str_concat(fname, ")\n")))))))
+      s = str_concat(s, "      return true\n    end\n")
+      if i < count - 1
+        s = str_concat(s, str_concat("    if ", str_concat(ftype, str_concat("$op_lt(b.", str_concat(fname, str_concat(", a.", str_concat(fname, ")\n")))))))
+        s = str_concat(s, "      return false\n    end\n")
+      end
+    end
+  end
+  s = str_concat(s, "    return false\n  end\nend\n")
+  return s
+end
+
+# ============================================================================
+# Main expansion driver
+# ============================================================================
+
+def is_valid_derive_trait(name: String): Int
+  if name == "Eq"
+    return 1
+  end
+  if name == "Hash"
+    return 1
+  end
+  if name == "Show"
+    return 1
+  end
+  if name == "Clone"
+    return 1
+  end
+  if name == "Ord"
+    return 1
+  end
+  return 0
+end
+
+## Expand all @derive annotations in the program.
+## Scans top-level structs, reads derive list from docs slot,
+## generates impl blocks, and appends them to the program's children.
+def expand_derive_annotations(s: ast::AstStorage, root: Int): Void
+  var children = ast::ast_get_children(s, root)
+  if children == 0
+    return
+  end
+  var count = children.size
+  var new_nodes = vec_new()
+
+  for i in 0..count
+    var node = children[i]
+    var kind = ast::ast_get_kind(s, node)
+    if kind != 36  # NODE_STRUCT_DEF
+      continue
+    end
+    var derive_str = ast::ast_get_doc(s, node)
+    if str_byte_len(derive_str) == 0
+      continue
+    end
+    # Only process if this is a derive annotation (prefixed with @derive:)
+    # Regular ## doc comments do NOT have this prefix
+    if str_byte_len(derive_str) < 8
+      continue
+    end
+    if str_byte_slice(derive_str, 0, 8) != "@derive:"
+      continue
+    end
+    # Strip the @derive: prefix to get the trait list
+    derive_str = str_byte_slice(derive_str, 8, str_byte_len(derive_str))
+
+    # Parse struct info
+    var struct_name = ast::ast_get_str1(s, node)
+    var field_children = ast::ast_get_children(s, node)
+    var field_names = vec_new<String>()
+    var field_types = vec_new<String>()
+    if field_children != 0
+      var fcount = field_children.size
+      for fi in 0..fcount
+        var fnode = field_children[fi]
+        var fkind = ast::ast_get_kind(s, fnode)
+        if fkind == 37  # NODE_FIELD_DEF
+          field_names.push(ast::ast_get_str1(s, fnode))
+          field_types.push(ast::ast_get_str2(s, fnode))
+        end
+      end
+    end
+
+    # Parse comma-separated derive list
+    var traits = str_split(derive_str, ",")
+    var tcount = traits.size
+    var line = ast::ast_get_line(s, node)
+    var col = ast::ast_get_col(s, node)
+
+    for ti in 0..tcount
+      var trait_name = traits[ti]
+      if is_valid_derive_trait(trait_name) == 0
+        var dd = diagnostic::diag_new(diagnostic::DIAG_ERROR, "QZ0521", "unknown derive trait '#{trait_name}' on struct #{struct_name}", _derive_diag_filename, line, col)
+        diagnostic::diag_set_source(dd, _derive_diag_src_lines)
+        diagnostic::diag_add_note(dd, "help: valid traits are Eq, Hash, Show, Clone, Ord")
+        diagnostic::diag_emit(dd)
+        continue
+      end
+
+      var source = ""
+      if trait_name == "Eq"
+        source = derive_eq(struct_name, field_names, field_types)
+      elsif trait_name == "Hash"
+        source = derive_hash(struct_name, field_names, field_types)
+      elsif trait_name == "Show"
+        source = derive_show(struct_name, field_names, field_types)
+      elsif trait_name == "Clone"
+        source = derive_clone(struct_name, field_names, field_types)
+      elsif trait_name == "Ord"
+        source = derive_ord(struct_name, field_names, field_types)
+      end
+
+      if str_byte_len(source) > 0
+        var impl_node = re_parse_top_level(s, source, struct_name, line, col)
+        new_nodes.push(impl_node)
+      end
+    end
+
+    # Clear docs slot so it doesn't confuse later phases
+    ast::ast_set_doc(s, node, "")
+  end
+
+  # Append generated impl blocks to the program's children
+  if new_nodes.size > 0
+    var new_children = vec_new()
+    for i in 0..count
+      new_children.push(children[i])
+    end
+    var ncount = new_nodes.size
+    for i in 0..ncount
+      new_children.push(new_nodes[i])
+    end
+    ast::ast_set_children(s, root, new_children)
+  end
+end

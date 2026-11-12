@@ -1,0 +1,1212 @@
+##! # MIR Lower Iteration Handlers
+##!
+##! Collection iteration lowering (Vec, channel, custom iterator, closure).
+##!
+##! @see mir_lower Main MIR lowering module
+
+import mir
+import * from mir
+import ast
+import op_constants
+import node_constants
+import type_constants
+import token_constants
+import diagnostic
+import mir_lower_gen
+import mir_lower
+import * from str_compat
+
+# Collection Iteration Lowering
+# ============================================================================
+
+# Lower Vec/Array iteration: for x in vec
+# Creates: __for_iter_N = vec, __for_idx_N = 0
+# COND: idx < vec_size(iter) ? body : exit
+# BODY: x = vec_get(iter, idx); user_body; idx++; jmp cond
+## Lower `for x in vec` iteration.
+##
+## `elem_type` is the dispatch hint that controls the vec_get layout
+## (@value struct inline read vs. non-@value deep-copy vs. default i64).
+## Callers MUST only pass it for `@value` structs or destructure patterns;
+## setting it for a regular non-@value struct would flip the semantics from
+## pointer-share to memcpy-copy and break `item.field = x` mutation loops.
+##
+## `annotation_hint` is a PSQ-4 fix: a struct name used ONLY to mark the
+## iter var's type for field-access resolution via `mir_ctx_mark_struct_var`.
+## This lets `item.field` resolve to the correct struct without changing
+## the vec_get dispatch. Set it whenever the caller knows the element
+## struct name (e.g., from `Vec<Live>` annotation) but isn't otherwise
+## changing vec_get behavior.
+def lower_vec_iteration(ctx: MirContext, s: ast::AstStorage, var_name: String, label: String, iter_node: AstNodeId, body_node: AstNodeId, elem_type: String, annotation_hint: String): Void
+  # Generate unique temp names
+  var iter_name = ctx.gen_for_temp("__for_iter")
+  var idx_name = ctx.gen_for_temp("__for_idx")
+
+  # In generators, register these temp vars for save/restore across yields.
+  # No-op outside generator context. Without this, kind=3 yield resumption
+  # restores user-named locals but not the for-loop iter/idx, causing
+  # iteration restart-from-zero or NULL-deref crashes on resume.
+  mir_lower_gen::mir_gen_register_dynamic_local(iter_name)
+  mir_lower_gen::mir_gen_register_dynamic_local(idx_name)
+
+  # Lower the collection expression
+  var coll_val = mir_lower::mir_lower_expr(ctx, s, iter_node)
+
+  # Allocate slots and bind temps
+  var iter_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(iter_name, iter_slot)
+  ctx.mir_emit_store_var(iter_name, coll_val)
+
+  var idx_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(idx_name, idx_slot)
+  var zero = ctx.mir_emit_const_int(0)
+  ctx.mir_emit_store_var(idx_name, zero)
+
+  # Allocate slot for element variable
+  var elem_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(var_name, elem_slot)
+  
+  # Create blocks
+  var cond_block = ctx.mir_create_block("for_cond")
+  var body_block = ctx.mir_create_block("for_body")
+  var incr_block = ctx.mir_create_block("for_incr")
+  var exit_block = ctx.mir_create_block("for_exit")
+  
+  # Jump to condition
+  var cur_block = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(cur_block, mir::TERM_JUMP, cond_block)
+  
+  # COND: idx < vec_size(iter) ? body : exit
+  ctx.mir_switch_to_block(cond_block)
+  var idx_val = ctx.mir_emit_load_var(idx_name)
+  var iter_val = ctx.mir_emit_load_var(iter_name)
+  
+  # Emit vec_size intrinsic call
+  var len_args = [iter_val]
+  var len_val = ctx.mir_emit_intrinsic("vec_size", len_args)
+  
+  var cmp_val = ctx.mir_emit_binary(op_constants::OP_LT, idx_val, len_val)
+  mir_block_set_branch(cond_block, cmp_val, body_block, exit_block)
+  
+  # Save old break/continue targets
+  var saved_break = ctx.mir_ctx_get_break_target()
+  var saved_continue = ctx.mir_ctx_get_continue_target()
+  var saved_loop_scope = ctx.mir_ctx_get_loop_scope_depth()
+  var saved_loop_defer = ctx.mir_ctx_get_loop_defer_depth()
+  var saved_loop_wrap = ctx.mir_ctx_get_loop_wrap_depth()
+
+  ctx.mir_ctx_set_break_target(exit_block)
+  ctx.mir_ctx_set_continue_target(incr_block)
+
+  var loop_scope = ctx.mir_ctx_get_scope_depth()
+  ctx.mir_ctx_set_loop_scope_depth(loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(ctx.drops.defer_stack.size)
+  var loop_wrap = ctx.wrap_stack_eff_names.size
+  ctx.mir_ctx_set_loop_wrap_depth(loop_wrap)
+
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_push_loop(label, exit_block, incr_block, loop_scope, loop_wrap)
+  end
+  
+  var body_scope = loop_scope + 1
+  ctx.mir_ctx_set_scope_depth(body_scope)
+  
+  # BODY: x = vec_get(iter, idx); user_body
+  ctx.mir_switch_to_block(body_block)
+  
+  # Reload iter and idx for body
+  var iter_val2 = ctx.mir_emit_load_var(iter_name)
+  var idx_val2 = ctx.mir_emit_load_var(idx_name)
+  
+  # Emit vec_get intrinsic call (typed for @value structs, untyped otherwise)
+  var get_args = [iter_val2, idx_val2]
+  var elem_val = 0
+  # F4-PRE-2 — a non-destructure `for item in vec` over a multi-word INLINE
+  # value-layout element (@value struct stored flat in the Vec, fc > 1) must take
+  # the TYPED vec_get so codegen emits the by-ADDRESS element fetch (data + i*fc)
+  # — exactly as `vec[i]` does. The untyped vec_get below loads a single i64 word
+  # (only field 0), and a later `item.field` then inttoptr's that scalar → SIGSEGV.
+  # Only inline value-layout structs upgrade; boxed/cow/scalar elements (fc 0) keep
+  # the untyped pointer/word-slot path. INERT at gate 0 (predicate 0 for plain
+  # structs ⇒ annotation-only, byte-identical).
+  var inline_elem_type = elem_type
+  if str_byte_len(inline_elem_type) == 0 and str_byte_len(annotation_hint) > 0
+    if mir::mir_vec_inline_field_count(ctx, annotation_hint) >= 1
+      inline_elem_type = annotation_hint
+    end
+  end
+  if str_byte_len(inline_elem_type) > 0
+    elem_val = ctx.mir_emit_intrinsic_typed("vec_get", get_args, inline_elem_type)
+    ctx.mir_ctx_mark_struct_var(var_name, inline_elem_type)
+  else
+    elem_val = ctx.mir_emit_intrinsic("vec_get", get_args)
+    # PSQ-4: mark the iter var's struct type so `item.field` resolves to the
+    # correct struct (no vec_get dispatch change — annotation-only).
+    if str_byte_len(annotation_hint) > 0
+      ctx.mir_ctx_mark_struct_var(var_name, annotation_hint)
+    end
+  end
+  ctx.mir_emit_store_var(var_name, elem_val)
+  
+  # Lower user body
+  mir_lower::mir_lower_stmt(ctx, s, body_node)
+  
+  # Jump to incr if no terminator
+  var body_cur = ctx.mir_ctx_get_block()
+  if mir_block_get_term_kind(body_cur) < 0
+    ctx.emit_drops_for_scope(body_scope)
+    # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+    body_cur = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(body_cur, mir::TERM_JUMP, incr_block)
+  end
+
+  ctx.mir_ctx_set_scope_depth(loop_scope)
+
+  # Pop body-scope droppables so function-exit doesn't re-drop them.
+  ctx.pop_droppables_for_scope(body_scope)
+
+  # INCR: idx++, jmp cond
+  ctx.mir_switch_to_block(incr_block)
+  var idx_cur = ctx.mir_emit_load_var(idx_name)
+  var one = ctx.mir_emit_const_int(1)
+  var idx_next = ctx.mir_emit_binary(op_constants::OP_ADD, idx_cur, one)
+  ctx.mir_emit_store_var(idx_name, idx_next)
+  # P21: fuel_check at for-in vec back-edge
+  mir_lower::mir_emit_fuel_check(ctx)
+  mir_block_set_terminator(incr_block, mir::TERM_JUMP, cond_block)
+
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_pop_loop()
+  end
+  
+  ctx.mir_ctx_set_break_target(saved_break)
+  ctx.mir_ctx_set_continue_target(saved_continue)
+  ctx.mir_ctx_set_loop_scope_depth(saved_loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(saved_loop_defer)
+  ctx.mir_ctx_set_loop_wrap_depth(saved_loop_wrap)
+  
+  ctx.mir_switch_to_block(exit_block)
+end
+
+# Lower Slice<T>/SliceMut<T> iteration: for x in slice
+# Structurally identical to lower_vec_iteration, but calls slice_size and
+# slice_get instead of vec_size / vec_get.  Part of Tier 4 #24 Phase 4.
+# Phase 4b §2.2: is_byte_stride selects byte_slice_get for Slice<Byte>.
+def lower_slice_iteration(ctx: MirContext, s: ast::AstStorage, var_name: String, label: String, iter_node: AstNodeId, body_node: AstNodeId, is_byte_stride: Bool): Void
+  var iter_name = ctx.gen_for_temp("__for_slice_iter")
+  var idx_name = ctx.gen_for_temp("__for_slice_idx")
+
+  # Generator frame registration — see lower_vec_iteration.
+  mir_lower_gen::mir_gen_register_dynamic_local(iter_name)
+  mir_lower_gen::mir_gen_register_dynamic_local(idx_name)
+
+  var coll_val = mir_lower::mir_lower_expr(ctx, s, iter_node)
+
+  var iter_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(iter_name, iter_slot)
+  ctx.mir_emit_store_var(iter_name, coll_val)
+
+  var idx_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(idx_name, idx_slot)
+  var zero = ctx.mir_emit_const_int(0)
+  ctx.mir_emit_store_var(idx_name, zero)
+
+  var elem_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(var_name, elem_slot)
+
+  var cond_block = ctx.mir_create_block("for_cond")
+  var body_block = ctx.mir_create_block("for_body")
+  var incr_block = ctx.mir_create_block("for_incr")
+  var exit_block = ctx.mir_create_block("for_exit")
+
+  var cur_block = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(cur_block, mir::TERM_JUMP, cond_block)
+
+  ctx.mir_switch_to_block(cond_block)
+  var idx_val = ctx.mir_emit_load_var(idx_name)
+  var iter_val = ctx.mir_emit_load_var(iter_name)
+  var len_args = [iter_val]
+  var len_val = ctx.mir_emit_intrinsic("slice_size", len_args)
+  var cmp_val = ctx.mir_emit_binary(op_constants::OP_LT, idx_val, len_val)
+  mir_block_set_branch(cond_block, cmp_val, body_block, exit_block)
+
+  var saved_break = ctx.mir_ctx_get_break_target()
+  var saved_continue = ctx.mir_ctx_get_continue_target()
+  var saved_loop_scope = ctx.mir_ctx_get_loop_scope_depth()
+  var saved_loop_defer = ctx.mir_ctx_get_loop_defer_depth()
+  var saved_loop_wrap = ctx.mir_ctx_get_loop_wrap_depth()
+
+  ctx.mir_ctx_set_break_target(exit_block)
+  ctx.mir_ctx_set_continue_target(incr_block)
+
+  var loop_scope = ctx.mir_ctx_get_scope_depth()
+  ctx.mir_ctx_set_loop_scope_depth(loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(ctx.drops.defer_stack.size)
+  var loop_wrap = ctx.wrap_stack_eff_names.size
+  ctx.mir_ctx_set_loop_wrap_depth(loop_wrap)
+
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_push_loop(label, exit_block, incr_block, loop_scope, loop_wrap)
+  end
+
+  var body_scope = loop_scope + 1
+  ctx.mir_ctx_set_scope_depth(body_scope)
+
+  ctx.mir_switch_to_block(body_block)
+
+  var iter_val2 = ctx.mir_emit_load_var(iter_name)
+  var idx_val2 = ctx.mir_emit_load_var(idx_name)
+  var get_args = [iter_val2, idx_val2]
+  var get_name = "slice_get"
+  if is_byte_stride
+    get_name = "byte_slice_get"
+  end
+  var elem_val = ctx.mir_emit_intrinsic(get_name, get_args)
+  ctx.mir_emit_store_var(var_name, elem_val)
+
+  mir_lower::mir_lower_stmt(ctx, s, body_node)
+
+  var body_cur = ctx.mir_ctx_get_block()
+  if mir_block_get_term_kind(body_cur) < 0
+    ctx.emit_drops_for_scope(body_scope)
+    # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+    body_cur = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(body_cur, mir::TERM_JUMP, incr_block)
+  end
+
+  ctx.mir_ctx_set_scope_depth(loop_scope)
+  ctx.pop_droppables_for_scope(body_scope)
+
+  ctx.mir_switch_to_block(incr_block)
+  var idx_cur = ctx.mir_emit_load_var(idx_name)
+  var one = ctx.mir_emit_const_int(1)
+  var idx_next = ctx.mir_emit_binary(op_constants::OP_ADD, idx_cur, one)
+  ctx.mir_emit_store_var(idx_name, idx_next)
+  mir_lower::mir_emit_fuel_check(ctx)
+  mir_block_set_terminator(incr_block, mir::TERM_JUMP, cond_block)
+
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_pop_loop()
+  end
+
+  ctx.mir_ctx_set_break_target(saved_break)
+  ctx.mir_ctx_set_continue_target(saved_continue)
+  ctx.mir_ctx_set_loop_scope_depth(saved_loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(saved_loop_defer)
+  ctx.mir_ctx_set_loop_wrap_depth(saved_loop_wrap)
+
+  ctx.mir_switch_to_block(exit_block)
+end
+
+# Lower Channel iteration: for x in chan
+# COND: (!channel_closed(chan) || channel_size(chan) > 0) ? body : exit
+# BODY: x = recv(chan); user_body; jmp cond
+def lower_channel_iteration(ctx: MirContext, s: ast::AstStorage, var_name: String, label: String, iter_node: AstNodeId, body_node: AstNodeId): Void
+  # Generate unique temp name for channel
+  var chan_name = ctx.gen_for_temp("__for_chan")
+
+  # Generator frame registration — see lower_vec_iteration.
+  mir_lower_gen::mir_gen_register_dynamic_local(chan_name)
+
+  # Lower the channel expression
+  var chan_val = mir_lower::mir_lower_expr(ctx, s, iter_node)
+  
+  # Store channel in temp
+  var chan_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(chan_name, chan_slot)
+  ctx.mir_emit_store_var(chan_name, chan_val)
+  
+  # Allocate slot for element variable
+  var elem_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(var_name, elem_slot)
+  
+  # Create blocks
+  var cond_block = ctx.mir_create_block("for_cond")
+  var body_block = ctx.mir_create_block("for_body")
+  var exit_block = ctx.mir_create_block("for_exit")
+  
+  # Jump to condition
+  var cur_block = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(cur_block, mir::TERM_JUMP, cond_block)
+  
+  # COND: (!channel_closed(chan) || channel_size(chan) > 0)
+  ctx.mir_switch_to_block(cond_block)
+  var chan_load = ctx.mir_emit_load_var(chan_name)
+  
+  # Check !channel_closed(chan) - negate by comparing to 0
+  var closed_args = [chan_load]
+  var closed_val = ctx.mir_emit_intrinsic("channel_closed", closed_args)
+  var zero_bool = ctx.mir_emit_const_int(0)
+  var not_closed = ctx.mir_emit_binary(op_constants::OP_EQ, closed_val, zero_bool)
+  
+  # Check channel_size(chan) > 0
+  var chan_load2 = ctx.mir_emit_load_var(chan_name)
+  var len_args = [chan_load2]
+  var len_val = ctx.mir_emit_intrinsic("channel_size", len_args)
+  var zero = ctx.mir_emit_const_int(0)
+  var len_gt_zero = ctx.mir_emit_binary(op_constants::OP_LE, len_val, zero)
+
+  # Combine: !closed || len > 0
+  var continue_cond = ctx.mir_emit_binary(op_constants::OP_NOT, not_closed, len_gt_zero)
+  mir_block_set_branch(cond_block, continue_cond, body_block, exit_block)
+  
+  # Save old break/continue targets
+  var saved_break = ctx.mir_ctx_get_break_target()
+  var saved_continue = ctx.mir_ctx_get_continue_target()
+  var saved_loop_scope = ctx.mir_ctx_get_loop_scope_depth()
+  var saved_loop_defer = ctx.mir_ctx_get_loop_defer_depth()
+  var saved_loop_wrap = ctx.mir_ctx_get_loop_wrap_depth()
+
+  ctx.mir_ctx_set_break_target(exit_block)
+  ctx.mir_ctx_set_continue_target(cond_block)  # Channel loops continue to cond, not incr
+
+  var loop_scope = ctx.mir_ctx_get_scope_depth()
+  ctx.mir_ctx_set_loop_scope_depth(loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(ctx.drops.defer_stack.size)
+  var loop_wrap = ctx.wrap_stack_eff_names.size
+  ctx.mir_ctx_set_loop_wrap_depth(loop_wrap)
+
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_push_loop(label, exit_block, cond_block, loop_scope, loop_wrap)
+  end
+  
+  var body_scope = loop_scope + 1
+  ctx.mir_ctx_set_scope_depth(body_scope)
+  
+  # BODY: x = recv(chan); user_body
+  ctx.mir_switch_to_block(body_block)
+  
+  var chan_load3 = ctx.mir_emit_load_var(chan_name)
+  var recv_args = [chan_load3]
+  var recv_val = ctx.mir_emit_intrinsic("recv", recv_args)
+  ctx.mir_emit_store_var(var_name, recv_val)
+
+  # Lower user body
+  mir_lower::mir_lower_stmt(ctx, s, body_node)
+
+  # Jump back to cond if no terminator
+  var body_cur = ctx.mir_ctx_get_block()
+  if mir_block_get_term_kind(body_cur) < 0
+    ctx.emit_drops_for_scope(body_scope)
+    # P21: fuel_check at for-in channel back-edge
+    mir_lower::mir_emit_fuel_check(ctx)
+    # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+    body_cur = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(body_cur, mir::TERM_JUMP, cond_block)
+  end
+
+  ctx.mir_ctx_set_scope_depth(loop_scope)
+
+  # Pop body-scope droppables so function-exit doesn't re-drop them.
+  ctx.pop_droppables_for_scope(body_scope)
+
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_pop_loop()
+  end
+
+  ctx.mir_ctx_set_break_target(saved_break)
+  ctx.mir_ctx_set_continue_target(saved_continue)
+  ctx.mir_ctx_set_loop_scope_depth(saved_loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(saved_loop_defer)
+  ctx.mir_ctx_set_loop_wrap_depth(saved_loop_wrap)
+
+  ctx.mir_switch_to_block(exit_block)
+end
+
+# Lower String iteration: for c in "hello"
+# Desugars to: var __chars = str_chars(s); for c in __chars
+# Each element is an Int codepoint value.
+def lower_string_iteration(ctx: MirContext, s: ast::AstStorage, var_name: String, label: String, iter_node: AstNodeId, body_node: AstNodeId): Void
+  # Lower the string expression
+  var str_val = mir_lower::mir_lower_expr(ctx, s, iter_node)
+
+  # Convert string to Vec<Int> of codepoints
+  var chars_args = [str_val]
+  var chars_val = ctx.mir_emit_intrinsic("str_chars", chars_args)
+
+  # Generate unique temp names
+  var iter_name = ctx.gen_for_temp("__for_iter")
+  var idx_name = ctx.gen_for_temp("__for_idx")
+
+  # Generator frame registration — see lower_vec_iteration.
+  mir_lower_gen::mir_gen_register_dynamic_local(iter_name)
+  mir_lower_gen::mir_gen_register_dynamic_local(idx_name)
+
+  # Store chars vec in temp
+  var iter_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(iter_name, iter_slot)
+  ctx.mir_emit_store_var(iter_name, chars_val)
+
+  var idx_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(idx_name, idx_slot)
+  var zero = ctx.mir_emit_const_int(0)
+  ctx.mir_emit_store_var(idx_name, zero)
+
+  # Allocate slot for element variable
+  var elem_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(var_name, elem_slot)
+
+  # Create blocks
+  var cond_block = ctx.mir_create_block("for_cond")
+  var body_block = ctx.mir_create_block("for_body")
+  var incr_block = ctx.mir_create_block("for_incr")
+  var exit_block = ctx.mir_create_block("for_exit")
+
+  # Jump to condition
+  var cur_block = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(cur_block, mir::TERM_JUMP, cond_block)
+
+  # COND: idx < vec_size(chars) ? body : exit
+  ctx.mir_switch_to_block(cond_block)
+  var idx_val = ctx.mir_emit_load_var(idx_name)
+  var iter_val = ctx.mir_emit_load_var(iter_name)
+  var len_args = [iter_val]
+  var len_val = ctx.mir_emit_intrinsic("vec_size", len_args)
+  var cmp_val = ctx.mir_emit_binary(op_constants::OP_LT, idx_val, len_val)
+  mir_block_set_branch(cond_block, cmp_val, body_block, exit_block)
+
+  # Save old break/continue targets
+  var saved_break = ctx.mir_ctx_get_break_target()
+  var saved_continue = ctx.mir_ctx_get_continue_target()
+  var saved_loop_scope = ctx.mir_ctx_get_loop_scope_depth()
+  var saved_loop_defer = ctx.mir_ctx_get_loop_defer_depth()
+  var saved_loop_wrap = ctx.mir_ctx_get_loop_wrap_depth()
+
+  ctx.mir_ctx_set_break_target(exit_block)
+  ctx.mir_ctx_set_continue_target(incr_block)
+
+  var loop_scope = ctx.mir_ctx_get_scope_depth()
+  ctx.mir_ctx_set_loop_scope_depth(loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(ctx.drops.defer_stack.size)
+  var loop_wrap = ctx.wrap_stack_eff_names.size
+  ctx.mir_ctx_set_loop_wrap_depth(loop_wrap)
+
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_push_loop(label, exit_block, incr_block, loop_scope, loop_wrap)
+  end
+
+  var body_scope = loop_scope + 1
+  ctx.mir_ctx_set_scope_depth(body_scope)
+
+  # BODY: c = vec_get(chars, idx); user_body
+  ctx.mir_switch_to_block(body_block)
+  var iter_val2 = ctx.mir_emit_load_var(iter_name)
+  var idx_val2 = ctx.mir_emit_load_var(idx_name)
+  var get_args = [iter_val2, idx_val2]
+  var elem_val = ctx.mir_emit_intrinsic("vec_get", get_args)
+  ctx.mir_emit_store_var(var_name, elem_val)
+
+  # Lower user body
+  mir_lower::mir_lower_stmt(ctx, s, body_node)
+
+  # Jump to incr if no terminator
+  var body_cur = ctx.mir_ctx_get_block()
+  if mir_block_get_term_kind(body_cur) < 0
+    ctx.emit_drops_for_scope(body_scope)
+    # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+    body_cur = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(body_cur, mir::TERM_JUMP, incr_block)
+  end
+
+  ctx.mir_ctx_set_scope_depth(loop_scope)
+  ctx.pop_droppables_for_scope(body_scope)
+
+  # INCR: idx++, jmp cond
+  ctx.mir_switch_to_block(incr_block)
+  var idx_cur = ctx.mir_emit_load_var(idx_name)
+  var one = ctx.mir_emit_const_int(1)
+  var idx_next = ctx.mir_emit_binary(op_constants::OP_ADD, idx_cur, one)
+  ctx.mir_emit_store_var(idx_name, idx_next)
+  mir_lower::mir_emit_fuel_check(ctx)
+  mir_block_set_terminator(incr_block, mir::TERM_JUMP, cond_block)
+
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_pop_loop()
+  end
+
+  ctx.mir_ctx_set_break_target(saved_break)
+  ctx.mir_ctx_set_continue_target(saved_continue)
+  ctx.mir_ctx_set_loop_scope_depth(saved_loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(saved_loop_defer)
+  ctx.mir_ctx_set_loop_wrap_depth(saved_loop_wrap)
+
+  ctx.mir_switch_to_block(exit_block)
+end
+
+# Lower Map iteration: for k in map
+# Desugars to: var __keys = map_keys(m); for k in __keys
+# Loop variable is bound to each key.
+#
+# `key_type` is the map's key type name ("Int" for int-key, "" or "String" or
+# a struct name for string-key). It's threaded through map_keys so codegen
+# dispatches to intmap_keys vs hashmap_keys. An empty string defaults to the
+# string-key path, matching the codegen convention used by all other map_*
+# intrinsics.
+def lower_map_iteration(ctx: MirContext, s: ast::AstStorage, var_name: String, label: String, iter_node: AstNodeId, body_node: AstNodeId, key_type: String): Void
+  # Lower the map expression
+  var map_val = mir_lower::mir_lower_expr(ctx, s, iter_node)
+
+  # Get keys as Vec — emits unified map_keys with elem_type in slot2 so
+  # codegen can route to the correct key-type-specialized handler.
+  var keys_args = [map_val]
+  var keys_val = 0
+  if str_byte_len(key_type) > 0
+    keys_val = ctx.mir_emit_intrinsic_typed("map_keys", keys_args, key_type)
+  else
+    keys_val = ctx.mir_emit_intrinsic("map_keys", keys_args)
+  end
+
+  # Generate unique temp names
+  var iter_name = ctx.gen_for_temp("__for_iter")
+  var idx_name = ctx.gen_for_temp("__for_idx")
+
+  # Generator frame registration — see lower_vec_iteration.
+  mir_lower_gen::mir_gen_register_dynamic_local(iter_name)
+  mir_lower_gen::mir_gen_register_dynamic_local(idx_name)
+
+  # Store keys vec in temp
+  var iter_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(iter_name, iter_slot)
+  ctx.mir_emit_store_var(iter_name, keys_val)
+
+  var idx_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(idx_name, idx_slot)
+  var zero = ctx.mir_emit_const_int(0)
+  ctx.mir_emit_store_var(idx_name, zero)
+
+  # Allocate slot for element variable (the key)
+  var elem_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(var_name, elem_slot)
+
+  # Create blocks
+  var cond_block = ctx.mir_create_block("for_cond")
+  var body_block = ctx.mir_create_block("for_body")
+  var incr_block = ctx.mir_create_block("for_incr")
+  var exit_block = ctx.mir_create_block("for_exit")
+
+  # Jump to condition
+  var cur_block = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(cur_block, mir::TERM_JUMP, cond_block)
+
+  # COND: idx < vec_size(keys) ? body : exit
+  ctx.mir_switch_to_block(cond_block)
+  var idx_val = ctx.mir_emit_load_var(idx_name)
+  var iter_val = ctx.mir_emit_load_var(iter_name)
+  var len_args = [iter_val]
+  var len_val = ctx.mir_emit_intrinsic("vec_size", len_args)
+  var cmp_val = ctx.mir_emit_binary(op_constants::OP_LT, idx_val, len_val)
+  mir_block_set_branch(cond_block, cmp_val, body_block, exit_block)
+
+  # Save old break/continue targets
+  var saved_break = ctx.mir_ctx_get_break_target()
+  var saved_continue = ctx.mir_ctx_get_continue_target()
+  var saved_loop_scope = ctx.mir_ctx_get_loop_scope_depth()
+  var saved_loop_defer = ctx.mir_ctx_get_loop_defer_depth()
+  var saved_loop_wrap = ctx.mir_ctx_get_loop_wrap_depth()
+
+  ctx.mir_ctx_set_break_target(exit_block)
+  ctx.mir_ctx_set_continue_target(incr_block)
+
+  var loop_scope = ctx.mir_ctx_get_scope_depth()
+  ctx.mir_ctx_set_loop_scope_depth(loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(ctx.drops.defer_stack.size)
+  var loop_wrap = ctx.wrap_stack_eff_names.size
+  ctx.mir_ctx_set_loop_wrap_depth(loop_wrap)
+
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_push_loop(label, exit_block, incr_block, loop_scope, loop_wrap)
+  end
+
+  var body_scope = loop_scope + 1
+  ctx.mir_ctx_set_scope_depth(body_scope)
+
+  # BODY: k = vec_get(keys, idx); user_body
+  ctx.mir_switch_to_block(body_block)
+  var iter_val2 = ctx.mir_emit_load_var(iter_name)
+  var idx_val2 = ctx.mir_emit_load_var(idx_name)
+  var get_args = [iter_val2, idx_val2]
+  # item 1a — thread the key type into vec_get's slot2 so codegen reads the
+  # element with the correct layout. For a value-layout struct key the keys Vec
+  # is `Vec<Struct>` (inline elements, stride fc*8 / packed sizeof), so vec_get
+  # must return the element POINTER (value-layout path), not a bare i64 (which
+  # would grab only the first field). Empty key_type ⇒ untyped vec_get, matching
+  # the String/Int-key element read exactly (byte-identical).
+  var elem_val = 0
+  if str_byte_len(key_type) > 0
+    elem_val = ctx.mir_emit_intrinsic_typed("vec_get", get_args, key_type)
+  else
+    elem_val = ctx.mir_emit_intrinsic("vec_get", get_args)
+  end
+  ctx.mir_emit_store_var(var_name, elem_val)
+
+  # Lower user body
+  mir_lower::mir_lower_stmt(ctx, s, body_node)
+
+  # Jump to incr if no terminator
+  var body_cur = ctx.mir_ctx_get_block()
+  if mir_block_get_term_kind(body_cur) < 0
+    ctx.emit_drops_for_scope(body_scope)
+    # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+    body_cur = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(body_cur, mir::TERM_JUMP, incr_block)
+  end
+
+  ctx.mir_ctx_set_scope_depth(loop_scope)
+  ctx.pop_droppables_for_scope(body_scope)
+
+  # INCR: idx++, jmp cond
+  ctx.mir_switch_to_block(incr_block)
+  var idx_cur = ctx.mir_emit_load_var(idx_name)
+  var one = ctx.mir_emit_const_int(1)
+  var idx_next = ctx.mir_emit_binary(op_constants::OP_ADD, idx_cur, one)
+  ctx.mir_emit_store_var(idx_name, idx_next)
+  mir_lower::mir_emit_fuel_check(ctx)
+  mir_block_set_terminator(incr_block, mir::TERM_JUMP, cond_block)
+
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_pop_loop()
+  end
+
+  ctx.mir_ctx_set_break_target(saved_break)
+  ctx.mir_ctx_set_continue_target(saved_continue)
+  ctx.mir_ctx_set_loop_scope_depth(saved_loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(saved_loop_defer)
+  ctx.mir_ctx_set_loop_wrap_depth(saved_loop_wrap)
+
+  ctx.mir_switch_to_block(exit_block)
+end
+
+# Lower custom iterator: for x in struct_with_next_method
+# Protocol: call StructName$next(iter) -> Option, loop while Some, free on each path
+def lower_custom_iteration(ctx: MirContext, s: ast::AstStorage, var_name: String, label: String, iter_node: AstNodeId, body_node: AstNodeId, next_func_name: String): Void
+  # Generate unique temp names
+  var citer_name = ctx.gen_for_temp("__citer")
+  var copt_name = ctx.gen_for_temp("__copt")
+
+  # In generators, register these temp vars for save/restore across yields
+  mir_lower_gen::mir_gen_register_dynamic_local(citer_name)
+  mir_lower_gen::mir_gen_register_dynamic_local(copt_name)
+
+  # Lower the collection expression
+  var coll_val = mir_lower::mir_lower_expr(ctx, s, iter_node)
+
+  # Store collection in temp
+  var citer_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(citer_name, citer_slot)
+  ctx.mir_emit_store_var(citer_name, coll_val)
+
+  # Allocate slot for option temp
+  var copt_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(copt_name, copt_slot)
+
+  # Allocate slot for element variable
+  var elem_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(var_name, elem_slot)
+
+  # Create blocks
+  var cond_block = ctx.mir_create_block("citer_cond")
+  var body_block = ctx.mir_create_block("citer_body")
+  var exit_block = ctx.mir_create_block("citer_exit")
+
+  # Jump to condition
+  var cur_block = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(cur_block, mir::TERM_JUMP, cond_block)
+
+  # COND: iter = load __citer; opt = next(iter); store __copt; br is_some -> body, exit
+  ctx.mir_switch_to_block(cond_block)
+  var iter_val = ctx.mir_emit_load_var(citer_name)
+  var next_args = [iter_val]
+  var opt_val = ctx.mir_emit_call(next_func_name, next_args)
+  ctx.mir_emit_store_var(copt_name, opt_val)
+  var is_some_args = [opt_val]
+  var is_some = ctx.mir_emit_intrinsic("option_is_some", is_some_args)
+  mir_block_set_branch(cond_block, is_some, body_block, exit_block)
+
+  # Save old break/continue targets
+  var saved_break = ctx.mir_ctx_get_break_target()
+  var saved_continue = ctx.mir_ctx_get_continue_target()
+  var saved_loop_scope = ctx.mir_ctx_get_loop_scope_depth()
+  var saved_loop_defer = ctx.mir_ctx_get_loop_defer_depth()
+  var saved_loop_wrap = ctx.mir_ctx_get_loop_wrap_depth()
+
+  ctx.mir_ctx_set_break_target(exit_block)
+  ctx.mir_ctx_set_continue_target(cond_block)
+
+  var loop_scope = ctx.mir_ctx_get_scope_depth()
+  ctx.mir_ctx_set_loop_scope_depth(loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(ctx.drops.defer_stack.size)
+  var loop_wrap = ctx.wrap_stack_eff_names.size
+  ctx.mir_ctx_set_loop_wrap_depth(loop_wrap)
+
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_push_loop(label, exit_block, cond_block, loop_scope, loop_wrap)
+  end
+
+  var body_scope = loop_scope + 1
+  ctx.mir_ctx_set_scope_depth(body_scope)
+
+  # BODY: opt = load __copt; x = option_get(opt); option_free(opt); <user body>; jmp cond
+  ctx.mir_switch_to_block(body_block)
+
+  var opt_loaded = ctx.mir_emit_load_var(copt_name)
+  var get_args = [opt_loaded]
+  var elem_val = ctx.mir_emit_intrinsic("option_get", get_args)
+  ctx.mir_emit_store_var(var_name, elem_val)
+  var free_args = [opt_loaded]
+  ctx.mir_emit_intrinsic("option_free", free_args)
+
+  # Null out __copt after free to prevent double-free on break
+  var null_val = ctx.mir_emit_const_int(0)
+  ctx.mir_emit_store_var(copt_name, null_val)
+
+  # Lower user body
+  mir_lower::mir_lower_stmt(ctx, s, body_node)
+
+  # Jump back to cond if no terminator
+  var body_cur = ctx.mir_ctx_get_block()
+  if mir_block_get_term_kind(body_cur) < 0
+    ctx.emit_drops_for_scope(body_scope)
+    # P21: fuel_check at for-in custom iterator back-edge
+    mir_lower::mir_emit_fuel_check(ctx)
+    # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+    body_cur = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(body_cur, mir::TERM_JUMP, cond_block)
+  end
+
+  ctx.mir_ctx_set_scope_depth(loop_scope)
+
+  # Pop body-scope droppables so function-exit doesn't re-drop them.
+  ctx.pop_droppables_for_scope(body_scope)
+
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_pop_loop()
+  end
+
+  ctx.mir_ctx_set_break_target(saved_break)
+  ctx.mir_ctx_set_continue_target(saved_continue)
+  ctx.mir_ctx_set_loop_scope_depth(saved_loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(saved_loop_defer)
+  ctx.mir_ctx_set_loop_wrap_depth(saved_loop_wrap)
+
+  # EXIT: opt = load __copt; option_free(opt)  (free the final None)
+  ctx.mir_switch_to_block(exit_block)
+  var opt_exit = ctx.mir_emit_load_var(copt_name)
+  var free_exit_args = [opt_exit]
+  var _discard = ctx.mir_emit_intrinsic("option_free", free_exit_args)
+end
+
+## Lower for-in loop over an Iterator-bounded closure param.
+## Same structure as lower_custom_iteration but calls the closure indirectly
+## (no args) instead of a named function.
+def lower_closure_iteration(ctx: MirContext, s: ast::AstStorage, var_name: String, label: String, iter_node: AstNodeId, body_node: AstNodeId): Void
+  var cl_name = ctx.gen_for_temp("__cl_iter")
+  var copt_name = ctx.gen_for_temp("__copt")
+
+  # Generator frame registration — see lower_vec_iteration.
+  mir_lower_gen::mir_gen_register_dynamic_local(cl_name)
+  mir_lower_gen::mir_gen_register_dynamic_local(copt_name)
+
+  # The iterator expression evaluates to the closure pointer
+  var closure_ptr = mir_lower::mir_lower_expr(ctx, s, iter_node)
+
+  # Store closure in temp for reload across blocks
+  var cl_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(cl_name, cl_slot)
+  ctx.mir_emit_store_var(cl_name, closure_ptr)
+
+  # Allocate slot for option temp
+  var copt_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(copt_name, copt_slot)
+
+  # Allocate slot for element variable
+  var elem_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(var_name, elem_slot)
+
+  # Create blocks
+  var cond_block = ctx.mir_create_block("citer_cond")
+  var body_block = ctx.mir_create_block("citer_body")
+  var exit_block = ctx.mir_create_block("citer_exit")
+
+  # Jump to condition
+  var cur_block = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(cur_block, mir::TERM_JUMP, cond_block)
+
+  # COND: load closure, call it (no args), check is_some
+  ctx.mir_switch_to_block(cond_block)
+  var cl_val = ctx.mir_emit_load_var(cl_name)
+  var empty_args = vec_new()
+  var opt_val = ctx.mir_emit_call_indirect(cl_val, empty_args)
+  ctx.mir_emit_store_var(copt_name, opt_val)
+  var is_some_args = [opt_val]
+  var is_some = ctx.mir_emit_intrinsic("option_is_some", is_some_args)
+  mir_block_set_branch(cond_block, is_some, body_block, exit_block)
+
+  # Save old break/continue targets
+  var saved_break = ctx.mir_ctx_get_break_target()
+  var saved_continue = ctx.mir_ctx_get_continue_target()
+  var saved_loop_scope = ctx.mir_ctx_get_loop_scope_depth()
+  var saved_loop_defer = ctx.mir_ctx_get_loop_defer_depth()
+  var saved_loop_wrap = ctx.mir_ctx_get_loop_wrap_depth()
+
+  ctx.mir_ctx_set_break_target(exit_block)
+  ctx.mir_ctx_set_continue_target(cond_block)
+
+  var loop_scope = ctx.mir_ctx_get_scope_depth()
+  ctx.mir_ctx_set_loop_scope_depth(loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(ctx.drops.defer_stack.size)
+  var loop_wrap = ctx.wrap_stack_eff_names.size
+  ctx.mir_ctx_set_loop_wrap_depth(loop_wrap)
+
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_push_loop(label, exit_block, cond_block, loop_scope, loop_wrap)
+  end
+
+  var body_scope = loop_scope + 1
+  ctx.mir_ctx_set_scope_depth(body_scope)
+
+  # BODY: opt = load __copt; x = option_get(opt); option_free(opt); <user body>; jmp cond
+  ctx.mir_switch_to_block(body_block)
+
+  var opt_loaded = ctx.mir_emit_load_var(copt_name)
+  var get_args = [opt_loaded]
+  var elem_val = ctx.mir_emit_intrinsic("option_get", get_args)
+  ctx.mir_emit_store_var(var_name, elem_val)
+  var free_args = [opt_loaded]
+  ctx.mir_emit_intrinsic("option_free", free_args)
+
+  # Null out __copt after free to prevent double-free on break
+  var null_val = ctx.mir_emit_const_int(0)
+  ctx.mir_emit_store_var(copt_name, null_val)
+
+  # Lower user body
+  mir_lower::mir_lower_stmt(ctx, s, body_node)
+
+  # Jump back to cond if no terminator
+  var body_cur = ctx.mir_ctx_get_block()
+  if mir_block_get_term_kind(body_cur) < 0
+    ctx.emit_drops_for_scope(body_scope)
+    # P21: fuel_check at for-in closure iterator back-edge
+    mir_lower::mir_emit_fuel_check(ctx)
+    # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+    body_cur = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(body_cur, mir::TERM_JUMP, cond_block)
+  end
+
+  ctx.mir_ctx_set_scope_depth(loop_scope)
+
+  # Pop body-scope droppables so function-exit doesn't re-drop them.
+  ctx.pop_droppables_for_scope(body_scope)
+
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_pop_loop()
+  end
+
+  ctx.mir_ctx_set_break_target(saved_break)
+  ctx.mir_ctx_set_continue_target(saved_continue)
+  ctx.mir_ctx_set_loop_scope_depth(saved_loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(saved_loop_defer)
+  ctx.mir_ctx_set_loop_wrap_depth(saved_loop_wrap)
+
+  # EXIT: opt = load __copt; option_free(opt) (free the final None)
+  ctx.mir_switch_to_block(exit_block)
+  var opt_exit = ctx.mir_emit_load_var(copt_name)
+  var free_exit_args = [opt_exit]
+  var _discard = ctx.mir_emit_intrinsic("option_free", free_exit_args)
+end
+
+# ============================================================================
+# Statement lowering
+# ============================================================================
+
+# ============================================================================
+# Loop Vec Access Optimization: body scanner
+# ============================================================================
+# Recursively scan a for-loop body AST for node_constants$NODE_INDEX/node_constants$NODE_INDEX_ASSIGN
+# where the base is a simple identifier. Collects the variable names
+# into `results`. These are Vec variables whose data pointers can
+# be hoisted before the loop for optimized access.
+
+def mir_scan_vec_accesses(s: ast::AstStorage, node: AstNodeId, results: Vec<String>): Void
+  if node == 0
+    return
+  end
+  var kind = ast::ast_get_kind(s, node)
+  
+  # node_constants$NODE_INDEX (13): v[k] — collect the base ident name
+  if kind == 13
+    var base = ast::ast_get_left(s, node)
+    var base_kind = ast::ast_get_kind(s, base)
+    if base_kind == 6  # node_constants$NODE_IDENT
+      var name = ast::ast_get_str1(s, base)
+      results.push(name)
+    end
+    # Also recurse into the index expression
+    mir_scan_vec_accesses(s, ast::ast_get_right(s, node), results)
+    return
+  end
+  
+  # node_constants$NODE_INDEX_ASSIGN (27): v[k] = val — collect the base ident name
+  if kind == 27
+    var base = ast::ast_get_left(s, node)
+    var base_kind = ast::ast_get_kind(s, base)
+    if base_kind == 6  # node_constants$NODE_IDENT
+      var name = ast::ast_get_str1(s, base)
+      results.push(name)
+    end
+    mir_scan_vec_accesses(s, ast::ast_get_right(s, node), results)
+    mir_scan_vec_accesses(s, ast::ast_get_extra(s, node), results)
+    return
+  end
+  
+  # node_constants$NODE_BLOCK (32): recurse into each statement in the block
+  if kind == 32
+    var children = ast::ast_get_children(s, node)
+    if children != 0
+      for ci in 0..children.size
+        mir_scan_vec_accesses(s, children[ci], results)
+      end
+    end
+    return
+  end
+  
+  # node_constants$NODE_IF (23): recurse into condition, then, else
+  if kind == 23
+    mir_scan_vec_accesses(s, ast::ast_get_left(s, node), results)
+    mir_scan_vec_accesses(s, ast::ast_get_right(s, node), results)
+    mir_scan_vec_accesses(s, ast::ast_get_extra(s, node), results)
+    return
+  end
+  
+  # node_constants$NODE_WHILE (24): recurse into condition and body
+  if kind == 24
+    mir_scan_vec_accesses(s, ast::ast_get_left(s, node), results)
+    mir_scan_vec_accesses(s, ast::ast_get_right(s, node), results)
+    return
+  end
+  
+  # node_constants$NODE_FOR (44): recurse into body (don't scan into nested for-loop iterators)
+  if kind == 44 or kind == 86  # NODE_FOR or NODE_FOR_AWAIT
+    mir_scan_vec_accesses(s, ast::ast_get_right(s, node), results)
+    return
+  end
+  
+  # node_constants$NODE_LET (25): recurse into initializer
+  if kind == 25
+    mir_scan_vec_accesses(s, ast::ast_get_right(s, node), results)
+    return
+  end
+
+  # NODE_LET_DESTRUCTURE (78): recurse into init expression
+  if kind == 78
+    mir_scan_vec_accesses(s, ast::ast_get_left(s, node), results)
+    return
+  end
+
+  # NODE_STRUCT_DESTRUCTURE (79) / NODE_VEC_DESTRUCTURE (80): recurse into init
+  if kind == 79 or kind == 80
+    var sd_init = ast::ast_get_left(s, node)
+    if sd_init > 0
+      mir_scan_vec_accesses(s, sd_init, results)
+    end
+    return
+  end
+
+  # node_constants$NODE_ASSIGN (26): recurse into left and right
+  if kind == 26
+    mir_scan_vec_accesses(s, ast::ast_get_left(s, node), results)
+    mir_scan_vec_accesses(s, ast::ast_get_right(s, node), results)
+    return
+  end
+  
+  # node_constants$NODE_CALL (9): recurse into arguments
+  if kind == 9
+    var children = ast::ast_get_children(s, node)
+    if children != 0
+      for ci in 0..children.size
+        mir_scan_vec_accesses(s, children[ci], results)
+      end
+    end
+    return
+  end
+  
+  # node_constants$NODE_RETURN (22): recurse into value
+  if kind == 22
+    mir_scan_vec_accesses(s, ast::ast_get_left(s, node), results)
+    return
+  end
+  
+  # node_constants$NODE_BINARY (8): recurse into left and right
+  if kind == 8
+    mir_scan_vec_accesses(s, ast::ast_get_left(s, node), results)
+    mir_scan_vec_accesses(s, ast::ast_get_right(s, node), results)
+    return
+  end
+  
+  # Other node types: don't recurse (safe conservative default)
+end
+
+## Lower for-in / for-await loop over an async iterator (Stream<T,e> with
+## e ⊇ {Async}). Phase 4D.5c.4 consolidation: one helper, two callers
+## distinguished by `is_indirect`.
+##
+## Protocol: read the inner async frame from the Stream wrapper's slot 0
+## (4D.5c.3 wrapping); call its `$poll` (direct: by name; indirect: load
+## step fn from wrapper slot 1, call via fn-pointer); route on the return:
+##   == 1 (POLL_READY)     — body complete, break out of loop.
+##   == 0 (POLL_SUSPENDED) — yield happened, handler stashed via TLS;
+##                           read via __qz_gen_take_stashed, run body,
+##                           re-poll.
+##   <  0 (park encoding)  — await/suspend in body. Inside an async caller
+##                           ($poll context), propagate the rv unchanged
+##                           via mir_emit_async_suspend_point_raw so the
+##                           scheduler registers on the SAME fd/timer the
+##                           inner $poll asked for. Outside async, fall
+##                           back to sched_yield + re-poll synchronously.
+##
+## The with-block installs a Yield handler ONCE around the whole loop;
+## subsequent polls dispatch through the same installed handler.
+##
+## Note: pre-4D.5c.4 this was two thin wrappers (lower_async_gen_iteration
+## / lower_async_gen_iteration_indirect) over a private _impl with the
+## boolean `indirect` flag. The wrappers added no value — direct callers
+## now pass `false` and indirect callers pass `true` explicitly. The park
+## branch was also upgraded from `mir_emit_async_suspend_point(-1, ...)`
+## (which encoded `ret 0`, losing fd info) to the raw variant that
+## propagates the inner $poll's rv literally.
+def lower_stream_async_iteration(ctx: MirContext, s: ast::AstStorage, var_name: String, label: String, iter_node: AstNodeId, body_node: AstNodeId, poll_func_name: String, is_indirect: Bool): Void
+  var citer_name = ctx.gen_for_temp("__agiter")
+  mir_lower_gen::mir_gen_register_dynamic_local(citer_name)
+
+  var coll_val = mir_lower::mir_lower_expr(ctx, s, iter_node)
+
+  var citer_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(citer_name, citer_slot)
+  ctx.mir_emit_store_var(citer_name, coll_val)
+
+  var elem_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(var_name, elem_slot)
+
+  # Post-4.B.7.b: Yield has a default handler (__qz_gen_yield_capture)
+  # installed at program start by `cg_emit_effect_main_prelude`, analogous
+  # to the Async default (P3.B). Generator bodies' `yield v` — routed
+  # through kind=3 perform — dispatch to it, stashing v via TLS and
+  # returning POLL_SUSPENDED. This consumer does NOT need to install
+  # locally; it just reads stashed after a POLL_SUSPENDED return. A with-
+  # block install here would allocate a setjmp frame inside the async
+  # $poll state machine — which the state dispatch re-entry paths
+  # (yield_resume / k3_perform_resume blocks) bypass, creating SSA
+  # dominance errors. The default-handler approach sidesteps that.
+
+  var poll_block = ctx.mir_create_block("agen_poll")
+  var check_yield_block = ctx.mir_create_block("agen_check_yield")
+  var got_yield_block = ctx.mir_create_block("agen_got_yield")
+  var park_block = ctx.mir_create_block("agen_park")
+  var exit_block = ctx.mir_create_block("agen_exit")
+
+  mir_block_set_terminator(ctx.mir_ctx_get_block(), mir::TERM_JUMP, poll_block)
+
+  # POLL: dispatch poll call (direct or indirect), branch on return value.
+  # Phase 4D.5c.3: the async generator constructor returns a 2-word
+  # Stream<T, e> handle `{frame@0, step@1}` (was: raw 6-slot async frame).
+  # Inner $poll frame is at wrapper[0]; step fn ptr (`__Future_<name>$poll`)
+  # at wrapper[1]. Direct path still calls by name; indirect path loads
+  # the step fn from wrapper[1] (was: frame[2] in the raw-frame layout).
+  ctx.mir_switch_to_block(poll_block)
+  var stream_val = ctx.mir_emit_load_var(citer_name)
+  var inner_frame = ctx.mir_emit_load_offset(stream_val, 0)
+  var poll_args = [inner_frame]
+  var status = 0
+  if is_indirect
+    var poll_fn_ptr = ctx.mir_emit_load_offset(stream_val, 1)
+    status = ctx.mir_emit_call_indirect(poll_fn_ptr, poll_args)
+  else
+    status = ctx.mir_emit_call(poll_func_name, poll_args)
+  end
+  var is_ready = ctx.mir_emit_binary(op_constants::OP_EQ, status, ctx.mir_emit_const_int(1))
+  mir_block_set_branch(ctx.mir_ctx_get_block(), is_ready, exit_block, check_yield_block)
+
+  # CHECK_YIELD: status != 1 — distinguish POLL_SUSPENDED (0) from park (<0).
+  ctx.mir_switch_to_block(check_yield_block)
+  var is_yield = ctx.mir_emit_binary(op_constants::OP_EQ, status, ctx.mir_emit_const_int(0))
+  mir_block_set_branch(ctx.mir_ctx_get_block(), is_yield, got_yield_block, park_block)
+
+  # PARK: poll returned a park encoding (await/suspend fired in body).
+  # Inside async context, propagate the rv UNCHANGED via the raw suspend-
+  # point helper so the outer $poll returns whatever the inner $poll
+  # asked for — fd encoding (≤ -2), timer encoding, or plain yield (0).
+  # Pre-4D.5c.4 this passed -1 to mir_emit_async_suspend_point, which
+  # synthesized `ret 0` — collapsing every park into a yield-style
+  # park and losing fd/timer registration. The raw variant takes the
+  # SSA register holding `status` directly and emits `ret %status`.
+  # Outside async (sync caller polling an async-typed Stream), fall
+  # back to sched_yield + retry synchronously.
+  ctx.mir_switch_to_block(park_block)
+  if mir_lower_gen::mir_gen_is_active() >= 2
+    mir_lower_gen::mir_emit_async_suspend_point_raw(ctx, status, poll_block, "park_resume")
+  else
+    ctx.mir_emit_intrinsic("sched_yield", vec_new())
+    mir_block_set_terminator(ctx.mir_ctx_get_block(), mir::TERM_JUMP, poll_block)
+  end
+
+  # GOT_YIELD: handler stashed the yielded value via __qz_gen_stash. Read
+  # back via __qz_gen_take_stashed and bind to the loop variable.
+  ctx.mir_switch_to_block(got_yield_block)
+  var take_args = vec_new<Int>()
+  var elem_val = ctx.mir_emit_call("__qz_gen_take_stashed", take_args)
+  ctx.mir_emit_store_var(var_name, elem_val)
+
+  # Save/restore break/continue
+  var saved_break = ctx.mir_ctx_get_break_target()
+  var saved_continue = ctx.mir_ctx_get_continue_target()
+  var saved_loop_scope = ctx.mir_ctx_get_loop_scope_depth()
+  var saved_loop_defer = ctx.mir_ctx_get_loop_defer_depth()
+  var saved_loop_wrap = ctx.mir_ctx_get_loop_wrap_depth()
+
+  ctx.mir_ctx_set_break_target(exit_block)
+  ctx.mir_ctx_set_continue_target(poll_block)
+
+  var loop_scope = ctx.mir_ctx_get_scope_depth()
+  ctx.mir_ctx_set_loop_scope_depth(loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(ctx.drops.defer_stack.size)
+  var loop_wrap = ctx.wrap_stack_eff_names.size
+  ctx.mir_ctx_set_loop_wrap_depth(loop_wrap)
+
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_push_loop(label, exit_block, poll_block, loop_scope, loop_wrap)
+  end
+
+  var body_scope = loop_scope + 1
+  ctx.mir_ctx_set_scope_depth(body_scope)
+
+  mir_lower::mir_lower_stmt(ctx, s, body_node)
+
+  var body_cur = ctx.mir_ctx_get_block()
+  if mir_block_get_term_kind(body_cur) < 0
+    ctx.emit_drops_for_scope(body_scope)
+    # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+    body_cur = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(body_cur, mir::TERM_JUMP, poll_block)
+  end
+
+  ctx.mir_ctx_set_scope_depth(loop_scope)
+  ctx.pop_droppables_for_scope(body_scope)
+
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_pop_loop()
+  end
+
+  ctx.mir_ctx_set_break_target(saved_break)
+  ctx.mir_ctx_set_continue_target(saved_continue)
+  ctx.mir_ctx_set_loop_scope_depth(saved_loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(saved_loop_defer)
+  ctx.mir_ctx_set_loop_wrap_depth(saved_loop_wrap)
+
+  # EXIT: for-in statement produces no value, no handler to uninstall
+  # (default is process-lifetime). Just land the block.
+  ctx.mir_switch_to_block(exit_block)
+end
+
+# ============================================================================
+# Statement lowering handlers (extracted from mir_lower_stmt)
+# ============================================================================
+

@@ -1,0 +1,496 @@
+## P23: Async TLS Integration Tests
+##
+## Tests non-blocking TLS handshake, read, write, and close using the M:N
+## scheduler's io_suspend mechanism. Each test generates self-signed certs,
+## starts an async TLS echo server, and connects with a TLS client.
+##
+## NOTE: Uses atomics for signaling instead of channels because importing
+## std/net/tls transitively imports std/ffi/socket which shadows the channel
+## send/recv builtins with the socket send/recv (4-arg) functions.
+##
+## NOTE: Uses `var _ig = expr` to normalize match arm types when one arm
+## returns CInt/Enum and the other returns Void.
+
+import * from qspec
+import * from qspec/subprocess
+
+def _assert_tls_stdout(src: String, expected: String): Void
+  _inc_assertions()
+  var r = subprocess_run_with_flags(src, "-I .")
+  if r.exit_code == 0 - 1
+    var sb = sb_new()
+    sb_append(sb, "Failed to compile/run: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if r.stdout_content != expected
+    var sb = sb_new()
+    sb_append(sb, "Expected stdout '")
+    sb_append(sb, expected)
+    sb_append(sb, "' but got '")
+    sb_append(sb, r.stdout_content)
+    sb_append(sb, "'")
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+def _tls_pre(): String
+  return """
+    import std/net/tls
+    import std/net/tcp
+
+    extern "C" def accept(sockfd: CInt, addr: CPtr, addrlen: CPtr): CInt
+    extern "C" def close(fd: CInt): CInt
+    extern "C" def fcntl(fd: CInt, cmd: CInt, arg: CInt): CInt
+    extern "C" def connect(sockfd: CInt, addr: CPtr, addrlen: CInt): CInt
+    extern "C" def socket(domain: CInt, socket_type: CInt, protocol: CInt): CInt
+
+    def set_nonblocking(fd: Int): Int
+      var flags = fcntl(fd, 3, 0)
+      if flags < 0
+        return 0 - 1
+      end
+      return fcntl(fd, 4, bor(flags, 4))
+    end
+
+    def gen_certs(): Void
+      system("openssl req -x509 -newkey rsa:2048 -keyout /tmp/qz_tls_test.key -out /tmp/qz_tls_test.crt -days 1 -nodes -subj '/CN=localhost' 2>/dev/null")
+    end
+
+    def make_server_ctx(): TlsContext
+      var ctx = tls_ctx_new_server()
+      tls_ctx_load_cert(ctx, "/tmp/qz_tls_test.crt")
+      tls_ctx_load_key(ctx, "/tmp/qz_tls_test.key")
+      return ctx
+    end
+
+    def make_client_ctx(): TlsContext
+      var ctx = tls_ctx_new_client()
+      tls_ctx_load_ca(ctx, "/tmp/qz_tls_test.crt")
+      return ctx
+    end
+
+    def spin_wait(atom: Int): Int
+      while atomic_load(atom) == 0
+        sched_yield()
+      end
+      return atomic_load(atom)
+    end
+
+    """
+end
+
+# Test 1: Basic async TLS handshake
+# Server: listen, accept TCP, non-blocking TLS handshake, signal result
+# Main: spawn server, blocking TLS connect as client, check result
+def _src_handshake(): String
+  return _tls_pre() + "\n" + """
+    def server(port_atom: Int, result_atom: Int): Void
+      match tcp_listen(0)
+        ListenResult::Ok(listener) =>
+          atomic_store(port_atom, listener.port)
+          var client_fd = accept(listener.fd, int_to_cptr(0), int_to_cptr(0))
+          set_nonblocking(client_fd)
+          var tls_ctx = make_server_ctx()
+          match tls_accept_async(tls_ctx, client_fd)
+            TlsResult::Ok(stream) =>
+              atomic_store(result_atom, 1)
+              tls_close_async(stream)
+            TlsResult::Err(e) =>
+              atomic_store(result_atom, 2)
+          end
+          tls_ctx_free(tls_ctx)
+          var _ig = close(listener.fd)
+        ListenResult::Err(e) =>
+          atomic_store(result_atom, 2)
+      end
+    end
+
+    def main(): Int
+      gen_certs()
+      sched_init(0)
+      var port_atom = atomic_new(0)
+      var result_atom = atomic_new(0)
+      var task = async server(port_atom, result_atom)
+      sched_spawn(task)
+      var port = spin_wait(port_atom)
+      var ctx = make_client_ctx()
+      match tls_connect_noverify(ctx, "localhost", port)
+        TlsResult::Ok(stream) =>
+          tls_close(stream)
+        TlsResult::Err(e) =>
+          puts("connect error")
+      end
+      var result = spin_wait(result_atom)
+      tls_ctx_free(ctx)
+      if result == 1
+        puts("handshake ok")
+      else
+        puts("handshake failed")
+      end
+      return 0
+    end
+    """
+end
+
+# Test 2: Async TLS echo (read + write)
+def _src_echo(): String
+  return _tls_pre() + "\n" + """
+    def echo_server(port_atom: Int): Void
+      match tcp_listen(0)
+        ListenResult::Ok(listener) =>
+          atomic_store(port_atom, listener.port)
+          var client_fd = accept(listener.fd, int_to_cptr(0), int_to_cptr(0))
+          set_nonblocking(client_fd)
+          var tls_ctx = make_server_ctx()
+          match tls_accept_async(tls_ctx, client_fd)
+            TlsResult::Ok(stream) =>
+              match tls_read_async(stream, 4096)
+                TlsReadResult::Ok(data) =>
+                  var _ig = tls_write_all_async(stream, data)
+                TlsReadResult::Err(e) =>
+                  puts("server read error")
+              end
+              tls_close_async(stream)
+            TlsResult::Err(e) =>
+              puts("accept error")
+          end
+          tls_ctx_free(tls_ctx)
+          var _ig2 = close(listener.fd)
+        ListenResult::Err(e) =>
+          puts("listen error")
+      end
+    end
+
+    def main(): Int
+      gen_certs()
+      sched_init(0)
+      var port_atom = atomic_new(0)
+      var task = async echo_server(port_atom)
+      sched_spawn(task)
+      var port = spin_wait(port_atom)
+      var ctx = make_client_ctx()
+      match tls_connect_noverify(ctx, "localhost", port)
+        TlsResult::Ok(stream) =>
+          var _ig = tls_write_all(stream, "hello TLS")
+          match tls_read(stream, 4096)
+            TlsReadResult::Ok(data) =>
+              puts("echo: " + data)
+            TlsReadResult::Err(e) =>
+              puts("read error")
+          end
+          tls_close(stream)
+        TlsResult::Err(e) =>
+          puts("connect error")
+      end
+      tls_ctx_free(ctx)
+      return 0
+    end
+    """
+end
+
+# Test 3: Concurrent TLS clients
+# Key fix: non-blocking accept + io_suspend prevents deadlock.
+# All state passed as function parameters (not locals across suspend points).
+# Server accept loop: all state is function parameters (survives io_suspend).
+# Listen on main thread, pass fd to go-task.
+def _src_concurrent(): String
+  return _tls_pre() + "\n" + """
+    var _ok_count = atomic_new(0)
+
+    def echo_handler(tls_ctx: TlsContext, client_fd: Int): Void
+      set_nonblocking(client_fd)
+      match tls_accept_async(tls_ctx, client_fd)
+        TlsResult::Ok(stream) =>
+          match tls_read_async(stream, 4096)
+            TlsReadResult::Ok(data) =>
+              var _ig = tls_write_all_async(stream, data)
+              var _ig2 = atomic_add(_ok_count, 1)
+            TlsReadResult::Err(e) =>
+              puts("handler read error")
+          end
+          tls_close_async(stream)
+        TlsResult::Err(e) =>
+          puts("handler accept error")
+      end
+    end
+
+    def server_loop(listener_fd: Int, port_atom: Int, accepted_atom: Int, count: Int): Void
+      var i = 0
+      while i < count
+        io_suspend(listener_fd)
+        var client_fd = accept(listener_fd, int_to_cptr(0), int_to_cptr(0))
+        if client_fd >= 0
+          var t = async echo_handler(make_server_ctx(), client_fd)
+          sched_spawn(t)
+          i = i + 1
+        end
+      end
+      var _ig = close(listener_fd)
+    end
+
+    def client(port: Int, msg: String): Int
+      var ctx = make_client_ctx()
+      match tls_connect_noverify(ctx, "localhost", port)
+        TlsResult::Ok(stream) =>
+          var _ig = tls_write_all(stream, msg)
+          match tls_read(stream, 4096)
+            TlsReadResult::Ok(data) =>
+              tls_close(stream)
+              tls_ctx_free(ctx)
+              if data == msg
+                return 1
+              end
+              return 0
+            TlsReadResult::Err(e) =>
+              tls_close(stream)
+              tls_ctx_free(ctx)
+              return 0
+          end
+        TlsResult::Err(e) =>
+          tls_ctx_free(ctx)
+          return 0
+      end
+    end
+
+    def main(): Int
+      gen_certs()
+      sched_init(0)
+      var n = 2
+      var port_atom = atomic_new(0)
+      var accepted_atom = atomic_new(0)
+      match tcp_listen(0)
+        ListenResult::Ok(listener) =>
+          atomic_store(port_atom, listener.port)
+          set_nonblocking(listener.fd)
+          var t = async server_loop(listener.fd, port_atom, accepted_atom, n)
+          sched_spawn(t)
+        ListenResult::Err(e) =>
+          puts("listen error")
+          return 1
+      end
+      var port = spin_wait(port_atom)
+      var successes = 0
+      var ci = 0
+      while ci < n
+        successes = successes + client(port, "msg" + ci.to_s())
+        ci = ci + 1
+      end
+      while atomic_load(_ok_count) < n
+        sched_sleep(10)
+      end
+      var server_ok = atomic_load(_ok_count)
+      if successes == n and server_ok == n
+        puts("ok")
+      else
+        puts("fail: clients=" + successes.to_s() + " servers=" + server_ok.to_s())
+      end
+      return 0
+    end
+    """
+end
+
+# Test 4: Read timeout
+def _src_read_timeout(): String
+  return _tls_pre() + "\n" + """
+    def stall_server(port_atom: Int): Void
+      match tcp_listen(0)
+        ListenResult::Ok(listener) =>
+          atomic_store(port_atom, listener.port)
+          var client_fd = accept(listener.fd, int_to_cptr(0), int_to_cptr(0))
+          set_nonblocking(client_fd)
+          var tls_ctx = make_server_ctx()
+          match tls_accept_async(tls_ctx, client_fd)
+            TlsResult::Ok(stream) =>
+              sched_sleep(2000)
+              tls_close_async(stream)
+            TlsResult::Err(e) =>
+              puts("accept error")
+          end
+          tls_ctx_free(tls_ctx)
+          var _ig = close(listener.fd)
+        ListenResult::Err(e) =>
+          puts("listen error")
+      end
+    end
+
+    def main(): Int
+      gen_certs()
+      sched_init(0)
+      var port_atom = atomic_new(0)
+      var t = async stall_server(port_atom)
+      sched_spawn(t)
+      var port = spin_wait(port_atom)
+      var ctx = make_client_ctx()
+      match tls_connect_noverify(ctx, "localhost", port)
+        TlsResult::Ok(stream) =>
+          set_nonblocking(stream.fd)
+          match tls_read_async_timeout(stream, 4096, 50)
+            TlsReadResult::Ok(data) =>
+              puts("unexpected data")
+            TlsReadResult::Err(e) =>
+              if e.code == 0 - 2
+                puts("timeout")
+              else
+                puts("error: " + e.message)
+              end
+          end
+          tls_close(stream)
+        TlsResult::Err(e) =>
+          puts("connect error: " + e.message)
+      end
+      tls_ctx_free(ctx)
+      return 0
+    end
+    """
+end
+
+# Test 5: Clean bidirectional shutdown
+def _src_close(): String
+  return _tls_pre() + "\n" + """
+    def server(port_atom: Int, result_atom: Int): Void
+      match tcp_listen(0)
+        ListenResult::Ok(listener) =>
+          atomic_store(port_atom, listener.port)
+          var client_fd = accept(listener.fd, int_to_cptr(0), int_to_cptr(0))
+          set_nonblocking(client_fd)
+          var tls_ctx = make_server_ctx()
+          match tls_accept_async(tls_ctx, client_fd)
+            TlsResult::Ok(stream) =>
+              var _ig = tls_write_all_async(stream, "bye")
+              tls_close_async(stream)
+              atomic_store(result_atom, 1)
+            TlsResult::Err(e) =>
+              atomic_store(result_atom, 2)
+          end
+          tls_ctx_free(tls_ctx)
+          var _ig2 = close(listener.fd)
+        ListenResult::Err(e) =>
+          atomic_store(result_atom, 2)
+      end
+    end
+
+    def main(): Int
+      gen_certs()
+      sched_init(0)
+      var port_atom = atomic_new(0)
+      var result_atom = atomic_new(0)
+      var t = async server(port_atom, result_atom)
+      sched_spawn(t)
+      var port = spin_wait(port_atom)
+      var ctx = make_client_ctx()
+      match tls_connect_noverify(ctx, "localhost", port)
+        TlsResult::Ok(stream) =>
+          match tls_read(stream, 4096)
+            TlsReadResult::Ok(data) =>
+              puts(data)
+            TlsReadResult::Err(e) =>
+              puts("read error")
+          end
+          tls_close(stream)
+        TlsResult::Err(e) =>
+          puts("connect error")
+      end
+      var server_ok = spin_wait(result_atom)
+      tls_ctx_free(ctx)
+      if server_ok == 1
+        puts("closed")
+      end
+      return 0
+    end
+    """
+end
+
+# Test 6: Accept handshake timeout
+# Main: connect with raw TCP (no TLS handshake) to trigger server-side timeout
+def _src_accept_timeout(): String
+  return _tls_pre() + "\n" + """
+    def server(port_atom: Int, result_atom: Int): Void
+      match tcp_listen(0)
+        ListenResult::Ok(listener) =>
+          atomic_store(port_atom, listener.port)
+          var client_fd = accept(listener.fd, int_to_cptr(0), int_to_cptr(0))
+          set_nonblocking(client_fd)
+          var tls_ctx = make_server_ctx()
+          match tls_accept_async_timeout(tls_ctx, client_fd, 50)
+            TlsResult::Ok(stream) =>
+              atomic_store(result_atom, 2)
+              tls_close_async(stream)
+            TlsResult::Err(e) =>
+              if e.code == 0 - 2
+                atomic_store(result_atom, 1)
+              else
+                atomic_store(result_atom, 2)
+              end
+          end
+          tls_ctx_free(tls_ctx)
+          var _ig = close(listener.fd)
+        ListenResult::Err(e) =>
+          atomic_store(result_atom, 2)
+      end
+    end
+
+    def main(): Int
+      gen_certs()
+      sched_init(0)
+      var port_atom = atomic_new(0)
+      var result_atom = atomic_new(0)
+      var t = async server(port_atom, result_atom)
+      sched_spawn(t)
+      var port = spin_wait(port_atom)
+      var fd = socket(2, 1, 0)
+      var addr = mem_alloc(16)
+      memset(addr, 0, 16)
+      ptr_write_byte(addr, 16)
+      ptr_write_byte(ptr_add(addr, 1), 2)
+      var p_hi = port / 256
+      var p_lo = port - p_hi * 256
+      ptr_write_byte(ptr_add(addr, 2), p_hi)
+      ptr_write_byte(ptr_add(addr, 3), p_lo)
+      ptr_write_byte(ptr_add(addr, 4), 127)
+      ptr_write_byte(ptr_add(addr, 7), 1)
+      var _ig = connect(fd, addr, 16)
+      qz_free(addr)
+      sched_sleep(200)
+      var _ig2 = close(fd)
+      var timed_out = spin_wait(result_atom)
+      if timed_out == 1
+        puts("accept timeout")
+      else
+        puts("unexpected")
+      end
+      return 0
+    end
+    """
+end
+
+def main(): Int
+  describe("async TLS (P23)") do ->
+    it("tls_accept_async completes handshake in go-task") do ->
+      _assert_tls_stdout(_src_handshake(), "handshake ok\n")
+    end
+
+    it("async TLS echo: read + write in go-tasks") do ->
+      _assert_tls_stdout(_src_echo(), "echo: hello TLS\n")
+    end
+
+    it("concurrent TLS clients with go-tasks") do ->
+      _assert_tls_stdout(_src_concurrent(), "ok\n")
+    end
+
+    it("tls_read_async_timeout returns error on timeout") do ->
+      _assert_tls_stdout(_src_read_timeout(), "timeout\n")
+    end
+
+    it("tls_close_async performs clean bidirectional shutdown") do ->
+      _assert_tls_stdout(_src_close(), "bye\nclosed\n")
+    end
+
+    it("tls_accept_async_timeout returns error on slow handshake") do ->
+      _assert_tls_stdout(_src_accept_timeout(), "accept timeout\n")
+    end
+  end
+
+  return qspec_main()
+end

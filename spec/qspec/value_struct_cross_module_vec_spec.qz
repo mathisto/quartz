@@ -1,0 +1,185 @@
+##! Cross-module @value struct in a Vec (item 47) — QSpec regression.
+##!
+##! REGRESSION: a value-layout struct DEFINED IN ONE MODULE and pushed into a
+##! `vec_new<Struct>()` in ANOTHER module used to miscompile — every pushed element
+##! aliased the LAST one (headers decoded as all-the-same; hpack broke), or the
+##! program segfaulted.
+##!
+##! ROOT (fixed): a PREDICATE SPLIT. The struct-literal construct path used the
+##! ctx-side value-layout predicate (resolves module-qualified names via
+##! mir_resolve_struct_name) → value-layout stack alloca (hoisted + reused every
+##! loop iteration). But the Vec element-width path used the prog-side predicate,
+##! which did a RAW `entry.name == name` compare: the vec_new element type carried
+##! the BARE name (`HH`) while prog.struct_defs is keyed by the module-qualified
+##! name (`hmodv$HH`) → miss → field-count 0 → element-width 8 → the push took the
+##! BOXED branch and stored the reused-alloca POINTER via vec_push_i64 ⇒ all
+##! elements point at the same slot ⇒ all read back as the last value.
+##!
+##! FIX: cg_vec_inline_field_count / cg_idx_inline_field_count now resolve the bare
+##! cross-module element name to its qualified struct_defs key (mir_prog_resolve_
+##! struct_name, the prog-side twin of mir_resolve_struct_name) before the value-
+##! layout / firewall / cow / field-count lookups. Cross-module @value → real field
+##! count → element-width = fc*8 → the push takes the WIDE memcpy branch (copies the
+##! struct VALUE, not the alloca pointer) → distinct elements.
+##!
+##! Uses subprocess compilation (two module files, whole-program compile, link, run)
+##! since the aliasing only manifests across a real module boundary.
+
+import * from qspec
+
+# =============================================================================
+# Multi-module compile + link + run harness (self-contained)
+# =============================================================================
+
+var _xmv_counter = 0
+
+def _xmv_next_id(): Int
+  _xmv_counter = _xmv_counter + 1
+  return _xmv_counter
+end
+
+def _xmv_dir(id: Int): String
+  return "/tmp/_qspec_xmv_" + id.to_s()
+end
+
+## Write [filename, source, ...] pairs into a temp dir, whole-program compile the
+## `main_idx` file with `-I <dir>`, return dir on success ("" on failure).
+def _xmv_compile(files: Vec, main_idx: Int): String
+  var id = _xmv_next_id()
+  var dir = _xmv_dir(id)
+  mkdir(dir)
+
+  var main_path = ""
+  var i = 0
+  while i < files.size
+    var fname = as_string(files[i])
+    var src = as_string(files[i + 1])
+    var fpath = dir + "/" + fname
+    write_file(fpath, src)
+    if i / 2 == main_idx
+      main_path = fpath
+    end
+    i = i + 2
+  end
+
+  var compiler = getenv("QUARTZ_COMPILER")
+  if compiler.size == 0
+    return ""
+  end
+  var cwd = getcwd()
+  if not str_starts_with(compiler, "/")
+    compiler = cwd + "/" + compiler
+  end
+
+  var cmd = "cd " + dir + " && " + compiler + " --no-cache -I " + dir
+  var std_path = getenv("QUARTZ_STD")
+  if std_path.size > 0
+    if not str_starts_with(std_path, "/")
+      std_path = cwd + "/" + std_path
+    end
+    cmd = cmd + " -I " + std_path
+  end
+  cmd = cmd + " " + main_path + " > " + dir + "/prog.ll 2> " + dir + "/compile.err"
+
+  var raw = system(cmd)
+  var exit_code = band(shr(raw, 8), 255)
+  if exit_code != 0
+    return ""
+  end
+  return dir
+end
+
+def _xmv_find_llc(): String
+  if system("llc --version > /dev/null 2>&1") == 0
+    return "llc"
+  end
+  if system("/opt/homebrew/opt/llvm/bin/llc --version > /dev/null 2>&1") == 0
+    return "/opt/homebrew/opt/llvm/bin/llc"
+  end
+  return ""
+end
+
+## llc the single prog.ll → link → run, returning stdout (or "FAIL:*").
+def _xmv_link_and_run(dir: String): String
+  var llc_path = _xmv_find_llc()
+  if llc_path.size == 0
+    return "FAIL:llc"
+  end
+  var ll = dir + "/prog.ll"
+  var obj = dir + "/prog.o"
+  var llc_cmd = llc_path + " -filetype=obj " + ll + " -o " + obj + " 2>/dev/null"
+  var lraw = system(llc_cmd)
+  if band(shr(lraw, 8), 255) != 0
+    return "FAIL:llc:compile"
+  end
+  var bin_path = dir + "/test_bin"
+  var link_cmd = "clang " + obj + " -o " + bin_path + " -lm -lpthread 2>/dev/null"
+  var link_raw = system(link_cmd)
+  if band(shr(link_raw, 8), 255) != 0
+    return "FAIL:link"
+  end
+  var out_path = dir + "/run.out"
+  var run_cmd = bin_path + " > " + out_path + " 2>/dev/null"
+  var _run = system(run_cmd)
+  return read_file(out_path)
+end
+
+def _xmv_cleanup(dir: String): Void
+  var _r = system("rm -rf " + dir + " 2>/dev/null")
+end
+
+# =============================================================================
+# Test
+# =============================================================================
+
+def main(): Int
+  describe("cross-module @value struct in a Vec (item 47)") do ->
+
+    it("pushed elements stay distinct (no reused-alloca aliasing)") do ->
+      var files = vec_new()
+      files.push(as_int("hmodv.qz"))
+      files.push(as_int("""
+        @value
+        struct HH
+          name: String
+          value: String
+        end
+        def buildv(n: Int): Vec<HH>
+          var hs = vec_new<HH>()
+          var i = 0
+          while i < n
+            var nm = "n" + str_from_codepoint(48 + i)
+            var vl = "v" + str_from_codepoint(48 + i)
+            hs.push(HH { name: nm, value: vl })
+            i = i + 1
+          end
+          return hs
+        end
+      """))
+      files.push(as_int("main.qz"))
+      files.push(as_int("""
+        import hmodv
+        def main(): Int
+          var hs = hmodv::buildv(3)
+          var j = 0
+          while j < hs.size
+            var h = hs[j]
+            puts(j.to_s() + ": " + h.name + "=" + h.value)
+            j = j + 1
+          end
+          return 0
+        end
+      """))
+
+      var dir = _xmv_compile(files, 1)
+      assert_gt(dir.size, 0)
+      var output = _xmv_link_and_run(dir)
+      _xmv_cleanup(dir)
+      # Each element must read back its OWN value — no aliasing to the last push.
+      assert_eq_str(output, "0: n0=v0\n1: n1=v1\n2: n2=v2\n")
+    end
+
+  end
+
+  return qspec_main()
+end

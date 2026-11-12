@@ -1,0 +1,681 @@
+##! # HPACK — Header Compression for HTTP/2 (RFC 7541)
+##!
+##! Encoder/decoder for HTTP/2 header compression.
+##! Static table (61 entries), dynamic table with LRU eviction,
+##! integer prefix encoding, raw + Huffman string decoding.
+
+import * from bytes
+
+# ============================================================================
+# HPACK Header
+# ============================================================================
+
+struct HpackHeader
+  name: String
+  value: String
+end
+
+# ============================================================================
+# Static Table (RFC 7541 Appendix A — 61 entries, 1-indexed)
+# ============================================================================
+
+var _hpack_static_names = vec_new<String>()
+var _hpack_static_values = vec_new<String>()
+var _hpack_static_init_done = 0
+
+def _hpack_add_static(name: String, value: String): Void
+  _hpack_static_names.push(name)
+  _hpack_static_values.push(value)
+end
+
+def hpack_static_init(): Void
+  return if _hpack_static_init_done == 1
+  _hpack_static_init_done = 1
+  # Index 0 is unused (1-indexed), push a placeholder
+  _hpack_add_static("", "")
+  # 1-10
+  _hpack_add_static(":authority", "")
+  _hpack_add_static(":method", "GET")
+  _hpack_add_static(":method", "POST")
+  _hpack_add_static(":path", "/")
+  _hpack_add_static(":path", "/index.html")
+  _hpack_add_static(":scheme", "http")
+  _hpack_add_static(":scheme", "https")
+  _hpack_add_static(":status", "200")
+  _hpack_add_static(":status", "204")
+  _hpack_add_static(":status", "206")
+  # 11-20
+  _hpack_add_static(":status", "304")
+  _hpack_add_static(":status", "400")
+  _hpack_add_static(":status", "404")
+  _hpack_add_static(":status", "500")
+  _hpack_add_static("accept-charset", "")
+  _hpack_add_static("accept-encoding", "gzip, deflate")
+  _hpack_add_static("accept-language", "")
+  _hpack_add_static("accept-ranges", "")
+  _hpack_add_static("accept", "")
+  _hpack_add_static("access-control-allow-origin", "")
+  # 21-30
+  _hpack_add_static("age", "")
+  _hpack_add_static("allow", "")
+  _hpack_add_static("authorization", "")
+  _hpack_add_static("cache-control", "")
+  _hpack_add_static("content-disposition", "")
+  _hpack_add_static("content-encoding", "")
+  _hpack_add_static("content-language", "")
+  _hpack_add_static("content-length", "")
+  _hpack_add_static("content-location", "")
+  _hpack_add_static("content-range", "")
+  # 31-40
+  _hpack_add_static("content-type", "")
+  _hpack_add_static("cookie", "")
+  _hpack_add_static("date", "")
+  _hpack_add_static("etag", "")
+  _hpack_add_static("expect", "")
+  _hpack_add_static("expires", "")
+  _hpack_add_static("from", "")
+  _hpack_add_static("host", "")
+  _hpack_add_static("if-match", "")
+  _hpack_add_static("if-modified-since", "")
+  # 41-50
+  _hpack_add_static("if-none-match", "")
+  _hpack_add_static("if-range", "")
+  _hpack_add_static("if-unmodified-since", "")
+  _hpack_add_static("last-modified", "")
+  _hpack_add_static("link", "")
+  _hpack_add_static("location", "")
+  _hpack_add_static("max-forwards", "")
+  _hpack_add_static("proxy-authenticate", "")
+  _hpack_add_static("proxy-authorization", "")
+  _hpack_add_static("range", "")
+  # 51-61
+  _hpack_add_static("referer", "")
+  _hpack_add_static("refresh", "")
+  _hpack_add_static("retry-after", "")
+  _hpack_add_static("server", "")
+  _hpack_add_static("set-cookie", "")
+  _hpack_add_static("strict-transport-security", "")
+  _hpack_add_static("transfer-encoding", "")
+  _hpack_add_static("user-agent", "")
+  _hpack_add_static("vary", "")
+  _hpack_add_static("via", "")
+  _hpack_add_static("www-authenticate", "")
+end
+
+def hpack_static_name(index: Int): String = _hpack_static_names[index]
+def hpack_static_value(index: Int): String = _hpack_static_values[index]
+def hpack_static_size(): Int = 61
+
+# ============================================================================
+# Dynamic Table
+# ============================================================================
+
+struct HpackDynTable
+  names: Vec<String>
+  values: Vec<String>
+  _size: Int
+  _max_size: Int
+end
+
+def hpack_dyn_new(max_size: Int): HpackDynTable
+  return HpackDynTable {
+    names: vec_new(),
+    values: vec_new(),
+    _size: 0,
+    _max_size: max_size
+  }
+end
+
+## Entry size per RFC 7541 §4.1: name_len + value_len + 32
+def _hpack_entry_size(name: String, value: String): Int
+  return str_byte_len(name) + str_byte_len(value) + 32
+end
+
+## Evict oldest entries (at the FRONT of the vec) until size fits.
+## Entries are stored newest-last: push appends at end, evict from front via vec_delete.
+def _hpack_dyn_evict(t: HpackDynTable): Void
+  while t._size > t._max_size and t.names.size > 0
+    var evicted_size = _hpack_entry_size(t.names[0], t.values[0])
+    t._size = t._size - evicted_size
+    vec_delete(t.names, 0)
+    vec_delete(t.values, 0)
+  end
+end
+
+## Insert entry (newest at end of vec, per RFC 7541 FIFO: newest = highest index)
+## HPACK indexing: dynamic index 0 = newest = LAST element in vec
+def hpack_dyn_insert(t: HpackDynTable, name: String, value: String): Void
+  var entry_size = _hpack_entry_size(name, value)
+  t._size = t._size + entry_size
+  t.names.push(name)
+  t.values.push(value)
+  _hpack_dyn_evict(t)
+end
+
+## Set max size (may trigger eviction)
+def hpack_dyn_set_max_size(t: HpackDynTable, max_size: Int): Void
+  t._max_size = max_size
+  _hpack_dyn_evict(t)
+end
+
+## Get entry by dynamic index (0 = newest = last element)
+def hpack_dyn_name(t: HpackDynTable, index: Int): String
+  var actual = t.names.size - 1 - index
+  return t.names[actual]
+end
+
+def hpack_dyn_value(t: HpackDynTable, index: Int): String
+  var actual = t.values.size - 1 - index
+  return t.values[actual]
+end
+
+def hpack_dyn_count(t: HpackDynTable): Int = t.names.size
+
+# ============================================================================
+# Unified table lookup: static (1-61) + dynamic (62+)
+# ============================================================================
+
+def hpack_lookup_name(t: HpackDynTable, index: Int): String
+  if index <= 0
+    eputs("[hpack] invalid index 0 in lookup_name")
+    return ""
+  end
+  if index <= hpack_static_size()
+    return hpack_static_name(index)
+  end
+  var dyn_idx = index - hpack_static_size() - 1
+  if dyn_idx >= hpack_dyn_count(t)
+    eputs("[hpack] dynamic table index out of range: index=#{index}, dyn_idx=#{dyn_idx}, dyn_count=#{hpack_dyn_count(t)}")
+    return ""
+  end
+  return hpack_dyn_name(t, dyn_idx)
+end
+
+def hpack_lookup_value(t: HpackDynTable, index: Int): String
+  if index <= 0
+    return ""
+  end
+  if index <= hpack_static_size()
+    return hpack_static_value(index)
+  end
+  var dyn_idx = index - hpack_static_size() - 1
+  if dyn_idx >= hpack_dyn_count(t)
+    return ""
+  end
+  return hpack_dyn_value(t, dyn_idx)
+end
+
+# ============================================================================
+# Integer Encoding/Decoding (RFC 7541 §5.1)
+# ============================================================================
+
+## Decode an HPACK integer with the given prefix bit width.
+## Returns: [decoded_value, bytes_consumed]
+def hpack_decode_int(data: Bytes, pos: Int, prefix_bits: Int): Vec<Int>
+  var max_prefix = shl(1, prefix_bits) - 1
+  var first_byte = band(data.get(pos), max_prefix)
+  var result = vec_new()
+  if first_byte < max_prefix
+    result.push(first_byte)
+    result.push(1)
+    return result
+  end
+  # Multi-byte encoding
+  var value = max_prefix
+  var shift = 0
+  var i = pos + 1
+  while i < data.size()
+    var b = data.get(i)
+    value = value + shl(band(b, 127), shift)
+    shift = shift + 7
+    i = i + 1
+    if band(b, 128) == 0
+      result.push(value)
+      result.push(i - pos)
+      return result
+    end
+  end
+  # Truncated integer (error)
+  result.push(value)
+  result.push(i - pos)
+  return result
+end
+
+## Encode an HPACK integer with the given prefix bit width.
+## prefix_value: high bits of the first byte (above the prefix)
+def hpack_encode_int(value: Int, prefix_bits: Int, prefix_value: Int): Bytes
+  var max_prefix = shl(1, prefix_bits) - 1
+  var result = Bytes { _data: vec_new() }
+  if value < max_prefix
+    result.push(bor(prefix_value, value))
+    return result
+  end
+  result.push(bor(prefix_value, max_prefix))
+  var remaining = value - max_prefix
+  while remaining >= 128
+    result.push(bor(band(remaining, 127), 128))
+    remaining = shr(remaining, 7)
+  end
+  result.push(remaining)
+  return result
+end
+
+# ============================================================================
+# String Decoding (RFC 7541 §5.2)
+# ============================================================================
+
+## Decode an HPACK string (raw or Huffman).
+## Returns: [string_as_int_ptr, bytes_consumed]
+## The string is returned as an Int (pointer to Quartz String).
+def hpack_decode_string(data: Bytes, pos: Int): Vec<Int>
+  var first_byte = data.get(pos)
+  var is_huffman = band(first_byte, 128) != 0
+  var len_result = hpack_decode_int(data, pos, 7)
+  var str_len = len_result[0]
+  var len_bytes = len_result[1]
+  var str_start = pos + len_bytes
+  var result = vec_new()
+  if is_huffman
+    var decoded = _hpack_huffman_decode(data, str_start, str_len)
+    result.push(decoded)
+    result.push(len_bytes + str_len)
+    return result
+  end
+  # Raw string: extract bytes as string
+  var s = ""
+  var i = 0
+  while i < str_len
+    s = s + str_from_codepoint(data.get(str_start + i))
+    i = i + 1
+  end
+  result.push(as_int_generic(s))
+  result.push(len_bytes + str_len)
+  return result
+end
+
+# ============================================================================
+# Huffman Decoding (RFC 7541 Appendix B)
+# ============================================================================
+
+# Huffman decode table: 4-bit nibble state machine.
+# Each state has 16 entries (one per nibble 0x0-0xF).
+# Entry format: [next_state, flags, symbol]
+#   flags: 1=emit symbol, 2=accepted (valid end state), 4=error
+# Generated from nghttp2's huffman table for HPACK.
+
+var _huff_table_inited = 0
+var _huff_states = vec_new<Int>()
+var _huff_flags = vec_new<Int>()
+var _huff_syms = vec_new<Int>()
+
+def _hpack_huffman_decode(data: Bytes, pos: Int, len: Int): Int
+  # Simplified Huffman decoder: bit-by-bit processing
+  # Process each byte, 8 bits at a time, walking the Huffman tree
+  var result = ""
+  var node = 0   # Current position in the tree (0 = root)
+  var bits_buf = 0
+  var bits_count = 0
+
+  var i = 0
+  while i < len
+    var byte_val = data.get(pos + i)
+    # Process 8 bits MSB first
+    var bit = 7
+    while bit >= 0
+      var b = band(shr(byte_val, bit), 1)
+      node = _huff_tree_walk(node, b)
+      if node < 0
+        # Leaf node: emit symbol
+        var sym = -(node + 1)
+        result = result + str_from_codepoint(sym)
+        node = 0
+      end
+      bit = bit - 1
+    end
+    i = i + 1
+  end
+  return as_int_generic(result)
+end
+
+# Huffman tree as a flat array. Each node is 2 entries: [child_0, child_1].
+# Positive values = internal node index (offset into tree).
+# Negative values = -(symbol + 1) meaning leaf with that symbol.
+var _huff_tree = vec_new<Int>()
+var _huff_tree_inited = 0
+
+def _huff_tree_walk(node: Int, bit: Int): Int
+  _huff_tree_init() if _huff_tree_inited == 0
+  var idx = node * 2 + bit
+  return _huff_tree[idx]
+end
+
+def _huff_tree_init(): Void
+  return if _huff_tree_inited == 1
+  _huff_tree_inited = 1
+  # Build Huffman tree from RFC 7541 Appendix B code table.
+  # We pre-compute the tree as a flat array of [child0, child1] pairs.
+  # Total nodes: ~512 (Huffman tree for 257 symbols, max 30 bits).
+  #
+  # For space efficiency, we build the tree at runtime from the canonical
+  # Huffman code table (symbol → code, code_length).
+  _huff_build_tree()
+end
+
+# Huffman codes from RFC 7541 Appendix B (symbol → code_bits, code_length)
+# Stored as parallel vectors for compactness.
+var _huff_codes = vec_new<Int>()
+var _huff_lens = vec_new<Int>()
+
+def _huff_build_tree(): Void
+  _huff_init_codes()
+  # Start with root node (index 0)
+  # Pre-allocate space: max tree size = 2 * 512 entries
+  var i = 0
+  while i < 1024
+    _huff_tree.push(0)
+    i = i + 1
+  end
+  var next_node = 1  # Node 0 is root, allocate from 1
+
+  i = 0
+  while i < _huff_codes.size
+    var code = _huff_codes[i]
+    var code_len = _huff_lens[i]
+    var node = 0
+    var bit_pos = code_len - 1
+    while bit_pos > 0
+      var b = band(shr(code, bit_pos), 1)
+      var idx = node * 2 + b
+      if _huff_tree[idx] == 0
+        _huff_tree[idx] = next_node
+        # Allocate space for new node
+        while _huff_tree.size <= (next_node * 2 + 1)
+          _huff_tree.push(0)
+        end
+        next_node = next_node + 1
+      end
+      node = _huff_tree[idx]
+      bit_pos = bit_pos - 1
+    end
+    # Last bit: store leaf (negative encoding)
+    var b = band(code, 1)
+    var idx = node * 2 + b
+    _huff_tree[idx] = -(i + 1)
+    i = i + 1
+  end
+end
+
+def _huff_init_codes(): Void
+  # RFC 7541 Appendix B: Huffman Code Table
+  # Symbols 0-255 + EOS(256)
+  # Format: _hc(code_hex, code_length)
+  _hc(0x1ff8, 13); _hc(0x7fffd8, 23); _hc(0xfffffe2, 28); _hc(0xfffffe3, 28)  # 0-3
+  _hc(0xfffffe4, 28); _hc(0xfffffe5, 28); _hc(0xfffffe6, 28); _hc(0xfffffe7, 28)  # 4-7
+  _hc(0xfffffe8, 28); _hc(0xffffea, 24); _hc(0x3ffffffc, 30); _hc(0xfffffe9, 28)  # 8-11
+  _hc(0xfffffea, 28); _hc(0x3ffffffd, 30); _hc(0xfffffeb, 28); _hc(0xfffffec, 28)  # 12-15
+  _hc(0xfffffed, 28); _hc(0xfffffee, 28); _hc(0xfffffef, 28); _hc(0xffffff0, 28)  # 16-19
+  _hc(0xffffff1, 28); _hc(0xffffff2, 28); _hc(0x3ffffffe, 30); _hc(0xffffff3, 28)  # 20-23
+  _hc(0xffffff4, 28); _hc(0xffffff5, 28); _hc(0xffffff6, 28); _hc(0xffffff7, 28)  # 24-27
+  _hc(0xffffff8, 28); _hc(0xffffff9, 28); _hc(0xffffffa, 28); _hc(0xffffffb, 28)  # 28-31
+  _hc(0x14, 6); _hc(0x3f8, 10); _hc(0x3f9, 10); _hc(0xffa, 12)  # 32-35 (SP ! " #)
+  _hc(0x1ff9, 13); _hc(0x15, 6); _hc(0xf8, 8); _hc(0x7fa, 11)  # 36-39 ($ % & ')
+  _hc(0x3fa, 10); _hc(0x3fb, 10); _hc(0xf9, 8); _hc(0x7fb, 11)  # 40-43 (( ) * +)
+  _hc(0xfa, 8); _hc(0x16, 6); _hc(0x17, 6); _hc(0x18, 6)  # 44-47 (, - . /)
+  _hc(0x0, 5); _hc(0x1, 5); _hc(0x2, 5); _hc(0x19, 6)  # 48-51 (0 1 2 3)
+  _hc(0x1a, 6); _hc(0x1b, 6); _hc(0x1c, 6); _hc(0x1d, 6)  # 52-55 (4 5 6 7)
+  _hc(0x1e, 6); _hc(0x1f, 6); _hc(0x5c, 7); _hc(0xfb, 8)  # 56-59 (8 9 : ;)
+  _hc(0x7ffc, 15); _hc(0x20, 6); _hc(0xffb, 12); _hc(0x3fc, 10)  # 60-63 (< = > ?)
+  _hc(0x1ffa, 13); _hc(0x21, 6); _hc(0x5d, 7); _hc(0x5e, 7)  # 64-67 (@ A B C)
+  _hc(0x5f, 7); _hc(0x60, 7); _hc(0x61, 7); _hc(0x62, 7)  # 68-71 (D E F G)
+  _hc(0x63, 7); _hc(0x64, 7); _hc(0x65, 7); _hc(0x66, 7)  # 72-75 (H I J K)
+  _hc(0x67, 7); _hc(0x68, 7); _hc(0x69, 7); _hc(0x6a, 7)  # 76-79 (L M N O)
+  _hc(0x6b, 7); _hc(0x6c, 7); _hc(0x6d, 7); _hc(0x6e, 7)  # 80-83 (P Q R S)
+  _hc(0x6f, 7); _hc(0x70, 7); _hc(0x71, 7); _hc(0x72, 7)  # 84-87 (T U V W)
+  _hc(0xfc, 8); _hc(0x73, 7); _hc(0xfd, 8); _hc(0x1ffb, 13)  # 88-91 (X Y Z [)
+  _hc(0x7fff0, 19); _hc(0x1ffc, 13); _hc(0x3ffc, 14); _hc(0x22, 6)  # 92-95 (\ ] ^ _)
+  _hc(0x7ffd, 15); _hc(0x3, 5); _hc(0x23, 6); _hc(0x4, 5)  # 96-99 (` a b c)
+  _hc(0x24, 6); _hc(0x5, 5); _hc(0x25, 6); _hc(0x26, 6)  # 100-103 (d e f g)
+  _hc(0x27, 6); _hc(0x6, 5); _hc(0x74, 7); _hc(0x75, 7)  # 104-107 (h i j k)
+  _hc(0x28, 6); _hc(0x29, 6); _hc(0x2a, 6); _hc(0x7, 5)  # 108-111 (l m n o)
+  _hc(0x2b, 6); _hc(0x76, 7); _hc(0x2c, 6); _hc(0x8, 5)  # 112-115 (p q r s)
+  _hc(0x9, 5); _hc(0x2d, 6); _hc(0x77, 7); _hc(0x78, 7)  # 116-119 (t u v w)
+  _hc(0x79, 7); _hc(0x7a, 7); _hc(0x7b, 7); _hc(0x7ffe, 15)  # 120-123 (x y z {)
+  _hc(0x7fc, 11); _hc(0x3ffd, 14); _hc(0x1ffd, 13); _hc(0xffffffc, 28)  # 124-127 (| } ~ DEL)
+  # 128-255: extended ASCII
+  _hc(0xfffe6, 20); _hc(0x3fffd2, 22); _hc(0xfffe7, 20); _hc(0xfffe8, 20)
+  _hc(0x3fffd3, 22); _hc(0x3fffd4, 22); _hc(0x3fffd5, 22); _hc(0x7fffd9, 23)
+  _hc(0x3fffd6, 22); _hc(0x7fffda, 23); _hc(0x7fffdb, 23); _hc(0x7fffdc, 23)
+  _hc(0x7fffdd, 23); _hc(0x7fffde, 23); _hc(0xffffeb, 24); _hc(0x7fffdf, 23)
+  _hc(0xffffec, 24); _hc(0xffffed, 24); _hc(0x3fffd7, 22); _hc(0x7fffe0, 23)
+  _hc(0xffffee, 24); _hc(0x7fffe1, 23); _hc(0x7fffe2, 23); _hc(0x7fffe3, 23)
+  _hc(0x7fffe4, 23); _hc(0x1fffdc, 21); _hc(0x3fffd8, 22); _hc(0x7fffe5, 23)
+  _hc(0x3fffd9, 22); _hc(0x7fffe6, 23); _hc(0x7fffe7, 23); _hc(0xffffef, 24)
+  _hc(0x3fffda, 22); _hc(0x1fffdd, 21); _hc(0xfffe9, 20); _hc(0x3fffdb, 22)
+  _hc(0x3fffdc, 22); _hc(0x7fffe8, 23); _hc(0x7fffe9, 23); _hc(0x1fffde, 21)
+  _hc(0x7fffea, 23); _hc(0x3fffdd, 22); _hc(0x3fffde, 22); _hc(0xfffff0, 24)
+  _hc(0x1fffdf, 21); _hc(0x3fffdf, 22); _hc(0x7fffeb, 23); _hc(0x7fffec, 23)
+  _hc(0x1fffe0, 21); _hc(0x1fffe1, 21); _hc(0x3fffe0, 22); _hc(0x1fffe2, 21)
+  _hc(0x7fffed, 23); _hc(0x3fffe1, 22); _hc(0x7fffee, 23); _hc(0x7fffef, 23)
+  _hc(0xfffea, 20); _hc(0x3fffe2, 22); _hc(0x3fffe3, 22); _hc(0x3fffe4, 22)
+  _hc(0x7ffff0, 23); _hc(0x3fffe5, 22); _hc(0x3fffe6, 22); _hc(0x7ffff1, 23)
+  _hc(0x3ffffe0, 26); _hc(0x3ffffe1, 26); _hc(0xfffeb, 20); _hc(0x7fff1, 19)
+  _hc(0x3fffe7, 22); _hc(0x7ffff2, 23); _hc(0x3fffe8, 22); _hc(0x1ffffec, 25)
+  _hc(0x3ffffe2, 26); _hc(0x3ffffe3, 26); _hc(0x3ffffe4, 26); _hc(0x7ffffde, 27)
+  _hc(0x7ffffdf, 27); _hc(0x3ffffe5, 26); _hc(0xfffff1, 24); _hc(0x1ffffed, 25)
+  _hc(0x7fff2, 19); _hc(0x1fffe3, 21); _hc(0x3ffffe6, 26); _hc(0x7ffffe0, 27)
+  _hc(0x7ffffe1, 27); _hc(0x3ffffe7, 26); _hc(0x7ffffe2, 27); _hc(0xfffff2, 24)
+  _hc(0x1fffe4, 21); _hc(0x1fffe5, 21); _hc(0x3ffffe8, 26); _hc(0x3ffffe9, 26)
+  _hc(0xffffffd, 28); _hc(0x7ffffe3, 27); _hc(0x7ffffe4, 27); _hc(0x7ffffe5, 27)
+  _hc(0xfffec, 20); _hc(0xfffff3, 24); _hc(0xfffed, 20); _hc(0x1fffe6, 21)
+  _hc(0x3fffe9, 22); _hc(0x1fffe7, 21); _hc(0x1fffe8, 21); _hc(0x7ffff3, 23)
+  _hc(0x3fffea, 22); _hc(0x3fffeb, 22); _hc(0x1ffffee, 25); _hc(0x1ffffef, 25)
+  _hc(0xfffff4, 24); _hc(0xfffff5, 24); _hc(0x3ffffea, 26); _hc(0x7ffff4, 23)
+  _hc(0x3ffffeb, 26); _hc(0x7ffffe6, 27); _hc(0x3ffffec, 26); _hc(0x3ffffed, 26)
+  _hc(0x7ffffe7, 27); _hc(0x7ffffe8, 27); _hc(0x7ffffe9, 27); _hc(0x7ffffea, 27)
+  _hc(0x7ffffeb, 27); _hc(0xffffffe, 28); _hc(0x7ffffec, 27); _hc(0x7ffffed, 27)
+  _hc(0x7ffffee, 27); _hc(0x7ffffef, 27); _hc(0x7fffff0, 27); _hc(0x3ffffee, 26)
+  _hc(0x3fffffff, 30)  # EOS (symbol 256)
+end
+
+def _hc(code: Int, len: Int): Void
+  _huff_codes.push(code)
+  _huff_lens.push(len)
+end
+
+# ============================================================================
+# Header Block Decoding (RFC 7541 §6)
+# ============================================================================
+
+## Decode a complete HPACK header block into a list of headers.
+def hpack_decode_block(data: Bytes, table: HpackDynTable): Vec<HpackHeader>
+  hpack_static_init()
+  # Diagnostic (temporary): dump first bytes of block
+  #var _dump = "[hpack] block size=#{data.size()} bytes:"
+  #var _di = 0
+  #while _di < data.size() and _di < 40
+  #  var _b = data.get(_di)
+  #  var _hi = shr(band(_b, 0xF0), 4)
+  #  var _lo = band(_b, 0x0F)
+  #  _dump = _dump + " " + str_from_codepoint(if _hi < 10 then 48 + _hi else 87 + _hi end) + str_from_codepoint(if _lo < 10 then 48 + _lo else 87 + _lo end)
+  #  _di = _di + 1
+  #end
+  #eputs(_dump)
+  var headers = vec_new<HpackHeader>()
+  var decoded_size = 0
+  var max_decoded_size = 65536  # HPACK bomb protection: 64KB max decompressed headers
+  var pos = 0
+  while pos < data.size()
+    var first = data.get(pos)
+    if band(first, 128) != 0
+      # §6.1 Indexed Header Field (1xxxxxxx)
+      var idx_result = hpack_decode_int(data, pos, 7)
+      var index = idx_result[0]
+      pos = pos + idx_result[1]
+      if index == 0
+        continue
+      end
+      var name = hpack_lookup_name(table, index)
+      var value = hpack_lookup_value(table, index)
+      if str_byte_len(name) == 0
+        eputs("[hpack] skipping invalid indexed header: index=#{index} at byte #{pos - idx_result[1]}, first_byte=0x#{str_from_codepoint(if shr(band(first, 0xF0), 4) < 10 then 48 + shr(band(first, 0xF0), 4) else 87 + shr(band(first, 0xF0), 4) end)}#{str_from_codepoint(if band(first, 0x0F) < 10 then 48 + band(first, 0x0F) else 87 + band(first, 0x0F) end)}")
+        continue
+      end
+      decoded_size = decoded_size + str_byte_len(name) + str_byte_len(value) + 32
+      if decoded_size > max_decoded_size
+        return headers
+      end
+      headers.push(HpackHeader { name: name, value: value })
+    elsif band(first, 192) == 64
+      # §6.2.1 Literal with Incremental Indexing (01xxxxxx)
+      var idx_result = hpack_decode_int(data, pos, 6)
+      var index = idx_result[0]
+      pos = pos + idx_result[1]
+      var name = ""
+      if index > 0
+        name = hpack_lookup_name(table, index)
+      else
+        var name_result = hpack_decode_string(data, pos)
+        name = as_type<String>(name_result[0])
+        pos = pos + name_result[1]
+      end
+      var val_result = hpack_decode_string(data, pos)
+      var value = as_type<String>(val_result[0])
+      pos = pos + val_result[1]
+      hpack_dyn_insert(table, name, value)
+      decoded_size = decoded_size + str_byte_len(name) + str_byte_len(value) + 32
+      if decoded_size > max_decoded_size
+        return headers
+      end
+      headers.push(HpackHeader { name: name, value: value })
+    elsif band(first, 240) == 0 or band(first, 240) == 16
+      # §6.2.2 Literal without Indexing (0000xxxx) or §6.2.3 Never Indexed (0001xxxx)
+      var prefix = 4
+      var idx_result = hpack_decode_int(data, pos, prefix)
+      var index = idx_result[0]
+      pos = pos + idx_result[1]
+      var name = ""
+      if index > 0
+        name = hpack_lookup_name(table, index)
+      else
+        var name_result = hpack_decode_string(data, pos)
+        name = as_type<String>(name_result[0])
+        pos = pos + name_result[1]
+      end
+      var val_result = hpack_decode_string(data, pos)
+      var value = as_type<String>(val_result[0])
+      pos = pos + val_result[1]
+      decoded_size = decoded_size + str_byte_len(name) + str_byte_len(value) + 32
+      if decoded_size > max_decoded_size
+        return headers
+      end
+      headers.push(HpackHeader { name: name, value: value })
+    elsif band(first, 224) == 32
+      # §6.3 Dynamic Table Size Update (001xxxxx)
+      var size_result = hpack_decode_int(data, pos, 5)
+      var new_size = size_result[0]
+      pos = pos + size_result[1]
+      hpack_dyn_set_max_size(table, new_size)
+    else
+      # Unknown encoding — skip byte to avoid infinite loop
+      pos = pos + 1
+    end
+  end
+  return headers
+end
+
+# ============================================================================
+# Header Encoding (RFC 7541 §6 — for responses)
+# ============================================================================
+
+## Find a static table entry matching name+value. Returns index or 0.
+def _hpack_find_static_full(name: String, value: String): Int
+  var i = 1
+  while i <= hpack_static_size()
+    if hpack_static_name(i) == name and hpack_static_value(i) == value
+      return i
+    end
+    i = i + 1
+  end
+  return 0
+end
+
+## Find a static table entry matching just name. Returns index or 0.
+def _hpack_find_static_name(name: String): Int
+  var i = 1
+  while i <= hpack_static_size()
+    if hpack_static_name(i) == name
+      return i
+    end
+    i = i + 1
+  end
+  return 0
+end
+
+## Encode a raw (non-Huffman) string
+def _hpack_encode_string_raw(s: String): Bytes
+  var len = str_byte_len(s)
+  var result = hpack_encode_int(len, 7, 0)  # H=0 (raw), 7-bit prefix
+  var i = 0
+  while i < len
+    result.push(str_byte_at(s, i))
+    i = i + 1
+  end
+  return result
+end
+
+## Encode a list of headers into an HPACK header block.
+## Uses static table indexing for known headers, literal without indexing otherwise.
+def hpack_encode_block(headers: Vec<HpackHeader>): Bytes
+  hpack_static_init()
+  var result = Bytes { _data: vec_new() }
+  var i = 0
+  while i < headers.size
+    var h = headers[i]
+    # Try full static match first
+    var full_idx = _hpack_find_static_full(h.name, h.value)
+    if full_idx > 0
+      # §6.1 Indexed Header Field
+      var encoded = hpack_encode_int(full_idx, 7, 128)
+      var j = 0
+      while j < encoded.size()
+        result.push(encoded.get(j))
+        j = j + 1
+      end
+    else
+      # Try name-only static match
+      var name_idx = _hpack_find_static_name(h.name)
+      if name_idx > 0
+        # §6.2.2 Literal without Indexing, indexed name
+        var idx_bytes = hpack_encode_int(name_idx, 4, 0)
+        var j = 0
+        while j < idx_bytes.size()
+          result.push(idx_bytes.get(j))
+          j = j + 1
+        end
+        var val_bytes = _hpack_encode_string_raw(h.value)
+        j = 0
+        while j < val_bytes.size()
+          result.push(val_bytes.get(j))
+          j = j + 1
+        end
+      else
+        # §6.2.2 Literal without Indexing, new name
+        result.push(0)  # 0000 prefix + index 0
+        var name_bytes = _hpack_encode_string_raw(h.name)
+        var j = 0
+        while j < name_bytes.size()
+          result.push(name_bytes.get(j))
+          j = j + 1
+        end
+        var val_bytes = _hpack_encode_string_raw(h.value)
+        j = 0
+        while j < val_bytes.size()
+          result.push(val_bytes.get(j))
+          j = j + 1
+        end
+      end
+    end
+    i = i + 1
+  end
+  return result
+end

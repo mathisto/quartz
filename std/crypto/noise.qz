@@ -1,0 +1,666 @@
+## std/crypto/noise - Noise IKpsk2 handshake driver for WireGuard
+##
+## Implements the `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` handshake variant —
+## the only one WireGuard uses. Mirrors the WireGuard whitepaper §5.4 verbatim
+## (https://www.wireguard.com/papers/wireguard.pdf).
+##
+## Scope: writes/reads the message body (msg_α — everything before mac1/mac2).
+## The mac1 + mac2 trailer is WireGuard cookie machinery and lives at the WG
+## layer (std/net/wireguard); we expose `noise_wg_mac1` as a courtesy because
+## the MAC1 key derivation is tightly tied to the message format.
+##
+## Message bodies (per WG whitepaper §5.4.2 / §5.4.3):
+##   MSG_INITIATION body — 116 bytes
+##     [0]      type = 0x01
+##     [1..4]   reserved = 0,0,0
+##     [4..8]   sender_index (u32-LE)  — initiator's local handle
+##     [8..40]  ephemeral pubkey       — E_i^pub (32 bytes)
+##     [40..88] msg.static             — AEAD-encrypted S_i^pub (32 ct + 16 tag)
+##     [88..116] msg.timestamp         — AEAD-encrypted TAI64N (12 ct + 16 tag)
+##   MSG_RESPONSE body — 60 bytes
+##     [0]      type = 0x02
+##     [1..4]   reserved = 0,0,0
+##     [4..8]   sender_index           — responder's local handle
+##     [8..12]  receiver_index         — initiator's sender_index, echoed back
+##     [12..44] ephemeral pubkey       — E_r^pub
+##     [44..60] msg.empty              — AEAD-encrypted ε (16-byte tag only)
+##
+## Caller adds 16-byte mac1 + 16-byte mac2 = 32 bytes to reach the wire-format
+## sizes (148 / 92 bytes). Use `noise_wg_mac1` to compute mac1; mac2 is the
+## cookie-mac and is `0^16` outside of cookie reply mode.
+##
+## API shape:
+##   - HandshakeState is a single-use object: one `noise_handshake_new` per
+##     handshake, then create+consume calls in spec-mandated order, then
+##     `noise_split` to derive transport keys, then `noise_handshake_destroy`.
+##   - All buffers are caller-owned (ptr, len) pairs — typically `malloc`'d.
+##   - PSK is always a 32-byte buffer; pass an all-zero buffer for "no PSK".
+##   - All AEAD / ECDH failures are reported as `-1` returns; caller silently
+##     drops on -1 (per WG paper §5.1 "silence is a virtue").
+##
+## See docs/design/CRYPTO_STDLIB_DESIGN.md "Phase 1, Step 1.6" and
+## docs/design/WIREGUARD_UNIKERNEL_DESIGN.md "Noise IKpsk2".
+
+import std/core/crypto/blake2s
+import std/core/crypto/chacha20poly1305
+import std/core/crypto/curve25519
+import std/core/crypto/hkdf
+import * from std/core/crypto/secret  # Secret<Int> + secret_wrap (NET.4.1)
+import std/core/crypto/zeroize
+import std/crypto/rng
+import * from ffi/socket  # malloc, free, memcpy, memset
+
+# =============================================================================
+# Handshake state — single 160-byte malloc'd buffer with fixed offsets
+# =============================================================================
+
+## Per-handshake symmetric and ephemeral state.
+##
+## Underlying buffer layout (160 bytes):
+##   [0..32)    chain_key (c)
+##   [32..64)   hash (h)
+##   [64..96)   ephemeral private key (e_priv)
+##   [96..128)  ephemeral public key (e_pub)
+##   [128..160) peer's ephemeral public key
+##
+## Single-use: one full handshake on either side. After `noise_split`, call
+## `noise_handshake_destroy` to wipe ephemeral keys + chain state. Static
+## keys + transport keys are caller-managed.
+struct HandshakeState
+  buf: Int   # malloc'd 160 bytes
+end
+
+def noise_handshake_new(): HandshakeState
+  var buf = malloc(160)
+  memset(buf, 0, 160)
+  return HandshakeState { buf: buf }
+end
+
+## Wipe ephemeral and chain material; free the state buffer.
+def noise_handshake_destroy(state: HandshakeState): Void
+  zeroize(state.buf, 160)
+  free(state.buf)
+end
+
+# Layout-offset accessors (purely internal — never exported as ptrs into the
+# protocol's wire surface).
+def _chain_key(state: HandshakeState): Int
+  return state.buf
+end
+
+def _hash(state: HandshakeState): Int
+  return state.buf + 32
+end
+
+def _eph_priv(state: HandshakeState): Int
+  return state.buf + 64
+end
+
+def _eph_pub(state: HandshakeState): Int
+  return state.buf + 96
+end
+
+def _peer_eph_pub(state: HandshakeState): Int
+  return state.buf + 128
+end
+
+# =============================================================================
+# Internal helpers
+# =============================================================================
+
+## Copy a Quartz String into a fresh malloc'd byte buffer (no NUL terminator).
+## Caller frees. Used to embed the CONSTRUCTION / IDENTIFIER / LABEL_MAC1
+## constants without per-byte writes.
+def _str_to_buf(s: String): Int
+  var n = str_byte_len(s)
+  var p = malloc(n)
+  var i = 0
+  while i < n
+    ptr_write_byte(p + i, str_byte_at(s, i))
+    i += 1
+  end
+  return p
+end
+
+## MIX_HASH(h, data) := h := BLAKE2s(h || data, 32).
+def _mix_hash(state: HandshakeState, data: Int, data_len: Int): Void
+  var tmp_len = 32 + data_len
+  var tmp = malloc(tmp_len)
+  memcpy(tmp, _hash(state), 32)
+  if data_len > 0
+    memcpy(tmp + 32, data, data_len)
+  end
+  blake2s_256(tmp, tmp_len, _hash(state))
+  zeroize(tmp, tmp_len)
+  free(tmp)
+end
+
+## MIX_KEY (KDF1) — chain_key := KDF1(chain_key, ikm).
+##
+## KDF1(k, x) ≡ HKDF-Expand(HKDF-Extract(salt=k, ikm=x), info="", L=32).
+## The WG-paper τ-chain (τ0 = HMAC(k, x); τ1 = HMAC(τ0, 0x1)) matches HKDF's
+## T(1) when info is empty; output is τ1.
+##
+## NET.4.1 B: `ikm` is `Int` here because callers pass both public IKMs
+## (peer ephemeral pubkey straight off the wire) and secret IKMs (DH outputs).
+## The wrap at the hkdf boundary satisfies HKDF's Secret<Int> contract; the
+## audit-greppable moment is "secret material entering a public-typed slot."
+## chain_key is used as salt (public-typed slot in HKDF) — the chain_key
+## carries secret material but HKDF's contract treats salt as public per
+## RFC 5869 §3.1. Same reading as Noise's IKpsk2 derivation chain.
+def _mix_key(state: HandshakeState, ikm: Int, ikm_len: Int): Void
+  var prk = malloc(32)
+  hkdf_extract_blake2s(prk, _chain_key(state), 32, secret_wrap(ikm), ikm_len)
+  hkdf_expand_blake2s(_chain_key(state), secret_wrap(prk), 0, 0, 32)
+  zeroize(prk, 32)
+  free(prk)
+end
+
+## KDF2 — (chain_key, kappa) := KDF2(chain_key, ikm). Both outputs are 32 bytes.
+##
+## NET.4.1 B: same ikm convention as `_mix_key` (see above).
+def _kdf2(state: HandshakeState, ikm: Int, ikm_len: Int, kappa_out: Int): Void
+  var prk = malloc(32)
+  hkdf_extract_blake2s(prk, _chain_key(state), 32, secret_wrap(ikm), ikm_len)
+  var out = malloc(64)
+  hkdf_expand_blake2s(out, secret_wrap(prk), 0, 0, 64)
+  memcpy(_chain_key(state), out, 32)
+  memcpy(kappa_out, out + 32, 32)
+  zeroize(prk, 32)
+  free(prk)
+  zeroize(out, 64)
+  free(out)
+end
+
+## KDF3 — (chain_key, tau, kappa) := KDF3(chain_key, ikm). All outputs 32 bytes.
+##
+## NET.4.1 B: same ikm convention as `_mix_key` (see above).
+def _kdf3(state: HandshakeState, ikm: Int, ikm_len: Int, tau_out: Int, kappa_out: Int): Void
+  var prk = malloc(32)
+  hkdf_extract_blake2s(prk, _chain_key(state), 32, secret_wrap(ikm), ikm_len)
+  var out = malloc(96)
+  hkdf_expand_blake2s(out, secret_wrap(prk), 0, 0, 96)
+  memcpy(_chain_key(state), out, 32)
+  memcpy(tau_out, out + 32, 32)
+  memcpy(kappa_out, out + 64, 32)
+  zeroize(prk, 32)
+  free(prk)
+  zeroize(out, 96)
+  free(out)
+end
+
+## Initialize chain_key + hash from CONSTRUCTION / IDENTIFIER, then mix in
+## the responder's static pubkey (per WG §5.4.2):
+##   C := Hash(CONSTRUCTION)
+##   H := Hash(C || IDENTIFIER)
+##   H := Hash(H || S_r^pub)
+##
+## On the initiator: peer_static_pub = responder's static pub.
+## On the responder: peer_static_pub = its own static pub (it's S_r^pub from
+##                   the initiator's POV; the responder pre-mixes the same).
+def _init_state(state: HandshakeState, peer_static_pub: Int): Void
+  # CONSTRUCTION = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s" — 37 bytes.
+  var c_buf = _str_to_buf("Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s")
+  blake2s_256(c_buf, 37, _chain_key(state))
+  free(c_buf)
+
+  # IDENTIFIER = "WireGuard v1 zx2c4 Jason@zx2c4.com" — 34 bytes.
+  var id_buf = _str_to_buf("WireGuard v1 zx2c4 Jason@zx2c4.com")
+  var tmp = malloc(66)
+  memcpy(tmp, _chain_key(state), 32)
+  memcpy(tmp + 32, id_buf, 34)
+  blake2s_256(tmp, 66, _hash(state))
+  free(tmp)
+  free(id_buf)
+
+  _mix_hash(state, peer_static_pub, 32)
+end
+
+## Write a 32-bit unsigned integer to dst in little-endian order.
+def _write_u32_le(dst: Int, v: Int): Void
+  ptr_write_byte(dst, v & 255)
+  ptr_write_byte(dst + 1, (v >> 8) & 255)
+  ptr_write_byte(dst + 2, (v >> 16) & 255)
+  ptr_write_byte(dst + 3, (v >> 24) & 255)
+end
+
+# =============================================================================
+# Initiator: create MSG_INITIATION body
+# =============================================================================
+
+## Initiator step 1: write the 116-byte handshake initiation body to `msg`.
+##
+## Args:
+## - state: zeroed HandshakeState; populated for use with `noise_consume_response`.
+## - rng: cryptographic RNG (e.g. from `rng_new()`).
+## - static_priv / static_pub: initiator's long-term Curve25519 keypair (32 + 32).
+## - peer_static_pub: responder's static pubkey, known a priori (32 bytes).
+## - local_index: u32 — initiator's local session index (random per handshake).
+## - timestamp: 12-byte TAI64N plaintext (caller computes; spec §5.1).
+## - msg: 116-byte output buffer (msg_α only — caller appends mac1/mac2).
+##
+## Returns 0 on success, -1 if any X25519 ECDH yields the all-zero point
+## (indicates a malformed peer pubkey or small-subgroup attack — caller drops).
+def noise_create_initiation(
+  state: HandshakeState,
+  rng: Rng,
+  static_priv: Secret<Int>,
+  static_pub: Int,
+  peer_static_pub: Int,
+  local_index: Int,
+  timestamp: Int,
+  msg: Int
+): Int
+  _init_state(state, peer_static_pub)
+
+  # E_i := DH-Generate(). The eph priv lives inside state.buf as an Int
+  # offset; wrap at the x25519 boundary. (Field-level Secret<Int> on the
+  # HandshakeState slots would propagate this through the accessor — filed
+  # forward; see SECRET_T_AND_DUDECT_DESIGN.md.)
+  rng_fill(rng, _eph_priv(state), 32)
+  x25519_secret_to_public(_eph_pub(state), secret_wrap(_eph_priv(state)))
+
+  # C_i := KDF1(C_i, E_i^pub)
+  _mix_key(state, _eph_pub(state), 32)
+
+  # Header: type=0x01, reserved=0,0,0, sender=local_index
+  ptr_write_byte(msg, 1)
+  ptr_write_byte(msg + 1, 0)
+  ptr_write_byte(msg + 2, 0)
+  ptr_write_byte(msg + 3, 0)
+  _write_u32_le(msg + 4, local_index)
+
+  # msg.ephemeral := E_i^pub
+  memcpy(msg + 8, _eph_pub(state), 32)
+  # H_i := Hash(H_i || msg.ephemeral)
+  _mix_hash(state, msg + 8, 32)
+
+  # (C_i, kappa) := KDF2(C_i, DH(E_i^priv, S_r^pub)).
+  var dh_out = malloc(32)
+  if x25519_ecdh(dh_out, secret_wrap(_eph_priv(state)), peer_static_pub) == 0
+    zeroize(dh_out, 32)
+    free(dh_out)
+    return 0 - 1
+  end
+  var kappa = malloc(32)
+  _kdf2(state, dh_out, 32, kappa)
+  zeroize(dh_out, 32)
+  free(dh_out)
+
+  # msg.static := AEAD(kappa, 0, S_i^pub, H_i) — 32 ct at msg+40, 16 tag at msg+72.
+  # NET.4.1 B: kappa is a derived one-shot AEAD key; wrap at the AEAD boundary.
+  var zero_nonce = malloc(12)
+  memset(zero_nonce, 0, 12)
+  chacha20poly1305_encrypt(msg + 40, msg + 72, static_pub, 32, _hash(state), 32, secret_wrap(kappa), zero_nonce)
+  zeroize(kappa, 32)
+  free(kappa)
+
+  # H_i := Hash(H_i || msg.static)
+  _mix_hash(state, msg + 40, 48)
+
+  # (C_i, kappa) := KDF2(C_i, DH(S_i^priv, S_r^pub)). NET.4.1 B: static_priv
+  # arrives already Secret<Int> from the public API boundary; no inner wrap.
+  dh_out = malloc(32)
+  if x25519_ecdh(dh_out, static_priv, peer_static_pub) == 0
+    zeroize(dh_out, 32)
+    free(dh_out)
+    free(zero_nonce)
+    return 0 - 1
+  end
+  kappa = malloc(32)
+  _kdf2(state, dh_out, 32, kappa)
+  zeroize(dh_out, 32)
+  free(dh_out)
+
+  # msg.timestamp := AEAD(kappa, 0, TIMESTAMP, H_i) — 12 ct at msg+88, 16 tag at msg+100.
+  chacha20poly1305_encrypt(msg + 88, msg + 100, timestamp, 12, _hash(state), 32, secret_wrap(kappa), zero_nonce)
+  zeroize(kappa, 32)
+  free(kappa)
+  free(zero_nonce)
+
+  # H_i := Hash(H_i || msg.timestamp)
+  _mix_hash(state, msg + 88, 28)
+
+  return 0
+end
+
+# =============================================================================
+# Responder: consume MSG_INITIATION body
+# =============================================================================
+
+## Responder step 1: parse a 116-byte initiation body and update state.
+##
+## Args:
+## - state: zeroed HandshakeState.
+## - static_priv / static_pub: responder's long-term keypair.
+## - msg: 116-byte input buffer (msg_α only — caller has already validated mac1).
+## - out_peer_static_pub: 32-byte buffer — receives the decoded initiator pubkey
+##                       (the WG layer uses this to look up the peer + PSK).
+## - out_timestamp: 12-byte buffer — receives the decoded TAI64N timestamp
+##                 (WG layer rejects replays via per-peer monotonic check).
+##
+## Returns 0 on success; -1 on AEAD decrypt failure (msg.static or msg.timestamp
+## tag mismatch) or on ECDH zero-output (initiator's ephemeral or static is
+## malformed). Caller drops silently on -1.
+def noise_consume_initiation(
+  state: HandshakeState,
+  static_priv: Secret<Int>,
+  static_pub: Int,
+  msg: Int,
+  out_peer_static_pub: Int,
+  out_timestamp: Int
+): Int
+  _init_state(state, static_pub)
+
+  # Capture peer's ephemeral pubkey (E_i^pub from msg.ephemeral)
+  memcpy(_peer_eph_pub(state), msg + 8, 32)
+
+  # C_r := KDF1(C_r, msg.ephemeral)
+  _mix_key(state, msg + 8, 32)
+  # H_r := Hash(H_r || msg.ephemeral)
+  _mix_hash(state, msg + 8, 32)
+
+  # (C_r, kappa) := KDF2(C_r, DH(S_r^priv, msg.ephemeral)). NET.4.1 B:
+  # static_priv arrives already Secret<Int> from the public API boundary.
+  var dh_out = malloc(32)
+  if x25519_ecdh(dh_out, static_priv, msg + 8) == 0
+    zeroize(dh_out, 32)
+    free(dh_out)
+    return 0 - 1
+  end
+  var kappa = malloc(32)
+  _kdf2(state, dh_out, 32, kappa)
+  zeroize(dh_out, 32)
+  free(dh_out)
+
+  # Decrypt msg.static (32 ct at msg+40, 16 tag at msg+72) → out_peer_static_pub.
+  var zero_nonce = malloc(12)
+  memset(zero_nonce, 0, 12)
+  var rc = chacha20poly1305_decrypt(out_peer_static_pub, msg + 40, 32, _hash(state), 32, secret_wrap(kappa), zero_nonce, msg + 72)
+  zeroize(kappa, 32)
+  free(kappa)
+  if rc != 0
+    free(zero_nonce)
+    return 0 - 1
+  end
+
+  # H_r := Hash(H_r || msg.static)
+  _mix_hash(state, msg + 40, 48)
+
+  # (C_r, kappa) := KDF2(C_r, DH(S_r^priv, S_i^pub))  — S_i^pub just decoded.
+  dh_out = malloc(32)
+  if x25519_ecdh(dh_out, static_priv, out_peer_static_pub) == 0
+    zeroize(dh_out, 32)
+    free(dh_out)
+    free(zero_nonce)
+    return 0 - 1
+  end
+  kappa = malloc(32)
+  _kdf2(state, dh_out, 32, kappa)
+  zeroize(dh_out, 32)
+  free(dh_out)
+
+  # Decrypt msg.timestamp (12 ct at msg+88, 16 tag at msg+100).
+  rc = chacha20poly1305_decrypt(out_timestamp, msg + 88, 12, _hash(state), 32, secret_wrap(kappa), zero_nonce, msg + 100)
+  zeroize(kappa, 32)
+  free(kappa)
+  free(zero_nonce)
+  if rc != 0
+    return 0 - 1
+  end
+
+  # H_r := Hash(H_r || msg.timestamp)
+  _mix_hash(state, msg + 88, 28)
+
+  return 0
+end
+
+# =============================================================================
+# Responder: create MSG_RESPONSE body
+# =============================================================================
+
+## Responder step 2: write the 60-byte handshake response body.
+##
+## Pre-state: `noise_consume_initiation` must have populated `state` immediately
+## prior. The state's chain_key/hash carry the post-initiation transcript.
+##
+## Args:
+## - rng: cryptographic RNG.
+## - peer_static_pub: initiator's static pubkey (the value `noise_consume_initiation`
+##                   wrote into out_peer_static_pub).
+## - psk: 32-byte buffer — pass an all-zero buffer for "no PSK" mode.
+## - local_index: u32 — responder's local session index (random per handshake).
+## - peer_index: u32 — initiator's sender_index (echoed back as receiver).
+## - msg: 60-byte output buffer (msg_α only — caller appends mac1/mac2).
+##
+## Returns 0 on success, -1 on ECDH zero-output failure.
+def noise_create_response(
+  state: HandshakeState,
+  rng: Rng,
+  peer_static_pub: Int,
+  psk: Secret<Int>,
+  local_index: Int,
+  peer_index: Int,
+  msg: Int
+): Int
+  # E_r := DH-Generate().
+  rng_fill(rng, _eph_priv(state), 32)
+  x25519_secret_to_public(_eph_pub(state), secret_wrap(_eph_priv(state)))
+
+  # C_r := KDF1(C_r, E_r^pub)
+  _mix_key(state, _eph_pub(state), 32)
+
+  # Header: type=0x02, reserved=0,0,0, sender=local_index, receiver=peer_index
+  ptr_write_byte(msg, 2)
+  ptr_write_byte(msg + 1, 0)
+  ptr_write_byte(msg + 2, 0)
+  ptr_write_byte(msg + 3, 0)
+  _write_u32_le(msg + 4, local_index)
+  _write_u32_le(msg + 8, peer_index)
+
+  # msg.ephemeral := E_r^pub
+  memcpy(msg + 12, _eph_pub(state), 32)
+  # H_r := Hash(H_r || msg.ephemeral)
+  _mix_hash(state, msg + 12, 32)
+
+  # C_r := KDF1(C_r, DH(E_r^priv, peer_eph_pub))  — "ee".
+  var dh_out = malloc(32)
+  if x25519_ecdh(dh_out, secret_wrap(_eph_priv(state)), _peer_eph_pub(state)) == 0
+    zeroize(dh_out, 32)
+    free(dh_out)
+    return 0 - 1
+  end
+  _mix_key(state, dh_out, 32)
+  zeroize(dh_out, 32)
+  free(dh_out)
+
+  # C_r := KDF1(C_r, DH(E_r^priv, S_i^pub))  — "se".
+  dh_out = malloc(32)
+  if x25519_ecdh(dh_out, secret_wrap(_eph_priv(state)), peer_static_pub) == 0
+    zeroize(dh_out, 32)
+    free(dh_out)
+    return 0 - 1
+  end
+  _mix_key(state, dh_out, 32)
+  zeroize(dh_out, 32)
+  free(dh_out)
+
+  # (C_r, tau, kappa) := KDF3(C_r, Q)  — "psk". NET.4.1 B: psk arrives
+  # already Secret<Int>; unwrap at the kdf3 boundary (kdf3 takes Int ikm
+  # and re-wraps for hkdf, per the public/secret-ikm tension documented on
+  # _mix_key above).
+  var tau = malloc(32)
+  var kappa = malloc(32)
+  _kdf3(state, secret_unwrap(psk), 32, tau, kappa)
+
+  # H_r := Hash(H_r || tau)
+  _mix_hash(state, tau, 32)
+  zeroize(tau, 32)
+  free(tau)
+
+  # msg.empty := AEAD(kappa, 0, ε, H_r) — 0 plaintext bytes, 16-byte tag at msg+44.
+  # Output ptr unused (input_len=0); pass msg+44 to keep aliasing trivial.
+  var zero_nonce = malloc(12)
+  memset(zero_nonce, 0, 12)
+  chacha20poly1305_encrypt(msg + 44, msg + 44, msg + 44, 0, _hash(state), 32, secret_wrap(kappa), zero_nonce)
+  zeroize(kappa, 32)
+  free(kappa)
+  free(zero_nonce)
+
+  # H_r := Hash(H_r || msg.empty)  — 16 bytes of tag.
+  _mix_hash(state, msg + 44, 16)
+
+  return 0
+end
+
+# =============================================================================
+# Initiator: consume MSG_RESPONSE body
+# =============================================================================
+
+## Initiator step 2: parse the 60-byte response body and finalize handshake.
+##
+## Pre-state: `noise_create_initiation` populated `state` immediately prior.
+##
+## Args:
+## - static_priv: initiator's long-term private key.
+## - psk: 32-byte buffer — must equal the responder's PSK or msg.empty fails.
+## - msg: 60-byte input buffer (msg_α only).
+##
+## Returns 0 on success; -1 on AEAD or ECDH failure. Caller drops silently.
+def noise_consume_response(
+  state: HandshakeState,
+  static_priv: Secret<Int>,
+  psk: Secret<Int>,
+  msg: Int
+): Int
+  # Capture responder's ephemeral pubkey (E_r^pub from msg.ephemeral)
+  memcpy(_peer_eph_pub(state), msg + 12, 32)
+
+  # C_i := KDF1(C_i, msg.ephemeral)
+  _mix_key(state, msg + 12, 32)
+  # H_i := Hash(H_i || msg.ephemeral)
+  _mix_hash(state, msg + 12, 32)
+
+  # C_i := KDF1(C_i, DH(E_i^priv, peer_eph_pub))  — "ee".
+  var dh_out = malloc(32)
+  if x25519_ecdh(dh_out, secret_wrap(_eph_priv(state)), _peer_eph_pub(state)) == 0
+    zeroize(dh_out, 32)
+    free(dh_out)
+    return 0 - 1
+  end
+  _mix_key(state, dh_out, 32)
+  zeroize(dh_out, 32)
+  free(dh_out)
+
+  # C_i := KDF1(C_i, DH(S_i^priv, peer_eph_pub))  — "se". NET.4.1 B:
+  # static_priv arrives already Secret<Int>.
+  dh_out = malloc(32)
+  if x25519_ecdh(dh_out, static_priv, _peer_eph_pub(state)) == 0
+    zeroize(dh_out, 32)
+    free(dh_out)
+    return 0 - 1
+  end
+  _mix_key(state, dh_out, 32)
+  zeroize(dh_out, 32)
+  free(dh_out)
+
+  # (C_i, tau, kappa) := KDF3(C_i, Q)  — "psk". NET.4.1 B: psk arrives
+  # already Secret<Int>; unwrap at the kdf3 boundary.
+  var tau = malloc(32)
+  var kappa = malloc(32)
+  _kdf3(state, secret_unwrap(psk), 32, tau, kappa)
+
+  # H_i := Hash(H_i || tau)
+  _mix_hash(state, tau, 32)
+  zeroize(tau, 32)
+  free(tau)
+
+  # Verify msg.empty: AEAD-decrypt with input_len=0; tag at msg+44.
+  # Output ptr unused; reuse msg+44 (no bytes written there).
+  var zero_nonce = malloc(12)
+  memset(zero_nonce, 0, 12)
+  var rc = chacha20poly1305_decrypt(msg + 44, msg + 44, 0, _hash(state), 32, secret_wrap(kappa), zero_nonce, msg + 44)
+  zeroize(kappa, 32)
+  free(kappa)
+  free(zero_nonce)
+  if rc != 0
+    return 0 - 1
+  end
+
+  # H_i := Hash(H_i || msg.empty)
+  _mix_hash(state, msg + 44, 16)
+
+  return 0
+end
+
+# =============================================================================
+# Final transport key derivation
+# =============================================================================
+
+## Derive per-direction transport keys after both sides have consumed each
+## other's handshake messages.
+##
+## Both sides have identical chain_key C at this point. KDF2(C, ε) yields
+## (T_initiator_send = T_responder_recv, T_initiator_recv = T_responder_send).
+##
+## Args:
+## - is_initiator: 1 from initiator side; 0 from responder. Determines which
+##                 derived half goes into `t_send` vs `t_recv`.
+## - t_send / t_recv: 32-byte output buffers (caller-owned).
+def noise_split(state: HandshakeState, is_initiator: Int, t_send: Int, t_recv: Int): Void
+  # KDF2(C, "") — empty IKM is a well-defined HMAC input.
+  # NET.4.1 B: ikm is the 0/0 sentinel for empty input; wrap satisfies the
+  # Secret<Int> contract without dereference (HKDF skips memcpy when len=0).
+  # The transport-key output stays Int per the output convention — callers
+  # wrap before threading the keys downstream (see std/net/wireguard/session.qz).
+  var prk = malloc(32)
+  hkdf_extract_blake2s(prk, _chain_key(state), 32, secret_wrap(0), 0)
+  var out = malloc(64)
+  hkdf_expand_blake2s(out, secret_wrap(prk), 0, 0, 64)
+  zeroize(prk, 32)
+  free(prk)
+
+  if is_initiator == 1
+    memcpy(t_send, out, 32)
+    memcpy(t_recv, out + 32, 32)
+  else
+    memcpy(t_recv, out, 32)
+    memcpy(t_send, out + 32, 32)
+  end
+  zeroize(out, 64)
+  free(out)
+end
+
+# =============================================================================
+# WireGuard MAC1 helper (sits beside Noise; not part of the Noise spec itself)
+# =============================================================================
+
+## Compute WG mac1 for a handshake message body.
+##
+##   mac1_key := Hash(LABEL_MAC1 || S_m'^pub)         # 32 bytes
+##   mac1     := Mac(mac1_key, msg_α)                  # 16 bytes (keyed BLAKE2s)
+##
+## Args:
+## - out: 16-byte output buffer.
+## - msg: pointer to msg_α start.
+## - msg_len: bytes of msg_α to MAC (initiation: 116; response: 60).
+## - peer_static_pub: 32-byte recipient pubkey (the receiver of the message).
+##
+## Note: production WG implementations cache `mac1_key` per peer because it's
+## stable across handshakes. We recompute each call; filed as a follow-up.
+def noise_wg_mac1(out: Int, msg: Int, msg_len: Int, peer_static_pub: Int): Void
+  # Compute mac1_key = Hash(LABEL_MAC1 || peer_static_pub).
+  var lbl = _str_to_buf("mac1----")  # 8 bytes
+  var tmp = malloc(40)
+  memcpy(tmp, lbl, 8)
+  memcpy(tmp + 8, peer_static_pub, 32)
+  var mac1_key = malloc(32)
+  blake2s_256(tmp, 40, mac1_key)
+  free(tmp)
+  free(lbl)
+
+  # mac1 = Keyed-BLAKE2s(mac1_key, msg, output_len=16, key_len=32)
+  blake2s_keyed(out, 16, msg, msg_len, mac1_key, 32)
+  zeroize(mac1_key, 32)
+  free(mac1_key)
+end

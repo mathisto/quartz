@@ -1,0 +1,567 @@
+## std/sync/composition/go.qz — Goroutine spawn family + structured-scope wrappers
+##
+## Higher-level concurrency built on the compiler intrinsics
+## (spawn, channels, atomics, mutex, task_group, cancel_token,
+## rwlock, waitgroup, oncecell).
+##
+## Primitives (re-exported from intrinsics, not stdlib):
+##   - go / async / await — M:N task scheduling
+##   - sched_init / sched_spawn / sched_shutdown / sched_yield
+##   - channel_new / send / recv / try_send / try_recv
+##   - atomic_new / load / store / add / sub / exchange / cas
+##   - mutex / rwlock / waitgroup / oncecell
+##   - cancel_token (capability-style cancellation)
+##   - task_group (scoped thread pool)
+##
+## Structured concurrency:
+##   - scope_with(scope_with_cancel(current_scope()), body) — the
+##     canonical entry point from std/sync/composition/scope. The
+##     wrappers here (`go_scope`, `go_supervisor`, `go_scope_timeout`,
+##     `structured_scope`, `structured_supervisor`) are legacy wrappers
+##     that re-shape that substrate for callers who want the older API.
+##   - The cancel-token API (`cancel_token_new`/`_cancel`/`_is_cancelled`/
+##     `_with_deadline`/`_free`) and capability-style spawning
+##     (`go_cancellable`, `go_cancel_on_success`, `supervisor_tree`)
+##     cover the (capability, explicit) corner of the two-axis
+##     decision tree — peer-to-peer cancel, externally-cancellable
+##     tasks, OTP-style restart strategies.
+
+# Phase E.1 — `go_arena(f)` uses `with Alloc.in_arena(ar) do ... end`.
+# Importing std/alloc brings the Alloc effect declaration into scope and
+# makes `arena_alloc_handler_e` / `arena_dealloc_handler_e` linkable for
+# the in_arena method-dispatch lowering.
+import std/alloc
+
+# B.7 Phase 5 Bucket 1 — structured-concurrency wrappers route through
+# the unified `Scope` substrate (cancel propagation via the scope tree
+# instead of cancel-token frame[3] wiring). Cancel-token API stays for
+# capability-style cancellation (go_cancellable, supervisor_tree).
+#
+# `import *` (wildcard) is required for the deadline-timer helper:
+# Phase 4d's `__qz_scope_deadline_thread` runtime function calls the
+# bare name `@_scope_fire_deadline_exceeded`. Quartz's named import
+# would mangle the symbol to `scope$_scope_fire_deadline_exceeded` and
+# the runtime call would fail to link. The wildcard exposes scope's
+# helpers under their bare names, matching the runtime's contract.
+import * from std/sync/composition/scope
+
+# ============================================================================
+# M:N Scheduler — Lightweight Task Spawning
+# ============================================================================
+
+## Spawn a lightweight task on the M:N scheduler.
+## The function is wrapped in an async frame and enqueued.
+## Returns the task frame handle (can be used with await later).
+## Requires sched_init() to have been called first.
+def go(f: Fn(): Int): Int
+  var task = async f()
+  sched_spawn(task)
+  return task
+end
+
+## Spawn a lightweight task with a per-task arena installed (Phase E.1).
+##
+## Wraps f's body in `with Alloc.in_arena(arena_new(8192)) do -> f() end`,
+## then `arena_destroy` after f returns. All allocations made inside the
+## task body land in the per-task arena and free in bulk at task end.
+##
+## Memory bound: each go_arena task transiently holds ≤ peak-allocation
+## of f's body, plus 8KB minimum arena overhead. Under task churn, total
+## RSS scales with PARALLELISM (concurrent live tasks × peak-per-task),
+## not with TASK COUNT — the Erlang/BEAM-style structured-memory win.
+##
+## **Limitations** (Phase E.1.a, opt-in stdlib API):
+##   - **Tasks must return value-typed data (`Int`, `Bool`, etc.).**
+##     Reference-typed returns (String, Vec) live in the per-task arena
+##     and dangle after `arena_destroy(ar)`. The `await` boundary auto-
+##     promote is filed as Phase E.4 (escape mechanism).
+##   - **Truly-parallel go_arena tasks under multi-worker scheduler
+##     (`sched_init(0)`) race on the global effect-stack top.** Two
+##     workers concurrently pushing `with Alloc.in_arena(ar)` corrupt
+##     each other's install slot → SIGSEGV. Workaround: `sched_init(1)`
+##     for parallel arena workloads. Sequential go_arena calls
+##     (each awaited before the next spawns) work under any worker
+##     count. Filed as Phase E.1.c — TLS effect-stack top + per-worker
+##     prelude install. See `docs/bugs/EFFECT_STACK_TOP_GLOBAL_MULTI_
+##     WORKER_RACE.md`.
+##   - **Heavy-allocating tasks (>50K allocations) can trigger the latent
+##     `arena_destroy` corruption bug** filed in
+##     `docs/bugs/D2_ARENA_DESTROY_AT_TC_SCALE_CORRUPTS_HEAP.md`. Phase
+##     E.5 is the bug fix; typical task workloads are bounded enough.
+##   - **Phase E.1.b SHIPPED 2026-04-28**: `go fn(args)` (named function,
+##     value-typed return) now auto-arenas via MIR-level synthesis —
+##     compiler rewrites to `go (-> { var ar = arena_new(8192); var r =
+##     with Alloc.in_arena(ar) do -> fn(args) end; arena_destroy(ar); r })`.
+##     Conservative gate skips reference-typed returns (until E.4 escape),
+##     lambda forms (`go (-> ...)()`), and programs that don't import
+##     std/alloc. `go_arena(f)` remains the explicit opt-in for lambda
+##     forms and reference-typed returns.
+def go_arena(f: Fn(): Int): Int
+  return go (-> _go_arena_body(f))
+end
+
+## Internal — body of a `go_arena` task. Allocates the arena, installs
+## the env-aware Alloc.in_arena handlers, calls f(), tears down.
+##
+## Phase E.4.b: a panic from `f()` previously skipped `arena_destroy(ar)`
+## (the throw unwinds through the with-block, bypassing post-with code).
+## The fix nests `with Throws { throw: __qz_arena_panic_rec }` INSIDE
+## `with Alloc.in_arena(ar)` — on panic, the throw longjmps to the
+## inner Throws's wb.catch (one level up from the throw site, still
+## inside Alloc's body); the inner Throws's wb.done pops cleanly; control
+## resumes in the outer Alloc body, which completes normally so Alloc's
+## wb.done ALSO runs and pops its 2 entries. Without that ordering, a
+## panic-recover loop accumulates leaked Alloc entries and SIGSEGVs on
+## iteration 2.
+##
+## On panic, `_go_arena_body` returns `-1` (the same sentinel
+## `panic_caught` already uses for goroutines whose body panics
+## uncaught). Re-throwing across the goroutine boundary into the
+## parent's `with Throws` setjmp is a cross-stack longjmp and aborts
+## the process — sentinel return matches existing await-side semantics.
+## The panic *message* is captured into `_qz_arena_panic_msg`
+## (`std/alloc.qz`) for diagnostic recovery but is not auto-propagated.
+def _go_arena_body(f: Fn(): Int): Int
+  var ar = arena_acquire(8192)
+  var result = -1
+  var panicked = 1
+  with Alloc.in_arena(ar) do ->
+    with Throws { throw: __qz_arena_panic_rec } do ->
+      result = f()
+      panicked = 0
+      0
+    end
+    0
+  end
+  if panicked == 1
+    arena_release(ar)
+    return -1
+  end
+  arena_release(ar)
+  return result
+end
+
+## Spawn a cancellable task on the M:N scheduler.
+## Sets frame[3] to the given cancel token before spawning.
+## The task will be cancelled at its next suspension point if the token fires.
+## Returns the task frame handle.
+##
+## Phase E.6: body runs inside a per-task arena (`_go_arena_body`) so
+## allocations during `f()` are absorbed by the task's arena and freed at
+## task end. Outer Alloc handlers see only the arena's bulk chain blocks,
+## not individual mallocs — same model as the auto-arena `go fn()` keyword
+## form (E.1.b). Type signature `Fn(): Int` already enforces a value-typed
+## return so the result survives `arena_destroy`.
+def go_cancellable(f: Fn(): Int, tok: Int): Int
+  var task = async _go_arena_body(f)
+  store(task, 3, tok)
+  sched_spawn(task)
+  return task
+end
+
+# ============================================================================
+# Structured Concurrency
+# ============================================================================
+
+## Scope — structured concurrency block.
+## All spawned children must complete before the scope exits.
+## If any child returns -1 (panic sentinel), the scope panics.
+## Returns 0 on success.
+def scope(body: Fn(Int): Int): Int
+  var results = task_group |g|
+    body(g)
+    taskgroup_collect(g)
+  end
+  # Check results for error sentinels (-1 = panicked child)
+  var i = 0
+  while i < vec_size(results)
+    if vec_get(results, i) == -1
+      panic("child task panicked in scope")
+    end
+    i = i + 1
+  end
+  return 0
+end
+
+## Supervisor — like scope but child failures don't cancel siblings.
+## Returns Vec<Int> of results (including -1 for failed tasks).
+def supervisor(body: Fn(Int): Int): Vec<Int>
+  return task_group |g|
+    body(g)
+    taskgroup_collect(g)
+  end
+end
+
+## Scope with timeout — runs body in a task_group with a deadline.
+## If the timeout fires before tasks complete, the group is cancelled.
+## Returns 0 on normal completion, 1 on timeout.
+def scope_with_timeout(timeout_ms: Int, body: Fn(Int): Int): Int
+  tok = cancel_token_with_deadline(timeout_ms)
+  task_group |g|
+    body(g)
+    taskgroup_collect(g)
+  end
+  result = cancel_token_is_cancelled(tok)
+  cancel_token_free(tok)
+  if result == 1
+    return 1
+  end
+  return 0
+end
+
+## Scope with cancel-on-failure policy.
+## All spawned children share a cancel token. If any child returns -1
+## (error/panic), the scheduler automatically cancels the shared token.
+## Other children will exit at their next suspension point.
+## The body receives the cancel token — use go_cancellable(f, tok) to spawn.
+## Returns 0 on success, -1 if any child failed.
+def scope_cancel_on_failure(body: Fn(Int): Int): Int
+  var tok = cancel_token_new()
+  body(tok)
+  sched_shutdown()
+  var cancelled = cancel_token_is_cancelled(tok)
+  cancel_token_free(tok)
+  if cancelled == 1
+    return -1
+  end
+  return 0
+end
+
+# ============================================================================
+# Supervision Trees — fault-tolerant concurrency
+# ============================================================================
+
+# B.7 Phase 5 Bucket 1: Structured-scope tracking.
+#
+# The single remaining module-global from the legacy `_current_scope_*`
+# ambient state. Its job is narrow: hold the children-task-handle vec for
+# the await loop in `structured_scope` / `structured_supervisor` /
+# `go_scope_timeout`. Cancellation propagation no longer rides on the
+# previous `_current_scope_token` (deleted) — the new substrate handles
+# that via the scope tree (Phase 4a-c TLS bridge + Phase 4e.1-5 wakes;
+# the sched_spawn intrinsic captures `current_scope` at spawn time so
+# go_spawn-spawned children inherit it automatically).
+#
+# Default 0 (Int) means "no structured scope active." When set to a
+# vec_new() handle, go_spawn registers itself for the await loop.
+var _current_scope_children = 0
+
+## Phase E.6: body runs inside a per-task arena (`_go_arena_body`).
+## See `go_cancellable` doc for the full rationale.
+def go_spawn(f: Fn(): Int): Int
+  var task = async _go_arena_body(f)
+  if _current_scope_children != 0
+    vec_push(_current_scope_children, task)
+  end
+  sched_spawn(task)
+  return task
+end
+
+# B.7 Phase 5 Bucket 1: structured_scope rewritten on the unified Scope
+# substrate. Runs body inside a child of `current_scope()` with cancel
+# semantics; children spawned via go_spawn inherit the scope automatically
+# (sched_spawn intrinsic captures it at spawn time, see Phase 5 prereq).
+# On any -1 child sentinel, scope_cancel propagates to siblings via
+# Phase 4e.1-5 chunked-poll wakes. Returns 0 on success, -1 on child failure.
+def structured_scope(body: Fn(): Int): Int
+  sched_init(0)
+  var prev_children = _current_scope_children
+  var children = vec_new()
+  _current_scope_children = children
+  var s = scope_with_cancel(current_scope())
+  var prev_scope = current_scope_load()
+  current_scope_store(s)
+  var body_result = body()
+  current_scope_store(prev_scope)
+  _current_scope_children = prev_children
+  var had_error = 0
+  var si = 0
+  while si < children.size
+    var r = await children[si]
+    if r == -1
+      had_error = 1
+      scope_cancel(s)
+    end
+    si = si + 1
+  end
+  scope_cancel(s)
+  if had_error == 1
+    return -1
+  end
+  return body_result
+end
+
+# B.7 Phase 5 Bucket 1: structured_supervisor on the unified Scope
+# substrate. Same shape as structured_scope but uses scope_supervised
+# (failures-don't-cascade flag) and collects all results including
+# -1 sentinels for failed children. Returns Vec<Int>.
+def structured_supervisor(body: Fn(): Int): Vec<Int>
+  sched_init(0)
+  var prev_children = _current_scope_children
+  var children = vec_new()
+  _current_scope_children = children
+  var s = scope_supervised(current_scope())
+  var prev_scope = current_scope_load()
+  current_scope_store(s)
+  body()
+  current_scope_store(prev_scope)
+  _current_scope_children = prev_children
+  var results = vec_new()
+  var si = 0
+  while si < children.size
+    results.push(await children[si])
+    si = si + 1
+  end
+  scope_cancel(s)
+  return results
+end
+
+const RESTART_ONE_FOR_ONE = 0
+const RESTART_ONE_FOR_ALL = 1
+const RESTART_REST_FOR_ONE = 2
+
+def supervised(max_restarts: Int, body: Fn(): Int): Int
+  var attempts = 0
+  while attempts <= max_restarts
+    var result = body()
+    if result != -1
+      return result
+    end
+    attempts += 1
+  end
+  return -1
+end
+
+def supervisor_tree(strategy: Int, max_restarts: Int, children: Vec<Fn(): Int>): Int
+  var count = children.size
+  if count == 0
+    return 0
+  end
+  sched_init(0)
+  var restart_count = 0
+  var handles = vec_new()
+  var tokens = vec_new()
+  # Spawn all children with individual cancel tokens
+  var k = 0
+  while k < count
+    var tok = cancel_token_new()
+    tokens.push(tok)
+    handles.push(go_cancellable(children[k], tok))
+    k = k + 1
+  end
+  var completed = 0
+  while completed < count
+    var ci = 0
+    while ci < count
+      if handles[ci] != 0
+        var state = load(handles[ci], 0)
+        if state == -1
+          var cresult = load(handles[ci], 1)
+          if cresult == -1
+            # Child failed — apply restart strategy
+            restart_count += 1
+            if restart_count > max_restarts
+              # Cancel all remaining children
+              var rj = 0
+              while rj < count
+                if handles[rj] != 0
+                  cancel_token_cancel(tokens[rj])
+                end
+                handles[rj] = 0
+                rj = rj + 1
+              end
+              sched_shutdown()
+              return -1
+            end
+            if strategy == RESTART_ONE_FOR_ONE
+              # Cancel + restart only the failed child
+              cancel_token_cancel(tokens[ci])
+              cancel_token_free(tokens[ci])
+              var new_tok = cancel_token_new()
+              tokens[ci] = new_tok
+              handles[ci] = go_cancellable(children[ci], new_tok)
+            elsif strategy == RESTART_ONE_FOR_ALL
+              # Cancel all running children, restart all
+              var rj = 0
+              while rj < count
+                if handles[rj] != 0
+                  cancel_token_cancel(tokens[rj])
+                  cancel_token_free(tokens[rj])
+                end
+                handles[rj] = 0
+                rj = rj + 1
+              end
+              completed = 0
+              rj = 0
+              while rj < count
+                var new_tok = cancel_token_new()
+                tokens[rj] = new_tok
+                handles[rj] = go_cancellable(children[rj], new_tok)
+                rj = rj + 1
+              end
+            elsif strategy == RESTART_REST_FOR_ONE
+              # Cancel failed + all after it, restart them
+              var rj = ci
+              while rj < count
+                if handles[rj] != 0
+                  cancel_token_cancel(tokens[rj])
+                  cancel_token_free(tokens[rj])
+                end
+                handles[rj] = 0
+                rj = rj + 1
+              end
+              rj = ci
+              while rj < count
+                var new_tok = cancel_token_new()
+                tokens[rj] = new_tok
+                handles[rj] = go_cancellable(children[rj], new_tok)
+                rj = rj + 1
+              end
+            end
+          else
+            # Child succeeded — clean up its token
+            cancel_token_free(tokens[ci])
+            tokens[ci] = 0
+            handles[ci] = 0
+            completed += 1
+          end
+        end
+      end
+      ci = ci + 1
+    end
+    sched_yield()
+  end
+  sched_shutdown()
+  return 0
+end
+
+## Spawn a task with cancel-on-success policy.
+## Stores -(tok) at frame[3] — the scheduler cancels the token when
+## this task completes successfully (result != -1).
+## Returns the task frame handle.
+##
+## Phase E.6: body runs inside a per-task arena (`_go_arena_body`).
+def go_cancel_on_success(f: Fn(): Int, tok: Int): Int
+  var task = async _go_arena_body(f)
+  store(task, 3, 0 - tok)
+  sched_spawn(task)
+  return task
+end
+
+# ============================================================================
+# Go-Task Scoped Concurrency (P26) — M:N scheduler nurseries
+# ============================================================================
+
+## go_scope — Nursery for go-tasks. All children spawned via go_spawn
+## are tracked, awaited, and cancelled on failure.
+## Uses M:N scheduler (async/sched_spawn, 317B/task).
+## Returns 0 on success, -1 if any child failed.
+def go_scope(body: Fn(): Int): Int
+  return structured_scope(body)
+end
+
+## go_supervisor — Non-cancelling nursery for go-tasks.
+## Like go_scope but child failures don't cancel siblings.
+## Returns Vec<Int> of all child results (including -1 for failures).
+def go_supervisor(body: Fn(): Int): Vec<Int>
+  return structured_supervisor(body)
+end
+
+## go_scope_timeout — Deadline-bounded nursery for go-tasks.
+## If the deadline expires before all children complete, remaining children
+## are cancelled via their shared cancel token.
+## Returns 0 on success, -1 on child failure, -2 on timeout.
+def go_scope_timeout(timeout_ms: Int, body: Fn(): Int): Int
+  sched_init(0)
+  var prev_children = _current_scope_children
+  var children = vec_new()
+  _current_scope_children = children
+  var s = scope_timeout(current_scope(), timeout_ms)
+  var prev_scope = current_scope_load()
+  current_scope_store(s)
+  var body_result = body()
+  current_scope_store(prev_scope)
+  _current_scope_children = prev_children
+  var had_error = 0
+  var timed_out = 0
+  var si = 0
+  while si < children.size
+    var r = await children[si]
+    if r == -1
+      had_error = 1
+      scope_cancel(s)
+    end
+    si = si + 1
+  end
+  # Phase 4d's proactive deadline timer fires _scope_fire_deadline_exceeded
+  # when the deadline elapses; lazy `scope_is_cancelled` check also fires
+  # one if the deadline passed without an explicit cancel. If had_error
+  # is 0 but the scope is now cancelled, the timer fired before the
+  # children finished — that's the timeout case.
+  if scope_is_cancelled(s) == true and had_error == 0
+    timed_out = 1
+  end
+  scope_cancel(s)
+  if timed_out == 1
+    return -2
+  end
+  if had_error == 1
+    return -1
+  end
+  return body_result
+end
+
+## go_race — First-completed wins. Spawns all tasks as cancellable go-tasks.
+## Each racer sends its result to a shared channel. First recv() gets the winner.
+## Remaining tasks are cancelled via the shared cancel token.
+## tasks: Vec of Fn(): Int — the competing functions.
+## Returns: result of the winning task.
+def go_race(tasks: Vec<Fn(): Int>): Int
+  sched_init(0)
+  var count = tasks.size
+  if count == 0
+    return 0
+  end
+  var token = cancel_token_new()
+  var result_ch = channel_new(count)
+  var handles = vec_new()
+  var k = 0
+  while k < count
+    # Each racer: run function, send result to channel, then cancel others
+    var f = tasks[k]
+    var racer = _go_race_racer(f, result_ch, token)
+    handles.push(racer)
+    k = k + 1
+  end
+  # First recv gives us the winner
+  var winner = recv(result_ch)
+  # Cancel remaining racers
+  cancel_token_cancel(token)
+  # Await all to ensure cleanup
+  var ri = 0
+  while ri < count
+    var _r = await handles[ri]
+    ri = ri + 1
+  end
+  channel_free(result_ch)
+  cancel_token_free(token)
+  return winner
+end
+
+# Helper: spawn a cancellable racer that sends its result to a channel.
+def _go_race_racer(f: Fn(): Int, ch: Int, tok: Int): Int
+  var task = async _go_race_run(f, ch)
+  store(task, 3, tok)
+  sched_spawn(task)
+  return task
+end
+
+# Helper: run a race function and send result to channel.
+# Phase E.6: user function `f()` runs inside a per-task arena
+# (`_go_arena_body`). The channel send happens on libc heap (correct,
+# since the channel is shared across racers).
+def _go_race_run(f: Fn(): Int, ch: Int): Int
+  var result = _go_arena_body(f)
+  send(ch, result)
+  return result
+end

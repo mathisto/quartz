@@ -1,0 +1,2372 @@
+##! # Quartz Doc Generator
+##!
+##! Extracts `##` and `##!` doc comments from Quartz source files
+##! and generates cross-linked Markdown documentation.
+##!
+##! Processes all standard library modules, producing:
+##! - One `.md` file per source file
+##! - An `index.md` with module table
+##! - Cross-linked function references
+##!
+##! Usage:
+##!   quartz doc                     # Generate docs/api/
+##!   quartz doc --output path/      # Custom output dir
+##!   quartz doc serve               # Generate + serve locally
+##!   quartz doc serve --port 8080   # Custom port
+
+import cst_parser
+import cst_lower
+import ast
+import net/http_server
+
+# NodeKind constants (from ast.qz)
+const NODE_FUNCTION   = 34
+const NODE_PROGRAM    = 35
+const NODE_STRUCT_DEF = 36
+const NODE_FIELD_DEF  = 37
+const NODE_ENUM_DEF   = 38
+const NODE_IMPORT     = 48
+const NODE_GLOBAL_VAR = 49
+const NODE_TRAIT_DEF  = 50
+const NODE_IMPL_BLOCK = 51
+const NODE_EXTEND_BLOCK = 52
+const NODE_EXTERN_FN  = 53
+const NODE_CONST_DECL = 69
+const NODE_PARAM      = 33
+const NODE_TYPE_ALIAS = 64
+const NODE_NEWTYPE    = 65
+
+# ============================================================================
+# File Discovery — recursive .qz scanning
+# ============================================================================
+
+## Check if a directory entry should be skipped during discovery.
+def should_skip_dir(name: String): Bool
+  if name == ".git"
+    return true
+  end
+  if name == "tmp"
+    return true
+  end
+  if name == "bin"
+    return true
+  end
+  if name == "node_modules"
+    return true
+  end
+  if name == "_html"
+    return true
+  end
+  if name == "spec"
+    return true
+  end
+  if name == "."
+    return true
+  end
+  if name == ".."
+    return true
+  end
+  return false
+end
+
+## Recursively discover all .qz files under a directory.
+def discover_qz_files(root: String, files: Vec<String>): Void
+  var entries = readdir(root)
+  var count = vec_size(entries)
+  var i = 0
+  while i < count
+    var entry = as_string(entries[i])
+    if should_skip_dir(entry) == false
+      var full_path = path_join(root, entry)
+      if entry.str_ends_with(".qz")
+        files.push(full_path)
+      else
+        # Try as subdirectory — readdir on non-directories returns empty
+        var sub_entries = readdir(full_path)
+        if vec_size(sub_entries) > 0
+          discover_qz_files(full_path, files)
+        end
+      end
+    end
+    i += 1
+  end
+end
+
+## Discover all .qz files in one or more source directories.
+def discover_files(src_dirs: Vec<String>): Vec<String>
+  var files: Vec<String> = vec_new()
+  var i = 0
+  while i < src_dirs.size
+    discover_qz_files(src_dirs[i], files)
+    i += 1
+  end
+  return files
+end
+
+# ============================================================================
+# Dynamic Module Grouping
+# ============================================================================
+
+## Get the directory prefix of a module name (e.g. "net/tcp" -> "net", "prelude" -> "").
+def module_prefix(mod_name: String): String
+  var slash_pos = -1
+  var i = 0
+  while i < str_byte_len(mod_name)
+    if mod_name.byte_at(i) == '/'  # '/'
+      slash_pos = i
+    end
+    i += 1
+  end
+  if slash_pos > 0
+    return mod_name.byte_slice(0, slash_pos)
+  end
+  return ""
+end
+
+## Capitalize a string for display (e.g. "net" -> "Net", "ffi" -> "Ffi").
+def capitalize(s: String): String
+  if str_byte_len(s) == 0
+    return "Core"
+  end
+  var first = s.byte_at(0)
+  if first >= 'a'
+    if first <= 'z'
+      return str_from_char(first - 32) + s.byte_slice(1, str_byte_len(s))
+    end
+  end
+  return s
+end
+
+## Collect unique group prefixes in order from module names.
+def collect_group_prefixes(module_names: Vec<String>): Vec<String>
+  var prefixes: Vec<String> = vec_new()
+  var i = 0
+  while i < module_names.size
+    var p = module_prefix(module_names[i])
+    # Check if already in list
+    var found = false
+    var j = 0
+    while j < prefixes.size
+      if prefixes[j] == p
+        found = true
+        break
+      end
+      j += 1
+    end
+    if found == false
+      prefixes.push(p)
+    end
+    i += 1
+  end
+  return prefixes
+end
+
+## Derive the module name from a file path relative to std/.
+## e.g. "std/net/http_server.qz" -> "net/http_server"
+def module_name_from_path(filepath: String, std_path: String): String
+  # Strip std_path prefix
+  var rel = filepath
+  if filepath.str_starts_with(std_path)
+    var prefix_len = str_byte_len(std_path)
+    if filepath.byte_at(prefix_len) == '/'  # '/'
+      rel = filepath.byte_slice(prefix_len + 1, str_byte_len(filepath))
+    else
+      rel = filepath.byte_slice(prefix_len, str_byte_len(filepath))
+    end
+  end
+  # Strip .qz extension
+  if rel.str_ends_with(".qz")
+    rel = rel.byte_slice(0, str_byte_len(rel) - 3)
+  end
+  return rel
+end
+
+## Derive the output markdown path from a module name.
+## e.g. "net/http_server" -> "docs/api/net/http_server.md"
+def output_path_for_module(output_dir: String, mod_name: String): String
+  return path_join(output_dir, mod_name + ".md")
+end
+
+# ============================================================================
+# Symbol Index — maps function/struct/enum names to their module
+# ============================================================================
+
+struct SymbolIndex
+  names: Vec<String>
+  modules: Vec<String>
+  kinds: Vec<String>
+end
+
+def symbol_index_new(): SymbolIndex
+  return SymbolIndex {
+    names: vec_new<String>(),
+    modules: vec_new<String>(),
+    kinds: vec_new<String>()
+  }
+end
+
+def symbol_index_add(idx: SymbolIndex, name: String, module: String, kind: String): Void
+  idx.names.push(name)
+  idx.modules.push(module)
+  idx.kinds.push(kind)
+end
+
+## Find the module that defines a given symbol name.
+def symbol_index_find_kind(idx: SymbolIndex, name: String): String
+  var i = 0
+  while i < idx.names.size
+    if idx.names[i] == name
+      return idx.kinds[i]
+    end
+    i += 1
+  end
+  return ""
+end
+
+## Find the module that defines a given symbol name.
+def symbol_index_find(idx: SymbolIndex, name: String): String
+  var i = 0
+  while i < idx.names.size
+    if idx.names[i] == name
+      return idx.modules[i]
+    end
+    i += 1
+  end
+  return ""
+end
+
+# ============================================================================
+# Parameter Extraction
+# ============================================================================
+
+## Format a function signature from AST.
+def extract_signature(storage: Int, h: Int): String
+  var name = ast_get_str1(storage, h)
+  var return_type = ast_get_str2(storage, h)
+  var children = ast_get_children(storage, h)
+
+  var sb = sb_new()
+  sb.append(name)
+  sb.append("(")
+
+  if children != 0
+    var n = children.size
+    # Count only params (NODE_PARAM = 33), skip body nodes
+    var param_count = 0
+    var pi = 0
+    while pi < n
+      var child_h = children[pi]
+      var kind = ast_get_kind(storage, child_h)
+      if kind == NODE_PARAM
+        if param_count > 0
+          sb.append(", ")
+        end
+        var pname = ast_get_str1(storage, child_h)
+        var ptype = ast_get_str2(storage, child_h)
+        sb.append(pname)
+        if str_byte_len(ptype) > 0
+          sb.append(": ")
+          sb.append(ptype)
+        end
+        param_count = param_count + 1
+      end
+      pi = pi + 1
+    end
+  end
+
+  sb.append(")")
+
+  if str_byte_len(return_type) > 0
+    sb.append(": ")
+    sb.append(return_type)
+  end
+
+  return sb.to_string()
+end
+
+## Extract struct field info as a markdown table.
+def extract_struct_fields(storage: Int, h: Int): String
+  var children = ast_get_children(storage, h)
+  if children == 0
+    return ""
+  end
+
+  # Check if any field has docs
+  var has_docs = false
+  var n = children.size
+  var i = 0
+  while i < n
+    var field_h = children[i]
+    if ast_get_kind(storage, field_h) == NODE_FIELD_DEF
+      var fdoc = ast_get_doc(storage, field_h)
+      if str_byte_len(fdoc) > 0
+        has_docs = true
+      end
+    end
+    i += 1
+  end
+
+  var sb = sb_new()
+  if has_docs
+    sb.append("| Field | Type | Description |\n|-------|------|-------------|\n")
+  else
+    sb.append("| Field | Type |\n|-------|------|\n")
+  end
+  i = 0
+  while i < n
+    var field_h = children[i]
+    var kind = ast_get_kind(storage, field_h)
+    if kind == NODE_FIELD_DEF
+      var fname = ast_get_str1(storage, field_h)
+      var ftype = ast_get_str2(storage, field_h)
+      sb.append("| `")
+      sb.append(fname)
+      sb.append("` | `")
+      sb.append(ftype)
+      sb.append("` |")
+      if has_docs
+        var fdoc = ast_get_doc(storage, field_h)
+        if str_byte_len(fdoc) > 0
+          sb.append(" ")
+          sb.append(extract_first_line(fdoc))
+        end
+        sb.append(" |")
+      end
+      sb.append("\n")
+    end
+    i += 1
+  end
+  return sb.to_string()
+end
+
+## Extract enum variant info as a markdown table.
+def extract_enum_variants(storage: Int, h: Int): String
+  var children = ast_get_children(storage, h)
+  if children == 0
+    return ""
+  end
+
+  var sb = sb_new()
+  sb.append("| Variant | Payload |\n|---------|----------|\n")
+  var n = children.size
+  var i = 0
+  while i < n
+    var variant_h = children[i]
+    var vname = ast_get_str1(storage, variant_h)
+    var payload = ast_get_str2(storage, variant_h)
+    sb.append("| `")
+    sb.append(vname)
+    sb.append("` | ")
+    if str_byte_len(payload) > 0
+      sb.append("`")
+      sb.append(payload)
+      sb.append("`")
+    else
+      sb.append("—")
+    end
+    sb.append(" |\n")
+    i += 1
+  end
+  return sb.to_string()
+end
+
+## Extract extern function signature.
+def extract_extern_signature(storage: Int, h: Int): String
+  var name = ast_get_str1(storage, h)
+  var return_type = ast_get_str2(storage, h)
+  var children = ast_get_children(storage, h)
+
+  var sb = sb_new()
+  sb.append(name)
+  sb.append("(")
+  if children != 0
+    var n = children.size
+    var i = 0
+    while i < n
+      if i > 0
+        sb.append(", ")
+      end
+      var param_h = children[i]
+      var pname = ast_get_str1(storage, param_h)
+      var ptype = ast_get_str2(storage, param_h)
+      sb.append(pname)
+      if str_byte_len(ptype) > 0
+        sb.append(": ")
+        sb.append(ptype)
+      end
+      i += 1
+    end
+  end
+  sb.append(")")
+  if str_byte_len(return_type) > 0
+    sb.append(": ")
+    sb.append(return_type)
+  end
+  return sb.to_string()
+end
+
+# ============================================================================
+# Pass 1: Collect all symbols for cross-linking
+# ============================================================================
+
+## Walk a parsed file and register all symbols in the index.
+def collect_symbols(storage: Int, root: Int, mod_name: String, idx: SymbolIndex): Void
+  var children = ast_get_children(storage, root)
+  if children == 0
+    return
+  end
+  var n = children.size
+  var i = 0
+  while i < n
+    var h = children[i]
+    var kind = ast_get_kind(storage, h)
+
+    if kind == NODE_FUNCTION
+      var name = ast_get_str1(storage, h)
+      symbol_index_add(idx, name, mod_name, "function")
+    elsif kind == NODE_STRUCT_DEF
+      var name = ast_get_str1(storage, h)
+      symbol_index_add(idx, name, mod_name, "struct")
+    elsif kind == NODE_ENUM_DEF
+      var name = ast_get_str1(storage, h)
+      symbol_index_add(idx, name, mod_name, "enum")
+    elsif kind == NODE_CONST_DECL
+      var name = ast_get_str1(storage, h)
+      symbol_index_add(idx, name, mod_name, "const")
+    elsif kind == NODE_EXTERN_FN
+      var name = ast_get_str1(storage, h)
+      symbol_index_add(idx, name, mod_name, "extern")
+    elsif kind == NODE_TYPE_ALIAS
+      var name = ast_get_str1(storage, h)
+      symbol_index_add(idx, name, mod_name, "type")
+    elsif kind == NODE_NEWTYPE
+      var name = ast_get_str1(storage, h)
+      symbol_index_add(idx, name, mod_name, "newtype")
+    elsif kind == NODE_TRAIT_DEF
+      var name = ast_get_str1(storage, h)
+      symbol_index_add(idx, name, mod_name, "trait")
+    elsif kind == NODE_IMPL_BLOCK
+      # str1 = trait name, str2 = implementing type
+      var for_type = ast_get_str2(storage, h)
+      var impl_children = ast_get_children(storage, h)
+      if impl_children != 0
+        var ci = 0
+        while ci < impl_children.size
+          var method_h = impl_children[ci]
+          var method_kind = ast_get_kind(storage, method_h)
+          if method_kind == NODE_FUNCTION
+            var method_name = ast_get_str1(storage, method_h)
+            symbol_index_add(idx, for_type + "." + method_name, mod_name, "method")
+          end
+          ci = ci + 1
+        end
+      end
+    elsif kind == NODE_EXTEND_BLOCK
+      # str1 = type being extended
+      var for_type = ast_get_str1(storage, h)
+      var ext_children = ast_get_children(storage, h)
+      if ext_children != 0
+        var ci = 0
+        while ci < ext_children.size
+          var method_h = ext_children[ci]
+          var method_kind = ast_get_kind(storage, method_h)
+          if method_kind == NODE_FUNCTION
+            var method_name = ast_get_str1(storage, method_h)
+            symbol_index_add(idx, for_type + "." + method_name, mod_name, "method")
+          end
+          ci = ci + 1
+        end
+      end
+    end
+
+    i += 1
+  end
+end
+
+# ============================================================================
+# Pass 2: Generate Markdown for each module
+# ============================================================================
+
+## Render methods from impl/extend blocks for a given type name.
+def render_methods_for_type(sb: Int, type_name: String, impl_type_names: Vec<String>, impl_trait_names: Vec<String>, impl_method_handles: Vec<Int>, impl_storages: Vec<Int>): Void
+  # Collect inherent methods (no trait) and trait impl methods
+  var has_inherent = false
+  var has_trait = false
+  var i = 0
+  while i < impl_type_names.size
+    if impl_type_names[i] == type_name
+      if str_byte_len(impl_trait_names[i]) == 0
+        has_inherent = true
+      else
+        has_trait = true
+      end
+    end
+    i += 1
+  end
+
+  # Render inherent methods
+  if has_inherent
+    sb_append(sb, "#### Methods\n\n")
+    i = 0
+    while i < impl_type_names.size
+      if impl_type_names[i] == type_name
+        if str_byte_len(impl_trait_names[i]) == 0
+          var mh = impl_method_handles[i]
+          var st = impl_storages[i]
+          var sig = extract_signature(st, mh)
+          var doc = ast_get_doc(st, mh)
+          sb_append(sb, "##### `")
+          sb_append(sb, sig)
+          sb_append(sb, "`\n\n")
+          if str_byte_len(doc) > 0
+            sb_append(sb, doc)
+            sb_append(sb, "\n\n")
+          end
+        end
+      end
+      i += 1
+    end
+  end
+
+  # Render trait implementations
+  if has_trait
+    sb_append(sb, "#### Trait Implementations\n\n")
+    # Collect unique trait names for this type
+    var seen_traits: Vec<String> = vec_new()
+    i = 0
+    while i < impl_type_names.size
+      if impl_type_names[i] == type_name
+        var tn = impl_trait_names[i]
+        if str_byte_len(tn) > 0
+          var found = false
+          var j = 0
+          while j < seen_traits.size
+            if seen_traits[j] == tn
+              found = true
+              break
+            end
+            j += 1
+          end
+          if found == false
+            seen_traits.push(tn)
+          end
+        end
+      end
+      i += 1
+    end
+    # Render methods grouped by trait
+    var ti = 0
+    while ti < seen_traits.size
+      var trait_n = seen_traits[ti]
+      sb_append(sb, "**impl ")
+      sb_append(sb, trait_n)
+      sb_append(sb, " for ")
+      sb_append(sb, type_name)
+      sb_append(sb, "**\n\n")
+      i = 0
+      while i < impl_type_names.size
+        if impl_type_names[i] == type_name
+          if impl_trait_names[i] == trait_n
+            var mh = impl_method_handles[i]
+            var st = impl_storages[i]
+            var sig = extract_signature(st, mh)
+            var doc = ast_get_doc(st, mh)
+            sb_append(sb, "##### `")
+            sb_append(sb, sig)
+            sb_append(sb, "`\n\n")
+            if str_byte_len(doc) > 0
+              sb_append(sb, doc)
+              sb_append(sb, "\n\n")
+            end
+          end
+        end
+        i += 1
+      end
+      ti = ti + 1
+    end
+  end
+end
+
+## Escape a string for JSON output.
+def json_escape(s: String): String
+  var sb = sb_new()
+  var i = 0
+  while i < str_byte_len(s)
+    var c = s.byte_at(i)
+    if c == '"'
+      sb.append("\\\"")
+    elsif c == '\\'
+      sb.append("\\\\")
+    elsif c == '\n'
+      sb.append("\\n")
+    elsif c == '\r'
+      sb.append("\\r")
+    elsif c == '\t'
+      sb.append("\\t")
+    else
+      sb.append_char(c)
+    end
+    i += 1
+  end
+  return sb.to_string()
+end
+
+## Generate breadcrumb navigation HTML.
+def generate_breadcrumbs(mod_name: String): String
+  if mod_name == "index"
+    return "<nav class=\"breadcrumbs\"><span>Index</span></nav>\n"
+  end
+  var sb = sb_new()
+  sb.append("<nav class=\"breadcrumbs\"><a href=\"/index.html\">Index</a>")
+  # Check for subdirectory modules like "net/tcp"
+  var slash_pos = -1
+  var i = 0
+  while i < str_byte_len(mod_name)
+    if mod_name.byte_at(i) == '/'  # /
+      slash_pos = i
+    end
+    i += 1
+  end
+  if slash_pos > 0
+    var dir = mod_name.byte_slice(0, slash_pos)
+    var leaf = mod_name.byte_slice(slash_pos + 1, str_byte_len(mod_name))
+    sb.append(" &rsaquo; <span>")
+    sb.append(dir)
+    sb.append("</span> &rsaquo; <span>")
+    sb.append(leaf)
+    sb.append("</span>")
+  else
+    sb.append(" &rsaquo; <span>")
+    sb.append(mod_name)
+    sb.append("</span>")
+  end
+  sb.append("</nav>\n")
+  return sb.to_string()
+end
+
+## Extract headings from HTML body and build a table of contents.
+## Scans for <h2 id="..."> and <h3 id="..."> patterns.
+def generate_toc(body_html: String): String
+  var sb = sb_new()
+  sb.append("<aside class=\"toc-sidebar\" id=\"page-toc\">\n")
+  sb.append("<h4>On This Page</h4>\n<ul>\n")
+
+  var i = 0
+  var len = str_byte_len(body_html)
+  var in_h2 = false
+  while i < len
+    # Look for <h2 id=" or <h3 id="
+    if i + 7 < len
+      if body_html.byte_at(i) == '<'
+        if body_html.byte_at(i + 1) == 'h'
+          var level = body_html.byte_at(i + 2)
+          if level == '2' or level == '3'
+            if body_html.byte_at(i + 3) == ' '
+              if body_html.byte_at(i + 4) == 'i'
+                if body_html.byte_at(i + 5) == 'd'
+                  if body_html.byte_at(i + 6) == '='
+                    if body_html.byte_at(i + 7) == '"'
+                      # Extract the id
+                      var id_start = i + 8
+                      var id_end = id_start
+                      while id_end < len
+                        if body_html.byte_at(id_end) == '"'
+                          break
+                        end
+                        id_end = id_end + 1
+                      end
+                      var anchor_id = body_html.byte_slice(id_start, id_end)
+                      # Find the closing > and then extract text until </h2> or </h3>
+                      var tag_end = id_end + 1
+                      while tag_end < len
+                        if body_html.byte_at(tag_end) == '>'
+                          break
+                        end
+                        tag_end = tag_end + 1
+                      end
+                      var text_start = tag_end + 1
+                      # Find closing </hN>
+                      var text_end = text_start
+                      while text_end + 4 < len
+                        if body_html.byte_at(text_end) == '<'
+                          if body_html.byte_at(text_end + 1) == '/'
+                            if body_html.byte_at(text_end + 2) == 'h'
+                              break
+                            end
+                          end
+                        end
+                        text_end = text_end + 1
+                      end
+                      var heading_text = body_html.byte_slice(text_start, text_end)
+                      # Strip HTML tags from heading text for display
+                      var clean = strip_html_tags(heading_text)
+                      # Strip source ref *(file:line)* from TOC text
+                      var paren_pos = -1
+                      var ci2 = 0
+                      while ci2 < str_byte_len(clean)
+                        if clean.byte_at(ci2) == '*'
+                          if ci2 + 1 < str_byte_len(clean)
+                            if clean.byte_at(ci2 + 1) == '('
+                              paren_pos = ci2
+                              break
+                            end
+                          end
+                        end
+                        ci2 = ci2 + 1
+                      end
+                      if paren_pos > 0
+                        clean = str_trim(clean.byte_slice(0, paren_pos))
+                      end
+                      # Truncate long names
+                      if str_byte_len(clean) > 40
+                        clean = clean.byte_slice(0, 37) + "..."
+                      end
+
+                      if level == 50  # h2
+                        if in_h2
+                          sb.append("</ul></li>\n")
+                        end
+                        sb.append("<li><a href=\"#")
+                        sb.append(anchor_id)
+                        sb.append("\">")
+                        sb.append(clean)
+                        sb.append("</a>\n<ul>\n")
+                        in_h2 = true
+                      else  # h3
+                        sb.append("<li><a href=\"#")
+                        sb.append(anchor_id)
+                        sb.append("\">")
+                        sb.append(clean)
+                        sb.append("</a></li>\n")
+                      end
+                      i = text_end
+                      continue
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    i += 1
+  end
+
+  if in_h2
+    sb.append("</ul></li>\n")
+  end
+  sb.append("</ul>\n</aside>\n")
+  return sb.to_string()
+end
+
+## Strip HTML tags from a string for plain-text display.
+def strip_html_tags(s: String): String
+  var sb = sb_new()
+  var i = 0
+  var in_tag = false
+  while i < str_byte_len(s)
+    var c = s.byte_at(i)
+    if c == '<'
+      in_tag = true
+    elsif c == '>'
+      in_tag = false
+    elsif in_tag == false
+      sb.append_char(c)
+    end
+    i += 1
+  end
+  return sb.to_string()
+end
+
+## Cross-link symbol references in HTML.
+## Scans for <code>SymbolName</code> patterns and replaces with links
+## to the symbol's definition page. Only links text inside <code> tags
+## to avoid false positives with common words.
+def cross_link_html(html: String, idx: SymbolIndex, current_module: String): String
+  var sb = sb_new()
+  var i = 0
+  var len = str_byte_len(html)
+  while i < len
+    # Look for <code> tags
+    if i + 5 < len
+      if html.byte_at(i) == '<'
+        if html.byte_at(i + 1) == 'c'
+          if html.byte_at(i + 2) == 'o'
+            if html.byte_at(i + 3) == 'd'
+              if html.byte_at(i + 4) == 'e'
+                if html.byte_at(i + 5) == '>'
+                  # Found <code>, find closing </code>
+                  var code_start = i + 6
+                  var code_end = code_start
+                  while code_end + 6 < len
+                    if html.byte_at(code_end) == '<'
+                      if html.byte_at(code_end + 1) == '/'
+                        if html.byte_at(code_end + 2) == 'c'
+                          if html.byte_at(code_end + 3) == 'o'
+                            if html.byte_at(code_end + 4) == 'd'
+                              if html.byte_at(code_end + 5) == 'e'
+                                if html.byte_at(code_end + 6) == '>'
+                                  break
+                                end
+                              end
+                            end
+                          end
+                        end
+                      end
+                    end
+                    code_end = code_end + 1
+                  end
+                  var code_text = html.byte_slice(code_start, code_end)
+                  # Try to find this symbol in the index
+                  var target_mod = symbol_index_find(idx, code_text)
+                  if str_byte_len(target_mod) > 0
+                    var anchor = make_anchor(code_text)
+                    if target_mod == current_module
+                      # Same-module: in-page anchor
+                      sb.append("<code><a href=\"#")
+                      sb.append(anchor)
+                      sb.append("\">")
+                      sb.append(code_text)
+                      sb.append("</a></code>")
+                    else
+                      # Cross-module: link to other page
+                      sb.append("<code><a href=\"/")
+                      sb.append(target_mod)
+                      sb.append(".html#")
+                      sb.append(anchor)
+                      sb.append("\">")
+                      sb.append(code_text)
+                      sb.append("</a></code>")
+                    end
+                    i = code_end + 7  # skip past </code>
+                    continue
+                  end
+                  # No match — emit as-is
+                  sb.append("<code>")
+                  sb.append(code_text)
+                  sb.append("</code>")
+                  i = code_end + 7
+                  continue
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    sb.append_char(html.byte_at(i))
+    i += 1
+  end
+  return sb.to_string()
+end
+
+## Format a source location reference.
+def source_ref(filepath: String, storage: Int, h: Int): String
+  var line = ast_get_line(storage, h)
+  if line > 0
+    return " *(" + filepath + ":" + str_from_int(line) + ")*"
+  end
+  return ""
+end
+
+## Generate markdown documentation for a single parsed file.
+def generate_module_doc(storage: Int, root: Int, mod_name: String, filepath: String): String
+  var sb = sb_new()
+
+  # Module header from ##! comments
+  var module_doc = ast_get_doc(storage, root)
+  if str_byte_len(module_doc) > 0
+    sb.append("# ")
+    sb.append(mod_name)
+    sb.append("\n\n> ")
+    sb.append(extract_first_line(module_doc))
+    sb.append("\n\n")
+    # Add full module doc (skip the first line which is the title)
+    var rest = skip_first_line(module_doc)
+    if str_byte_len(rest) > 0
+      sb.append(rest)
+      sb.append("\n\n")
+    end
+  else
+    sb.append("# ")
+    sb.append(mod_name)
+    sb.append("\n\n")
+  end
+
+  # Categorize top-level items
+  var children = ast_get_children(storage, root)
+  if children == 0
+    return sb.to_string()
+  end
+
+  var n = children.size
+
+  # Collect functions, structs, enums, consts, extern fns, etc.
+  var func_handles: Vec<Int> = vec_new()
+  var struct_handles: Vec<Int> = vec_new()
+  var enum_handles: Vec<Int> = vec_new()
+  var const_handles: Vec<Int> = vec_new()
+  var extern_handles: Vec<Int> = vec_new()
+  var type_handles: Vec<Int> = vec_new()
+  var trait_handles: Vec<Int> = vec_new()
+
+  var i = 0
+  while i < n
+    var h = children[i]
+    var kind = ast_get_kind(storage, h)
+    if kind == NODE_FUNCTION
+      func_handles.push(h)
+    elsif kind == NODE_STRUCT_DEF
+      struct_handles.push(h)
+    elsif kind == NODE_ENUM_DEF
+      enum_handles.push(h)
+    elsif kind == NODE_CONST_DECL
+      const_handles.push(h)
+    elsif kind == NODE_EXTERN_FN
+      extern_handles.push(h)
+    elsif kind == NODE_TYPE_ALIAS
+      type_handles.push(h)
+    elsif kind == NODE_NEWTYPE
+      type_handles.push(h)
+    elsif kind == NODE_TRAIT_DEF
+      trait_handles.push(h)
+    end
+    i += 1
+  end
+
+  # Collect impl/extend block methods indexed by parent type name
+  var impl_type_names: Vec<String> = vec_new()
+  var impl_trait_names: Vec<String> = vec_new()
+  var impl_method_handles: Vec<Int> = vec_new()
+  var impl_storages: Vec<Int> = vec_new()
+  i = 0
+  while i < n
+    var h = children[i]
+    var kind = ast_get_kind(storage, h)
+    if kind == NODE_IMPL_BLOCK
+      var trait_name = ast_get_str1(storage, h)
+      var for_type = ast_get_str2(storage, h)
+      var impl_children = ast_get_children(storage, h)
+      if impl_children != 0
+        var ci = 0
+        while ci < impl_children.size
+          var mh = impl_children[ci]
+          if ast_get_kind(storage, mh) == NODE_FUNCTION
+            impl_type_names.push(for_type)
+            impl_trait_names.push(trait_name)
+            impl_method_handles.push(mh)
+            impl_storages.push(storage)
+          end
+          ci = ci + 1
+        end
+      end
+    elsif kind == NODE_EXTEND_BLOCK
+      var for_type = ast_get_str1(storage, h)
+      var ext_children = ast_get_children(storage, h)
+      if ext_children != 0
+        var ci = 0
+        while ci < ext_children.size
+          var mh = ext_children[ci]
+          if ast_get_kind(storage, mh) == NODE_FUNCTION
+            impl_type_names.push(for_type)
+            impl_trait_names.push("")
+            impl_method_handles.push(mh)
+            impl_storages.push(storage)
+          end
+          ci = ci + 1
+        end
+      end
+    end
+    i += 1
+  end
+
+  # --- Structs ---
+  if struct_handles.size > 0
+    sb.append("## Structs\n\n")
+    i = 0
+    while i < struct_handles.size
+      var h = struct_handles[i]
+      var name = ast_get_str1(storage, h)
+      var type_params = ast_get_str2(storage, h)
+      var doc = ast_get_doc(storage, h)
+      sb.append("### `")
+      sb.append(name)
+      if str_byte_len(type_params) > 0
+        sb.append("<")
+        sb.append(type_params)
+        sb.append(">")
+      end
+      sb.append("`")
+      sb.append(source_ref(filepath, storage, h))
+      sb.append("\n\n")
+      if str_byte_len(doc) > 0
+        sb.append(doc)
+        sb.append("\n\n")
+      end
+      var fields = extract_struct_fields(storage, h)
+      if fields.size > 0
+        sb.append(fields)
+        sb.append("\n")
+      end
+      # Render methods for this type
+      render_methods_for_type(sb, name, impl_type_names, impl_trait_names, impl_method_handles, impl_storages)
+      i += 1
+    end
+  end
+
+  # --- Enums ---
+  if enum_handles.size > 0
+    sb.append("## Enums\n\n")
+    i = 0
+    while i < enum_handles.size
+      var h = enum_handles[i]
+      var name = ast_get_str1(storage, h)
+      var type_params = ast_get_str2(storage, h)
+      var doc = ast_get_doc(storage, h)
+      sb.append("### `")
+      sb.append(name)
+      if str_byte_len(type_params) > 0
+        sb.append("<")
+        sb.append(type_params)
+        sb.append(">")
+      end
+      sb.append("`")
+      sb.append(source_ref(filepath, storage, h))
+      sb.append("\n\n")
+      if str_byte_len(doc) > 0
+        sb.append(doc)
+        sb.append("\n\n")
+      end
+      var variants = extract_enum_variants(storage, h)
+      if variants.size > 0
+        sb.append(variants)
+        sb.append("\n")
+      end
+      # Render methods for this type
+      render_methods_for_type(sb, name, impl_type_names, impl_trait_names, impl_method_handles, impl_storages)
+      i += 1
+    end
+  end
+
+  # --- Traits ---
+  if trait_handles.size > 0
+    sb.append("## Traits\n\n")
+    i = 0
+    while i < trait_handles.size
+      var h = trait_handles[i]
+      var name = ast_get_str1(storage, h)
+      var doc = ast_get_doc(storage, h)
+      sb.append("### `")
+      sb.append(name)
+      sb.append("`\n\n")
+      if str_byte_len(doc) > 0
+        sb.append(doc)
+        sb.append("\n\n")
+      end
+      i += 1
+    end
+  end
+
+  # --- Type Aliases ---
+  if type_handles.size > 0
+    sb.append("## Type Aliases\n\n")
+    i = 0
+    while i < type_handles.size
+      var h = type_handles[i]
+      var name = ast_get_str1(storage, h)
+      var target_type = ast_get_str2(storage, h)
+      var doc = ast_get_doc(storage, h)
+      sb.append("### `")
+      sb.append(name)
+      sb.append("`\n\n")
+      if str_byte_len(target_type) > 0
+        sb.append("Alias for `")
+        sb.append(target_type)
+        sb.append("`\n\n")
+      end
+      if str_byte_len(doc) > 0
+        sb.append(doc)
+        sb.append("\n\n")
+      end
+      i += 1
+    end
+  end
+
+  # --- Constants ---
+  if const_handles.size > 0
+    sb.append("## Constants\n\n")
+    i = 0
+    while i < const_handles.size
+      var h = const_handles[i]
+      var name = ast_get_str1(storage, h)
+      var doc = ast_get_doc(storage, h)
+      sb.append("### `")
+      sb.append(name)
+      sb.append("`\n\n")
+      if str_byte_len(doc) > 0
+        sb.append(doc)
+        sb.append("\n\n")
+      end
+      i += 1
+    end
+  end
+
+  # --- Functions ---
+  if func_handles.size > 0
+    sb.append("## Functions\n\n")
+    i = 0
+    while i < func_handles.size
+      var h = func_handles[i]
+      var sig = extract_signature(storage, h)
+      var doc = ast_get_doc(storage, h)
+      sb.append("### `")
+      sb.append(sig)
+      sb.append("`")
+      sb.append(source_ref(filepath, storage, h))
+      sb.append("\n\n")
+      if str_byte_len(doc) > 0
+        sb.append(doc)
+        sb.append("\n\n")
+      end
+      sb.append("---\n\n")
+      i += 1
+    end
+  end
+
+  # --- Extern Functions ---
+  if extern_handles.size > 0
+    sb.append("## FFI Functions\n\n")
+    i = 0
+    while i < extern_handles.size
+      var h = extern_handles[i]
+      var sig = extract_extern_signature(storage, h)
+      var doc = ast_get_doc(storage, h)
+      sb.append("### `")
+      sb.append(sig)
+      sb.append("`")
+      sb.append(source_ref(filepath, storage, h))
+      sb.append("\n\n")
+      if str_byte_len(doc) > 0
+        sb.append(doc)
+        sb.append("\n\n")
+      end
+      i += 1
+    end
+  end
+
+  return sb.to_string()
+end
+
+# ============================================================================
+# Index Generation
+# ============================================================================
+
+## Group info for the index table.
+struct ModuleInfo
+  name: String
+  description: String
+  func_count: Int
+  struct_count: Int
+  enum_count: Int
+end
+
+## Generate the index.md page.
+def generate_index(modules: Vec<ModuleInfo>): String
+  var sb = sb_new()
+  sb.append("# Quartz Standard Library\n\n")
+  sb.append("> Auto-generated API documentation for the Quartz standard library.\n\n")
+  sb.append("## Modules\n\n")
+  sb.append("| Module | Description | Functions | Types |\n")
+  sb.append("|--------|-------------|-----------|-------|\n")
+
+  var i = 0
+  while i < modules.size
+    var m = modules[i]
+    sb.append("| [")
+    sb.append(m.name)
+    sb.append("](")
+    sb.append(m.name)
+    sb.append(".md) | ")
+    sb.append(m.description)
+    sb.append(" | ")
+    sb.append(to_string(m.func_count))
+    sb.append(" | ")
+    var types_count = m.struct_count + m.enum_count
+    sb.append(to_string(types_count))
+    sb.append(" |\n")
+    i += 1
+  end
+
+  sb.append("\n---\n\n")
+  sb.append("*Generated by `quartz doc`*\n")
+  return sb.to_string()
+end
+
+# ============================================================================
+# String Helpers
+# ============================================================================
+
+## Extract the first line of a multi-line string.
+def extract_first_line(s: String): String
+  var i = 0
+  while i < str_byte_len(s)
+    if s.byte_at(i) == '\n'
+      return s.byte_slice(0, i)
+    end
+    i += 1
+  end
+  return s
+end
+
+## Skip the first line and return the rest.
+def skip_first_line(s: String): String
+  var i = 0
+  while i < str_byte_len(s)
+    if s.byte_at(i) == '\n'
+      if i + 1 < str_byte_len(s)
+        return s.byte_slice(i + 1, str_byte_len(s))
+      else
+        return ""
+      end
+    end
+    i += 1
+  end
+  return ""
+end
+
+## Convert integer to string.
+def to_string(n: Int): String
+  return str_from_int(n)
+end
+
+## Ensure parent directories exist for a path.
+def ensure_parent_dirs(path: String): Void
+  # Find all / characters and create directories
+  var i = 0
+  while i < str_byte_len(path)
+    if path.byte_at(i) == '/'
+      if i > 0
+        var dir = path.byte_slice(0, i)
+        mkdir(dir)
+      end
+    end
+    i += 1
+  end
+end
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+## Parse a single .qz file and return (storage, root) via out params.
+## Returns 1 on success, 0 on failure.
+def parse_file(filepath: String): Vec<Int>
+  var source = read_file(filepath)
+  if str_byte_len(source) == 0
+    return vec_new()
+  end
+
+  # CST parse route (the sole parser). cst_parse_source lexes internally and
+  # takes raw source; cst_lower produces the AST into a fresh storage.
+  var res = cst_parser::cst_parse_source(source)
+  if res.parser.had_error == 1
+    var first_msg = "parse error"
+    if res.parser.err_msgs.size > 0 and str_byte_len(res.parser.err_msgs[0]) > 0
+      first_msg = res.parser.err_msgs[0]
+    end
+    eprint("warning: parse error in ")
+    eprint(filepath)
+    eprint(": ")
+    eprint(first_msg)
+    eprint("\n")
+    return vec_new()
+  end
+
+  var ast_storage = ast::ast_new_storage()
+  var root = cst_lower::cst_lower(res.parser.store, res.root, ast_storage)
+
+  var result: Vec<Int> = vec_new()
+  result.push(as_int(ast_storage))
+  result.push(root)
+  return result
+end
+
+## Count items of a specific kind in a program node.
+def count_items(storage: Int, root: Int, target_kind: Int): Int
+  var children = ast_get_children(storage, root)
+  if children == 0
+    return 0
+  end
+  var n = children.size
+  var count = 0
+  var i = 0
+  while i < n
+    var h = children[i]
+    var kind = ast_get_kind(storage, h)
+    if kind == target_kind
+      count += 1
+    end
+    i += 1
+  end
+  return count
+end
+
+def main(): Int
+  # Parse CLI
+  var output_dir = "docs/api"
+  var src_dirs: Vec<String> = vec_new()
+  var serve_mode = 0
+  var serve_port = 4000
+  var theme = "tokyo-night"
+  var filter_private = 0
+
+  var i = 1
+  while i < argc()
+    var arg = argv(i)
+    if arg == "--help"
+      print_help()
+      return 0
+    elsif arg == "-h"
+      print_help()
+      return 0
+    elsif arg == "--output"
+      i += 1
+      if i < argc()
+        output_dir = argv(i)
+      end
+    elsif arg == "--src"
+      i += 1
+      if i < argc()
+        src_dirs.push(argv(i))
+      end
+    elsif arg == "--std-path"
+      # Legacy compat: treat as --src
+      i += 1
+      if i < argc()
+        src_dirs.push(argv(i))
+      end
+    elsif arg == "--no-private"
+      filter_private = 1
+    elsif arg == "serve"
+      serve_mode = 1
+    elsif arg == "--port"
+      i += 1
+      if i < argc()
+        serve_port = argv(i).to_i()
+      end
+    elsif arg == "--theme"
+      i += 1
+      if i < argc()
+        theme = argv(i)
+      end
+    end
+    i += 1
+  end
+
+  # Default to std/ if no source directories specified
+  if src_dirs.size == 0
+    src_dirs.push("std")
+  end
+
+  # Discover .qz files recursively
+  var files = discover_files(src_dirs)
+  var base_dir = src_dirs[0]
+
+  puts("Quartz Doc Generator")
+  puts("====================")
+  print("Scanning ")
+  print(to_string(files.size))
+  puts(" stdlib modules...")
+  puts("")
+
+  # Pass 1: Parse all files and collect symbols
+  var idx = symbol_index_new()
+  var storages: Vec<Int> = vec_new()
+  var roots: Vec<Int> = vec_new()
+  var mod_names: Vec<String> = vec_new()
+  var valid: Vec<Int> = vec_new()
+
+  i = 0
+  while i < files.size
+    var filepath = files[i]
+    var mod_name = module_name_from_path(filepath, base_dir)
+
+    var result = parse_file(filepath)
+    if result.size == 2
+      var storage = result[0]
+      var root = result[1]
+      storages.push(storage)
+      roots.push(root)
+      mod_names.push(mod_name)
+      valid.push(1)
+      collect_symbols(storage, root, mod_name, idx)
+      print("  [OK] ")
+      puts(mod_name)
+    else
+      storages.push(0)
+      roots.push(0)
+      mod_names.push(mod_name)
+      valid.push(0)
+      print("  [SKIP] ")
+      print(mod_name)
+      puts(" (parse error or empty)")
+    end
+    i += 1
+  end
+
+  puts("")
+  print("Found ")
+  print(to_string(idx.names.size))
+  puts(" symbols across all modules.")
+  puts("")
+
+  # Pass 2: Generate markdown for each module
+  mkdir(output_dir)
+  var modules: Vec<ModuleInfo> = vec_new()
+
+  i = 0
+  while i < files.size
+    if valid[i]
+      var storage = storages[i]
+      var root = roots[i]
+      var mod_name = mod_names[i]
+
+      var md = generate_module_doc(storage, root, mod_name, files[i])
+      var out_path = output_path_for_module(output_dir, mod_name)
+
+      # Ensure parent dirs exist
+      ensure_parent_dirs(out_path)
+
+      write_file(out_path, md)
+      print("  -> ")
+      puts(out_path)
+
+      # Collect module info for index
+      var module_doc = ast_get_doc(storage, root)
+      var desc = ""
+      if str_byte_len(module_doc) > 0
+        desc = extract_first_line(module_doc)
+        # Strip leading "# " from the title
+        if desc.str_starts_with("# ")
+          desc = desc.byte_slice(2, str_byte_len(desc))
+        end
+      end
+
+      var fc = count_items(storage, root, NODE_FUNCTION)
+      var sc = count_items(storage, root, NODE_STRUCT_DEF)
+      var ec = count_items(storage, root, NODE_ENUM_DEF)
+
+      modules.push(ModuleInfo {
+        name: mod_name,
+        description: desc,
+        func_count: fc,
+        struct_count: sc,
+        enum_count: ec
+      })
+    end
+    i += 1
+  end
+
+  # Generate index
+  var index_md = generate_index(modules)
+  var index_path = path_join(output_dir, "index.md")
+  write_file(index_path, index_md)
+  print("  -> ")
+  puts(index_path)
+
+  puts("")
+  print("Generated documentation for ")
+  print(to_string(modules.size))
+  puts(" modules.")
+
+  # Pass 3: Generate static HTML site
+  var html_dir = path_join(output_dir, "_site")
+  mkdir(html_dir)
+
+  # Collect valid module names for sidebar
+  var valid_mod_names: Vec<String> = vec_new()
+  i = 0
+  while i < files.size
+    if valid[i]
+      valid_mod_names.push(mod_names[i])
+    end
+    i += 1
+  end
+
+  # Generate HTML for each module
+  i = 0
+  while i < files.size
+    if valid[i]
+      var mod_name = mod_names[i]
+      var md_path = output_path_for_module(output_dir, mod_name)
+      var md_content = read_file(md_path)
+      var body_html = cross_link_html(md_to_html(md_content), idx, mod_name)
+      var html_content = build_html_page(mod_name, body_html, valid_mod_names, mod_name, theme)
+      var html_path = path_join(html_dir, mod_name + ".html")
+      ensure_parent_dirs(html_path)
+      write_file(html_path, html_content)
+    end
+    i += 1
+  end
+
+  # Generate index HTML
+  var index_md_content = read_file(path_join(output_dir, "index.md"))
+  var index_html = build_html_page("Index", md_to_html(index_md_content), valid_mod_names, "index", theme)
+  write_file(path_join(html_dir, "index.html"), index_html)
+
+  # Generate search index JSON
+  var search_sb = sb_new()
+  search_sb.append("[\n")
+  var search_count = 0
+  i = 0
+  while i < idx.names.size
+    if search_count > 0
+      search_sb.append(",\n")
+    end
+    search_sb.append("{\"n\":\"")
+    search_sb.append(json_escape(idx.names[i]))
+    search_sb.append("\",\"k\":\"")
+    search_sb.append(idx.kinds[i])
+    search_sb.append("\",\"m\":\"")
+    search_sb.append(idx.modules[i])
+    search_sb.append("\"}")
+    search_count = search_count + 1
+    i += 1
+  end
+  search_sb.append("\n]")
+  write_file(path_join(html_dir, "search-index.json"), search_sb.to_string())
+
+  puts("")
+  print("Static HTML site generated in ")
+  puts(html_dir)
+  print("  Open ")
+  print(html_dir)
+  puts("/index.html in your browser")
+
+  # Serve mode — powered by Quartz HTTP/1.1
+  if serve_mode
+    serve_docs(html_dir, serve_port)
+  end
+
+  return 0
+end
+
+def print_help(): Void
+  puts("quartz doc — Generate API documentation from Quartz source")
+  puts("")
+  puts("Usage:")
+  puts("  quartz doc                         Generate docs/api/ from std/")
+  puts("  quartz doc --src DIR               Scan directory for .qz files")
+  puts("  quartz doc --output DIR            Custom output directory")
+  puts("  quartz doc --no-private            Exclude private items")
+  puts("  quartz doc serve                   Generate and serve locally")
+  puts("  quartz doc serve --port PORT       Custom port (default: 4000)")
+  puts("  quartz doc serve --theme THEME     Theme: tokyo-night, catppuccin-mocha,")
+  puts("                                            catppuccin-latte, github-light")
+  puts("")
+  puts("Options:")
+  puts("  -h, --help    Show this help message")
+end
+
+# ============================================================================
+# Doc Server — Markdown → HTML with themes
+# ============================================================================
+
+## Simple Markdown to HTML converter.
+## Handles: headings, code blocks, tables, bold, italic, inline code, links, lists, paragraphs.
+def md_to_html(md: String): String
+  var sb = sb_new()
+  var lines = str_split(md, "\n")
+  var i = 0
+  var in_code_block = 0
+  var in_table = 0
+
+  while i < lines.size
+    var line = lines[i]
+
+    # Code blocks
+    if line.str_starts_with("```")
+      if in_code_block
+        sb.append("</code></pre>\n")
+        in_code_block = 0
+      else
+        var lang = ""
+        if str_byte_len(line) > 3
+          lang = line.byte_slice(3, str_byte_len(line))
+        end
+        if str_byte_len(lang) > 0
+          sb.append("<pre><code class=\"language-")
+          sb.append(lang)
+          sb.append("\">")
+        else
+          sb.append("<pre><code>")
+        end
+        in_code_block = 1
+      end
+      i += 1
+      continue
+    end
+
+    if in_code_block
+      sb.append(html_escape(line))
+      sb.append("\n")
+      i += 1
+      continue
+    end
+
+    # Table rows
+    if line.str_starts_with("|")
+      if in_table == 0
+        sb.append("<table>\n")
+        in_table = 1
+        # First row is header
+        sb.append("<thead><tr>")
+        var cells = split_table_row(line)
+        var ci = 0
+        while ci < cells.size
+          sb.append("<th>")
+          sb.append(inline_format(cells[ci]))
+          sb.append("</th>")
+          ci = ci + 1
+        end
+        sb.append("</tr></thead>\n<tbody>\n")
+        # Skip separator row
+        i += 1
+        if i < lines.size
+          if lines[i].str_starts_with("|")
+            i += 1
+          end
+        end
+        continue
+      else
+        sb.append("<tr>")
+        var cells = split_table_row(line)
+        var ci = 0
+        while ci < cells.size
+          sb.append("<td>")
+          sb.append(inline_format(cells[ci]))
+          sb.append("</td>")
+          ci = ci + 1
+        end
+        sb.append("</tr>\n")
+        i += 1
+        continue
+      end
+    else
+      if in_table
+        sb.append("</tbody></table>\n")
+        in_table = 0
+      end
+    end
+
+    # Headings
+    if line.str_starts_with("### `")
+      var text = line.byte_slice(4, str_byte_len(line))
+      var anchor = make_anchor(text)
+      sb.append("<h3 id=\"")
+      sb.append(anchor)
+      sb.append("\">")
+      sb.append(inline_format(text))
+      sb.append("</h3>\n")
+      i += 1
+      continue
+    end
+    if line.str_starts_with("### ")
+      var text = line.byte_slice(4, str_byte_len(line))
+      var anchor = make_anchor(text)
+      sb.append("<h3 id=\"")
+      sb.append(anchor)
+      sb.append("\">")
+      sb.append(inline_format(text))
+      sb.append("</h3>\n")
+      i += 1
+      continue
+    end
+    if line.str_starts_with("## ")
+      var text = line.byte_slice(3, str_byte_len(line))
+      var anchor = make_anchor(text)
+      sb.append("<h2 id=\"")
+      sb.append(anchor)
+      sb.append("\">")
+      sb.append(inline_format(text))
+      sb.append("</h2>\n")
+      i += 1
+      continue
+    end
+    if line.str_starts_with("# ")
+      var text = line.byte_slice(2, str_byte_len(line))
+      sb.append("<h1>")
+      sb.append(inline_format(text))
+      sb.append("</h1>\n")
+      i += 1
+      continue
+    end
+
+    # Blockquote
+    if line.str_starts_with("> ")
+      var text = line.byte_slice(2, str_byte_len(line))
+      sb.append("<blockquote>")
+      sb.append(inline_format(text))
+      sb.append("</blockquote>\n")
+      i += 1
+      continue
+    end
+
+    # Horizontal rule
+    if line == "---"
+      sb.append("<hr>\n")
+      i += 1
+      continue
+    end
+
+    # Unordered list
+    if line.str_starts_with("- ")
+      var text = line.byte_slice(2, str_byte_len(line))
+      sb.append("<ul><li>")
+      sb.append(inline_format(text))
+      sb.append("</li></ul>\n")
+      i += 1
+      continue
+    end
+
+    # Empty line
+    if str_byte_len(line) == 0
+      i += 1
+      continue
+    end
+
+    # Regular paragraph
+    sb.append("<p>")
+    sb.append(inline_format(line))
+    sb.append("</p>\n")
+    i += 1
+  end
+
+  if in_table
+    sb.append("</tbody></table>\n")
+  end
+  if in_code_block
+    sb.append("</code></pre>\n")
+  end
+
+  return sb.to_string()
+end
+
+## Format inline elements: `code`, **bold**, *italic*, [links](url).
+def inline_format(s: String): String
+  var sb = sb_new()
+  var i = 0
+  while i < str_byte_len(s)
+    var c = s.byte_at(i)
+
+    # Inline code
+    if c == '`'
+      var end_pos = i + 1
+      while end_pos < str_byte_len(s)
+        if s.byte_at(end_pos) == '`'
+          break
+        end
+        end_pos = end_pos + 1
+      end
+      if end_pos < str_byte_len(s)
+        var code = s.byte_slice(i + 1, end_pos)
+        sb.append("<code>")
+        sb.append(html_escape(code))
+        sb.append("</code>")
+        i = end_pos + 1
+        continue
+      end
+    end
+
+    # Bold
+    if c == '*'
+      if i + 1 < str_byte_len(s)
+        if s.byte_at(i + 1) == '*'
+          var end_pos = i + 2
+          while end_pos + 1 < str_byte_len(s)
+            if s.byte_at(end_pos) == '*'
+              if s.byte_at(end_pos + 1) == '*'
+                break
+              end
+            end
+            end_pos = end_pos + 1
+          end
+          if end_pos + 1 < str_byte_len(s)
+            var text = s.byte_slice(i + 2, end_pos)
+            sb.append("<strong>")
+            sb.append(text)
+            sb.append("</strong>")
+            i = end_pos + 2
+            continue
+          end
+        end
+      end
+    end
+
+    # Link [text](url)
+    if c == '['
+      var close_bracket = i + 1
+      while close_bracket < str_byte_len(s)
+        if s.byte_at(close_bracket) == ']'
+          break
+        end
+        close_bracket = close_bracket + 1
+      end
+      if close_bracket < str_byte_len(s)
+        if close_bracket + 1 < str_byte_len(s)
+          if s.byte_at(close_bracket + 1) == '('
+            var close_paren = close_bracket + 2
+            while close_paren < str_byte_len(s)
+              if s.byte_at(close_paren) == ')'
+                break
+              end
+              close_paren = close_paren + 1
+            end
+            if close_paren < str_byte_len(s)
+              var text = s.byte_slice(i + 1, close_bracket)
+              var url = s.byte_slice(close_bracket + 2, close_paren)
+              sb.append("<a href=\"")
+              sb.append(url)
+              sb.append("\">")
+              sb.append(text)
+              sb.append("</a>")
+              i = close_paren + 1
+              continue
+            end
+          end
+        end
+      end
+    end
+
+    sb.append_char(c)
+    i += 1
+  end
+  return sb.to_string()
+end
+
+## HTML-escape special characters.
+def html_escape(s: String): String
+  var sb = sb_new()
+  var i = 0
+  while i < str_byte_len(s)
+    var c = s.byte_at(i)
+    if c == '&'
+      sb.append("&amp;")
+    elsif c == '<'
+      sb.append("&lt;")
+    elsif c == '>'
+      sb.append("&gt;")
+    elsif c == '"'
+      sb.append("&quot;")
+    else
+      sb.append_char(c)
+    end
+    i += 1
+  end
+  return sb.to_string()
+end
+
+## Split a markdown table row into cells.
+def split_table_row(line: String): Vec<String>
+  var cells: Vec<String> = vec_new()
+  var i = 1  # Skip leading |
+  var start = 1
+  while i < str_byte_len(line)
+    if line.byte_at(i) == '|'
+      var cell = line.byte_slice(start, i).str_trim()
+      if str_byte_len(cell) > 0
+        cells.push(cell)
+      end
+      start = i + 1
+    end
+    i += 1
+  end
+  return cells
+end
+
+## Make an anchor from heading text (lowercase, replace spaces with -).
+def make_anchor(text: String): String
+  # Strip backticks first
+  var csb = sb_new()
+  var i = 0
+  while i < str_byte_len(text)
+    var c = text.byte_at(i)
+    if c != '`'
+      csb.append_char(c)
+    end
+    i += 1
+  end
+  var clean = csb.to_string()
+
+  var sb = sb_new()
+  i = 0
+  while i < str_byte_len(clean)
+    var c = clean.byte_at(i)
+    if c == ' '
+      sb.append_char('-')
+    elsif c >= 'A'
+      if c <= 'Z'
+        sb.append_char(c + 32)
+      else
+        sb.append_char(c)
+      end
+    elsif c >= 'a'
+      if c <= 'z'
+        sb.append_char(c)
+      end
+    elsif c >= '0'
+      if c <= '9'
+        sb.append_char(c)
+      end
+    elsif c == '_'
+      sb.append_char('_')
+    elsif c == '-'
+      sb.append_char('-')
+    end
+    i += 1
+  end
+  return sb.to_string()
+end
+
+# ============================================================================
+# Syntax Highlighting
+# ============================================================================
+
+## Lightweight Quartz syntax highlighting CSS.
+def highlight_css(): String
+  var sb = sb_new()
+  sb.append(".token.keyword { color: var(--accent2); font-weight: 500; }\n")
+  sb.append(".token.string { color: var(--success); }\n")
+  sb.append(".token.comment { color: var(--fg-dim); font-style: italic; }\n")
+  sb.append(".token.number { color: var(--warn); }\n")
+  sb.append(".token.type { color: var(--accent3); }\n")
+  sb.append(".token.function { color: var(--accent); }\n")
+  sb.append(".token.operator { color: var(--fg); }\n")
+  sb.append(".token.punctuation { color: var(--fg-dim); }\n")
+  return sb.to_string()
+end
+
+## Client-side search JS — loads search-index.json and provides fuzzy matching.
+def search_js(): String
+  var sb = sb_new()
+  sb.append("<script>\n")
+  sb.append("(function(){\n")
+  sb.append("var idx=null,input=document.getElementById('search-input'),res=document.getElementById('search-results'),sel=-1;\n")
+  sb.append("function load(cb){if(idx)return cb();fetch('search-index.json').then(r=>r.json()).then(d=>{idx=d;cb()}).catch(()=>{});}\n")
+  sb.append("function search(q){\n")
+  sb.append("if(!idx||!q){res.className='';res.innerHTML='';return;}\n")
+  sb.append("q=q.toLowerCase();var hits=[];\n")
+  sb.append("for(var i=0;i<idx.length;i++){var e=idx[i],n=e.n.toLowerCase(),score=0;\n")
+  sb.append("if(n===q)score=100;else if(n.startsWith(q))score=80;else if(n.includes(q))score=60;else continue;\n")
+  sb.append("hits.push({e:e,s:score});}\n")
+  sb.append("hits.sort(function(a,b){return b.s-a.s;});\n")
+  sb.append("var html='';for(var i=0;i<Math.min(hits.length,15);i++){var h=hits[i].e;\n")
+  sb.append("var anchor=h.n.toLowerCase().replace(/[^a-z0-9_-]/g,'-');\n")
+  sb.append("html+='<a href=\"/'+h.m+'.html#'+anchor+'\"><span class=\"kind\">'+h.k+'</span>'+h.n+'<small style=\"color:var(--fg-dim);margin-left:auto\">'+h.m+'</small></a>';}\n")
+  sb.append("if(hits.length===0)html='<div style=\"padding:12px;color:var(--fg-dim)\">No results</div>';\n")
+  sb.append("res.innerHTML=html;res.className='active';sel=-1;}\n")
+  sb.append("input.addEventListener('input',function(){load(function(){search(input.value)});});\n")
+  sb.append("input.addEventListener('keydown',function(e){\n")
+  sb.append("var items=res.querySelectorAll('a');\n")
+  sb.append("if(e.key==='ArrowDown'){e.preventDefault();sel=Math.min(sel+1,items.length-1);}\n")
+  sb.append("else if(e.key==='ArrowUp'){e.preventDefault();sel=Math.max(sel-1,0);}\n")
+  sb.append("else if(e.key==='Enter'&&sel>=0){e.preventDefault();items[sel].click();}\n")
+  sb.append("else if(e.key==='Escape'){res.className='';input.blur();}\n")
+  sb.append("items.forEach(function(a,i){a.className=i===sel?'selected':'';});\n")
+  sb.append("});\n")
+  sb.append("document.addEventListener('keydown',function(e){\n")
+  sb.append("if(e.key==='/'&&document.activeElement!==input){e.preventDefault();input.focus();}\n")
+  sb.append("});\n")
+  sb.append("input.addEventListener('blur',function(){setTimeout(function(){res.className='';},200);});\n")
+  sb.append("})();\n")
+  sb.append("</script>\n")
+  return sb.to_string()
+end
+
+## IntersectionObserver-based TOC scroll sync.
+def toc_scroll_js(): String
+  var sb = sb_new()
+  sb.append("<script>\n")
+  sb.append("(function(){\n")
+  sb.append("var toc=document.getElementById('page-toc');\n")
+  sb.append("if(!toc)return;\n")
+  sb.append("var links=toc.querySelectorAll('a');\n")
+  sb.append("var headings=[];\n")
+  sb.append("links.forEach(function(a){var id=a.getAttribute('href');\n")
+  sb.append("if(id&&id.charAt(0)==='#'){var el=document.getElementById(id.slice(1));if(el)headings.push({el:el,link:a});}});\n")
+  sb.append("if(!headings.length)return;\n")
+  sb.append("var obs=new IntersectionObserver(function(entries){\n")
+  sb.append("entries.forEach(function(e){if(e.isIntersecting){\n")
+  sb.append("links.forEach(function(a){a.classList.remove('active');});\n")
+  sb.append("headings.forEach(function(h){if(h.el===e.target)h.link.classList.add('active');});\n")
+  sb.append("}});},{rootMargin:'-80px 0px -60% 0px'});\n")
+  sb.append("headings.forEach(function(h){obs.observe(h.el);});\n")
+  sb.append("})();\n")
+  sb.append("</script>\n")
+  return sb.to_string()
+end
+
+## Minimal syntax highlighter JS for Quartz code blocks.
+## Runs on page load, highlights all <code class="language-quartz"> blocks.
+def highlight_js(): String
+  var sb = sb_new()
+  sb.append("<script>\n")
+  sb.append("document.addEventListener('DOMContentLoaded',function(){\n")
+  sb.append("var kw=/\\b(def|struct|enum|impl|extend|trait|import|from|var|const|if|else|elsif|while|for|in|match|return|end|do|break|continue|yield|async|await|go|priv|extern|type|newtype)\\b/g;\n")
+  sb.append("var ty=/\\b(Int|String|Bool|Void|Float|Vec|Map|Option|Result|Some|None|Ok|Err)\\b/g;\n")
+  sb.append("var cm=/(#[^{].*)/g;\n")
+  sb.append("var st=/(&quot;[^&]*?&quot;)/g;\n")
+  sb.append("var nm=/\\b(\\d+)\\b/g;\n")
+  sb.append("document.querySelectorAll('code.language-quartz,code.language-qz,code.language-be').forEach(function(el){\n")
+  sb.append("var h=el.innerHTML;\n")
+  sb.append("h=h.replace(cm,'<span class=\"token comment\">$1</span>');\n")
+  sb.append("h=h.replace(st,'<span class=\"token string\">$1</span>');\n")
+  sb.append("h=h.replace(kw,'<span class=\"token keyword\">$1</span>');\n")
+  sb.append("h=h.replace(ty,'<span class=\"token type\">$1</span>');\n")
+  sb.append("h=h.replace(nm,'<span class=\"token number\">$1</span>');\n")
+  sb.append("el.innerHTML=h;\n")
+  sb.append("});\n")
+  sb.append("});\n")
+  sb.append("</script>\n")
+  return sb.to_string()
+end
+
+# ============================================================================
+# Theme CSS
+# ============================================================================
+
+def get_theme_css(theme: String): String
+  if theme == "catppuccin-mocha"
+    return catppuccin_mocha_css()
+  elsif theme == "catppuccin-latte"
+    return catppuccin_latte_css()
+  elsif theme == "github-light"
+    return github_light_css()
+  end
+  return tokyo_night_css()
+end
+
+def theme_vars(bg: String, bg_sidebar: String, bg_code: String, fg: String, fg_dim: String, fg_heading: String, accent: String, accent2: String, accent3: String, border: String, link: String, link_hover: String, success: String, warn: String, table_stripe: String): String
+  var sb = sb_new()
+  sb.append(":root {\n")
+  sb.append("  --bg: ")
+  sb.append(bg)
+  sb.append("; --bg-sidebar: ")
+  sb.append(bg_sidebar)
+  sb.append("; --bg-code: ")
+  sb.append(bg_code)
+  sb.append(";\n  --fg: ")
+  sb.append(fg)
+  sb.append("; --fg-dim: ")
+  sb.append(fg_dim)
+  sb.append("; --fg-heading: ")
+  sb.append(fg_heading)
+  sb.append(";\n  --accent: ")
+  sb.append(accent)
+  sb.append("; --accent2: ")
+  sb.append(accent2)
+  sb.append("; --accent3: ")
+  sb.append(accent3)
+  sb.append(";\n  --border: ")
+  sb.append(border)
+  sb.append("; --link: ")
+  sb.append(link)
+  sb.append("; --link-hover: ")
+  sb.append(link_hover)
+  sb.append(";\n  --success: ")
+  sb.append(success)
+  sb.append("; --warn: ")
+  sb.append(warn)
+  sb.append("; --table-stripe: ")
+  sb.append(table_stripe)
+  sb.append(";\n}\n")
+  return sb.to_string()
+end
+
+def tokyo_night_css(): String
+  return theme_vars("#1a1b26", "#16161e", "#24283b", "#a9b1d6", "#565f89", "#c0caf5", "#7aa2f7", "#bb9af7", "#7dcfff", "#292e42", "#7aa2f7", "#89b4fa", "#9ece6a", "#e0af68", "#1e2030")
+end
+
+def catppuccin_mocha_css(): String
+  return theme_vars("#1e1e2e", "#181825", "#313244", "#cdd6f4", "#6c7086", "#cdd6f4", "#89b4fa", "#cba6f7", "#94e2d5", "#313244", "#89b4fa", "#b4befe", "#a6e3a1", "#f9e2af", "#181825")
+end
+
+def catppuccin_latte_css(): String
+  return theme_vars("#eff1f5", "#e6e9ef", "#ccd0da", "#4c4f69", "#9ca0b0", "#4c4f69", "#1e66f5", "#8839ef", "#179299", "#ccd0da", "#1e66f5", "#7287fd", "#40a02b", "#df8e1d", "#e6e9ef")
+end
+
+def github_light_css(): String
+  return theme_vars("#ffffff", "#f6f8fa", "#f6f8fa", "#1f2328", "#656d76", "#1f2328", "#0969da", "#8250df", "#0550ae", "#d0d7de", "#0969da", "#0550ae", "#1a7f37", "#9a6700", "#f6f8fa")
+end
+
+def base_css(): String
+  var sb = sb_new()
+  sb.append("* { margin: 0; padding: 0; box-sizing: border-box; }\n")
+  sb.append("body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--fg); line-height: 1.7; display: flex; min-height: 100vh; }\n")
+  sb.append(".sidebar { width: 280px; background: var(--bg-sidebar); border-right: 1px solid var(--border); padding: 24px 16px; position: fixed; top: 0; left: 0; bottom: 0; overflow-y: auto; font-size: 14px; }\n")
+  sb.append(".sidebar h2 { color: var(--accent2); font-size: 16px; margin-bottom: 16px; letter-spacing: 0.5px; }\n")
+  sb.append(".sidebar a { display: block; color: var(--fg-dim); text-decoration: none; padding: 6px 12px; border-radius: 6px; margin-bottom: 2px; transition: all 0.15s ease; }\n")
+  sb.append(".sidebar a:hover, .sidebar a.active { color: var(--accent); background: var(--bg-code); }\n")
+  sb.append(".sidebar .group { margin-bottom: 16px; }\n")
+  sb.append(".sidebar .group-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--fg-dim); padding: 8px 12px; font-weight: 600; }\n")
+  sb.append("main { margin-left: 280px; padding: 48px 64px; max-width: 800px; flex: 1; margin-right: 224px; }\n")
+  sb.append("h1 { color: var(--fg-heading); font-size: 32px; margin-bottom: 8px; font-weight: 700; }\n")
+  sb.append("h2 { color: var(--accent2); font-size: 22px; margin-top: 40px; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--border); font-weight: 600; }\n")
+  sb.append("h3 { color: var(--accent3); font-size: 16px; margin-top: 24px; margin-bottom: 8px; font-weight: 600; }\n")
+  sb.append("h3 code { font-size: 15px; background: var(--bg-code); padding: 4px 10px; border-radius: 6px; font-weight: 500; }\n")
+  sb.append("p { margin-bottom: 12px; }\n")
+  sb.append("a { color: var(--link); text-decoration: none; }\n")
+  sb.append("a:hover { color: var(--link-hover); text-decoration: underline; }\n")
+  sb.append("code { font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', monospace; background: var(--bg-code); padding: 2px 6px; border-radius: 4px; font-size: 0.9em; color: var(--accent); }\n")
+  sb.append("pre { background: var(--bg-code); padding: 16px 20px; border-radius: 8px; overflow-x: auto; margin: 12px 0 20px; border: 1px solid var(--border); }\n")
+  sb.append("pre code { background: none; padding: 0; color: var(--fg); font-size: 14px; }\n")
+  sb.append("table { width: 100%; border-collapse: collapse; margin: 12px 0 20px; font-size: 14px; }\n")
+  sb.append("th { text-align: left; padding: 10px 14px; border-bottom: 2px solid var(--border); color: var(--fg-heading); font-weight: 600; }\n")
+  sb.append("td { padding: 8px 14px; border-bottom: 1px solid var(--border); }\n")
+  sb.append("tr:nth-child(even) { background: var(--table-stripe); }\n")
+  sb.append("blockquote { border-left: 3px solid var(--accent2); padding: 8px 16px; margin: 12px 0; background: var(--bg-code); border-radius: 0 6px 6px 0; color: var(--fg-dim); font-style: italic; }\n")
+  sb.append("hr { border: none; border-top: 1px solid var(--border); margin: 24px 0; }\n")
+  sb.append("ul { padding-left: 24px; margin-bottom: 12px; }\n")
+  sb.append("li { margin-bottom: 4px; }\n")
+  sb.append(".theme-switcher { position: fixed; top: 16px; right: 16px; z-index: 100; }\n")
+  sb.append(".theme-switcher select { background: var(--bg-code); color: var(--fg); border: 1px solid var(--border); padding: 6px 12px; border-radius: 6px; font-size: 13px; cursor: pointer; }\n")
+  sb.append(".breadcrumbs { font-size: 13px; color: var(--fg-dim); margin-bottom: 16px; }\n")
+  sb.append(".breadcrumbs a { color: var(--fg-dim); }\n")
+  sb.append(".breadcrumbs a:hover { color: var(--accent); }\n")
+  sb.append(".toc-sidebar { position: fixed; top: 48px; right: 24px; width: 200px; max-height: calc(100vh - 96px); overflow-y: auto; font-size: 12px; }\n")
+  sb.append(".toc-sidebar h4 { color: var(--fg-dim); text-transform: uppercase; letter-spacing: 1px; font-size: 11px; margin-bottom: 8px; }\n")
+  sb.append(".toc-sidebar ul { list-style: none; padding-left: 0; margin: 0; }\n")
+  sb.append(".toc-sidebar ul ul { padding-left: 12px; }\n")
+  sb.append(".toc-sidebar li { margin-bottom: 2px; }\n")
+  sb.append(".toc-sidebar a { color: var(--fg-dim); text-decoration: none; display: block; padding: 2px 0; line-height: 1.4; }\n")
+  sb.append(".toc-sidebar a:hover, .toc-sidebar a.active { color: var(--accent); }\n")
+  sb.append(".search-box { margin-bottom: 16px; position: relative; }\n")
+  sb.append(".search-box input { width: 100%; padding: 8px 12px; background: var(--bg-code); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; font-size: 13px; outline: none; }\n")
+  sb.append(".search-box input:focus { border-color: var(--accent); }\n")
+  sb.append("#search-results { position: absolute; top: 100%; left: 0; right: 0; background: var(--bg-sidebar); border: 1px solid var(--border); border-radius: 6px; max-height: 300px; overflow-y: auto; z-index: 200; display: none; }\n")
+  sb.append("#search-results.active { display: block; }\n")
+  sb.append("#search-results a { display: flex; align-items: center; gap: 8px; padding: 8px 12px; color: var(--fg); text-decoration: none; font-size: 13px; }\n")
+  sb.append("#search-results a:hover, #search-results a.selected { background: var(--bg-code); color: var(--accent); }\n")
+  sb.append("#search-results .kind { font-size: 10px; padding: 2px 6px; border-radius: 4px; background: var(--bg-code); color: var(--fg-dim); text-transform: uppercase; font-weight: 600; }\n")
+  sb.append("@media (max-width: 768px) { .sidebar { display: none; } .toc-sidebar { display: none; } main { margin-left: 0; margin-right: 0; padding: 24px; } }\n")
+  sb.append("@media (max-width: 1200px) { .toc-sidebar { display: none; } main { margin-right: 0; } }\n")
+  return sb.to_string()
+end
+
+# ============================================================================
+# HTML page wrapper
+# ============================================================================
+
+## Build full HTML page with sidebar navigation.
+def build_html_page(title: String, body_html: String, module_names: Vec<String>, current_module: String, theme: String): String
+  var sb = sb_new()
+  sb.append("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n")
+  sb.append("<meta charset=\"UTF-8\">\n")
+  sb.append("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n")
+  sb.append("<title>")
+  sb.append(title)
+  sb.append(" — Quartz Docs</title>\n")
+  sb.append("<style>\n")
+  sb.append(get_theme_css(theme))
+  sb.append(base_css())
+  sb.append(highlight_css())
+  sb.append("</style>\n")
+  sb.append("</head>\n<body>\n")
+
+  # Sidebar
+  sb.append("<nav class=\"sidebar\">\n")
+  sb.append("<h2>Quartz Docs</h2>\n")
+
+  # Dynamic module grouping
+  var prefixes = collect_group_prefixes(module_names)
+
+  # Index link
+  sb.append("<a href=\"/index.html\"")
+  if current_module == "index"
+    sb.append(" class=\"active\"")
+  end
+  sb.append(">Index</a>\n")
+
+  # Search input
+  sb.append("<div class=\"search-box\">\n")
+  sb.append("<input type=\"text\" id=\"search-input\" placeholder=\"Search (press /)\" autocomplete=\"off\">\n")
+  sb.append("<div id=\"search-results\"></div>\n")
+  sb.append("</div>\n")
+
+  # Render each group
+  var gi = 0
+  while gi < prefixes.size
+    var prefix = prefixes[gi]
+    sb.append("<div class=\"group\"><div class=\"group-title\">")
+    sb.append(capitalize(prefix))
+    sb.append("</div>\n")
+    var mi = 0
+    while mi < module_names.size
+      var m = module_names[mi]
+      if module_prefix(m) == prefix
+        # For sub-modules, show just the leaf name in sidebar
+        var display_name = m
+        var prefix_len = str_byte_len(prefix)
+        if prefix_len > 0
+          if str_byte_len(m) > prefix_len + 1
+            display_name = m.byte_slice(prefix_len + 1, str_byte_len(m))
+          end
+        end
+        sb.append("<a href=\"/")
+        sb.append(m)
+        sb.append(".html\"")
+        if m == current_module
+          sb.append(" class=\"active\"")
+        end
+        sb.append(">")
+        sb.append(display_name)
+        sb.append("</a>\n")
+      end
+      mi = mi + 1
+    end
+    sb.append("</div>\n")
+    gi = gi + 1
+  end
+
+  sb.append("</nav>\n")
+
+  # Theme switcher
+  sb.append("<div class=\"theme-switcher\">\n")
+  sb.append("<select onchange=\"window.location.search='?theme='+this.value\">\n")
+  sb.append("<option value=\"tokyo-night\"")
+  if theme == "tokyo-night"
+    sb.append(" selected")
+  end
+  sb.append(">Tokyo Night</option>\n")
+  sb.append("<option value=\"catppuccin-mocha\"")
+  if theme == "catppuccin-mocha"
+    sb.append(" selected")
+  end
+  sb.append(">Catppuccin Mocha</option>\n")
+  sb.append("<option value=\"catppuccin-latte\"")
+  if theme == "catppuccin-latte"
+    sb.append(" selected")
+  end
+  sb.append(">Catppuccin Latte</option>\n")
+  sb.append("<option value=\"github-light\"")
+  if theme == "github-light"
+    sb.append(" selected")
+  end
+  sb.append(">GitHub Light</option>\n")
+  sb.append("</select></div>\n")
+
+  # Breadcrumbs + Main content + TOC
+  sb.append("<main>\n")
+  sb.append(generate_breadcrumbs(current_module))
+  sb.append(body_html)
+  sb.append("\n</main>\n")
+  sb.append(generate_toc(body_html))
+  sb.append(search_js())
+  sb.append(highlight_js())
+  sb.append(toc_scroll_js())
+  sb.append("</body>\n</html>")
+
+  return sb.to_string()
+end
+
+# ============================================================================
+# HTTP Server for docs
+# ============================================================================
+
+## Serve documentation files over HTTP.
+# ============================================================================
+# Static File Server (dogfooding Quartz HTTP/1.1)
+# ============================================================================
+
+## Global: site root directory for the static file handler.
+var _g_site_root = ""
+
+## Detect MIME type from file extension.
+def detect_mime(path: String): String
+  if str_ends_with(path, ".html")
+    return "text/html; charset=utf-8"
+  end
+  if str_ends_with(path, ".json")
+    return "application/json"
+  end
+  if str_ends_with(path, ".css")
+    return "text/css"
+  end
+  if str_ends_with(path, ".js")
+    return "application/javascript"
+  end
+  if str_ends_with(path, ".svg")
+    return "image/svg+xml"
+  end
+  if str_ends_with(path, ".png")
+    return "image/png"
+  end
+  return "text/plain"
+end
+
+## Serve a static file from the site root.
+def serve_static(req_path: String): Response
+  # Resolve path: "/" -> "/index.html"
+  var file_path = req_path
+  if file_path == "/"
+    file_path = "/index.html"
+  end
+
+  # Strip leading /
+  if str_byte_len(file_path) > 0
+    if file_path.byte_at(0) == '/'
+      file_path = file_path.byte_slice(1, str_byte_len(file_path))
+    end
+  end
+
+  var full_path = path_join(_g_site_root, file_path)
+
+  if file_exists(full_path) == false
+    return Response {
+      status: 404,
+      body: "<h1>404 — Not Found</h1><p>No documentation at <code>" + html_escape(req_path) + "</code></p><p><a href=\"/index.html\">Back to index</a></p>",
+      content_type: "text/html; charset=utf-8",
+      extra_header_keys: vec_new(),
+      extra_header_vals: vec_new(),
+      body_ptr: 0,
+      body_len: 0
+    }
+  end
+
+  var content = read_file(full_path)
+  var mime = detect_mime(full_path)
+  return Response {
+    status: 200,
+    body: content,
+    content_type: mime,
+    extra_header_keys: vec_new(),
+    extra_header_vals: vec_new(),
+    body_ptr: 0,
+    body_len: 0
+  }
+end
+
+## Request handler for the doc server.
+def doc_server_handler(req: Request): Response
+  return serve_static(req.path)
+end
+
+## Start the Quartz-native documentation server.
+def serve_docs(site_dir: String, port: Int): Void
+  _g_site_root = site_dir
+
+  puts("")
+  puts("  Quartz Doc Server")
+  puts("  =================")
+  print("  Serving from: ")
+  puts(site_dir)
+  puts("")
+  print("  http://localhost:")
+  puts(to_string(port))
+  puts("")
+  puts("  Press Ctrl+C to stop")
+  puts("")
+
+  http_serve(port, doc_server_handler)
+end

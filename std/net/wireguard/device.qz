@@ -1,0 +1,1373 @@
+## std/net/wireguard/device - WireGuard top-level peer table + entry points
+##
+## This is the integration layer that ties peer + session + handshake +
+## transport + timers together. A `Device` owns:
+##   - A long-term static Curve25519 keypair
+##   - A Vec<DevicePeer> — configured peers + their per-peer state
+##   - An RNG for ephemeral keys + index allocation
+##
+## Each `DevicePeer` carries up to three transport sessions in named slots
+## (per WG paper §6.5 — "previous, current, next"):
+##
+##   - `previous_session` (when `has_previous==1`): the deprecated session
+##     immediately before the current one. Valid for receiving only — the
+##     other side may still be sending under it for in-flight packets after
+##     a rekey. Expires REJECT_AFTER_TIME after its own creation; lazily
+##     reaped via `wg_device_peer_gc_stale`.
+##   - `current_session` (when `has_current==1`): the active session, used
+##     for both send and receive.
+##   - `next_session` (when `has_next==1`): a freshly handshaked session
+##     that has not yet been used. The first send (initiator side) or first
+##     valid receive (responder side) on `next` *promotes* it: the prior
+##     `current` becomes `previous`, `next` becomes `current`, and the slot
+##     clears.
+##
+## Plus the in-flight handshake state (`handshake_state` when
+## `has_handshake==1`, with `pending_local_index` recording the
+## sender_index we put on the wire) and per-peer `timers` + `last_ts`
+## (TAI64N replay watermark).
+##
+## Top-level entry points (the API the unikernel / userspace caller drives):
+##
+##   wg_device_initiate_handshake(d, peer_idx, msg_out, now_ms)
+##       → wire_len   — fills msg_out with 148-byte MSG_INITIATION
+##   wg_device_handle_initiation(d, msg_in, msg_resp_out, now_ms)
+##       → peer_idx | -1   — fills msg_resp_out with 92-byte MSG_RESPONSE;
+##                            new session installed as `next`
+##   wg_device_handle_response(d, msg_in, now_ms)
+##       → peer_idx | -1   — installs Session as `next` on the initiator
+##                            side
+##   wg_device_send_data(d, peer_idx, pt, pt_len, msg_out, now_ms)
+##       → wire_len | -1   — encrypts a transport-data packet; promotes
+##                            `next` to `current` if applicable
+##   wg_device_handle_data(d, msg_in, msg_in_len, pt_out, peer_idx_ptr, now_ms)
+##       → pt_len | -1     — decrypts; promotes `next` to `current` on
+##                            first successful recv via that slot
+##
+## Lifecycle helpers (call sites that mutate DevicePeer state):
+##   wg_device_peer_drop_handshake(d, peer_idx)
+##   wg_device_peer_drop_session(d, peer_idx)
+##       — drops `current`; leaves `previous`/`next` untouched. Used by the
+##         tick driver on REJECT_SESSION (180s of session age).
+##   wg_device_peer_mark_keepalive_sent(d, peer_idx, now_ms)
+##       — bumps the keepalive-sent timestamp so the next tick suppresses
+##         a duplicate fire.
+##   wg_device_peer_gc_stale(d, peer_idx, now_ms)
+##       — drops `previous` if its age >= REJECT_AFTER_TIME. Caller invokes
+##         once per peer per tick.
+##
+## Plus lookup helpers (`_lookup_by_pub`, `_lookup_by_local_index`,
+## `_lookup_route`) used by both internal dispatch and the unikernel's
+## IP-stack glue.
+##
+## What's deferred to Phase 2 / future:
+##   - Cookie reply (DoS defense). Type 3 packets are dropped.
+##   - IPv6 transport. Outer UDP is IPv4-only Phase 1.
+##
+## See:
+## - docs/design/WIREGUARD_UNIKERNEL_DESIGN.md "tun-equivalent: integrating
+##   with the unikernel IP stack"
+## - WG paper §5.4, §6.5 (multi-session generations)
+
+import std/core/crypto/curve25519
+import * from std/core/crypto/secret  # Secret<Int> + secret_wrap (NET.4.1)
+import std/core/crypto/zeroize
+import std/crypto/noise
+import std/crypto/rng
+import std/net/wireguard/peer
+import std/net/wireguard/session
+import std/net/wireguard/handshake
+import std/net/wireguard/transport
+import std/net/wireguard/timers
+import * from ffi/socket  # malloc/free/memcpy/memset
+
+# =============================================================================
+# AllowedIPs — IPv4 CIDR
+# =============================================================================
+
+## A single IPv4 prefix advertised as routable through this peer.
+##
+## ip_be: 4-byte IPv4 address in network byte order (big-endian as a u32 —
+##        the same shape `inet_pton` produces). Only the high `prefix_len`
+##        bits are significant; lower bits are ignored at match time.
+## prefix_len: 0..32. 0 = match all (default route); 32 = exact-host match.
+struct AllowedIPv4Cidr
+  ip_be: Int
+  prefix_len: Int
+end
+
+def cidr_v4(ip_be: Int, prefix_len: Int): AllowedIPv4Cidr
+  return AllowedIPv4Cidr { ip_be: ip_be, prefix_len: prefix_len }
+end
+
+## Mask for the high `prefix_len` bits of a 32-bit IPv4 address. The mask is
+## byte-reversed because we operate on network-byte-order storage.
+##
+## Examples:
+##   prefix_len=0  → 0x00000000 (no bits — match all)
+##   prefix_len=8  → 0x000000FF (high octet of network-order = byte 0)
+##   prefix_len=16 → 0x0000FFFF
+##   prefix_len=24 → 0x00FFFFFF
+##   prefix_len=32 → 0xFFFFFFFF
+def _cidr_mask_be(prefix_len: Int): Int
+  if prefix_len == 0
+    return 0
+  end
+  if prefix_len >= 32
+    return 4294967295
+  end
+  # Build host-order mask = (1 << prefix_len) - 1 shifted into high bits,
+  # then byte-swap to network order.
+  var host_mask = 0
+  var n = prefix_len
+  while n > 0
+    host_mask = (host_mask << 1) | 1
+    n -= 1
+  end
+  host_mask = host_mask << (32 - prefix_len)
+  # Byte-swap host_mask (which is built as if MSB-first big-endian view) into
+  # network-order representation matching ip_be storage.
+  var b0 = host_mask & 255
+  var b1 = (host_mask >> 8) & 255
+  var b2 = (host_mask >> 16) & 255
+  var b3 = (host_mask >> 24) & 255
+  return b3 | (b2 << 8) | (b1 << 16) | (b0 << 24)
+end
+
+## Does a 4-byte network-order IPv4 address match this CIDR?
+def cidr_v4_matches(c: AllowedIPv4Cidr, ip_be: Int): Int
+  var m = _cidr_mask_be(c.prefix_len)
+  if (ip_be & m) == (c.ip_be & m)
+    return 1
+  end
+  return 0
+end
+
+# =============================================================================
+# DevicePeer — per-peer state (3-slot session generations)
+# =============================================================================
+
+## Per-peer in-device state. Mutation via "read entire struct, modify, write
+## back to Vec<DevicePeer>" pattern (Quartz value semantics) — see
+## `_replace_peer` helper for the canonical form.
+##
+## Slot ordering (must match every DevicePeer { ... } construction site):
+##   peer, allowed_ips,
+##   has_previous, previous_session,
+##   has_current, current_session,
+##   has_next, next_session,
+##   has_handshake, handshake_state,
+##   pending_local_index, timers, last_ts,
+##   cookie_cached, cookie_cached_ms, last_outbound_mac1
+##
+## Ownership: `peer.buf`, each session's `.buf` (when its has_X flag is 1),
+## `handshake_state.buf` (when has_handshake==1), `last_ts` (when non-zero),
+## `cookie_cached` (when non-zero), `last_outbound_mac1` (when non-zero) are
+## all malloc'd. `_destroy_device_peer` frees them.
+struct DevicePeer
+  peer: Peer
+  allowed_ips: Vec<AllowedIPv4Cidr>
+  has_previous: Int
+  previous_session: Session
+  has_current: Int
+  current_session: Session
+  has_next: Int
+  next_session: Session
+  has_handshake: Int
+  handshake_state: HandshakeState
+  pending_local_index: Int      # u32 — local_index we put in MSG_INITIATION
+                                # (0 if no in-flight handshake; needed by
+                                # wg_consume_response's receiver_index check)
+  timers: PeerTimers
+  last_ts: Int                  # malloc'd 12-byte TAI64N buf; 0 = no init seen
+  # Cookie reply state — initiator-side cache (WG paper §5.4.7).
+  cookie_cached: Int            # malloc'd 16-byte cookie buf; 0 = no cookie
+  cookie_cached_ms: Int         # when received; 0 = never
+  last_outbound_mac1: Int       # malloc'd 16-byte mac1 of most recent
+                                # outbound MSG_INITIATION/_RESPONSE; 0 = none.
+                                # Used as AEAD aad for cookie-reply consume.
+end
+
+# Sentinel "empty" Session for unfilled slots. Only valid when the
+# corresponding has_X flag is 0; never dereference its .buf.
+def _empty_session(): Session
+  return Session { buf: 0, local_index: 0, peer_index: 0, is_initiator: 0 }
+end
+
+# =============================================================================
+# Device
+# =============================================================================
+
+struct Device
+  static_priv: Int              # malloc'd 32 bytes
+  static_pub: Int               # malloc'd 32 bytes
+  rng: Rng
+  peers: Vec<DevicePeer>
+  # Cookie reply state — responder-side under-load DoS defense.
+  # Two cookie secrets per WG paper §5.4.7: rotate every 120s; grace the
+  # previous one for an additional 60s so initiators caching a fresh-but-
+  # rotating cookie don't get bounced into a second cookie reply.
+  cookie_secret: Int            # malloc'd 32 bytes — current τ_R
+  cookie_secret_ms: Int         # when current secret was set; 0 = never
+  prev_cookie_secret: Int       # malloc'd 32 bytes — previous τ_R (or zeros)
+  prev_cookie_secret_ms: Int    # when previous was demoted; 0 = no prev
+  under_load: Int               # operator-set / counter-set under-load flag
+  recent_handshake_count: Int   # counter for the current 1-second window
+  recent_handshake_window_ms: Int # start of the current 1-second window
+end
+
+## Construct a fresh device with a random static keypair. Caller is
+## responsible for distributing `wg_device_static_pub` to peers
+## out-of-band — there is no PKI in WireGuard.
+def wg_device_new(): Device
+  var r = rng_new()
+  var sk = malloc(32)
+  var pk = malloc(32)
+  rng_fill(r, sk, 32)
+  # NET.4.1: wrap freshly-generated static private key at the x25519 boundary.
+  x25519_secret_to_public(pk, secret_wrap(sk))
+  return _make_device(sk, pk, r)
+end
+
+## Construct a device from a known static keypair (for reproducible tests
+## or restoring from persisted config). Both buffers are 32 bytes; ownership
+## transfers to the Device (it will free them on destroy).
+def wg_device_from_keys(static_priv_src: Int, static_pub_src: Int): Device
+  var sk = malloc(32)
+  var pk = malloc(32)
+  memcpy(sk, static_priv_src, 32)
+  memcpy(pk, static_pub_src, 32)
+  return _make_device(sk, pk, rng_new())
+end
+
+## Construct a fresh device with a random static keypair, seeded from the
+## x86 hardware RNG (RDSEED/RDRAND). Use this in freestanding contexts
+## where POSIX `getentropy(3)` is unavailable (the unikernel). Userspace
+## should prefer `wg_device_new`, which is cross-architecture.
+def wg_device_new_hw(): Device
+  var r = rng_new_hw()
+  var sk = malloc(32)
+  var pk = malloc(32)
+  rng_fill(r, sk, 32)
+  # NET.4.1: wrap freshly-generated static private key at the x25519 boundary.
+  x25519_secret_to_public(pk, secret_wrap(sk))
+  return _make_device(sk, pk, r)
+end
+
+## Construct a device from a known static keypair, seeded for ephemeral-key
+## use from the x86 hardware RNG. Freestanding twin of `wg_device_from_keys`.
+def wg_device_from_keys_hw(static_priv_src: Int, static_pub_src: Int): Device
+  var sk = malloc(32)
+  var pk = malloc(32)
+  memcpy(sk, static_priv_src, 32)
+  memcpy(pk, static_pub_src, 32)
+  return _make_device(sk, pk, rng_new_hw())
+end
+
+# Internal Device constructor — owns RNG seed for the cookie secret too.
+def _make_device(sk: Int, pk: Int, r: Rng): Device
+  var sec = malloc(32)
+  rng_fill(r, sec, 32)
+  var prev = malloc(32)
+  memset(prev, 0, 32)
+  return Device {
+    static_priv: sk,
+    static_pub: pk,
+    rng: r,
+    peers: vec_new<DevicePeer>(),
+    cookie_secret: sec,
+    cookie_secret_ms: 0,
+    prev_cookie_secret: prev,
+    prev_cookie_secret_ms: 0,
+    under_load: 0,
+    recent_handshake_count: 0,
+    recent_handshake_window_ms: 0
+  }
+end
+
+## Wipe + free all device state. After this, `d` must not be used.
+def wg_device_destroy(d: Device): Void
+  var i = 0
+  while i < d.peers.size
+    _destroy_device_peer(d.peers[i])
+    i += 1
+  end
+  zeroize(d.static_priv, 32)
+  free(d.static_priv)
+  free(d.static_pub)
+  zeroize(d.cookie_secret, 32)
+  free(d.cookie_secret)
+  zeroize(d.prev_cookie_secret, 32)
+  free(d.prev_cookie_secret)
+  rng_destroy(d.rng)
+end
+
+def wg_device_static_pub(d: Device): Int
+  return d.static_pub
+end
+
+# Frees all malloc'd state held by a single DevicePeer. Caller has already
+# removed the entry from the device's Vec.
+def _destroy_device_peer(p: DevicePeer): Void
+  if p.has_previous == 1
+    session_destroy(p.previous_session)
+  end
+  if p.has_current == 1
+    session_destroy(p.current_session)
+  end
+  if p.has_next == 1
+    session_destroy(p.next_session)
+  end
+  if p.has_handshake == 1
+    noise_handshake_destroy(p.handshake_state)
+  end
+  if p.last_ts != 0
+    free(p.last_ts)
+  end
+  if p.cookie_cached != 0
+    zeroize(p.cookie_cached, 16)
+    free(p.cookie_cached)
+  end
+  if p.last_outbound_mac1 != 0
+    free(p.last_outbound_mac1)
+  end
+  peer_destroy(p.peer)
+end
+
+# Replace one peer in d.peers[idx] with a new struct value. Caller is
+# responsible for not orphaning malloc'd buffers (e.g., session_destroy old
+# session before reassigning has_X).
+def _replace_peer(d: Device, idx: Int, np: DevicePeer): Void
+  d.peers[idx] = np
+end
+
+# =============================================================================
+# Peer table mutation
+# =============================================================================
+
+## Add a configured peer. Returns the new peer's index in `d.peers`. The
+## returned index is stable for the device's lifetime (peers are never
+## removed in this MVP).
+def wg_device_add_peer(d: Device, static_pub_src: Int, psk_src: Int,
+                       endpoint: EndpointV4,
+                       allowed_ips: Vec<AllowedIPv4Cidr>): Int
+  var p = peer_new(static_pub_src, psk_src, endpoint)
+  var idx = d.peers.size
+  d.peers.push(DevicePeer {
+    peer: p,
+    allowed_ips: allowed_ips,
+    has_previous: 0,
+    previous_session: _empty_session(),
+    has_current: 0,
+    current_session: _empty_session(),
+    has_next: 0,
+    next_session: _empty_session(),
+    has_handshake: 0,
+    handshake_state: HandshakeState { buf: 0 },
+    pending_local_index: 0,
+    timers: wg_timers_new(),
+    last_ts: 0,
+    cookie_cached: 0,
+    cookie_cached_ms: 0,
+    last_outbound_mac1: 0
+  })
+  return idx
+end
+
+## Update peer's last-known UDP endpoint (IP + port). Per WG paper §6.2,
+## the responder updates its peer's endpoint on every successfully
+## decrypted inbound message — this is "roaming". The initiator side
+## also benefits because keepalive / rekey TX needs somewhere to send
+## to; without this, a responder-mode boot starts with peer endpoints
+## set to (0, 0) and has no way to reach them unsolicited.
+def wg_device_update_endpoint(d: Device, peer_idx: Int, ip_be: Int, port: Int): Void
+  if peer_idx < 0 or peer_idx >= d.peers.size
+    return
+  end
+  var dp = d.peers[peer_idx]
+  if dp.peer.endpoint.ip_be == ip_be and dp.peer.endpoint.port == port
+    return    # no change — avoid the value-rebuild dance
+  end
+  var new_peer = Peer {
+    buf: dp.peer.buf,
+    endpoint: EndpointV4 { ip_be: ip_be, port: port }
+  }
+  d.peers[peer_idx] = DevicePeer {
+    peer: new_peer,
+    allowed_ips: dp.allowed_ips,
+    has_previous: dp.has_previous,
+    previous_session: dp.previous_session,
+    has_current: dp.has_current,
+    current_session: dp.current_session,
+    has_next: dp.has_next,
+    next_session: dp.next_session,
+    has_handshake: dp.has_handshake,
+    handshake_state: dp.handshake_state,
+    pending_local_index: dp.pending_local_index,
+    timers: dp.timers,
+    last_ts: dp.last_ts,
+    cookie_cached: dp.cookie_cached,
+    cookie_cached_ms: dp.cookie_cached_ms,
+    last_outbound_mac1: dp.last_outbound_mac1
+  }
+end
+
+# =============================================================================
+# Lookups
+# =============================================================================
+
+## Find a peer by its static Curve25519 public key (32-byte buffer).
+## Returns the peer index, or -1 if not found.
+def wg_device_lookup_by_pub(d: Device, pub_src: Int): Int
+  var i = 0
+  while i < d.peers.size
+    var dp = d.peers[i]
+    if peer_static_pub_eq(dp.peer, pub_src) == 1
+      return i
+    end
+    i += 1
+  end
+  return 0 - 1
+end
+
+# Per-peer slot probe. Returns 0=current, 1=previous, 2=next, -1=none.
+# Order matters: current first (most likely match in steady state).
+def _slot_for_local_index(dp: DevicePeer, idx: Int): Int
+  if dp.has_current == 1 and dp.current_session.local_index == idx
+    return 0
+  end
+  if dp.has_previous == 1 and dp.previous_session.local_index == idx
+    return 1
+  end
+  if dp.has_next == 1 and dp.next_session.local_index == idx
+    return 2
+  end
+  return 0 - 1
+end
+
+## Find the peer that owns a session (any slot — previous, current, or next)
+## whose local_index == `idx`. Returns peer index, or -1 if no live session
+## across the table matches.
+def wg_device_lookup_by_local_index(d: Device, idx: Int): Int
+  var i = 0
+  while i < d.peers.size
+    if _slot_for_local_index(d.peers[i], idx) >= 0
+      return i
+    end
+    i += 1
+  end
+  return 0 - 1
+end
+
+## Find the peer to route an outbound packet through, by longest-prefix
+## match against allowed_ips. Returns peer index, or -1 if no peer covers
+## this destination.
+def wg_device_lookup_route(d: Device, dest_ip_be: Int): Int
+  var best_idx = 0 - 1
+  var best_len = 0 - 1
+  var i = 0
+  while i < d.peers.size
+    var dp = d.peers[i]
+    var j = 0
+    while j < dp.allowed_ips.size
+      var c = dp.allowed_ips[j]
+      if cidr_v4_matches(c, dest_ip_be) == 1 and c.prefix_len > best_len
+        best_idx = i
+        best_len = c.prefix_len
+      end
+      j += 1
+    end
+    i += 1
+  end
+  return best_idx
+end
+
+# =============================================================================
+# Internal: index allocation
+# =============================================================================
+
+## Allocate a fresh u32 session-local-index that does NOT collide with any
+## live session's local_index in the device. Avoids 0 (some impls reserve
+## it). Panics after 100 collisions (RNG broken).
+def _alloc_local_index(d: Device): Int
+  var attempts = 0
+  while attempts < 100
+    var buf = malloc(4)
+    rng_fill(d.rng, buf, 4)
+    var idx = ptr_read_byte(buf) +
+              (ptr_read_byte(buf + 1) * 256) +
+              (ptr_read_byte(buf + 2) * 65536) +
+              (ptr_read_byte(buf + 3) * 16777216)
+    free(buf)
+    if idx != 0 and wg_device_lookup_by_local_index(d, idx) == (0 - 1)
+      return idx
+    end
+    attempts += 1
+  end
+  panic("wg_device: failed to allocate fresh local_index after 100 attempts")
+end
+
+# =============================================================================
+# Internal: install a new session into the `next` slot
+# =============================================================================
+
+# Replace dp.next_session with `s`. If a prior next existed, destroy it
+# (it never proved itself with data — replaced before promotion). Returns
+# the rebuilt DevicePeer; caller writes back to d.peers[].
+def _install_as_next(dp: DevicePeer, s: Session): DevicePeer
+  if dp.has_next == 1
+    session_destroy(dp.next_session)
+  end
+  return DevicePeer {
+    peer: dp.peer,
+    allowed_ips: dp.allowed_ips,
+    has_previous: dp.has_previous,
+    previous_session: dp.previous_session,
+    has_current: dp.has_current,
+    current_session: dp.current_session,
+    has_next: 1,
+    next_session: s,
+    has_handshake: dp.has_handshake,
+    handshake_state: dp.handshake_state,
+    pending_local_index: dp.pending_local_index,
+    timers: dp.timers,
+    last_ts: dp.last_ts,
+    cookie_cached: dp.cookie_cached,
+    cookie_cached_ms: dp.cookie_cached_ms,
+    last_outbound_mac1: dp.last_outbound_mac1
+  }
+end
+
+# Promote: previous = current; current = next; next = empty. Frees any prior
+# `previous` (it has been superseded). Updates timers to track the new
+# current session (REKEY/REJECT/KEEPALIVE timers re-anchor here).
+#
+# Caller must check dp.has_next==1 before calling. Returns the rebuilt
+# DevicePeer; caller writes back to d.peers[].
+def _promote_next_to_current(dp: DevicePeer, now_ms: Int): DevicePeer
+  if dp.has_previous == 1
+    session_destroy(dp.previous_session)
+  end
+  var new_prev_has = dp.has_current
+  var new_prev = dp.current_session
+  var promoted_is_initiator = dp.next_session.is_initiator
+  return DevicePeer {
+    peer: dp.peer,
+    allowed_ips: dp.allowed_ips,
+    has_previous: new_prev_has,
+    previous_session: new_prev,
+    has_current: 1,
+    current_session: dp.next_session,
+    has_next: 0,
+    next_session: _empty_session(),
+    has_handshake: dp.has_handshake,
+    handshake_state: dp.handshake_state,
+    pending_local_index: dp.pending_local_index,
+    timers: wg_timers_session_established(dp.timers, now_ms, promoted_is_initiator),
+    last_ts: dp.last_ts,
+    cookie_cached: dp.cookie_cached,
+    cookie_cached_ms: dp.cookie_cached_ms,
+    last_outbound_mac1: dp.last_outbound_mac1
+  }
+end
+
+# =============================================================================
+# Handshake — initiator
+# =============================================================================
+
+## Initiate a handshake with peer `peer_idx`. Fills `msg_out` (148 bytes)
+## and stores the in-flight HandshakeState on the peer; the caller sends
+## msg_out to peer's endpoint over UDP.
+##
+## Returns 148 on success, -1 if peer doesn't exist or ECDH fails.
+def wg_device_initiate_handshake(d: Device, peer_idx: Int, msg_out: Int,
+                                 now_ms: Int): Int
+  if peer_idx < 0 or peer_idx >= d.peers.size
+    return 0 - 1
+  end
+  var dp = d.peers[peer_idx]
+
+  # Free any prior in-flight handshake.
+  if dp.has_handshake == 1
+    noise_handshake_destroy(dp.handshake_state)
+  end
+
+  var hs = noise_handshake_new()
+  var local_index = _alloc_local_index(d)
+  var ts = malloc(12)
+  wg_tai64n_now(ts)
+
+  # NET.4.1 B: wrap the device's static private key and (one day) the
+  # peer's PSK at the handshake-driver boundary. The `static_priv` field
+  # is still Int on the Device struct — field-level Secret<Int> typing on
+  # struct fields is filed forward (see SECRET_T_AND_DUDECT_DESIGN.md).
+  var rc = wg_create_initiation(hs, d.rng, secret_wrap(d.static_priv), d.static_pub,
+                                peer_static_pub(dp.peer),
+                                local_index, ts, msg_out)
+  free(ts)
+  if rc != 0
+    noise_handshake_destroy(hs)
+    return 0 - 1
+  end
+
+  # If we have a fresh cached cookie from this peer, attach mac2 to defeat
+  # under-load DoS rate-limiting on their end. Otherwise mac2 stays zeros
+  # (set by wg_create_initiation).
+  if dp.cookie_cached != 0
+    var age = now_ms - dp.cookie_cached_ms
+    if age < WG_COOKIE_REFRESH_TIME_MS()
+      wg_attach_mac2(msg_out, 116, dp.cookie_cached)
+    end
+  end
+
+  # Stash mac1 (computed by wg_create_initiation at msg_out + 116) for the
+  # cookie-reply consume path: any inbound MSG_COOKIEREPLY for this handshake
+  # uses our mac1 as AEAD aad.
+  if dp.last_outbound_mac1 == 0
+    dp.last_outbound_mac1 = malloc(16)
+  end
+  memcpy(dp.last_outbound_mac1, msg_out + 116, 16)
+
+  # Stash in-flight state on this peer; bump timers.
+  d.peers[peer_idx] = DevicePeer {
+    peer: dp.peer,
+    allowed_ips: dp.allowed_ips,
+    has_previous: dp.has_previous,
+    previous_session: dp.previous_session,
+    has_current: dp.has_current,
+    current_session: dp.current_session,
+    has_next: dp.has_next,
+    next_session: dp.next_session,
+    has_handshake: 1,
+    handshake_state: hs,
+    pending_local_index: local_index,
+    timers: wg_timers_handshake_started(dp.timers, now_ms),
+    last_ts: dp.last_ts,
+    cookie_cached: dp.cookie_cached,
+    cookie_cached_ms: dp.cookie_cached_ms,
+    last_outbound_mac1: dp.last_outbound_mac1
+  }
+  return 148
+end
+
+# =============================================================================
+# Handshake — responder
+# =============================================================================
+
+## Consume a 148-byte MSG_INITIATION. On success, look up the originating
+## peer, validate timestamp monotonicity, generate a 92-byte MSG_RESPONSE
+## into `msg_resp_out`, and install the new transport Session in the peer's
+## `next` slot. The current session (if any) stays live until the new one
+## proves itself by carrying a successful inbound data packet (lazy
+## promotion in `wg_device_handle_data`).
+##
+## Returns peer_idx on success, -1 on:
+##   - MAC1 / AEAD / ECDH failure
+##   - decoded peer pubkey not in our peer table
+##   - timestamp not strictly greater than last seen from this peer
+def wg_device_handle_initiation(d: Device, msg_in: Int, msg_resp_out: Int,
+                                now_ms: Int): Int
+  var hs = noise_handshake_new()
+  var seen_pub = malloc(32)
+  var seen_ts = malloc(12)
+  var seen_idx_buf = malloc(4)
+
+  # NET.4.1 B: wrap at the handshake-driver boundary (see create_initiation).
+  var rc = wg_consume_initiation(hs, secret_wrap(d.static_priv), d.static_pub,
+                                 msg_in, seen_pub, seen_ts, seen_idx_buf)
+  if rc != 0
+    noise_handshake_destroy(hs)
+    free(seen_pub); free(seen_ts); free(seen_idx_buf)
+    return 0 - 1
+  end
+
+  var peer_idx = wg_device_lookup_by_pub(d, seen_pub)
+  if peer_idx < 0
+    noise_handshake_destroy(hs)
+    free(seen_pub); free(seen_ts); free(seen_idx_buf)
+    return 0 - 1
+  end
+  free(seen_pub)
+
+  var dp = d.peers[peer_idx]
+
+  # Replay defense: timestamp must be strictly greater than last seen.
+  if dp.last_ts != 0 and _ts_le(seen_ts, dp.last_ts) == 1
+    noise_handshake_destroy(hs)
+    free(seen_ts); free(seen_idx_buf)
+    return 0 - 1
+  end
+
+  # Decode initiator's sender_index (becomes our peer_index for this session).
+  var initiator_index = ptr_read_byte(seen_idx_buf) +
+                        (ptr_read_byte(seen_idx_buf + 1) * 256) +
+                        (ptr_read_byte(seen_idx_buf + 2) * 65536) +
+                        (ptr_read_byte(seen_idx_buf + 3) * 16777216)
+  free(seen_idx_buf)
+
+  var local_index = _alloc_local_index(d)
+
+  # Build and send response. NET.4.1 B: wrap the peer's PSK at the
+  # handshake-driver boundary; the Peer.psk field stays Int (struct-field
+  # discipline filed forward).
+  var resp_rc = wg_create_response(hs, d.rng, peer_static_pub(dp.peer),
+                                   secret_wrap(peer_psk(dp.peer)),
+                                   local_index, initiator_index,
+                                   msg_resp_out)
+  if resp_rc != 0
+    noise_handshake_destroy(hs)
+    free(seen_ts)
+    return 0 - 1
+  end
+
+  # Build the new Session and install into the `next` slot. The current
+  # session (if any) keeps serving inbound packets until the new one is
+  # promoted on first valid data recv.
+  var new_session = wg_finalize_session(hs, 0, local_index, initiator_index, now_ms)
+  noise_handshake_destroy(hs)
+
+  # Update last_ts (replay watermark).
+  if dp.last_ts == 0
+    dp.last_ts = malloc(12)
+  end
+  memcpy(dp.last_ts, seen_ts, 12)
+  free(seen_ts)
+
+  # Clear any in-flight handshake state on this peer (we just generated a
+  # response on a fresh handshake; old state, if any, is moot).
+  if dp.has_handshake == 1
+    noise_handshake_destroy(dp.handshake_state)
+  end
+  var dp1 = DevicePeer {
+    peer: dp.peer,
+    allowed_ips: dp.allowed_ips,
+    has_previous: dp.has_previous,
+    previous_session: dp.previous_session,
+    has_current: dp.has_current,
+    current_session: dp.current_session,
+    has_next: dp.has_next,
+    next_session: dp.next_session,
+    has_handshake: 0,
+    handshake_state: HandshakeState { buf: 0 },
+    pending_local_index: 0,
+    timers: dp.timers,
+    last_ts: dp.last_ts,
+    cookie_cached: dp.cookie_cached,
+    cookie_cached_ms: dp.cookie_cached_ms,
+    last_outbound_mac1: dp.last_outbound_mac1
+  }
+  d.peers[peer_idx] = _install_as_next(dp1, new_session)
+  return peer_idx
+end
+
+# Compare two 12-byte TAI64N buffers byte-wise (big-endian). Returns 1 if
+# `a <= b`, 0 if `a > b`. Used for replay defense — only timestamps strictly
+# greater than the prior watermark are accepted.
+def _ts_le(a: Int, b: Int): Int
+  var i = 0
+  while i < 12
+    var av = ptr_read_byte(a + i)
+    var bv = ptr_read_byte(b + i)
+    if av < bv
+      return 1
+    end
+    if av > bv
+      return 0
+    end
+    i += 1
+  end
+  return 1   # equal counts as "not strictly greater" → reject
+end
+
+## Consume a 92-byte MSG_RESPONSE. Looks up the in-flight peer by
+## `receiver_index` (== our pending_local_index for that handshake), validates,
+## and installs the transport session in the `next` slot. The first send
+## promotes it to `current`.
+##
+## Returns peer_idx on success, -1 on:
+##   - no peer has an in-flight handshake at this index
+##   - MAC1 / AEAD / ECDH failure
+def wg_device_handle_response(d: Device, msg_in: Int, now_ms: Int): Int
+  # receiver_index field at msg_in[8..12) — this is the initiator's
+  # local_index that the responder echoed. That's OUR pending_local_index.
+  var our_idx = ptr_read_byte(msg_in + 8) +
+                (ptr_read_byte(msg_in + 9) * 256) +
+                (ptr_read_byte(msg_in + 10) * 65536) +
+                (ptr_read_byte(msg_in + 11) * 16777216)
+
+  # Find the peer whose in-flight handshake matches.
+  var i = 0
+  while i < d.peers.size
+    var dp = d.peers[i]
+    if dp.has_handshake == 1 and dp.pending_local_index == our_idx
+      var seen_peer_idx = malloc(4)
+      # NET.4.1 B: wrap static_priv + psk at the handshake-driver boundary.
+      var rc = wg_consume_response(dp.handshake_state,
+                                   secret_wrap(d.static_priv), d.static_pub,
+                                   secret_wrap(peer_psk(dp.peer)),
+                                   msg_in, our_idx, seen_peer_idx)
+      if rc != 0
+        free(seen_peer_idx)
+        return 0 - 1
+      end
+      var peer_index = ptr_read_byte(seen_peer_idx) +
+                       (ptr_read_byte(seen_peer_idx + 1) * 256) +
+                       (ptr_read_byte(seen_peer_idx + 2) * 65536) +
+                       (ptr_read_byte(seen_peer_idx + 3) * 16777216)
+      free(seen_peer_idx)
+
+      var new_session = wg_finalize_session(dp.handshake_state, 1,
+                                            our_idx, peer_index, now_ms)
+      noise_handshake_destroy(dp.handshake_state)
+
+      var dp1 = DevicePeer {
+        peer: dp.peer,
+        allowed_ips: dp.allowed_ips,
+        has_previous: dp.has_previous,
+        previous_session: dp.previous_session,
+        has_current: dp.has_current,
+        current_session: dp.current_session,
+        has_next: dp.has_next,
+        next_session: dp.next_session,
+        has_handshake: 0,
+        handshake_state: HandshakeState { buf: 0 },
+        pending_local_index: 0,
+        timers: dp.timers,
+        last_ts: dp.last_ts,
+        cookie_cached: dp.cookie_cached,
+        cookie_cached_ms: dp.cookie_cached_ms,
+        last_outbound_mac1: dp.last_outbound_mac1
+      }
+      d.peers[i] = _install_as_next(dp1, new_session)
+      return i
+    end
+    i += 1
+  end
+  return 0 - 1
+end
+
+# =============================================================================
+# Transport — data
+# =============================================================================
+
+## Encrypt + frame an outbound transport-data packet for peer `peer_idx`.
+## Returns wire length on success (== `wg_data_packet_total_len(pt_len)`),
+## or -1 if peer doesn't exist / has no live session / counter exhausted.
+##
+## Multi-session promotion (initiator-side): if a `next` session exists,
+## promote it to `current` (with the prior `current` shifted to `previous`)
+## before sending. This implements wireguard-go's `LoadNext` semantics:
+## the act of sending consumes the new keypair.
+##
+## The caller handles UDP send to `dp.peer.endpoint`.
+def wg_device_send_data(d: Device, peer_idx: Int, pt: Int, pt_len: Int,
+                        msg_out: Int, now_ms: Int): Int
+  if peer_idx < 0 or peer_idx >= d.peers.size
+    return 0 - 1
+  end
+  var dp = d.peers[peer_idx]
+
+  if dp.has_next == 1
+    dp = _promote_next_to_current(dp, now_ms)
+    d.peers[peer_idx] = dp
+  end
+
+  if dp.has_current == 0
+    return 0 - 1
+  end
+  return wg_encrypt_data_packet(dp.current_session, pt, pt_len, msg_out)
+end
+
+## Decrypt an inbound transport-data packet. Looks up the receiving session
+## via `receiver_index` across the 3 slots (current, previous, next),
+## AEAD-verifies, replay-checks, decrypts. Writes the owning peer's index to
+## `*peer_idx_ptr` (4 bytes LE).
+##
+## Multi-session promotion (responder-side): if the matching slot is `next`,
+## promote it to `current` after a successful decrypt. A receive on
+## `previous` is honored (rekey-overlap retransmits) but does NOT trigger
+## any slot reshuffle.
+##
+## Returns padded plaintext byte count on success, -1 on any failure (no
+## matching session, AEAD failure, replay).
+def wg_device_handle_data(d: Device, msg_in: Int, msg_in_len: Int,
+                          pt_out: Int, peer_idx_ptr: Int, now_ms: Int): Int
+  if msg_in_len < 16
+    return 0 - 1
+  end
+  var our_idx = ptr_read_byte(msg_in + 4) +
+                (ptr_read_byte(msg_in + 5) * 256) +
+                (ptr_read_byte(msg_in + 6) * 65536) +
+                (ptr_read_byte(msg_in + 7) * 16777216)
+  var peer_idx = wg_device_lookup_by_local_index(d, our_idx)
+  if peer_idx < 0
+    return 0 - 1
+  end
+  var dp = d.peers[peer_idx]
+  var slot = _slot_for_local_index(dp, our_idx)
+  if slot < 0
+    return 0 - 1
+  end
+
+  var target = _empty_session()
+  if slot == 0
+    target = dp.current_session
+  end
+  if slot == 1
+    target = dp.previous_session
+    # Stale-previous reject: the prior session has aged out. WG paper §6.5
+    # says REJECT_AFTER_TIME applies independently of slot — once the
+    # session age limit is hit, no further packets are accepted on it.
+    var age = now_ms - session_established_ms(dp.previous_session)
+    if age >= WG_REJECT_AFTER_TIME_MS()
+      return 0 - 1
+    end
+  end
+  if slot == 2
+    target = dp.next_session
+  end
+
+  var rc = wg_decrypt_data_packet(target, msg_in, msg_in_len, pt_out)
+  if rc < 0
+    return 0 - 1
+  end
+
+  # Promotion on first successful recv via `next`.
+  if slot == 2
+    dp = _promote_next_to_current(dp, now_ms)
+  end
+
+  # Bump activity timer (always — current/previous/next all count as
+  # "peer is alive"). Note: wg_timers_data_recv updates last_recv_ms; on
+  # promotion the timer was just refreshed by _promote_next_to_current via
+  # wg_timers_session_established which sets last_recv_ms = now_ms — calling
+  # data_recv here is a no-op-ish, just keeps the slot exclusively-true.
+  d.peers[peer_idx] = DevicePeer {
+    peer: dp.peer,
+    allowed_ips: dp.allowed_ips,
+    has_previous: dp.has_previous,
+    previous_session: dp.previous_session,
+    has_current: dp.has_current,
+    current_session: dp.current_session,
+    has_next: dp.has_next,
+    next_session: dp.next_session,
+    has_handshake: dp.has_handshake,
+    handshake_state: dp.handshake_state,
+    pending_local_index: dp.pending_local_index,
+    timers: wg_timers_data_recv(dp.timers, now_ms),
+    last_ts: dp.last_ts,
+    cookie_cached: dp.cookie_cached,
+    cookie_cached_ms: dp.cookie_cached_ms,
+    last_outbound_mac1: dp.last_outbound_mac1
+  }
+  ptr_write_byte(peer_idx_ptr, peer_idx & 255)
+  ptr_write_byte(peer_idx_ptr + 1, (peer_idx >> 8) & 255)
+  ptr_write_byte(peer_idx_ptr + 2, (peer_idx >> 16) & 255)
+  ptr_write_byte(peer_idx_ptr + 3, (peer_idx >> 24) & 255)
+  return rc
+end
+
+# =============================================================================
+# Public lifecycle helpers — chokepoints for state mutation
+# =============================================================================
+
+## Tear down any in-flight handshake state on this peer (the responder did
+## not reply within REKEY_ATTEMPT_TIME). Frees `handshake_state`, clears
+## `has_handshake` + `pending_local_index`, and updates timers.
+def wg_device_peer_drop_handshake(d: Device, peer_idx: Int): Void
+  if peer_idx < 0 or peer_idx >= d.peers.size
+    return
+  end
+  var dp = d.peers[peer_idx]
+  if dp.has_handshake == 0
+    return
+  end
+  noise_handshake_destroy(dp.handshake_state)
+  d.peers[peer_idx] = DevicePeer {
+    peer: dp.peer,
+    allowed_ips: dp.allowed_ips,
+    has_previous: dp.has_previous,
+    previous_session: dp.previous_session,
+    has_current: dp.has_current,
+    current_session: dp.current_session,
+    has_next: dp.has_next,
+    next_session: dp.next_session,
+    has_handshake: 0,
+    handshake_state: HandshakeState { buf: 0 },
+    pending_local_index: 0,
+    timers: wg_timers_handshake_dropped(dp.timers),
+    last_ts: dp.last_ts,
+    cookie_cached: dp.cookie_cached,
+    cookie_cached_ms: dp.cookie_cached_ms,
+    last_outbound_mac1: dp.last_outbound_mac1
+  }
+end
+
+## Drop the `current` session (180s elapsed since establishment). Leaves
+## `previous` and `next` untouched — `previous` will be reaped by
+## `wg_device_peer_gc_stale` once it too crosses REJECT_AFTER_TIME, and
+## `next` (if any) gets promoted on the next send/recv.
+def wg_device_peer_drop_session(d: Device, peer_idx: Int): Void
+  if peer_idx < 0 or peer_idx >= d.peers.size
+    return
+  end
+  var dp = d.peers[peer_idx]
+  if dp.has_current == 0
+    return
+  end
+  session_destroy(dp.current_session)
+  d.peers[peer_idx] = DevicePeer {
+    peer: dp.peer,
+    allowed_ips: dp.allowed_ips,
+    has_previous: dp.has_previous,
+    previous_session: dp.previous_session,
+    has_current: 0,
+    current_session: _empty_session(),
+    has_next: dp.has_next,
+    next_session: dp.next_session,
+    has_handshake: dp.has_handshake,
+    handshake_state: dp.handshake_state,
+    pending_local_index: dp.pending_local_index,
+    timers: wg_timers_session_dropped(dp.timers),
+    last_ts: dp.last_ts,
+    cookie_cached: dp.cookie_cached,
+    cookie_cached_ms: dp.cookie_cached_ms,
+    last_outbound_mac1: dp.last_outbound_mac1
+  }
+end
+
+## Mark a keepalive packet as just-sent. Suppresses repeated SEND_KEEPALIVE
+## flag fires until the next idle window elapses.
+def wg_device_peer_mark_keepalive_sent(d: Device, peer_idx: Int, now_ms: Int): Void
+  if peer_idx < 0 or peer_idx >= d.peers.size
+    return
+  end
+  var dp = d.peers[peer_idx]
+  d.peers[peer_idx] = DevicePeer {
+    peer: dp.peer,
+    allowed_ips: dp.allowed_ips,
+    has_previous: dp.has_previous,
+    previous_session: dp.previous_session,
+    has_current: dp.has_current,
+    current_session: dp.current_session,
+    has_next: dp.has_next,
+    next_session: dp.next_session,
+    has_handshake: dp.has_handshake,
+    handshake_state: dp.handshake_state,
+    pending_local_index: dp.pending_local_index,
+    timers: wg_timers_keepalive_sent(dp.timers, now_ms),
+    last_ts: dp.last_ts,
+    cookie_cached: dp.cookie_cached,
+    cookie_cached_ms: dp.cookie_cached_ms,
+    last_outbound_mac1: dp.last_outbound_mac1
+  }
+end
+
+## Garbage-collect stale `previous` session: drops it if its age has
+## exceeded REJECT_AFTER_TIME. Caller invokes once per peer per tick to
+## bound memory occupancy in the long-idle case (one peer with no rekey
+## traffic for >180s after the last promotion).
+def wg_device_peer_gc_stale(d: Device, peer_idx: Int, now_ms: Int): Void
+  if peer_idx < 0 or peer_idx >= d.peers.size
+    return
+  end
+  var dp = d.peers[peer_idx]
+  if dp.has_previous == 0
+    return
+  end
+  var age = now_ms - session_established_ms(dp.previous_session)
+  if age < WG_REJECT_AFTER_TIME_MS()
+    return
+  end
+  session_destroy(dp.previous_session)
+  d.peers[peer_idx] = DevicePeer {
+    peer: dp.peer,
+    allowed_ips: dp.allowed_ips,
+    has_previous: 0,
+    previous_session: _empty_session(),
+    has_current: dp.has_current,
+    current_session: dp.current_session,
+    has_next: dp.has_next,
+    next_session: dp.next_session,
+    has_handshake: dp.has_handshake,
+    handshake_state: dp.handshake_state,
+    pending_local_index: dp.pending_local_index,
+    timers: dp.timers,
+    last_ts: dp.last_ts,
+    cookie_cached: dp.cookie_cached,
+    cookie_cached_ms: dp.cookie_cached_ms,
+    last_outbound_mac1: dp.last_outbound_mac1
+  }
+end
+
+# =============================================================================
+# Convenience accessors used by tests / the unikernel layer
+# =============================================================================
+
+def wg_device_peer_count(d: Device): Int = d.peers.size
+
+## Has this peer ANY transport session — previous, current, or next?
+## (Aggregate check; the spec uses this after handshake to confirm the new
+## session landed somewhere, since it now goes into `next`.)
+def wg_device_peer_has_session(d: Device, peer_idx: Int): Int
+  if peer_idx < 0 or peer_idx >= d.peers.size
+    return 0
+  end
+  var dp = d.peers[peer_idx]
+  if dp.has_previous == 1
+    return 1
+  end
+  if dp.has_current == 1
+    return 1
+  end
+  if dp.has_next == 1
+    return 1
+  end
+  return 0
+end
+
+## Slot-precise accessors (for tests / debugging — not used by normal code).
+def wg_device_peer_has_current(d: Device, peer_idx: Int): Int
+  if peer_idx < 0 or peer_idx >= d.peers.size
+    return 0
+  end
+  return d.peers[peer_idx].has_current
+end
+
+def wg_device_peer_has_previous(d: Device, peer_idx: Int): Int
+  if peer_idx < 0 or peer_idx >= d.peers.size
+    return 0
+  end
+  return d.peers[peer_idx].has_previous
+end
+
+def wg_device_peer_has_next(d: Device, peer_idx: Int): Int
+  if peer_idx < 0 or peer_idx >= d.peers.size
+    return 0
+  end
+  return d.peers[peer_idx].has_next
+end
+
+def wg_device_peer_endpoint(d: Device, peer_idx: Int): EndpointV4
+  return d.peers[peer_idx].peer.endpoint
+end
+
+# =============================================================================
+# Cookie reply (NET.1 Phase 2) — DoS defense for handshake floods
+# =============================================================================
+#
+# Two-sided machinery (WG paper §5.4.7):
+#
+# Responder side ("under load"):
+#   - Per-device cookie secret τ_R, rotates every WG_COOKIE_REFRESH_TIME_MS.
+#     Previous secret kept valid for an additional 60s (grace) so initiators
+#     caching a fresh-but-rotating cookie don't bounce.
+#   - Under-load detection: simple per-second handshake-inbound counter.
+#     `wg_device_set_under_load` overrides for testing/operator policy.
+#   - When under load: caller asks `wg_device_should_cookie_reply` BEFORE
+#     handing the inbound to handle_initiation/handle_response. If it returns
+#     1, caller emits the cookie reply via `wg_device_emit_cookie_reply` and
+#     drops the original inbound.
+#
+# Initiator side (we sent a handshake message and might get a cookie reply):
+#   - When we send MSG_INITIATION (or MSG_RESPONSE), stash its mac1 on the
+#     peer (`last_outbound_mac1`) — the cookie reply's AEAD aad will be
+#     this mac1, so we need it to decrypt.
+#   - On inbound MSG_COOKIEREPLY: caller invokes
+#     `wg_device_handle_cookie_reply`, which decrypts and caches the cookie.
+#   - Subsequent outbound handshakes attach mac2 derived from the cached
+#     cookie (lazy — done in `wg_device_initiate_handshake`).
+
+## Operator/testing override of the under-load flag. Set 1 to force cookie
+## replies on every inbound handshake; 0 to clear and rely on
+## auto-detection via the per-second counter.
+def wg_device_set_under_load(d: Device, flag: Int): Void
+  d.under_load = flag
+end
+
+## Returns 1 if the device is currently under load (auto-detected or forced).
+def wg_device_under_load(d: Device): Int
+  return d.under_load
+end
+
+## Bump the inbound-handshake counter for the current 1-second window.
+## If the count crosses WG_UNDER_LOAD_THRESHOLD, sets `under_load = 1`.
+## The flag stays set until a quiet second resets the counter.
+def wg_device_note_handshake_inbound(d: Device, now_ms: Int): Void
+  var window_age = now_ms - d.recent_handshake_window_ms
+  if window_age >= 1000 or d.recent_handshake_window_ms == 0
+    # New window: reset counter; quiet last window means under_load decays.
+    d.recent_handshake_window_ms = now_ms
+    d.recent_handshake_count = 1
+    if d.under_load == 1
+      d.under_load = 0
+    end
+    return
+  end
+  d.recent_handshake_count = d.recent_handshake_count + 1
+  if d.recent_handshake_count >= 8
+    d.under_load = 1
+  end
+end
+
+## Rotate the cookie secret if it's been at least WG_COOKIE_REFRESH_TIME_MS
+## since the last rotation. Caller invokes from the periodic tick loop.
+##
+## On rotation: previous_cookie_secret := current_cookie_secret;
+##              current_cookie_secret  := fresh random 32 bytes.
+## The previous secret is honored for an additional WG_COOKIE_GRACE_MS so
+## in-flight initiator-cached cookies derived under it still validate.
+def wg_device_rotate_cookie_secret_if_due(d: Device, now_ms: Int): Void
+  if d.cookie_secret_ms != 0
+    var age = now_ms - d.cookie_secret_ms
+    if age < WG_COOKIE_REFRESH_TIME_MS()
+      return
+    end
+  end
+  # Promote current → previous.
+  memcpy(d.prev_cookie_secret, d.cookie_secret, 32)
+  d.prev_cookie_secret_ms = now_ms
+  # Fresh current.
+  rng_fill(d.rng, d.cookie_secret, 32)
+  d.cookie_secret_ms = now_ms
+end
+
+# Grace window during which the previous cookie secret is still honored
+# (per WG paper "The previous one is allowed for an additional minute").
+def WG_COOKIE_GRACE_MS(): Int = 60000
+
+## Determine whether to send a cookie reply instead of processing this
+## inbound MSG_INITIATION/_RESPONSE. Returns 1 if:
+##   - Device is under load, AND
+##   - msg.mac2 does NOT validate against MAC(cookie(τ_R, src_addr), msg_α||mac1)
+##     for either the current or (if within grace) the previous cookie secret.
+##
+## - msg_in: pointer to start of inbound MSG_INITIATION/_RESPONSE.
+## - body_len: 116 (initiation) or 60 (response).
+## - src_addr_buf, src_addr_len: source IP||port of the inbound (typically
+##                              4-byte IPv4 + 2-byte port = 6 bytes).
+def wg_device_should_cookie_reply(d: Device, msg_in: Int, body_len: Int,
+                                  src_addr_buf: Int, src_addr_len: Int,
+                                  now_ms: Int): Int
+  if d.under_load == 0
+    return 0
+  end
+  # Make sure we have a current cookie secret.
+  if d.cookie_secret_ms == 0
+    wg_device_rotate_cookie_secret_if_due(d, now_ms)
+  end
+  var cookie_cur = malloc(16)
+  wg_compute_cookie(cookie_cur, d.cookie_secret, src_addr_buf, src_addr_len)
+  var ok_cur = wg_validate_mac2(msg_in, body_len, cookie_cur)
+  zeroize(cookie_cur, 16)
+  free(cookie_cur)
+  if ok_cur == 1
+    return 0
+  end
+  # Try previous cookie secret if within grace.
+  if d.prev_cookie_secret_ms != 0
+    var age = now_ms - d.prev_cookie_secret_ms
+    if age < WG_COOKIE_GRACE_MS()
+      var cookie_prev = malloc(16)
+      wg_compute_cookie(cookie_prev, d.prev_cookie_secret, src_addr_buf, src_addr_len)
+      var ok_prev = wg_validate_mac2(msg_in, body_len, cookie_prev)
+      zeroize(cookie_prev, 16)
+      free(cookie_prev)
+      if ok_prev == 1
+        return 0
+      end
+    end
+  end
+  return 1
+end
+
+## Build a 64-byte MSG_COOKIEREPLY for the given inbound. Returns 64 on
+## success. Cookie is derived from the current cookie secret + src_addr.
+## Inbound message's sender_index becomes the cookie reply's receiver_index;
+## inbound's mac1 (at msg_in + body_len) is used as AEAD aad.
+##
+## Caller is responsible for transmitting `msg_out[0..64)` back to the source.
+def wg_device_emit_cookie_reply(d: Device, msg_in: Int, body_len: Int,
+                                src_addr_buf: Int, src_addr_len: Int,
+                                msg_out: Int, now_ms: Int): Int
+  if d.cookie_secret_ms == 0
+    wg_device_rotate_cookie_secret_if_due(d, now_ms)
+  end
+  var cookie = malloc(16)
+  wg_compute_cookie(cookie, d.cookie_secret, src_addr_buf, src_addr_len)
+  var peer_index = ptr_read_byte(msg_in + 4) +
+                   (ptr_read_byte(msg_in + 5) * 256) +
+                   (ptr_read_byte(msg_in + 6) * 65536) +
+                   (ptr_read_byte(msg_in + 7) * 16777216)
+  wg_create_cookie_reply(d.rng, d.static_pub, cookie, peer_index,
+                         msg_in + body_len, msg_out)
+  zeroize(cookie, 16)
+  free(cookie)
+  return 64
+end
+
+## Initiator-side handler: parse a 64-byte MSG_COOKIEREPLY, decrypt the
+## cookie, and cache it on the peer with an in-flight handshake whose
+## pending_local_index matches msg.receiver_index.
+##
+## Returns peer_idx on success, -1 on:
+##   - msg too short or wrong type byte
+##   - no peer has an in-flight handshake at this index OR no last_outbound_mac1
+##   - AEAD decrypt failure (wrong peer pubkey / wrong aad / tampered ciphertext)
+def wg_device_handle_cookie_reply(d: Device, msg_in: Int, msg_in_len: Int,
+                                  now_ms: Int): Int
+  if msg_in_len < 64
+    return 0 - 1
+  end
+  if ptr_read_byte(msg_in) != 3
+    return 0 - 1
+  end
+  var our_idx = ptr_read_byte(msg_in + 4) +
+                (ptr_read_byte(msg_in + 5) * 256) +
+                (ptr_read_byte(msg_in + 6) * 65536) +
+                (ptr_read_byte(msg_in + 7) * 16777216)
+  var i = 0
+  while i < d.peers.size
+    var dp = d.peers[i]
+    if dp.has_handshake == 1 and dp.pending_local_index == our_idx and dp.last_outbound_mac1 != 0
+      var cookie = malloc(16)
+      var rc = wg_consume_cookie_reply(msg_in, peer_static_pub(dp.peer),
+                                        our_idx, dp.last_outbound_mac1, cookie)
+      if rc != 0
+        zeroize(cookie, 16)
+        free(cookie)
+        return 0 - 1
+      end
+      # Cache the cookie. Allocate buffer if peer doesn't have one yet.
+      if dp.cookie_cached == 0
+        dp.cookie_cached = malloc(16)
+      end
+      memcpy(dp.cookie_cached, cookie, 16)
+      dp.cookie_cached_ms = now_ms
+      d.peers[i] = dp
+      zeroize(cookie, 16)
+      free(cookie)
+      return i
+    end
+    i += 1
+  end
+  return 0 - 1
+end
+
+## Read-only accessor — does this peer have a cached cookie that's still
+## within COOKIE_REFRESH_TIME of `now_ms`? Used by `wg_device_initiate_handshake`
+## to decide whether to attach mac2.
+def wg_device_peer_has_fresh_cookie(d: Device, peer_idx: Int, now_ms: Int): Int
+  if peer_idx < 0 or peer_idx >= d.peers.size
+    return 0
+  end
+  var dp = d.peers[peer_idx]
+  if dp.cookie_cached == 0
+    return 0
+  end
+  var age = now_ms - dp.cookie_cached_ms
+  if age >= WG_COOKIE_REFRESH_TIME_MS()
+    return 0
+  end
+  return 1
+end

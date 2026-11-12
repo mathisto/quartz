@@ -1,0 +1,704 @@
+## std/tui/cell.qz — cell-level primitive for the v0.6 cell engine.
+##
+## A `Cell` is the smallest unit the terminal can draw: an extended
+## grapheme cluster (one or more codepoints rendered as a single
+## column) plus foreground / background `Channel`s plus a bitset of
+## SGR attributes (bold, dim, italic, underline, strikethrough,
+## reverse, blink).
+##
+## A `Channel` carries 24-bit-or-palette color, a 2-bit `AlphaMode`
+## (Opaque / Blend / Transparent / HighContrast — Notcurses-shaped),
+## and two flags: `default_color` (use the terminal's default) and
+## `palette` (interpret `rgb` as a 256-palette index rather than
+## packed truecolor).
+##
+## Color encoding interoperates with `std/style.qz`. The `Channel.color`
+## Int uses the same scheme: -1 = none-sentinel, 0-15 = ANSI 16,
+## 16-255 = 256-palette, ≥ 0x1000000 = packed truecolor with bits
+## (r << 16) | (g << 8) | b. This means `theme.base05` (a Color = Int)
+## can be passed straight to `channel_rgb(theme.base05)` *and* to
+## `Style.fg(theme.base05)` without conversion.
+##
+## The field is named `color` (not `rgb`) to dodge UFCS paren-elision
+## ambiguity with the 4-arg free function `std/colors::rgb`. The
+## semantic is also more honest — a Channel's `color` may be a
+## truecolor RGB int, an ANSI 16 index, or a 256-palette index.
+##
+## Storage: unpacked named-field structs. Notcurses-style 16-byte
+## packed cells with EGC-pool indirection are deferred to v0.7 if
+## profiling shows allocation pressure on real workloads. See
+## `docs/design/TUI_V06_OPEN_QUESTIONS.md` Q1/Q2 for the rationale.
+##
+## @since 5.28.x
+
+# =============================================================================
+# AlphaMode — Notcurses-shaped 2-bit alpha
+# =============================================================================
+
+## How a channel composes onto whatever sits below it during plane merge.
+##
+## - Opaque:       this channel covers; nothing below shows through.
+## - Blend:        average color with what's below (used by Tier-B blend modes).
+## - Transparent:  show whatever's below; this channel contributes nothing.
+## - HighContrast: pick fg automatically for legibility against the bg below
+##                 (useful for status/HUD overlays whose underlay varies).
+enum AlphaMode
+  Opaque
+  Blend
+  Transparent
+  HighContrast
+end
+
+# =============================================================================
+# Cell attribute bitset
+# =============================================================================
+
+## Cell SGR attribute bits. Composable via bitwise OR.
+def CELL_ATTR_BOLD():     Int = 1
+def CELL_ATTR_DIM():      Int = 2
+def CELL_ATTR_ITALIC():   Int = 4
+def CELL_ATTR_UNDER():    Int = 8
+def CELL_ATTR_STRIKE():   Int = 16
+def CELL_ATTR_REVERSE():  Int = 32
+def CELL_ATTR_BLINK():    Int = 64
+
+## Test whether a given attribute bit is set.
+def cell_attr_has(attrs: Int, bit: Int): Bool
+  return (attrs & bit) != 0
+end
+
+## Set a bit in an attribute bitset (returns new bitset; original unchanged).
+def cell_attr_set(attrs: Int, bit: Int): Int
+  return attrs | bit
+end
+
+## Clear a bit in an attribute bitset.
+def cell_attr_clear(attrs: Int, bit: Int): Int
+  return attrs & (~bit)
+end
+
+# =============================================================================
+# Channel — fg/bg color + alpha + flags
+# =============================================================================
+
+## A single color channel. Used as `cell.fg` and `cell.bg`.
+##
+## - `color`:         packed color value (truecolor / palette / ANSI 16).
+##                    Encoding matches `std/style.qz` color values.
+## - `alpha`:         composition mode against what sits below.
+## - `default_color`: when true, override `color` with the terminal's
+##                    default foreground or background. Used for
+##                    "transparent" cells that should still respect the
+##                    user's terminal theme.
+## - `palette`:       cache hint that `color` is a 256-palette index. The
+##                    flush pipeline can also infer this from `color`
+##                    directly; the flag exists to skip the inference step
+##                    on the hot path.
+struct Channel
+  color:         Int
+  alpha:         AlphaMode
+  default_color: Bool
+  palette:       Bool
+end
+
+## Default "use terminal default color" channel — fully transparent contribution
+## to whatever's below in compositional terms, but rendered as the user's
+## terminal default fg/bg at flush time.
+def channel_default(): Channel
+  return Channel {
+    color:         -1,
+    alpha:         AlphaMode::Transparent,
+    default_color: true,
+    palette:       false
+  }
+end
+
+## Channel from a packed RGB / ANSI16 / palette Int (matches `std/style.qz`
+## encoding). `Opaque` alpha — covers the underlay completely.
+def channel_rgb(color: Int): Channel
+  return Channel {
+    color:         color,
+    alpha:         AlphaMode::Opaque,
+    default_color: false,
+    palette:       false
+  }
+end
+
+## Channel from a 256-palette index (0-255). `Opaque` alpha. The `palette`
+## flag is set so the flush pipeline can skip truecolor inference.
+def channel_palette(idx: Int): Channel
+  return Channel {
+    color:         idx,
+    alpha:         AlphaMode::Opaque,
+    default_color: false,
+    palette:       true
+  }
+end
+
+## Replace a channel's alpha mode.
+def channel_with_alpha(c: Channel, a: AlphaMode): Channel
+  return Channel {
+    color:         c.color,
+    alpha:         a,
+    default_color: c.default_color,
+    palette:       c.palette
+  }
+end
+
+# =============================================================================
+# Cell — egc + fg + bg + attrs
+# =============================================================================
+
+## A drawable cell. `egc` is an extended grapheme cluster: one or more
+## codepoints that occupy a single visual column. Empty / blank cells use
+## a single space (`" "`) which every terminal renders as a blank.
+struct Cell
+  egc:   String
+  fg:    Channel
+  bg:    Channel
+  attrs: Int
+end
+
+## A blank cell with default fg / bg and no attributes. The standard
+## "nothing painted here" value.
+def cell_blank(): Cell
+  return Cell {
+    egc:   " ",
+    fg:    channel_default(),
+    bg:    channel_default(),
+    attrs: 0
+  }
+end
+
+## A cell rendering a single grapheme cluster, default fg / bg.
+def cell_char(egc: String): Cell
+  return Cell {
+    egc:   egc,
+    fg:    channel_default(),
+    bg:    channel_default(),
+    attrs: 0
+  }
+end
+
+## A cell with an explicit fg channel.
+def cell_with_fg(c: Cell, fg: Channel): Cell
+  return Cell {
+    egc:   c.egc,
+    fg:    fg,
+    bg:    c.bg,
+    attrs: c.attrs
+  }
+end
+
+## A cell with an explicit bg channel.
+def cell_with_bg(c: Cell, bg: Channel): Cell
+  return Cell {
+    egc:   c.egc,
+    fg:    c.fg,
+    bg:    bg,
+    attrs: c.attrs
+  }
+end
+
+## A cell with replaced attribute bitset.
+def cell_with_attrs(c: Cell, attrs: Int): Cell
+  return Cell {
+    egc:   c.egc,
+    fg:    c.fg,
+    bg:    c.bg,
+    attrs: attrs
+  }
+end
+
+## A cell with an additional attribute bit set (composes via OR).
+def cell_add_attr(c: Cell, bit: Int): Cell
+  return cell_with_attrs(c, c.attrs | bit)
+end
+
+# =============================================================================
+# Color encoding — shared by Tier A (`std/style.qz`) and Tier B
+# =============================================================================
+#
+# Cell.qz is the canonical owner of the color-encoding scheme that
+# style.qz, plane.qz, render.qz, theme.qz, and any future v0.6+
+# emitter agree on. Encoding (24-bit packed Int):
+#
+#   -1            → none-sentinel (use terminal default fg or bg)
+#   0..15         → ANSI 16-color palette index
+#   16..255       → 256-palette index
+#   ≥ 0x1000000   → packed truecolor; bits (R << 16) | (G << 8) | B
+#
+# The `RGB_FLAG()` bit is what distinguishes a packed truecolor value
+# (≥ 0x1000000) from a palette index. `color_is_rgb` is the predicate;
+# `color_r` / `color_g` / `color_b` extract individual channels.
+
+## Truecolor sentinel bit. Set on packed-RGB values to disambiguate
+## them from palette indices.
+def RGB_FLAG(): Int = 0x1000000
+
+## True if `c` is a packed truecolor value (≥ `RGB_FLAG()`).
+def color_is_rgb(c: Int): Bool = c >= RGB_FLAG()
+
+## Extract the R / G / B byte from a packed truecolor value.
+def color_r(c: Int): Int = (c >> 16) & 0xFF
+def color_g(c: Int): Int = (c >> 8)  & 0xFF
+def color_b(c: Int): Int = c          & 0xFF
+
+# =============================================================================
+# Color degradation — RGB → 256, RGB → 16, 256 → 16
+# =============================================================================
+
+def _min3_int(a: Int, b: Int, c: Int): Int
+  var m = a
+  if b < m
+    m = b
+  end
+  if c < m
+    m = c
+  end
+  return m
+end
+
+## Convert RGB to nearest ANSI 256-color index.
+## Uses the 6×6×6 color cube (16-231) and grayscale ramp (232-255).
+def rgb_to_ansi256(r: Int, g: Int, b: Int): Int
+  if r == g and g == b
+    if r < 8
+      return 16
+    end
+    if r > 248
+      return 231
+    end
+    return ((r - 8) * 24) / 240 + 232
+  end
+  var ri = (r * 5 + 127) / 255
+  var gi = (g * 5 + 127) / 255
+  var bi = (b * 5 + 127) / 255
+  return 16 + 36 * ri + 6 * gi + bi
+end
+
+## Convert RGB to nearest ANSI 16-color index.
+## Heuristic mix of perceived luminance + max-channel + dominant-channel.
+def rgb_to_ansi16(r: Int, g: Int, b: Int): Int
+  var lum = (r * 299 + g * 587 + b * 114) / 1000
+  if lum < 32
+    return 0
+  end
+  if lum > 224
+    return 15
+  end
+  var max_c = r
+  if g > max_c
+    max_c = g
+  end
+  if b > max_c
+    max_c = b
+  end
+  var bright = 0
+  if lum > 128 or max_c > 170
+    bright = 8
+  end
+  var range = max_c - _min3_int(r, g, b)
+  if range < 30
+    if bright == 0
+      return 8
+    end
+    return 7
+  end
+  var base = 0
+  if r > g and r > b
+    if g > b and g > r / 2
+      base = 3
+    else
+      base = 1
+    end
+  else
+    if g > r and g > b
+      if b > r and b > g / 2
+        base = 6
+      else
+        base = 2
+      end
+    else
+      if r > g and r > b / 2
+        base = 5
+      else
+        base = 4
+      end
+    end
+  end
+  return base + bright
+end
+
+## Approximate a 256-palette index as the nearest ANSI 16 color.
+def ansi256_to_ansi16(c: Int): Int
+  if c < 16
+    return c
+  end
+  if c >= 232
+    var gray = (c - 232) * 10 + 8
+    if gray < 64
+      return 0
+    end
+    if gray < 128
+      return 8
+    end
+    if gray < 192
+      return 7
+    end
+    return 15
+  end
+  var idx = c - 16
+  var bi = idx % 6
+  var gi = (idx / 6) % 6
+  var ri = idx / 36
+  var r = ri * 51
+  var g = gi * 51
+  var b = bi * 51
+  return rgb_to_ansi16(r, g, b)
+end
+
+# =============================================================================
+# Inline ANSI emission — combined-SGR format
+# =============================================================================
+#
+# The "inline" emitter walks a cell sequence left-to-right and produces
+# an ANSI escape string with combined SGR sequences (`\x1b[1;3;31m`)
+# for cell-style transitions. No cursor positioning is emitted — this
+# path is for "render styled text into a String" use cases (Tier A's
+# `Style.render`, single-row `Plane → String`).
+#
+# Multi-cell runs at the same (fg, bg, attrs) collapse to one SGR
+# prefix + concatenated egcs + one SGR reset. This matches the byte
+# format of the pre-v0.6.7 `Style.render` implementation exactly,
+# preserving every existing test's pinned byte output.
+#
+# `cells_render_inline` is paired with `cell_render_inline` (single
+# cell) and `style_to_cells` (Tier-A "styled text" → Vec<Cell> bridge).
+# `plane_render_inline` (in `plane.qz`) layers row iteration on top.
+
+## Append a numeric SGR code into an in-progress accumulator.
+##
+## Convention: an "in-progress accumulator" begins with `\x1b[` and is
+## closed with `m`. Multiple codes are joined by `;`. The `has_prior`
+## flag tells the helper whether to emit `\x1b[` (no prior code) or
+## `;` (prior code present).
+def _sgr_code(sb: StringBuilder, code: Int, has_prior: Bool): Void
+  if not has_prior
+    sb.append("\x1b[")
+  else
+    sb.append(";")
+  end
+  sb.append(code.to_s())
+end
+
+## Emit attribute codes (1=bold, 2=dim, 3=italic, 4=under, 5=blink,
+## 7=reverse, 9=strike) into the SGR accumulator. Returns the new
+## `has_prior` value (true iff at least one attr was emitted).
+def _sgr_emit_attrs(sb: StringBuilder, attrs: Int, has_prior: Bool): Bool
+  var hp = has_prior
+  if (attrs & CELL_ATTR_BOLD()) != 0
+    _sgr_code(sb, 1, hp)
+    hp = true
+  end
+  if (attrs & CELL_ATTR_DIM()) != 0
+    _sgr_code(sb, 2, hp)
+    hp = true
+  end
+  if (attrs & CELL_ATTR_ITALIC()) != 0
+    _sgr_code(sb, 3, hp)
+    hp = true
+  end
+  if (attrs & CELL_ATTR_UNDER()) != 0
+    _sgr_code(sb, 4, hp)
+    hp = true
+  end
+  if (attrs & CELL_ATTR_BLINK()) != 0
+    _sgr_code(sb, 5, hp)
+    hp = true
+  end
+  if (attrs & CELL_ATTR_REVERSE()) != 0
+    _sgr_code(sb, 7, hp)
+    hp = true
+  end
+  if (attrs & CELL_ATTR_STRIKE()) != 0
+    _sgr_code(sb, 9, hp)
+    hp = true
+  end
+  return hp
+end
+
+## Emit fg color into the accumulator. Returns true (color always
+## takes a slot when called). `is_bg=true` switches to bg codes
+## (40-47, 100-107, 48;5;N, 48;2;R;G;B).
+def _sgr_emit_color(sb: StringBuilder, color: Int, depth: Int, has_prior: Bool, is_bg: Bool): Bool
+  if color_is_rgb(color)
+    var r = color_r(color)
+    var g = color_g(color)
+    var b = color_b(color)
+    if depth >= 16777216
+      if not has_prior
+        sb.append("\x1b[")
+      else
+        sb.append(";")
+      end
+      if is_bg
+        sb.append("48;2;")
+      else
+        sb.append("38;2;")
+      end
+      sb.append(r.to_s())
+      sb.append(";")
+      sb.append(g.to_s())
+      sb.append(";")
+      sb.append(b.to_s())
+      return true
+    end
+    if depth >= 256
+      var idx256 = rgb_to_ansi256(r, g, b)
+      if not has_prior
+        sb.append("\x1b[")
+      else
+        sb.append(";")
+      end
+      if is_bg
+        sb.append("48;5;")
+      else
+        sb.append("38;5;")
+      end
+      sb.append(idx256.to_s())
+      return true
+    end
+    var idx16 = rgb_to_ansi16(r, g, b)
+    return _sgr_emit_basic(sb, idx16, has_prior, is_bg)
+  end
+  # Indexed color (0..255 or sentinel)
+  if color < 16
+    if depth >= 16
+      return _sgr_emit_basic(sb, color, has_prior, is_bg)
+    end
+    return has_prior
+  end
+  if depth >= 256
+    if not has_prior
+      sb.append("\x1b[")
+    else
+      sb.append(";")
+    end
+    if is_bg
+      sb.append("48;5;")
+    else
+      sb.append("38;5;")
+    end
+    sb.append(color.to_s())
+    return true
+  end
+  var approx = ansi256_to_ansi16(color)
+  return _sgr_emit_basic(sb, approx, has_prior, is_bg)
+end
+
+## Emit a basic ANSI 16 color code (30-37 / 90-97 fg; 40-47 / 100-107 bg).
+def _sgr_emit_basic(sb: StringBuilder, color: Int, has_prior: Bool, is_bg: Bool): Bool
+  if not has_prior
+    sb.append("\x1b[")
+  else
+    sb.append(";")
+  end
+  var base = 30
+  if is_bg
+    base = 40
+  end
+  if color < 8
+    sb.append((base + color).to_s())
+  else
+    sb.append((base + 60 + color - 8).to_s())
+  end
+  return true
+end
+
+## Resolve a cell channel to the (color, is_default) pair the SGR
+## emitter uses. Default-color channels collapse to `-1` regardless of
+## what's stored in `Channel.color`, so styled text that opts into
+## terminal defaults round-trips cleanly through the emitter.
+def _channel_render_color(c: Channel): Int
+  if c.default_color
+    return -1
+  end
+  return c.color
+end
+
+## Build an SGR prefix for a (fg, bg, attrs) triple. Returns the empty
+## string if no codes apply (no attrs + no colors). Used by
+## `cells_render_inline` to emit a single combined `\x1b[...m`
+## sequence per styled run.
+def _sgr_build_prefix(fg_color: Int, bg_color: Int, attrs: Int, depth: Int): String
+  var sb = sb_new()
+  var has_prior = false
+  has_prior = _sgr_emit_attrs(sb, attrs, has_prior)
+  if fg_color != -1
+    has_prior = _sgr_emit_color(sb, fg_color, depth, has_prior, false)
+  end
+  if bg_color != -1
+    has_prior = _sgr_emit_color(sb, bg_color, depth, has_prior, true)
+  end
+  if has_prior
+    sb.append("m")
+  end
+  return sb.to_string()
+end
+
+## Render a `Vec<Cell>` to an inline ANSI escape String.
+##
+## Walks left-to-right; for each cell, if its (fg, bg, attrs) differs
+## from the active SGR state, emit a reset followed by the new
+## combined-SGR prefix. Then emit `cell.egc`. At end-of-stream, if any
+## SGR was active, emit a final `\x1b[0m` reset.
+##
+## Single-style runs (the common case for `Style.render`) collapse to:
+## one combined-SGR prefix + concatenated egcs + one reset. This
+## matches the byte format of the pre-v0.6.7 `_style_render`
+## implementation exactly.
+##
+## Pure-egc cells (default fg, default bg, no attrs) emit no SGR,
+## producing bare-text output for "empty Style" or `depth == 0` paths.
+##
+## `depth == 0` short-circuits color and attribute emission entirely:
+## the result is the concatenated egcs only.
+def cells_render_inline(cells: Vec<Cell>, depth: Int): String
+  var sb = sb_new()
+  var n = cells.size
+  if n == 0
+    return ""
+  end
+
+  if depth == 0
+    var i = 0
+    while i < n
+      var c0: Cell = cells[i]
+      sb.append(c0.egc)
+      i += 1
+    end
+    return sb.to_string()
+  end
+
+  # SGR state: -2 sentinel = "nothing emitted yet", -1 = default-color
+  var cur_fg: Int = -2
+  var cur_bg: Int = -2
+  var cur_attrs: Int = -1
+  var sgr_active = false
+
+  var i = 0
+  while i < n
+    var c: Cell = cells[i]
+    var c_fg: Channel = c.fg
+    var c_bg: Channel = c.bg
+    var fg_color = _channel_render_color(c_fg)
+    var bg_color = _channel_render_color(c_bg)
+    var attrs = c.attrs
+
+    var first = cur_attrs == -1 and cur_fg == -2 and cur_bg == -2
+    var changed = first or fg_color != cur_fg or bg_color != cur_bg or attrs != cur_attrs
+    if changed
+      if sgr_active
+        sb.append("\x1b[0m")
+        sgr_active = false
+      end
+      var prefix = _sgr_build_prefix(fg_color, bg_color, attrs, depth)
+      if str_byte_len(prefix) > 0
+        sb.append(prefix)
+        sgr_active = true
+      end
+      cur_fg = fg_color
+      cur_bg = bg_color
+      cur_attrs = attrs
+    end
+
+    sb.append(c.egc)
+    i += 1
+  end
+
+  if sgr_active
+    sb.append("\x1b[0m")
+  end
+  return sb.to_string()
+end
+
+## Render a single cell inline. Convenience for callers with one cell.
+def cell_render_inline(c: Cell, depth: Int): String
+  var cells = vec_new<Cell>()
+  cells.push(c)
+  return cells_render_inline(cells, depth)
+end
+
+# =============================================================================
+# Tier-A bridge — `style_to_cells`
+# =============================================================================
+#
+# `Style.render` (Tier A) layers on top of cells_render_inline by way
+# of `style_to_cells`. The bridge converts a styled text string into a
+# Vec<Cell> where every cell carries the same (fg, bg, attrs) and an
+# egc covering one Unicode codepoint (one UTF-8 sequence).
+#
+# v0.6.7 byte-iterated and called `sb.append_char(byte)` for each byte,
+# which treated each continuation byte as an independent codepoint and
+# re-encoded it as UTF-8 — corrupting every multi-byte glyph (em-dash,
+# octant sparklines, block-element bars, ellipsis, anything beyond
+# ASCII). Fixed in v0.6.8 by walking the lead-byte structure and
+# slicing the original UTF-8 bytes into per-codepoint egcs.
+#
+# Full grapheme clustering (combining marks, ZWJ sequences, regional
+# indicators) is still a separate task — single codepoints render
+# correctly; multi-codepoint clusters render as N adjacent cells.
+
+## Length in bytes of the UTF-8 sequence whose lead byte is `b`.
+## Returns 1 for invalid leads so the walker can advance and recover.
+def _utf8_lead_byte_len(b: Int): Int
+  if (b & 0x80) == 0
+    return 1               # 0xxxxxxx — ASCII
+  end
+  if (b & 0xE0) == 0xC0
+    return 2               # 110xxxxx — 2-byte
+  end
+  if (b & 0xF0) == 0xE0
+    return 3               # 1110xxxx — 3-byte
+  end
+  if (b & 0xF8) == 0xF0
+    return 4               # 11110xxx — 4-byte
+  end
+  return 1                 # invalid; treat as single byte
+end
+
+## Build a Vec<Cell> for a styled text string. One cell per Unicode
+## codepoint. `fg_color` and `bg_color` use the canonical color
+## encoding (-1 = terminal default, 0-15 = ANSI 16, 16-255 = 256-palette,
+## ≥ RGB_FLAG = truecolor). `attrs` is a `CELL_ATTR_*` bitset.
+def style_to_cells(text: String, fg_color: Int, bg_color: Int, attrs: Int): Vec<Cell>
+  var fg_chan = channel_default()
+  if fg_color != -1
+    fg_chan = channel_rgb(fg_color)
+  end
+  var bg_chan = channel_default()
+  if bg_color != -1
+    bg_chan = channel_rgb(bg_color)
+  end
+  var cells = vec_new<Cell>()
+  var n = str_byte_len(text)
+  var i = 0
+  while i < n
+    var lead = str_byte_at(text, i)
+    var clen = _utf8_lead_byte_len(lead)
+    var end_i = i + clen
+    if end_i > n
+      end_i = n
+    end
+    var egc = str_byte_slice(text, i, end_i)
+    cells.push(Cell {
+      egc:   egc,
+      fg:    fg_chan,
+      bg:    bg_chan,
+      attrs: attrs
+    })
+    i = end_i
+  end
+  return cells
+end

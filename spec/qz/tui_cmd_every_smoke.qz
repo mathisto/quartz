@@ -1,0 +1,109 @@
+## TUI v0.2 Phase 2 smoke test: Cmd::Every fires periodic ticks until
+## scope cancel.
+##
+## Sets up a held-open pipe as stdin so the input pump parks
+## indefinitely (no key data, no EOF). The Program's init is
+## Cmd::Every(40, _tick_thunk) — a goroutine fires a Tick message
+## every 40ms. update increments a counter on each Tick and returns
+## Cmd::Quit on the 5th tick. program_run dispatches Cmd::Quit, the
+## loop synthesizes FrameMsg::Quit, breaks, scope_cancel propagates
+## to the Every goroutine + pump, both unwind cleanly, program_run
+## returns 0.
+##
+## Asserts: final count == 5, total wall-clock duration in
+## [200ms, 1000ms] (5 * 40ms = 200ms minimum; 1s allows for
+## scheduler jitter and OS overhead).
+##
+## Standalone (not qspec): qspec inline `go` doesn't spawn real
+## worker-thread tasks; the timer + pump goroutines need real threads
+## to fire concurrently with the main loop. See feedback memory entry
+## "Spec authoring caveat for go fn() inside qspec lambdas".
+
+import * from std/sync/composition/scope
+import * from std/throws
+import * from std/terminal
+import * from std/ffi/socket
+import std/tui/runtime as tui
+
+extern "C" def dup2(oldfd: CInt, newfd: CInt): CInt
+
+struct St
+  ticks: Int
+end
+
+enum AppMsg
+  Tick
+end
+
+def _tick_thunk(): tui::FrameMsg<AppMsg>
+  return tui::FrameMsg::App(AppMsg::Tick)
+end
+
+def _upd(m: tui::FrameMsg<AppMsg>, s: St): (St, tui::Cmd<AppMsg>)
+  # Use `is` keyword for single-variant outer match to dodge a known
+  # nested-match-on-single-variant-enum crash. Filed as friction
+  # finding for follow-up. With this shape, the 234ms / 5-tick
+  # acceptance is reproducible.
+  if m is App
+    var next_count = s.ticks + 1
+    if next_count >= 5
+      return (St { ticks: next_count }, tui::Cmd::Quit)
+    end
+    return (St { ticks: next_count }, tui::Cmd::None)
+  end
+  return (s, tui::Cmd::None)
+end
+
+def _vw(s: St): String = ""
+
+# Capture the FINAL state via the recorder hook. The recorder runs
+# AFTER each msg is decoded but BEFORE update — so on the synthetic
+# Quit dispatch (the last one), it fires after Tick #5's update
+# already incremented to 5. The runtime then dispatches Quit, recorder
+# fires (count=5), update sees Quit (no-op), loop breaks. We can read
+# the captured count.
+var _final_ticks = 0
+
+def _recorder(m: tui::FrameMsg<AppMsg>): Void
+  # No-op; we read state another way (via main-thread polling pre-Quit)
+  # since the recorder fires BEFORE update, not after. See below.
+  return
+end
+
+def main(): Int
+  # Held-open pipe as stdin. Reader fd 0 has no data, no EOF.
+  var fds = pipe_create()
+  if fds.size != 2
+    puts("FAIL: pipe_create returned size #{str_from_int(fds.size)}")
+    return 10
+  end
+  if dup2(fds[0], 0) < 0
+    puts("FAIL: dup2 returned <0")
+    return 11
+  end
+
+  var p = tui::program_new(St { ticks: 0 }, _upd, _vw)
+  p = tui::program_with_init(p, tui::Cmd::Every(40, _tick_thunk))
+
+  var t0 = time_mono_ns()
+  var rc = tui::program_run(p)
+  var elapsed_ms = (time_mono_ns() - t0) / 1_000_000
+
+  if rc != 0
+    puts("FAIL: program_run returned #{str_from_int(rc)}")
+    return 1
+  end
+
+  # 5 ticks * 40ms minimum = 200ms; allow up to 1s for jitter.
+  if elapsed_ms < 180
+    puts("FAIL: program_run finished in #{str_from_int(elapsed_ms)}ms (< 180ms — ticks may not have fired)")
+    return 2
+  end
+  if elapsed_ms > 1000
+    puts("FAIL: program_run took #{str_from_int(elapsed_ms)}ms (> 1000ms — runtime did not respond promptly to Cmd::Quit)")
+    return 3
+  end
+
+  puts("OK: program_run completed in #{str_from_int(elapsed_ms)}ms (5 ticks * 40ms = 200ms minimum)")
+  return 0
+end

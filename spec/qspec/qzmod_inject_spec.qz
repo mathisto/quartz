@@ -1,0 +1,444 @@
+## qzmod_inject — Phase 1.4.c.1 acceptance.
+##
+## The full inject body (`qzmod_remap::tc_inject_qzmod`) walks a
+## `QzmodLoadResult` and populates `tc.registry` so the consumer's
+## downstream typecheck finds the imported module's decls already
+## registered.
+##
+## Coverage:
+##   1. Empty hit → ok=1, registry untouched.
+##   2. hit.ok=0 → return 0 immediately (advisory miss).
+##   3. One struct (Point { x: Int, y: Int }) → tc_lookup_struct finds it.
+##   4. One enum (Color { Red, Green, Blue }) → tc_lookup_enum finds it.
+##   5. One type alias (UserId = Int) → tc_lookup_type_alias finds it.
+##   6. One newtype (Token wraps String) → tc_lookup_newtype finds it.
+##   7. One func (foo(Int, String) -> Int, required=2) → registry entry present.
+##   8. Generic struct ships type_params verbatim.
+##   9. TYPES walk with Vec<Int> ptype + Point name-stamp → ptype_name set.
+##  10. Advisory-miss propagates: TYPE_FUNCTION with fn_id out of range → ok=0.
+
+import * from qspec
+import typecheck
+import typecheck_walk
+import typecheck_util
+import typecheck_registry
+import qzmod_load
+import qzmod_remap
+import type_constants
+import * from str_compat
+
+def _qi_mock_hit(): QzmodLoadResult
+  var h = qzmod_load::qzmod_load_miss("synthetic", "mock/inject")
+  h.ok = 1
+  h.error_reason = ""
+  return h
+end
+
+# Push a struct entry: name + field blob (n_fields, is_linear, name_idx, type_id, ...)
+def _qi_push_struct_blob(hit: QzmodLoadResult, name: String, field_names: Vec<String>, field_types: Vec<Int>): Void
+  hit.struct_names.push(name)
+  hit.struct_fields_off.push(hit.struct_fields_blob.size)
+  hit.struct_fields_blob.push(field_names.size)
+  hit.struct_fields_blob.push(0)  # is_linear
+  for i in 0..field_names.size
+    var nm = field_names[i]
+    var nmidx = hit.strings.size
+    hit.strings.push(nm)
+    hit.struct_fields_blob.push(nmidx)
+    hit.struct_fields_blob.push(field_types[i])
+  end
+  # Phase 1.4.c.0 parallels.
+  hit.struct_type_params.push("")
+  hit.struct_field_annotations.push(vec_new<String>())
+end
+
+## Push an enum blob using the Phase 1.4.c.2.b layout:
+##   [n_variants,
+##    name_idx_0, n_payloads_0, payload_type_0_0, ...,
+##    name_idx_1, n_payloads_1, payload_type_1_0, ...,
+##    ...]
+## `variant_payloads[i]` is the per-variant payload type list (use an
+## empty Vec for unit variants).
+def _qi_push_enum_blob(hit: QzmodLoadResult, name: String, variants: Vec<String>, variant_payloads: Vec<Vec<Int>>): Void
+  hit.enum_names.push(name)
+  hit.enum_variants_off.push(hit.enum_variants_blob.size)
+  hit.enum_variants_blob.push(variants.size)
+  for i in 0..variants.size
+    var nm = variants[i]
+    var nmidx = hit.strings.size
+    hit.strings.push(nm)
+    hit.enum_variants_blob.push(nmidx)
+    var v_payloads = vec_new<Int>()
+    if i < variant_payloads.size
+      v_payloads = variant_payloads[i]
+    end
+    hit.enum_variants_blob.push(v_payloads.size)
+    for j in 0..v_payloads.size
+      hit.enum_variants_blob.push(v_payloads[j])
+    end
+  end
+  hit.enum_type_params.push("")
+  # Phase 1.4.c.2.b — per-enum slot is semantically Vec<Vec<String>>
+  # (outer per variant, inner per payload-field annotation). The
+  # field's declared element type is Vec<String> though, so pushing a
+  # nested Vec<Vec<String>> triggers Quartz's strict vec_push element
+  # type check. Tests in this file build unit-variant enums where
+  # annotations are absent; a flat empty Vec<String> works (it
+  # collapses to `vec_size == 0` at pattern-binding read sites, so
+  # the variant-anns branch in `tc_bind_pattern_variables` is
+  # skipped and the fallback ptype extraction runs).
+  hit.enum_variant_field_annotations.push(vec_new<String>())
+end
+
+def _qi_push_func_blob(hit: QzmodLoadResult, name: String, return_t: Int, required: Int, param_ts: Vec<Int>): Void
+  hit.func_names.push(name)
+  hit.func_sig_off.push(hit.func_sig_blob.size)
+  hit.func_sig_blob.push(param_ts.size)
+  hit.func_sig_blob.push(return_t)
+  hit.func_sig_blob.push(required)
+  for i in 0..param_ts.size
+    hit.func_sig_blob.push(param_ts[i])
+  end
+end
+
+def main(): Int
+
+  describe("qzmod_inject · null-cases") do ->
+
+    it("empty hit (ok=1, no data) → ok=1, registry untouched") do ->
+      var tc = typecheck::tc_new()
+      var before = tc.registry.struct_names.size
+      var hit = _qi_mock_hit()
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 1)
+      assert_eq(tc.registry.struct_names.size, before)
+    end
+
+    it("hit.ok=0 → returns 0 (advisory miss before any work)") do ->
+      var tc = typecheck::tc_new()
+      var hit = qzmod_load::qzmod_load_miss("nope", "mock/inject")
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 0)
+    end
+
+  end
+
+  describe("qzmod_inject · single-decl round-trips") do ->
+
+    it("one struct (Point { x: Int, y: Int }) registers via tc_lookup_struct") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qi_mock_hit()
+      var fnames = vec_new<String>()
+      fnames.push("x")
+      fnames.push("y")
+      var ftypes = vec_new<Int>()
+      ftypes.push(type_constants::TYPE_INT)
+      ftypes.push(type_constants::TYPE_INT)
+      _qi_push_struct_blob(hit, "Point", fnames, ftypes)
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 1)
+      var lookup = typecheck_registry::tc_lookup_struct(tc, "Point")
+      assert_eq(lookup.is_found(), 1)
+    end
+
+    it("one enum (Color { Red, Green, Blue }) registers via tc_lookup_enum") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qi_mock_hit()
+      var vnames = vec_new<String>()
+      vnames.push("Red")
+      vnames.push("Green")
+      vnames.push("Blue")
+      var pl = vec_new<Vec<Int>>()
+      for _i in 0..vnames.size
+        pl.push(vec_new<Int>())
+      end
+      _qi_push_enum_blob(hit, "Color", vnames, pl)
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 1)
+      var lookup = typecheck_registry::tc_lookup_enum(tc, "Color")
+      assert_eq(lookup.is_found(), 1)
+    end
+
+    it("one type alias (UserId = Int) registers via tc_lookup_type_alias") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qi_mock_hit()
+      hit.type_alias_names.push("UserId")
+      hit.type_alias_targets.push("Int")
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 1)
+      assert_eq_str(typecheck::tc_lookup_type_alias(tc, "UserId"), "Int")
+    end
+
+    it("one newtype (Token wraps String) is reachable via newtype_names") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qi_mock_hit()
+      hit.newtype_names.push("Token")
+      hit.newtype_wrapped.push("String")
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 1)
+      # tc_register_newtype pushes to newtype_names + allocates a TYPE_NEWTYPE_BASE+i.
+      assert_eq(tc.registry.newtype_names.size > 0, true)
+      var found = 0
+      for i in 0..tc.registry.newtype_names.size
+        if str_eq(tc.registry.newtype_names[i], "Token")
+          found = 1
+        end
+      end
+      assert_eq(found, 1)
+    end
+
+    # STRICT_NEWTYPES_QZMOD — strict-flag survives the qzmod inject path.
+    # Demonstrates the new newtype_strict_flags parallel array threading
+    # through tc_register_newtype so cross-module strict newtypes (Secret<T>
+    # in std/core/crypto/secret.qz, consumed by mlkem/ed25519/hkdf/etc.)
+    # keep their strictness when the consumer pulls them from the qzmod cache.
+    it("strict-flagged newtype is registered as strict via tc_is_strict_newtype") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qi_mock_hit()
+      hit.newtype_names.push("StrictTok")
+      hit.newtype_wrapped.push("Int")
+      hit.newtype_strict_flags.push(1)
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 1)
+      var tid = typecheck::tc_lookup_newtype_id(tc, "StrictTok")
+      assert_eq(tid > 0, true)
+      assert_eq(typecheck::tc_is_strict_newtype(tc, tid), true)
+    end
+
+    # STRICT_NEWTYPES_QZMOD — absent strict-flag entry defaults to loose.
+    # Models the pre-MINOR=1 cache shape (older `.qzmod` files emitted
+    # before the parallel array existed): consumer must read the missing
+    # slot as 0 so old caches keep their original semantics.
+    it("missing strict-flag entry defaults to loose (backward compat)") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qi_mock_hit()
+      hit.newtype_names.push("LooseTok")
+      hit.newtype_wrapped.push("Int")
+      # Deliberately omit a strict_flags push — emulates older qzmod.
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 1)
+      var tid = typecheck::tc_lookup_newtype_id(tc, "LooseTok")
+      assert_eq(tid > 0, true)
+      assert_eq(typecheck::tc_is_strict_newtype(tc, tid), false)
+    end
+
+    it("one func (foo(Int, String) -> Int, required=2) registers via tc_lookup_function_index") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qi_mock_hit()
+      var ptypes = vec_new<Int>()
+      ptypes.push(type_constants::TYPE_INT)
+      ptypes.push(type_constants::TYPE_STRING)
+      _qi_push_func_blob(hit, "qzmod_inject_test_foo", type_constants::TYPE_INT, 2, ptypes)
+      # Phase 1.4.c.3 — parallel push of effect-row state (untracked).
+      hit.func_effect_state.push(0)
+      hit.func_effect_labels.push(vec_new<String>())
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 1)
+      var fidx = typecheck_registry::tc_lookup_function_index(tc, "qzmod_inject_test_foo")
+      assert_eq(fidx >= 0, true)
+      assert_eq(tc.registry.func_return_types[fidx], type_constants::TYPE_INT)
+      assert_eq(tc.registry.func_required_counts[fidx], 2)
+      assert_eq(typecheck_registry::tc_get_func_effect_row(tc, fidx), -1)
+    end
+
+    it("one func with closed effect row (can Throws) registers the row") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qi_mock_hit()
+      var ptypes = vec_new<Int>()
+      _qi_push_func_blob(hit, "qzmod_inject_test_throws", type_constants::TYPE_VOID, 0, ptypes)
+      hit.func_effect_state.push(1)  # closed row
+      var labels = vec_new<String>()
+      labels.push("Throws")
+      hit.func_effect_labels.push(labels)
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 1)
+      var fidx = typecheck_registry::tc_lookup_function_index(tc, "qzmod_inject_test_throws")
+      var row_id = typecheck_registry::tc_get_func_effect_row(tc, fidx)
+      assert_eq(row_id >= 0, true)
+      var row_labels = typecheck_registry::tc_row_get_labels(tc, row_id)
+      assert_eq(row_labels.size, 1)
+      assert_eq(typecheck_registry::tc_row_get_tail(tc, row_id), -1)
+    end
+
+    it("one func with open effect row (can | e) allocates a fresh tail") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qi_mock_hit()
+      var ptypes = vec_new<Int>()
+      _qi_push_func_blob(hit, "qzmod_inject_test_open_row", type_constants::TYPE_VOID, 0, ptypes)
+      hit.func_effect_state.push(2)  # open row
+      hit.func_effect_labels.push(vec_new<String>())
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 1)
+      var fidx = typecheck_registry::tc_lookup_function_index(tc, "qzmod_inject_test_open_row")
+      var row_id = typecheck_registry::tc_get_func_effect_row(tc, fidx)
+      assert_eq(row_id >= 0, true)
+      assert_eq(typecheck_registry::tc_row_get_tail(tc, row_id) >= 0, true)
+    end
+
+  end
+
+  describe("qzmod_inject · generic + TYPES integration") do ->
+
+    it("generic struct ships type_params verbatim") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qi_mock_hit()
+      var fnames = vec_new<String>()
+      var ftypes = vec_new<Int>()
+      _qi_push_struct_blob(hit, "GBox", fnames, ftypes)
+      # Override the empty type_params push with the actual generic header.
+      hit.struct_type_params[hit.struct_type_params.size - 1] = "T"
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 1)
+      var lookup = typecheck_registry::tc_lookup_struct(tc, "GBox")
+      var sidx = lookup.unwrap()
+      assert_eq_str(tc.registry.struct_type_params[sidx], "T")
+    end
+
+    it("TYPES walk creates a Vec<Int> ptype with name-stamp applied") do ->
+      var tc = typecheck::tc_new()
+      var pre_count = tc.ptype_names.size
+      var hit = _qi_mock_hit()
+      hit.types_tag.push(type_constants::TYPE_VEC)
+      hit.types_arg1.push(type_constants::TYPE_INT)
+      hit.types_arg2.push(0)
+      hit.ptype_names.push("MyVecInt")
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 1)
+      # The new ptype lands at `pre_count` (tc_new pre-creates builtin
+      # ptypes like Vec<String> during init). Confirm name stamp landed.
+      var found = 0
+      for i in 0..tc.ptype_names.size
+        if str_eq(tc.ptype_names[i], "MyVecInt")
+          found = 1
+        end
+      end
+      assert_eq(found, 1)
+    end
+
+    it("derived-base type in TYPES → advisory miss propagates as ok=0") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qi_mock_hit()
+      hit.types_tag.push(type_constants::TYPE_VEC)
+      hit.types_arg1.push(type_constants::TYPE_NEWTYPE_BASE + 0)
+      hit.types_arg2.push(0)
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 0)
+    end
+
+  end
+
+  describe("qzmod_inject · traits + impls (Phase 1.4.d)") do ->
+
+    it("trait with one abstract method round-trips name + sig + default flag") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qi_mock_hit()
+      hit.trait_names.push("qzmod_inject_test_Eq")
+      hit.trait_type_params.push("")
+      hit.trait_super_traits.push("")
+      # Methods blob layout per trait:
+      #   [n_methods, name_idx, default, n_params, return_type, p0, ..., name_idx, ...]
+      # Single abstract method `eq(self, other) -> Int`, default=0.
+      hit.trait_methods_off.push(hit.trait_methods_blob.size)
+      hit.trait_methods_blob.push(1)             # n_methods
+      var mname_idx = hit.strings.size
+      hit.strings.push("eq")
+      hit.trait_methods_blob.push(mname_idx)     # name_idx
+      hit.trait_methods_blob.push(0)             # default flag
+      hit.trait_methods_blob.push(2)             # n_params (self, other)
+      hit.trait_methods_blob.push(type_constants::TYPE_INT)  # return_type
+      hit.trait_methods_blob.push(type_constants::TYPE_INT)  # param 0
+      hit.trait_methods_blob.push(type_constants::TYPE_INT)  # param 1
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 1)
+      var lookup = typecheck_registry::tc_lookup_trait(tc, "qzmod_inject_test_Eq")
+      assert_eq(lookup.is_found(), 1)
+      var tidx = lookup.unwrap()
+      assert_eq(typecheck_registry::tc_trait_method_count(tc, tidx), 1)
+      assert_eq(typecheck_registry::tc_trait_has_method(tc, tidx, "eq"), 1)
+      # Default flag (0 = abstract) round-trips.
+      assert_eq(tc.registry.trait_method_defaults[tidx][0], 0)
+    end
+
+    it("trait with super-trait + type-params round-trips both") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qi_mock_hit()
+      hit.trait_names.push("qzmod_inject_test_Ord")
+      hit.trait_type_params.push("T")
+      hit.trait_super_traits.push("Eq")
+      hit.trait_methods_off.push(hit.trait_methods_blob.size)
+      hit.trait_methods_blob.push(0)             # zero methods — pure marker w/ super
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 1)
+      var lookup = typecheck_registry::tc_lookup_trait(tc, "qzmod_inject_test_Ord")
+      var tidx = lookup.unwrap()
+      assert_eq_str(tc.registry.trait_type_params[tidx], "T")
+      assert_eq_str(tc.registry.trait_super_traits[tidx], "Eq")
+    end
+
+    it("trait with default method records default flag = 1") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qi_mock_hit()
+      hit.trait_names.push("qzmod_inject_test_Show")
+      hit.trait_type_params.push("")
+      hit.trait_super_traits.push("")
+      hit.trait_methods_off.push(hit.trait_methods_blob.size)
+      hit.trait_methods_blob.push(1)             # n_methods
+      var mname_idx = hit.strings.size
+      hit.strings.push("show")
+      hit.trait_methods_blob.push(mname_idx)
+      hit.trait_methods_blob.push(1)             # default flag = 1 (has default body)
+      hit.trait_methods_blob.push(1)             # n_params (self)
+      hit.trait_methods_blob.push(type_constants::TYPE_STRING)
+      hit.trait_methods_blob.push(type_constants::TYPE_INT)
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 1)
+      var lookup = typecheck_registry::tc_lookup_trait(tc, "qzmod_inject_test_Show")
+      var tidx = lookup.unwrap()
+      assert_eq(tc.registry.trait_method_defaults[tidx][0], 1)
+    end
+
+    it("duplicate trait inject (e.g. cross-hit re-export) is idempotent") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qi_mock_hit()
+      hit.trait_names.push("qzmod_inject_test_Dup")
+      hit.trait_type_params.push("")
+      hit.trait_super_traits.push("")
+      hit.trait_methods_off.push(hit.trait_methods_blob.size)
+      hit.trait_methods_blob.push(0)
+      var ok1 = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok1, 1)
+      var count_before = tc.registry.trait_names.size
+      # Inject the same hit again — should not duplicate.
+      var ok2 = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok2, 1)
+      assert_eq(tc.registry.trait_names.size, count_before)
+    end
+
+    it("impl block round-trips (trait_name, for_type)") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qi_mock_hit()
+      # Pre-condition: register a trait + a struct so the impl has
+      # well-formed referents (the inject impl path is loose — only
+      # records names — but a meaningful round-trip flows through.)
+      hit.trait_names.push("qzmod_inject_test_Eq2")
+      hit.trait_type_params.push("")
+      hit.trait_super_traits.push("")
+      hit.trait_methods_off.push(hit.trait_methods_blob.size)
+      hit.trait_methods_blob.push(0)
+      var trait_idx = hit.strings.size
+      hit.strings.push("qzmod_inject_test_Eq2")
+      var for_type_idx = hit.strings.size
+      hit.strings.push("qzmod_inject_test_Point")
+      hit.impls_off.push(hit.impls_blob.size)
+      hit.impls_blob.push(trait_idx)
+      hit.impls_blob.push(for_type_idx)
+      var ok = qzmod_remap::tc_inject_qzmod(tc, hit, vec_new<Int>())
+      assert_eq(ok, 1)
+      var impl_idx = typecheck_registry::tc_lookup_impl(tc, "qzmod_inject_test_Eq2", "qzmod_inject_test_Point")
+      assert_eq(impl_idx >= 0, true)
+    end
+
+  end
+
+  return qspec_main()
+end

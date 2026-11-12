@@ -1,0 +1,592 @@
+## measure_rss — controlled before/after RSS measurement harness.
+##
+## Filed 2026-05-01 to gate Phase A.2 P2 (Slice<Byte> sweep) on a
+## *real* gradient measurement and to substrate Phase B.1 (compiler
+## memory <1 GB) + Phase C.8 (statistical bench framework).
+##
+## ## Why this exists
+##
+## A naive `/usr/bin/time -l` of a saved-golden binary vs the current
+## binary is NOT a valid before/after — source-tree drift between the
+## two snapshot points + bootstrap-path asymmetry + macOS malloc-arena
+## retention all confound the peak-RSS reading. This harness pins the
+## workload (one .qz file, identical compile flags, identical stdlib),
+## runs N iterations of each binary against it, parses per-phase peak
+## RSS from the Profile-effect NDJSON stream on stderr, and reports
+## medians side-by-side with a baseline.
+##
+## ## Usage
+##
+##   quartz tools/measure_rss.qz -- \
+##     --binary self-hosted/bin/quartz \
+##     --workload self-hosted/quartz.qz \
+##     --runs 5 \
+##     [--baseline path/to/prev.csv] \
+##     [--emit-csv path/to/out.csv] \
+##     [--include-flags "-I self-hosted/frontend ..."]
+##
+## Run without --baseline to capture a snapshot; run with --baseline
+## to diff against a previously-captured snapshot.
+##
+## ## Snapshot format (CSV)
+##
+## Plain CSV — std/json typed-payload map-value-type-loss bug
+## (`docs/bugs/JSON_TYPED_PAYLOAD_MAP_VALUE_TYPE_LOSS.md`) blocks
+## importing json into a fresh user program. CSV is sufficient: one
+## row per phase, columns `name,rss_mb,peak_mb,wall_ms,samples`. All
+## numbers are medians across runs.
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+var g_binary = "self-hosted/bin/quartz"
+var g_workload = "self-hosted/quartz.qz"
+var g_runs = 5
+var g_baseline_path = ""
+var g_emit_csv_path = ""
+var g_include_flags = "-I self-hosted/frontend -I self-hosted/middle -I self-hosted/backend -I self-hosted/error -I self-hosted/shared -I tools -I std"
+
+# ============================================================================
+# Argument parsing
+# ============================================================================
+
+def parse_args(): Void
+  var n = argc()
+  var i = 1
+  while i < n
+    var arg = argv(i)
+    if str_eq(arg, "--binary")
+      i += 1
+      g_binary = argv(i)
+    elsif str_eq(arg, "--workload")
+      i += 1
+      g_workload = argv(i)
+    elsif str_eq(arg, "--runs")
+      i += 1
+      g_runs = str_to_int(argv(i))
+    elsif str_eq(arg, "--baseline")
+      i += 1
+      g_baseline_path = argv(i)
+    elsif str_eq(arg, "--emit-csv")
+      i += 1
+      g_emit_csv_path = argv(i)
+    elsif str_eq(arg, "--include-flags")
+      i += 1
+      g_include_flags = argv(i)
+    elsif str_eq(arg, "--help") or str_eq(arg, "-h")
+      print_help()
+      exit(0)
+    else
+      eputs("measure_rss: unknown argument: #{arg}")
+      eputs("run with --help for usage")
+      exit(2)
+    end
+    i += 1
+  end
+end
+
+def print_help(): Void
+  puts("Usage: measure_rss [options]")
+  puts("")
+  puts("Options:")
+  puts("  --binary PATH         Compiler binary to measure (default: self-hosted/bin/quartz)")
+  puts("  --workload PATH       .qz source file to compile (default: self-hosted/quartz.qz)")
+  puts("  --runs N              Iterations to run (default: 5)")
+  puts("  --baseline PATH       CSV snapshot to diff against")
+  puts("  --emit-csv PATH       Write median snapshot to PATH")
+  puts("  --include-flags STR   Override default -I flags")
+end
+
+# ============================================================================
+# Per-phase aggregation
+# ============================================================================
+#
+# Vec<Vec<Int>> trips a separate compiler quirk; use a flat
+# `Vec<Int>` keyed by `phase_idx * MAX_RUNS + run_idx` instead. The
+# upper bound on runs is generous since real usage is N≤30.
+
+var MAX_RUNS = 64
+
+struct PhaseStats
+  name: String
+  rss_mb: Int
+  peak_mb: Int
+  wall_ms: Int
+  samples: Int
+end
+
+var g_phase_names = vec_new<String>()
+var g_phase_count = vec_new<Int>()        # samples per phase
+var g_phase_rss = vec_new<Int>()          # flat: phase_idx * MAX_RUNS + sample_idx
+var g_phase_peak = vec_new<Int>()
+var g_phase_wall = vec_new<Int>()
+
+def find_or_create_phase(name: String): Int
+  var i = 0
+  while i < g_phase_names.size
+    if str_eq(g_phase_names[i], name)
+      return i
+    end
+    i += 1
+  end
+  g_phase_names.push(name)
+  g_phase_count.push(0)
+  var k = 0
+  while k < MAX_RUNS
+    g_phase_rss.push(0)
+    g_phase_peak.push(0)
+    g_phase_wall.push(0)
+    k += 1
+  end
+  return g_phase_names.size - 1
+end
+
+def record_phase(name: String, rss_mb: Int, peak_mb: Int, wall_ms: Int): Void
+  var idx = find_or_create_phase(name)
+  var s = g_phase_count[idx]
+  if s >= MAX_RUNS
+    return
+  end
+  var off = idx * MAX_RUNS + s
+  g_phase_rss[off] = rss_mb
+  g_phase_peak[off] = peak_mb
+  g_phase_wall[off] = wall_ms
+  g_phase_count[idx] = s + 1
+end
+
+def median_phase_rss(idx: Int): Int = median_of_slice(g_phase_rss, idx)
+def median_phase_peak(idx: Int): Int = median_of_slice(g_phase_peak, idx)
+def median_phase_wall(idx: Int): Int = median_of_slice(g_phase_wall, idx)
+
+def median_of_slice(flat: Vec<Int>, idx: Int): Int
+  var n = g_phase_count[idx]
+  if n == 0
+    return 0
+  end
+  var samples = vec_new<Int>()
+  var k = 0
+  while k < n
+    samples.push(flat[idx * MAX_RUNS + k])
+    k += 1
+  end
+  var s = sorted(samples)
+  return s[n / 2]
+end
+
+# ============================================================================
+# Run a single iteration: invoke the binary, capture stderr, parse phases.
+# ============================================================================
+
+def run_one(run_idx: Int): Int
+  reset_run_seen()
+  var err_path = "/tmp/_measure_rss_#{str_from_int(run_idx)}.err"
+  # --no-cache forces full pipeline; cache hits skip phases and would mask
+  # the per-phase RSS gradient we're trying to measure.
+  var cmd = "#{g_binary} --no-cache --memory-stats --progress #{g_include_flags} #{g_workload} > /dev/null 2>#{err_path}"
+  var rc = system(cmd)
+  if rc != 0
+    eputs("measure_rss: binary exited #{str_from_int(rc)} on run #{str_from_int(run_idx)}")
+    eputs("  cmd: #{cmd}")
+    if file_exists(err_path) == 1
+      eputs("  stderr tail:")
+      var errs = read_file(err_path)
+      eputs(errs)
+    end
+    return rc
+  end
+  var contents = read_file(err_path)
+  parse_ndjson(contents)
+  file_delete(err_path)
+  return 0
+end
+
+def parse_ndjson(blob: String): Void
+  var lines = str_split(blob, "\n")
+  var i = 0
+  while i < lines.size
+    var line = lines[i]
+    if line.starts_with("{")
+      extract_phase_event(line)
+    elsif line.starts_with("[prof] ") or line.starts_with("[mem] ")
+      # Pre-A.6 binaries (`[mem]`) emit RSS/peak only in the human-readable
+      # text lines — their NDJSON omits `rss_mb`/`peak_mb`. Post-A.6 binaries
+      # (`[prof]`) include both. Parsing the text lines makes the tool work
+      # uniformly across the A.6 schema-change boundary.
+      extract_text_phase(line)
+    end
+    i += 1
+  end
+end
+
+# Parse a human-readable phase line of the shape
+#   "[prof] phasename: N MB current, N MB peak (Nms)"        (first phase)
+#   "[prof] phasename: N MB (+D), N MB peak (Nms)"          (subsequent)
+#   "[mem] phasename: N MB ..., N MB peak (Nms)"            (pre-A.6)
+# Returns silently on any line that doesn't match the shape (some pre-A.6
+# emitters omit the peak field — those are dropped).
+def extract_text_phase(line: String): Void
+  # Find "] " then ":" to extract the phase name.
+  var name_start = str_find(line, "] ").unwrap_or(-1)
+  if name_start < 0
+    return
+  end
+  var name_off = name_start + 2
+  var rest = str_byte_slice(line, name_off, str_byte_len(line))
+  var colon = str_find(rest, ":").unwrap_or(-1)
+  if colon < 0
+    return
+  end
+  var name = str_byte_slice(rest, 0, colon)
+  if name_already_recorded_for_run(name)
+    return
+  end
+  var after_colon = str_byte_slice(rest, colon + 1, str_byte_len(rest))
+  # Extract first integer (current MB) — skip leading space.
+  var rss_mb = read_leading_int(after_colon)
+  # Find " MB peak (" to anchor peak + wall extraction.
+  var peak_anchor = str_find(after_colon, " MB peak (").unwrap_or(-1)
+  if peak_anchor < 0
+    return
+  end
+  # Walk backwards from peak_anchor to find the number that precedes "MB peak".
+  var peak_mb = read_int_before(after_colon, peak_anchor)
+  var wall_start = peak_anchor + 10
+  var wall_rest = str_byte_slice(after_colon, wall_start, str_byte_len(after_colon))
+  var ms_idx = str_find(wall_rest, "ms)").unwrap_or(-1)
+  var wall_ms = 0
+  if ms_idx >= 0
+    var ms_str = str_byte_slice(wall_rest, 0, ms_idx)
+    wall_ms = str_to_int(ms_str)
+  end
+  record_phase(name, rss_mb, peak_mb, wall_ms)
+end
+
+# Has a phase by this name already been recorded for the current run?
+# Each run emits both NDJSON and `[prof]`/`[mem]` lines for the same
+# phase — without this guard, every phase double-counts and the median
+# becomes meaningless.
+var g_run_seen = vec_new<String>()
+
+def reset_run_seen(): Void
+  g_run_seen = vec_new<String>()
+end
+
+def name_already_recorded_for_run(name: String): Int
+  var i = 0
+  while i < g_run_seen.size
+    if str_eq(g_run_seen[i], name)
+      return 1
+    end
+    i += 1
+  end
+  g_run_seen.push(name)
+  return 0
+end
+
+# Parse an integer at the start of `s`, skipping leading whitespace.
+def read_leading_int(s: String): Int
+  var n = str_byte_len(s)
+  var i = 0
+  while i < n
+    var c = str_byte_at(s, i)
+    if c != 32
+      break
+    end
+    i += 1
+  end
+  var start = i
+  while i < n
+    var c = str_byte_at(s, i)
+    if c < 48 or c > 57
+      break
+    end
+    i += 1
+  end
+  if i == start
+    return 0
+  end
+  return str_to_int(str_byte_slice(s, start, i))
+end
+
+# Walk backwards from `end_off` over digits to find the preceding integer.
+# Returns 0 if no digits found.
+def read_int_before(s: String, end_off: Int): Int
+  var i = end_off
+  while i > 0
+    var c = str_byte_at(s, i - 1)
+    if c < 48 or c > 57
+      break
+    end
+    i -= 1
+  end
+  if i == end_off
+    return 0
+  end
+  return str_to_int(str_byte_slice(s, i, end_off))
+end
+
+# Parse one NDJSON line of the fixed shape:
+#   {"v":1,"event":"phase","name":"NAME","elapsed_ms":N,"rss_mb":N,"peak_mb":N}
+# This is the Profile effect's emit format from std/profile.qz. We don't
+# need a full JSON parser — pull each `"key":VALUE` slice out by hand.
+def extract_phase_event(line: String): Void
+  var ev = json_string_field(line, "event")
+  if str_eq(ev, "phase") == false
+    return
+  end
+  # Post-A.6 NDJSON uses `name`; pre-A.6 uses `phase`.
+  var name = json_string_field(line, "name")
+  if str_byte_len(name) == 0
+    name = json_string_field(line, "phase")
+  end
+  if str_byte_len(name) == 0
+    return
+  end
+  var rss = json_int_field(line, "rss_mb")
+  var peak = json_int_field(line, "peak_mb")
+  var wall = json_int_field(line, "elapsed_ms")
+  # Pre-A.6 JSON omits rss_mb/peak_mb — let the `[mem]` text-line parser
+  # fill those in. Skip recording from JSON if both are zero (sentinel for
+  # "no data here, await text"). For post-A.6, JSON has the data; mark
+  # the phase seen so the text-line parser doesn't double-count.
+  if rss == 0 and peak == 0
+    return
+  end
+  if name_already_recorded_for_run(name)
+    return
+  end
+  record_phase(name, rss, peak, wall)
+end
+
+# Find `"key":"VALUE"` and return VALUE. Returns "" if missing.
+# str_find returns Option<Int> (v5.26+); -1 = not found.
+def json_string_field(line: String, key: String): String
+  var q = "\""
+  var marker = q + key + q + ":" + q
+  var start = str_find(line, marker).unwrap_or(-1)
+  if start < 0
+    return ""
+  end
+  var val_start = start + str_byte_len(marker)
+  var rest = str_byte_slice(line, val_start, str_byte_len(line))
+  var end_idx = str_find(rest, q).unwrap_or(-1)
+  if end_idx < 0
+    return ""
+  end
+  return str_byte_slice(rest, 0, end_idx)
+end
+
+# Find `"key":NUMBER` (NUMBER is unquoted) and return NUMBER as Int.
+# Returns 0 if missing.
+def json_int_field(line: String, key: String): Int
+  var q = "\""
+  var marker = q + key + q + ":"
+  var start = str_find(line, marker).unwrap_or(-1)
+  if start < 0
+    return 0
+  end
+  var val_start = start + str_byte_len(marker)
+  var rest = str_byte_slice(line, val_start, str_byte_len(line))
+  # Read digits until first non-digit. JSON ints in our format are
+  # always non-negative.
+  var end_idx = 0
+  while end_idx < str_byte_len(rest)
+    var c = str_byte_at(rest, end_idx)
+    if c < 48 or c > 57
+      break
+    end
+    end_idx += 1
+  end
+  if end_idx == 0
+    return 0
+  end
+  var digits = str_byte_slice(rest, 0, end_idx)
+  return str_to_int(digits)
+end
+
+# ============================================================================
+# Reporting
+# ============================================================================
+
+def collect_phase_stats(): Vec<PhaseStats>
+  var out = vec_new<PhaseStats>()
+  var i = 0
+  while i < g_phase_names.size
+    var ps = PhaseStats {
+      name: g_phase_names[i],
+      rss_mb: median_phase_rss(i),
+      peak_mb: median_phase_peak(i),
+      wall_ms: median_phase_wall(i),
+      samples: g_phase_count[i]
+    }
+    out.push(ps)
+    i += 1
+  end
+  return out
+end
+
+def print_table(stats: Vec<PhaseStats>): Void
+  puts("")
+  puts("Snapshot: #{g_binary} compiling #{g_workload} (median of #{str_from_int(g_runs)} runs)")
+  puts("")
+  puts("  phase             rss_mb   peak_mb   wall_ms   N")
+  puts("  ---------------   ------   -------   -------   --")
+  var i = 0
+  while i < stats.size
+    var s = stats[i]
+    puts("  #{pad_right(s.name, 15)}   #{pad_left(str_from_int(s.rss_mb), 6)}   #{pad_left(str_from_int(s.peak_mb), 7)}   #{pad_left(str_from_int(s.wall_ms), 7)}   #{pad_left(str_from_int(s.samples), 2)}")
+    i += 1
+  end
+end
+
+def print_diff_table(cur: Vec<PhaseStats>, baseline: Vec<PhaseStats>): Void
+  puts("")
+  puts("Diff: baseline vs #{g_binary} (median of #{str_from_int(g_runs)} runs)")
+  puts("")
+  puts("  phase             base_peak   cur_peak   d_peak     base_wall   cur_wall   d_wall")
+  puts("  ---------------   ---------   --------   ------     ---------   --------   ------")
+  var i = 0
+  while i < cur.size
+    var s = cur[i]
+    var b_idx = lookup_baseline_idx(baseline, s.name)
+    var b_peak = 0
+    var b_wall = 0
+    if b_idx >= 0
+      b_peak = baseline[b_idx].peak_mb
+      b_wall = baseline[b_idx].wall_ms
+    end
+    var d_peak = s.peak_mb - b_peak
+    var d_wall = s.wall_ms - b_wall
+    var d_peak_s = format_signed(d_peak)
+    var d_wall_s = format_signed(d_wall)
+    puts("  #{pad_right(s.name, 15)}   #{pad_left(str_from_int(b_peak), 9)}   #{pad_left(str_from_int(s.peak_mb), 8)}   #{pad_left(d_peak_s, 6)}     #{pad_left(str_from_int(b_wall), 9)}   #{pad_left(str_from_int(s.wall_ms), 8)}   #{pad_left(d_wall_s, 6)}")
+    i += 1
+  end
+end
+
+def lookup_baseline_idx(baseline: Vec<PhaseStats>, name: String): Int
+  var i = 0
+  while i < baseline.size
+    if str_eq(baseline[i].name, name)
+      return i
+    end
+    i += 1
+  end
+  return -1
+end
+
+def format_signed(n: Int): String
+  if n >= 0
+    return "+#{str_from_int(n)}"
+  end
+  return str_from_int(n)
+end
+
+def pad_right(s: String, width: Int): String
+  var out = s
+  var i = str_byte_len(s)
+  while i < width
+    out = "#{out} "
+    i += 1
+  end
+  return out
+end
+
+def pad_left(s: String, width: Int): String
+  var out = s
+  var i = str_byte_len(s)
+  while i < width
+    out = " #{out}"
+    i += 1
+  end
+  return out
+end
+
+# ============================================================================
+# CSV snapshot read / write
+# ============================================================================
+
+def write_snapshot(path: String, stats: Vec<PhaseStats>): Void
+  var buf = "name,rss_mb,peak_mb,wall_ms,samples\n"
+  var i = 0
+  while i < stats.size
+    var s = stats[i]
+    buf = "#{buf}#{s.name},#{str_from_int(s.rss_mb)},#{str_from_int(s.peak_mb)},#{str_from_int(s.wall_ms)},#{str_from_int(s.samples)}\n"
+    i += 1
+  end
+  var _w = write_file(path, buf)
+  puts("Wrote snapshot: #{path}")
+end
+
+def read_snapshot(path: String): Vec<PhaseStats>
+  var blob = read_file(path)
+  var lines = str_split(blob, "\n")
+  var out = vec_new<PhaseStats>()
+  var i = 1   # skip header
+  while i < lines.size
+    var line = lines[i]
+    if str_byte_len(line) == 0
+      i += 1
+      continue
+    end
+    var cols = str_split(line, ",")
+    if cols.size < 5
+      i += 1
+      continue
+    end
+    var s = PhaseStats {
+      name: cols[0],
+      rss_mb: str_to_int(cols[1]),
+      peak_mb: str_to_int(cols[2]),
+      wall_ms: str_to_int(cols[3]),
+      samples: str_to_int(cols[4])
+    }
+    out.push(s)
+    i += 1
+  end
+  return out
+end
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main(): Int
+  parse_args()
+
+  if file_exists(g_binary) == 0
+    eputs("measure_rss: binary not found: #{g_binary}")
+    return 2
+  end
+  if file_exists(g_workload) == 0
+    eputs("measure_rss: workload not found: #{g_workload}")
+    return 2
+  end
+
+  eputs("measure_rss: #{g_binary} × #{g_workload} × #{str_from_int(g_runs)} runs")
+  var i = 0
+  while i < g_runs
+    eputs("  run #{str_from_int(i + 1)}/#{str_from_int(g_runs)} ...")
+    var rc = run_one(i)
+    if rc != 0
+      return rc
+    end
+    i += 1
+  end
+
+  var stats = collect_phase_stats()
+
+  if str_byte_len(g_baseline_path) > 0
+    var baseline = read_snapshot(g_baseline_path)
+    print_diff_table(stats, baseline)
+  else
+    print_table(stats)
+  end
+
+  if str_byte_len(g_emit_csv_path) > 0
+    write_snapshot(g_emit_csv_path, stats)
+  end
+
+  return 0
+end

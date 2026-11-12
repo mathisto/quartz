@@ -1,0 +1,281 @@
+import * from qspec
+
+# ============================================================================
+# park_state CAS protocol tests — frame[5] wake-before-park coordination
+#
+# The CAS protocol (frame[5]): 0=RUNNING, 1=PARKED, 2=WAKE_PENDING
+# These tests verify all three transitions:
+#   Normal:        task parks (0→1), then woken (1→0)
+#   Wake-pending:  sched_wake fires before park (0→2), worker detects and re-enqueues
+#   Repeated:      multiple park/wake cycles on same frame
+# ============================================================================
+
+# --- Test 1: Wake-before-park (WAKE_PENDING path) ---
+# Forces the WAKE_PENDING transition by having the waker call sched_wake
+# BEFORE the parker calls sched_park. Uses a barrier flag to enforce ordering.
+
+var g_wp_frame = 0
+var g_wp_go = 0
+var g_wp_result = 0
+
+def wp_parker(): Int
+  var me = task_frame()
+  # Publish frame BEFORE parking
+  atomic_store(g_wp_frame, me)
+  # Busy-yield until waker has called sched_wake on us
+  while atomic_load(g_wp_go) == 0
+    sched_yield()
+  end
+  # Park — sched_wake already fired, frame[5] should be WAKE_PENDING(2)
+  # Worker loop should detect WAKE_PENDING and re-enqueue instead of parking
+  sched_park()
+  # If we get here, the WAKE_PENDING protocol worked
+  atomic_store(g_wp_result, 1)
+  return 0
+end
+
+def wp_waker(): Int
+  var frame = 0
+  while frame == 0
+    frame = atomic_load(g_wp_frame)
+    sched_yield()
+  end
+  # Call sched_wake BEFORE parker has called sched_park
+  sched_wake(frame)
+  # Now let parker proceed to sched_park
+  atomic_store(g_wp_go, 1)
+  return 0
+end
+
+def test_wake_before_park(): Int
+  g_wp_frame = atomic_new(0)
+  g_wp_go = atomic_new(0)
+  g_wp_result = atomic_new(0)
+  sched_init(2)
+  var h1 = go wp_parker()
+  var h2 = go wp_waker()
+  await h1
+  await h2
+  sched_shutdown()
+  return atomic_load(g_wp_result)
+end
+
+# --- Test 2: Mass park then mass wake (simulates load_stop) ---
+# Spawns N tasks that park, then wakes them all from a single waker.
+
+var g_mw_frames = 0
+var g_mw_count = 0
+var g_mw_woken = 0
+
+def mw_park_task(idx: Int): Int
+  var me = task_frame()
+  var base = atomic_load(g_mw_frames)
+  store(base, idx, me)
+  atomic_add(g_mw_count, 1)
+  sched_park()
+  atomic_add(g_mw_woken, 1)
+  return 0
+end
+
+def mw_waker(n: Int): Int
+  # Wait for all tasks to store their frames
+  while atomic_load(g_mw_count) < n
+    sched_yield()
+  end
+  # Small delay for tasks to reach sched_park
+  var j = 0
+  while j < 10
+    sched_yield()
+    j += 1
+  end
+  # Mass wake all tasks
+  var base = atomic_load(g_mw_frames)
+  var i = 0
+  while i < n
+    var frame = load(base, i)
+    sched_wake(frame)
+    i = i + 1
+  end
+  return 0
+end
+
+def test_mass_park_wake(): Int
+  var n = 20
+  g_mw_frames = atomic_new(as_int(mem_alloc(n * 8)))
+  g_mw_count = atomic_new(0)
+  g_mw_woken = atomic_new(0)
+  sched_init(4)
+  var handles = vec_new()
+  var i = 0
+  while i < n
+    handles.push(go mw_park_task(i))
+    i = i + 1
+  end
+  var waker = go mw_waker(n)
+  i = 0
+  while i < n
+    await handles[i]
+    i = i + 1
+  end
+  await waker
+  sched_shutdown()
+  return atomic_load(g_mw_woken)
+end
+
+# --- Test 3: Forced wake-before-park with multiple tasks ---
+# Multiple parkers, each forced through WAKE_PENDING via barrier flag.
+
+var g_fwp_frames = 0
+var g_fwp_go = 0
+var g_fwp_count = 0
+var g_fwp_woken = 0
+
+def fwp_parker(idx: Int): Int
+  var me = task_frame()
+  var base = atomic_load(g_fwp_frames)
+  store(base, idx, me)
+  atomic_add(g_fwp_count, 1)
+  # Wait for waker to fire sched_wake before we park
+  while atomic_load(g_fwp_go) == 0
+    sched_yield()
+  end
+  sched_park()
+  atomic_add(g_fwp_woken, 1)
+  return 0
+end
+
+def fwp_waker(n: Int): Int
+  # Wait for all tasks to register
+  while atomic_load(g_fwp_count) < n
+    sched_yield()
+  end
+  # Wake all tasks BEFORE they park
+  var base = atomic_load(g_fwp_frames)
+  var i = 0
+  while i < n
+    var frame = load(base, i)
+    sched_wake(frame)
+    i = i + 1
+  end
+  # Now let them proceed to sched_park (which should be a no-op due to WAKE_PENDING)
+  atomic_store(g_fwp_go, 1)
+  return 0
+end
+
+def test_forced_wake_pending_multi(): Int
+  var n = 8
+  g_fwp_frames = atomic_new(as_int(mem_alloc(n * 8)))
+  g_fwp_go = atomic_new(0)
+  g_fwp_count = atomic_new(0)
+  g_fwp_woken = atomic_new(0)
+  # n+2 workers: ensures waker isn't starved by parker yield-loops
+  # (local queue LIFO can starve global queue tasks)
+  sched_init(n + 2)
+  var handles = vec_new()
+  var i = 0
+  while i < n
+    handles.push(go fwp_parker(i))
+    i = i + 1
+  end
+  var waker = go fwp_waker(n)
+  i = 0
+  while i < n
+    await handles[i]
+    i = i + 1
+  end
+  await waker
+  sched_shutdown()
+  return atomic_load(g_fwp_woken)
+end
+
+# --- Test 4: try_recv returns proper Option ---
+# Verifies that try_recv on an empty channel returns None (option_is_some = 0)
+# and try_recv on a non-empty channel returns Some(value).
+
+def test_try_recv_option(): Int
+  var ch = channel_new_unbounded()
+  # Empty channel → None
+  var opt1 = try_recv(ch)
+  var empty_ok = 0
+  if option_is_some(opt1) == 0
+    empty_ok = 1
+  end
+  option_free(opt1)
+  # Send a value then recv → Some(42)
+  send(ch, 42)
+  var opt2 = try_recv(ch)
+  var value_ok = 0
+  if option_is_some(opt2)
+    var v = option_get(opt2)
+    if v == 42
+      value_ok = 1
+    end
+  end
+  option_free(opt2)
+  # Empty again → None
+  var opt3 = try_recv(ch)
+  var empty2_ok = 0
+  if option_is_some(opt3) == 0
+    empty2_ok = 1
+  end
+  option_free(opt3)
+  return empty_ok + value_ok + empty2_ok
+end
+
+# --- Test 5: try_recv drains channel correctly (load_stop pattern) ---
+
+def test_try_recv_drain(): Int
+  var ch = channel_new_unbounded()
+  # Send 10 values
+  var i = 0
+  while i < 10
+    send(ch, i + 1)
+    i = i + 1
+  end
+  # Drain loop (same pattern as load_stop)
+  var total = 0
+  var count = 0
+  var opt = try_recv(ch)
+  while option_is_some(opt)
+    total = total + option_get(opt)
+    count += 1
+    option_free(opt)
+    opt = try_recv(ch)
+  end
+  option_free(opt)
+  # 1+2+...+10 = 55, count = 10
+  if count != 10
+    return -1
+  end
+  return total
+end
+
+# --- Main ---
+
+def _qspec_is_slow(): Int = 1
+
+def main(): Int
+  describe("park_state CAS protocol") do ->
+    it("wake-before-park: sched_wake fires before sched_park") do ->
+      assert_eq(test_wake_before_park(), 1)
+    end
+
+    it("mass park then mass wake (20 tasks)") do ->
+      assert_eq(test_mass_park_wake(), 20)
+    end
+
+    it("forced wake-pending on 8 tasks simultaneously") do ->
+      assert_eq(test_forced_wake_pending_multi(), 8)
+    end
+
+    it("try_recv returns Option (None for empty, Some for value)") do ->
+      assert_eq(test_try_recv_option(), 3)
+    end
+
+    it("try_recv drain loop matches load_stop pattern") do ->
+      assert_eq(test_try_recv_drain(), 55)
+    end
+  end
+
+  return qspec_main()
+end

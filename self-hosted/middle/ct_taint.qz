@@ -1,0 +1,493 @@
+##! # CT taint pass — NET.4 Layer 3
+##!
+##! Forward dataflow over MIR SSA values inside any function marked `@ct`,
+##! tracking which values are `Secret<T>`-derived and rejecting sinks that
+##! would leak secret data via control flow, address dependence, comparison,
+##! or variable-time shifts.
+##!
+##! This is the Layer 3 enforcement for the NET.4 epic. Layers 1+2 (source-
+##! level `Secret<T>` newtype rejections + `dudect` statistical CT validation)
+##! ship the production-language baseline. Layer 3 is what research languages
+##! like Jasmin and FaCT give you — flow-sensitive CT enforcement that catches
+##! leaks `secret_unwrap` would otherwise hide.
+##!
+##! Reference: Sun et al. 2024, *Towards Efficient Verification of CT
+##! Cryptographic Implementations* (arxiv 2402.13506) — §3 IFDS construction.
+##!
+##! ## Lattice
+##!
+##!     public ⊑ secret
+##!
+##! Two-valued lattice. Sources lift `public → secret`; nothing lowers
+##! `secret → public` inside an `@ct` function (the design's
+##! "no-declassification" stance — `secret_unwrap` is the boundary marker,
+##! not a sanitizer).
+##!
+##! ## Sources of secret taint
+##!
+##! 1. **Parameters typed `Secret<T>`** — seeded into the per-function var
+##!    set before the fixpoint loop runs. Recognized by parameter type-name
+##!    string starting with `"Secret<"`.
+##! 2. **Calls to `secret_wrap`** — any monomorphized variant. Return is
+##!    tainted regardless of argument taint.
+##! 3. **Op-level derivation** — every instruction whose operand is tainted
+##!    produces a tainted SSA register. Variables learn taint via
+##!    `MIR_STORE_VAR` from a tainted register; loads via `MIR_LOAD_VAR` re-
+##!    produce the taint on a fresh SSA register.
+##!
+##! ## Sinks
+##!
+##! Inside an `@ct` function, the following positions are rejected if their
+##! operand is taint-derived:
+##!
+##! - **Branch condition** — terminator `TERM_BRANCH` / `TERM_SWITCH`'s
+##!   `term_data` (the condition SSA register).
+##! - **Array index** — `MIR_INDEX` / `MIR_INDEX_RAW` second operand.
+##! - **Comparison** — `MIR_BINARY` with op in `[OP_EQ, OP_NE, OP_LT, OP_LE,
+##!   OP_GT, OP_GE]` (7-12), either operand.
+##! - **Variable shift amount** — `MIR_BINARY` with op in `[OP_SHL, OP_SHR]`
+##!   (19-20), RIGHT operand (the amount).
+##!
+##! ## Algorithm
+##!
+##! 1. **Seed**: walk `func.params[]` + `func.param_type_names[]`. For each
+##!    param whose type name starts with `"Secret<"`, add the param name to
+##!    `taint_vars`.
+##! 2. **Fixpoint**: repeatedly walk every block / instruction; propagate
+##!    taint through `MIR_LOAD_VAR` (var → reg), `MIR_STORE_VAR` (reg → var),
+##!    `MIR_BINARY` / `MIR_UNARY` / `MIR_INDEX` / `MIR_PHI` / `MIR_CALL` /
+##!    `MIR_INTRINSIC` / `MIR_FIELD_ACCESS` / `MIR_LOAD_OFFSET` / `MIR_LOAD`
+##!    (operand or arg taint → dest taint). Iterate until no change.
+##! 3. **Report**: walk once more; at each sink position, emit a `QZ07xx`
+##!    diagnostic via `diag::diag_emit`.
+##!
+##! The fixpoint-then-report shape (rather than report-on-propagate) makes
+##! the algorithm idempotent — each sink is reported exactly once at its
+##! source location, with no dependence on iteration order.
+##!
+##! ## Diagnostic codes
+##!
+##! - `QZ0700` — branch on Secret-derived condition.
+##! - `QZ0701` — array index by Secret-derived value.
+##! - `QZ0702` — comparison with a Secret-derived operand.
+##! - `QZ0703` — variable shift by a Secret-derived amount.
+##!
+##! Each points users at `std/core/crypto/subtle` for the canonical
+##! constant-time replacement helper.
+
+import mir
+import * from mir
+import op_constants
+import diagnostic
+
+# -----------------------------------------------------------------------------
+# State
+# -----------------------------------------------------------------------------
+
+## Per-function taint state. Two parallel sets:
+##
+## - `taint_vars` — variable names whose stored content is currently treated
+##   as Secret-derived. Seeded from `Secret<T>`-typed params and grown by
+##   `MIR_STORE_VAR` of tainted registers.
+## - `taint_regs` — SSA register IDs whose value is currently treated as
+##   Secret-derived. Grown by every propagation rule.
+##
+## `Vec<String>` / `Vec<Int>` with linear membership check. Function bodies
+## are typically <1000 SSA values; the linear check is the standard pattern
+## used elsewhere in the codebase (see `_g_cconv_c_funcs` etc.).
+struct CtTaint
+  taint_vars: Vec<String>
+  taint_regs: Vec<Int>
+end
+
+def _ct_new(): CtTaint
+  return CtTaint {
+    taint_vars: vec_new<String>(),
+    taint_regs: vec_new<Int>()
+  }
+end
+
+def _ct_var_tainted(ct: CtTaint, name: String): Int
+  var n = ct.taint_vars.size
+  for i in 0..n
+    if ct.taint_vars[i] == name
+      return 1
+    end
+  end
+  return 0
+end
+
+def _ct_reg_tainted(ct: CtTaint, reg: Int): Int
+  var n = ct.taint_regs.size
+  for i in 0..n
+    if ct.taint_regs[i] == reg
+      return 1
+    end
+  end
+  return 0
+end
+
+def _ct_taint_var(ct: CtTaint, name: String): Int
+  if _ct_var_tainted(ct, name) == 1
+    return 0
+  end
+  ct.taint_vars.push(name)
+  return 1
+end
+
+def _ct_taint_reg(ct: CtTaint, reg: Int): Int
+  if _ct_reg_tainted(ct, reg) == 1
+    return 0
+  end
+  ct.taint_regs.push(reg)
+  return 1
+end
+
+# -----------------------------------------------------------------------------
+# Source recognition
+# -----------------------------------------------------------------------------
+
+## Is `type_name` a `Secret<T>` ptype? Recognized by literal `"Secret<"`
+## prefix. Robust against arbitrary inner T because we never need to inspect
+## T — taint flows through the whole value.
+def _ct_is_secret_type(type_name: String): Int
+  if str_byte_len(type_name) < 7
+    return 0
+  end
+  if str_byte_slice(type_name, 0, 7) == "Secret<"
+    return 1
+  end
+  return 0
+end
+
+## Is `name` a `secret_wrap` callee? Match both bare (no qualification) and
+## module-qualified (`secret$secret_wrap`) forms, with optional generic
+## specialization suffixes (`secret_wrap_Int`, `secret_wrap_Bytes32`, etc.).
+##
+## NOTE: `secret_unwrap` is deliberately NOT a source — inside `@ct`, the
+## unwrap is the boundary marker; the value remains tainted per Layer 3's
+## "no declassification inside @ct" rule.
+def _ct_is_wrap_callee(name: String): Int
+  var n = str_byte_len(name)
+  if n == 0
+    return 0
+  end
+  # Strip a `module$` prefix if present.
+  var bare = name
+  var dollar = __char_index(bare, '$')
+  if dollar >= 0
+    bare = str_byte_slice(bare, dollar + 1, str_byte_len(bare))
+  end
+  # Match `secret_wrap` exactly or `secret_wrap_…` for monomorphization.
+  if bare == "secret_wrap"
+    return 1
+  end
+  if str_byte_len(bare) > 11
+    if str_byte_slice(bare, 0, 12) == "secret_wrap_"
+      return 1
+    end
+  end
+  return 0
+end
+
+# -----------------------------------------------------------------------------
+# Sink classification
+# -----------------------------------------------------------------------------
+
+## Comparison ops leak through `icmp` result observable to the caller via
+## branch / phi / store. Range: OP_EQ (7) through OP_GE (12).
+def _ct_is_cmp_op(op: Int): Int
+  if op >= op_constants::OP_EQ
+    if op <= op_constants::OP_GE
+      return 1
+    end
+  end
+  return 0
+end
+
+## Variable-amount shifts leak through the µop dispatch path (BSR/BSF chain
+## on x86, mov-shifted-reg on ARM). OP_SHL=19, OP_SHR=20.
+def _ct_is_shift_op(op: Int): Int
+  if op == op_constants::OP_SHL
+    return 1
+  end
+  if op == op_constants::OP_SHR
+    return 1
+  end
+  return 0
+end
+
+# -----------------------------------------------------------------------------
+# Fixpoint propagation
+# -----------------------------------------------------------------------------
+
+## Propagate taint for one instruction. Returns 1 if any new taint was added
+## (used by the fixpoint driver to detect convergence). Does NOT report sinks
+## — sinks are reported in a separate single pass after fixpoint.
+def _ct_propagate_instr(ct: CtTaint, instr: MirInstr): Int
+  var kind = instr.mir_instr_get_kind()
+  var changed = 0
+
+  if kind == mir::MIR_LOAD_VAR
+    var vname = instr.mir_instr_get_var_name()
+    if _ct_var_tainted(ct, vname) == 1
+      var dest = instr.mir_instr_get_dest_id()
+      changed = changed | _ct_taint_reg(ct, dest)
+    end
+    return changed
+  end
+
+  if kind == mir::MIR_STORE_VAR
+    var src = instr.mir_instr_get_operand2()
+    if _ct_reg_tainted(ct, src) == 1
+      var vname = instr.mir_instr_get_var_name()
+      changed = changed | _ct_taint_var(ct, vname)
+    end
+    return changed
+  end
+
+  if kind == mir::MIR_CALL or kind == mir::MIR_INTRINSIC or kind == mir::MIR_CALL_INDIRECT
+    var dest = instr.mir_instr_get_dest_id()
+    if dest < 0
+      return 0
+    end
+    # `secret_wrap*` is a taint source independent of arg taint.
+    if kind == mir::MIR_CALL
+      var fname = instr.mir_instr_get_func_name()
+      if _ct_is_wrap_callee(fname) == 1
+        changed = changed | _ct_taint_reg(ct, dest)
+        return changed
+      end
+    end
+    # Otherwise: any tainted argument taints the return value.
+    # Per design: `secret_unwrap` is NOT a sanitizer inside `@ct` — its
+    # tainted argument keeps the return tainted. This fall-through covers it.
+    var args = instr.mir_instr_get_args()
+    var nargs = args.size
+    for i in 0..nargs
+      if _ct_reg_tainted(ct, args[i]) == 1
+        changed = changed | _ct_taint_reg(ct, dest)
+        return changed
+      end
+    end
+    return changed
+  end
+
+  if kind == mir::MIR_BINARY
+    var l = instr.mir_instr_get_operand1()
+    var r = instr.mir_instr_get_operand2()
+    if _ct_reg_tainted(ct, l) == 1 or _ct_reg_tainted(ct, r) == 1
+      var dest = instr.mir_instr_get_dest_id()
+      changed = changed | _ct_taint_reg(ct, dest)
+    end
+    return changed
+  end
+
+  if kind == mir::MIR_UNARY
+    var op1 = instr.mir_instr_get_operand1()
+    if _ct_reg_tainted(ct, op1) == 1
+      var dest = instr.mir_instr_get_dest_id()
+      changed = changed | _ct_taint_reg(ct, dest)
+    end
+    return changed
+  end
+
+  if kind == mir::MIR_INDEX or kind == mir::MIR_INDEX_RAW
+    # Loading from a tainted base also produces a tainted result — e.g.
+    # `key[i]` where `key` is a Secret-derived buffer.
+    var base = instr.mir_instr_get_operand1()
+    if _ct_reg_tainted(ct, base) == 1
+      var dest = instr.mir_instr_get_dest_id()
+      changed = changed | _ct_taint_reg(ct, dest)
+    end
+    return changed
+  end
+
+  if kind == mir::MIR_PHI
+    # PHI args are SSA register IDs in `args`. Any tainted incoming taints
+    # the dest.
+    var args = instr.mir_instr_get_args()
+    var nargs = args.size
+    for i in 0..nargs
+      if _ct_reg_tainted(ct, args[i]) == 1
+        var dest = instr.mir_instr_get_dest_id()
+        changed = changed | _ct_taint_reg(ct, dest)
+        return changed
+      end
+    end
+    return changed
+  end
+
+  if kind == mir::MIR_FIELD_ACCESS or kind == mir::MIR_LOAD_OFFSET or kind == mir::MIR_LOAD
+    var src = instr.mir_instr_get_operand1()
+    if _ct_reg_tainted(ct, src) == 1
+      var dest = instr.mir_instr_get_dest_id()
+      changed = changed | _ct_taint_reg(ct, dest)
+    end
+    return changed
+  end
+
+  if kind == mir::MIR_SELECT
+    # SELECT(cond, then, else) — result is tainted if either branch is
+    # tainted. The condition being tainted is NOT a sink (`select` is the
+    # CT replacement for `if/else`), but the data flow still propagates.
+    var args = instr.mir_instr_get_args()
+    var nargs = args.size
+    if nargs >= 2
+      if _ct_reg_tainted(ct, args[0]) == 1 or _ct_reg_tainted(ct, args[1]) == 1
+        var dest = instr.mir_instr_get_dest_id()
+        changed = changed | _ct_taint_reg(ct, dest)
+      end
+    end
+    return changed
+  end
+
+  return 0
+end
+
+## Run taint propagation to fixpoint over every block in `func`.
+def _ct_fixpoint(ct: CtTaint, func: MirFunc): Void
+  var blocks = func.mir_func_get_blocks()
+  var nblocks = blocks.size
+  var more = 1
+  while more == 1
+    more = 0
+    for bi in 0..nblocks
+      var blk = blocks[bi]
+      var instrs = blk.mir_block_get_instructions()
+      var ninstrs = instrs.size
+      for ii in 0..ninstrs
+        var instr = instrs[ii]
+        if _ct_propagate_instr(ct, instr) == 1
+          more = 1
+        end
+      end
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Sink reporting
+# -----------------------------------------------------------------------------
+
+def _ct_emit_diag(code: String, msg: String, line: Int, col: Int, func_name: String): Void
+  var full_msg = "@ct (NET.4 Layer 3): #{msg} in `#{func_name}`. Use a constant-time helper from `std/core/crypto/subtle`."
+  var d = diagnostic::diag_new(diagnostic::DIAG_ERROR, code, full_msg, "", line, col)
+  diagnostic::diag_emit(d)
+end
+
+## Walk every block once after fixpoint convergence and report each sink
+## position whose operand is taint-derived.
+def _ct_report_sinks(ct: CtTaint, func: MirFunc): Void
+  var fname = func.mir_func_get_name()
+  var blocks = func.mir_func_get_blocks()
+  var nblocks = blocks.size
+  for bi in 0..nblocks
+    var blk = blocks[bi]
+    var instrs = blk.mir_block_get_instructions()
+    var ninstrs = instrs.size
+
+    for ii in 0..ninstrs
+      var instr = instrs[ii]
+      var kind = instr.mir_instr_get_kind()
+      var line = instr.mir_instr_get_line()
+      var col = instr.mir_instr_get_col()
+
+      if kind == mir::MIR_BINARY
+        var op = instr.mir_instr_get_op()
+        var l = instr.mir_instr_get_operand1()
+        var r = instr.mir_instr_get_operand2()
+        if _ct_is_cmp_op(op) == 1
+          if _ct_reg_tainted(ct, l) == 1 or _ct_reg_tainted(ct, r) == 1
+            _ct_emit_diag("QZ0702",
+              "comparison on Secret-derived operand leaks bits via icmp",
+              line, col, fname)
+          end
+        end
+        if _ct_is_shift_op(op) == 1
+          if _ct_reg_tainted(ct, r) == 1
+            _ct_emit_diag("QZ0703",
+              "variable shift by Secret-derived amount leaks through the µop dispatch path",
+              line, col, fname)
+          end
+        end
+      end
+
+      if kind == mir::MIR_INDEX or kind == mir::MIR_INDEX_RAW
+        var idx = instr.mir_instr_get_operand2()
+        if _ct_reg_tainted(ct, idx) == 1
+          _ct_emit_diag("QZ0701",
+            "array index by Secret-derived value leaks via cache-line addressing",
+            line, col, fname)
+        end
+      end
+
+      if kind == mir::MIR_INDEX_STORE or kind == mir::MIR_INDEX_STORE_RAW
+        # Index store: args[0] is the index, args[1] is the value.
+        var args = instr.mir_instr_get_args()
+        if args.size >= 1
+          if _ct_reg_tainted(ct, args[0]) == 1
+            _ct_emit_diag("QZ0701",
+              "array index by Secret-derived value leaks via cache-line addressing",
+              line, col, fname)
+          end
+        end
+      end
+    end
+
+    # Block terminator — branch/switch conditions.
+    var term_kind = blk.mir_block_get_term_kind()
+    if term_kind == mir::TERM_BRANCH or term_kind == mir::TERM_SWITCH
+      var cond = blk.mir_block_get_term_data()
+      if _ct_reg_tainted(ct, cond) == 1
+        var fl = func.mir_func_get_line()
+        _ct_emit_diag("QZ0700",
+          "branch on Secret-derived condition leaks bits via control flow",
+          fl, 0, fname)
+      end
+    end
+  end
+end
+
+# -----------------------------------------------------------------------------
+# Per-function entry
+# -----------------------------------------------------------------------------
+
+## Seed the taint set from `Secret<T>`-typed parameters.
+def _ct_seed_from_params(ct: CtTaint, func: MirFunc): Void
+  var params = func.params
+  var type_names = func.param_type_names
+  var n = params.size
+  for i in 0..n
+    if i < type_names.size
+      var tn = type_names[i]
+      if _ct_is_secret_type(tn) == 1
+        _ct_taint_var(ct, params[i])
+      end
+    end
+  end
+end
+
+## Run the CT taint pass on a single function. No-op unless `@ct`.
+def ct_taint_function(func: MirFunc): Void
+  if mir_func_is_ct(func) == 0
+    return
+  end
+  var ct = _ct_new()
+  _ct_seed_from_params(ct, func)
+  _ct_fixpoint(ct, func)
+  _ct_report_sinks(ct, func)
+end
+
+## Run the CT taint pass over every function in `prog`. Cheap on programs
+## with no `@ct` annotations — each function pays one `mir_func_is_ct` side-
+## table check and returns. The pass runs after MIR lowering, before any
+## MIR optimization or codegen, so source locations are still accurate.
+def ct_taint_program(prog: MirProgram): Void
+  var funcs = prog.mir_get_functions()
+  var n = funcs.size
+  for i in 0..n
+    var func = funcs[i]
+    ct_taint_function(func)
+  end
+end

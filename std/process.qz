@@ -1,0 +1,195 @@
+##! # process — Async-aware subprocess execution
+##!
+##! Non-blocking subprocess wrappers that yield cooperatively to the M:N
+##! scheduler while waiting for child output or exit. Unlike std/shell.qz's
+##! blocking `shell_capture` / `shell_run` helpers (which block the main
+##! thread for the entire child lifetime), these integrate with the I/O
+##! poller via `io_suspend`, allowing other tasks — go-tasks, idle hooks,
+##! parallel subprocess drivers — to continue running during the wait.
+##!
+##! ## How it works
+##!
+##! POSIX `popen(3)` forks a child and returns a `FILE *` whose underlying
+##! fd is the read end of a pipe connected to the child's stdout. We
+##! `fileno(3)` that FILE* to get the raw fd, set it non-blocking via
+##! `fcntl(F_SETFL, O_NONBLOCK)`, then read(2) in a loop: on EAGAIN, call
+##! `io_suspend(fd)` to park the task until the scheduler's poller thread
+##! wakes it. When the child exits it closes its stdout, read() returns 0,
+##! we break out and call pclose() for the exit code.
+##!
+##! Setting O_NONBLOCK on the parent's pipe read fd does NOT affect the
+##! child's stdout write fd — they're separate entries in the open file
+##! table. The child keeps blocking writes, which is what you want.
+##!
+##! ## Usage
+##!
+##!   import * from process
+##!
+##!   # Capture stdout as a String, yield cooperatively during read waits
+##!   var output = sh_capture_async("ls -la")
+##!
+##!   # Run a command, stream stderr line-by-line into a callback, return exit
+##!   def on_event(line: String): Void = puts("got: #{line}")
+##!   var exit = sh_stream_lines_async("quartz --progress prog.qz", on_event)
+##!
+##!   # Fire-and-forget run with only the exit code
+##!   var rc = sh_run_async("clang -o bin obj.o")
+##!
+##! All three helpers are callable from async contexts directly (the body
+##! is implicitly suspendable via `io_suspend`), or from non-async code
+##! through `var task = async sh_capture_async(cmd); var s = await task`.
+##!
+##! @since Quartz 5.28.0
+
+import * from ffi/socket
+
+extern "C" def fileno(stream: CPtr): CInt
+
+## Return the raw fd backing a popen() handle, or -1 if the handle is null.
+def _proc_fileno(handle: Int): Int
+  if handle == 0
+    return -1
+  end
+  return fileno(int_to_cptr(handle))
+end
+
+## Mark a pipe read-end non-blocking so read(2) returns EAGAIN instead of
+## blocking when no data is available. Returns 0 on success, -1 on error.
+def _proc_set_nonblocking(fd: Int): Int
+  if fd < 0
+    return -1
+  end
+  var flags = fcntl(fd, F_GETFL(), 0)
+  if flags < 0
+    return -1
+  end
+  return fcntl(fd, F_SETFL(), flags | O_NONBLOCK())
+end
+
+## Async non-blocking read. Retries indefinitely on EAGAIN by suspending
+## via `io_suspend(fd)`; the scheduler's poller thread wakes us when the
+## fd becomes readable.
+##
+## Returns:
+##   > 0  bytes read into buf
+##   = 0  EOF (child closed the pipe — usually means it has exited)
+##   < 0  read error (stash errno externally if you care)
+def _proc_read_async(fd: Int, buf: Int, max: Int): Int
+  while true
+    var n = read(fd, int_to_cptr(buf), max)
+    if n >= 0
+      return n
+    end
+    var err = get_errno()
+    if err == EAGAIN() or err == EWOULDBLOCK()
+      io_suspend(fd)
+    else
+      return -1
+    end
+  end
+  return -1
+end
+
+## Decode a POSIX waitstatus (as returned from pclose / waitpid) into an
+## exit-code-like integer: 0..255 for normal exit, 128+signal for signal
+## termination. Mirrors `shell_exit`'s decoding.
+def _proc_decode_status(raw: Int): Int
+  var signaled = band(raw, 127)
+  if signaled != 0
+    return 128 + signaled
+  end
+  return band(shr(raw, 8), 255)
+end
+
+## Run a command via /bin/sh -c, yield cooperatively while waiting for
+## its stdout to close, then reap and return the decoded exit code. The
+## command's stdout is read (and discarded) so it doesn't block on a
+## full pipe buffer; use `sh_capture_async` if you want to keep the
+## output, or redirect in the command itself (`"cmd > /dev/null"`).
+def sh_run_async(cmd: String): Int
+  var handle = pipe_open(cmd, "r")
+  if handle == 0
+    return -1
+  end
+  var fd = _proc_fileno(handle)
+  _proc_set_nonblocking(fd)
+  var buf = mem_alloc(4096)
+  var done = false
+  while not done
+    var n = _proc_read_async(fd, buf, 4096)
+    if n <= 0
+      done = true
+    end
+  end
+  var raw = pipe_close(handle)
+  return _proc_decode_status(raw)
+end
+
+## Run a command and capture its stdout as a String, yielding
+## cooperatively during pipe read waits. Returns empty string on
+## pipe_open failure.
+def sh_capture_async(cmd: String): String
+  var handle = pipe_open(cmd, "r")
+  if handle == 0
+    return ""
+  end
+  var fd = _proc_fileno(handle)
+  _proc_set_nonblocking(fd)
+  var buf = mem_alloc(4096)
+  var result = sb_new()
+  var done = false
+  while not done
+    var n = _proc_read_async(fd, buf, 4096)
+    if n > 0
+      var chunk = str_from_ptr(int_to_cptr(buf), n)
+      sb_append(result, chunk)
+    else
+      done = true
+    end
+  end
+  pipe_close(handle)
+  return sb_to_string(result)
+end
+
+## Run a command and stream its stdout line-by-line into a user-supplied
+## callback, yielding cooperatively between reads. The callback receives
+## each line WITHOUT the trailing newline. Trailing unterminated data is
+## passed through when the child exits.
+##
+## Returns the decoded child exit code, or -1 if pipe_open failed.
+def sh_stream_lines_async(cmd: String, on_line: Fn(String): Void): Int
+  var handle = pipe_open(cmd, "r")
+  if handle == 0
+    return -1
+  end
+  var fd = _proc_fileno(handle)
+  _proc_set_nonblocking(fd)
+  var buf = mem_alloc(4096)
+  var line_buf = sb_new()
+  var done = false
+  while not done
+    var n = _proc_read_async(fd, buf, 4096)
+    if n > 0
+      var i = 0
+      while i < n
+        var c = ptr_read_byte(int_to_cptr(buf + i))
+        if c == '\n'
+          on_line(sb_to_string(line_buf))
+          line_buf = sb_new()
+        else
+          sb_append_char(line_buf, c)
+        end
+        i = i + 1
+      end
+    else
+      done = true
+    end
+  end
+  # Flush any trailing unterminated line
+  var tail = sb_to_string(line_buf)
+  if str_byte_len(tail) > 0
+    on_line(tail)
+  end
+  var raw = pipe_close(handle)
+  return _proc_decode_status(raw)
+end

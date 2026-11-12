@@ -1,0 +1,126 @@
+## std/net/http_connection_handler — Per-connection lifecycle trait (D.11 Phase 1)
+##
+## The `ConnectionHandler` trait is the per-connection lifecycle surface
+## that `http_serve_supervised` (Phase 2) spawns one instance of per
+## accepted connection. Implementations own the connection's runtime
+## state (anything beyond the socket fd) and respond to four lifecycle
+## events:
+##
+##   on_open(conn_fd)               — called once, immediately after
+##                                    accept, before the keep-alive loop
+##                                    starts. Use for per-conn init
+##                                    (allocate request buffer, log,
+##                                    register against connection table).
+##
+##   handle_request(req) → Response — called for each fully-parsed
+##                                    HTTP request. Returns the Response
+##                                    to write back. Phase 2's keep-alive
+##                                    loop wraps each call in a per-request
+##                                    scope with deadline =
+##                                    min(request_timeout_ms,
+##                                        shutdown_remaining_ms).
+##
+##   on_keepalive_timeout()         — called when the connection's
+##                                    keep-alive idle timer fires before
+##                                    the next request arrives. Default
+##                                    impl is a no-op; the keep-alive
+##                                    loop closes the socket immediately
+##                                    after this returns.
+##
+##   on_terminate(reason)           — called when the per-connection
+##                                    scope unwinds — whether from
+##                                    normal close, keepalive timeout,
+##                                    shutdown cascade, or supervisor
+##                                    restart (in which case the next
+##                                    spawn calls on_open on the new
+##                                    instance, not the old). Use for
+##                                    per-conn teardown (close per-conn
+##                                    resources, decrement counters).
+##                                    Reason is one of "close" / "timeout"
+##                                    / "shutdown" / "crash:<msg>".
+##
+## Phase 1 (this file): ships the trait + a default impl that wraps a
+##   `Fn(Request): Response` for callers who don't need lifecycle hooks.
+##
+## Phase 2: ships `http_serve_supervised(config, handler_factory)` that
+##   accepts connections + spawns one `Fn(): Int` goroutine per
+##   connection — each goroutine constructs a fresh handler via the
+##   factory and drives its lifecycle (on_open → keep-alive loop →
+##   on_terminate). The goroutine is supervised by a new
+##   `http_dynamic_goroutine_sup` (Phase 2) modeled on
+##   `DynamicSupervisor`'s active-wake pattern.
+##
+## Why a trait, not a C.14 actor? See D.11 design memo Phase 1 entry
+## for the architectural rationale. Short version: HTTP connections
+## block on socket reads, not inbox messages; the actor pattern would
+## need an extra driver goroutine relaying reads to messages. Trait +
+## supervised goroutine is the cleaner shape.
+##
+## See `docs/design/D11_HTTP_SERVER_MIGRATION.md` for the full design
+## context and the phase plan.
+
+import std/net/http_server
+
+## Per-connection lifecycle trait. One instance per accepted connection.
+## All methods take `self` so impls can hold per-connection state.
+trait ConnectionHandler
+  ## Called once after accept, before the keep-alive loop begins.
+  ## conn_fd is the socket — already set non-blocking by the caller.
+  def on_open(self, conn_fd: Int): Void
+
+  ## Called per parsed request. Returns the response to send.
+  ## Implementations may throw — Phase 2's keep-alive loop catches via
+  ## the per-request scope's Throws handler and converts to 500.
+  def handle_request(self, req: http_server::Request): http_server::Response
+
+  ## Called when the keep-alive idle timer fires before the next
+  ## request arrives. Default no-op via DefaultConnectionHandler; the
+  ## keep-alive loop closes the socket immediately after this returns.
+  def on_keepalive_timeout(self): Void
+
+  ## Called once on connection teardown — close, timeout, shutdown
+  ## cascade, or crash-then-restart. Reason naming convention:
+  ##   "close"        — peer closed cleanly
+  ##   "timeout"      — keep-alive idle timeout
+  ##   "shutdown"     — server-wide shutdown cancel cascade fired
+  ##   "crash:<msg>"  — handle_request or other body threw
+  def on_terminate(self, reason: String): Void
+end
+
+## Default impl — wraps a plain `Fn(Request): Response` for callers
+## who don't need lifecycle hooks. This is what http_serve(port, handler)
+## (the high-level entry) constructs under the hood.
+##
+## Holds the handler function. Doesn't track conn_fd itself — Phase 2's
+## keep-alive loop holds the fd; this impl just relays request → response.
+struct DefaultConnectionHandler
+  handler_fn: Fn(http_server::Request): http_server::Response
+end
+
+extend DefaultConnectionHandler with ConnectionHandler
+  ## No-op — the loop doesn't need per-conn state.
+  def on_open(self, conn_fd: Int): Void
+    return
+  end
+
+  ## Delegate to the wrapped function.
+  def handle_request(self, req: http_server::Request): http_server::Response
+    return self.handler_fn(req)
+  end
+
+  ## No-op — the loop closes the fd after this returns regardless.
+  def on_keepalive_timeout(self): Void
+    return
+  end
+
+  ## No-op — nothing to clean up.
+  def on_terminate(self, reason: String): Void
+    return
+  end
+end
+
+## Wrap a `Fn(Request): Response` in a DefaultConnectionHandler.
+## Used by `http_serve(port, handler)` and similar high-level entries.
+def default_connection_handler(handler: Fn(http_server::Request): http_server::Response): DefaultConnectionHandler
+  return DefaultConnectionHandler { handler_fn: handler }
+end

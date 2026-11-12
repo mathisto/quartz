@@ -1,0 +1,258 @@
+## C.14.5 standalone smoke: restart_with_backoff.
+##
+## Pure BackoffConfig state-machine tests (no actors, no sleeps) cover the
+## exponential / cap / stable-uptime-reset / jitter-range invariants
+## deterministically via `backoff_next_delay_at(cfg, now)`. Two
+## end-to-end tests confirm wiring through `Supervisor` and
+## `DynamicSupervisor` — they only check that `current_delay_ms` advances
+## after a real restart (timing assertions on the sleep itself are too
+## flaky to land in CI).
+##
+## Standalone (not qspec) because it stresses real actor lifecycles —
+## same caveat as actor_restart_types_smoke.qz. First DynamicSupervisor
+## local in main() is literally named `dsup` per
+## feedback_dynamic_supervisor_param_name_shadow_bug.md.
+
+import * from std/actor
+import * from time
+
+extern "C" def usleep(us: Int): Int
+
+actor BWorker
+  var n: Int = 0
+  def inc(): Void
+    n += 1
+  end
+  def get(): Int = n
+end
+
+def spawn_bworker(): Int = BWorker()
+
+def main(): Int
+  # ============================================================
+  # Test 1: Disabled-sentinel BackoffConfig — all zeroes; delay = 0.
+  # The `_backoff_apply` short-circuit covers the hot path, but
+  # `backoff_next_delay_at` should also not blow up on a disabled cfg.
+  # ============================================================
+  var cfg_dis = backoff_disabled()
+  if cfg_dis.min_backoff_ms != 0
+    puts("FAIL[1]: disabled.min_backoff_ms = #{str_from_int(cfg_dis.min_backoff_ms)} (expected 0)")
+    return 1
+  end
+  var d_dis = backoff_next_delay_at(cfg_dis, 1000)
+  if d_dis != 0
+    puts("FAIL[1]: disabled.delay = #{str_from_int(d_dis)} (expected 0)")
+    return 2
+  end
+  puts("OK: backoff_disabled returns zero delay")
+
+  # ============================================================
+  # Test 2: Exponential doubling with no jitter — deterministic.
+  # min=10, max=100, factor=0. Successive deaths within < min_backoff
+  # so the stable-uptime reset never fires.
+  #   d1: base=10, next=20
+  #   d2: base=20, next=40
+  #   d3: base=40, next=80
+  #   d4: base=80, next=160 → capped to 100
+  #   d5: base=100, next=200 → capped to 100
+  # ============================================================
+  var cfg = backoff_config_new(10, 100, 0)
+  var d1 = backoff_next_delay_at(cfg, 1000)
+  var d2 = backoff_next_delay_at(cfg, 1005)
+  var d3 = backoff_next_delay_at(cfg, 1010)
+  var d4 = backoff_next_delay_at(cfg, 1015)
+  var d5 = backoff_next_delay_at(cfg, 1020)
+  if d1 != 10
+    puts("FAIL[2]: d1 = #{str_from_int(d1)} (expected 10)")
+    return 3
+  end
+  if d2 != 20
+    puts("FAIL[2]: d2 = #{str_from_int(d2)} (expected 20)")
+    return 4
+  end
+  if d3 != 40
+    puts("FAIL[2]: d3 = #{str_from_int(d3)} (expected 40)")
+    return 5
+  end
+  if d4 != 80
+    puts("FAIL[2]: d4 = #{str_from_int(d4)} (expected 80)")
+    return 6
+  end
+  if d5 != 100
+    puts("FAIL[2]: d5 = #{str_from_int(d5)} (expected 100)")
+    return 7
+  end
+  puts("OK: exponential doubling, capped at max")
+
+  # ============================================================
+  # Test 3: Stable-uptime reset — child survives > min_backoff_ms,
+  # current_delay drops back to min_backoff_ms on next death.
+  # ============================================================
+  var cfg_r = backoff_config_new(10, 100, 0)
+  var _r1 = backoff_next_delay_at(cfg_r, 1000)
+  var _r2 = backoff_next_delay_at(cfg_r, 1005)
+  var _r3 = backoff_next_delay_at(cfg_r, 1010)
+  # current_delay_ms is now 80; last_restart_ts_ms = 1010.
+  # Child survives 50ms (> min_backoff=10) before next death.
+  var d_reset = backoff_next_delay_at(cfg_r, 1060)
+  if d_reset != 10
+    puts("FAIL[3]: reset delay = #{str_from_int(d_reset)} (expected 10)")
+    return 8
+  end
+  # After the reset call, current_delay was reset to 10 then doubled to 20.
+  if cfg_r.current_delay_ms != 20
+    puts("FAIL[3]: post-reset current = #{str_from_int(cfg_r.current_delay_ms)} (expected 20)")
+    return 9
+  end
+  puts("OK: stable uptime > min_backoff resets current_delay")
+
+  # ============================================================
+  # Test 4: Jitter range — every sampled delay must fall in
+  # [base - jitter, base + jitter] where jitter = base * factor / 100.
+  # base=20, factor=50 → jitter=10 → range [10, 30].
+  # Manually reset current_delay between samples so we test a fixed
+  # base; otherwise base doubles every call and the bounds shift.
+  # ============================================================
+  rand_seed(42)
+  var cfg_j = backoff_config_new(20, 200, 50)
+  var i = 0
+  var n_samples = 50
+  var min_seen = 99999
+  var max_seen = -1
+  while i < n_samples
+    cfg_j.current_delay_ms = 20
+    cfg_j.last_restart_ts_ms = 0
+    var dj = backoff_next_delay_at(cfg_j, 0)
+    if dj < 10
+      puts("FAIL[4]: jitter sample #{str_from_int(dj)} < 10 (i=#{str_from_int(i)})")
+      return 10
+    end
+    if dj > 30
+      puts("FAIL[4]: jitter sample #{str_from_int(dj)} > 30 (i=#{str_from_int(i)})")
+      return 11
+    end
+    if dj < min_seen
+      min_seen = dj
+    end
+    if dj > max_seen
+      max_seen = dj
+    end
+    i = i + 1
+  end
+  # 50 samples should show some spread — guard against the jitter being
+  # silently dead (e.g., rand_range returning 0 every call).
+  if max_seen == min_seen
+    puts("FAIL[4]: jitter dead — all 50 samples = #{str_from_int(min_seen)}")
+    return 12
+  end
+  puts("OK: jitter samples in [10, 30] with observable spread")
+
+  # ============================================================
+  # Test 5: Default Supervisor backoff is disabled.
+  # `supervisor_with_strategy` seeds `backoff_disabled()`. Asserting
+  # `current_delay_ms == 0` confirms the disabled-sentinel default.
+  # ============================================================
+  var spawns = vec_new()
+  spawns.push(spawn_bworker)
+  var sup = supervisor_new(spawns, 5, 10000)
+  if supervisor_current_backoff_ms(sup) != 0
+    puts("FAIL[5]: default current_backoff = #{str_from_int(supervisor_current_backoff_ms(sup))} (expected 0)")
+    return 13
+  end
+  supervisor_stop(sup)
+  puts("OK: default Supervisor backoff is disabled")
+
+  # ============================================================
+  # Test 6: Default DynamicSupervisor backoff is disabled.
+  # FIRST DynamicSupervisor local in this main() — must be named `dsup`
+  # per the param-name-shadow workaround. Once that one exists, later
+  # tests can use suffixed names.
+  # ============================================================
+  var dsup = dynamic_supervisor_new(spawn_bworker, 5, 10000)
+  if dynamic_supervisor_current_backoff_ms(dsup) != 0
+    puts("FAIL[6]: default dsup current_backoff = #{str_from_int(dynamic_supervisor_current_backoff_ms(dsup))} (expected 0)")
+    return 14
+  end
+  dynamic_supervisor_stop(dsup)
+  puts("OK: default DynamicSupervisor backoff is disabled")
+
+  # ============================================================
+  # Test 7: Supervisor backoff e2e — after configuring backoff and
+  # forcing a respawn, current_delay_ms must have advanced past
+  # min_backoff_ms. Doesn't time the sleep itself (too flaky); just
+  # confirms the watcher's respawn branch invoked `_backoff_apply`.
+  # ============================================================
+  var spawns7 = vec_new()
+  spawns7.push(spawn_bworker)
+  var sup7 = supervisor_new(spawns7, 5, 10000)
+  # min=20, max=200, factor=0 — deterministic exponential.
+  supervisor_set_backoff(sup7, 20, 200, 0)
+  if supervisor_current_backoff_ms(sup7) != 20
+    puts("FAIL[7]: post-config current_backoff = #{str_from_int(supervisor_current_backoff_ms(sup7))} (expected 20)")
+    return 15
+  end
+  # Stop the child → watcher detects close, runs through backoff_apply
+  # before respawn, doubles current_delay to 40.
+  # NOTE: the watcher bumps restart_count BEFORE _backoff_apply runs the
+  # mutation + sleep. So wait on current_delay_ms directly to avoid the
+  # race window where restart_count=1 but the backoff mutation hasn't
+  # landed yet.
+  var w7 = supervisor_child(sup7, 0)
+  w7.stop()
+  var a7 = 0
+  while a7 < 200
+    if supervisor_current_backoff_ms(sup7) >= 40
+      a7 = 999
+    else
+      usleep(10000)
+      a7 = a7 + 1
+    end
+  end
+  if supervisor_restart_count(sup7) < 1
+    puts("FAIL[7]: respawn did not fire within 2s")
+    return 16
+  end
+  # After one respawn, current should be 40 (doubled from 20).
+  if supervisor_current_backoff_ms(sup7) != 40
+    puts("FAIL[7]: post-respawn current_backoff = #{str_from_int(supervisor_current_backoff_ms(sup7))} (expected 40)")
+    return 17
+  end
+  supervisor_stop(sup7)
+  puts("OK: Supervisor backoff advances current_delay across respawns")
+
+  # ============================================================
+  # Test 8: DynamicSupervisor backoff e2e — same shape, mutates the
+  # shared BackoffConfig under children_lock + releases for sleep.
+  # ============================================================
+  var dsup8 = dynamic_supervisor_new(spawn_bworker, 5, 10000)
+  dynamic_supervisor_set_backoff(dsup8, 20, 200, 0)
+  if dynamic_supervisor_current_backoff_ms(dsup8) != 20
+    puts("FAIL[8]: post-config dsup current_backoff = #{str_from_int(dynamic_supervisor_current_backoff_ms(dsup8))} (expected 20)")
+    return 18
+  end
+  var w8 = dynamic_supervisor_spawn(dsup8)
+  w8.stop()
+  # Same race-avoidance as Test 7 — wait on the mutation, not the count.
+  var a8 = 0
+  while a8 < 200
+    if dynamic_supervisor_current_backoff_ms(dsup8) >= 40
+      a8 = 999
+    else
+      usleep(10000)
+      a8 = a8 + 1
+    end
+  end
+  if dynamic_supervisor_restart_count(dsup8) < 1
+    puts("FAIL[8]: dsup respawn did not fire within 2s")
+    return 19
+  end
+  if dynamic_supervisor_current_backoff_ms(dsup8) != 40
+    puts("FAIL[8]: post-respawn dsup current_backoff = #{str_from_int(dynamic_supervisor_current_backoff_ms(dsup8))} (expected 40)")
+    return 20
+  end
+  dynamic_supervisor_stop(dsup8)
+  puts("OK: DynamicSupervisor backoff advances current_delay across respawns")
+
+  puts("ALL OK")
+  return 0
+end

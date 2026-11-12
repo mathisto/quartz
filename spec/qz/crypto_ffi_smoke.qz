@@ -1,0 +1,1029 @@
+## NET.1 Phase 1 crypto smoke test: end-to-end FFI through to HACL*.
+##
+## Exercises the crypto stdlib stack:
+##   - blake2s_256       — known-answer test from RFC 7693 (BLAKE2s-256("abc"))
+##   - chacha20poly1305  — encrypt + decrypt round-trip + tag verification
+##   - x25519_*          — public-key derivation matches RFC 7748 §6.1 vector
+##   - hkdf_*            — extract + expand against a small known vector
+##   - rng               — entropy_fill + Rng / DRBG forward-secrecy
+##   - noise (Step 1.6)  — full IKpsk2 handshake: matching transport keys,
+##                         AEAD round-trip under transport keys, MAC1 sanity,
+##                         tampered-tag and PSK-mismatch rejection
+##
+## Standalone (not qspec): qspec doesn't link extra C libraries — see
+## `quake crypto:smoke` for the full build pipeline that compiles the HACL\*
+## sources into .quartz-cache/hacl/ and links them with this binary.
+##
+## Run on success: prints one "PASS:" line per check, exits 0.
+## Run on failure: prints "FAIL: <what>" + actual vs expected, exits 1.
+
+import std/core/crypto/blake2s
+import std/core/crypto/chacha20  # hchacha20, chacha20_block, chacha20_encrypt
+import std/core/crypto/chacha20poly1305
+import std/core/crypto/curve25519
+import std/core/crypto/hkdf
+import std/core/crypto/poly1305  # poly1305_mac (Step 2.15)
+import * from std/core/crypto/secret  # Secret<Int> + secret_wrap (NET.4.1)
+import std/crypto/rng
+import std/crypto/noise
+import * from ffi/socket  # for malloc/free
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+## Convert a hex character to its integer value (0..15). Returns -1 on bad input.
+def hex_nibble(c: Int): Int
+  if c >= '0' and c <= '9'
+    return c - '0'
+  end
+  if c >= 'a' and c <= 'f'
+    return c - 'a' + 10
+  end
+  if c >= 'A' and c <= 'F'
+    return c - 'A' + 10
+  end
+  return 0 - 1
+end
+
+## Decode a hex string into a fresh malloc'd byte buffer, returning the pointer.
+## Caller frees. Length is hex_len / 2.
+def hex_decode(hex: String): Int
+  var n = str_byte_len(hex)
+  if n & 1 != 0
+    panic("hex_decode: odd-length input")
+  end
+  var bytes = n / 2
+  var p = malloc(bytes)
+  var i = 0
+  while i < bytes
+    var hi = hex_nibble(str_byte_at(hex, i * 2))
+    var lo = hex_nibble(str_byte_at(hex, i * 2 + 1))
+    ptr_write_byte(p + i, (hi * 16) + lo)
+    i += 1
+  end
+  return p
+end
+
+## Compare two byte ranges. Returns 1 if equal, 0 otherwise.
+def bytes_eq(a: Int, b: Int, len: Int): Int
+  var i = 0
+  while i < len
+    if ptr_read_byte(a + i) != ptr_read_byte(b + i)
+      return 0
+    end
+    i += 1
+  end
+  return 1
+end
+
+## Convert a byte to its 2-char hex representation.
+def byte_to_hex(b: Int): String
+  var sb = sb_new()
+  sb_append(sb, nibble_to_hex(b / 16))
+  sb_append(sb, nibble_to_hex(b & 15))
+  return sb_to_string(sb)
+end
+
+def nibble_to_hex(n: Int): String
+  if n < 10
+    return n.to_s()
+  end
+  if n == 10
+    return "a"
+  end
+  if n == 11
+    return "b"
+  end
+  if n == 12
+    return "c"
+  end
+  if n == 13
+    return "d"
+  end
+  if n == 14
+    return "e"
+  end
+  return "f"
+end
+
+## Format a byte buffer as a hex string.
+def hex_format(p: Int, len: Int): String
+  var sb = sb_new()
+  var i = 0
+  while i < len
+    sb_append(sb, byte_to_hex(ptr_read_byte(p + i)))
+    i += 1
+  end
+  return sb_to_string(sb)
+end
+
+## Copy a Quartz String into a fresh malloc'd byte buffer (null-byte free).
+## Caller frees. Length is the string's byte length.
+def str_to_bytes(s: String): Int
+  var n = str_byte_len(s)
+  var p = malloc(n)
+  var i = 0
+  while i < n
+    ptr_write_byte(p + i, str_byte_at(s, i))
+    i += 1
+  end
+  return p
+end
+
+# =============================================================================
+# Test cases
+# =============================================================================
+
+## RFC 7693 Appendix A — BLAKE2s-256("abc") known-answer test plus a few
+## block-boundary sizes (1, 64, 65, 1000) for the pure-Quartz impl.
+##
+## The pure-Quartz BLAKE2s landed in NET.1 Phase 2 Step 2.12; it was
+## cross-validated against HACL across 11 unkeyed sizes + 6 keyed shapes
+## during the swap, plus the full wg:smoke 48/48 + cross-impl wireguard-go
+## interop. Once that all passed, the HACL FFI was removed.
+def test_blake2s(): Int
+  var input = str_to_bytes("abc")
+  var output = malloc(32)
+  blake2s_256(input, 3, output)
+  var expected = hex_decode("508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982")
+  var ok_kat = bytes_eq(output, expected, 32)
+  if ok_kat == 1
+    puts("PASS: blake2s_256(\"abc\") (RFC 7693 §A)")
+  else
+    eputs("FAIL: blake2s_256(\"abc\")")
+    eputs("  expected: 508c5e8c327c14e2e1a72ba34eeb452f37458b209ed63a294d999b4c86675982")
+    eputs("  actual:   #{hex_format(output, 32)}")
+  end
+  free(input)
+  free(output)
+  free(expected)
+
+  # Empty input — blake2.net reference vector
+  var empty_out = malloc(32)
+  blake2s_256(0, 0, empty_out)
+  var empty_exp = hex_decode("69217a3079908094e11121d042354a7c1f55b6482ca1a51e1b250dfd1ed0eef9")
+  var ok_empty = bytes_eq(empty_out, empty_exp, 32)
+  if ok_empty == 1
+    puts("PASS: blake2s_256(\"\") (blake2.net reference)")
+  else
+    eputs("FAIL: blake2s_256(\"\")")
+  end
+  free(empty_out)
+  free(empty_exp)
+
+  return ok_kat & ok_empty
+end
+
+## ChaCha20 + ChaCha20-Poly1305 KAT + round-trip suite. Validates the
+## native ChaCha20 stream cipher (Step 2.14) and the native AEAD composition
+## that sits on top of it. Three RFC 8439 vectors plus three sanity checks.
+def test_chacha20poly1305(): Int
+  # ---- KAT 1: RFC 8439 §2.3.2 ChaCha20-Block ----------------------------
+  # key = 0x00..0x1f, nonce = 0x000000090000004a00000000, counter = 1
+  # Expected first 64 bytes of keystream block.
+  var k1 = hex_decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+  var n1 = hex_decode("000000090000004a00000000")
+  var blk = malloc(64)
+  chacha20_block(k1, 1, n1, blk)
+  var blk_exp = hex_decode("10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4ed2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e")
+  var ok_block = bytes_eq(blk, blk_exp, 64)
+  if ok_block == 1
+    puts("PASS: chacha20_block RFC 8439 §2.3.2 KAT")
+  else
+    eputs("FAIL: chacha20_block RFC 8439 §2.3.2")
+    eputs("  expected: #{hex_format(blk_exp, 64)}")
+    eputs("  actual:   #{hex_format(blk, 64)}")
+  end
+  free(k1)
+  free(n1)
+  free(blk)
+  free(blk_exp)
+
+  # ---- KAT 2: RFC 8439 §2.4.2 ChaCha20-Encrypt --------------------------
+  # 114-byte plaintext "Ladies and Gentlemen of the class of '99: ..."
+  var k2 = hex_decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+  var n2 = hex_decode("000000000000004a00000000")
+  var pt2 = str_to_bytes("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.")
+  var ct2 = malloc(114)
+  chacha20_encrypt(ct2, pt2, 114, k2, 1, n2)
+  var ct2_exp = hex_decode("6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf74a35be6b40b8eedf2785e42874d")
+  var ok_enc = bytes_eq(ct2, ct2_exp, 114)
+  if ok_enc == 1
+    puts("PASS: chacha20_encrypt RFC 8439 §2.4.2 KAT (114B \"Ladies...\")")
+  else
+    eputs("FAIL: chacha20_encrypt RFC 8439 §2.4.2")
+    eputs("  expected: #{hex_format(ct2_exp, 114)}")
+    eputs("  actual:   #{hex_format(ct2, 114)}")
+  end
+  # Round-trip via the same primitive (XOR-keystream is involutive).
+  var rt2 = malloc(114)
+  chacha20_encrypt(rt2, ct2, 114, k2, 1, n2)
+  var ok_rt = bytes_eq(rt2, pt2, 114)
+  if ok_rt == 1
+    puts("PASS: chacha20_encrypt symmetry (decrypt = re-encrypt)")
+  else
+    eputs("FAIL: chacha20_encrypt symmetry")
+  end
+  free(k2)
+  free(n2)
+  free(pt2)
+  free(ct2)
+  free(ct2_exp)
+  free(rt2)
+
+  # ---- KAT 3: RFC 8439 §2.8.2 full AEAD encrypt -------------------------
+  # key = 0x80..0x9f, nonce = 0x070000004041424344454647,
+  # aad = 0x50515253c0c1c2c3c4c5c6c7,
+  # plaintext = same 114-byte "Ladies..." string.
+  var k3 = hex_decode("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+  var n3 = hex_decode("070000004041424344454647")
+  var aad3 = hex_decode("50515253c0c1c2c3c4c5c6c7")
+  var pt3 = str_to_bytes("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.")
+  var ct3 = malloc(114)
+  var tag3 = malloc(16)
+  chacha20poly1305_encrypt(ct3, tag3, pt3, 114, aad3, 12, secret_wrap(k3), n3)
+  var ct3_exp = hex_decode("d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116")
+  var tag3_exp = hex_decode("1ae10b594f09e26a7e902ecbd0600691")
+  var ok_aead_ct = bytes_eq(ct3, ct3_exp, 114)
+  var ok_aead_tag = bytes_eq(tag3, tag3_exp, 16)
+  if ok_aead_ct == 1 and ok_aead_tag == 1
+    puts("PASS: chacha20poly1305 RFC 8439 §2.8.2 KAT (ct + tag)")
+  else
+    eputs("FAIL: chacha20poly1305 RFC 8439 §2.8.2")
+    if ok_aead_ct == 0
+      eputs("  ct expected: #{hex_format(ct3_exp, 114)}")
+      eputs("  ct actual:   #{hex_format(ct3, 114)}")
+    end
+    if ok_aead_tag == 0
+      eputs("  tag expected: #{hex_format(tag3_exp, 16)}")
+      eputs("  tag actual:   #{hex_format(tag3, 16)}")
+    end
+  end
+  var ok_aead_kat = ok_aead_ct & ok_aead_tag
+
+  # Decrypt the §2.8.2 vector; verify recovered plaintext matches.
+  var dec3 = malloc(114)
+  var rc3 = chacha20poly1305_decrypt(dec3, ct3, 114, aad3, 12, secret_wrap(k3), n3, tag3)
+  var ok_aead_dec = 0
+  if rc3 == 0
+    if bytes_eq(dec3, pt3, 114) == 1
+      ok_aead_dec = 1
+    end
+  end
+  if ok_aead_dec == 1
+    puts("PASS: chacha20poly1305 §2.8.2 decrypt round-trip")
+  else
+    eputs("FAIL: chacha20poly1305 §2.8.2 decrypt")
+  end
+
+  # Tamper with the tag and verify decrypt rejects (constant-time path).
+  ptr_write_byte(tag3, ptr_read_byte(tag3) ^ 1)
+  var rc_bad = chacha20poly1305_decrypt(dec3, ct3, 114, aad3, 12, secret_wrap(k3), n3, tag3)
+  var tamper_ok = 0
+  if rc_bad != 0
+    tamper_ok = 1
+  end
+  if tamper_ok == 1
+    puts("PASS: chacha20poly1305 rejects tampered tag")
+  else
+    eputs("FAIL: chacha20poly1305 accepted tampered tag (catastrophic)")
+  end
+
+  free(k3)
+  free(n3)
+  free(aad3)
+  free(pt3)
+  free(ct3)
+  free(tag3)
+  free(ct3_exp)
+  free(tag3_exp)
+  free(dec3)
+
+  return ok_block & ok_enc & ok_rt & ok_aead_kat & ok_aead_dec & tamper_ok
+end
+
+## Poly1305-MAC KAT suite. Six vectors covering RFC 8439 §2.5.2 and the
+## boundary cases the AEAD path doesn't naturally exercise (empty msg →
+## tag = s; 1B; 17B / multi-block-with-short-last; exact 32B / two full
+## blocks; 64B / four full blocks). Reference values computed against the
+## Python reference impl (`hmac` doesn't support Poly1305; we open-coded
+## the §2.5.1 algorithm in pure Python and ran each vector). Wycheproof
+## test corpus is the formal gate (Step 2.15a follow-up).
+def _poly1305_check(label: String, key_hex: String, msg_hex: String, expected_tag_hex: String): Int
+  var key = hex_decode(key_hex)
+  var n = str_byte_len(msg_hex) / 2
+  var msg_ptr = 0
+  if n > 0
+    msg_ptr = hex_decode(msg_hex)
+  end
+  var tag = malloc(16)
+  poly1305_mac(tag, msg_ptr, n, key)
+  var expected = hex_decode(expected_tag_hex)
+  var ok = bytes_eq(tag, expected, 16)
+  if ok == 1
+    puts("PASS: poly1305 #{label}")
+  else
+    eputs("FAIL: poly1305 #{label}")
+    eputs("  expected: #{expected_tag_hex}")
+    eputs("  actual:   #{hex_format(tag, 16)}")
+  end
+  free(key)
+  if n > 0
+    free(msg_ptr)
+  end
+  free(tag)
+  free(expected)
+  return ok
+end
+
+def test_poly1305(): Int
+  # Vector 1: RFC 8439 §2.5.2 — "Cryptographic Forum Research Group"
+  # 34-byte message, exercises 2 full + 1 short-last block.
+  var ok1 = _poly1305_check(
+    "RFC 8439 §2.5.2 (\"Cryptographic Forum Research Group\")",
+    "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b",
+    "43727970746f6772617068696320466f72756d2052657365617263682047726f7570",
+    "a8061dc1305136c6c22b8baf0c0127a9"
+  )
+
+  # Vector 2: empty message → tag = s = key[16..32].
+  var ok2 = _poly1305_check(
+    "vec empty msg (tag = s)",
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "",
+    "101112131415161718191a1b1c1d1e1f"
+  )
+
+  # Vector 3: 17B — multi-block + 1B short-last (tickles the short-last 0x01-pad path).
+  var ok3 = _poly1305_check(
+    "vec 17B (multi-block + 1B short-last)",
+    "1c9240a5eb55d38af333888604f6b5f0473917c1402b80099dca5cbc207075c0",
+    "48656c6c6f2c20576f726c642101020304",
+    "70510575ca1192df339ac133064f1b9c"
+  )
+
+  # Vector 4: exact 32B all-zero — exercises full-block-only path with non-zero key.
+  var ok4 = _poly1305_check(
+    "vec 32B all-zero (2 full blocks)",
+    "1c9240a5eb55d38af333888604f6b5f0473917c1402b80099dca5cbc207075c0",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "f37d7754844b8e7899b40290074d01a9"
+  )
+
+  # Vector 5: 1B msg — single short-last block, the smallest non-empty input.
+  var ok5 = _poly1305_check(
+    "vec 1B (\"a\")",
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "61",
+    "2972d5389cff62c6298df053b71a7ee1"
+  )
+
+  # Vector 6: 64B / 4 full blocks 0x00..0x3f — common length on the wire.
+  var ok6 = _poly1305_check(
+    "vec 64B (4 full blocks 00..3f)",
+    "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+    "f9d0417a47fe294b725871bbfccab63d"
+  )
+
+  return ok1 & ok2 & ok3 & ok4 & ok5 & ok6
+end
+
+## RFC 7748 single-step scalarmult helper.
+def _x25519_check(label: String, scalar_hex: String, u_hex: String, expected_hex: String): Int
+  var scalar = hex_decode(scalar_hex)
+  var u = hex_decode(u_hex)
+  var out = malloc(32)
+  # NET.4.1: scalar is freshly-decoded private key material.
+  x25519_scalarmult(out, secret_wrap(scalar), u)
+  var expected = hex_decode(expected_hex)
+  var ok = bytes_eq(out, expected, 32)
+  if ok == 1
+    puts("PASS: x25519 #{label}")
+  else
+    eputs("FAIL: x25519 #{label}")
+    eputs("  expected: #{expected_hex}")
+    eputs("  actual:   #{hex_format(out, 32)}")
+  end
+  free(scalar)
+  free(u)
+  free(out)
+  free(expected)
+  return ok
+end
+
+## RFC 7748 §5.2 + §6.1 — full Curve25519 KAT coverage.
+##  - §6.1 Alice's public key (secret_to_public against basepoint).
+##  - §6.1 Bob's public key.
+##  - §6.1 Shared-secret derivation (alice_priv * bob_pub == bob_priv * alice_pub).
+##  - §5.2 single-step vector 1 (non-basepoint u-coord, exercises full ladder
+##    on a randomly-chosen scalar).
+##  - §5.2 single-step vector 2 (likewise).
+def test_curve25519(): Int
+  # §6.1 Alice
+  var ok_alice = _x25519_check(
+    "§6.1 Alice secret_to_public",
+    "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+    "0900000000000000000000000000000000000000000000000000000000000000",
+    "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
+  )
+
+  # §6.1 Bob
+  var ok_bob = _x25519_check(
+    "§6.1 Bob secret_to_public",
+    "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb",
+    "0900000000000000000000000000000000000000000000000000000000000000",
+    "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"
+  )
+
+  # §6.1 Alice + Bob shared secret (alice_priv · bob_pub).
+  var ok_shared_ab = _x25519_check(
+    "§6.1 Alice·Bob shared secret",
+    "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+    "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+    "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
+  )
+
+  # §6.1 reverse direction (bob_priv · alice_pub) — must yield same shared secret.
+  var ok_shared_ba = _x25519_check(
+    "§6.1 Bob·Alice shared secret",
+    "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb",
+    "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+    "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
+  )
+
+  # §5.2 single-step vector 1 — random scalar against random u.
+  var ok_v1 = _x25519_check(
+    "§5.2 vec 1",
+    "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4",
+    "e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c",
+    "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552"
+  )
+
+  # §5.2 single-step vector 2.
+  var ok_v2 = _x25519_check(
+    "§5.2 vec 2",
+    "4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d",
+    "e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493",
+    "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957"
+  )
+
+  return ok_alice & ok_bob & ok_shared_ab & ok_shared_ba & ok_v1 & ok_v2
+end
+
+## Single HKDF-BLAKE2s KAT assertion. Computes PRK + OKM, checks against
+## expected hex strings. Returns 1 on full match, 0 on any mismatch (with
+## eputs diagnostics). Caller frees salt/ikm/info; helper allocates+frees
+## the prk + okm scratch.
+def _hkdf_check(
+  label: String,
+  salt: Int, salt_len: Int,
+  ikm: Int, ikm_len: Int,
+  info: Int, info_len: Int,
+  okm_len: Int,
+  expected_prk_hex: String,
+  expected_okm_hex: String
+): Int
+  var prk = malloc(32)
+  # NET.4.1 B: KAT-test helper — wrap ikm/prk at the HKDF Secret<Int>
+  # boundary so the KAT corpus exercises the strict-newtype seam.
+  hkdf_extract_blake2s(prk, salt, salt_len, secret_wrap(ikm), ikm_len)
+
+  var okm = malloc(okm_len)
+  hkdf_expand_blake2s(okm, secret_wrap(prk), info, info_len, okm_len)
+
+  var prk_exp = hex_decode(expected_prk_hex)
+  var okm_exp = hex_decode(expected_okm_hex)
+  var ok_prk = bytes_eq(prk, prk_exp, 32)
+  var ok_okm = bytes_eq(okm, okm_exp, okm_len)
+
+  var ok = ok_prk & ok_okm
+  if ok == 1
+    puts("PASS: hkdf-blake2s #{label}")
+  else
+    if ok_prk == 0
+      eputs("FAIL: hkdf-blake2s #{label} PRK")
+      eputs("  expected: #{expected_prk_hex}")
+      eputs("  actual:   #{hex_format(prk, 32)}")
+    end
+    if ok_okm == 0
+      eputs("FAIL: hkdf-blake2s #{label} OKM")
+      eputs("  expected: #{expected_okm_hex}")
+      eputs("  actual:   #{hex_format(okm, okm_len)}")
+    end
+  end
+
+  free(prk)
+  free(okm)
+  free(prk_exp)
+  free(okm_exp)
+  return ok
+end
+
+## HKDF-BLAKE2s known-answer tests. Four KAT vectors cover the major paths:
+##
+##   A. Short inputs (RFC 5869 §A.1 Test 1 inputs, BLAKE2s flavor).
+##   B. Empty salt + empty info — exercises the §2.2 "salt = HashLen zeros"
+##      default path.
+##   C. Long inputs (>B=64 bytes) — exercises the HMAC `K' = H(K)` branch
+##      and the §A.2 Test 2 OKM length (82 bytes spans 3 T(i) chunks).
+##   D. Application-style inputs reused from prior smoke (preserves the
+##      info-separation regression check via two distinct expands).
+##
+## Reference values computed offline against Python's
+## `hmac.new(salt, ikm, hashlib.blake2s)` chained per RFC 5869 §2.3. BLAKE2s
+## is not in Wycheproof's NIST-track corpus, so dense KAT coverage here +
+## live wireguard-go interop downstream supplies the validation that
+## NIST primitives get from Wycheproof in the design-memo plan.
+def test_hkdf(): Int
+  # ---- Vector A: RFC 5869 Test 1 inputs, BLAKE2s flavor -----------------
+  var ikm_a = hex_decode("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")
+  var salt_a = hex_decode("000102030405060708090a0b0c")
+  var info_a = hex_decode("f0f1f2f3f4f5f6f7f8f9")
+  var ok_a = _hkdf_check(
+    "vec A (short inputs)",
+    salt_a, 13, ikm_a, 22, info_a, 10, 42,
+    "57e878130679f9ea85900980b52df2643d043b82f290eb7dd62175dbb04cca4e",
+    "1472c31f2ff768c71b19f8803683ee3b13c1a5fb3ea59c0c3bf0d44a4a40dcd4329d9cd85bbe35a1b3e7"
+  )
+  free(ikm_a)
+  free(salt_a)
+  free(info_a)
+
+  # ---- Vector B: empty salt + empty info (zero-fill default path) -------
+  var ikm_b = hex_decode("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")
+  var ok_b = _hkdf_check(
+    "vec B (empty salt + empty info)",
+    0, 0, ikm_b, 22, 0, 0, 42,
+    "ca62915d4a8508e2c993341d6cd4221d9152f2582c263e0335c6cfab4ebf1937",
+    "064c0f0b9d9148a2e5ac797e5ef23d1b39b422f1ec37b57b45065ff2b607527143b9b9f8ba59db392663"
+  )
+  free(ikm_b)
+
+  # ---- Vector C: long inputs (>64B salt + key triggers HMAC K' = H(K)) --
+  var ikm_c = hex_decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f")
+  var salt_c = hex_decode("606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf")
+  var info_c = hex_decode("b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff")
+  var ok_c = _hkdf_check(
+    "vec C (long inputs, K' = H(K) branch, OKM spans 3 chunks)",
+    salt_c, 80, ikm_c, 80, info_c, 80, 82,
+    "67ba3b32417ecf634cce8b62ef78dd621c3d5c6f40615b7fa6759a5c54c13745",
+    "9a4d17a2953c7331fecfb23ff13578c4758b4f5ebaac2dae59dd0d2c8457e2f0075434cf17d98cadf4fcfdcd6d818a3f4f99679d3265bd9da9955b901661a974b146aa7e89fbdcc114e6de28b28b38b87c51"
+  )
+  free(ikm_c)
+  free(salt_c)
+  free(info_c)
+
+  # ---- Vector D: application-style inputs (info-separation regression) --
+  var salt_d = str_to_bytes("salt")
+  var ikm_d = str_to_bytes("input key material")
+  var info_da = str_to_bytes("application a")
+  var info_db = str_to_bytes("application b")
+  var ok_da = _hkdf_check(
+    "vec D-A (application a)",
+    salt_d, 4, ikm_d, 18, info_da, 13, 64,
+    "09f303b9c960680e085fc497cb95abd332cea76c2ec3fe5a9ce2312d4f5490c8",
+    "5a1d2f48820945f63af723b1ae91bef8fb9f195678192211ce8350376ce1b8c51ede3af6d399535780d8b2125f57e2ba3dd098e23656707aac5290d92b75ee00"
+  )
+  var ok_db = _hkdf_check(
+    "vec D-B (application b, info-separated from D-A)",
+    salt_d, 4, ikm_d, 18, info_db, 13, 64,
+    "09f303b9c960680e085fc497cb95abd332cea76c2ec3fe5a9ce2312d4f5490c8",
+    "e63bac894c553d1401b91ac5518a2211e2ef3547a329277219507567f5d814f986784f179d2c03e5190e85c21f6c20c4432c45d5a444af8ce6b469f936cd693b"
+  )
+  free(salt_d)
+  free(ikm_d)
+  free(info_da)
+  free(info_db)
+
+  return ok_a & ok_b & ok_c & ok_da & ok_db
+end
+
+## OS entropy + DRBG smoke. Sanity checks: outputs are non-zero, distinct
+## across calls, and surveying byte-frequency distribution looks roughly
+## uniform (loose bound — full statistical testing is for `dudect_check` /
+## Wycheproof). Catastrophic failures (all-zero output, identical outputs
+## across calls) are caught here.
+def test_rng(): Int
+  # 1. entropy_fill: 32 bytes, non-zero, two consecutive calls differ.
+  var a = malloc(32)
+  var b = malloc(32)
+  entropy_fill(a, 32)
+  entropy_fill(b, 32)
+
+  var any_a_nonzero = 0
+  var differ = 0
+  var i = 0
+  while i < 32
+    if ptr_read_byte(a + i) != 0
+      any_a_nonzero = 1
+    end
+    if ptr_read_byte(a + i) != ptr_read_byte(b + i)
+      differ = 1
+    end
+    i += 1
+  end
+
+  var ok_entropy = 0
+  if any_a_nonzero == 1 and differ == 1
+    ok_entropy = 1
+    puts("PASS: entropy_fill — non-zero + consecutive calls differ")
+  else
+    eputs("FAIL: entropy_fill")
+  end
+
+  # 2. rng_new + rng_fill: produces non-zero, different across two
+  # consecutive calls on the same Rng.
+  var r = rng_new()
+  var x = malloc(32)
+  var y = malloc(32)
+  rng_fill(r, x, 32)
+  rng_fill(r, y, 32)
+
+  var any_x_nonzero = 0
+  var differ_xy = 0
+  i = 0
+  while i < 32
+    if ptr_read_byte(x + i) != 0
+      any_x_nonzero = 1
+    end
+    if ptr_read_byte(x + i) != ptr_read_byte(y + i)
+      differ_xy = 1
+    end
+    i += 1
+  end
+
+  var ok_drbg_basic = 0
+  if any_x_nonzero == 1 and differ_xy == 1
+    ok_drbg_basic = 1
+    puts("PASS: rng_fill — non-zero + per-call rekey advances output")
+  else
+    eputs("FAIL: rng_fill basic")
+  end
+
+  # 3. Multi-chunk rng_fill: 16384 bytes (>8128, two HKDF-Expand chunks).
+  # Verify the result has reasonable byte-frequency distribution.
+  var big = malloc(16384)
+  rng_fill(r, big, 16384)
+  var byte_zero_count = 0
+  i = 0
+  while i < 16384
+    if ptr_read_byte(big + i) == 0
+      byte_zero_count += 1
+    end
+    i += 1
+  end
+  # Expected ~64 zero bytes (16384 / 256). With overwhelming probability
+  # we land between 30 and 110. Catastrophic failure shapes (all-zero,
+  # all-same) are caught by this band.
+  var ok_chunk = 0
+  if byte_zero_count >= 30 and byte_zero_count <= 110
+    ok_chunk = 1
+    puts("PASS: rng_fill — 16KB output has uniform-looking byte distribution (#{byte_zero_count} zeros)")
+  else
+    eputs("FAIL: rng_fill 16KB byte distribution: #{byte_zero_count} zero bytes (expected ~64, accepted 30..110)")
+  end
+
+  # 4. Independent Rngs produce independent output.
+  var r2 = rng_new()
+  var z = malloc(32)
+  rng_fill(r2, z, 32)
+  var differ_xz = 0
+  i = 0
+  while i < 32
+    if ptr_read_byte(x + i) != ptr_read_byte(z + i)
+      differ_xz = 1
+    end
+    i += 1
+  end
+  var ok_indep = 0
+  if differ_xz == 1
+    ok_indep = 1
+    puts("PASS: rng_new — independent Rng instances produce different output")
+  else
+    eputs("FAIL: rng_new independent — two Rngs gave identical 32 bytes")
+  end
+
+  rng_destroy(r)
+  rng_destroy(r2)
+  free(a)
+  free(b)
+  free(x)
+  free(y)
+  free(big)
+  free(z)
+  return ok_entropy & ok_drbg_basic & ok_chunk & ok_indep
+end
+
+# =============================================================================
+# Step 2.8 — HChaCha20 + XChaCha20-Poly1305 (pure-Quartz HChaCha20 + HACL AEAD)
+# =============================================================================
+
+## HChaCha20 KAT — draft-irtf-cfrg-xchacha-03 §A.2.1.
+## key   = 00..1f
+## input = 000000090000004a0000000031415927
+## want  = 82413b4227b27bfed30e42508a877d73a0f9e4d58a74a853c12ec41326d3ecdc
+def test_hchacha20(): Int
+  var key = hex_decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+  var input = hex_decode("000000090000004a0000000031415927")
+  var subkey = malloc(32)
+  hchacha20(key, input, subkey)
+  var expected = hex_decode("82413b4227b27bfed30e42508a877d73a0f9e4d58a74a853c12ec41326d3ecdc")
+  var ok = bytes_eq(subkey, expected, 32)
+  if ok == 1
+    puts("PASS: hchacha20 (draft-xchacha §A.2.1 KAT)")
+  else
+    eputs("FAIL: hchacha20")
+    eputs("  expected: 82413b4227b27bfed30e42508a877d73a0f9e4d58a74a853c12ec41326d3ecdc")
+    eputs("  actual:   #{hex_format(subkey, 32)}")
+  end
+  free(key)
+  free(input)
+  free(subkey)
+  free(expected)
+  return ok
+end
+
+## XChaCha20-Poly1305 KAT — draft-irtf-cfrg-xchacha-03 §A.3.1.
+## Encrypt: assert ct + tag match the test vector.
+## Decrypt: assert recovered plaintext + AEAD tag verify under matching aad,
+##          and that flipping any tag byte causes decrypt to reject.
+def test_xchacha20poly1305(): Int
+  # 114-byte plaintext: "Ladies and Gentlemen of the class of '99: If I could
+  # offer you only one tip for the future, sunscreen would be it."
+  var pt_hex = "4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66202739393a204966204920636f756c64206f6666657220796f75206f6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73637265656e20776f756c642062652069742e"
+  var pt = hex_decode(pt_hex)
+  var aad = hex_decode("50515253c0c1c2c3c4c5c6c7")
+  var key = hex_decode("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+  var nonce = hex_decode("404142434445464748494a4b4c4d4e4f5051525354555657")
+  var ct = malloc(114)
+  var tag = malloc(16)
+  xchacha20poly1305_encrypt(ct, tag, pt, 114, aad, 12, secret_wrap(key), nonce)
+
+  var expect_ct = hex_decode("bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b4522f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff921f9664c97637da9768812f615c68b13b52e")
+  var expect_tag = hex_decode("c0875924c1c7987947deafd8780acf49")
+
+  var ok_ct = bytes_eq(ct, expect_ct, 114)
+  var ok_tag = bytes_eq(tag, expect_tag, 16)
+  var ok_kat = 0
+  if ok_ct == 1 and ok_tag == 1
+    ok_kat = 1
+    puts("PASS: xchacha20poly1305 encrypt KAT (draft-xchacha §A.3.1)")
+  else
+    eputs("FAIL: xchacha20poly1305 KAT (ct_eq=#{ok_ct} tag_eq=#{ok_tag})")
+  end
+
+  # Decrypt round-trip.
+  var dec = malloc(114)
+  var rc = xchacha20poly1305_decrypt(dec, ct, 114, aad, 12, secret_wrap(key), nonce, tag)
+  var ok_rt = 0
+  if rc == 0 and bytes_eq(dec, pt, 114) == 1
+    ok_rt = 1
+    puts("PASS: xchacha20poly1305 decrypt round-trip")
+  else
+    eputs("FAIL: xchacha20poly1305 round-trip rc=#{rc}")
+  end
+
+  # Tamper tag → reject.
+  ptr_write_byte(tag, ptr_read_byte(tag) ^ 1)
+  var rc_bad = xchacha20poly1305_decrypt(dec, ct, 114, aad, 12, secret_wrap(key), nonce, tag)
+  var ok_tamper = 0
+  if rc_bad != 0
+    ok_tamper = 1
+    puts("PASS: xchacha20poly1305 rejects tampered tag")
+  else
+    eputs("FAIL: xchacha20poly1305 accepted tampered tag (catastrophic)")
+  end
+
+  free(pt)
+  free(aad)
+  free(key)
+  free(nonce)
+  free(ct)
+  free(tag)
+  free(dec)
+  free(expect_ct)
+  free(expect_tag)
+  return ok_kat & ok_rt & ok_tamper
+end
+
+# =============================================================================
+# Step 1.6 — Noise IKpsk2 handshake
+# =============================================================================
+
+## Run a full Noise IKpsk2 handshake end-to-end and verify both sides derive
+## matching, swapped (t_send, t_recv) pairs. Then exercise an AEAD round-trip
+## under the transport keys, check noise_wg_mac1 against a self-consistency
+## reference, and verify negative paths (tampered msg.static, PSK mismatch).
+def test_noise(): Int
+  var rng = rng_new()
+
+  # Fresh static keypairs for both sides.
+  var i_priv = malloc(32)
+  var i_pub = malloc(32)
+  var r_priv = malloc(32)
+  var r_pub = malloc(32)
+  rng_fill(rng, i_priv, 32)
+  rng_fill(rng, r_priv, 32)
+  x25519_secret_to_public(i_pub, secret_wrap(i_priv))
+  x25519_secret_to_public(r_pub, secret_wrap(r_priv))
+
+  # PSK shared by both ends.
+  var psk = malloc(32)
+  var i = 0
+  while i < 32
+    ptr_write_byte(psk + i, 0x5A)
+    i += 1
+  end
+
+  # 12-byte TAI64N timestamp (zeros — not testing replay logic here).
+  var ts_in = malloc(12)
+  memset(ts_in, 0, 12)
+
+  # Initiator: state + 116-byte initiation body.
+  var init_state = noise_handshake_new()
+  var msg_init = malloc(116)
+  var rc = noise_create_initiation(init_state, rng, secret_wrap(i_priv), i_pub, r_pub, 0xCAFEBABE, ts_in, msg_init)
+  if rc != 0
+    eputs("FAIL: noise_create_initiation rc=#{rc}")
+    return 0
+  end
+
+  # Responder: state + parse initiation.
+  var resp_state = noise_handshake_new()
+  var seen_i_pub = malloc(32)
+  var seen_ts = malloc(12)
+  rc = noise_consume_initiation(resp_state, secret_wrap(r_priv), r_pub, msg_init, seen_i_pub, seen_ts)
+  if rc != 0
+    eputs("FAIL: noise_consume_initiation rc=#{rc}")
+    return 0
+  end
+  if bytes_eq(seen_i_pub, i_pub, 32) != 1
+    eputs("FAIL: responder decoded wrong initiator pubkey from msg.static")
+    return 0
+  end
+  if bytes_eq(seen_ts, ts_in, 12) != 1
+    eputs("FAIL: responder decoded wrong timestamp from msg.timestamp")
+    return 0
+  end
+
+  # Responder: 60-byte response body.
+  var msg_resp = malloc(60)
+  rc = noise_create_response(resp_state, rng, seen_i_pub, secret_wrap(psk), 0xDEADBEEF, 0xCAFEBABE, msg_resp)
+  if rc != 0
+    eputs("FAIL: noise_create_response rc=#{rc}")
+    return 0
+  end
+
+  # Initiator: parse response.
+  rc = noise_consume_response(init_state, secret_wrap(i_priv), secret_wrap(psk), msg_resp)
+  if rc != 0
+    eputs("FAIL: noise_consume_response rc=#{rc}")
+    return 0
+  end
+
+  # Split — derive transport keys on both sides.
+  var i_send = malloc(32)
+  var i_recv = malloc(32)
+  var r_send = malloc(32)
+  var r_recv = malloc(32)
+  noise_split(init_state, 1, i_send, i_recv)
+  noise_split(resp_state, 0, r_send, r_recv)
+
+  # Verify swapped match: i_send == r_recv AND i_recv == r_send.
+  var ok_split = 0
+  if bytes_eq(i_send, r_recv, 32) == 1 and bytes_eq(i_recv, r_send, 32) == 1
+    ok_split = 1
+    puts("PASS: noise — handshake derives matching swapped transport keys")
+  else
+    eputs("FAIL: split — initiator/responder transport keys do not match")
+  end
+
+  # AEAD round-trip under transport keys: initiator encrypts under i_send,
+  # responder decrypts under r_recv (== i_send).
+  var pt = malloc(64)
+  var idx = 0
+  while idx < 64
+    ptr_write_byte(pt + idx, idx)
+    idx += 1
+  end
+  var ct = malloc(64)
+  var tag = malloc(16)
+  var dec = malloc(64)
+  var nonce = malloc(12)
+  memset(nonce, 0, 12)
+  chacha20poly1305_encrypt(ct, tag, pt, 64, 0, 0, secret_wrap(i_send), nonce)
+  var dec_rc = chacha20poly1305_decrypt(dec, ct, 64, 0, 0, secret_wrap(r_recv), nonce, tag)
+  var ok_aead = 0
+  if dec_rc == 0 and bytes_eq(pt, dec, 64) == 1
+    ok_aead = 1
+    puts("PASS: noise — transport-key AEAD round-trip recovers plaintext")
+  else
+    eputs("FAIL: transport-key AEAD round-trip (rc=#{dec_rc})")
+  end
+
+  # MAC1 self-consistency: same key+message yields the same 16 bytes twice;
+  # different peer pubkeys yield different macs.
+  var mac1_a = malloc(16)
+  var mac1_b = malloc(16)
+  var mac1_c = malloc(16)
+  noise_wg_mac1(mac1_a, msg_init, 116, r_pub)
+  noise_wg_mac1(mac1_b, msg_init, 116, r_pub)
+  noise_wg_mac1(mac1_c, msg_init, 116, i_pub)
+  var ok_mac1 = 0
+  if bytes_eq(mac1_a, mac1_b, 16) == 1 and bytes_eq(mac1_a, mac1_c, 16) == 0
+    ok_mac1 = 1
+    puts("PASS: noise_wg_mac1 — deterministic + key-separated")
+  else
+    eputs("FAIL: noise_wg_mac1 self-consistency")
+  end
+
+  # Negative path: tamper with msg.static ciphertext → responder rejects.
+  var tampered = malloc(116)
+  memcpy(tampered, msg_init, 116)
+  ptr_write_byte(tampered + 40, ptr_read_byte(tampered + 40) ^ 1)
+  var bad_state = noise_handshake_new()
+  var bad_pub = malloc(32)
+  var bad_ts = malloc(12)
+  var bad_rc = noise_consume_initiation(bad_state, secret_wrap(r_priv), r_pub, tampered, bad_pub, bad_ts)
+  noise_handshake_destroy(bad_state)
+  var ok_tamper = 0
+  if bad_rc != 0
+    ok_tamper = 1
+    puts("PASS: noise — responder rejects tampered msg.static")
+  else
+    eputs("FAIL: responder accepted tampered msg.static (catastrophic)")
+  end
+
+  # Negative path: PSK mismatch → initiator's consume_response fails the
+  # msg.empty AEAD check (chain key diverges between sides).
+  var psk_alt = malloc(32)
+  memset(psk_alt, 0xA5, 32)
+
+  var alt_init_state = noise_handshake_new()
+  var alt_resp_state = noise_handshake_new()
+  var alt_msg_init = malloc(116)
+  var alt_msg_resp = malloc(60)
+  var alt_seen_i_pub = malloc(32)
+  var alt_seen_ts = malloc(12)
+  var alt_ts = malloc(12)
+  memset(alt_ts, 0, 12)
+
+  var ar1 = noise_create_initiation(alt_init_state, rng, secret_wrap(i_priv), i_pub, r_pub, 0x11111111, alt_ts, alt_msg_init)
+  var ar2 = noise_consume_initiation(alt_resp_state, secret_wrap(r_priv), r_pub, alt_msg_init, alt_seen_i_pub, alt_seen_ts)
+  # Responder uses psk_alt; initiator uses psk.
+  var ar3 = noise_create_response(alt_resp_state, rng, alt_seen_i_pub, secret_wrap(psk_alt), 0x22222222, 0x11111111, alt_msg_resp)
+  var ar4 = noise_consume_response(alt_init_state, secret_wrap(i_priv), secret_wrap(psk), alt_msg_resp)
+
+  var ok_psk = 0
+  if ar1 == 0 and ar2 == 0 and ar3 == 0 and ar4 != 0
+    ok_psk = 1
+    puts("PASS: noise — PSK mismatch causes msg.empty AEAD rejection")
+  else
+    eputs("FAIL: PSK mismatch path: ar1=#{ar1} ar2=#{ar2} ar3=#{ar3} ar4=#{ar4}")
+  end
+
+  # Cleanup
+  noise_handshake_destroy(init_state)
+  noise_handshake_destroy(resp_state)
+  noise_handshake_destroy(alt_init_state)
+  noise_handshake_destroy(alt_resp_state)
+  rng_destroy(rng)
+  free(i_priv); free(i_pub); free(r_priv); free(r_pub)
+  free(psk); free(psk_alt)
+  free(ts_in); free(alt_ts)
+  free(msg_init); free(msg_resp); free(tampered)
+  free(seen_i_pub); free(seen_ts); free(bad_pub); free(bad_ts)
+  free(alt_msg_init); free(alt_msg_resp); free(alt_seen_i_pub); free(alt_seen_ts)
+  free(i_send); free(i_recv); free(r_send); free(r_recv)
+  free(pt); free(ct); free(tag); free(dec); free(nonce)
+  free(mac1_a); free(mac1_b); free(mac1_c)
+
+  return ok_split & ok_aead & ok_mac1 & ok_tamper & ok_psk
+end
+
+# =============================================================================
+# Entry
+# =============================================================================
+
+def main(): Int
+  puts("=== NET.1 Phase 1 crypto FFI smoke test ===")
+
+  var blake_ok = test_blake2s()
+  var aead_ok = test_chacha20poly1305()
+  var poly_ok = test_poly1305()
+  var curve_ok = test_curve25519()
+  var hkdf_ok = test_hkdf()
+  var rng_ok = test_rng()
+  var hchacha_ok = test_hchacha20()
+  var xaead_ok = test_xchacha20poly1305()
+  var noise_ok = test_noise()
+
+  if blake_ok == 1 and aead_ok == 1 and poly_ok == 1 and curve_ok == 1 and hkdf_ok == 1 and rng_ok == 1 and hchacha_ok == 1 and xaead_ok == 1 and noise_ok == 1
+    puts("=== ALL GREEN ===")
+    return 0
+  end
+  eputs("=== FAILURES ===")
+  return 1
+end

@@ -1,0 +1,1040 @@
+## std/actor — BEAM-in-a-box stdlib API (C.14 Phase 1–2)
+##
+## Builds on the language-level `actor X ... end` keyword. Provides
+## `Supervisor` for restart-on-death semantics across a static set of
+## actors. Phase 1 shipped static one_for_one + permanent restart;
+## Phase 2 (this file) adds one_for_all + rest_for_one strategies and
+## an active-wake retrofit on a new "channel close event" waker kind
+## (`@inbox | 2`, see compiler change in `cg_intrinsic_conc_channel.qz`).
+## C.14.3b added DynamicSupervisor (spawn-on-demand). C.14.4 added
+## Permanent | Transient | Temporary restart types + PreRestart hook.
+## C.14.5 (this file) adds exponential restart backoff with jitter.
+## C.14.6+ is the docs sweep. See `docs/design/ACTOR_MODEL.md` for the
+## full design.
+##
+## Usage (one_for_one, the default):
+##
+##   actor Counter
+##     var count: Int = 0
+##     def get(): Int = count
+##     def inc(): Void
+##       count += 1
+##     end
+##   end
+##
+##   def spawn_counter(): Int = Counter()
+##
+##   var spawns = vec_new<Fn(): Int>()
+##   spawns.push(spawn_counter)
+##   spawns.push(spawn_counter)
+##
+##   var sup = supervisor_new(spawns, 5, 10000)
+##   var c0 = supervisor_child(sup, 0)
+##   c0.inc()
+##   supervisor_stop(sup)
+##
+## Usage (one_for_all / rest_for_one — explicit strategy):
+##
+##   var sup = supervisor_with_strategy(spawns, SUPERVISOR_ONE_FOR_ALL,
+##                                      5, 10000)
+##   var sup2 = supervisor_with_strategy(spawns, SUPERVISOR_REST_FOR_ONE,
+##                                       5, 10000)
+##
+## Death detection is via `channel_closed(inbox)`. An actor's inbox
+## closes on explicit `.stop()` or link-cascade stop. Per-handler panics
+## do NOT close the inbox — the scheduler's actor-frame recovery
+## (`frame[3] == -999` sentinel) drops the offending reply and continues.
+## C.14.7 adds `actor_die(reason)` — closes the running actor's own inbox
+## WITHOUT marking it clean, so the supervisor sees EXIT_CRASH and respawns
+## under Permanent/Transient policy.
+
+import * from time
+
+const SUPERVISOR_DEFAULT_MAX_RESTARTS = 1
+const SUPERVISOR_DEFAULT_PERIOD_MS = 5000
+
+## Strategy constants. Match the routing matrix from
+## `docs/design/ACTOR_MODEL.md` Phase 2.
+const SUPERVISOR_ONE_FOR_ONE = 0
+const SUPERVISOR_ONE_FOR_ALL = 1
+const SUPERVISOR_REST_FOR_ONE = 2
+
+## Watcher park budget (ms). Falls back to a chunked sleep when no
+## active-wake fires (defensive — close-event notify_all should wake
+## us within ~us, so this is mostly a long-poll safety net).
+const SUPERVISOR_PARK_MS = 50
+
+## Close-event kind bit (C.14.2). Channel handles are 16-byte aligned
+## so low 3 bits are free. Encoding (matches C.13.6):
+##   `@ch`     — recv-direction waiter (kind=0)
+##   `@ch | 1` — send-direction waiter (kind=1)
+##   `@ch | 2` — close-event-only watcher (kind=2)
+## `channel_close` fires `notify_all` on all three keys.
+const CLOSE_EVENT_BIT = 2
+
+## Restart-type constants (C.14.4). Mirrors Erlang/OTP `child_spec.restart`
+## semantics. Per-child for `Supervisor`; per-supervisor for `DynamicSupervisor`
+## (Elixir DynamicSupervisor exposes this only at the supervisor level —
+## every dynamic child gets the same policy).
+##
+##   `RESTART_PERMANENT` (0, default) — always restart, regardless of how
+##                                       the actor died. The Phase 1 behavior.
+##   `RESTART_TRANSIENT` (1)          — restart only if the actor died with
+##                                       an abnormal exit reason. Clean stops
+##                                       (`.stop()` or cascade from a linked
+##                                       actor's clean shutdown) skip restart.
+##   `RESTART_TEMPORARY` (2)          — never restart. One-shot worker pattern.
+##
+## How "clean vs crash" is determined: the auto-generated actor poll loop
+## calls `actor_mark_clean(inbox)` on its stop / cascade-stop paths before
+## `channel_close`. The supervisor watcher's death-detection consults this
+## via `actor_check_clean(inbox)` — present → clean, absent → crash. Any
+## externally-driven close (e.g., a future `actor_die()` or someone calling
+## `channel_close` on an inbox directly) leaves the entry absent → CRASH.
+const RESTART_PERMANENT = 0
+const RESTART_TRANSIENT = 1
+const RESTART_TEMPORARY = 2
+
+## Exit-reason constants returned by the supervisor's internal close-detect
+## helper. Surfaces in case a future API wants to expose the reason
+## directly (e.g. telemetry). Mirrors the runtime sidecar's binary
+## semantics — clean (1) vs unmarked-default (0).
+const EXIT_NORMAL = 1
+const EXIT_CRASH = 0
+
+## Tombstone written into an inbox slot once a Transient/Temporary child
+## has been "permanently gone" — the supervisor must NOT respawn it AND
+## must not re-detect its close on subsequent watcher iterations. Picked
+## as -1 because actor inboxes are heap pointers (always > 0). `channel_closed`
+## is never called on this value; the watcher's per-slot guard short-circuits.
+const ACTOR_TERMINATED_SENTINEL = -1
+
+## No-op default for the PreRestart hook. Used when a caller doesn't
+## supply one — keeps the field non-nullable so the watcher can always
+## invoke it without a sentinel check on the hot path.
+def actor_no_pre_restart(_dead_inbox: Int): Void
+  return
+end
+
+## C.14.7 — Erlang-style self-escalation. Closes the running actor's own
+## inbox WITHOUT marking it clean, so the supervisor's death-detection
+## consults `actor_check_clean` → returns 0 → EXIT_CRASH. Permanent
+## children always respawn; Transient children respawn (this is what
+## makes Transient ≠ Permanent — without `actor_die`, no Quartz code
+## path produces EXIT_CRASH); Temporary children stay dead.
+##
+## The current handler completes normally; the next iteration of the
+## auto-generated poll loop observes the closed inbox and short-circuits
+## to `crash_exit_block` (compiler-emitted) which notifies links/monitors
+## with crash tags and frees state. Buffered messages are drained;
+## pending stop-message replies are sent so callers don't deadlock.
+##
+## `reason` is reserved for future use (Erlang's `exit(self(), Reason)`
+## carries an arbitrary term). Today only the binary clean/crash split
+## is observable via `actor_check_clean`. Pass `0` until the multi-reason
+## API lands.
+##
+## Calling outside an actor context (e.g. from a non-actor task) is a
+## no-op: `actor_self_inbox()` returns 0 (the TLS default) and we skip
+## the channel_close (which would null-deref the handle).
+def actor_die(_reason: Int): Void
+  var inbox = actor_self_inbox()
+  if inbox != 0
+    channel_close(inbox)
+  end
+end
+
+## BackoffConfig (C.14.5) — exponential restart backoff with jitter.
+##
+## Akka's `(min_backoff, max_backoff, random_factor)` shape, adapted to
+## integer math: `random_factor_pct` is in percent (0..100) where 0 means
+## no jitter and 100 means ±100% (delay range = [0, 2*base]).
+##
+## State machine: `current_delay_ms` starts at `min_backoff_ms`. Each call
+## to `backoff_next_delay` returns the current delay (with jitter applied)
+## and doubles `current_delay_ms` for the next call (capped at
+## `max_backoff_ms`). If the child survived for more than `min_backoff_ms`
+## between deaths, `current_delay_ms` resets to `min_backoff_ms` — the
+## new death is "fresh," not part of the same crash storm.
+##
+## Disabled (the default) when `min_backoff_ms == 0`. `_backoff_apply`
+## short-circuits in that case, preserving Phase 1 zero-overhead semantics.
+##
+## Pairs with intensity escalation, not replaces. Backoff spaces deaths
+## out; intensity remains the circuit-breaker for truly relentless
+## failures (a child crashing in < min_backoff_ms repeatedly will still
+## fill the intensity window).
+struct BackoffConfig
+  min_backoff_ms: Int
+  max_backoff_ms: Int
+  random_factor_pct: Int
+  current_delay_ms: Int
+  last_restart_ts_ms: Int
+end
+
+## Construct a BackoffConfig. `current_delay_ms` is seeded to
+## `min_backoff_ms`; `last_restart_ts_ms` starts at 0 (sentinel for
+## "no respawn yet" — the first call won't reset the delay).
+def backoff_config_new(min_backoff_ms: Int, max_backoff_ms: Int,
+                       random_factor_pct: Int): BackoffConfig
+  return BackoffConfig {
+    min_backoff_ms: min_backoff_ms,
+    max_backoff_ms: max_backoff_ms,
+    random_factor_pct: random_factor_pct,
+    current_delay_ms: min_backoff_ms,
+    last_restart_ts_ms: 0,
+  }
+end
+
+## Disabled-sentinel BackoffConfig. Default for both `Supervisor` and
+## `DynamicSupervisor`. `_backoff_apply` returns immediately when
+## `min_backoff_ms == 0`, so no sched_sleep, no rand_range, no time
+## syscall on the hot path.
+def backoff_disabled(): BackoffConfig
+  return BackoffConfig {
+    min_backoff_ms: 0,
+    max_backoff_ms: 0,
+    random_factor_pct: 0,
+    current_delay_ms: 0,
+    last_restart_ts_ms: 0,
+  }
+end
+
+## Compute the next sleep delay and advance state, taking `now` as an
+## explicit argument so this is testable without sleeping. Mutates cfg:
+##   1. If the child survived > min_backoff_ms (last_restart_ts_ms > 0
+##      AND now - last_restart_ts_ms > min_backoff_ms): reset
+##      current_delay_ms to min_backoff_ms.
+##   2. Apply jitter: delay = base + rand_range(-jitter, +jitter+1) where
+##      jitter = base * random_factor_pct / 100. Clamped to >= 0.
+##   3. Double current_delay_ms for next call (capped at max_backoff_ms).
+##   4. Update last_restart_ts_ms = now.
+##
+## Returns the (jittered) delay to sleep before the respawn fires.
+def backoff_next_delay_at(cfg: BackoffConfig, now: Int): Int
+  if cfg.last_restart_ts_ms > 0 and now - cfg.last_restart_ts_ms > cfg.min_backoff_ms
+    cfg.current_delay_ms = cfg.min_backoff_ms
+  end
+  var base = cfg.current_delay_ms
+  var jittered = base
+  if cfg.random_factor_pct > 0 and base > 0
+    var jitter_range = base * cfg.random_factor_pct / 100
+    if jitter_range > 0
+      # rand_range(lo, hi) returns Int in [lo, hi). Symmetric jitter.
+      var offset = rand_range(0 - jitter_range, jitter_range + 1)
+      jittered = base + offset
+      if jittered < 0
+        jittered = 0
+      end
+    end
+  end
+  var next = base * 2
+  if next > cfg.max_backoff_ms
+    next = cfg.max_backoff_ms
+  end
+  cfg.current_delay_ms = next
+  cfg.last_restart_ts_ms = now
+  return jittered
+end
+
+## Convenience wrapper around `backoff_next_delay_at` that captures
+## `now = time_epoch_ms()` at call time.
+def backoff_next_delay(cfg: BackoffConfig): Int
+  return backoff_next_delay_at(cfg, time_epoch_ms())
+end
+
+## Apply backoff before a respawn. No-op when disabled (the default).
+## Sleeps via `sched_sleep`. Caller MUST NOT hold a contended lock around
+## this — for `DynamicSupervisor`, the lock is released around the sleep.
+def _backoff_apply(cfg: BackoffConfig): Void
+  if cfg.min_backoff_ms == 0
+    return
+  end
+  var delay = backoff_next_delay(cfg)
+  if delay > 0
+    sched_sleep(delay)
+  end
+end
+
+## Map `(restart_type, exit_reason)` to "should respawn?". Returns 1 to
+## respawn the child, 0 to skip. Permanent always respawns; Temporary
+## never respawns; Transient respawns iff exit was a crash.
+def _should_respawn(restart_type: Int, exit_reason: Int): Int
+  if restart_type == RESTART_TEMPORARY
+    return 0
+  end
+  if restart_type == RESTART_TRANSIENT
+    if exit_reason == EXIT_NORMAL
+      return 0
+    end
+    return 1
+  end
+  return 1
+end
+
+## Supervisor over a static set of actor spawn closures.
+##
+## Watcher goroutine sleeps until a child's inbox closes (active-wake
+## via `@inbox | 2` close-event waker, registered up-front for each
+## child). On wake, identifies the dead child and applies the configured
+## strategy:
+##
+##   `SUPERVISOR_ONE_FOR_ONE`  — respawn only the dead child
+##   `SUPERVISOR_ONE_FOR_ALL`  — stop all surviving children + respawn all
+##   `SUPERVISOR_REST_FOR_ONE` — stop children at index >= dead + respawn them
+##
+## In all strategies, `inboxes[i]` is updated in place; callers fetch the
+## latest handle via `supervisor_child(sup, i)`.
+##
+## Intensity escalation: if more than `max_restarts` deaths occur within
+## a `period_ms`-wide rolling window, the watcher sets `escalated=1` and
+## exits; `supervisor_alive(sup)` returns 0. The window resets when
+## `period_ms` elapses without an excess.
+##
+## Active-wake retrofit (C.14.2): registers `(@inbox | 2, watcher_frame)`
+## with the @__qz_waiters side-table for every child. `channel_close`
+## (compiler intrinsic) calls `notify_all(@ch | 2)` which `sched_wake`s
+## us. Cancel observation drops from ~SUPERVISOR_PARK_MS (yield-cadence)
+## to ~us (sched_wake latency). The `sched_sleep` chunk is still present
+## as a defensive long-poll — close-event entries are one-shot (notify_all
+## swap-removes after firing), so we need to re-arm post-restart.
+struct Supervisor
+  spawn_fns: Vec<Fn(): Int>
+  inboxes: Vec<Int>
+  ## C.14.4: per-child restart type. Size matches `inboxes`. Default-filled
+  ## with `RESTART_PERMANENT` by `supervisor_with_strategy` for Phase 1
+  ## compatibility; caller flips via `supervisor_set_restart_type`.
+  restart_types: Vec<Int>
+  strategy: Int
+  max_restarts: Int
+  period_ms: Int
+  restart_count: Int
+  window_start_ms: Int
+  done: Int
+  escalated: Int
+  watcher: Int
+  ## C.14.4: hook fired before a child respawn, given the dead inbox handle.
+  ## Caller binds Scoped (B.8) cleanup in the closure body. Defaults to
+  ## `actor_no_pre_restart` (no-op) so the field is always callable.
+  on_pre_restart: Fn(Int): Void
+  ## C.14.4: counters surfaced for telemetry / spec assertions.
+  ##   - skipped_restart_count: incremented whenever Transient saw clean or
+  ##     Temporary saw any death (i.e., a death NOT followed by respawn).
+  ##   - pre_restart_count: incremented after each on_pre_restart invocation.
+  skipped_restart_count: Int
+  pre_restart_count: Int
+  ## C.14.5: restart backoff config. Default `backoff_disabled()` —
+  ## `_backoff_apply` short-circuits on min_backoff_ms == 0, so the
+  ## Phase 1 zero-overhead path is preserved. Caller flips on via
+  ## `supervisor_set_backoff(sup, min, max, factor_pct)`.
+  backoff: BackoffConfig
+end
+
+## Register a close-event waker for every child inbox. Called once at
+## watcher entry, and re-armed for each freshly respawned inbox.
+def _supervisor_register_all(sup: Supervisor, frame: Int): Void
+  var i = 0
+  var n = sup.inboxes.size
+  while i < n
+    waiter_register(sup.inboxes[i] | CLOSE_EVENT_BIT, frame)
+    i = i + 1
+  end
+end
+
+## Unregister waker entries for any inboxes the watcher hasn't yet seen
+## consumed (notify_all swap-removes on fire, so we only need to clean
+## up entries for still-open inboxes on shutdown).
+def _supervisor_unregister_all(sup: Supervisor, frame: Int): Void
+  var i = 0
+  var n = sup.inboxes.size
+  while i < n
+    var ib = sup.inboxes[i]
+    if ib != ACTOR_TERMINATED_SENTINEL
+      waiter_unregister(ib | CLOSE_EVENT_BIT, frame)
+    end
+    i = i + 1
+  end
+end
+
+## Send the canonical actor stop message to the inbox at `idx` and
+## re-spawn into the same slot. Re-registers the close-event waker on
+## the new inbox. Used by one_for_all + rest_for_one cascade-restart
+## paths. Skips closed inboxes (the death already counted in the
+## driving event).
+def _supervisor_cascade_restart(sup: Supervisor, idx: Int, frame: Int): Void
+  var inbox = sup.inboxes[idx]
+  # C.14.4: Transient/Temporary tombstones don't participate in cascade
+  # restart — a "gone" child stays gone even under one_for_all.
+  if inbox == ACTOR_TERMINATED_SENTINEL
+    return
+  end
+  if channel_closed(inbox) == 0
+    _supervisor_stop_child(inbox)
+    # Wait briefly for the actor to ack the stop + close its inbox.
+    var attempts = 0
+    while channel_closed(inbox) == 0 and attempts < 100
+      sched_yield()
+      attempts = attempts + 1
+    end
+  end
+  var spawn_fn = sup.spawn_fns[idx]
+  var fresh = spawn_fn()
+  sup.inboxes[idx] = fresh
+  waiter_register(fresh | CLOSE_EVENT_BIT, frame)
+end
+
+## Watcher loop body — exposed as a top-level def so the spawn lambda
+## stays minimal (`go (-> _supervisor_watcher(sup))`).
+##
+## Strategy dispatch on first detected death per iteration. Active-wake
+## via close-event waker keys; long-poll fallback every SUPERVISOR_PARK_MS
+## handles the case where the close fires before the watcher registers
+## (the close-event notify_all then has no waiters; we discover via
+## sleep+recheck).
+def _supervisor_watcher(sup: Supervisor): Int
+  var frame = task_self()
+  _supervisor_register_all(sup, frame)
+  while sup.done == 0 and sup.escalated == 0
+    var i = 0
+    var n = sup.inboxes.size
+    var any_died = 0
+    while i < n
+      if sup.done == 1
+        _supervisor_unregister_all(sup, frame)
+        return 0
+      end
+      var inbox = sup.inboxes[i]
+      # C.14.4 ACTOR_TERMINATED_SENTINEL (-1): slot was skipped by an
+      # earlier scan (Transient on clean exit, or any Temporary death).
+      # Without this guard the watcher would re-detect the same closed
+      # inbox on every outer-while iteration and either inflate skipped_count
+      # forever or eventually treat it as crash (after the clean-mark gets
+      # consumed) and respawn it. Skip terminated slots entirely.
+      if inbox == ACTOR_TERMINATED_SENTINEL
+        i = i + 1
+      elsif channel_closed(inbox) == 1
+        # C.14.4: consume the actor's clean-exit marker. EXIT_NORMAL (1)
+        # means the actor closed via its own stop / cascade-stop paths
+        # (`actor_mark_clean` fired in MIR before channel_close); absence
+        # (0) means the inbox closed by some other route — treat as crash.
+        var reason = actor_check_clean(inbox)
+        var rtype = sup.restart_types[i]
+        var respawn = _should_respawn(rtype, reason)
+        if respawn == 0
+          # Restart-type policy says don't respawn this child.
+          # Telemetry: count the skipped death once, then mark the slot
+          # as terminated so subsequent watcher passes don't re-detect.
+          # Cascade strategies still propagate via the respawn path below
+          # ONLY when this child is actually respawning, so a skipped
+          # Transient/Temporary doesn't cascade-stop its siblings. This
+          # matches OTP semantics — a non-respawn child is "gone" from
+          # the supervision tree.
+          sup.skipped_restart_count = sup.skipped_restart_count + 1
+          sup.inboxes[i] = ACTOR_TERMINATED_SENTINEL
+          any_died = 1
+          i = i + 1
+        else
+          var ok = _supervisor_count_restart(sup)
+          if ok == 0
+            sup.escalated = 1
+            _supervisor_unregister_all(sup, frame)
+            return -1
+          end
+          # C.14.4: fire PreRestart hook before respawn. Caller-supplied
+          # closure receives the dead inbox handle — perfect place to bind
+          # Scoped resource release in a `with` block.
+          var hook = sup.on_pre_restart
+          hook(inbox)
+          sup.pre_restart_count = sup.pre_restart_count + 1
+          # C.14.5: throttle respawns when backoff is configured. Gate the
+          # call with the disabled-sentinel check so the default path skips
+          # the Future allocation entirely. (`_backoff_apply` contains
+          # `sched_sleep`, which marks it suspendable — invoking it even
+          # just to short-circuit allocates a Future frame and polls it,
+          # widening the watcher's per-restart latency enough to flake the
+          # intensity-escalation timing test.) Sits between intensity check
+          # and spawn so escalation still fires fast on truly relentless
+          # failures, but a recoverable child gets the exponential cooldown.
+          if sup.backoff.min_backoff_ms > 0
+            _backoff_apply(sup.backoff)
+          end
+          if sup.strategy == SUPERVISOR_ONE_FOR_ONE
+            var spawn_fn = sup.spawn_fns[i]
+            var fresh = spawn_fn()
+            sup.inboxes[i] = fresh
+            waiter_register(fresh | CLOSE_EVENT_BIT, frame)
+          elsif sup.strategy == SUPERVISOR_ONE_FOR_ALL
+            # Cascade-stop + respawn every child.
+            var j = 0
+            while j < n
+              _supervisor_cascade_restart(sup, j, frame)
+              j = j + 1
+            end
+          elsif sup.strategy == SUPERVISOR_REST_FOR_ONE
+            # Cascade-stop + respawn children at index >= i.
+            var j = i
+            while j < n
+              _supervisor_cascade_restart(sup, j, frame)
+              j = j + 1
+            end
+          end
+          any_died = 1
+          # Break out of the per-iteration scan — cascade strategies
+          # already touched every relevant child; one_for_one continues
+          # via the outer loop to catch sibling deaths.
+          i = n
+        end
+      else
+        i = i + 1
+      end
+    end
+    if any_died == 0
+      # Park; sched_wake from notify_all(@inbox | 2) interrupts this
+      # sleep within microseconds. The chunk is a defensive long-poll.
+      sched_sleep(SUPERVISOR_PARK_MS)
+    end
+  end
+  _supervisor_unregister_all(sup, frame)
+  return 0
+end
+
+## Intensity bookkeeping. Returns 1 if a restart is allowed, 0 if
+## `max_restarts` within the current window is exceeded. Rolling window:
+## if `now - window_start_ms > period_ms`, the count + anchor reset.
+def _supervisor_count_restart(sup: Supervisor): Int
+  var now = time_epoch_ms()
+  if now - sup.window_start_ms > sup.period_ms
+    sup.restart_count = 0
+    sup.window_start_ms = now
+  end
+  sup.restart_count = sup.restart_count + 1
+  if sup.restart_count > sup.max_restarts
+    return 0
+  end
+  return 1
+end
+
+## Construct a supervisor with the chosen strategy. Spawns each child
+## via its closure (call once up-front), starts the watcher goroutine,
+## returns the handle.
+##
+## Strategy choices:
+##
+##   `SUPERVISOR_ONE_FOR_ONE`  — restart only the dead child (independent
+##                               actors; the common case)
+##   `SUPERVISOR_ONE_FOR_ALL`  — restart all children when any one dies
+##                               (tightly-coupled actors that share state
+##                               via reply channels)
+##   `SUPERVISOR_REST_FOR_ONE` — restart the dead child plus all children
+##                               started after it (pipelines where later
+##                               stages depend on earlier ones)
+##
+## `max_restarts` is the count within `period_ms`. Erlang/OTP defaults
+## are 1 restart per 5000ms; pick higher numbers for crash-tolerant
+## workloads.
+def supervisor_with_strategy(spawns: Vec<Fn(): Int>, strategy: Int,
+                             max_restarts: Int, period_ms: Int): Supervisor
+  var inboxes = vec_new<Int>()
+  var restart_types = vec_new<Int>()
+  var i = 0
+  var n = spawns.size
+  while i < n
+    var f = spawns[i]
+    inboxes.push(f())
+    restart_types.push(RESTART_PERMANENT)
+    i = i + 1
+  end
+  var sup = Supervisor {
+    spawn_fns: spawns,
+    inboxes: inboxes,
+    restart_types: restart_types,
+    strategy: strategy,
+    max_restarts: max_restarts,
+    period_ms: period_ms,
+    restart_count: 0,
+    window_start_ms: time_epoch_ms(),
+    done: 0,
+    escalated: 0,
+    watcher: 0,
+    on_pre_restart: actor_no_pre_restart,
+    skipped_restart_count: 0,
+    pre_restart_count: 0,
+    backoff: backoff_disabled(),
+  }
+  # Spawn the watcher via the raw `async` + `sched_spawn` pair instead
+  # of `go (-> _supervisor_watcher(sup))`. Reason: the inline lambda
+  # path tickles the async-after-return slot codegen bug that emits
+  # `load i64, ptr %, align 8` (empty SSA name) when the enclosing
+  # function is itself async (sister to feedback_channel_result_spec_
+  # llc_undefined_value.md). The named-call form via `async f(arg)`
+  # routes through the regular suspendable-call path which has the
+  # var name preserved.
+  var task = async _supervisor_watcher(sup)
+  sched_spawn(task)
+  sup.watcher = task
+  return sup
+end
+
+## One_for_one supervisor constructor — the Phase 1 default and the
+## ergonomic shorthand for the common case. Equivalent to
+## `supervisor_with_strategy(spawns, SUPERVISOR_ONE_FOR_ONE,
+## max_restarts, period_ms)`.
+def supervisor_new(spawns: Vec<Fn(): Int>, max_restarts: Int, period_ms: Int): Supervisor
+  return supervisor_with_strategy(spawns, SUPERVISOR_ONE_FOR_ONE, max_restarts, period_ms)
+end
+
+## Fetch the latest inbox for child `i`. During a brief restart gap
+## (inbox closed but watcher hasn't respawned yet), polls via
+## `sched_yield` up to ~100 cycles before returning the current handle.
+## Caller should not assume the returned handle is alive — under heavy
+## crash-loop conditions a stale handle may slip through.
+def supervisor_child(sup: Supervisor, i: Int): Int
+  var inbox = sup.inboxes[i]
+  # C.14.4: terminated children (Transient clean / Temporary) return the
+  # tombstone immediately — no restart gap to wait on, the slot is final.
+  if inbox == ACTOR_TERMINATED_SENTINEL
+    return ACTOR_TERMINATED_SENTINEL
+  end
+  var attempts = 0
+  while channel_closed(inbox) == 1 and sup.escalated == 0 and sup.done == 0 and attempts < 100
+    sched_yield()
+    inbox = sup.inboxes[i]
+    if inbox == ACTOR_TERMINATED_SENTINEL
+      return ACTOR_TERMINATED_SENTINEL
+    end
+    attempts = attempts + 1
+  end
+  return inbox
+end
+
+## Send the canonical actor stop message (`[tag=-1, reply_ch]`) to an
+## inbox and wait for the reply with a cascade-stop fallback. Mirrors
+## the auto-generated `<Actor>$stop` proxy. No-op on a closed inbox.
+def _supervisor_stop_child(inbox: Int): Void
+  if channel_closed(inbox) == 1
+    return
+  end
+  var msg = mem_alloc(2)
+  store(msg, 0, -1)
+  var reply_ch = channel_new(1)
+  store(msg, 1, reply_ch)
+  send(inbox, msg)
+  var attempts = 0
+  while attempts < 10000
+    var opt = try_recv(reply_ch)
+    if option_is_some(opt)
+      channel_close(reply_ch)
+      return
+    end
+    if channel_closed(inbox) == 1
+      channel_close(reply_ch)
+      return
+    end
+    sched_yield()
+    attempts = attempts + 1
+  end
+  channel_close(reply_ch)
+end
+
+## Synchronous shutdown. Sets `done=1`, stops each child via the actor
+## stop protocol, awaits the watcher goroutine. Idempotent — second
+## call is a no-op.
+def supervisor_stop(sup: Supervisor): Void
+  if sup.done == 1
+    return
+  end
+  sup.done = 1
+  var i = 0
+  var n = sup.inboxes.size
+  while i < n
+    var ib = sup.inboxes[i]
+    if ib != ACTOR_TERMINATED_SENTINEL
+      _supervisor_stop_child(ib)
+    end
+    i = i + 1
+  end
+  var w = sup.watcher
+  await w
+end
+
+## Returns 1 if the supervisor is still actively watching, 0 if it has
+## been stopped or escalated past `max_restarts`.
+def supervisor_alive(sup: Supervisor): Int
+  if sup.done == 1
+    return 0
+  end
+  if sup.escalated == 1
+    return 0
+  end
+  return 1
+end
+
+## Returns the supervisor's cumulative restart count within the current
+## rolling window. Useful for telemetry / health probes.
+def supervisor_restart_count(sup: Supervisor): Int = sup.restart_count
+
+## C.14.4 — set the restart policy for child `i`. Default is
+## `RESTART_PERMANENT`. Idempotent and safe to call before or after the
+## watcher has started (the watcher reads restart_types on every death
+## detection, not on construction).
+def supervisor_set_restart_type(sup: Supervisor, i: Int, restart_type: Int): Void
+  sup.restart_types[i] = restart_type
+end
+
+## C.14.4 — set restart policy for ALL children to the same value.
+## Ergonomic shortcut for "I want every child Transient" rather than
+## looping `supervisor_set_restart_type` over each index.
+def supervisor_set_all_restart_types(sup: Supervisor, restart_type: Int): Void
+  var i = 0
+  var n = sup.restart_types.size
+  while i < n
+    sup.restart_types[i] = restart_type
+    i = i + 1
+  end
+end
+
+## C.14.4 — install a PreRestart hook. Fires once per child respawn, given
+## the dead inbox handle. Caller's closure is the right place to bind
+## Scoped (B.8) resource release (`with FileGuard...` inside the lambda).
+## Restart-skipped deaths (Transient on clean exit, any Temporary death)
+## do NOT fire the hook — only actual respawns do.
+def supervisor_on_pre_restart(sup: Supervisor, hook: Fn(Int): Void): Void
+  sup.on_pre_restart = hook
+end
+
+## C.14.4 — count of deaths the watcher saw but did NOT respawn (Transient
+## on clean stop, Temporary on any death). Distinct from restart_count
+## which counts respawns within the rolling intensity window.
+def supervisor_skipped_count(sup: Supervisor): Int = sup.skipped_restart_count
+
+## C.14.4 — count of PreRestart hook invocations. Useful for spec
+## assertions on hook firing.
+def supervisor_pre_restart_count(sup: Supervisor): Int = sup.pre_restart_count
+
+## C.14.5 — configure exponential restart backoff for this supervisor.
+## See `BackoffConfig` for semantics. Pass `min_backoff_ms = 0` to disable
+## (the default; matches `backoff_disabled`). Idempotent — re-calling
+## resets the state to a fresh config with the new parameters. Safe to
+## call before or after the watcher has started.
+def supervisor_set_backoff(sup: Supervisor, min_backoff_ms: Int,
+                           max_backoff_ms: Int, random_factor_pct: Int): Void
+  sup.backoff = backoff_config_new(min_backoff_ms, max_backoff_ms, random_factor_pct)
+end
+
+## C.14.5 — current backoff delay (ms) the next respawn will wait. After a
+## stable child uptime > min_backoff_ms, this resets to min_backoff_ms on
+## the NEXT call to `backoff_next_delay` (not eagerly). Useful for
+## telemetry / spec assertions on the exponential-progression invariant.
+def supervisor_current_backoff_ms(sup: Supervisor): Int = sup.backoff.current_delay_ms
+
+## DynamicSupervisor (C.14.3b) — spawn-on-demand supervised workers.
+##
+## Where `Supervisor` takes a fixed `Vec<Fn(): Int>` and spawns every
+## child up-front, `DynamicSupervisor` takes ONE `spawn_fn` and lets the
+## caller spawn arbitrarily many children at runtime. This is the
+## "millions of supervised workers" pattern (Elixir DynamicSupervisor /
+## Broadway ConsumerSupervisor).
+##
+## Strategy is fixed `one_for_one`. Per Elixir/Broadway, `one_for_all` at
+## 5M children is a denial-of-service primitive — one death cascades a
+## stop+respawn to the entire population. Don't add the option.
+##
+## Usage:
+##
+##   actor Worker
+##     def process(job: Int): Int = job * 2
+##   end
+##
+##   def spawn_worker(): Int = Worker()
+##
+##   var dsup = dynamic_supervisor_new(spawn_worker, 5, 10000)
+##   for i in 0..1000
+##     var w = dynamic_supervisor_spawn(dsup)
+##     w.process(i)
+##   end
+##
+##   var n = dynamic_supervisor_alive(dsup)   # snapshot child count
+##   dynamic_supervisor_iter(dsup, w -> puts("inbox=#{w}"))
+##   dynamic_supervisor_stop(dsup)
+##
+## Memory model: children Vec grows on every spawn and is never compacted
+## while the supervisor lives. Slots are reused across restarts (the slot
+## holds the latest inbox; the old inbox is closed). Caller's stale
+## inbox handle is dead after restart — re-fetch via iter or remember
+## that the handle may go stale.
+##
+## Concurrency: `children` is guarded by `children_lock` (a procedural
+## `mutex_new` handle). spawn / iter / alive / stop / watcher all serialize
+## on it. The hot path is spawn — locks just long enough to push.
+##
+## Active-wake: same close-event waker pattern as `Supervisor` (C.14.2).
+## Each spawn registers `(@inbox | CLOSE_EVENT_BIT, watcher_frame)` so any
+## child's inbox close wakes the watcher. The watcher then scans the Vec
+## under lock to identify which child(ren) closed and respawns each.
+## At 5M children, the scan is O(N) atomic loads — sub-10ms even at the
+## headline scale, paid only when SOMETHING dies.
+struct DynamicSupervisor
+  spawn_fn: Fn(): Int
+  children: Vec<Int>
+  children_lock: Int
+  max_restarts: Int
+  period_ms: Int
+  restart_count: Int
+  window_start_ms: Int
+  done: Int
+  escalated: Int
+  watcher: Int
+  ## C.14.4: single restart policy for ALL children. Elixir/Broadway
+  ## DynamicSupervisor exposes this at the supervisor level (not per-child)
+  ## because the population is homogeneous by construction (one spawn_fn).
+  ## Default `RESTART_PERMANENT`. Caller flips via `dynamic_supervisor_set_restart_type`.
+  restart_type: Int
+  on_pre_restart: Fn(Int): Void
+  skipped_restart_count: Int
+  pre_restart_count: Int
+  ## C.14.5: shared exponential backoff. Same semantics as `Supervisor.backoff`
+  ## (shared, not per-child — at 5M children per-child state is prohibitive,
+  ## and Akka's typical pattern is one BackoffConfig per supervisor anyway).
+  ## Default `backoff_disabled()`.
+  backoff: BackoffConfig
+end
+
+## Intensity bookkeeping for DynamicSupervisor. Returns 1 if a restart is
+## allowed, 0 if `max_restarts` within the current window is exceeded.
+def _dynamic_supervisor_count_restart(dsup: DynamicSupervisor): Int
+  var now = time_epoch_ms()
+  if now - dsup.window_start_ms > dsup.period_ms
+    dsup.restart_count = 0
+    dsup.window_start_ms = now
+  end
+  dsup.restart_count = dsup.restart_count + 1
+  if dsup.restart_count > dsup.max_restarts
+    return 0
+  end
+  return 1
+end
+
+## Watcher loop. Parks on close-event waker; on wake (or 50ms park
+## expiry), scans the children Vec under children_lock to find any
+## closed inboxes and respawns each into the same slot. Re-registers
+## the close-event waker on the new inbox.
+def _dynamic_supervisor_watcher(dsup: DynamicSupervisor): Int
+  var frame = task_self()
+  while dsup.done == 0 and dsup.escalated == 0
+    mutex_lock(dsup.children_lock)
+    var i = 0
+    var n = dsup.children.size
+    while i < n
+      if dsup.done == 1
+        mutex_unlock(dsup.children_lock, 0)
+        return 0
+      end
+      var inbox = dsup.children[i]
+      if inbox == ACTOR_TERMINATED_SENTINEL
+        # Skipped already — see same guard in `_supervisor_watcher`. The
+        # outer-while `i = i + 1` at the bottom advances us past this slot.
+        var _skip = 0
+      elsif channel_closed(inbox) == 1
+        # C.14.4: same clean-vs-crash routing as Supervisor. Single
+        # restart_type applies to every child here (Elixir pattern).
+        var reason = actor_check_clean(inbox)
+        var respawn = _should_respawn(dsup.restart_type, reason)
+        if respawn == 0
+          dsup.skipped_restart_count = dsup.skipped_restart_count + 1
+          dsup.children[i] = ACTOR_TERMINATED_SENTINEL
+        else
+          var ok = _dynamic_supervisor_count_restart(dsup)
+          if ok == 0
+            dsup.escalated = 1
+            mutex_unlock(dsup.children_lock, 0)
+            return -1
+          end
+          # PreRestart hook fires before respawn. Caller's closure runs
+          # under children_lock — keep it short (no I/O, no other locks
+          # on this dsup). Matches `dynamic_supervisor_iter`'s caveat.
+          var hook = dsup.on_pre_restart
+          hook(inbox)
+          dsup.pre_restart_count = dsup.pre_restart_count + 1
+          # C.14.5: when backoff is configured, advance state UNDER the
+          # lock (mutates shared `current_delay_ms` + captures
+          # `last_restart_ts_ms` atomically), then drop the lock to
+          # sleep so concurrent spawns/iters aren't starved during the
+          # backoff window. children Vec is push-only (no deletes/swaps),
+          # so children[i] is still our slot when we re-acquire. When
+          # backoff is disabled, keep the original under-lock spawn
+          # behavior — the lock-drop dance is purely a backoff cost.
+          if dsup.backoff.min_backoff_ms > 0
+            var delay = backoff_next_delay(dsup.backoff)
+            mutex_unlock(dsup.children_lock, 0)
+            if delay > 0
+              sched_sleep(delay)
+            end
+            var f = dsup.spawn_fn
+            var fresh = f()
+            mutex_lock(dsup.children_lock)
+            dsup.children[i] = fresh
+            waiter_register(fresh | CLOSE_EVENT_BIT, frame)
+          else
+            var f = dsup.spawn_fn
+            var fresh = f()
+            dsup.children[i] = fresh
+            waiter_register(fresh | CLOSE_EVENT_BIT, frame)
+          end
+        end
+      end
+      i = i + 1
+    end
+    mutex_unlock(dsup.children_lock, 0)
+    sched_sleep(SUPERVISOR_PARK_MS)
+  end
+  return 0
+end
+
+## Construct a DynamicSupervisor. Spawns the watcher goroutine but no
+## children (those come on-demand via `dynamic_supervisor_spawn`).
+def dynamic_supervisor_new(spawn_fn: Fn(): Int, max_restarts: Int, period_ms: Int): DynamicSupervisor
+  var dsup = DynamicSupervisor {
+    spawn_fn: spawn_fn,
+    children: vec_new<Int>(),
+    children_lock: mutex_new(0),
+    max_restarts: max_restarts,
+    period_ms: period_ms,
+    restart_count: 0,
+    window_start_ms: time_epoch_ms(),
+    done: 0,
+    escalated: 0,
+    watcher: 0,
+    restart_type: RESTART_PERMANENT,
+    on_pre_restart: actor_no_pre_restart,
+    skipped_restart_count: 0,
+    pre_restart_count: 0,
+    backoff: backoff_disabled(),
+  }
+  var task = async _dynamic_supervisor_watcher(dsup)
+  sched_spawn(task)
+  dsup.watcher = task
+  return dsup
+end
+
+## Spawn a new supervised child via the supervisor's spawn_fn. Returns
+## the new child's inbox handle (or 0 if the supervisor has been stopped
+## or escalated). Registers a close-event waker for active-wake. Holds
+## children_lock briefly while pushing to the Vec.
+def dynamic_supervisor_spawn(dsup: DynamicSupervisor): Int
+  if dsup.done == 1 or dsup.escalated == 1
+    return 0
+  end
+  var f = dsup.spawn_fn
+  var inbox = f()
+  mutex_lock(dsup.children_lock)
+  dsup.children.push(inbox)
+  mutex_unlock(dsup.children_lock, 0)
+  waiter_register(inbox | CLOSE_EVENT_BIT, dsup.watcher)
+  return inbox
+end
+
+## Returns the count of currently-active (non-closed) children. O(N) walk
+## under children_lock — for telemetry, not for hot-loop use.
+def dynamic_supervisor_alive(dsup: DynamicSupervisor): Int
+  if dsup.done == 1 or dsup.escalated == 1
+    return 0
+  end
+  mutex_lock(dsup.children_lock)
+  var alive = 0
+  var i = 0
+  var n = dsup.children.size
+  while i < n
+    var inbox = dsup.children[i]
+    # C.14.4: skip tombstone slots and closed inboxes alike.
+    if inbox != ACTOR_TERMINATED_SENTINEL and channel_closed(inbox) == 0
+      alive = alive + 1
+    end
+    i = i + 1
+  end
+  mutex_unlock(dsup.children_lock, 0)
+  return alive
+end
+
+## Walk every current child inbox under children_lock and call `fn` with
+## each. The fn runs UNDER LOCK — keep it short (don't block on I/O,
+## don't acquire other locks on this dsup). Used by SOUL.4 telemetry to
+## walk per-child mailbox depth.
+def dynamic_supervisor_iter(dsup: DynamicSupervisor, fn: Fn(Int): Void): Void
+  mutex_lock(dsup.children_lock)
+  var i = 0
+  var n = dsup.children.size
+  while i < n
+    var ib = dsup.children[i]
+    # C.14.4: skip tombstone slots — terminated children aren't visible
+    # to callers (they're effectively gone from the supervision tree).
+    if ib != ACTOR_TERMINATED_SENTINEL
+      fn(ib)
+    end
+    i = i + 1
+  end
+  mutex_unlock(dsup.children_lock, 0)
+end
+
+## Synchronous shutdown. Sets `done=1` first so the watcher exits on its
+## next wake (the watcher's loop condition checks `dsup.done == 0`). Then
+## closes each child's inbox directly (skipping the per-actor stop-message
+## handshake) — channel_close is non-blocking and observable by the
+## actor's recv-loop the same way (recv returns the close sentinel, actor
+## exits cleanly). Snapshots children indices under a brief lock then
+## walks the snapshot WITHOUT the lock so the watcher (which also takes
+## children_lock for its scan) isn't starved while we close. Idempotent.
+def dynamic_supervisor_stop(dsup: DynamicSupervisor): Void
+  if dsup.done == 1
+    return
+  end
+  dsup.done = 1
+  mutex_lock(dsup.children_lock)
+  var i = 0
+  var n = dsup.children.size
+  while i < n
+    var ib = dsup.children[i]
+    if ib != ACTOR_TERMINATED_SENTINEL
+      _supervisor_stop_child(ib)
+    end
+    i = i + 1
+  end
+  mutex_unlock(dsup.children_lock, 0)
+  var w = dsup.watcher
+  await w
+end
+
+## Returns the supervisor's cumulative restart count within the current
+## rolling window. Useful for telemetry / health probes.
+def dynamic_supervisor_restart_count(dsup: DynamicSupervisor): Int = dsup.restart_count
+
+## C.14.4 — set the restart policy applied to every child. Default
+## `RESTART_PERMANENT`. Per Elixir/Broadway, DynamicSupervisor exposes
+## this at supervisor level only — the population is homogeneous.
+def dynamic_supervisor_set_restart_type(dsup: DynamicSupervisor, restart_type: Int): Void
+  dsup.restart_type = restart_type
+end
+
+## C.14.4 — install a PreRestart hook. Same semantics as `supervisor_on_pre_restart`,
+## but the closure runs UNDER children_lock — keep it short (no I/O, no other
+## locks on this dsup). Same caveat as `dynamic_supervisor_iter`.
+def dynamic_supervisor_on_pre_restart(dsup: DynamicSupervisor, hook: Fn(Int): Void): Void
+  dsup.on_pre_restart = hook
+end
+
+## C.14.4 — count of deaths the watcher saw but did NOT respawn.
+def dynamic_supervisor_skipped_count(dsup: DynamicSupervisor): Int = dsup.skipped_restart_count
+
+## C.14.4 — count of PreRestart hook invocations across all child respawns.
+def dynamic_supervisor_pre_restart_count(dsup: DynamicSupervisor): Int = dsup.pre_restart_count
+
+## C.14.5 — configure exponential restart backoff. Same semantics as
+## `supervisor_set_backoff`, but the BackoffConfig is shared across all
+## children (Elixir/Broadway pattern — homogeneous population, single policy).
+## Pass `min_backoff_ms = 0` to disable.
+def dynamic_supervisor_set_backoff(dsup: DynamicSupervisor, min_backoff_ms: Int,
+                                   max_backoff_ms: Int, random_factor_pct: Int): Void
+  dsup.backoff = backoff_config_new(min_backoff_ms, max_backoff_ms, random_factor_pct)
+end
+
+## C.14.5 — current backoff delay (ms) the next respawn will wait.
+def dynamic_supervisor_current_backoff_ms(dsup: DynamicSupervisor): Int = dsup.backoff.current_delay_ms

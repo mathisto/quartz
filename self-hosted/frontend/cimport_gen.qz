@@ -1,0 +1,777 @@
+##! @cImport clang-JSON → Quartz-source translator (B.11b, P3.6a).
+##!
+##! Pure transformation: takes clang's `-Xclang -ast-dump=json` output (already
+##! parsed into a JsonValue TranslationUnitDecl) plus the target header's
+##! basename, and returns a Quartz source module string — `@repr(C)` struct
+##! mirrors + `extern "C"` function declarations. There is NO I/O here; the
+##! resolver does the clang shell-out, caching, and module load (resolver.qz).
+##!
+##! By emitting Quartz *source* (not AST), every binding rides the existing
+##! parse → typecheck → MIR → codegen → C-ABI pipeline that is already proven
+##! correct for hand-written `extern "C"` decls (MEMORY_MODEL_V3.md §13.1-§13.5).
+##! This mirrors Zig's translate-c (it produces Zig source).
+##!
+##! Scope (P3.6a + P3.6c-enums + P3.6b-macros): named-tag structs (`struct Tag
+##! {...}` and `typedef struct Tag {...} Tag`) + scalar/pointer/struct-by-value
+##! functions + enums (named `enum Tag {...}` and `typedef enum {...} Mode;`) —
+##! enumerators become module-level `const`s, enum-typed args map to I32 (C int
+##! rank) — + object-like `#define` constants (integer/hex/float literals →
+##! `const`s; `cimport_emit_macros` over `clang -dM -E` text, baseline-diffed
+##! against an empty-input dump to drop compiler/platform builtins) + alias
+##! typedefs (`typedef unsigned int Uint32;` → a bare `Uint32` in any position
+##! resolves through `cimport_collect_typedef_aliases` to its underlying type) +
+##! POINTER struct fields (P3.6c-ptrfields: `T *p` → `p: CPtr`, an 8-byte INTEGER
+##! eightbyte that rides the same C-ABI path as a wide-int field, both directions).
+##! Deferred (filed §13.6a): anonymous-struct typedefs (`typedef struct {...} A;`),
+##! unions, function pointers, variadics, bitfields, NESTED-struct fields,
+##! function-like / expression
+##! `#define` macros. STRING `#define`s (`#define NAME "text"`) emit string
+##! `const`s (unblocked by the module-level string-const fix, 4cd19500).
+##! Any construct outside scope is surfaced as a `# cimport:` comment, never
+##! silently emitted wrong.
+
+import * from json
+import * from str_compat
+
+# True if `v` (Vec<String>) contains `s`.
+def cimport_vec_has(v: Vec<String>, s: String): Bool
+  var i = 0
+  while i < v.size
+    if v[i] == s
+      return true
+    end
+    i = i + 1
+  end
+  return false
+end
+
+# Map a C `qualType` string to a Quartz type name, given the set of known
+# (declared) struct names so bare typedef'd struct references resolve, and the
+# typedef-alias map (flat [name, underlying, …] pairs) so a bare alias like
+# `Uint32` resolves through to its mapped underlying type. Returns "" when the
+# type is unsupported (caller skips the decl + comments it).
+def cimport_map_ctype(ct: String, structs: Vec<String>, enums: Vec<String>, aliases: Vec<String>): String
+  var t = str_trim(ct)
+
+  # Any pointer is an opaque CPtr in Quartz's C FFI (char*, const T*, T**, ...).
+  if __str_contains(t, "*")
+    return "CPtr"
+  end
+
+  # Strip a leading `const ` qualifier (value types; pointers handled above).
+  if t.starts_with("const ")
+    t = str_trim(str_byte_slice(t, 6, str_byte_len(t)))
+  end
+
+  # A C enum has int rank — it crosses the C boundary as a plain `int` (I32).
+  # Covers `enum Tag` references; bare typedef'd enum names are matched below.
+  if t.starts_with("enum ")
+    return "I32"
+  end
+
+  # struct/union by value: "struct Vec2f" -> "Vec2f".
+  if t.starts_with("struct ")
+    var sname = str_trim(str_byte_slice(t, 7, str_byte_len(t)))
+    if cimport_vec_has(structs, sname)
+      return sname
+    end
+    return ""
+  end
+  if t.starts_with("union ")
+    return ""
+  end
+
+  # Scalar primitives → Quartz fixed-width types. We use the exact-width Quartz
+  # types (I32 / I8 / U64 …), NOT the C-prefixed aliases (CInt/CChar/CSize):
+  # the `@value @repr(C)` struct-field layout + C-ABI classifier path is proven
+  # for the fixed-width set (spec/c_abi oracle), whereas a CInt struct field does
+  # not register in the classifier's struct table and silently falls back to the
+  # (ABI-wrong) boxed i64 convention.
+  return "Void" if t == "void"
+  return "I32" if t == "int"
+  return "I32" if t == "signed int"
+  return "U32" if t == "unsigned int"
+  return "U32" if t == "unsigned"
+  return "I8" if t == "char"
+  return "I8" if t == "signed char"
+  return "U8" if t == "unsigned char"
+  return "I16" if t == "short"
+  return "I16" if t == "short int"
+  return "U16" if t == "unsigned short"
+  return "U16" if t == "unsigned short int"
+  return "I64" if t == "long"
+  return "I64" if t == "long int"
+  return "I64" if t == "long long"
+  return "I64" if t == "long long int"
+  return "U64" if t == "unsigned long"
+  return "U64" if t == "unsigned long int"
+  return "U64" if t == "unsigned long long"
+  return "U64" if t == "unsigned long long int"
+  return "F32" if t == "float"
+  return "F64" if t == "double"
+  return "U8" if t == "_Bool"
+  return "U8" if t == "bool"
+  # <stdint.h> / <stddef.h> exact-width aliases.
+  return "U64" if t == "size_t"
+  return "I64" if t == "ssize_t"
+  return "I8" if t == "int8_t"
+  return "U8" if t == "uint8_t"
+  return "I16" if t == "int16_t"
+  return "U16" if t == "uint16_t"
+  return "I32" if t == "int32_t"
+  return "U32" if t == "uint32_t"
+  return "I64" if t == "int64_t"
+  return "U64" if t == "uint64_t"
+  return "I64" if t == "intptr_t"
+  return "U64" if t == "uintptr_t"
+
+  # A bare identifier naming a known struct (typedef'd tag, e.g. "Point").
+  if cimport_vec_has(structs, t)
+    return t
+  end
+
+  # A bare identifier naming a typedef'd enum (e.g. "Mode") — int rank → I32.
+  if cimport_vec_has(enums, t)
+    return "I32"
+  end
+
+  # A typedef alias (e.g. `typedef unsigned int Uint32`) — resolve through to the
+  # underlying type. Recurses for alias-of-alias chains (C typedefs are acyclic);
+  # the `under != t` guard rejects a self-referential definition.
+  var under = cimport_alias_lookup(aliases, t)
+  if under != "" and under != t
+    return cimport_map_ctype(under, structs, enums, aliases)
+  end
+
+  return ""
+end
+
+# Look up a typedef alias's underlying C type in the flat [name, underlying, …]
+# alias map; returns "" if `name` is not an alias.
+def cimport_alias_lookup(aliases: Vec<String>, name: String): String
+  var i = 0
+  while i + 1 < aliases.size
+    if aliases[i] == name
+      return aliases[i + 1]
+    end
+    i = i + 2
+  end
+  return ""
+end
+
+# Collect typedef aliases declared in the target header as a flat Vec of
+# [name, underlying-qualType, …] pairs (e.g. ["Uint32", "unsigned int", ...]).
+# Struct/enum typedefs are also captured but resolve via the struct/enum sets
+# before the alias fallback fires, so they are harmless duplicates.
+def cimport_collect_typedef_aliases(inner: Vec<JsonValue>, header: String): Vec<String>
+  var out = vec_new<String>()
+  var cur_file = ""
+  var i = 0
+  while i < inner.size
+    var node = inner[i]
+    var f = cimport_node_file(node)
+    if f != ""
+      cur_file = f
+    end
+    i = i + 1
+    if cimport_is_implicit(node)
+      continue
+    end
+    if cur_file.ends_with(header) == false
+      continue
+    end
+    if json_as_string(json_object_get(node, "kind")) != "TypedefDecl"
+      continue
+    end
+    var name = json_as_string(json_object_get(node, "name"))
+    var under = json_as_string(json_object_get(json_object_get(node, "type"), "qualType"))
+    if name != "" and under != ""
+      out.push(name)
+      out.push(under)
+    end
+  end
+  return out
+end
+
+# Extract a function's return type from its full type qualType
+# ("int (int, int)" -> "int"; "char *(const char *)" -> "char *").
+# Returns "" when a parameter list paren isn't found (defensive).
+def cimport_ret_qualtype(fn_qt: String): String
+  var paren = __str_index(fn_qt, "(")
+  if paren < 0
+    return ""
+  end
+  return str_trim(str_byte_slice(fn_qt, 0, paren))
+end
+
+# True if `node` is an implicit (compiler-builtin) declaration to skip.
+def cimport_is_implicit(node: JsonValue): Bool
+  return json_as_bool(json_object_get(node, "isImplicit")) == 1
+end
+
+# A node's source file, "" if the node carries none (clang only emits `file`
+# when it changes — the caller carries it forward).
+def cimport_node_file(node: JsonValue): String
+  var loc = json_object_get(node, "loc")
+  return json_as_string(json_object_get(loc, "file"))
+end
+
+# Pass 1: collect every named struct RecordDecl from the target header.
+def cimport_collect_structs(inner: Vec<JsonValue>, header: String): Vec<String>
+  var names = vec_new<String>()
+  var cur_file = ""
+  var i = 0
+  while i < inner.size
+    var node = inner[i]
+    var f = cimport_node_file(node)
+    if f != ""
+      cur_file = f
+    end
+    i = i + 1
+    if cimport_is_implicit(node)
+      continue
+    end
+    if cur_file.ends_with(header) == false
+      continue
+    end
+    if json_as_string(json_object_get(node, "kind")) != "RecordDecl"
+      continue
+    end
+    if json_as_string(json_object_get(node, "tagUsed")) != "struct"
+      continue
+    end
+    var name = json_as_string(json_object_get(node, "name"))
+    if name == ""
+      continue
+    end
+    if cimport_vec_has(names, name) == false
+      names.push(name)
+    end
+  end
+  return names
+end
+
+# Pass 1b: collect typedef names that alias an enum (`typedef enum {...} Mode;`
+# or `typedef enum Tag AliasT;`), so a bare `Mode`/`AliasT` reference maps to
+# I32. Named `enum Tag` references are matched directly by the `enum ` prefix.
+def cimport_collect_enum_typedefs(inner: Vec<JsonValue>, header: String): Vec<String>
+  var names = vec_new<String>()
+  var cur_file = ""
+  var i = 0
+  while i < inner.size
+    var node = inner[i]
+    var f = cimport_node_file(node)
+    if f != ""
+      cur_file = f
+    end
+    i = i + 1
+    if cimport_is_implicit(node)
+      continue
+    end
+    if cur_file.ends_with(header) == false
+      continue
+    end
+    if json_as_string(json_object_get(node, "kind")) != "TypedefDecl"
+      continue
+    end
+    var qt = json_as_string(json_object_get(json_object_get(node, "type"), "qualType"))
+    if qt.starts_with("enum ") == false
+      continue
+    end
+    var name = json_as_string(json_object_get(node, "name"))
+    if name != "" and cimport_vec_has(names, name) == false
+      names.push(name)
+    end
+  end
+  return names
+end
+
+# True if a mapped Quartz type may appear as a struct field that crosses a C
+# boundary by value. The numeric fixed-width set plus `CPtr` — all proven for the
+# `@value @repr(C)` + C-ABI classifier path (spec/c_abi). A pointer field is an
+# 8-byte INTEGER eightbyte (P3.6c-ptrfields): identical to `long` across the ABI,
+# and Quartz stores a CPtr as a raw i64 slot byte-identical to the C pointer, so
+# `struct { T *p; ... }` rides the same machinery as a wide-int field. Nested
+# structs and anything else are NOT packable — a struct with such a field compiles
+# but is ABI-wrong, so it is skipped + commented (D5).
+def cimport_field_packable(t: String): Bool
+  return true if t == "I8"
+  return true if t == "U8"
+  return true if t == "I16"
+  return true if t == "U16"
+  return true if t == "I32"
+  return true if t == "U32"
+  return true if t == "I64"
+  return true if t == "U64"
+  return true if t == "F32"
+  return true if t == "F64"
+  return true if t == "CPtr"
+  return false
+end
+
+# Emit one `@value @repr(C)` struct from a RecordDecl. Returns the source text,
+# or "" if any field is unsupported (caller emits a `# cimport:` comment). Both
+# attributes are required: `@value` registers the struct's layout with the C-ABI
+# classifier (so by-value calls coerce correctly), `@repr(C)` pins C field order.
+def cimport_emit_struct(node: JsonValue, structs: Vec<String>, enums: Vec<String>, aliases: Vec<String>): String
+  var name = json_as_string(json_object_get(node, "name"))
+  var fields = json_as_array(json_object_get(node, "inner"))
+  var body = ""
+  var nfields = 0
+  var i = 0
+  while i < fields.size
+    var fld = fields[i]
+    i = i + 1
+    if json_as_string(json_object_get(fld, "kind")) != "FieldDecl"
+      continue
+    end
+    # Bitfields are unsupported in P3.6a (need packed struct(uN)).
+    if json_object_has(fld, "isBitfield")
+      return ""
+    end
+    var fname = json_as_string(json_object_get(fld, "name"))
+    var fty_c = json_as_string(json_object_get(json_object_get(fld, "type"), "qualType"))
+    var fty = cimport_map_ctype(fty_c, structs, enums, aliases)
+    if fty == ""
+      return ""
+    end
+    if cimport_field_packable(fty) == false
+      return ""
+    end
+    body = body + "  " + fname + ": " + fty + "\n"
+    nfields = nfields + 1
+  end
+  if nfields == 0
+    return ""
+  end
+  return "@value @repr(C) struct " + name + "\n" + body + "end\n"
+end
+
+# Read an EnumConstantDecl's explicit value: clang folds any initializer
+# (`5`, `1 << 4`, `0x10`) into a child ConstantExpr carrying a decimal `value`
+# string. Returns "" when the enumerator has no initializer (implicit value).
+def cimport_enum_const_value(node: JsonValue): String
+  var inner = json_as_array(json_object_get(node, "inner"))
+  var i = 0
+  while i < inner.size
+    var child = inner[i]
+    i = i + 1
+    if json_object_has(child, "value")
+      var v = json_as_string(json_object_get(child, "value"))
+      if v != ""
+        return v
+      end
+    end
+  end
+  return ""
+end
+
+# Emit module-level `const`s for one EnumDecl's enumerators. A C enum is just a
+# set of named int constants the caller needs, so each becomes `const NAME = V`.
+# Implicit enumerators are emitted as `const NAME = <prev> + 1` (the first as 0),
+# leaning on Quartz's const-references-const — no integer parsing needed, and it
+# exactly mirrors C's increment-from-previous semantics. `emitted` dedupes names
+# across forward decls / repeated tags. Returns the const block (may be "").
+def cimport_emit_enum(node: JsonValue, emitted: Vec<String>): String
+  var consts = json_as_array(json_object_get(node, "inner"))
+  var body = ""
+  var prev = ""
+  var i = 0
+  while i < consts.size
+    var c = consts[i]
+    i = i + 1
+    if json_as_string(json_object_get(c, "kind")) != "EnumConstantDecl"
+      continue
+    end
+    var cname = json_as_string(json_object_get(c, "name"))
+    if cname == ""
+      continue
+    end
+    if cimport_vec_has(emitted, cname)
+      prev = cname
+      continue
+    end
+    var v = cimport_enum_const_value(c)
+    if v != ""
+      body = body + "const " + cname + " = " + v + "\n"
+    else
+      if prev == ""
+        body = body + "const " + cname + " = 0\n"
+      else
+        body = body + "const " + cname + " = " + prev + " + 1\n"
+      end
+    end
+    emitted.push(cname)
+    prev = cname
+  end
+  return body
+end
+
+# Emit one `extern "C"` def from a FunctionDecl. Returns "" if the return type,
+# any parameter type is unsupported, or the function is variadic.
+def cimport_emit_function(node: JsonValue, structs: Vec<String>, enums: Vec<String>, aliases: Vec<String>): String
+  var name = json_as_string(json_object_get(node, "name"))
+  var fn_qt = json_as_string(json_object_get(json_object_get(node, "type"), "qualType"))
+
+  # Variadic (printf-like) — defer to a later phase.
+  if __str_contains(fn_qt, "...")
+    return ""
+  end
+
+  var ret_c = cimport_ret_qualtype(fn_qt)
+  var ret = cimport_map_ctype(ret_c, structs, enums, aliases)
+  if ret == ""
+    return ""
+  end
+
+  var params = ""
+  var nparams = 0
+  var inner = json_as_array(json_object_get(node, "inner"))
+  var i = 0
+  while i < inner.size
+    var p = inner[i]
+    var idx = i
+    i = i + 1
+    if json_as_string(json_object_get(p, "kind")) != "ParmVarDecl"
+      continue
+    end
+    var pty_c = json_as_string(json_object_get(json_object_get(p, "type"), "qualType"))
+    var pty = cimport_map_ctype(pty_c, structs, enums, aliases)
+    if pty == ""
+      return ""
+    end
+    var pname = json_as_string(json_object_get(p, "name"))
+    if pname == ""
+      pname = "arg" + str_from_int(idx)
+    end
+    if nparams > 0
+      params = params + ", "
+    end
+    params = params + pname + ": " + pty
+    nparams = nparams + 1
+  end
+
+  return "extern \"C\" def " + name + "(" + params + "): " + ret + "\n"
+end
+
+# Translate a parsed clang AST-dump (TranslationUnitDecl JsonValue) into a
+# Quartz source module string. `header` is the header basename used to filter
+# the target's declarations from builtins and transitively-included headers.
+def cimport_translate(tu: JsonValue, header: String): String
+  var inner = json_as_array(json_object_get(tu, "inner"))
+  var structs = cimport_collect_structs(inner, header)
+  var enums = cimport_collect_enum_typedefs(inner, header)
+  var aliases = cimport_collect_typedef_aliases(inner, header)
+
+  var out = "##! Auto-generated by @cImport from " + header + " — DO NOT EDIT.\n"
+  out = out + "##! Regenerated from the C header via clang AST on each build.\n\n"
+
+  # Pass 1c: enum constants (independent module-level consts; callers pass these
+  # to enum-typed C functions). Emitted first so later refs resolve top-down.
+  var emitted_consts = vec_new<String>()
+  var ec_file = ""
+  var ei = 0
+  while ei < inner.size
+    var enode = inner[ei]
+    var ef = cimport_node_file(enode)
+    if ef != ""
+      ec_file = ef
+    end
+    ei = ei + 1
+    if cimport_is_implicit(enode)
+      continue
+    end
+    if ec_file.ends_with(header) == false
+      continue
+    end
+    if json_as_string(json_object_get(enode, "kind")) != "EnumDecl"
+      continue
+    end
+    out = out + cimport_emit_enum(enode, emitted_consts)
+  end
+  if emitted_consts.size > 0
+    out = out + "\n"
+  end
+
+  # Pass 2: structs first (functions may reference them by value).
+  var emitted = vec_new<String>()
+  var cur_file = ""
+  var i = 0
+  while i < inner.size
+    var node = inner[i]
+    var f = cimport_node_file(node)
+    if f != ""
+      cur_file = f
+    end
+    i = i + 1
+    if cimport_is_implicit(node)
+      continue
+    end
+    if cur_file.ends_with(header) == false
+      continue
+    end
+    if json_as_string(json_object_get(node, "kind")) != "RecordDecl"
+      continue
+    end
+    if json_as_string(json_object_get(node, "tagUsed")) != "struct"
+      continue
+    end
+    var name = json_as_string(json_object_get(node, "name"))
+    if name == ""
+      out = out + "# cimport: skipped anonymous struct (needs manual binding)\n"
+      continue
+    end
+    if cimport_vec_has(emitted, name)
+      continue
+    end
+    var src = cimport_emit_struct(node, structs, enums, aliases)
+    if src == ""
+      out = out + "# cimport: skipped struct " + name + " (unsupported field type — needs manual binding)\n"
+      continue
+    end
+    out = out + src + "\n"
+    emitted.push(name)
+  end
+
+  # Pass 3: functions.
+  cur_file = ""
+  i = 0
+  while i < inner.size
+    var node = inner[i]
+    var f = cimport_node_file(node)
+    if f != ""
+      cur_file = f
+    end
+    i = i + 1
+    if cimport_is_implicit(node)
+      continue
+    end
+    if cur_file.ends_with(header) == false
+      continue
+    end
+    if json_as_string(json_object_get(node, "kind")) != "FunctionDecl"
+      continue
+    end
+    var fname = json_as_string(json_object_get(node, "name"))
+    var src = cimport_emit_function(node, emitted, enums, aliases)
+    if src == ""
+      out = out + "# cimport: skipped fn " + fname + " (unsupported type/variadic — needs manual binding)\n"
+      continue
+    end
+    out = out + src
+  end
+
+  return out
+end
+
+# True iff every byte of `s` is in `allowed` (and `s` is non-empty).
+def cimport_all_in(s: String, allowed: String): Bool
+  var n = str_byte_len(s)
+  if n == 0
+    return false
+  end
+  var i = 0
+  while i < n
+    var ch = str_byte_slice(s, i, i + 1)
+    if __str_contains(allowed, ch) == false
+      return false
+    end
+    i = i + 1
+  end
+  return true
+end
+
+# Strip the longest trailing run of bytes that are all in `suffix` (the C
+# literal suffix letters, e.g. "uUlL" for ints, "fFlL" for floats).
+def cimport_strip_suffix(s: String, suffix: String): String
+  var n = str_byte_len(s)
+  while n > 0
+    var ch = str_byte_slice(s, n - 1, n)
+    if __str_contains(suffix, ch)
+      n = n - 1
+    else
+      return str_byte_slice(s, 0, n)
+    end
+  end
+  return str_byte_slice(s, 0, n)
+end
+
+# Classify a (trimmed) numeric macro value → emittable Quartz literal, or "" if
+# it's not a simple integer/hex/float literal. C integer/float suffixes are
+# stripped (Quartz rejects `100UL`); hex keeps `0x` (Quartz accepts it). No
+# exponent floats in v1.
+def cimport_macro_number(v: String): String
+  var s = str_trim(v)
+  if s == ""
+    return ""
+  end
+  var sign = ""
+  if s.starts_with("-") or s.starts_with("+")
+    sign = str_byte_slice(s, 0, 1)
+    s = str_byte_slice(s, 1, str_byte_len(s))
+  end
+  if s == ""
+    return ""
+  end
+  # Hex integer: 0x<hexdigits>[uUlL]* — note F is a hex digit, NOT a suffix here.
+  if s.starts_with("0x") or s.starts_with("0X")
+    var hex = cimport_strip_suffix(str_byte_slice(s, 2, str_byte_len(s)), "uUlL")
+    if cimport_all_in(hex, "0123456789abcdefABCDEF")
+      return sign + "0x" + hex
+    end
+    return ""
+  end
+  # Decimal float: <digits>.<digits>[fFlL]*
+  if __str_contains(s, ".")
+    var f = cimport_strip_suffix(s, "fFlL")
+    var dot = __str_index(f, ".")
+    if dot < 0
+      return ""
+    end
+    var ip = str_byte_slice(f, 0, dot)
+    var fp = str_byte_slice(f, dot + 1, str_byte_len(f))
+    if cimport_all_in(ip, "0123456789") and cimport_all_in(fp, "0123456789")
+      return sign + f
+    end
+    return ""
+  end
+  # Decimal integer: <digits>[uUlL]*
+  var d = cimport_strip_suffix(s, "uUlL")
+  if cimport_all_in(d, "0123456789")
+    return sign + d
+  end
+  return ""
+end
+
+# Classify a single double-quoted C string literal → the verbatim literal (valid
+# as a Quartz string literal), or "" if `s` is not exactly one string literal.
+# Adjacent-string concatenation (`"a" "b"`) and interior bare `"` are rejected
+# (surfaced as a comment by the caller). C escapes are passed through verbatim —
+# the common ones (`\n` `\t` `\\` `\"`) match Quartz; exotic escapes are a v1
+# limitation, not a correctness hazard (they'd surface at compile time).
+def cimport_macro_string(s: String): String
+  var n = str_byte_len(s)
+  if n < 2
+    return ""
+  end
+  if s.starts_with("\"") == false
+    return ""
+  end
+  if str_byte_slice(s, n - 1, n) != "\""
+    return ""
+  end
+  # Reject any unescaped `"` strictly inside the literal (catches `"a" "b"`).
+  var i = 1
+  while i < n - 1
+    var ch = str_byte_slice(s, i, i + 1)
+    if ch == "\\"
+      i = i + 2
+      continue
+    end
+    if ch == "\""
+      return ""
+    end
+    i = i + 1
+  end
+  return s
+end
+
+# Classify a (trimmed) macro value → emittable Quartz literal, or "" if it's not
+# a supported constant. Simple integer/hex/float numbers and single double-quoted
+# string literals are accepted (module-level string consts compile as of
+# 4cd19500 — `docs/bugs/done/MODULE_LEVEL_STRING_CONST_UNSUPPORTED.md`). Char
+# literals, expression bodies, and casts return "" (commented by the caller).
+def cimport_classify_macro_value(v: String): String
+  var s = str_trim(v)
+  if s == ""
+    return ""
+  end
+  var num = cimport_macro_number(s)
+  if num != ""
+    return num
+  end
+  return cimport_macro_string(s)
+end
+
+# Collect the NAMEs of every `#define` in a `clang -dM -E` text dump (the macro
+# name is the token after `#define `, truncated at the first space or `(`).
+def cimport_collect_define_names(dm: String): Vec<String>
+  var names = vec_new<String>()
+  var lines = str_split(dm, "\n")
+  var i = 0
+  while i < lines.size
+    var line = str_trim(lines[i])
+    i = i + 1
+    if line.starts_with("#define ") == false
+      continue
+    end
+    var rest = str_byte_slice(line, 8, str_byte_len(line))
+    var sp = __str_index(rest, " ")
+    var spec = rest
+    if sp >= 0
+      spec = str_byte_slice(rest, 0, sp)
+    end
+    var paren = __str_index(spec, "(")
+    if paren >= 0
+      spec = str_byte_slice(spec, 0, paren)
+    end
+    if spec != "" and cimport_vec_has(names, spec) == false
+      names.push(spec)
+    end
+  end
+  return names
+end
+
+# Translate object-like `#define` constants into module-level `const`s.
+# `full_dm` = `clang -dM -E header`, `base_dm` = `clang -dM -E` of empty input
+# (the baseline of compiler/platform builtins to subtract). `prior_src` is the
+# already-generated module text, used to skip a macro whose name collides with
+# an emitted enum const / struct / function (which would be a duplicate-decl
+# compile error — surfaced as a comment instead). Function-like, expression, and
+# non-literal macros are surfaced as `# cimport:` comments (D5).
+def cimport_emit_macros(full_dm: String, base_dm: String, prior_src: String): String
+  var base_names = cimport_collect_define_names(base_dm)
+  var lines = str_split(full_dm, "\n")
+  var out = ""
+  var emitted = vec_new<String>()
+  var i = 0
+  while i < lines.size
+    var line = str_trim(lines[i])
+    i = i + 1
+    if line.starts_with("#define ") == false
+      continue
+    end
+    var rest = str_byte_slice(line, 8, str_byte_len(line))
+    var sp = __str_index(rest, " ")
+    if sp < 0
+      continue
+    end
+    var spec = str_byte_slice(rest, 0, sp)
+    # Function-like macro (`NAME(args)`) — not a constant.
+    if __str_contains(spec, "(")
+      continue
+    end
+    var name = spec
+    # Drop compiler/platform builtins (present in the empty-input baseline).
+    if cimport_vec_has(base_names, name)
+      continue
+    end
+    if cimport_vec_has(emitted, name)
+      continue
+    end
+    # Skip a name already defined in the AST-derived source (const/struct/fn).
+    if __str_contains(prior_src, "const " + name + " =") or __str_contains(prior_src, "struct " + name + "\n") or __str_contains(prior_src, "def " + name + "(")
+      continue
+    end
+    var val = str_trim(str_byte_slice(rest, sp + 1, str_byte_len(rest)))
+    var lit = cimport_classify_macro_value(val)
+    if lit == ""
+      out = out + "# cimport: skipped macro " + name + " (non-constant — needs manual binding)\n"
+      emitted.push(name)
+      continue
+    end
+    out = out + "const " + name + " = " + lit + "\n"
+    emitted.push(name)
+  end
+  return out
+end

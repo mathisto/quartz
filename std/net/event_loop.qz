@@ -1,0 +1,355 @@
+# std/net/event_loop.qz - Event loop for non-blocking I/O (Layer 2)
+#
+# Cross-platform event multiplexer using kqueue (macOS) or epoll (Linux).
+#
+# Block-scoped close with throw-safety (B.8 Phase 5):
+#   import * from std/net/event_loop
+#   var el = event_loop_new()
+#   with event_loop_scoped(el) do fd ->
+#     drive_loop(el)
+#   end
+#   # implicit event_loop_close on every exit, including throw.
+# See EventLoopGuard / event_loop_scoped near the bottom of this file.
+#
+# Usage:
+#   import std/net/event_loop
+#   import std/ffi/event
+#
+#   var el = event_loop_new()
+#   set_nonblocking(server_fd)
+#   event_loop_add_read(el, server_fd)
+#
+#   while true
+#     var events = event_loop_wait(el, 1000)  # 1s timeout
+#     var i = 0
+#     while i < events.size
+#       var ev = events.get(i)
+#       if ev.fd == server_fd
+#         # accept new connection
+#       else
+#         # read/write on client fd
+#       end
+#       i += 1
+#     end
+#     vec_free(events)
+#   end
+#
+#   event_loop_close(el)
+
+import std/ffi/event
+import std/ffi/socket
+
+# =============================================================================
+# Event types
+# =============================================================================
+
+# Ready event returned from event_loop_wait
+struct ReadyEvent
+  fd: Int       # File descriptor that is ready
+  readable: Int # 1 if readable, 0 otherwise
+  writable: Int # 1 if writable, 0 otherwise
+  error: Int    # 1 if error/hangup, 0 otherwise
+  eof: Int      # 1 if EOF (peer closed), 0 otherwise
+end
+
+# EventLoop handle
+struct EventLoop
+  fd: Int       # kqueue fd or epoll fd
+end
+
+# Maximum events per wait call
+def MAX_EVENTS(): Int = 64
+
+# =============================================================================
+# EventLoop creation / destruction
+# =============================================================================
+
+# Create a new event loop
+# Returns: EventLoop with valid fd, or fd == -1 on error
+@cfg(os: "macos")
+def event_loop_new(): EventLoop
+  var kq = kqueue()
+  return EventLoop { fd: kq }
+end
+
+@cfg(os: "linux")
+def event_loop_new(): EventLoop
+  var epfd = epoll_create1(0)
+  return EventLoop { fd: epfd }
+end
+
+# Close the event loop
+def event_loop_close(el: EventLoop): Int
+  return close(el.fd)
+end
+
+# =============================================================================
+# Registration - macOS (kqueue)
+# =============================================================================
+
+# Register a file descriptor for read events
+@cfg(os: "macos")
+def event_loop_add_read(el: EventLoop, fd: Int): Int
+  var ev = mem_alloc(KEVENT_SIZE())
+  kevent_set(ev, fd, EVFILT_READ(), EV_ADD() | EV_ENABLE())
+  var ret = kevent(el.fd, ev, 1, 0, 0, 0)
+  qz_free(ev)
+  return ret
+end
+
+# Register a file descriptor for write events
+@cfg(os: "macos")
+def event_loop_add_write(el: EventLoop, fd: Int): Int
+  var ev = mem_alloc(KEVENT_SIZE())
+  kevent_set(ev, fd, EVFILT_WRITE(), EV_ADD() | EV_ENABLE())
+  var ret = kevent(el.fd, ev, 1, 0, 0, 0)
+  qz_free(ev)
+  return ret
+end
+
+# Register for both read and write events
+@cfg(os: "macos")
+def event_loop_add_readwrite(el: EventLoop, fd: Int): Int
+  # kqueue needs two separate kevent entries (one per filter)
+  var evs = mem_alloc(KEVENT_SIZE() * 2)
+  kevent_set(evs, fd, EVFILT_READ(), EV_ADD() | EV_ENABLE())
+  kevent_set(ptr_add(evs, KEVENT_SIZE()), fd, EVFILT_WRITE(), EV_ADD() | EV_ENABLE())
+  var ret = kevent(el.fd, evs, 2, 0, 0, 0)
+  qz_free(evs)
+  return ret
+end
+
+# Remove a file descriptor from read events
+@cfg(os: "macos")
+def event_loop_remove_read(el: EventLoop, fd: Int): Int
+  var ev = mem_alloc(KEVENT_SIZE())
+  kevent_set(ev, fd, EVFILT_READ(), EV_DELETE())
+  var ret = kevent(el.fd, ev, 1, 0, 0, 0)
+  qz_free(ev)
+  return ret
+end
+
+# Remove a file descriptor from write events
+@cfg(os: "macos")
+def event_loop_remove_write(el: EventLoop, fd: Int): Int
+  var ev = mem_alloc(KEVENT_SIZE())
+  kevent_set(ev, fd, EVFILT_WRITE(), EV_DELETE())
+  var ret = kevent(el.fd, ev, 1, 0, 0, 0)
+  qz_free(ev)
+  return ret
+end
+
+# Remove a file descriptor from all events
+@cfg(os: "macos")
+def event_loop_remove(el: EventLoop, fd: Int): Int
+  var evs = mem_alloc(KEVENT_SIZE() * 2)
+  kevent_set(evs, fd, EVFILT_READ(), EV_DELETE())
+  kevent_set(ptr_add(evs, KEVENT_SIZE()), fd, EVFILT_WRITE(), EV_DELETE())
+  # Ignore errors (filter may not be registered)
+  kevent(el.fd, evs, 2, 0, 0, 0)
+  qz_free(evs)
+  return 0
+end
+
+# =============================================================================
+# Registration - Linux (epoll)
+# =============================================================================
+
+@cfg(os: "linux")
+def event_loop_add_read(el: EventLoop, fd: Int): Int
+  var ev = mem_alloc(EPOLL_EVENT_SIZE())
+  epoll_event_set(ev, EPOLLIN(), fd)
+  var ret = epoll_ctl(el.fd, EPOLL_CTL_ADD(), fd, ev)
+  qz_free(ev)
+  return ret
+end
+
+@cfg(os: "linux")
+def event_loop_add_write(el: EventLoop, fd: Int): Int
+  var ev = mem_alloc(EPOLL_EVENT_SIZE())
+  epoll_event_set(ev, EPOLLOUT(), fd)
+  var ret = epoll_ctl(el.fd, EPOLL_CTL_ADD(), fd, ev)
+  qz_free(ev)
+  return ret
+end
+
+@cfg(os: "linux")
+def event_loop_add_readwrite(el: EventLoop, fd: Int): Int
+  var ev = mem_alloc(EPOLL_EVENT_SIZE())
+  epoll_event_set(ev, EPOLLIN() | EPOLLOUT(), fd)
+  var ret = epoll_ctl(el.fd, EPOLL_CTL_ADD(), fd, ev)
+  qz_free(ev)
+  return ret
+end
+
+@cfg(os: "linux")
+def event_loop_remove_read(el: EventLoop, fd: Int): Int
+  return epoll_ctl(el.fd, EPOLL_CTL_DEL(), fd, 0)
+end
+
+@cfg(os: "linux")
+def event_loop_remove_write(el: EventLoop, fd: Int): Int
+  return epoll_ctl(el.fd, EPOLL_CTL_DEL(), fd, 0)
+end
+
+@cfg(os: "linux")
+def event_loop_remove(el: EventLoop, fd: Int): Int
+  return epoll_ctl(el.fd, EPOLL_CTL_DEL(), fd, 0)
+end
+
+# =============================================================================
+# Wait for events - macOS (kqueue)
+# =============================================================================
+
+# Wait for events with timeout in milliseconds (-1 for infinite)
+# Returns: Vec<ReadyEvent> of ready file descriptors
+@cfg(os: "macos")
+def event_loop_wait(el: EventLoop, timeout_ms: Int): Vec<ReadyEvent>
+  var buf = mem_alloc(KEVENT_SIZE() * MAX_EVENTS())
+  var ts_ptr = 0
+  var ts = mem_alloc(16)
+  if timeout_ms >= 0
+    var sec = timeout_ms / 1000
+    var nsec = (timeout_ms % 1000) * 1000000
+    timespec_set(ts, sec, nsec)
+    ts_ptr = ts
+  end
+
+  var n = kevent(el.fd, 0, 0, buf, MAX_EVENTS(), ts_ptr)
+  qz_free(ts)
+
+  var result = vec_new<ReadyEvent>()
+  if n < 0
+    qz_free(buf)
+    return result
+  end
+
+  var i = 0
+  while i < n
+    var ev = ptr_add(buf, i * KEVENT_SIZE())
+    var fd = kevent_get_ident(ev)
+    var filter = kevent_get_filter(ev)
+    var flags = kevent_get_flags(ev)
+
+    var readable = 0
+    var writable = 0
+    var is_eof = 0
+    var is_error = 0
+
+    if filter == EVFILT_READ()
+      readable = 1
+    end
+    if filter == EVFILT_WRITE()
+      writable = 1
+    end
+    if (flags & EV_EOF()) != 0
+      is_eof = 1
+    end
+    if (flags & EV_ERROR()) != 0
+      is_error = 1
+    end
+
+    var rev = ReadyEvent { fd: fd, readable: readable, writable: writable, error: is_error, eof: is_eof }
+    result.push(rev)
+    i += 1
+  end
+
+  qz_free(buf)
+  return result
+end
+
+# =============================================================================
+# Wait for events - Linux (epoll)
+# =============================================================================
+
+@cfg(os: "linux")
+def event_loop_wait(el: EventLoop, timeout_ms: Int): Vec<ReadyEvent>
+  var buf = mem_alloc(EPOLL_EVENT_SIZE() * MAX_EVENTS())
+  var n = epoll_wait(el.fd, buf, MAX_EVENTS(), timeout_ms)
+
+  var result = vec_new<ReadyEvent>()
+  if n < 0
+    qz_free(buf)
+    return result
+  end
+
+  var i = 0
+  while i < n
+    var ev = ptr_add(buf, i * EPOLL_EVENT_SIZE())
+    var events = epoll_event_get_events(ev)
+    var fd = epoll_event_get_fd(ev)
+
+    var readable = 0
+    var writable = 0
+    var is_eof = 0
+    var is_error = 0
+
+    if (events & EPOLLIN()) != 0
+      readable = 1
+    end
+    if (events & EPOLLOUT()) != 0
+      writable = 1
+    end
+    if (events & EPOLLHUP()) != 0
+      is_eof = 1
+    end
+    if (events & EPOLLERR()) != 0
+      is_error = 1
+    end
+
+    var rev = ReadyEvent { fd: fd, readable: readable, writable: writable, error: is_error, eof: is_eof }
+    result.push(rev)
+    i += 1
+  end
+
+  qz_free(buf)
+  return result
+end
+
+# ============================================================================
+# B.8 Phase 5 — Scoped wrapper for EventLoop
+# ============================================================================
+#
+# `with event_loop_scoped(el) do fd -> body end` wraps an already-created
+# event loop so its underlying kqueue/epoll fd is closed when the
+# surrounding `with`-block exits — both on normal exit and on throw-unwind.
+#
+# Asymmetry note: release and release_on_throw both call event_loop_close.
+# The handoff envisioned a "drain pending tasks vs abort pending" split,
+# but task tracking lives at a higher layer (the supervisor primitive in
+# C.14). The kqueue/epoll fd close is unconditional in either path —
+# pending events are dropped by the OS when the descriptor closes.
+# Apps that want to drain queued work can run a final
+# event_loop_wait(el, 0) before block exit; apps that want to abort can
+# wrap a custom guard whose release_on_throw issues per-fd cancels.
+
+import * from std/scoped
+
+## A scoped EventLoop guard. Wraps an already-created event loop so its
+## underlying fd is closed when the surrounding `with`-block exits.
+struct EventLoopGuard
+  inner: EventLoop
+end
+
+extend EventLoopGuard with Scoped
+  ## Returns the event loop's fd as the bound value. Body code can use
+  ## the raw fd or reconstruct via `EventLoop { fd: fd }` if it wants
+  ## the high-level event_loop_* helpers.
+  def acquire(self): Int = @inner.fd
+
+  ## Close the event loop on normal block exit.
+  def release(self, value: Int): Void
+    var ignore = event_loop_close(@inner)
+  end
+
+  ## Close the event loop on throw-unwind. Same as release — pending
+  ## events are dropped by the OS when the fd closes.
+  def release_on_throw(self, value: Int, exc_msg: String): Void
+    var ignore = event_loop_close(@inner)
+  end
+end
+
+## Construct a scoped wrapper for an already-created EventLoop.
+def event_loop_scoped(el: EventLoop): EventLoopGuard
+  return EventLoopGuard { inner: el }
+end

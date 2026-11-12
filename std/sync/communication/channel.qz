@@ -1,0 +1,361 @@
+## std/sync/communication/channel — Scoped channel close (B.8 Phase 5) +
+## RecvSelectable (C.13 Phase 5 partial)
+##
+## A Scoped wrapper for closing a channel at end-of-block. Wraps the
+## procedural `channel_new` / `send` / `recv` / `channel_close`
+## intrinsics — the underlying handle is what `acquire` returns and
+## what callers `send` / `recv` against inside the body.
+##
+## Also ships `RecvSelectable` + `recvable(ch)` — the first
+## `impl Selectable` for the unified `select` block (C.13). Use as:
+##
+##   select
+##     case msg = recvable(ch) => process(msg)
+##     case _   = recvable(ctrl) => shutdown()
+##     default  => non_blocking_fallback()
+##   end
+##
+## Usage:
+##
+##   var ch = channel_new(64)
+##   go consumer(ch)
+##
+##   with chan_scope(ch) do h ->
+##     for i in 0..10
+##       send(h, i)
+##     end
+##   end
+##   # implicit: channel_close(ch). Receiver(s) observe EOF after
+##   # draining queued values.
+##
+##   # On throw inside the body: channel_close(ch) STILL fires — the
+##   # receiver observes EOF. Error context belongs in the Throws
+##   # handler upstream, not in the channel's payload (channel values
+##   # are Int; encoding "this was an error close" would force every
+##   # channel to reserve a sentinel value).
+##
+## Asymmetry note: by deliberate design, release and release_on_throw
+## are identical (both close). Apps that need "poison" semantics can
+## write a separate guard whose release_on_throw sends a sentinel
+## value before closing, but the stdlib primitive does not enshrine
+## any particular sentinel encoding.
+
+import * from std/scoped
+import * from std/selectable
+
+## Canonical Channel constructors (D.10). `Channel` is the built-in
+## TYPE_CHANNEL — these `extend Channel` methods add associated-function
+## syntax. Equivalent to the existing free-fn `channel_new` /
+## `channel_new_unbounded` intrinsics.
+extend Channel
+  ## Allocate a new bounded channel with capacity `cap`.
+  def new(cap: Int): Channel = channel_new(cap)
+
+  ## Allocate a new unbounded channel.
+  def new_unbounded(): Channel = channel_new_unbounded()
+end
+
+## A scoped channel-close guard. Wraps a channel handle so that the
+## handle is closed when the surrounding `with`-block exits — both on
+## normal exit and on throw-unwind.
+struct ChannelGuard
+  handle: Int
+end
+
+extend ChannelGuard with Scoped
+  ## Acquire returns the wrapped channel handle. The channel was opened
+  ## by the caller (via `channel_new` or `channel_new_unbounded`) — the
+  ## guard does not open it.
+  def acquire(self): Int = @handle
+
+  ## Release on normal block exit. Closes the channel; subsequent
+  ## receivers observe EOF after draining queued values.
+  def release(self, value: Int): Void
+    channel_close(value)
+  end
+
+  ## Release on exceptional block exit. Same close — receivers observe
+  ## EOF. Error context flows through the outer Throws handler, not
+  ## through the channel itself.
+  def release_on_throw(self, value: Int, exc_msg: String): Void
+    channel_close(value)
+  end
+end
+
+## Wrap a channel handle for close-on-scope-exit. The handle must already
+## be open (typically from `channel_new(cap)` or `channel_new_unbounded()`).
+## Construction is free — the channel is unaffected until the guard's
+## release fires at block exit.
+def chan_scope(ch: Int): ChannelGuard = ChannelGuard { handle: ch }
+
+# ============================================================================
+# RecvSelectable — Selectable wrapper for channel-recv (C.13 Phase 5 partial)
+# ============================================================================
+
+## A Selectable that observes "channel ch has a value to recv". Use as
+## the right-hand side of a `case x = recvable(ch) => ...` arm in
+## `select`. Constructing the wrapper is free; the channel is
+## unaffected until the select runtime calls `try_poll`.
+##
+## **v1 cancellation-safety caveat:** `try_poll` is destructive — it
+## calls `try_recv` and pops the head value off the queue, stashing it
+## in the returned `Option<Int>` payload. If two RecvSelectable arms in
+## the SAME select observe the SAME channel, the loser's queue entry
+## has already been popped when its arm was abandoned. For the common
+## case of one channel per arm this is fine. Tracked as a follow-up:
+## ship a `channel_peek` intrinsic + non-destructive try_poll variant.
+struct RecvSelectable
+  ch: Int
+end
+
+extend RecvSelectable with Selectable<Int>
+  ## try_poll: destructive recv. Returns Some(value) if a value was
+  ## available, None otherwise. The popped value lives in the Option's
+  ## payload; the select runtime extracts it and binds it to the
+  ## `case x = ...` pattern. See the v1 caveat on the struct.
+  def try_poll(self): Option<Int>
+    return try_recv(@ch)
+  end
+
+  ## register_waker: active-wake via the resource-waiter side-table (C.13.6).
+  ## Kind-tagged key — read-waiters use `@ch` (the natural handle).
+  ## SendSelectable's write-waiters use `@ch | 1`. channel handles are
+  ## 16-byte aligned, so bit 0 is reliably clear and the two keys never
+  ## collide.
+  ##
+  ## Send ops on this channel call notify_all(@ch) (slot just filled,
+  ## receivers interested). channel_close also calls notify_all(@ch).
+  ## Zero spurious wakes from recv-side activity. Same shape Go's
+  ## runtime uses with split recvq / sendq waiter lists per channel.
+  def register_waker(self, frame: Int): Void
+    waiter_register(@ch, frame)
+  end
+
+  def unregister_waker(self, frame: Int): Void
+    waiter_unregister(@ch, frame)
+  end
+
+  ## complete: side-effect-only. The destructive op already happened in
+  ## try_poll (v1 design). Returns 0 — the user's pattern binding is
+  ## set from try_poll's Option payload, not from complete's return.
+  ## See `mir_lower_expr_handlers.qz` op_kind=5 body block.
+  def complete(self): Int
+    return 0
+  end
+end
+
+## Wrap a channel handle as a Selectable. Use inside `select { case x =
+## recvable(ch) => ... }`. The wrapper is free; the channel is
+## unaffected until the select runtime polls the wrapper.
+def recvable(ch: Int): RecvSelectable = RecvSelectable { ch: ch }
+
+# ============================================================================
+# SendSelectable — Selectable wrapper for channel-send (C.13 Phase 5)
+# ============================================================================
+
+## A Selectable that observes "channel ch has space for one more value".
+## Use as the right-hand side of a `case _ = sendable(ch, v) => ...` arm
+## in `select`. Constructing the wrapper is free; the channel is
+## unaffected until the select runtime calls `try_poll`.
+##
+## **v1 cancellation-safety caveat:** `try_poll` is destructive — it
+## calls `try_send` and pushes the value into the channel buffer. The
+## binding payload (`Some(0)`) is just a placeholder for "send
+## completed"; the value is gone-into-the-channel by the time the body
+## runs. Multiple `sendable` arms on the SAME channel will race for the
+## free slot; the loser's value has already been pushed when its arm
+## was abandoned. For the common case of one channel per arm this is
+## fine. Tracked as a follow-up: ship a `channel_send_reserve` /
+## non-destructive try_poll variant.
+struct SendSelectable
+  ch: Int
+  payload: Int
+end
+
+extend SendSelectable with Selectable<Int>
+  ## try_poll: destructive try_send. Returns `Some(0)` if the value was
+  ## accepted into the buffer, `None` if the channel is full. The bound
+  ## payload (0) is a placeholder — channels carry no
+  ## per-send-completion value. See the v1 caveat on the struct.
+  def try_poll(self): Option<Int>
+    if try_send(@ch, @payload)
+      return option_some(0)
+    end
+    return option_none()
+  end
+
+  ## register_waker: active-wake via the resource-waiter side-table (C.13.6).
+  ## Kind-tagged key — write-waiters use `@ch | 1`, distinct from
+  ## RecvSelectable's `@ch` (read-waiters). channel handles are 16-byte
+  ## aligned (malloc invariant; verified 128/128), so bit 0 is reliably
+  ## clear and `ch | 1` is collision-free against any channel handle.
+  ##
+  ## Recv ops on this channel call notify_all(@ch | 1) (slot just freed,
+  ## senders interested). Send ops call notify_all(@ch) (slot just filled,
+  ## receivers interested). close calls BOTH (both sides observe close).
+  ## Zero spurious cross-direction wakes. Same shape Go's runtime uses
+  ## with split recvq / sendq waiter lists per channel.
+  def register_waker(self, frame: Int): Void
+    waiter_register(@ch | 1, frame)
+  end
+
+  def unregister_waker(self, frame: Int): Void
+    waiter_unregister(@ch | 1, frame)
+  end
+
+  ## complete: side-effect-only. The destructive op already happened in
+  ## try_poll (v1 design). Returns 0 — the user's pattern binding is
+  ## set from try_poll's Option payload (also 0), not from complete's
+  ## return. See `mir_lower_expr_handlers.qz` op_kind=5 body block.
+  def complete(self): Int
+    return 0
+  end
+end
+
+## Wrap a channel handle + value for non-blocking send inside `select`.
+## Use inside `select { case _ = sendable(ch, v) => ... }`. The wrapper
+## is free; the channel is unaffected until the select runtime polls
+## the wrapper. Once polled successfully, the value is in the channel.
+def sendable(ch: Int, v: Int): SendSelectable = SendSelectable { ch: ch, payload: v }
+
+# ============================================================================
+# Result-Based Channel Operations — distinguish closed from value
+# ============================================================================
+
+## Blocking receive with Result return.
+## Returns Ok(value) on success, Err(0) on closed channel.
+## Unlike recv(), this correctly handles receiving the value -1 or 0.
+def recv_safe(ch: Int): Result<Int, Int>
+  var opt = try_recv(ch)
+  while not option_is_some(opt)
+    if channel_closed(ch)
+      return Result::Err(0)
+    end
+    sched_yield()
+    opt = try_recv(ch)
+  end
+  return Result::Ok(load(opt, 1))
+end
+
+## Non-blocking receive with Result return.
+## Returns Ok(value) on success, Err(0) on closed, Err(1) on would-block (empty).
+def try_recv_safe(ch: Int): Result<Int, Int>
+  var opt = try_recv(ch)
+  if option_is_some(opt)
+    return Result::Ok(load(opt, 1))
+  end
+  if channel_closed(ch)
+    return Result::Err(0)
+  end
+  return Result::Err(1)
+end
+
+## Async receive with Result return.
+## Suspends the async task (not OS thread) when channel is empty.
+## Returns Ok(value) on success, Err(0) on closed.
+## Must be called from within an async context (go/structured_scope).
+def async_recv_safe(ch: Int): Result<Int, Int>
+  var nfd = channel_notify_fd(ch)
+  var opt = try_recv(ch)
+  while not option_is_some(opt)
+    if channel_closed(ch)
+      return Result::Err(0)
+    end
+    io_suspend(nfd)
+    opt = try_recv(ch)
+  end
+  return Result::Ok(load(opt, 1))
+end
+
+# ============================================================================
+# Oneshot Channels — single-use request-response pattern
+# ============================================================================
+
+## Create a oneshot channel (1-cap, auto-close after first send).
+def oneshot_new(): Int = channel_new(1)
+
+## Send the single value and close the channel.
+## Returns -1 if the channel was already closed, 0 on success.
+def oneshot_send(ch: Int, val: Int): Int
+  if channel_closed(ch)
+    return -1
+  end
+  send(ch, val)
+  channel_close(ch)
+  return 0
+end
+
+## Receive the single value (blocks until sender arrives).
+def oneshot_recv(ch: Int): Int = recv(ch)
+
+## Receive on a oneshot channel with Result return.
+def oneshot_recv_safe(ch: Int): Result<Int, Int>
+  return recv_safe(ch)
+end
+
+# ============================================================================
+# Rendezvous Channels — synchronous hand-off (CSP)
+# ============================================================================
+#
+# Zero-capacity rendezvous channels (channel_new(0)). Sender blocks
+# until receiver arrives, receiver blocks until sender arrives.
+# Synchronous handoff — no buffering. Matches Go's make(chan T)
+# semantics.
+
+## Create a rendezvous channel (zero-capacity, synchronous hand-off).
+def rendezvous_new(): Int = channel_new(0)
+
+# ============================================================================
+# Async Channel Ops — suspend async task instead of blocking OS thread
+# ============================================================================
+
+## Async receive — suspends the async task (not the OS thread) when the
+## channel is empty. Uses io_suspend on the channel's notification pipe
+## fd for event-driven wakeup. When a sender writes to the channel it
+## notifies the pipe, waking this task. Returns the received value, or
+## -1 if the channel is closed and empty.
+def async_recv(ch: Int): Int
+  var nfd = channel_notify_fd(ch)
+  while true
+    var opt = try_recv(ch)
+    if option_is_some(opt)
+      return load(opt, 1)
+    end
+    if channel_closed(ch)
+      return -1
+    end
+    io_suspend(nfd)
+  end
+  return 0
+end
+
+## Async send — suspends the async task when the channel is full.
+## Uses io_suspend on a send notification pipe — try_recv writes to this
+## pipe after dequeuing.
+def async_send(ch: Int, val: Int): Int
+  var nfd = channel_send_notify_fd(ch)
+  while true
+    if try_send(ch, val)
+      return 0
+    end
+    io_suspend(nfd)
+  end
+  return 0
+end
+
+# ============================================================================
+# Observability
+# ============================================================================
+
+## Print structured channel information.
+## Shows capacity, current item count, and closed status.
+def chan_inspect(ch: Int): Void
+  var cap = channel_capacity(ch)
+  var len = channel_size(ch)
+  var closed = channel_closed(ch)
+  var closed_str = "open"
+  if closed
+    closed_str = "closed"
+  end
+  puts("Channel: capacity=#{to_str(cap)}, len=#{to_str(len)}, status=#{closed_str}")
+end

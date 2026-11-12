@@ -1,0 +1,320 @@
+## std/tui/fov.qz — symmetric shadowcasting field of view (Phase 6.5).
+##
+## Implements Albert Ford's symmetric shadowcasting (2019), the modern
+## default for grid-based field-of-view. Symmetric in the sense that A
+## sees B iff B sees A — the property most other classic FOV
+## algorithms (Bresenham, recursive shadowcasting circa 2002, raycast
+## from-origin) violate at edges and corners.
+##
+## **Why symmetric matters.** Asymmetric FOV is the source of the
+## "monster ambush" gameplay bug: the player thinks they're hidden in
+## a corner, but the monster sees them and attacks from cells the
+## player can't see back. Brogue, NetHack, DCSS all spent years
+## working around asymmetric quirks. Symmetric FOV makes the geometry
+## self-consistent.
+##
+## **The algorithm.** From the origin, scan 4 quadrants outward. For
+## each quadrant, walk rows from depth=1 to depth=radius. At each row:
+##
+##   1. Compute the column range visible at this depth, given the
+##      currently-open slope wedge (start_slope, end_slope).
+##   2. Walk columns left-to-right.
+##   3. When you transition from wall to floor, narrow the start_slope
+##      to the slope of the new floor cell.
+##   4. When you transition from floor to wall, recurse into the next
+##      row with end_slope set to the slope of the new wall cell.
+##   5. After the row, if it ended on floor, recurse into the next row
+##      with the current slope wedge.
+##
+## A cell is "visible" if it's a wall (always painted — walls stop
+## light, but they reflect light) or if its center falls strictly
+## inside the slope wedge (the symmetry condition). Slopes are
+## rationals: `slope(col) = (2*col - 1) / (2*depth)` — half-cell
+## offsets ensure tiles aren't on slope boundaries.
+##
+## **Integer arithmetic.** Slopes are stored as `(num, den)` pairs of
+## Ints; comparisons use cross-products to avoid floating-point
+## indeterminacy. The ceiling/floor rounding for visible-column ranges
+## (`round_ties_up`, `round_ties_down`) is hand-written to handle
+## negative numerators correctly under Quartz's truncate-toward-zero
+## integer division.
+##
+## **Public API.**
+##
+##   fov_for_each_visible(origin_x, origin_y, radius, blocks, visit)
+##
+## - `blocks(x, y) -> Bool`: true iff the cell blocks light propagation.
+## - `visit(x, y, distance) -> Void`: called once per visible cell,
+##   `distance` = integer-truncated Euclidean distance from origin.
+## - Origin is always visited with `distance = 0`.
+## - Cells with Euclidean distance > radius are not visited even if
+##   they're inside the slope wedge.
+##
+## **Composes with std/tui/light.qz.** `light_buffer_paint` uses this
+## walker (since v0.6.5) to determine which cells receive contribution
+## from a light source. v0.6.4 used a private Bresenham LOS; the
+## switch to symmetric shadowcasting is observable in dense corridors
+## (lights now spill correctly through narrow gaps that Bresenham
+## occasionally clipped).
+##
+## See `docs/design/TUI_V06_CELL_ENGINE.md` D5 for the design rationale,
+## and Albert Ford's 2019 article "Symmetric Shadowcasting" for the
+## algorithm derivation.
+##
+## @since 5.28.x
+
+# =============================================================================
+# Quadrant ids
+# =============================================================================
+
+## Cardinal quadrants. Each scan covers a 90-degree wedge anchored at
+## the origin and extending outward.
+def QUADRANT_NORTH(): Int = 0
+def QUADRANT_EAST():  Int = 1
+def QUADRANT_SOUTH(): Int = 2
+def QUADRANT_WEST():  Int = 3
+
+# =============================================================================
+# Integer arithmetic helpers
+# =============================================================================
+
+## Newton's-method integer sqrt (truncating). `fov_int_sqrt(0) == 0`,
+## `fov_int_sqrt(15) == 3`, `fov_int_sqrt(16) == 4`. Public so other
+## modules (light.qz) can avoid duplicating it.
+def fov_int_sqrt(n: Int): Int
+  if n <= 0
+    return 0
+  end
+  if n < 4
+    return 1
+  end
+  var x = n
+  var y = (x + 1) / 2
+  while y < x
+    x = y
+    y = (x + n / x) / 2
+  end
+  return x
+end
+
+## Quartz `/` truncates toward zero, so for negative numerators the
+## naive `n / d` differs from mathematical floor by one. This helper
+## returns the true mathematical floor of `n / d` for `d > 0`.
+def _floor_div(n: Int, d: Int): Int
+  if n >= 0
+    return n / d
+  end
+  # n < 0, d > 0: floor(n/d) = -ceil(-n/d) = -((-n + d - 1) / d).
+  return 0 - ((0 - n + d - 1) / d)
+end
+
+## True mathematical ceil of `n / d` for `d > 0`.
+def _ceil_div(n: Int, d: Int): Int
+  if n >= 0
+    return (n + d - 1) / d
+  end
+  # n < 0, d > 0: ceil(n/d) = -floor(-n/d) = -((-n) / d).
+  return 0 - ((0 - n) / d)
+end
+
+## Round `num/den` to the nearest integer, ties going UP (away from
+## zero on the positive side; toward +∞).
+##
+## Method: `floor((num/den) + 1/2) = floor((2*num + den) / (2*den))`.
+## Requires `den > 0`.
+def _round_ties_up(num: Int, den: Int): Int
+  return _floor_div(2 * num + den, 2 * den)
+end
+
+## Round `num/den` to the nearest integer, ties going DOWN (toward -∞).
+##
+## Method: `ceil((num/den) - 1/2) = ceil((2*num - den) / (2*den))`.
+## Requires `den > 0`.
+def _round_ties_down(num: Int, den: Int): Int
+  return _ceil_div(2 * num - den, 2 * den)
+end
+
+# =============================================================================
+# Quadrant transform — local (depth, col) → global (x, y)
+# =============================================================================
+
+## For a given quadrant, compute the global x of the cell at local
+## (depth, col).
+##
+## Quadrant orientations:
+##   NORTH: depth grows upward (-y), col grows rightward (+x).
+##   EAST:  depth grows rightward (+x), col grows downward (+y).
+##   SOUTH: depth grows downward (+y), col grows leftward (-x).
+##   WEST:  depth grows leftward (-x), col grows upward (-y).
+##
+## Each quadrant's "col=0" axis is the one perpendicular to its
+## "depth" axis, in the direction that produces a clockwise sweep
+## around the origin from north.
+def _qt_x(quadrant: Int, depth: Int, col: Int, ox: Int): Int
+  if quadrant == 0  # NORTH: col along +x.
+    return ox + col
+  end
+  if quadrant == 1  # EAST: depth along +x.
+    return ox + depth
+  end
+  if quadrant == 2  # SOUTH: col along -x.
+    return ox - col
+  end
+  # WEST: depth along -x.
+  return ox - depth
+end
+
+def _qt_y(quadrant: Int, depth: Int, col: Int, oy: Int): Int
+  if quadrant == 0  # NORTH: depth along -y.
+    return oy - depth
+  end
+  if quadrant == 1  # EAST: col along +y.
+    return oy + col
+  end
+  if quadrant == 2  # SOUTH: depth along +y.
+    return oy + depth
+  end
+  # WEST: col along -y.
+  return oy - col
+end
+
+# =============================================================================
+# Symmetric shadowcasting scan
+# =============================================================================
+
+## Internal: walk a row at `depth` with the slope wedge
+## `(start_num/start_den, end_num/end_den)`. Recurse into deeper rows
+## as walls and floors are encountered. `radius` caps the scan depth;
+## cells beyond Euclidean radius are walked-but-not-visited so wall
+## tracking remains correct.
+##
+## `blocks` and `visit` are the user callbacks; threaded through every
+## recursive call.
+def _scan(
+  depth: Int, radius: Int,
+  start_num: Int, start_den: Int,
+  end_num: Int, end_den: Int,
+  ox: Int, oy: Int, quadrant: Int,
+  blocks: Fn(Int, Int): Bool,
+  visit: Fn(Int, Int, Int): Void
+): Void
+  if depth > radius
+    return
+  end
+
+  # Empty wedge: start >= end means the row got pruned away by walls.
+  if start_num * end_den >= end_num * start_den
+    return
+  end
+
+  var min_col = _round_ties_up(start_num * depth, start_den)
+  var max_col = _round_ties_down(end_num * depth, end_den)
+
+  var prev_was_wall = false
+  var have_prev = false
+
+  # Mutable tracking copies of the slope wedge — narrowed when a
+  # wall→floor transition happens mid-row.
+  var cur_start_num = start_num
+  var cur_start_den = start_den
+
+  var radius_sq = radius * radius
+
+  var col = min_col
+  while col <= max_col
+    var gx = _qt_x(quadrant, depth, col, ox)
+    var gy = _qt_y(quadrant, depth, col, oy)
+    var dx = gx - ox
+    var dy = gy - oy
+    var dist_sq = dx * dx + dy * dy
+    var in_radius = dist_sq <= radius_sq
+
+    var is_wall = blocks(gx, gy)
+
+    # Symmetry condition: a tile's center is at slope `col/depth`. A cell is
+    # visible iff its center falls inside the slope wedge OR it's a wall (walls
+    # are always visible if reachable in this row; floor cells require the
+    # symmetry condition for A↔B agreement). The wedge is inclusive on the
+    # start (≥) and exclusive on the end (<), which gives each diagonal cell
+    # to exactly one of its two adjacent quadrants — preventing double-visits
+    # at slope=±1 between NORTH/EAST, EAST/SOUTH, SOUTH/WEST, WEST/NORTH.
+    var sym_geq_start = col * cur_start_den >= cur_start_num * depth
+    var sym_lt_end = col * end_den < end_num * depth
+    var is_symmetric = sym_geq_start and sym_lt_end
+
+    # Visit gating: a cell is reported to the caller iff it's inside the
+    # symmetric wedge AND inside the Euclidean radius. Walls at the exact
+    # end-slope boundary (slope=1) are NOT reported here — the adjacent
+    # quadrant's start-slope (slope=-1, inclusive) reports them. This
+    # ensures every visible cell is reported exactly once.
+    if in_radius and is_symmetric
+      var dist = fov_int_sqrt(dist_sq)
+      visit(gx, gy, dist)
+    end
+
+    if have_prev
+      if prev_was_wall and (not is_wall)
+        # Wall → floor: narrow the start slope to this floor cell's leading edge.
+        cur_start_num = 2 * col - 1
+        cur_start_den = 2 * depth
+      end
+      if (not prev_was_wall) and is_wall
+        # Floor → wall: recurse into next row with end slope clamped at this wall.
+        _scan(depth + 1, radius,
+              cur_start_num, cur_start_den,
+              2 * col - 1, 2 * depth,
+              ox, oy, quadrant, blocks, visit)
+      end
+    end
+
+    prev_was_wall = is_wall
+    have_prev = true
+    col += 1
+  end
+
+  # Row ended on floor — continue into next row with the current wedge.
+  if have_prev and (not prev_was_wall)
+    _scan(depth + 1, radius,
+          cur_start_num, cur_start_den,
+          end_num, end_den,
+          ox, oy, quadrant, blocks, visit)
+  end
+end
+
+# =============================================================================
+# Public API
+# =============================================================================
+
+## Walk every cell visible from `(origin_x, origin_y)` within `radius`
+## (Euclidean), respecting `blocks_light` as the LOS predicate. `visit`
+## is called once per visible cell with `(x, y, distance)` where
+## `distance` is the integer-truncated Euclidean distance from origin.
+##
+## The origin is always visited with `distance = 0`.
+##
+## Symmetric: A is visible from B iff B is visible from A. If a wall
+## blocks A→B, it also blocks B→A.
+##
+## Algorithm: Albert Ford's symmetric shadowcasting (2019). 4-quadrant
+## scan from origin, recursive narrowing of slope wedges per
+## wall/floor transition. Integer rational arithmetic; no floats.
+##
+## See module docstring for the algorithm explanation.
+def fov_for_each_visible(
+  origin_x: Int, origin_y: Int, radius: Int,
+  blocks_light: Fn(Int, Int): Bool,
+  visit: Fn(Int, Int, Int): Void
+): Void
+  if radius < 0
+    return
+  end
+  visit(origin_x, origin_y, 0)
+  if radius == 0
+    return
+  end
+  var q = 0
+  while q < 4
+    _scan(1, radius, -1, 1, 1, 1, origin_x, origin_y, q, blocks_light, visit)
+    q += 1
+  end
+end

@@ -1,0 +1,359 @@
+##! # Type Checker Capture Analysis
+##!
+##! Closure capture collection — walks AST to find free variables
+##! that closures need to capture from their enclosing scope.
+##!
+##! @see typecheck_walk Main AST walking module
+
+import typecheck_util
+import typecheck_builtins
+import ast
+import node_constants
+import type_constants
+import * from str_compat
+
+# ============================================================================
+# Lambda Expressions - Capture Collection
+# ============================================================================
+
+## Check if a name is in a list of parameter names.
+def tc_is_param(name: String, param_names: Vec<String>): Int
+  if any?(param_names, pname: String -> name == pname)
+    return 1
+  end
+  return 0
+end
+
+## Check if a name is already in captures list.
+def tc_is_captured(name: String, captures: Vec<String>): Int
+  if any?(captures, cname: String -> name == cname)
+    return 1
+  end
+  return 0
+end
+
+## Recursively collect captured variables from an AST node.
+## Adds free variables to captures vec (variables not in param_names, not builtins,
+## but in outer scope).
+def tc_collect_captures_walk(tc: TypecheckState, ast_storage: ast::AstStorage, node: AstNodeId, param_names: Vec<String>, captures: Vec<String>): Void
+  return if node == 0
+  # B.15d/N3.1 step-4a-2 — some AST slots this walker follows (e.g. a for-node's
+  # `int_val` step slot, or a layout-mismatched range slot) can hold a non-node
+  # integer such as a *type id* rather than a real AstNodeId. Pre-flip those were
+  # the bare TYPE_STRUCT(=7) collapse — a coincidentally in-bounds node index, so
+  # the stray walk was silently harmless. Per-struct nominal ids (≥7000) overflow
+  # the node array. A valid AstNodeId is always in [1, node_count); anything else
+  # is not a walkable expression and carries no captures, so skip it.
+  return if node < 0 or node >= ast::ast_node_count(ast_storage)
+
+  var kind = ast::ast_get_kind(ast_storage, node)
+
+  # Identifier - check if it's a captured variable
+  if kind == node_constants::NODE_IDENT
+    var name = ast::ast_get_str1(ast_storage, node)
+    # Skip if it's a parameter
+    return if tc_is_param(name, param_names)
+    # Skip if already captured
+    return if tc_is_captured(name, captures)
+    # Skip if it's a builtin
+    return if typecheck_builtins::tc_lookup_builtin(tc, name) != type_constants::TYPE_ERROR
+    # Check if it's in outer scope (not just this lambda's scope)
+    var typ = typecheck_util::tc_scope_lookup(tc, name)
+    if typ != type_constants::TYPE_ERROR
+      captures.push(name)
+    end
+    return
+  end
+
+  # Binary - walk both sides
+  if kind == node_constants::NODE_BINARY
+    var left = ast::ast_get_left(ast_storage, node)
+    var right = ast::ast_get_right(ast_storage, node)
+    tc_collect_captures_walk(tc, ast_storage, left, param_names, captures)
+    tc_collect_captures_walk(tc, ast_storage, right, param_names, captures)
+    return
+  end
+
+  # Unary - walk operand
+  if kind == node_constants::NODE_UNARY
+    var operand = ast::ast_get_left(ast_storage, node)
+    tc_collect_captures_walk(tc, ast_storage, operand, param_names, captures)
+    return
+  end
+
+  # Call - walk callee and arguments
+  if kind == node_constants::NODE_CALL
+    var callee = ast::ast_get_left(ast_storage, node)
+    var args = ast::ast_get_children(ast_storage, node)
+    tc_collect_captures_walk(tc, ast_storage, callee, param_names, captures)
+    if args != 0
+      each(args, arg: Int -> tc_collect_captures_walk(tc, ast_storage, arg, param_names, captures))
+    end
+    return
+  end
+
+  # If - walk condition, then, else
+  if kind == node_constants::NODE_IF
+    var cond = ast::ast_get_left(ast_storage, node)
+    var then_block = ast::ast_get_right(ast_storage, node)
+    var else_block = ast::ast_get_extra(ast_storage, node)
+    tc_collect_captures_walk(tc, ast_storage, cond, param_names, captures)
+    tc_collect_captures_walk(tc, ast_storage, then_block, param_names, captures)
+    tc_collect_captures_walk(tc, ast_storage, else_block, param_names, captures)
+    return
+  end
+
+  # Block - walk all statements
+  if kind == node_constants::NODE_BLOCK
+    var stmts = ast::ast_get_children(ast_storage, node)
+    if stmts != 0
+      each(stmts, stmt: Int -> tc_collect_captures_walk(tc, ast_storage, stmt, param_names, captures))
+    end
+    return
+  end
+
+  # With-block (Piezo C.1): walk handler expression AND body. Both can
+  # reference closure-captured identifiers.
+  if kind == node_constants::NODE_WITH
+    var handler_n = ast::ast_get_left(ast_storage, node)
+    var body_n = ast::ast_get_right(ast_storage, node)
+    tc_collect_captures_walk(tc, ast_storage, handler_n, param_names, captures)
+    tc_collect_captures_walk(tc, ast_storage, body_n, param_names, captures)
+    return
+  end
+
+  # Return - walk value
+  if kind == node_constants::NODE_RETURN
+    var val = ast::ast_get_left(ast_storage, node)
+    tc_collect_captures_walk(tc, ast_storage, val, param_names, captures)
+    return
+  end
+
+  # Let - walk initializer (but add binding to params to shadow).
+  # NODE_LET stores its init in the `left` slot (ast.qz:1337
+  # `ast_let` / `s.lefts.push(value)`), not `right`. Reading `right`
+  # silently misses captures inside `var q = p` — pre-fix, QZ1301
+  # spawn safety only fired on bare-expression captures like
+  # `(-> { p })`, never `(-> { var q = p; ... })`.
+  if kind == node_constants::NODE_LET
+    # WS1a — consistency with the MIR capture walker (mir.qz mir_collect_captures_walk).
+    # A BARE reassignment `name = expr` lowers to NODE_LET int_val==0 and rebinds an
+    # EXISTING slot; when `name` is an outer local it is a mut-CAPTURE, and a WRITE-ONLY
+    # reassignment `{ a = expr }` never references `a` in the init, so without this the
+    # tc walker would not see `a` as captured — disagreeing with MIR on escape/spawn
+    # (Send/Sync, QZ1301) analysis. Mirror the NODE_IDENT gate: not a param, not already
+    # captured, not a builtin, resolves in an outer scope. int_val==1 (a fresh `var`
+    # decl) introduces a NEW local and is NOT a capture.
+    if ast::ast_get_int_val(ast_storage, node) == 0
+      var let_name = ast::ast_get_str1(ast_storage, node)
+      if str_byte_len(let_name) > 0
+        if tc_is_param(let_name, param_names) == 0
+          if tc_is_captured(let_name, captures) == 0
+            if typecheck_builtins::tc_lookup_builtin(tc, let_name) == type_constants::TYPE_ERROR
+              if typecheck_util::tc_scope_lookup(tc, let_name) != type_constants::TYPE_ERROR
+                captures.push(let_name)
+              end
+            end
+          end
+        end
+      end
+    end
+    var init = ast::ast_get_left(ast_storage, node)
+    tc_collect_captures_walk(tc, ast_storage, init, param_names, captures)
+    return
+  end
+
+  # ExprStmt - walk expression
+  if kind == node_constants::NODE_EXPR_STMT
+    var expr = ast::ast_get_left(ast_storage, node)
+    tc_collect_captures_walk(tc, ast_storage, expr, param_names, captures)
+    return
+  end
+
+  # Index - walk array and index
+  if kind == node_constants::NODE_INDEX
+    var arr = ast::ast_get_left(ast_storage, node)
+    var idx = ast::ast_get_right(ast_storage, node)
+    tc_collect_captures_walk(tc, ast_storage, arr, param_names, captures)
+    tc_collect_captures_walk(tc, ast_storage, idx, param_names, captures)
+    return
+  end
+
+  # Spread operator - walk inner expression
+  if kind == node_constants::NODE_SPREAD
+    tc_collect_captures_walk(tc, ast_storage, ast::ast_get_left(ast_storage, node), param_names, captures)
+    return
+  end
+
+  # Array literal - walk elements
+  if kind == node_constants::NODE_ARRAY or kind == node_constants::NODE_TUPLE_LITERAL
+    var elements = ast::ast_get_children(ast_storage, node)
+    if elements != 0
+      each(elements, elem: Int -> tc_collect_captures_walk(tc, ast_storage, elem, param_names, captures))
+    end
+    return
+  end
+
+  # Set literal - walk elements
+  if kind == node_constants::NODE_SET_LITERAL
+    var elements = ast::ast_get_children(ast_storage, node)
+    if elements != 0
+      each(elements, elem: Int -> tc_collect_captures_walk(tc, ast_storage, elem, param_names, captures))
+    end
+    return
+  end
+
+  # Map literal - walk keys and values
+  if kind == node_constants::NODE_MAP_LIT
+    var keys = ast::ast_get_extra(ast_storage, node)
+    var values = ast::ast_get_children(ast_storage, node)
+    if keys != 0
+      var count = vec_size(keys)
+      for i in 0..count
+        var key = keys[i]
+        var val = values[i]
+        tc_collect_captures_walk(tc, ast_storage, key, param_names, captures)
+        tc_collect_captures_walk(tc, ast_storage, val, param_names, captures)
+      end
+    end
+    return
+  end
+
+  # Field access - walk base
+  if kind == node_constants::NODE_FIELD_ACCESS
+    var base = ast::ast_get_left(ast_storage, node)
+    tc_collect_captures_walk(tc, ast_storage, base, param_names, captures)
+    return
+  end
+
+  # Struct init - walk field values
+  if kind == node_constants::NODE_STRUCT_INIT
+    var fields = ast::ast_get_children(ast_storage, node)
+    if fields != 0
+      each(fields, field: Int -> tc_collect_captures_walk(tc, ast_storage, field, param_names, captures))
+    end
+    # C.1 spread base lives in `lefts` until tc desugar.
+    var su_base = ast::ast_get_left(ast_storage, node)
+    if su_base != 0
+      tc_collect_captures_walk(tc, ast_storage, su_base, param_names, captures)
+    end
+    return
+  end
+
+  # Match - walk subject and arm expressions
+  if kind == node_constants::NODE_MATCH
+    var subject = ast::ast_get_left(ast_storage, node)
+    var arms = ast::ast_get_children(ast_storage, node)
+    tc_collect_captures_walk(tc, ast_storage, subject, param_names, captures)
+    if arms != 0
+      each(arms, arm: Int -> {
+        var arm_body = ast::ast_get_right(ast_storage, arm)
+        tc_collect_captures_walk(tc, ast_storage, arm_body, param_names, captures)
+      })
+    end
+    return
+  end
+
+  # While - walk condition and body
+  if kind == node_constants::NODE_WHILE
+    var cond = ast::ast_get_left(ast_storage, node)
+    var body = ast::ast_get_right(ast_storage, node)
+    tc_collect_captures_walk(tc, ast_storage, cond, param_names, captures)
+    tc_collect_captures_walk(tc, ast_storage, body, param_names, captures)
+    return
+  end
+
+  # For - walk range, step, and body (skip iterator as it's a new binding)
+  if kind == node_constants::NODE_FOR
+    var range_start = ast::ast_get_left(ast_storage, node)
+    var range_end = ast::ast_get_right(ast_storage, node)
+    var body = ast::ast_get_extra(ast_storage, node)
+    tc_collect_captures_walk(tc, ast_storage, range_start, param_names, captures)
+    tc_collect_captures_walk(tc, ast_storage, range_end, param_names, captures)
+    # Walk step expression if present
+    var cap_step = ast::ast_get_int_val(ast_storage, node)
+    if cap_step > 0
+      tc_collect_captures_walk(tc, ast_storage, cap_step, param_names, captures)
+    end
+    tc_collect_captures_walk(tc, ast_storage, body, param_names, captures)
+    return
+  end
+
+  if kind == node_constants::NODE_FOR_AWAIT
+    var fa_ch = ast::ast_get_left(ast_storage, node)
+    var fa_body = ast::ast_get_right(ast_storage, node)
+    tc_collect_captures_walk(tc, ast_storage, fa_ch, param_names, captures)
+    tc_collect_captures_walk(tc, ast_storage, fa_body, param_names, captures)
+    return
+  end
+
+  # Assign - walk value
+  if kind == node_constants::NODE_ASSIGN
+    var val = ast::ast_get_right(ast_storage, node)
+    tc_collect_captures_walk(tc, ast_storage, val, param_names, captures)
+    return
+  end
+
+  # Enum::Variant(payload, ...) — payloads in `children`. Mirrors the
+  # mir_collect_captures_walk fix for LAMBDA_CAPTURE_BODY_NOT_REWRITTEN_TO_ENV;
+  # Send/Sync checks on closures that construct enum variants from outer
+  # locals would otherwise silently miss the captures.
+  if kind == node_constants::NODE_ENUM_ACCESS
+    var ea_payloads = ast::ast_get_children(ast_storage, node)
+    if ea_payloads != 0
+      each(ea_payloads, p: Int -> tc_collect_captures_walk(tc, ast_storage, p, param_names, captures))
+    end
+    return
+  end
+
+  # `expr is Variant` — subject in `left`.
+  if kind == node_constants::NODE_IS_CHECK
+    tc_collect_captures_walk(tc, ast_storage, ast::ast_get_left(ast_storage, node), param_names, captures)
+    return
+  end
+
+  # `expr as Type` — base in `left`.
+  if kind == node_constants::NODE_TYPE_CAST
+    tc_collect_captures_walk(tc, ast_storage, ast::ast_get_left(ast_storage, node), param_names, captures)
+    return
+  end
+
+  # `yield expr` — value in `left`.
+  if kind == node_constants::NODE_YIELD
+    tc_collect_captures_walk(tc, ast_storage, ast::ast_get_left(ast_storage, node), param_names, captures)
+    return
+  end
+
+  # Nested lambda - walk body with combined params (lambda params shadow outer)
+  if kind == node_constants::NODE_LAMBDA
+    var inner_params = ast::ast_get_left(ast_storage, node)
+    var inner_body = ast::ast_get_right(ast_storage, node)
+    # Combine outer params with inner params for shadowing
+    var combined = vec_new<String>()
+    each(param_names, p: String -> combined.push(p))
+    if inner_params != 0
+      each(inner_params, p: Int -> combined.push(ast::ast_get_str1(ast_storage, p)))
+    end
+    tc_collect_captures_walk(tc, ast_storage, inner_body, combined, captures)
+    return
+  end
+
+  # Default: literals and other nodes with no sub-expressions
+end
+
+## Collect captured variables for a lambda.
+## Finds free variables in the lambda body that are bound in outer scope.
+##
+## Parameters:
+##   tc          - Type checker context
+##   ast_storage - AST storage handle
+##   lambda_node - Lambda AST node handle
+##   param_names - Vector of lambda parameter names (strings as Int)
+##
+## Returns: Vector of captured variable names (strings as Int)
+def tc_collect_captures(tc: TypecheckState, ast_storage: ast::AstStorage, lambda_node: AstNodeId, param_names: Vec<String>): Vec<String>
+  var captures = vec_new<String>()
+  var body = ast::ast_get_right(ast_storage, lambda_node)
+  tc_collect_captures_walk(tc, ast_storage, body, param_names, captures)
+  return captures
+end

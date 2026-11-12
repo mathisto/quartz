@@ -1,0 +1,256 @@
+# NET.3c — TLS 1.3 X25519MLKEM768 hybrid combiner smoke.
+#
+# Verifies the std/crypto/hybrid.qz surface:
+#   - hybrid_x25519_mlkem768_keygen_internal — determinism on fixed seeds.
+#   - hybrid_x25519_mlkem768_encaps_internal — determinism + valid round-trip.
+#   - hybrid_x25519_mlkem768_decaps_internal — round-trip equality.
+#   - 50 randomised top-level round-trips via getentropy.
+#   - Tamper rejection — flipping a bit in the mlkem_ct portion of ct
+#     diverges the first 32B of the resulting shared secret (mlkem's
+#     implicit-reject branch); flipping a bit in the x25519_eph_pub portion
+#     diverges the last 32B (different ECDH point).
+#   - Low-order x25519 peer pubkey: encaps + decaps with all-zero x25519
+#     half is rejected with return 0.
+
+import * from ffi/socket
+import * from std/core/crypto/curve25519
+import * from std/core/crypto/mlkem
+import * from std/core/crypto/secret  # Secret<Int> + secret_wrap (NET.4.1 B)
+import * from std/crypto/hybrid
+# Pulled in because mlkem's internal CT helpers call subtle's ct_eq_byte /
+# ct_select_byte. Quartz's cross-module name mangling produces a
+# `subtle$ct_eq_byte` reference at the mlkem call sites; without an
+# explicit import in the entry spec, the resolver emits the call but
+# elides the function body.
+import * from std/core/crypto/subtle
+
+var g_total: Int = 0
+var g_passed: Int = 0
+
+def check_eq_int(label: String, got: Int, want: Int): Void
+  g_total = g_total + 1
+  if got == want
+    g_passed = g_passed + 1
+    puts("OK   " + label)
+    return
+  end
+  puts("FAIL " + label)
+  puts("       got:  " + to_str(got))
+  puts("       want: " + to_str(want))
+end
+
+def check_true(label: String, cond: Int): Void
+  g_total = g_total + 1
+  if cond != 0
+    g_passed = g_passed + 1
+    puts("OK   " + label)
+    return
+  end
+  puts("FAIL " + label)
+end
+
+def bytes_equal(a: Int, b: Int, n: Int): Int
+  var i = 0
+  while i < n
+    if ptr_read_byte(a + i) != ptr_read_byte(b + i) then return 0 end
+    i += 1
+  end
+  return 1
+end
+
+# Deterministic LCG fill for test seeds.
+var _g_lcg_state: Int = 0
+
+def _lcg_init(s: Int): Void
+  _g_lcg_state = s
+end
+
+def _lcg_next(): Int
+  _g_lcg_state = (_g_lcg_state * 1103515245 + 12345) & 2147483647
+  return _g_lcg_state
+end
+
+def fill_bytes_lcg(buf: Int, len: Int, seed: Int): Void
+  _lcg_init(seed)
+  var i = 0
+  while i < len
+    ptr_write_byte(buf + i, _lcg_next() & 255)
+    i += 1
+  end
+end
+
+def test_internal_roundtrip(): Void
+  puts("--- hybrid internal round-trip (deterministic seeds) ---")
+
+  var d         = malloc(32)
+  var z         = malloc(32)
+  var x25519_sk = malloc(32)
+  var m         = malloc(32)
+  var eph_sk    = malloc(32)
+  var ek        = malloc(1216)
+  var dk_seed   = malloc(96)
+  var ct        = malloc(1120)
+  var ss_a      = malloc(64)
+  var ss_b      = malloc(64)
+
+  var iter = 0
+  while iter < 5
+    fill_bytes_lcg(d,         32, 10000 + iter)
+    fill_bytes_lcg(z,         32, 20000 + iter)
+    fill_bytes_lcg(x25519_sk, 32, 30000 + iter)
+    fill_bytes_lcg(m,         32, 40000 + iter)
+    fill_bytes_lcg(eph_sk,    32, 50000 + iter)
+
+    hybrid_x25519_mlkem768_keygen_internal(ek, dk_seed, secret_wrap(d), secret_wrap(z), secret_wrap(x25519_sk))
+    var rc1 = hybrid_x25519_mlkem768_encaps_internal(ct, ss_a, ek, secret_wrap(m), secret_wrap(eph_sk))
+    var rc2 = hybrid_x25519_mlkem768_decaps_internal(ss_b, ct, secret_wrap(dk_seed))
+
+    check_eq_int("iter " + to_str(iter) + ": encaps rc==1", rc1, 1)
+    check_eq_int("iter " + to_str(iter) + ": decaps rc==1", rc2, 1)
+    check_true("iter " + to_str(iter) + ": ss_encaps == ss_decaps", bytes_equal(ss_a, ss_b, 64))
+    iter += 1
+  end
+
+  free(d); free(z); free(x25519_sk); free(m); free(eph_sk)
+  free(ek); free(dk_seed); free(ct); free(ss_a); free(ss_b)
+end
+
+def test_keygen_determinism(): Void
+  puts("")
+  puts("--- hybrid_keygen_internal determinism ---")
+  var d = malloc(32); var z = malloc(32); var x25519_sk = malloc(32)
+  var ek1 = malloc(1216); var dk1 = malloc(96)
+  var ek2 = malloc(1216); var dk2 = malloc(96)
+  fill_bytes_lcg(d,         32, 7)
+  fill_bytes_lcg(z,         32, 13)
+  fill_bytes_lcg(x25519_sk, 32, 23)
+  hybrid_x25519_mlkem768_keygen_internal(ek1, dk1, secret_wrap(d), secret_wrap(z), secret_wrap(x25519_sk))
+  hybrid_x25519_mlkem768_keygen_internal(ek2, dk2, secret_wrap(d), secret_wrap(z), secret_wrap(x25519_sk))
+  check_true("same (d,z,sk) → byte-identical ek",      bytes_equal(ek1, ek2, 1216))
+  check_true("same (d,z,sk) → byte-identical dk_seed", bytes_equal(dk1, dk2, 96))
+  free(d); free(z); free(x25519_sk); free(ek1); free(dk1); free(ek2); free(dk2)
+end
+
+def test_toplevel_roundtrip(): Void
+  puts("")
+  puts("--- hybrid (top-level randomised) round-trip ×50 ---")
+  var ek = malloc(1216)
+  var dk_seed = malloc(96)
+  var ct = malloc(1120)
+  var ss_a = malloc(64)
+  var ss_b = malloc(64)
+
+  var n_ok = 0
+  var iter = 0
+  while iter < 50
+    hybrid_x25519_mlkem768_keygen(ek, dk_seed)
+    var rc1 = hybrid_x25519_mlkem768_encaps(ct, ss_a, ek)
+    var rc2 = hybrid_x25519_mlkem768_decaps(ss_b, ct, dk_seed)
+    if rc1 == 1 and rc2 == 1 and bytes_equal(ss_a, ss_b, 64) == 1
+      n_ok += 1
+    end
+    iter += 1
+  end
+  check_eq_int("50 iterations: all ss_encaps == ss_decaps", n_ok, 50)
+
+  free(ek); free(dk_seed); free(ct); free(ss_a); free(ss_b)
+end
+
+def test_tamper_mlkem_half(): Void
+  puts("")
+  puts("--- tamper rejection: ML-KEM half (ct[0..1088]) ---")
+  var d = malloc(32); var z = malloc(32); var x25519_sk = malloc(32)
+  var m = malloc(32); var eph_sk = malloc(32)
+  var ek = malloc(1216); var dk_seed = malloc(96)
+  var ct = malloc(1120); var ct_t = malloc(1120)
+  var ss_a = malloc(64); var ss_b = malloc(64)
+
+  fill_bytes_lcg(d, 32, 11); fill_bytes_lcg(z, 32, 13); fill_bytes_lcg(x25519_sk, 32, 17)
+  fill_bytes_lcg(m, 32, 19); fill_bytes_lcg(eph_sk, 32, 23)
+  hybrid_x25519_mlkem768_keygen_internal(ek, dk_seed, secret_wrap(d), secret_wrap(z), secret_wrap(x25519_sk))
+  hybrid_x25519_mlkem768_encaps_internal(ct, ss_a, ek, secret_wrap(m), secret_wrap(eph_sk))
+
+  # Tamper byte 5 of the mlkem half.
+  memcpy(ct_t, ct, 1120)
+  ptr_write_byte(ct_t + 5, ptr_read_byte(ct_t + 5) ^ 1)
+  hybrid_x25519_mlkem768_decaps_internal(ss_b, ct_t, secret_wrap(dk_seed))
+
+  # The mlkem half (ss[0..32]) must diverge via implicit-reject;
+  # the x25519 half (ss[32..64]) is unchanged (eph_pub untouched).
+  check_true("mlkem half (ss[0..32]) diverges", 1 - bytes_equal(ss_a, ss_b, 32))
+  check_true("x25519 half (ss[32..64]) unchanged", bytes_equal(ss_a + 32, ss_b + 32, 32))
+
+  free(d); free(z); free(x25519_sk); free(m); free(eph_sk)
+  free(ek); free(dk_seed); free(ct); free(ct_t); free(ss_a); free(ss_b)
+end
+
+def test_tamper_x25519_half(): Void
+  puts("")
+  puts("--- tamper rejection: x25519 half (ct[1088..1120]) ---")
+  var d = malloc(32); var z = malloc(32); var x25519_sk = malloc(32)
+  var m = malloc(32); var eph_sk = malloc(32)
+  var ek = malloc(1216); var dk_seed = malloc(96)
+  var ct = malloc(1120); var ct_t = malloc(1120)
+  var ss_a = malloc(64); var ss_b = malloc(64)
+
+  fill_bytes_lcg(d, 32, 71); fill_bytes_lcg(z, 32, 73); fill_bytes_lcg(x25519_sk, 32, 77)
+  fill_bytes_lcg(m, 32, 79); fill_bytes_lcg(eph_sk, 32, 83)
+  hybrid_x25519_mlkem768_keygen_internal(ek, dk_seed, secret_wrap(d), secret_wrap(z), secret_wrap(x25519_sk))
+  hybrid_x25519_mlkem768_encaps_internal(ct, ss_a, ek, secret_wrap(m), secret_wrap(eph_sk))
+
+  # Tamper byte 5 of the x25519 ephemeral pubkey (ct[1088 + 5]).
+  memcpy(ct_t, ct, 1120)
+  ptr_write_byte(ct_t + 1093, ptr_read_byte(ct_t + 1093) ^ 2)
+  var rc = hybrid_x25519_mlkem768_decaps_internal(ss_b, ct_t, secret_wrap(dk_seed))
+
+  # x25519 ECDH should give a different point (assuming it's not all-zero,
+  # which it isn't for a single-bit flip on a random key). mlkem half is
+  # also fed through implicit reject because the FO compare on
+  # K-PKE.Encrypt(ek_PKE, m', r') uses the unchanged mlkem half of ct.
+  # Both halves of ss should diverge.
+  check_eq_int("decaps rc==1 (x25519 still non-zero)", rc, 1)
+  # The mlkem half is unchanged by tampering x25519 (mlkem only sees ct[0..1088])
+  check_true("mlkem half (ss[0..32]) unchanged", bytes_equal(ss_a, ss_b, 32))
+  check_true("x25519 half (ss[32..64]) diverges", 1 - bytes_equal(ss_a + 32, ss_b + 32, 32))
+
+  free(d); free(z); free(x25519_sk); free(m); free(eph_sk)
+  free(ek); free(dk_seed); free(ct); free(ct_t); free(ss_a); free(ss_b)
+end
+
+def test_lowzero_x25519_rejection(): Void
+  puts("")
+  puts("--- low-order x25519 rejection (all-zero peer pubkey) ---")
+  var d = malloc(32); var z = malloc(32); var x25519_sk = malloc(32)
+  var m = malloc(32); var eph_sk = malloc(32)
+  var ek = malloc(1216); var dk_seed = malloc(96)
+  var ct = malloc(1120); var ct_z = malloc(1120)
+  var ss_a = malloc(64); var ss_b = malloc(64)
+
+  fill_bytes_lcg(d, 32, 31); fill_bytes_lcg(z, 32, 37); fill_bytes_lcg(x25519_sk, 32, 41)
+  fill_bytes_lcg(m, 32, 43); fill_bytes_lcg(eph_sk, 32, 47)
+  hybrid_x25519_mlkem768_keygen_internal(ek, dk_seed, secret_wrap(d), secret_wrap(z), secret_wrap(x25519_sk))
+  hybrid_x25519_mlkem768_encaps_internal(ct, ss_a, ek, secret_wrap(m), secret_wrap(eph_sk))
+
+  # Force x25519 eph_pub to all-zero — low-order point that gives ECDH = 0.
+  memcpy(ct_z, ct, 1120)
+  memset(ct_z + 1088, 0, 32)
+  var rc = hybrid_x25519_mlkem768_decaps_internal(ss_b, ct_z, secret_wrap(dk_seed))
+  check_eq_int("decaps with all-zero x25519 → rc=0", rc, 0)
+
+  free(d); free(z); free(x25519_sk); free(m); free(eph_sk)
+  free(ek); free(dk_seed); free(ct); free(ct_z); free(ss_a); free(ss_b)
+end
+
+def main(): Int
+  test_internal_roundtrip()
+  test_keygen_determinism()
+  test_toplevel_roundtrip()
+  test_tamper_mlkem_half()
+  test_tamper_x25519_half()
+  test_lowzero_x25519_rejection()
+
+  puts("")
+  puts(to_str(g_passed) + "/" + to_str(g_total) + " hybrid checks green")
+  if g_passed == g_total then return 0 end
+  return 1
+end

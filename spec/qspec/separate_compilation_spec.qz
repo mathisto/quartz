@@ -1,0 +1,357 @@
+##! Separate Compilation (P.3) — QSpec tests
+##!
+##! Tests that --separate flag produces per-module .ll files that:
+##! 1. Are individually valid LLVM IR
+##! 2. Can be compiled to .o and linked
+##! 3. Produce correct runtime output
+##!
+##! Uses subprocess compilation since we need to invoke the compiler with --separate.
+##! @since 5.26.0
+##
+## Contract:
+##   1. Cross-module global variables work.
+##   2. Diamond imports: a imports.
+##   3. Monomorphized generics with linkonce_odr.
+##   4. Produces separate .ll files.
+##   5. String constants are per-module.
+##   6. Two-module program links and.
+
+import * from qspec
+import * from qspec/subprocess
+
+# =============================================================================
+# Test Helpers
+# =============================================================================
+
+var _sep_counter = 0
+
+def _sep_next_id(): Int
+  _sep_counter = _sep_counter + 1
+  return _sep_counter
+end
+
+def _sep_dir(id: Int): String
+  return "/tmp/_qspec_sep_" + id.to_s()
+end
+
+## Write multi-file project to temp dir, compile with --separate, return dir path.
+## files: flat Vec of [filename, source, filename, source, ...]
+## main_idx: which pair is the entry point (0-indexed)
+## Returns dir path on success, empty string on failure.
+def _sep_compile(files: Vec, main_idx: Int): String
+  var id = _sep_next_id()
+  var dir = _sep_dir(id)
+  mkdir(dir)
+
+  var main_path = ""
+  var i = 0
+  while i < files.size
+    var fname = as_string(files[i])
+    var src = as_string(files[i + 1])
+    var fpath = dir + "/" + fname
+    write_file(fpath, src)
+    if i / 2 == main_idx
+      main_path = fpath
+    end
+    i = i + 2
+  end
+
+  var compiler = getenv("QUARTZ_COMPILER")
+  if compiler.size == 0
+    return ""
+  end
+
+  # Resolve relative paths to absolute (cd in the command breaks relative paths)
+  var cwd = getcwd()
+  if not str_starts_with(compiler, "/")
+    compiler = cwd + "/" + compiler
+  end
+
+  # Compile with --separate (cd to dir so .quartz-cache/sep/ is local)
+  var cmd = "cd " + dir + " && " + compiler + " --separate --no-cache -I " + dir
+  var std_path = getenv("QUARTZ_STD")
+  if std_path.size > 0
+    if not str_starts_with(std_path, "/")
+      std_path = cwd + "/" + std_path
+    end
+    cmd = cmd + " -I " + std_path
+  end
+  cmd = cmd + " " + main_path + " > " + dir + "/manifest.txt 2> " + dir + "/compile.err"
+
+  var raw = system(cmd)
+  var exit_code = band(shr(raw, 8), 255)
+  if exit_code != 0
+    return ""
+  end
+
+  return dir
+end
+
+## Compile .ll files to .o, link, and run. Return stdout.
+def _sep_find_llc(): String
+  # Try PATH first, then common install locations
+  if system("llc --version > /dev/null 2>&1") == 0
+    return "llc"
+  end
+  if system("/opt/homebrew/opt/llvm/bin/llc --version > /dev/null 2>&1") == 0
+    return "/opt/homebrew/opt/llvm/bin/llc"
+  end
+  if system("/opt/homebrew/Cellar/llvm@20/20.1.8/bin/llc --version > /dev/null 2>&1") == 0
+    return "/opt/homebrew/Cellar/llvm@20/20.1.8/bin/llc"
+  end
+  if system("/usr/lib/llvm-20/bin/llc --version > /dev/null 2>&1") == 0
+    return "/usr/lib/llvm-20/bin/llc"
+  end
+  if system("/usr/lib/llvm-19/bin/llc --version > /dev/null 2>&1") == 0
+    return "/usr/lib/llvm-19/bin/llc"
+  end
+  return ""
+end
+
+def _sep_link_and_run(dir: String): String
+  var manifest = read_file(dir + "/manifest.txt")
+  if manifest.size == 0
+    # Manifest goes to stderr for --separate
+    manifest = read_file(dir + "/compile.err")
+  end
+  var lines = str_split(manifest, "\n")
+
+  var llc_path = _sep_find_llc()
+  if llc_path.size == 0
+    return "FAIL:llc:not found"
+  end
+
+  # Compile each .ll to .o (paths are relative to dir)
+  var obj_files = ""
+  var i = 0
+  while i < lines.size
+    var ll = lines[i]
+    if ll.size > 0 and str_contains(ll, ".ll")
+      # .ll paths are relative (e.g. .quartz-cache/sep/helper.ll)
+      # Make absolute by prepending dir
+      var abs_ll = dir + "/" + ll
+      var abs_o = str_replace(abs_ll, ".ll", ".o")
+      var cmd = llc_path + " -filetype=obj " + abs_ll + " -o " + abs_o + " 2>/dev/null"
+      var raw = system(cmd)
+      var ec = band(shr(raw, 8), 255)
+      if ec != 0
+        return "FAIL:llc:" + ll
+      end
+      obj_files = obj_files + " " + abs_o
+    end
+    i += 1
+  end
+
+  # Link
+  var bin_path = dir + "/test_bin"
+  var link_cmd = "clang " + obj_files + " -o " + bin_path + " 2>/dev/null"
+  var link_raw = system(link_cmd)
+  var link_ec = band(shr(link_raw, 8), 255)
+  if link_ec != 0
+    return "FAIL:link"
+  end
+
+  # Run
+  var out_path = dir + "/run.out"
+  var run_cmd = bin_path + " > " + out_path + " 2>/dev/null"
+  var _run = system(run_cmd)
+  return read_file(out_path)
+end
+
+## Count .ll file entries in the manifest/compile.err
+def _sep_count_modules(dir: String): Int
+  var manifest = read_file(dir + "/manifest.txt")
+  if manifest.size == 0
+    manifest = read_file(dir + "/compile.err")
+  end
+  var lines = str_split(manifest, "\n")
+  var count = 0
+  var i = 0
+  while i < lines.size
+    if str_contains(lines[i], ".ll")
+      count += 1
+    end
+    i += 1
+  end
+  return count
+end
+
+## Cleanup temp dir
+def _sep_cleanup(dir: String): Void
+  var _r = system("rm -rf " + dir + " 2>/dev/null")
+end
+
+# =============================================================================
+# Tests
+# =============================================================================
+
+def main(): Int
+  describe("Separate Compilation (P.3)") do ->
+
+    it("produces separate .ll files for each module") do ->
+      var files = vec_new()
+      files.push(as_int("helper.qz"))
+      files.push(as_int("def helper_add(a: Int, b: Int): Int = a + b\n"))
+      files.push(as_int("main.qz"))
+      files.push(as_int("""
+        import helper
+        def main(): Int
+          puts(helper::helper_add(3, 4).to_s())
+          return 0
+        end
+      """))
+
+      var dir = _sep_compile(files, 1)
+      assert_gt(dir.size, 0)
+      var count = _sep_count_modules(dir)
+      assert_gt(count, 1)
+      _sep_cleanup(dir)
+    end
+
+    it("two-module program links and runs correctly") do ->
+      var files = vec_new()
+      files.push(as_int("helper.qz"))
+      files.push(as_int("""
+        def helper_double(x: Int): Int = x * 2
+        def helper_greet(): String = "hello"
+      """))
+      files.push(as_int("main.qz"))
+      files.push(as_int("""
+        import helper
+        def main(): Int
+          puts(helper::helper_double(21).to_s())
+          puts(helper::helper_greet())
+          return 0
+        end
+      """))
+
+      var dir = _sep_compile(files, 1)
+      assert_gt(dir.size, 0)
+      var output = _sep_link_and_run(dir)
+      assert_eq_str(output, "42\nhello\n")
+      _sep_cleanup(dir)
+    end
+
+    it("diamond imports: A imports B and C, both import D") do ->
+      var files = vec_new()
+      files.push(as_int("base.qz"))
+      files.push(as_int("""
+        def base_value(): Int = 100
+      """))
+      files.push(as_int("liba.qz"))
+      files.push(as_int("""
+        import base
+        def liba_get(): Int = base::base_value() + 1
+      """))
+      files.push(as_int("libb.qz"))
+      files.push(as_int("""
+        import base
+        def libb_get(): Int = base::base_value() + 2
+      """))
+      files.push(as_int("main.qz"))
+      files.push(as_int("""
+        import liba
+        import libb
+        def main(): Int
+          puts(liba::liba_get().to_s())
+          puts(libb::libb_get().to_s())
+          return 0
+        end
+      """))
+
+      var dir = _sep_compile(files, 3)
+      assert_gt(dir.size, 0)
+      var count = _sep_count_modules(dir)
+      assert_gt(count, 3)
+      var output = _sep_link_and_run(dir)
+      assert_eq_str(output, "101\n102\n")
+      _sep_cleanup(dir)
+    end
+
+    it("cross-module global variables work") do ->
+      var files = vec_new()
+      files.push(as_int("state.qz"))
+      files.push(as_int("""
+        var state_value = 0
+        def state_set(v: Int): Void
+          state_value = v
+        end
+        def state_get(): Int = state_value
+      """))
+      files.push(as_int("main.qz"))
+      files.push(as_int("""
+        import state
+        def main(): Int
+          state::state_set(42)
+          puts(state::state_get().to_s())
+          return 0
+        end
+      """))
+
+      var dir = _sep_compile(files, 1)
+      assert_gt(dir.size, 0)
+      var output = _sep_link_and_run(dir)
+      assert_eq_str(output, "42\n")
+      _sep_cleanup(dir)
+    end
+
+    it("string constants are per-module (no cross-ref)") do ->
+      var files = vec_new()
+      files.push(as_int("greeter.qz"))
+      files.push(as_int("""
+        def greet(name: String): String = "Hello, " + name + "!"
+      """))
+      files.push(as_int("main.qz"))
+      files.push(as_int("""
+        import greeter
+        def main(): Int
+          puts(greeter::greet("World"))
+          puts("Done")
+          return 0
+        end
+      """))
+
+      var dir = _sep_compile(files, 1)
+      assert_gt(dir.size, 0)
+      var output = _sep_link_and_run(dir)
+      assert_eq_str(output, "Hello, World!\nDone\n")
+      _sep_cleanup(dir)
+    end
+
+    it("monomorphized generics with linkonce_odr") do ->
+      var files = vec_new()
+      files.push(as_int("data.qz"))
+      files.push(as_int("""
+        def make_vec(): Vec<Int>
+          var v = vec_new()
+          v.push(10)
+          v.push(20)
+          v.push(30)
+          return v
+        end
+      """))
+      files.push(as_int("main.qz"))
+      files.push(as_int("""
+        import data
+        def main(): Int
+          var v = data::make_vec()
+          var total = 0
+          for i in 0..v.size
+            total += v[i]
+          end
+          puts(total.to_s())
+          return 0
+        end
+      """))
+
+      var dir = _sep_compile(files, 1)
+      assert_gt(dir.size, 0)
+      var output = _sep_link_and_run(dir)
+      assert_eq_str(output, "60\n")
+      _sep_cleanup(dir)
+    end
+
+  end
+
+  return qspec_main()
+end

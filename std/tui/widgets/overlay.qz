@@ -1,0 +1,422 @@
+## std/tui/widgets/overlay.qz — Z-stacked pane primitive.
+##
+## Renders a smaller, bordered pane on top of a base view via absolute
+## ANSI cursor positioning. The base view is written first; the overlay
+## emits `\x1b[<row>;<col>H<line>` for each of its rows, overwriting
+## the base content underneath. No string-level slicing, no re-flow,
+## no awareness of base styling needed — the terminal does the work.
+##
+## Same shape works for help modals, confirm dialogs, error toasts,
+## and tooltips. The Overlay is a value object — visibility is parent
+## state, not Overlay state. The parent calls `overlay_compose(base, o)`
+## when it wants the overlay shown and just returns `base` otherwise.
+##
+## Usage:
+##
+##   import std/tui/widgets/overlay as ov
+##
+##   var help = ov::overlay_new(help_text(), ov::POS_CENTER(),
+##                              ly::BORDER_ROUNDED())
+##
+##   def view(g: Game): String
+##     var base = view_combat(g.combat)
+##     if g.help_visible
+##       return ov::overlay_compose(base, help)
+##     end
+##     return base
+##   end
+##
+## In v0.4 Overlay is non-interactive — its content is a static string
+## supplied at construction. v0.4+ will add interactive overlays
+## (Y/N confirms with their own update path) by composing the same
+## blit logic with a widget-shaped state interior.
+
+import std/tui/layout as ly
+
+# ============================================================
+# Position constants
+# ============================================================
+
+## Overlay anchored at the centre of the base view, both axes.
+def POS_CENTER():       Int = 0
+
+## Overlay anchored at the top-left corner of the base (1,1).
+def POS_TOP_LEFT():     Int = 1
+
+## Overlay anchored at the top-right corner.
+def POS_TOP_RIGHT():    Int = 2
+
+## Overlay anchored at the bottom-left corner.
+def POS_BOTTOM_LEFT():  Int = 3
+
+## Overlay anchored at the bottom-right corner.
+def POS_BOTTOM_RIGHT(): Int = 4
+
+# ============================================================
+# Overlay value
+# ============================================================
+
+struct Overlay
+  content:  String   # pre-bordered content; lines joined by \n
+  width:    Int      # visible cells (border-inclusive)
+  height:   Int      # row count (border-inclusive)
+  position: Int      # POS_*
+  dim_base: Bool     # when true, compose paths wrap base lines in \x1b[2m...\x1b[0m
+end
+
+## Build an Overlay from `body` content. The body is wrapped in a
+## border of `border_style` (use `ly::BORDER_NONE()` to skip — bare
+## content overlays are useful for status-line takeovers and tooltips).
+def overlay_new(body: String, position: Int, border_style: Int): Overlay
+  var bordered = ly::border_with(body, border_style)
+  return Overlay {
+    content:  bordered,
+    width:    ly::visible_width(bordered),
+    height:   ly::line_count(bordered),
+    position: position,
+    dim_base: false
+  }
+end
+
+## Replace the body. Represerves position and re-borders. Border style
+## isn't preserved across this call — pass it again.
+def overlay_with_body(o: Overlay, body: String, border_style: Int): Overlay
+  var bordered = ly::border_with(body, border_style)
+  return Overlay {
+    content:  bordered,
+    width:    ly::visible_width(bordered),
+    height:   ly::line_count(bordered),
+    position: o.position,
+    dim_base: o.dim_base
+  }
+end
+
+## Move the overlay to a different anchor.
+def overlay_with_position(o: Overlay, position: Int): Overlay
+  return Overlay {
+    content:  o.content,
+    width:    o.width,
+    height:   o.height,
+    position: position,
+    dim_base: o.dim_base
+  }
+end
+
+## Toggle base-content dimming. When on, both compose paths wrap each
+## line of the base view in `\x1b[2m...\x1b[0m` before splicing the
+## overlay over it. Used to draw the eye to the modal — the base
+## fades behind it without disappearing.
+##
+## Limitation: dim composition is applied per line as a wrap. If the
+## base already carries SGR, the dim attribute may not stack cleanly
+## with the existing styling on every terminal — terminals that treat
+## `\x1b[0m` as fully resetting will drop both the base SGR and the
+## dim. Acceptable v0.4 behaviour; a true stacking solution would need
+## an SGR-state walker that merges DIM into each existing escape.
+def overlay_with_dim_base(o: Overlay, dim: Bool): Overlay
+  return Overlay {
+    content:  o.content,
+    width:    o.width,
+    height:   o.height,
+    position: o.position,
+    dim_base: dim
+  }
+end
+
+# ============================================================
+# Composition
+# ============================================================
+
+## Compute the 1-indexed (top_row, left_col) screen position of the
+## overlay's top-left corner against a base view of `base_w × base_h`.
+## Clamps to (1, 1) if the overlay is wider or taller than the base.
+def _overlay_origin(position: Int, base_w: Int, base_h: Int, ov_w: Int, ov_h: Int): (Int, Int)
+  if position == POS_TOP_LEFT()
+    return (1, 1)
+  end
+  if position == POS_TOP_RIGHT()
+    var col = base_w - ov_w + 1
+    if col < 1
+      col = 1
+    end
+    return (1, col)
+  end
+  if position == POS_BOTTOM_LEFT()
+    var row = base_h - ov_h + 1
+    if row < 1
+      row = 1
+    end
+    return (row, 1)
+  end
+  if position == POS_BOTTOM_RIGHT()
+    var brow = base_h - ov_h + 1
+    var bcol = base_w - ov_w + 1
+    if brow < 1
+      brow = 1
+    end
+    if bcol < 1
+      bcol = 1
+    end
+    return (brow, bcol)
+  end
+  ## POS_CENTER (default).
+  var crow = (base_h - ov_h) / 2 + 1
+  var ccol = (base_w - ov_w) / 2 + 1
+  if crow < 1
+    crow = 1
+  end
+  if ccol < 1
+    ccol = 1
+  end
+  return (crow, ccol)
+end
+
+# Wrap each line of `base` in `\x1b[2m...\x1b[0m` and rejoin with `\n`.
+# Empty input returns empty.
+def _dim_wrap_base(base: String): String
+  if base.empty?
+    return base
+  end
+  var lines = str_split(base, "\n")
+  var out = vec_new<String>()
+  var i = 0
+  while i < lines.size
+    var line = lines[i]
+    if line.empty?
+      out.push(line)
+    else
+      out.push("\x1b[2m" + line + "\x1b[0m")
+    end
+    i = i + 1
+  end
+  return str_join(out, "\n")
+end
+
+## Compose `o` over `base`. Returns base + cursor-positioning
+## sequences + overlay content. The terminal renders the overlay on
+## top of the base because the cursor-position sequences are absolute
+## and the overlay rows are written after the base.
+##
+## When `o.dim_base` is true, each line of `base` is wrapped in
+## `\x1b[2m...\x1b[0m` before the overlay rows are spliced in, so the
+## base content fades behind the modal.
+##
+## Caller must invoke this only when the overlay should be visible —
+## v0.4 Overlay carries no visibility state.
+def overlay_compose(base: String, o: Overlay): String
+  var base_w = ly::visible_width(base)
+  var base_h = ly::line_count(base)
+  var origin = _overlay_origin(o.position, base_w, base_h, o.width, o.height)
+  var top_row  = origin.0
+  var left_col = origin.1
+
+  var rendered_base = base
+  if o.dim_base
+    rendered_base = _dim_wrap_base(base)
+  end
+
+  var lines = str_split(o.content, "\n")
+  var out = rendered_base
+  var i = 0
+  while i < lines.size
+    var row = top_row + i
+    out = out + "\x1b[" + row.to_s() + ";" + left_col.to_s() + "H" + lines[i]
+    i = i + 1
+  end
+  return out
+end
+
+# ============================================================
+# String-level compositing (fallback path)
+# ============================================================
+
+# Walk `line`, emitting bytes verbatim until the visible-column counter
+# reaches `target_col`. SGR escape sequences (`ESC [ ... m` and other
+# CSI sequences) contribute zero visible cells but are emitted through
+# the prefix unchanged so styling state survives the splice. If the
+# line runs out of visible cells before `target_col`, the prefix is
+# padded with spaces to reach the column. Returns the prefix as a
+# String — the caller pairs it with `_skip_visible_for_suffix` to
+# get the trailing portion past the splice.
+def _overlay_take_prefix(line: String, target_col: Int): String
+  if target_col <= 0
+    return ""
+  end
+  var sb = sb_new()
+  var len = str_byte_len(line)
+  var i = 0
+  var col = 0
+  while i < len and col < target_col
+    var b = str_byte_at(line, i)
+    if b == 0x1B
+      if i + 1 < len and str_byte_at(line, i + 1) == 0x5B
+        sb_append_byte(sb, b)
+        sb_append_byte(sb, 0x5B)
+        i = i + 2
+        while i < len
+          var cb = str_byte_at(line, i)
+          sb_append_byte(sb, cb)
+          i = i + 1
+          if cb >= 0x40 and cb <= 0x7E
+            break
+          end
+        end
+      else
+        sb_append_byte(sb, b)
+        i = i + 1
+      end
+    else
+      var cp = str_codepoint_at(line, i)
+      var cw = unicode_width(cp)
+      if col + cw > target_col
+        break
+      end
+      var stride = str_codepoint_byte_len(line, i)
+      var k = 0
+      while k < stride
+        sb_append_byte(sb, str_byte_at(line, i + k))
+        k = k + 1
+      end
+      i = i + stride
+      col = col + cw
+    end
+  end
+  if col < target_col
+    sb_append(sb, str_repeat(" ", target_col - col))
+  end
+  return sb_to_string(sb)
+end
+
+# Skip past `skip_cols` visible cells of `line` and return the
+# remaining tail. SGR escapes inside the skipped region are collected
+# and replayed at the head of the suffix (preceded by `\x1b[0m`) so the
+# base's styling state at the splice-end column is restored after the
+# overlay's own SGR. SGR escapes after the splice are emitted verbatim.
+# If the line runs out of visible cells before `skip_cols`, returns "".
+def _overlay_skip_for_suffix(line: String, skip_cols: Int): String
+  var len = str_byte_len(line)
+  if len == 0
+    return ""
+  end
+  var sgr = sb_new()
+  var i = 0
+  var col = 0
+  while i < len and col < skip_cols
+    var b = str_byte_at(line, i)
+    if b == 0x1B
+      if i + 1 < len and str_byte_at(line, i + 1) == 0x5B
+        sb_append_byte(sgr, b)
+        sb_append_byte(sgr, 0x5B)
+        i = i + 2
+        while i < len
+          var cb = str_byte_at(line, i)
+          sb_append_byte(sgr, cb)
+          i = i + 1
+          if cb >= 0x40 and cb <= 0x7E
+            break
+          end
+        end
+      else
+        i = i + 1
+      end
+    else
+      var cp = str_codepoint_at(line, i)
+      col = col + unicode_width(cp)
+      i = i + str_codepoint_byte_len(line, i)
+    end
+  end
+  if i >= len
+    return ""
+  end
+  var collected = sb_to_string(sgr)
+  if collected.empty?
+    return str_byte_slice(line, i, len)
+  end
+  return "\x1b[0m" + collected + str_byte_slice(line, i, len)
+end
+
+# Splice `ov_line` into `base_line` at 1-indexed visible column
+# `left_col`, replacing `ov_width` visible cells of the base.
+def _overlay_splice_row(base_line: String, ov_line: String, left_col: Int, ov_width: Int): String
+  var prefix = _overlay_take_prefix(base_line, left_col - 1)
+  var suffix = _overlay_skip_for_suffix(base_line, left_col - 1 + ov_width)
+  return prefix + ov_line + suffix
+end
+
+## Compose `o` over `base` purely at the string level — no absolute
+## cursor-positioning escapes. Walks `base` line-by-line, splicing
+## the overlay's row content into the matching base row at the
+## visible-column boundary computed from `o.position`. Splices are
+## ANSI-aware: SGR escapes in the base before/after the overlay
+## region survive, base styling at the splice-end column is replayed
+## after the overlay so subsequent base content keeps its colours.
+##
+## Use this when the consumer can't rely on cursor-position
+## compositing — e.g. capturing TUI output to a static log, rendering
+## into a buffer that doesn't translate cursor moves, or testing
+## composed views with substring matchers. The cursor-position path
+## (`overlay_compose`) is faster on real terminals; this one is the
+## fallback that always works.
+def overlay_compose_string(base: String, o: Overlay): String
+  var base_w = ly::visible_width(base)
+  var base_h = ly::line_count(base)
+  var origin = _overlay_origin(o.position, base_w, base_h, o.width, o.height)
+  var top_row  = origin.0
+  var left_col = origin.1
+
+  if o.width <= 0 or o.height <= 0
+    if o.dim_base
+      return _dim_wrap_base(base)
+    end
+    return base
+  end
+
+  var rendered_base = base
+  if o.dim_base
+    rendered_base = _dim_wrap_base(base)
+  end
+
+  var base_lines = str_split(rendered_base, "\n")
+  if base_lines.size == 0 or (base_lines.size == 1 and base_lines[0].empty?)
+    base_lines = vec_new<String>()
+  end
+  var ov_lines = str_split(o.content, "\n")
+
+  var out = vec_new<String>()
+  # Top-row is 1-indexed; convert to 0-indexed array space.
+  var ov_first = top_row - 1
+  var ov_last  = ov_first + o.height - 1
+
+  var max_row = base_lines.size
+  if ov_last + 1 > max_row
+    max_row = ov_last + 1
+  end
+
+  var r = 0
+  while r < max_row
+    var base_line = ""
+    if r < base_lines.size
+      base_line = base_lines[r]
+    end
+    if r >= ov_first and r <= ov_last
+      var ov_idx = r - ov_first
+      var ov_line = ""
+      if ov_idx < ov_lines.size
+        ov_line = ov_lines[ov_idx]
+      end
+      out.push(_overlay_splice_row(base_line, ov_line, left_col, o.width))
+    else
+      out.push(base_line)
+    end
+    r = r + 1
+  end
+  return str_join(out, "\n")
+end
+
+## Recommended entry point for new code. Defaults to the string-level
+## fallback (`overlay_compose_string`) — works in every consumer,
+## no terminal cooperation needed. Apps that want the faster
+## cursor-position path on real terminals can call `overlay_compose`
+## directly.
+def overlay_compose_safe(base: String, o: Overlay): String =
+  overlay_compose_string(base, o)

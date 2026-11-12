@@ -1,0 +1,1960 @@
+## QSpec Subprocess Testing - Compile and run Quartz programs as subprocesses
+##
+## Provides assertion functions for testing compiler errors, IR output,
+## panic behavior, and stderr output by invoking the compiler as a subprocess.
+##
+## Requires environment variables:
+##   QUARTZ_COMPILER - path to the Quartz compiler binary
+##   QUARTZ_STD      - path to the std/ directory (for -I flag)
+##
+## Runtime tests compile to a native binary (llc -O0 → ld), so the host
+## needs `llc` and `ld` on PATH plus the macOS SDK (via `xcrun`).
+##
+## Usage:
+##   import * from qspec/subprocess
+##
+##   assert_compile_error(source, "error message")
+##   assert_ir_contains(source, "load volatile")
+##   assert_run_exits(source, 1)
+
+import * from qspec/matchers
+import io/file
+import time
+
+extern "C" def getpid(): CInt
+extern "C" def kill(pid: CInt, sig: CInt): CInt
+
+# =============================================================================
+# Module State
+# =============================================================================
+
+var _sub_counter = atomic_new(0)
+var _sub_issue_counter = atomic_new(0)
+var _sub_call_lock = mutex_new(0)
+var _sub_compiler_str = ""
+var _sub_std_str = ""
+var _sub_sdk_str = ""
+var _sub_fixtures_str = ""
+var _sub_init_state = 0
+var _sub_timeout_secs = 30
+var _sub_compile_timeout_secs = 30
+var _sub_tool_timeout_secs = 30
+var _sub_run_timeout_secs = 30
+var _sub_sdk_timeout_secs = 10
+var _sub_pid = 0
+var _sub_root_str = ""
+var _sub_supervision_records = vec_new<String>()
+var _sub_supervision_timing_records = vec_new<String>()
+var _sub_service_flag = false
+var _sub_service_pid = 0
+var _sub_service_token = ""
+var _sub_service_ready_record = ""
+var _sub_queue_counter = atomic_new(0)
+var _sub_service_terminal_failure = false
+
+## Detect the macOS SDK path (for direct `ld` linking). Empty when
+## `xcrun` is unavailable — link then falls back to clang.
+def _sub_detect_sdk(): String
+  var tmp = _sub_tmp(-1, ".sdk")
+  var argv = vec_new<String>(); argv.push("xcrun"); argv.push("--show-sdk-path")
+  var status = _sub_supervised("nested-sdk", -1, argv, vec_new<String>(), vec_new<String>(), tmp, "", false)
+  if not status.valid or status.exit_code != 0 or status.signal != 0 or status.timed_out or str_byte_len(status.spawn_error) > 0
+    file_delete(tmp)
+    return ""
+  end
+  var sdk = str_trim(read_file(tmp))
+  file_delete(tmp)
+  return sdk
+end
+
+def _sub_init(): Void
+  if _sub_init_state == 2
+    return
+  end
+  if _sub_init_state == 1
+    return
+  end
+  _sub_init_state = 1
+  _sub_compiler_str = getenv("QUARTZ_COMPILER")
+  _sub_std_str = getenv("QUARTZ_STD")
+  _sub_fixtures_str = getenv("QUARTZ_FIXTURES")
+  _sub_pid = getpid()
+  _sub_root_str = getenv("QSPEC_SUB_ROOT")
+  if not _sub_safe_root(_sub_root_str)
+    _sub_root_str = "/tmp/_qspec_subroot_" + str_from_int(_sub_pid)
+  end
+  mkdir(_sub_root_str)
+  var sub_timeout_env = getenv("QSPEC_SUB_TIMEOUT")
+  if _sub_valid_timeout(sub_timeout_env)
+    _sub_timeout_secs = str_to_int(sub_timeout_env)
+  end
+  _sub_compile_timeout_secs = _sub_timeout_or("QSPEC_SUB_COMPILE_TIMEOUT", _sub_timeout_secs)
+  _sub_tool_timeout_secs = _sub_timeout_or("QSPEC_SUB_TOOL_TIMEOUT", _sub_timeout_secs)
+  _sub_run_timeout_secs = _sub_timeout_or("QSPEC_SUB_RUN_TIMEOUT", _sub_timeout_secs)
+  _sub_sdk_timeout_secs = _sub_timeout_or("QSPEC_SUB_SDK_TIMEOUT", 10)
+  _sub_service_flag = _sub_ensure_service()
+  if _sub_service_flag and not (getenv("QSPEC_RUNNER_TEST") == "1" and getenv("QSPEC_SUB_TEST_SKIP_SDK") == "1")
+    _sub_sdk_str = _sub_detect_sdk()
+  end
+  _sub_init_state = 2
+end
+
+def _sub_ready_path(): String
+  return _sub_root_str + "/.qspec-supervisor.ready"
+end
+
+def _sub_validate_service(): Bool
+  var ready_path = _sub_ready_path()
+  if file_exists(ready_path) == 0
+    return false
+  end
+  var record = str_trim(read_file(ready_path))
+  var parts = str_split(record, "\t")
+  if parts.size != 7 or parts[0] != "QSR2" or parts[3] != str_from_int(_sub_pid) or parts[6] != "trusted-test-no-setsid:qsc3-pgid-anchor:detached-unknown"
+    return false
+  end
+  if not _sub_canonical_unsigned(parts[1], 2147483647) or str_to_int(parts[1]) < 1 or str_byte_len(parts[2]) == 0 or str_byte_len(parts[4]) == 0 or str_byte_len(parts[5]) != 32
+    return false
+  end
+  for i in 0..str_byte_len(parts[5])
+    var ch = str_byte_at(parts[5], i)
+    if not ((ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f'))
+      return false
+    end
+  end
+  var service_pid = str_to_int(parts[1])
+  if kill(service_pid, 0) != 0
+    return false
+  end
+  _sub_service_pid = service_pid
+  _sub_service_token = parts[5]
+  _sub_service_ready_record = record
+  return true
+end
+
+def _sub_ensure_service(): Bool
+  if _sub_service_terminal_failure
+    return false
+  end
+  # The outer Ruby supervisor starts this service with Process.spawn before it
+  # releases the spec child. Quartz only validates that prestarted identity.
+  return _sub_validate_service()
+end
+
+def _sub_safe_root(path: String): Bool
+  if str_byte_len(path) == 0
+    return false
+  end
+  var parts = str_split(path, "/")
+  for i in 0..parts.size
+    var part = parts[i]
+    if part == ".."
+      return false
+    end
+    for j in 0..str_byte_len(part)
+      var ch = str_byte_at(part, j)
+      var safe = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '-' or ch == '.'
+      if not safe
+        return false
+      end
+    end
+  end
+  return true
+end
+
+def _sub_timeout_or(name: String, fallback: Int): Int
+  var value = getenv(name)
+  if _sub_valid_timeout(value)
+    return str_to_int(value)
+  end
+  return fallback
+end
+
+def _sub_valid_timeout(value: String): Bool
+  if str_byte_len(value) == 0 or str_byte_len(value) > 4
+    return false
+  end
+  for i in 0..str_byte_len(value)
+    var ch = str_byte_at(value, i)
+    if ch < '0' or ch > '9'
+      return false
+    end
+  end
+  var parsed = str_to_int(value)
+  return parsed >= 1 and parsed <= 3600
+end
+
+# =============================================================================
+# Compiler Feature Probes (A.28)
+# =============================================================================
+#
+# The qspec suite compiler is built with no `--feature` flags, so specs that
+# exercise `quartz lint` or the WASM backend would structurally fail. These
+# probes let such specs self-gate to `it_pending` in the default lane while a
+# feature-enabled CI lane provides real coverage.
+
+var _sub_lint_probe = 0    # 0 = unprobed, 1 = available, 2 = unavailable
+var _sub_wasm_probe = 0
+
+## Resolve the compiler under test, falling back to the in-tree binary.
+def _sub_compiler_or_default(): String
+  _sub_init()
+  if str_byte_len(_sub_compiler_str) == 0
+    return "self-hosted/bin/quartz"
+  end
+  return _sub_compiler_str
+end
+
+## True when the compiler under test was built with `--feature lint`.
+## Probes `<compiler> lint` on a trivial file — a feature-disabled build
+## prints "lint subcommand not available". Result cached after first call.
+def qspec_feature_lint(): Bool
+  _sub_begin_result()
+  if _sub_lint_probe != 0
+    return _sub_finish_bool(_sub_lint_probe == 1)
+  end
+  var id = _sub_next_id()
+  var src = _sub_tmp(id, ".qz")
+  var err = _sub_tmp(id, ".err")
+  write_file(src, "def main(): Int\n  return 0\nend\n")
+  var argv = vec_new<String>(); argv.push(_sub_compiler_or_default()); argv.push("lint"); argv.push(src)
+  var _probe = _sub_supervised("nested-compile", id, argv, vec_new<String>(), vec_new<String>(), "/dev/null", err, false)
+  var e = read_file(err)
+  file_delete(src)
+  file_delete(err)
+  if str_contains(e, "not available") == 1
+    _sub_lint_probe = 2
+    return _sub_finish_bool(false)
+  end
+  _sub_lint_probe = 1
+  return _sub_finish_bool(true)
+end
+
+## True when the compiler under test was built with `--feature wasm`.
+## Probes `<compiler> --backend wasm` — a feature-disabled build prints
+## "WASM backend not available". Result cached after first call.
+def qspec_feature_wasm(): Bool
+  _sub_begin_result()
+  if _sub_wasm_probe != 0
+    return _sub_finish_bool(_sub_wasm_probe == 1)
+  end
+  var id = _sub_next_id()
+  var src = _sub_tmp(id, ".qz")
+  var err = _sub_tmp(id, ".err")
+  write_file(src, "def main(): Int\n  return 0\nend\n")
+  var argv = vec_new<String>(); argv.push(_sub_compiler_or_default()); argv.push("--backend"); argv.push("wasm"); argv.push(src)
+  var _probe = _sub_supervised("nested-compile", id, argv, vec_new<String>(), vec_new<String>(), "/dev/null", err, false)
+  var e = read_file(err)
+  file_delete(src)
+  file_delete(err)
+  if str_contains(e, "not available") == 1
+    _sub_wasm_probe = 2
+    return _sub_finish_bool(false)
+  end
+  _sub_wasm_probe = 1
+  return _sub_finish_bool(true)
+end
+
+# =============================================================================
+# Temp File Management
+# =============================================================================
+
+def _sub_next_id(): Int
+  _sub_init()
+  return atomic_add(_sub_counter, 1)
+end
+
+## Generate a PID-scoped path beneath the outer runner's owned temp root.
+## Standalone callers fall back to /tmp; overlapping spec processes cannot
+## collide because the process PID remains part of every name.
+def _sub_tmp(id: Int, ext: String): String
+  var sb = sb_new()
+  sb_append(sb, _sub_root_str)
+  sb_append(sb, "/_qspec_sub_")
+  sb_append(sb, str_from_int(_sub_pid))
+  sb_append(sb, "_")
+  sb_append(sb, str_from_int(id))
+  sb_append(sb, ext)
+  return sb_to_string(sb)
+end
+
+# =============================================================================
+# Timeout Wrapper
+# =============================================================================
+
+struct SubStageStatus
+  valid: Bool
+  stage: String
+  spawn_error: String
+  exit_code: Int
+  signal: Int
+  timed_out: Bool
+  orphan: Bool
+  cancelled: Bool
+  containment_limited: Bool
+  record: String
+end
+
+var _sub_last_status = SubStageStatus { valid: false, stage: "", spawn_error: "no stage executed", exit_code: -1, signal: 0, timed_out: false, orphan: false, cancelled: false, containment_limited: true, record: "" }
+
+def _sub_protocol_field(out: StringBuilder, value: String): Void
+  sb_append(out, str_from_int(str_byte_len(value)))
+  sb_append(out, "\n")
+  sb_append(out, value)
+  sb_append(out, "\n")
+end
+
+def _sub_stage_timeout(stage: String): Int
+  if stage == "nested-sdk"
+    return _sub_sdk_timeout_secs
+  elsif stage == "nested-compile"
+    return _sub_compile_timeout_secs
+  elsif stage == "nested-run"
+    return _sub_run_timeout_secs
+  end
+  return _sub_tool_timeout_secs
+end
+
+def _sub_invalid_stage(stage: String, error: String): SubStageStatus
+  return SubStageStatus { valid: false, stage: stage, spawn_error: error, exit_code: -1, signal: 0, timed_out: false, orphan: true, cancelled: false, containment_limited: true, record: "" }
+end
+
+def _sub_canonical_unsigned(raw: String, max_value: Int): Bool
+  if str_byte_len(raw) == 0 or str_byte_len(raw) > 16 or (str_byte_len(raw) > 1 and str_byte_at(raw, 0) == '0')
+    return false
+  end
+  for i in 0..str_byte_len(raw)
+    var ch = str_byte_at(raw, i)
+    if ch < '0' or ch > '9'
+      return false
+    end
+  end
+  var value = str_to_int(raw)
+  return value >= 0 and value <= max_value
+end
+
+def _sub_canonical_exit(raw: String): Bool
+  return raw == "-1" or _sub_canonical_unsigned(raw, 255)
+end
+
+def _sub_stage_raw(status: SubStageStatus): Int
+  if not status.valid or str_byte_len(status.spawn_error) > 0 or status.orphan
+    return 125 * 256
+  end
+  if status.timed_out
+    return 124 * 256
+  end
+  if status.signal != 0
+    return status.signal
+  end
+  return status.exit_code * 256
+end
+
+def _sub_read_stage(path: String, stage: String): SubStageStatus
+  if file_exists(path) == 0
+    return _sub_invalid_stage(stage, "missing supervisor status")
+  end
+  var record = str_trim(read_file(path))
+  var parts = str_split(record, "\t")
+  if parts.size != 13 or parts[0] != "QSS2" or parts[1] != stage or parts[12] != "trusted-test-no-setsid:qsc3-pgid-anchor:detached-unknown"
+    return _sub_invalid_stage(stage, "malformed supervisor status")
+  end
+  if not _sub_canonical_unsigned(parts[2], 3600000) or str_to_int(parts[2]) < 1 or not _sub_canonical_exit(parts[4]) or not _sub_canonical_unsigned(parts[5], 64) or not _sub_canonical_unsigned(parts[9], 3615000)
+    return _sub_invalid_stage(stage, "malformed supervisor numeric field")
+  end
+  if (parts[6] != "0" and parts[6] != "1") or (parts[7] != "0" and parts[7] != "1") or (parts[8] != "0" and parts[8] != "1") or (parts[10] != "0" and parts[10] != "1") or (parts[11] != "0" and parts[11] != "1")
+    return _sub_invalid_stage(stage, "malformed supervisor boolean field")
+  end
+  var exit_code = str_to_int(parts[4]); var sig = str_to_int(parts[5]); var timed_out = parts[6] == "1"; var term_sent = parts[7] == "1"; var kill_sent = parts[8] == "1"; var orphan = parts[10] == "1"; var cancelled = parts[11] == "1"
+  var refused_before_spawn = cancelled and exit_code == -1 and sig == 0 and str_byte_len(parts[3]) > 0 and not term_sent and not kill_sent and not orphan
+  var indeterminate_unowned = cancelled and orphan and exit_code == -1 and sig == 0 and str_starts_with(parts[3], "indeterminate:") and not term_sent and not kill_sent
+  var legal = not (exit_code >= 0 and sig > 0) and not (timed_out and cancelled) and not (timed_out and (exit_code >= 0 or sig > 0)) and not (cancelled and (exit_code >= 0 or sig > 0)) and (not timed_out or term_sent) and (not cancelled or term_sent or refused_before_spawn or indeterminate_unowned) and (not kill_sent or term_sent) and (not orphan or kill_sent or indeterminate_unowned)
+  if str_byte_len(parts[3]) == 0 and exit_code == -1 and sig == 0 and not timed_out and not cancelled
+    legal = false
+  end
+  if not legal
+    return _sub_invalid_stage(stage, "illegal supervisor status combination")
+  end
+  return SubStageStatus { valid: true, stage: stage, spawn_error: parts[3], exit_code: exit_code, signal: sig, timed_out: timed_out, orphan: orphan, cancelled: cancelled, containment_limited: true, record: record }
+end
+
+def _sub_malformed_status(stage: String, mode: String): String
+  if mode == "numeric"
+    return "QSS2\t" + stage + "\t01\t\t0\t0\t0\t0\t0\t1\t0\t0\ttrusted-test-no-setsid:qsc3-pgid-anchor:detached-unknown\n"
+  elsif mode == "boolean"
+    return "QSS2\t" + stage + "\t1000\t\t0\t0\t2\t0\t0\t1\t0\t0\ttrusted-test-no-setsid:qsc3-pgid-anchor:detached-unknown\n"
+  elsif mode == "bounds"
+    return "QSS2\t" + stage + "\t1000\t\t999\t0\t0\t0\t0\t1\t0\t0\ttrusted-test-no-setsid:qsc3-pgid-anchor:detached-unknown\n"
+  elsif mode == "combination"
+    return "QSS2\t" + stage + "\t1000\t\t0\t9\t0\t0\t0\t1\t0\t0\ttrusted-test-no-setsid:qsc3-pgid-anchor:detached-unknown\n"
+  elsif mode == "sentinel"
+    return "QSS2\t" + stage + "\t1000\t\t0\t0\t0\t0\t0\t1\t0\t0\twrong-owner\n"
+  end
+  return "QSS2\t" + stage + "\t1000\n"
+end
+
+def _sub_prepare_stage(stage: String, id: Int, input_argv: Vec<String>, env_keys: Vec<String>, env_values: Vec<String>, stdout_path: String, stderr_path: String, merge_stderr: Bool): Vec<String>
+  var argv = input_argv
+  if getenv("QSPEC_RUNNER_TEST") == "1" and getenv("QSPEC_SUB_TEST_STAGE") == stage
+    var mode = getenv("QSPEC_SUB_TEST_MODE")
+    var replacement = vec_new<String>(); replacement.push("ruby"); replacement.push("-e")
+    if mode == "hang"
+      replacement.push("Signal.trap('TERM', 'IGNORE'); spawn('ruby', '-e', \"Signal.trap('TERM', 'IGNORE'); sleep 30\"); sleep 30")
+    elsif mode == "crash"
+      replacement.push("Process.kill('SEGV', Process.pid)")
+    elsif mode == "signal2"
+      replacement.push("Process.kill('INT', Process.pid)")
+    elsif mode == "fail"
+      replacement.push("exit 23")
+    elsif mode == "exit124"
+      replacement.push("exit 124")
+    elsif mode == "service-death"
+      replacement.push("Signal.trap('TERM', 'IGNORE'); spawn('ruby', '-e', \"Signal.trap('TERM', 'IGNORE'); sleep 1; File.write(ARGV[0], 'escaped')\", ARGV[0]); sleep 30")
+      replacement.push(getenv("QSPEC_SUB_TEST_ORPHAN_MARKER"))
+    elsif mode == "spawn-failure"
+      replacement = vec_new<String>(); replacement.push(getenv("QSPEC_SUB_TEST_MISSING") + "/missing")
+    else
+      replacement = argv
+    end
+    argv = replacement
+  end
+  var command_path = _sub_tmp(id, "." + stage + ".request")
+  var status_path = _sub_tmp(id, "." + stage + ".status")
+  var out = sb_new(); sb_append(out, "QSP2\n")
+  _sub_protocol_field(out, stage); _sub_protocol_field(out, str_from_int(_sub_stage_timeout(stage) * 1000)); _sub_protocol_field(out, "1000")
+  _sub_protocol_field(out, ""); _sub_protocol_field(out, stdout_path); _sub_protocol_field(out, stderr_path)
+  if merge_stderr
+    _sub_protocol_field(out, "1")
+  else
+    _sub_protocol_field(out, "0")
+  end
+  var cancel_path = getenv("QSPEC_CANCEL_PATH")
+  _sub_protocol_field(out, cancel_path)
+  if str_byte_len(cancel_path) > 0
+    _sub_protocol_field(out, path_dir(cancel_path))
+  else
+    _sub_protocol_field(out, _sub_root_str)
+  end
+  sb_append(out, str_from_int(argv.size)); sb_append(out, "\n")
+  for i in 0..argv.size
+    _sub_protocol_field(out, argv[i])
+  end
+  sb_append(out, str_from_int(env_keys.size)); sb_append(out, "\n")
+  for i in 0..env_keys.size
+    _sub_protocol_field(out, env_keys[i]); _sub_protocol_field(out, env_values[i])
+  end
+  write_file(command_path, sb_to_string(out))
+  var paths = vec_new<String>(); paths.push(command_path); paths.push(status_path)
+  return paths
+end
+
+def _sub_begin_result(): Void
+  mutex_lock(_sub_call_lock)
+  _sub_init()
+  _sub_supervision_records = vec_new<String>()
+  _sub_supervision_timing_records = vec_new<String>()
+  _sub_last_status = _sub_invalid_stage("", "no stage executed")
+end
+
+def _sub_finish_bool(value: Bool): Bool
+  mutex_unlock(_sub_call_lock, 0)
+  return value
+end
+
+def _sub_record_push(records: Vec<String>, record: String): Void
+  records.push(record)
+end
+
+def _sub_records_string(records: Vec<String>): String
+  var out = sb_new()
+  for i in 0..records.size
+    sb_append(out, records[i]); sb_append(out, "\n")
+  end
+  return sb_to_string(out)
+end
+
+def _sub_collect_stage(paths: Vec<String>, stage: String, request_id: String, raw: Int): SubStageStatus
+  var status_path = paths[1]
+  var malformed = getenv("QSPEC_SUB_TEST_STATUS")
+  if getenv("QSPEC_RUNNER_TEST") == "1" and str_byte_len(malformed) > 0 and getenv("QSPEC_SUB_TEST_STAGE") == stage
+    write_file(status_path, _sub_malformed_status(stage, malformed))
+  end
+  if getenv("QSPEC_RUNNER_TEST") == "1" and getenv("QSPEC_SUB_TEST_STAGE") == stage
+    var mode = getenv("QSPEC_SUB_TEST_MODE")
+    if mode == "orphan"
+      write_file(status_path, "QSS2\t" + stage + "\t1000\tinjected orphan\t-1\t0\t0\t1\t1\t1\t1\t0\ttrusted-test-no-setsid:qsc3-pgid-anchor:detached-unknown\n")
+    elsif mode == "cancelled"
+      write_file(status_path, "QSS2\t" + stage + "\t1000\tinjected cancellation\t-1\t0\t0\t0\t0\t1\t0\t1\ttrusted-test-no-setsid:qsc3-pgid-anchor:detached-unknown\n")
+    end
+  end
+  var status = _sub_read_stage(status_path, stage)
+  if raw != 0 and not status.valid
+    status.spawn_error = "supervisor status publication failed"
+  end
+  var result_path = getenv("QSPEC_RESULT_PATH")
+  if getenv("QSPEC_RUNNER_TEST") == "1" and str_byte_len(result_path) > 0 and getenv("QSPEC_SUB_TEST_STAGE") == stage
+    var evidence = getenv("QSPEC_SUB_TEST_EVIDENCE")
+    if evidence == "truncated-qsi"
+      file.file_append(result_path, "QSI1\ttruncated\n")
+    elsif evidence == "unknown-qsi"
+      file.file_append(result_path, "QSI9\tunknown\t" + stage + "\n")
+    elsif evidence == "truncated-qse"
+      file.file_append(result_path, "QSE1\ttruncated\n")
+    elsif evidence == "unknown-qss"
+      file.file_append(result_path, "QSS9\t" + stage + "\n")
+    end
+  end
+  if status.valid and str_byte_len(result_path) > 0
+    # One append publishes both the durable QSS2 evidence and its request-ID
+    # completion. A missing/torn completion fails aggregate reconciliation.
+    if getenv("QSPEC_RUNNER_TEST") == "1" and getenv("QSPEC_SUB_TEST_DROP_COMPLETION") == "1" and getenv("QSPEC_SUB_TEST_STAGE") == stage
+      file.file_append(result_path, status.record + "\n")
+    else
+      file.file_append(result_path, status.record + "\nQSE1\t" + request_id + "\t" + status.record + "\n")
+    end
+  end
+  if status.valid
+    _sub_record_push(_sub_supervision_records, status.record)
+  end
+  file_delete(paths[0])
+  file_delete(status_path)
+  return status
+end
+
+
+def _sub_queue_field(out: StringBuilder, value: String): Void
+  _sub_protocol_field(out, value)
+end
+
+def _sub_submit_queue(paths: Vec<String>, stage: String, attempt: Int): String
+  var now_ms = time.time_epoch_ms()
+  var counter = atomic_add(_sub_queue_counter, 1)
+  var request_id = str_from_int(_sub_pid) + "." + str_from_int(counter) + "." + str_from_int(attempt) + "." + str_from_int(now_ms)
+  var queue_path = paths[0] + "." + request_id + ".queue"
+  var queue_tmp = queue_path + ".tmp"
+  var expires_ms = now_ms + 5000
+  var out = sb_new(); sb_append(out, "QSQ2\n")
+  _sub_queue_field(out, request_id); _sub_queue_field(out, _sub_service_token)
+  _sub_queue_field(out, str_from_int(now_ms)); _sub_queue_field(out, str_from_int(expires_ms))
+  _sub_queue_field(out, paths[0]); _sub_queue_field(out, paths[1])
+  write_file(queue_tmp, sb_to_string(out))
+  if rename(queue_tmp, queue_path) != 0
+    file_delete(queue_tmp)
+    return ""
+  end
+  return queue_path
+end
+
+
+## Submit one nested payload as framed argv/env/redirection data. Ruby executes
+## the payload with exec(*argv); the outer Quake-to-Ruby launch remains string-
+## based until Quartz exposes an argv spawn primitive outside compiler source.
+def _sub_supervised(stage: String, id: Int, input_argv: Vec<String>, env_keys: Vec<String>, env_values: Vec<String>, stdout_path: String, stderr_path: String, merge_stderr: Bool): SubStageStatus
+  var started_ms = time.time_epoch_ms()
+  var issue = atomic_add(_sub_issue_counter, 1)
+  var request_id = str_from_int(_sub_pid) + "." + str_from_int(issue)
+  var result_path = getenv("QSPEC_RESULT_PATH")
+  if issue >= 4096
+    if issue == 4096 and str_byte_len(result_path) > 0
+      file.file_append(result_path, "QSO1\t4096\n")
+    end
+    _sub_last_status = _sub_invalid_stage(stage, "nested stage limit exceeded")
+    return _sub_last_status
+  end
+  if str_byte_len(result_path) > 0
+    file.file_append(result_path, "QSI1\t" + request_id + "\t" + stage + "\n")
+  end
+  var paths = _sub_prepare_stage(stage, id, input_argv, env_keys, env_values, stdout_path, stderr_path, merge_stderr)
+  if _sub_service_terminal_failure
+    file_delete(paths[0]); file_delete(paths[1])
+    _sub_last_status = _sub_invalid_stage(stage, "supervisor transaction is indeterminate")
+    return _sub_last_status
+  end
+  var attempt = 0
+  var dispatched = false
+  while attempt < 2 and not dispatched
+    if not _sub_validate_service()
+      if attempt > 0 or not _sub_ensure_service()
+        break
+      end
+    end
+    var queue_path = _sub_submit_queue(paths, stage, attempt)
+    if str_byte_len(queue_path) == 0
+      break
+    end
+    var wait_ms = 0
+    var wait_limit = _sub_stage_timeout(stage) * 1000 + 2500
+    var service_died = false
+    while file_exists(paths[1]) == 0 and wait_ms < wait_limit
+      time.time_sleep_ms(1)
+      wait_ms += 1
+      if wait_ms % 10 == 0 and not _sub_validate_service()
+        service_died = true
+        break
+      end
+    end
+    if file_exists(paths[1]) == 1
+      dispatched = true
+    elsif service_died
+      # Never guess whether a claimed request ran. Recovery is owned by the
+      # Ruby supervisor; the client records an unreconciled issued stage red.
+      _sub_service_flag = false
+      _sub_service_terminal_failure = true
+      break
+    else
+      break
+    end
+  end
+  var status = _sub_collect_stage(paths, stage, request_id, 0)
+  _sub_last_status = status
+  if status.valid
+    var wall_ms = time.time_epoch_ms() - started_ms
+    var stage_parts = str_split(status.record, "\t")
+    var stage_ms = str_to_int(stage_parts[9])
+    var overhead_ms = wall_ms - stage_ms
+    if overhead_ms < 0
+      overhead_ms = 0
+    end
+    _sub_record_push(_sub_supervision_timing_records, "QST1\t1\t" + str_from_int(wall_ms) + "\t" + str_from_int(stage_ms) + "\t" + str_from_int(overhead_ms))
+  end
+  return status
+end
+
+# =============================================================================
+# Native Compile + Link + Run
+# =============================================================================
+
+## Build the linker command for a compiled object file.
+## Fast path: direct `ld` against -lSystem — skips the ~45ms clang driver.
+## Falls back to `clang` when the SDK is unknown (non-macOS) or the program
+## needs libraries (regex/openssl) whose link lines are clang-driver shaped.
+def _sub_link_argv(obj: String, bin: String, ir_content: String): Vec<String>
+  var needs_regex = str_contains(ir_content, "regex_find_all_pattern") == 1 or str_contains(ir_content, "regex_split_pattern") == 1 or str_contains(ir_content, "regex_count_pattern") == 1 or str_contains(ir_content, "regex_capture_named_pattern") == 1 or str_contains(ir_content, "regex_capture_pattern") == 1
+  var needs_ssl = str_contains(ir_content, "@SSL_") == 1 or str_contains(ir_content, "@ERR_") == 1 or str_contains(ir_content, "@OPENSSL_") == 1
+  var argv = vec_new<String>()
+  if needs_regex or needs_ssl or str_byte_len(_sub_sdk_str) == 0
+    argv.push("clang"); argv.push(obj)
+    if needs_regex
+      if file_exists("lib/libquartz_regex.a") == 1
+        argv.push("lib/libquartz_regex.a"); argv.push("-lpcre2-8"); argv.push("-L/opt/homebrew/opt/pcre2/lib")
+      end
+    end
+    if needs_ssl
+      argv.push("-L/opt/homebrew/opt/openssl@3/lib"); argv.push("-lssl"); argv.push("-lcrypto")
+    end
+    argv.push("-o"); argv.push(bin)
+    return argv
+  end
+  argv.push("ld"); argv.push("-o"); argv.push(bin); argv.push(obj); argv.push("-lSystem"); argv.push("-syslibroot"); argv.push(_sub_sdk_str); argv.push("-arch"); argv.push("arm64")
+  return argv
+end
+
+def _sub_append_flags(argv: Vec<String>, flags: String): Bool
+  for i in 0..str_byte_len(flags)
+    var ch = str_byte_at(flags, i)
+    var safe = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '-' or ch == '=' or ch == ':' or ch == '/' or ch == '.' or ch == ',' or ch == ' '
+    if not safe
+      return false
+    end
+  end
+  var parts = str_split(flags, " ")
+  for i in 0..parts.size
+    if str_byte_len(parts[i]) > 0
+      argv.push(parts[i])
+    end
+  end
+  return true
+end
+
+def _sub_compile_argv(src: String, flags: String, extra_include: String): Vec<String>
+  var argv = vec_new<String>(); argv.push(_sub_compiler_str); argv.push("--no-cache")
+  if not _sub_append_flags(argv, flags)
+    return vec_new<String>()
+  end
+  if str_byte_len(extra_include) > 0
+    argv.push("-I"); argv.push(extra_include)
+  end
+  if str_byte_len(_sub_std_str) > 0
+    argv.push("-I"); argv.push(_sub_std_str)
+  end
+  argv.push(src)
+  return argv
+end
+
+## Compile IR → object → executable → run, returning the run exit code.
+## `llc -O0` (test snippets need correct, not fast, machine code) plus a
+## direct `ld` link — no `codesign`, since `ld` already ad-hoc signs the
+## output. Returns -2 if `llc` fails, -3 if linking fails, otherwise the
+## program's exit code. Cleans up the object and binary it creates; the
+## run is timeout-wrapped.
+def _sub_native_run(ir_path: String, ir_content: String, obj: String, bin: String, rout: String, rerr: String): Int
+  var llc_argv = vec_new<String>(); llc_argv.push("llc"); llc_argv.push("-O0"); llc_argv.push("-filetype=obj"); llc_argv.push(ir_path); llc_argv.push("-o"); llc_argv.push(obj)
+  var llc_status = _sub_supervised("nested-llc", _sub_next_id(), llc_argv, vec_new<String>(), vec_new<String>(), "", "/dev/null", false)
+  if not llc_status.valid or str_byte_len(llc_status.spawn_error) > 0 or llc_status.exit_code != 0 or llc_status.signal != 0 or llc_status.timed_out or llc_status.orphan
+    file_delete(obj)
+    return -2
+  end
+  var link_status = _sub_supervised("nested-link", _sub_next_id(), _sub_link_argv(obj, bin, ir_content), vec_new<String>(), vec_new<String>(), "", "/dev/null", false)
+  if not link_status.valid or str_byte_len(link_status.spawn_error) > 0 or link_status.exit_code != 0 or link_status.signal != 0 or link_status.timed_out or link_status.orphan
+    file_delete(obj)
+    file_delete(bin)
+    return -3
+  end
+  var run_argv = vec_new<String>(); run_argv.push(bin)
+  # Nested programs must not inherit the outer spec's result-file authority.
+  # A fixture that imports qspec would otherwise append a second identity-bound
+  # record and corrupt the parent file's evidence.
+  var run_env_keys = vec_new<String>(); var run_env_values = vec_new<String>()
+  run_env_keys.push("QSPEC_RESULT_PATH"); run_env_values.push("")
+  run_env_keys.push("QSPEC_RESULT_RUN_ID"); run_env_values.push("")
+  run_env_keys.push("QSPEC_RESULT_FILE_ID"); run_env_values.push("")
+  run_env_keys.push("QSPEC_RESULT_TOKEN"); run_env_values.push("")
+  var run_status = _sub_supervised("nested-run", _sub_next_id(), run_argv, run_env_keys, run_env_values, rout, rerr, false)
+  file_delete(obj)
+  file_delete(bin)
+  if not run_status.valid or str_byte_len(run_status.spawn_error) > 0 or run_status.orphan
+    return -4
+  end
+  if run_status.timed_out
+    return 124
+  end
+  if run_status.signal != 0
+    return 128 + run_status.signal
+  end
+  return run_status.exit_code
+end
+
+# =============================================================================
+# Result Struct
+# =============================================================================
+
+struct SubResult
+  exit_code: Int
+  stdout_content: String
+  stderr_content: String
+  outcome: String = "exit"
+  signal: Int = 0
+  timed_out: Bool = false
+  orphan: Bool = false
+  cancelled: Bool = false
+  spawn_error: String = ""
+  supervision: String = ""
+  supervision_timing: String = ""
+  supervision_containment: String = "pgid-contained; detached descendants unknown under trusted-test-no-setsid"
+end
+
+def _sub_result(exit_code: Int, stdout_content: String, stderr_content: String): SubResult
+  var status = _sub_last_status
+  var outcome = "exit"
+  if status.valid == false
+    outcome = "protocol_failure"
+  elsif status.orphan
+    outcome = "orphan"
+  elsif status.cancelled
+    outcome = "cancelled"
+  elsif status.timed_out
+    outcome = "timeout"
+  elsif str_byte_len(status.spawn_error) > 0
+    outcome = "spawn_failure"
+  elsif status.signal > 0
+    outcome = "signal"
+  end
+  var result = SubResult {
+    exit_code: exit_code, stdout_content: stdout_content, stderr_content: stderr_content,
+    outcome: outcome, signal: status.signal, timed_out: status.timed_out,
+    orphan: status.orphan, cancelled: status.cancelled, spawn_error: status.spawn_error,
+    supervision: _sub_records_string(_sub_supervision_records),
+    supervision_timing: _sub_records_string(_sub_supervision_timing_records),
+  }
+  mutex_unlock(_sub_call_lock, 0)
+  return result
+end
+
+## Run an argv-based external command through the nested QSpec supervisor.
+## The stage name is preserved in QSS2 evidence; no shell parses argv.
+def subprocess_exec_argv(stage: String, argv: Vec<String>): SubResult
+  _sub_begin_result()
+  var id = _sub_next_id()
+  var out = _sub_tmp(id, ".exec.out")
+  var err = _sub_tmp(id, ".exec.err")
+  var status = _sub_supervised(stage, id, argv, vec_new<String>(), vec_new<String>(), out, err, false)
+  var exit_code = -1
+  if status.valid and str_byte_len(status.spawn_error) == 0 and not status.orphan
+    if status.timed_out
+      exit_code = 124
+    elsif status.signal != 0
+      exit_code = 128 + status.signal
+    else
+      exit_code = status.exit_code
+    end
+  end
+  var stdout_content = read_file(out)
+  var stderr_content = read_file(err)
+  if str_byte_len(status.spawn_error) > 0
+    stderr_content = status.spawn_error + "\n" + stderr_content
+  end
+  file_delete(out)
+  file_delete(err)
+  return _sub_result(exit_code, stdout_content, stderr_content)
+end
+
+# =============================================================================
+# Core: subprocess_compile(source) -> SubResult
+# =============================================================================
+
+def subprocess_compile(source: String): SubResult
+  _sub_begin_result()
+  var compiler = _sub_compiler_str
+  if str_byte_len(compiler) == 0
+    return _sub_result(-1, "", "QUARTZ_COMPILER not set")
+  end
+
+  var id = _sub_next_id()
+  var src = _sub_tmp(id, ".qz")
+  var ir = _sub_tmp(id, ".ll")
+  var err = _sub_tmp(id, ".err")
+
+  write_file(src, source)
+
+  var sb = sb_new()
+  sb_append(sb, compiler)
+  sb_append(sb, " --no-cache")
+  var std_path = _sub_std_str
+  if str_byte_len(std_path) > 0
+    sb_append(sb, " -I ")
+    sb_append(sb, std_path)
+  end
+  sb_append(sb, " ")
+  sb_append(sb, src)
+  sb_append(sb, " > ")
+  sb_append(sb, ir)
+  sb_append(sb, " 2> ")
+  sb_append(sb, err)
+
+  var raw = _sub_stage_raw(_sub_supervised("nested-compile", id, _sub_compile_argv(src, "", ""), vec_new<String>(), vec_new<String>(), ir, err, false))
+  var signaled = band(raw, 127)
+  var exit_code = 0
+  if signaled != 0
+    exit_code = 128 + signaled
+  else
+    exit_code = band(shr(raw, 8), 255)
+  end
+
+  var ir_content = read_file(ir)
+  var err_content = read_file(err)
+
+  file_delete(src)
+  file_delete(ir)
+  file_delete(err)
+
+  return _sub_result(exit_code, ir_content, err_content)
+end
+
+# =============================================================================
+# Core: subprocess_run(source) -> SubResult
+# =============================================================================
+
+def subprocess_run(source: String): SubResult
+  _sub_begin_result()
+  var compiler = _sub_compiler_str
+  if str_byte_len(compiler) == 0
+    return _sub_result(-1, "", "QUARTZ_COMPILER not set")
+  end
+
+  var id = _sub_next_id()
+  var src = _sub_tmp(id, ".qz")
+  var ir = _sub_tmp(id, ".ll")
+  var cerr = _sub_tmp(id, ".cerr")
+  var rout = _sub_tmp(id, ".out")
+  var rerr = _sub_tmp(id, ".rerr")
+
+  write_file(src, source)
+
+  # Step 1: Compile
+  var sb = sb_new()
+  sb_append(sb, compiler)
+  sb_append(sb, " --no-cache")
+  var std_path = _sub_std_str
+  if str_byte_len(std_path) > 0
+    sb_append(sb, " -I ")
+    sb_append(sb, std_path)
+  end
+  sb_append(sb, " ")
+  sb_append(sb, src)
+  sb_append(sb, " > ")
+  sb_append(sb, ir)
+  sb_append(sb, " 2> ")
+  sb_append(sb, cerr)
+
+  var compile_raw = _sub_stage_raw(_sub_supervised("nested-compile", id, _sub_compile_argv(src, "", ""), vec_new<String>(), vec_new<String>(), ir, cerr, false))
+  if band(compile_raw, 127) != 0 or band(shr(compile_raw, 8), 255) != 0
+    var cerr_content = read_file(cerr)
+    file_delete(src)
+    file_delete(ir)
+    file_delete(cerr)
+    return _sub_result(-1, "", "compilation failed: " + cerr_content)
+  end
+
+  # Step 2: native compile (llc -O0) → link → run
+  var ir_content = read_file(ir)
+  var obj = _sub_tmp(id, ".o")
+  var bin = _sub_tmp(id, ".bin")
+  var run_exit = _sub_native_run(ir, ir_content, obj, bin, rout, rerr)
+  if run_exit == -2 or run_exit == -3
+    var fail_msg = "llc failed"
+    if run_exit == -3
+      fail_msg = "link failed"
+    end
+    file_delete(src)
+    file_delete(ir)
+    file_delete(cerr)
+    return _sub_result(-1, "", fail_msg)
+  end
+
+  var stdout_content = read_file(rout)
+  var stderr_content = read_file(rerr)
+
+  file_delete(src)
+  file_delete(ir)
+  file_delete(cerr)
+  file_delete(rout)
+  file_delete(rerr)
+
+  return _sub_result(run_exit, stdout_content, stderr_content)
+end
+
+# =============================================================================
+# High-Level Assertion Functions
+# =============================================================================
+
+## Assert that source code fails to compile
+def assert_compile_fails(source: String): Void
+  _inc_assertions()
+  var r = subprocess_compile(source)
+  if r.exit_code == 0
+    _record_failure("Expected compilation to fail but it succeeded")
+  end
+end
+
+## Assert that source code fails to compile with stderr containing expected pattern
+def assert_compile_error(source: String, expected: String): Void
+  _inc_assertions()
+  var r = subprocess_compile(source)
+  if r.exit_code == 0
+    var sb = sb_new()
+    sb_append(sb, "Expected compilation to fail but it succeeded")
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if not str_contains(r.stderr_content, expected)
+    var sb = sb_new()
+    sb_append(sb, "Expected compile error to contain '")
+    sb_append(sb, expected)
+    sb_append(sb, "' but stderr was: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert that source code compiles successfully
+def assert_compile_succeeds(source: String): Void
+  _inc_assertions()
+  var r = subprocess_compile(source)
+  if r.exit_code != 0
+    var sb = sb_new()
+    sb_append(sb, "Expected compilation to succeed but it failed: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert that compiled IR contains a pattern
+def assert_ir_contains(source: String, pattern: String): Void
+  _inc_assertions()
+  var r = subprocess_compile(source)
+  if r.exit_code != 0
+    var sb = sb_new()
+    sb_append(sb, "Compilation failed (expected IR check): ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if not str_contains(r.stdout_content, pattern)
+    var sb = sb_new()
+    sb_append(sb, "Expected IR to contain '")
+    sb_append(sb, pattern)
+    sb_append(sb, "' but it was not found")
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert that compiled IR does NOT contain a pattern
+def assert_ir_not_contains(source: String, pattern: String): Void
+  _inc_assertions()
+  var r = subprocess_compile(source)
+  if r.exit_code != 0
+    var sb = sb_new()
+    sb_append(sb, "Compilation failed (expected IR check): ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if str_contains(r.stdout_content, pattern)
+    var sb = sb_new()
+    sb_append(sb, "Expected IR to NOT contain '")
+    sb_append(sb, pattern)
+    sb_append(sb, "' but it was found")
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert that program exits with specific exit code
+def assert_run_exits(source: String, code: Int): Void
+  _inc_assertions()
+  var r = subprocess_run(source)
+  if r.exit_code == -1
+    var sb = sb_new()
+    sb_append(sb, "Failed to compile/run: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if r.exit_code != code
+    var sb = sb_new()
+    sb_append(sb, "Expected exit code ")
+    sb_append(sb, str_from_int(code))
+    sb_append(sb, " but got ")
+    sb_append(sb, str_from_int(r.exit_code))
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert that program's stderr contains expected pattern
+def assert_run_stderr_contains(source: String, expected: String): Void
+  _inc_assertions()
+  var r = subprocess_run(source)
+  if r.exit_code == -1
+    var sb = sb_new()
+    sb_append(sb, "Failed to compile/run: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if not str_contains(r.stderr_content, expected)
+    var sb = sb_new()
+    sb_append(sb, "Expected stderr to contain '")
+    sb_append(sb, expected)
+    sb_append(sb, "' but stderr was: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert that program panics (non-zero exit) and output contains message
+## Checks both stdout and stderr since panic output location varies by compiler
+def assert_run_panics(source: String, expected: String): Void
+  _inc_assertions()
+  var r = subprocess_run(source)
+  if r.exit_code == -1
+    var sb = sb_new()
+    sb_append(sb, "Failed to compile/run: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if r.exit_code == 0
+    _record_failure("Expected program to panic (non-zero exit) but it exited 0")
+    return
+  end
+  var found_in_stdout = str_contains(r.stdout_content, expected)
+  var found_in_stderr = str_contains(r.stderr_content, expected)
+  if not found_in_stdout and not found_in_stderr
+    var sb = sb_new()
+    sb_append(sb, "Expected panic output to contain '")
+    sb_append(sb, expected)
+    sb_append(sb, "' but stdout was: ")
+    sb_append(sb, r.stdout_content)
+    sb_append(sb, " and stderr was: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Compile source with fixtures include path (for cross-module tests)
+def subprocess_compile_with_fixtures(source: String): SubResult
+  _sub_begin_result()
+  var compiler = _sub_compiler_str
+  if str_byte_len(compiler) == 0
+    return _sub_result(-1, "", "QUARTZ_COMPILER not set")
+  end
+
+  var id = _sub_next_id()
+  var src = _sub_tmp(id, ".qz")
+  var ir = _sub_tmp(id, ".ll")
+  var err = _sub_tmp(id, ".err")
+
+  write_file(src, source)
+
+  var sb = sb_new()
+  sb_append(sb, compiler)
+  sb_append(sb, " --no-cache")
+  var std_path = _sub_std_str
+  if str_byte_len(std_path) > 0
+    sb_append(sb, " -I ")
+    sb_append(sb, std_path)
+  end
+  var fix_path = _sub_fixtures_str
+  if str_byte_len(fix_path) > 0
+    sb_append(sb, " -I ")
+    sb_append(sb, fix_path)
+  end
+  sb_append(sb, " ")
+  sb_append(sb, src)
+  sb_append(sb, " > ")
+  sb_append(sb, ir)
+  sb_append(sb, " 2> ")
+  sb_append(sb, err)
+
+  var raw = _sub_stage_raw(_sub_supervised("nested-compile", id, _sub_compile_argv(src, "", _sub_fixtures_str), vec_new<String>(), vec_new<String>(), ir, err, false))
+  var signaled = band(raw, 127)
+  var exit_code = 0
+  if signaled != 0
+    exit_code = 128 + signaled
+  else
+    exit_code = band(shr(raw, 8), 255)
+  end
+
+  var ir_content = read_file(ir)
+  var err_content = read_file(err)
+
+  file_delete(src)
+  file_delete(ir)
+  file_delete(err)
+
+  return _sub_result(exit_code, ir_content, err_content)
+end
+
+## Assert that source code fails to compile (with fixtures include path)
+def assert_compile_error_with_fixtures(source: String, expected: String): Void
+  _inc_assertions()
+  var r = subprocess_compile_with_fixtures(source)
+  if r.exit_code == 0
+    _record_failure("Expected compilation to fail but it succeeded")
+    return
+  end
+  if not str_contains(r.stderr_content, expected)
+    var sb = sb_new()
+    sb_append(sb, "Expected compile error to contain '")
+    sb_append(sb, expected)
+    sb_append(sb, "' but stderr was: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Compile source with extra compiler flags
+def subprocess_compile_with_flags(source: String, flags: String): SubResult
+  _sub_begin_result()
+  var compiler = _sub_compiler_str
+  if str_byte_len(compiler) == 0
+    return _sub_result(-1, "", "QUARTZ_COMPILER not set")
+  end
+
+  var id = _sub_next_id()
+  var src = _sub_tmp(id, ".qz")
+  var ir = _sub_tmp(id, ".ll")
+  var err = _sub_tmp(id, ".err")
+
+  write_file(src, source)
+
+  var sb = sb_new()
+  sb_append(sb, compiler)
+  sb_append(sb, " --no-cache ")
+  sb_append(sb, flags)
+  var std_path = _sub_std_str
+  if str_byte_len(std_path) > 0
+    sb_append(sb, " -I ")
+    sb_append(sb, std_path)
+  end
+  sb_append(sb, " ")
+  sb_append(sb, src)
+  sb_append(sb, " > ")
+  sb_append(sb, ir)
+  sb_append(sb, " 2> ")
+  sb_append(sb, err)
+
+  var raw = _sub_stage_raw(_sub_supervised("nested-compile", id, _sub_compile_argv(src, flags, ""), vec_new<String>(), vec_new<String>(), ir, err, false))
+  var signaled = band(raw, 127)
+  var exit_code = 0
+  if signaled != 0
+    exit_code = 128 + signaled
+  else
+    exit_code = band(shr(raw, 8), 255)
+  end
+
+  var ir_content = read_file(ir)
+  var err_content = read_file(err)
+
+  file_delete(src)
+  file_delete(ir)
+  file_delete(err)
+
+  return _sub_result(exit_code, ir_content, err_content)
+end
+
+## Run source with extra compiler flags
+def subprocess_run_with_flags(source: String, flags: String): SubResult
+  _sub_begin_result()
+  var compiler = _sub_compiler_str
+  if str_byte_len(compiler) == 0
+    return _sub_result(-1, "", "QUARTZ_COMPILER not set")
+  end
+
+  var id = _sub_next_id()
+  var src = _sub_tmp(id, ".qz")
+  var ir = _sub_tmp(id, ".ll")
+  var cerr = _sub_tmp(id, ".cerr")
+  var rout = _sub_tmp(id, ".out")
+  var rerr = _sub_tmp(id, ".rerr")
+
+  write_file(src, source)
+
+  var sb = sb_new()
+  sb_append(sb, compiler)
+  sb_append(sb, " --no-cache ")
+  sb_append(sb, flags)
+  var std_path = _sub_std_str
+  if str_byte_len(std_path) > 0
+    sb_append(sb, " -I ")
+    sb_append(sb, std_path)
+  end
+  sb_append(sb, " ")
+  sb_append(sb, src)
+  sb_append(sb, " > ")
+  sb_append(sb, ir)
+  sb_append(sb, " 2> ")
+  sb_append(sb, cerr)
+
+  var compile_raw = _sub_stage_raw(_sub_supervised("nested-compile", id, _sub_compile_argv(src, flags, ""), vec_new<String>(), vec_new<String>(), ir, cerr, false))
+  if band(compile_raw, 127) != 0 or band(shr(compile_raw, 8), 255) != 0
+    var cerr_content = read_file(cerr)
+    file_delete(src)
+    file_delete(ir)
+    file_delete(cerr)
+    return _sub_result(-1, "", "compilation failed: " + cerr_content)
+  end
+
+  # Run — native compile (llc -O0) → link → run
+  var ir_content = read_file(ir)
+  var obj = _sub_tmp(id, ".o")
+  var bin = _sub_tmp(id, ".bin")
+  var run_exit = _sub_native_run(ir, ir_content, obj, bin, rout, rerr)
+  if run_exit == -2 or run_exit == -3
+    var fail_msg = "llc failed"
+    if run_exit == -3
+      fail_msg = "link failed"
+    end
+    file_delete(src)
+    file_delete(ir)
+    file_delete(cerr)
+    return _sub_result(-1, "", fail_msg)
+  end
+
+  var stdout_content = read_file(rout)
+  var stderr_content = read_file(rerr)
+
+  file_delete(src)
+  file_delete(ir)
+  file_delete(cerr)
+  file_delete(rout)
+  file_delete(rerr)
+
+  return _sub_result(run_exit, stdout_content, stderr_content)
+end
+
+## Assert that compiled IR contains a pattern (with extra flags)
+def assert_ir_contains_with_flags(source: String, pattern: String, flags: String): Void
+  _inc_assertions()
+  var r = subprocess_compile_with_flags(source, flags)
+  if r.exit_code != 0
+    var sb = sb_new()
+    sb_append(sb, "Compilation failed (expected IR check): ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if not str_contains(r.stdout_content, pattern)
+    var sb = sb_new()
+    sb_append(sb, "Expected IR to contain '")
+    sb_append(sb, pattern)
+    sb_append(sb, "' but it was not found")
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert that compiled IR does NOT contain a pattern (with extra flags)
+def assert_ir_not_contains_with_flags(source: String, pattern: String, flags: String): Void
+  _inc_assertions()
+  var r = subprocess_compile_with_flags(source, flags)
+  if r.exit_code != 0
+    var sb = sb_new()
+    sb_append(sb, "Compilation failed (expected IR check): ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if str_contains(r.stdout_content, pattern)
+    var sb = sb_new()
+    sb_append(sb, "Expected IR to NOT contain '")
+    sb_append(sb, pattern)
+    sb_append(sb, "' but it was found")
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert that program panics with extra compiler flags
+def assert_run_panics_with_flags(source: String, expected: String, flags: String): Void
+  _inc_assertions()
+  var r = subprocess_run_with_flags(source, flags)
+  if r.exit_code == -1
+    var sb = sb_new()
+    sb_append(sb, "Failed to compile/run: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if r.exit_code == 0
+    _record_failure("Expected program to panic (non-zero exit) but it exited 0")
+    return
+  end
+  var found_in_stdout = str_contains(r.stdout_content, expected)
+  var found_in_stderr = str_contains(r.stderr_content, expected)
+  if not found_in_stdout and not found_in_stderr
+    var sb = sb_new()
+    sb_append(sb, "Expected panic output to contain '")
+    sb_append(sb, expected)
+    sb_append(sb, "' but stdout was: ")
+    sb_append(sb, r.stdout_content)
+    sb_append(sb, " and stderr was: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert that program exits with specific code with extra compiler flags
+def assert_run_exits_with_flags(source: String, code: Int, flags: String): Void
+  _inc_assertions()
+  var r = subprocess_run_with_flags(source, flags)
+  if r.exit_code == -1
+    var sb = sb_new()
+    sb_append(sb, "Failed to compile/run: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if r.exit_code != code
+    var sb = sb_new()
+    sb_append(sb, "Expected exit code ")
+    sb_append(sb, str_from_int(code))
+    sb_append(sb, " but got ")
+    sb_append(sb, str_from_int(r.exit_code))
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert that program's stdout equals expected string with extra compiler flags
+def assert_run_stdout_eq_with_flags(source: String, expected: String, flags: String): Void
+  _inc_assertions()
+  var r = subprocess_run_with_flags(source, flags)
+  if r.exit_code == -1
+    var sb = sb_new()
+    sb_append(sb, "Failed to compile/run: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if r.stdout_content != expected
+    var sb = sb_new()
+    sb_append(sb, "Expected stdout '")
+    sb_append(sb, expected)
+    sb_append(sb, "' but got '")
+    sb_append(sb, r.stdout_content)
+    sb_append(sb, "'")
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert that program's stdout equals expected string
+def assert_run_stdout_eq(source: String, expected: String): Void
+  _inc_assertions()
+  var r = subprocess_run(source)
+  if r.exit_code == -1
+    var sb = sb_new()
+    sb_append(sb, "Failed to compile/run: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if r.stdout_content != expected
+    var sb = sb_new()
+    sb_append(sb, "Expected stdout '")
+    sb_append(sb, expected)
+    sb_append(sb, "' but got '")
+    sb_append(sb, r.stdout_content)
+    sb_append(sb, "'")
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+# =============================================================================
+# Timeout-Wrapped Run — for scheduler programs that may hang/OOM
+# =============================================================================
+
+## Run a compiled Quartz program with a timeout to prevent hangs.
+## If the program doesn't exit within _sub_timeout_secs, it is killed.
+## Returns exit code 124 for compatibility; `SubResult.supervision` is the
+## authority that distinguishes a deadline from a program's normal exit 124.
+def subprocess_run_with_timeout(source: String): SubResult
+  _sub_begin_result()
+  var compiler = _sub_compiler_str
+  if str_byte_len(compiler) == 0
+    return _sub_result(-1, "", "QUARTZ_COMPILER not set")
+  end
+
+  var id = _sub_next_id()
+  var src = _sub_tmp(id, ".qz")
+  var ir = _sub_tmp(id, ".ll")
+  var cerr = _sub_tmp(id, ".cerr")
+  var rout = _sub_tmp(id, ".out")
+  var rerr = _sub_tmp(id, ".rerr")
+
+  write_file(src, source)
+
+  # Step 1: Compile under the same bounded stage supervisor.
+  var sb = sb_new()
+  sb_append(sb, compiler)
+  sb_append(sb, " --no-cache")
+  var std_path = _sub_std_str
+  if str_byte_len(std_path) > 0
+    sb_append(sb, " -I ")
+    sb_append(sb, std_path)
+  end
+  sb_append(sb, " ")
+  sb_append(sb, src)
+  sb_append(sb, " > ")
+  sb_append(sb, ir)
+  sb_append(sb, " 2> ")
+  sb_append(sb, cerr)
+
+  var compile_raw = _sub_stage_raw(_sub_supervised("nested-compile", id, _sub_compile_argv(src, "", ""), vec_new<String>(), vec_new<String>(), ir, cerr, false))
+  if band(compile_raw, 127) != 0 or band(shr(compile_raw, 8), 255) != 0
+    var cerr_content = read_file(cerr)
+    file_delete(src)
+    file_delete(ir)
+    file_delete(cerr)
+    return _sub_result(-1, "", "compilation failed: " + cerr_content)
+  end
+
+  # Step 2: native compile (llc -O0) → link → run (timeout-wrapped)
+  var ir_content = read_file(ir)
+  var obj = _sub_tmp(id, ".o")
+  var bin = _sub_tmp(id, ".bin")
+  var run_exit = _sub_native_run(ir, ir_content, obj, bin, rout, rerr)
+  if run_exit == -2 or run_exit == -3
+    var fail_msg = "llc failed"
+    if run_exit == -3
+      fail_msg = "link failed"
+    end
+    file_delete(src)
+    file_delete(ir)
+    file_delete(cerr)
+    return _sub_result(-1, "", fail_msg)
+  end
+
+  var stdout_content = read_file(rout)
+  var stderr_content = read_file(rerr)
+
+  file_delete(src)
+  file_delete(ir)
+  file_delete(cerr)
+  file_delete(rout)
+  file_delete(rerr)
+
+  return _sub_result(run_exit, stdout_content, stderr_content)
+end
+
+## Assert that program exits with specific exit code (with timeout).
+def assert_run_exits_timeout(source: String, code: Int): Void
+  _inc_assertions()
+  var r = subprocess_run_with_timeout(source)
+  if r.exit_code == -1
+    var sb = sb_new()
+    sb_append(sb, "Failed to compile/run: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if r.exit_code != code
+    var sb = sb_new()
+    sb_append(sb, "Expected exit code ")
+    sb_append(sb, str_from_int(code))
+    sb_append(sb, " but got ")
+    sb_append(sb, str_from_int(r.exit_code))
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+# =============================================================================
+# Multi-File Compilation Support
+# =============================================================================
+
+## Create a temp directory path for multi-file compilation.
+def _sub_multi_dir(id: Int): String
+  var sb = sb_new()
+  sb_append(sb, _sub_root_str)
+  sb_append(sb, "/_qspec_multi_")
+  sb_append(sb, str_from_int(_sub_pid))
+  sb_append(sb, "_")
+  sb_append(sb, str_from_int(id))
+  return sb_to_string(sb)
+end
+
+def _sub_valid_relative_path(path: String): Bool
+  if str_byte_len(path) == 0 or str_starts_with(path, "/")
+    return false
+  end
+  var parts = str_split(path, "/")
+  for i in 0..parts.size
+    var part = parts[i]
+    if str_byte_len(part) == 0 or part == "." or part == ".."
+      return false
+    end
+    for j in 0..str_byte_len(part)
+      var ch = str_byte_at(part, j)
+      var safe = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '-' or ch == '.'
+      if not safe
+        return false
+      end
+    end
+  end
+  return true
+end
+
+## Write multi-file sources to a temp directory.
+## files: Vec with alternating [filename, source] pairs.
+## main_idx: which pair (0-based) is the main file.
+## Returns: Vec of [dir_path, main_file_path] as int handles.
+def _sub_write_multi(files: Vec, main_idx: Int): Vec
+  _sub_init()
+  var invalid: Vec = vec_new()
+  if vec_size(files) == 0 or vec_size(files) % 2 != 0 or main_idx < 0 or main_idx >= vec_size(files) / 2
+    return invalid
+  end
+  var check_idx = 0
+  while check_idx < vec_size(files)
+    if not _sub_valid_relative_path(as_string(vec_get(files, check_idx)))
+      return invalid
+    end
+    check_idx += 2
+  end
+  var id = _sub_next_id()
+  var dir = _sub_multi_dir(id)
+  mkdir(dir)
+
+  var main_path = ""
+  var i = 0
+  while i < vec_size(files)
+    var fname = as_string(vec_get(files, i))
+    var src = as_string(vec_get(files, i + 1))
+    if str_contains(fname, "/")
+      var subdir_sb = sb_new()
+      sb_append(subdir_sb, dir)
+      sb_append(subdir_sb, "/")
+      sb_append(subdir_sb, path_dir(fname))
+      mkdir(sb_to_string(subdir_sb))
+    end
+    var fpath_sb = sb_new()
+    sb_append(fpath_sb, dir)
+    sb_append(fpath_sb, "/")
+    sb_append(fpath_sb, fname)
+    var fpath = sb_to_string(fpath_sb)
+    write_file(fpath, src)
+    if i / 2 == main_idx
+      main_path = fpath
+    end
+    i = i + 2
+  end
+
+  var result: Vec = vec_new()
+  result.push(as_int(dir))
+  result.push(as_int(main_path))
+  return result
+end
+
+## Clean up multi-file temp directory.
+def _sub_cleanup_multi(dir: String, files: Vec): Void
+  var i = 0
+  while i < vec_size(files)
+    var fname = as_string(vec_get(files, i))
+    var sb = sb_new()
+    sb_append(sb, dir)
+    sb_append(sb, "/")
+    sb_append(sb, fname)
+    file_delete(sb_to_string(sb))
+    i = i + 2
+  end
+  var ir_sb = sb_new()
+  sb_append(ir_sb, dir)
+  sb_append(ir_sb, "/out.ll")
+  file_delete(sb_to_string(ir_sb))
+  var err_sb = sb_new()
+  sb_append(err_sb, dir)
+  sb_append(err_sb, "/out.err")
+  file_delete(sb_to_string(err_sb))
+  var rout_sb = sb_new()
+  sb_append(rout_sb, dir)
+  sb_append(rout_sb, "/run.out")
+  file_delete(sb_to_string(rout_sb))
+  var rerr_sb = sb_new()
+  sb_append(rerr_sb, dir)
+  sb_append(rerr_sb, "/run.err")
+  file_delete(sb_to_string(rerr_sb))
+  return
+end
+
+## Compile a multi-file project.
+## files: Vec with alternating [filename, source] pairs.
+## main_idx: which pair (0-based) is the main file to compile.
+## Returns SubResult with IR in stdout_content, errors in stderr_content.
+def subprocess_compile_multi(files: Vec, main_idx: Int): SubResult
+  _sub_begin_result()
+  var compiler = _sub_compiler_str
+  if str_byte_len(compiler) == 0
+    return _sub_result(-1, "", "QUARTZ_COMPILER not set")
+  end
+
+  var paths = _sub_write_multi(files, main_idx)
+  if vec_size(paths) != 2
+    return _sub_result(-1, "", "invalid multi-file relative path")
+  end
+  var dir = as_string(vec_get(paths, 0))
+  var main_path = as_string(vec_get(paths, 1))
+
+  var ir_sb = sb_new()
+  sb_append(ir_sb, dir)
+  sb_append(ir_sb, "/out.ll")
+  var ir_path = sb_to_string(ir_sb)
+
+  var err_sb = sb_new()
+  sb_append(err_sb, dir)
+  sb_append(err_sb, "/out.err")
+  var err_path = sb_to_string(err_sb)
+
+  var sb = sb_new()
+  sb_append(sb, compiler)
+  sb_append(sb, " --no-cache -I ")
+  sb_append(sb, dir)
+  var std_path = _sub_std_str
+  if str_byte_len(std_path) > 0
+    sb_append(sb, " -I ")
+    sb_append(sb, std_path)
+  end
+  sb_append(sb, " ")
+  sb_append(sb, main_path)
+  sb_append(sb, " > ")
+  sb_append(sb, ir_path)
+  sb_append(sb, " 2> ")
+  sb_append(sb, err_path)
+
+  var raw = _sub_stage_raw(_sub_supervised("nested-compile", _sub_next_id(), _sub_compile_argv(main_path, "", dir), vec_new<String>(), vec_new<String>(), ir_path, err_path, false))
+  var signaled = band(raw, 127)
+  var exit_code = 0
+  if signaled != 0
+    exit_code = 128 + signaled
+  else
+    exit_code = band(shr(raw, 8), 255)
+  end
+
+  var ir_content = read_file(ir_path)
+  var err_content = read_file(err_path)
+  _sub_cleanup_multi(dir, files)
+
+  return _sub_result(exit_code, ir_content, err_content)
+end
+
+## Compile and run a multi-file project.
+## files: Vec with alternating [filename, source] pairs.
+## main_idx: which pair (0-based) is the main file to compile.
+def subprocess_run_multi(files: Vec, main_idx: Int): SubResult
+  _sub_begin_result()
+  var compiler = _sub_compiler_str
+  if str_byte_len(compiler) == 0
+    return _sub_result(-1, "", "QUARTZ_COMPILER not set")
+  end
+
+  var paths = _sub_write_multi(files, main_idx)
+  if vec_size(paths) != 2
+    return _sub_result(-1, "", "invalid multi-file relative path")
+  end
+  var dir = as_string(vec_get(paths, 0))
+  var main_path = as_string(vec_get(paths, 1))
+
+  var ir_sb = sb_new()
+  sb_append(ir_sb, dir)
+  sb_append(ir_sb, "/out.ll")
+  var ir_path = sb_to_string(ir_sb)
+
+  var err_sb = sb_new()
+  sb_append(err_sb, dir)
+  sb_append(err_sb, "/out.err")
+  var err_path = sb_to_string(err_sb)
+
+  # Step 1: Compile
+  var sb = sb_new()
+  sb_append(sb, compiler)
+  sb_append(sb, " --no-cache -I ")
+  sb_append(sb, dir)
+  var std_path = _sub_std_str
+  if str_byte_len(std_path) > 0
+    sb_append(sb, " -I ")
+    sb_append(sb, std_path)
+  end
+  sb_append(sb, " ")
+  sb_append(sb, main_path)
+  sb_append(sb, " > ")
+  sb_append(sb, ir_path)
+  sb_append(sb, " 2> ")
+  sb_append(sb, err_path)
+
+  var compile_raw = _sub_stage_raw(_sub_supervised("nested-compile", _sub_next_id(), _sub_compile_argv(main_path, "", dir), vec_new<String>(), vec_new<String>(), ir_path, err_path, false))
+  if band(compile_raw, 127) != 0 or band(shr(compile_raw, 8), 255) != 0
+    var cerr_content = read_file(err_path)
+    _sub_cleanup_multi(dir, files)
+    return _sub_result(-1, "", "compilation failed: " + cerr_content)
+  end
+
+  # Step 2: native compile (llc -O0) → link → run
+  var rout_sb = sb_new()
+  sb_append(rout_sb, dir)
+  sb_append(rout_sb, "/run.out")
+  var rout_path = sb_to_string(rout_sb)
+
+  var rerr_sb = sb_new()
+  sb_append(rerr_sb, dir)
+  sb_append(rerr_sb, "/run.err")
+  var rerr_path = sb_to_string(rerr_sb)
+
+  var obj_sb = sb_new()
+  sb_append(obj_sb, dir)
+  sb_append(obj_sb, "/out.o")
+  var obj_path = sb_to_string(obj_sb)
+  var bin_sb = sb_new()
+  sb_append(bin_sb, dir)
+  sb_append(bin_sb, "/out.bin")
+  var bin_path = sb_to_string(bin_sb)
+
+  var ir_content_multi = read_file(ir_path)
+  var run_exit = _sub_native_run(ir_path, ir_content_multi, obj_path, bin_path, rout_path, rerr_path)
+  if run_exit == -2 or run_exit == -3
+    var fail_msg = "llc failed"
+    if run_exit == -3
+      fail_msg = "link failed"
+    end
+    _sub_cleanup_multi(dir, files)
+    return _sub_result(-1, "", fail_msg)
+  end
+
+  var stdout_content = read_file(rout_path)
+  var stderr_content = read_file(rerr_path)
+  _sub_cleanup_multi(dir, files)
+
+  return _sub_result(run_exit, stdout_content, stderr_content)
+end
+
+# =============================================================================
+# Multi-File High-Level Assertions
+# =============================================================================
+
+## Assert multi-file project compiles successfully.
+def assert_multi_compile_succeeds(files: Vec, main_idx: Int): Void
+  _inc_assertions()
+  var r = subprocess_compile_multi(files, main_idx)
+  if r.exit_code != 0
+    var sb = sb_new()
+    sb_append(sb, "Expected multi-file compilation to succeed but it failed: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert multi-file project fails to compile with expected error.
+def assert_multi_compile_error(files: Vec, main_idx: Int, expected: String): Void
+  _inc_assertions()
+  var r = subprocess_compile_multi(files, main_idx)
+  if r.exit_code == 0
+    _record_failure("Expected multi-file compilation to fail but it succeeded")
+    return
+  end
+  if not str_contains(r.stderr_content, expected)
+    var sb = sb_new()
+    sb_append(sb, "Expected compile error to contain '")
+    sb_append(sb, expected)
+    sb_append(sb, "' but stderr was: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert multi-file project runs and exits with expected code.
+def assert_multi_run_exits(files: Vec, main_idx: Int, expected_code: Int): Void
+  _inc_assertions()
+  var r = subprocess_run_multi(files, main_idx)
+  if r.exit_code == -1
+    var sb = sb_new()
+    sb_append(sb, "Failed to compile/run multi-file: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if r.exit_code != expected_code
+    var sb = sb_new()
+    sb_append(sb, "Expected exit code ")
+    sb_append(sb, str_from_int(expected_code))
+    sb_append(sb, " but got ")
+    sb_append(sb, str_from_int(r.exit_code))
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert multi-file project runs and stdout matches expected.
+def assert_multi_run_output(files: Vec, main_idx: Int, expected: String): Void
+  _inc_assertions()
+  var r = subprocess_run_multi(files, main_idx)
+  if r.exit_code == -1
+    var sb = sb_new()
+    sb_append(sb, "Failed to compile/run multi-file: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if r.stdout_content != expected
+    var sb = sb_new()
+    sb_append(sb, "Expected stdout '")
+    sb_append(sb, expected)
+    sb_append(sb, "' but got '")
+    sb_append(sb, r.stdout_content)
+    sb_append(sb, "'")
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert multi-file project's IR contains a pattern.
+def assert_multi_ir_contains(files: Vec, main_idx: Int, pattern: String): Void
+  _inc_assertions()
+  var r = subprocess_compile_multi(files, main_idx)
+  if r.exit_code != 0
+    var sb = sb_new()
+    sb_append(sb, "Multi-file compilation failed (expected IR check): ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if not str_contains(r.stdout_content, pattern)
+    var sb = sb_new()
+    sb_append(sb, "Expected IR to contain '")
+    sb_append(sb, pattern)
+    sb_append(sb, "' but it was not found")
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert that source code compiles successfully BUT produces a warning on stderr
+## Unlike assert_compile_error, this checks for warnings that don't prevent compilation.
+def assert_compile_warning(source: String, expected: String): Void
+  _inc_assertions()
+  var r = subprocess_compile(source)
+  if r.exit_code != 0
+    var sb = sb_new()
+    sb_append(sb, "Expected compilation to succeed (with warning) but it failed: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+    return
+  end
+  if not str_contains(r.stderr_content, expected)
+    var sb = sb_new()
+    sb_append(sb, "Expected compile warning to contain '")
+    sb_append(sb, expected)
+    sb_append(sb, "' but stderr was: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## ========================================================================
+## Lint helpers
+## ========================================================================
+
+## Run `quartz lint` on source, returning stdout+stderr as SubResult.
+def subprocess_lint(source: String): SubResult
+  _sub_begin_result()
+  var compiler = _sub_compiler_str
+  if str_byte_len(compiler) == 0
+    return _sub_result(-1, "", "QUARTZ_COMPILER not set")
+  end
+  var id = _sub_next_id()
+  var src = _sub_tmp(id, ".qz")
+  var out = _sub_tmp(id, ".out")
+  var err = _sub_tmp(id, ".err")
+  write_file(src, source)
+  var sb = sb_new()
+  sb_append(sb, compiler)
+  sb_append(sb, " lint ")
+  sb_append(sb, src)
+  sb_append(sb, " > ")
+  sb_append(sb, out)
+  sb_append(sb, " 2> ")
+  sb_append(sb, err)
+  var lint_argv = vec_new<String>(); lint_argv.push(compiler); lint_argv.push("lint"); lint_argv.push(src)
+  var raw = _sub_stage_raw(_sub_supervised("nested-compile", id, lint_argv, vec_new<String>(), vec_new<String>(), out, err, false))
+  var signaled = band(raw, 127)
+  var exit_code = 0
+  if signaled != 0
+    exit_code = 128 + signaled
+  else
+    exit_code = band(shr(raw, 8), 255)
+  end
+  var out_content = read_file(out)
+  var err_content = read_file(err)
+  file_delete(src)
+  file_delete(out)
+  file_delete(err)
+  return _sub_result(exit_code, out_content, err_content)
+end
+
+## Assert that linting source produces a warning with the given code.
+def assert_lint_warns(source: String, expected_code: String): Void
+  _inc_assertions()
+  var r = subprocess_lint(source)
+  if not str_contains(r.stderr_content, expected_code)
+    var sb = sb_new()
+    sb_append(sb, "Expected lint warning ")
+    sb_append(sb, expected_code)
+    sb_append(sb, " but stderr was: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+  end
+end
+
+## Assert that linting source produces no warnings.
+def assert_lint_clean(source: String): Void
+  _inc_assertions()
+  var r = subprocess_lint(source)
+  if r.exit_code != 0
+    var sb = sb_new()
+    sb_append(sb, "Expected clean lint but got exit code ")
+    sb_append(sb, str_from_int(r.exit_code))
+    sb_append(sb, " stderr: ")
+    sb_append(sb, r.stderr_content)
+    _record_failure(sb_to_string(sb))
+  end
+end

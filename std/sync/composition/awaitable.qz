@@ -1,0 +1,91 @@
+## std/sync/composition/awaitable — FutureSelectable wrapper for `select` (C.13 Phase 5)
+##
+## Lifts a task handle (from `go`, `async`, or `spawn`) into a Selectable so
+## it can race other Selectables inside `select`:
+##
+##   var t = go (-> long_running())
+##   select
+##     case x = awaitable(t) => use(x)
+##     case _ = deadline_ms(5000) => give_up()
+##     default => non_blocking_fallback()
+##   end
+##
+## Lives in `std/sync/composition/awaitable.qz` rather than the future-combinator
+## module because a Selectable wrapper for futures is logically a sync primitive,
+## not a future combinator — co-located with the rest of the C.13 Selectable
+## impls (`recvable`, `sendable`, `deadline_ms`, `cancellable`).
+##
+## Frame layout matches `std/concurrency.qz` and `std/sync/composition/future.qz` use
+## of `load(handle, N)`:
+##   slot 0: state — -1 = done, 0 = pending, > 0 = in-progress markers
+##   slot 1: result — the task's return value (valid once state == -1)
+
+import * from std/selectable
+
+## A Selectable that observes "task `task_handle` has completed". Use
+## as the right-hand side of a `case x = awaitable(t) => ...` arm in
+## `select`. The bound `x` is the task's return value (frame slot 1)
+## once the task is done. Constructing the wrapper is free; the task
+## is unaffected until the select runtime polls the wrapper.
+##
+## **Non-destructive**: unlike RecvSelectable / SendSelectable, the
+## task frame's result slot is read-only — `try_poll` reads it without
+## consuming. Multiple `awaitable(t)` arms across separate selects
+## observing the same task all see the same result; there's no
+## race-on-completion caveat. (However, awaiting through `await t` or
+## `async_race` / `async_select` after a winning Selectable arm will
+## of course re-read the same value.)
+##
+## Phase 5 (2026-05-10) — register_waker wires the polling task's
+## frame onto the generic resource-waiter side-table (`@__qz_waiters`).
+## When the target task completes, `task_done` / `panic_caught` walk
+## the table and call `sched_wake` on every matching waiter. Drops
+## select-arm observation latency from sched_yield-cadence (~ms) to ~us.
+struct FutureSelectable
+  task_handle: Int
+end
+
+extend FutureSelectable with Selectable<Int>
+  ## try_poll: reads the task frame's state slot. Returns
+  ## `Some(result)` if the task is done (state == -1), `None`
+  ## otherwise. Non-destructive — the result slot is read, not
+  ## consumed.
+  def try_poll(self): Option<Int>
+    if load(@task_handle, 0) == -1
+      var result = load(@task_handle, 1)
+      return option_some(result)
+    end
+    return option_none()
+  end
+
+  ## register_waker: append (target_task, waiter_frame) to the global
+  ## resource-waiter side-table. Idempotent — re-registration of the
+  ## same pair is a no-op. When `target_task` finishes (task_done /
+  ## panic_caught), the runtime walks the table and `sched_wake`s the
+  ## waiter, which retries try_poll and wins the arm.
+  def register_waker(self, frame: Int): Void
+    waiter_register(@task_handle, frame)
+  end
+
+  ## unregister_waker: remove (target_task, waiter_frame) from the
+  ## side-table. Called eagerly in the body prologue (Plan A) before
+  ## the user's arm body runs — keeps the table clean even if
+  ## complete() throws via Throws.
+  def unregister_waker(self, frame: Int): Void
+    waiter_unregister(@task_handle, frame)
+  end
+
+  ## complete: no-op. The result was read non-destructively in
+  ## try_poll and lives in the Option's payload. Returns 0 — the
+  ## user's pattern binding is set from try_poll's payload, not from
+  ## complete's return.
+  def complete(self): Int
+    return 0
+  end
+end
+
+## Wrap a task handle (from `go`, `async`, or `spawn`) as a Selectable
+## that fires when the task completes. Use inside `select { case x =
+## awaitable(t) => ... }`. The wrapper is free; the task is
+## unaffected until the select runtime polls the wrapper.
+def awaitable(task: Int): FutureSelectable = FutureSelectable { task_handle: task }

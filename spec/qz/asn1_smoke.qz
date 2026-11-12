@@ -1,0 +1,567 @@
+# NET.5b.1 — ASN.1/DER decoder KAT runner.
+#
+# Standalone smoke driven from `quake asn1:smoke`. Verifies the
+# std/core/crypto/asn1 primitives against hand-crafted byte sequences that
+# exercise every supported tag, length form, and minimal-DER rejection rule.
+#
+# Vector groups (organised by tag / behaviour, ~50 checks total):
+#
+#   1. Tag + length forms (short, long-1, long-2, minimal-DER rejection)
+#   2. INTEGER positive / zero / padded / overflow / negative reject
+#   3. BOOLEAN strict 0x00/0xFF, value reject
+#   4. NULL strict 0-length
+#   5. OCTET STRING span extraction
+#   6. OBJECT IDENTIFIER + der_oid_equals
+#   7. BIT STRING with unused-bits prefix
+#   8. SEQUENCE / SET / context-specific open + close
+#   9. der_close trailing-bytes / sticky-err propagation
+#   10. UTCTime + GeneralizedTime → unix seconds (RFC 5280 §4.1.2.5)
+#   11. der_skip_tlv + der_peek_tag + at-end behaviour
+#
+# Format mirrors spec/qz/aes_smoke.qz so the smoke runners share idiom.
+
+import * from ffi/socket
+import * from std/core/crypto/asn1
+
+# =============================================================================
+# Hex + buffer helpers (mirrors aes_smoke.qz)
+# =============================================================================
+
+def hex_nibble(c: Int): Int
+  if (c >= 48) & (c <= 57) then return c - 48 end
+  if (c >= 97) & (c <= 102) then return c - 97 + 10 end
+  return c - 65 + 10
+end
+
+# Build a malloc'd byte buffer from a hex string. Caller frees.
+def hex_decode(hex: String): Int
+  var n = str_byte_len(hex) / 2
+  var buf = malloc(if n == 0 then 1 else n end)
+  var i = 0
+  while i < n
+    var hi = hex_nibble(str_byte_at(hex, i * 2))
+    var lo = hex_nibble(str_byte_at(hex, i * 2 + 1))
+    ptr_write_byte(buf + i, (hi << 4) | lo)
+    i = i + 1
+  end
+  return buf
+end
+
+def hex_len(hex: String): Int = str_byte_len(hex) / 2
+
+# =============================================================================
+# Pass/fail trackers
+# =============================================================================
+
+var g_total: Int = 0
+var g_passed: Int = 0
+
+def check_eq_int(label: String, got: Int, want: Int): Void
+  g_total = g_total + 1
+  if got == want
+    g_passed = g_passed + 1
+    puts("OK   " + label)
+    return
+  end
+  puts("FAIL " + label)
+  puts("       got:  " + got.to_s())
+  puts("       want: " + want.to_s())
+end
+
+def check_span(label: String, p: Int, len: Int, want_hex: String): Void
+  g_total = g_total + 1
+  var wl = hex_len(want_hex)
+  if len != wl
+    puts("FAIL " + label + " (len " + len.to_s() + " != " + wl.to_s() + ")")
+    return
+  end
+  var want = hex_decode(want_hex)
+  var i = 0
+  while i < len
+    if ptr_read_byte(p + i) != ptr_read_byte(want + i)
+      puts("FAIL " + label + " byte " + i.to_s())
+      free(want)
+      return
+    end
+    i = i + 1
+  end
+  free(want)
+  g_passed = g_passed + 1
+  puts("OK   " + label)
+end
+
+# =============================================================================
+# 1. Tag + length forms
+# =============================================================================
+
+def test_tag_length(): Void
+  puts("--- Tag + length forms ---")
+
+  # Short form: OCTET STRING with 5 bytes of payload.
+  var b1 = hex_decode("0405" + "0102030405")
+  var r1 = der_new(b1, 7)
+  der_read_octet_string(r1)
+  check_eq_int("short-form err",       r1.err,     0)
+  check_eq_int("short-form val_len",   r1.val_len, 5)
+  check_eq_int("short-form at_end",    der_at_end(r1), 1)
+  free(b1)
+
+  # Long form, 1 length byte: OCTET STRING with 200 bytes (0xc8).
+  # We don't fill the payload; just need pos arithmetic right.
+  var b2 = malloc(203)
+  ptr_write_byte(b2, 0x04)
+  ptr_write_byte(b2 + 1, 0x81)
+  ptr_write_byte(b2 + 2, 0xc8)   # 200
+  var i = 0
+  while i < 200
+    ptr_write_byte(b2 + 3 + i, i & 0xff)
+    i = i + 1
+  end
+  var r2 = der_new(b2, 203)
+  der_read_octet_string(r2)
+  check_eq_int("long1 err",        r2.err,     0)
+  check_eq_int("long1 val_len",    r2.val_len, 200)
+  check_eq_int("long1 at_end",     der_at_end(r2), 1)
+  free(b2)
+
+  # Long form, 2 length bytes: OCTET STRING with 300 bytes (0x012c).
+  var b3 = malloc(304)
+  ptr_write_byte(b3,     0x04)
+  ptr_write_byte(b3 + 1, 0x82)
+  ptr_write_byte(b3 + 2, 0x01)
+  ptr_write_byte(b3 + 3, 0x2c)
+  var j = 0
+  while j < 300
+    ptr_write_byte(b3 + 4 + j, j & 0xff)
+    j = j + 1
+  end
+  var r3 = der_new(b3, 304)
+  der_read_octet_string(r3)
+  check_eq_int("long2 err",     r3.err,     0)
+  check_eq_int("long2 val_len", r3.val_len, 300)
+  free(b3)
+
+  # Minimal-DER reject: 0x81 0x05 should have been short form 0x05.
+  var b4 = hex_decode("0481" + "05" + "0102030405")
+  var r4 = der_new(b4, 8)
+  der_read_octet_string(r4)
+  check_eq_int("minimal reject long1<128", r4.err, DER_ERR_LEN())
+  free(b4)
+
+  # Minimal-DER reject: 0x82 0x00 0xFF — leading zero byte in long form.
+  var b5 = hex_decode("0482" + "00ff" + "0102030405")
+  var r5 = der_new(b5, 9)
+  der_read_octet_string(r5)
+  check_eq_int("minimal reject long-leading-zero", r5.err, DER_ERR_LEN())
+  free(b5)
+
+  # Indefinite length (BER, not DER) reject: 0x80 first length byte.
+  var b6 = hex_decode("0480")
+  var r6 = der_new(b6, 2)
+  der_read_octet_string(r6)
+  check_eq_int("indefinite-length reject", r6.err, DER_ERR_UNSUPPORTED())
+  free(b6)
+
+  # Truncated length: short form claims 5 but only 3 left.
+  var b7 = hex_decode("0405" + "010203")
+  var r7 = der_new(b7, 5)
+  der_read_octet_string(r7)
+  check_eq_int("truncated value reject", r7.err, DER_ERR_EOF())
+  free(b7)
+
+  # Tag mismatch.
+  var b8 = hex_decode("0201" + "05")
+  var r8 = der_new(b8, 3)
+  der_read_octet_string(r8)   # expecting OCTET STRING (0x04), got INTEGER (0x02)
+  check_eq_int("tag mismatch", r8.err, DER_ERR_TAG())
+  free(b8)
+end
+
+# =============================================================================
+# 2. INTEGER readers
+# =============================================================================
+
+def test_integer(): Void
+  puts("--- INTEGER ---")
+
+  # Positive small: 5
+  var b1 = hex_decode("020105")
+  var r1 = der_new(b1, 3)
+  check_eq_int("int 5", der_read_integer_u64(r1), 5)
+  check_eq_int("int 5 err", r1.err, 0)
+  free(b1)
+
+  # Zero: 0x02 0x01 0x00
+  var b2 = hex_decode("020100")
+  var r2 = der_new(b2, 3)
+  check_eq_int("int 0", der_read_integer_u64(r2), 0)
+  free(b2)
+
+  # Padded: 0x02 0x02 0x00 0xFF → unsigned 255 (high bit set, needs pad).
+  var b3 = hex_decode("020200ff")
+  var r3 = der_new(b3, 4)
+  check_eq_int("int padded 255", der_read_integer_u64(r3), 255)
+  free(b3)
+
+  # Negative reject: 0x02 0x01 0xFF would be -1 in two's complement.
+  var b4 = hex_decode("0201ff")
+  var r4 = der_new(b4, 3)
+  der_read_integer_u64(r4)
+  check_eq_int("int negative reject", r4.err, DER_ERR_VALUE())
+  free(b4)
+
+  # Non-canonical pad: 0x02 0x02 0x00 0x01 — leading 0x00 unnecessary (0x01 < 0x80).
+  var b5 = hex_decode("02020001")
+  var r5 = der_new(b5, 4)
+  der_read_integer_u64(r5)
+  check_eq_int("int non-canonical pad reject", r5.err, DER_ERR_VALUE())
+  free(b5)
+
+  # 8-byte positive at the u63 boundary: 0x7FFFFFFFFFFFFFFF.
+  var b6 = hex_decode("0208" + "7fffffffffffffff")
+  var r6 = der_new(b6, 10)
+  check_eq_int("int u63 max", der_read_integer_u64(r6), 9223372036854775807)
+  free(b6)
+
+  # Overflow: 9 raw bytes (no pad), can't fit in i64.
+  var b7 = hex_decode("0209" + "010000000000000000")
+  var r7 = der_new(b7, 11)
+  der_read_integer_u64(r7)
+  check_eq_int("int overflow reject (9 raw bytes)", r7.err, DER_ERR_OVERFLOW())
+  free(b7)
+
+  # Overflow variant: pad + 8 high-bit-set bytes (after strip, value ≥ 2^63).
+  var b7b = hex_decode("0209" + "00ffffffffffffffff")
+  var r7b = der_new(b7b, 11)
+  der_read_integer_u64(r7b)
+  check_eq_int("int overflow reject (pad + 2^63 set)", r7b.err, DER_ERR_OVERFLOW())
+  free(b7b)
+
+  # Span variant: 16-byte serial number (typical X.509).
+  var b8 = hex_decode("0210" + "0102030405060708090a0b0c0d0e0f10")
+  var r8 = der_new(b8, 18)
+  der_read_integer_span(r8)
+  check_eq_int("int span err", r8.err, 0)
+  check_span("int span bytes", r8.val_ptr, r8.val_len, "0102030405060708090a0b0c0d0e0f10")
+  free(b8)
+end
+
+# =============================================================================
+# 3. BOOLEAN
+# =============================================================================
+
+def test_boolean(): Void
+  puts("--- BOOLEAN ---")
+
+  var t = hex_decode("0101ff")
+  var rt = der_new(t, 3)
+  check_eq_int("bool TRUE", der_read_boolean(rt), 1)
+  free(t)
+
+  var f = hex_decode("010100")
+  var rf = der_new(f, 3)
+  check_eq_int("bool FALSE", der_read_boolean(rf), 0)
+  free(f)
+
+  # Strict DER: 0x01 is not a valid BOOLEAN (BER would accept "any non-zero").
+  var b = hex_decode("010101")
+  var rb = der_new(b, 3)
+  der_read_boolean(rb)
+  check_eq_int("bool strict reject 0x01", rb.err, DER_ERR_VALUE())
+  free(b)
+
+  # Wrong length.
+  var w = hex_decode("0102ff00")
+  var rw = der_new(w, 4)
+  der_read_boolean(rw)
+  check_eq_int("bool length reject", rw.err, DER_ERR_VALUE())
+  free(w)
+end
+
+# =============================================================================
+# 4. NULL
+# =============================================================================
+
+def test_null(): Void
+  puts("--- NULL ---")
+
+  var n = hex_decode("0500")
+  var rn = der_new(n, 2)
+  der_read_null(rn)
+  check_eq_int("null ok",     rn.err,         0)
+  check_eq_int("null at_end", der_at_end(rn), 1)
+  free(n)
+
+  var bad = hex_decode("050100")
+  var rb = der_new(bad, 3)
+  der_read_null(rb)
+  check_eq_int("null with bytes reject", rb.err, DER_ERR_VALUE())
+  free(bad)
+end
+
+# =============================================================================
+# 5. OCTET STRING — span verified
+# =============================================================================
+
+def test_octet_string(): Void
+  puts("--- OCTET STRING ---")
+
+  var b = hex_decode("0403414243")   # "ABC"
+  var r = der_new(b, 5)
+  der_read_octet_string(r)
+  check_eq_int("ostr err",     r.err,     0)
+  check_eq_int("ostr val_len", r.val_len, 3)
+  check_span("ostr bytes", r.val_ptr, r.val_len, "414243")
+  free(b)
+end
+
+# =============================================================================
+# 6. OBJECT IDENTIFIER + der_oid_equals
+# =============================================================================
+
+def test_oid(): Void
+  puts("--- OBJECT IDENTIFIER ---")
+
+  # 1.3.101.112 (id-Ed25519, RFC 8410) → DER value bytes 2B 65 70.
+  var ed = hex_decode("0603" + "2b6570")
+  var rd = der_new(ed, 5)
+  der_read_oid(rd)
+  check_eq_int("oid ed25519 err",     rd.err,     0)
+  check_eq_int("oid ed25519 val_len", rd.val_len, 3)
+  check_span("oid ed25519 bytes", rd.val_ptr, rd.val_len, "2b6570")
+
+  # OID equality match against an independent buffer.
+  var expected = hex_decode("2b6570")
+  check_eq_int("oid_equals match", der_oid_equals(rd.val_ptr, rd.val_len, expected, 3), 1)
+  free(expected)
+
+  # 2.5.29.19 (id-ce-basicConstraints) → 55 1D 13. Inequality with Ed25519 OID.
+  var bc = hex_decode("551d13")
+  check_eq_int("oid_equals mismatch (different len)", der_oid_equals(rd.val_ptr, rd.val_len, bc, 3), 0)
+  free(bc)
+  free(ed)
+
+  # Empty OID value reject.
+  var e = hex_decode("0600")
+  var re = der_new(e, 2)
+  der_read_oid(re)
+  check_eq_int("oid empty reject", re.err, DER_ERR_VALUE())
+  free(e)
+end
+
+# =============================================================================
+# 7. BIT STRING with unused-bits prefix
+# =============================================================================
+
+def test_bit_string(): Void
+  puts("--- BIT STRING ---")
+
+  # 0x03 0x04 0x00 'A' 'B' 'C' — 3 bytes payload, 0 unused bits.
+  var b = hex_decode("0304" + "00414243")
+  var r = der_new(b, 6)
+  var ub_out = malloc(1)
+  der_read_bit_string(r, ub_out)
+  check_eq_int("bitstr err",     r.err,             0)
+  check_eq_int("bitstr unused",  ptr_read_byte(ub_out), 0)
+  check_eq_int("bitstr val_len", r.val_len,         3)
+  check_span("bitstr bytes", r.val_ptr, r.val_len, "414243")
+  free(ub_out)
+  free(b)
+
+  # unused-bits > 7 reject.
+  var bad = hex_decode("0302" + "08ff")
+  var rb = der_new(bad, 4)
+  var ub2 = malloc(1)
+  der_read_bit_string(rb, ub2)
+  check_eq_int("bitstr unused>7 reject", rb.err, DER_ERR_VALUE())
+  free(ub2)
+  free(bad)
+
+  # Empty BIT STRING (0-length value, no unused-bits byte present) reject.
+  var e = hex_decode("0300")
+  var re = der_new(e, 2)
+  var ub3 = malloc(1)
+  der_read_bit_string(re, ub3)
+  check_eq_int("bitstr empty reject", re.err, DER_ERR_VALUE())
+  free(ub3)
+  free(e)
+end
+
+# =============================================================================
+# 8. SEQUENCE / SET / context-specific
+# =============================================================================
+
+def test_sequence(): Void
+  puts("--- SEQUENCE / SET / context ---")
+
+  # SEQUENCE { INTEGER 5, OCTET STRING "AB" } → 0x30 07 02 01 05 04 02 41 42
+  var seq = hex_decode("3007" + "020105" + "04024142")
+  var r = der_new(seq, 9)
+  var inner = der_open_sequence(r)
+  check_eq_int("seq outer err after open", r.err, 0)
+  check_eq_int("seq inner err on open",    inner.err, 0)
+  check_eq_int("seq inner len",            inner.end_pos - inner.pos, 7)
+
+  var i = der_read_integer_u64(inner)
+  check_eq_int("seq inner INTEGER", i, 5)
+
+  der_read_octet_string(inner)
+  check_eq_int("seq inner OCTET err",      inner.err,     0)
+  check_eq_int("seq inner OCTET len",      inner.val_len, 2)
+  check_span("seq inner OCTET bytes", inner.val_ptr, inner.val_len, "4142")
+
+  var rc = der_close(inner, r)
+  check_eq_int("seq close ok", rc, 0)
+  check_eq_int("seq outer at_end", der_at_end(r), 1)
+  free(seq)
+
+  # SET (same shape, tag 0x31).
+  var set_b = hex_decode("3103" + "020100")
+  var rs = der_new(set_b, 5)
+  var sin = der_open_set(rs)
+  check_eq_int("set open err", sin.err, 0)
+  check_eq_int("set inner INTEGER", der_read_integer_u64(sin), 0)
+  der_close(sin, rs)
+  check_eq_int("set outer err after close", rs.err, 0)
+  free(set_b)
+
+  # Context-specific [0] EXPLICIT INTEGER (X.509 version field shape).
+  # Outer: A0 03 02 01 02   → [0] EXPLICIT { INTEGER 2 }
+  var ctx = hex_decode("a003" + "020102")
+  var rc2 = der_new(ctx, 5)
+  var cin = der_open_context(rc2, 0)
+  check_eq_int("ctx[0] open err", cin.err, 0)
+  check_eq_int("ctx[0] inner INTEGER", der_read_integer_u64(cin), 2)
+  der_close(cin, rc2)
+  check_eq_int("ctx[0] outer err after close", rc2.err, 0)
+  free(ctx)
+end
+
+# =============================================================================
+# 9. der_close error propagation
+# =============================================================================
+
+def test_close_propagation(): Void
+  puts("--- der_close error propagation ---")
+
+  # Trailing bytes in child after close.
+  # SEQUENCE claims 7 bytes; inner is INTEGER 5 (3 bytes) + leftover 4 bytes.
+  var b = hex_decode("3007" + "020105" + "abcdef01")
+  var r = der_new(b, 9)
+  var inner = der_open_sequence(r)
+  der_read_integer_u64(inner)   # consumes 3 of 7
+  var rc = der_close(inner, r)
+  check_eq_int("trailing bytes propagate", rc, DER_ERR_TRAIL())
+  check_eq_int("parent now errored",       r.err, DER_ERR_TRAIL())
+  free(b)
+
+  # Sticky error: after a failed read, every subsequent helper short-circuits.
+  var b2 = hex_decode("0405" + "010203")   # truncated
+  var r2 = der_new(b2, 5)
+  der_read_octet_string(r2)
+  check_eq_int("sticky first err set", r2.err, DER_ERR_EOF())
+  # Now try another read; err must remain the original code (not overwritten).
+  der_read_integer_u64(r2)
+  check_eq_int("sticky err preserved", r2.err, DER_ERR_EOF())
+  free(b2)
+end
+
+# =============================================================================
+# 10. UTCTime / GeneralizedTime → unix seconds
+# =============================================================================
+
+# Reference values computed via `date -u -d 'YYYY-MM-DD HH:MM:SS' +%s`.
+#   1779451200 = 2026-05-22 12:00:00 UTC
+#   -631152000 = 1950-01-01 00:00:00 UTC (pre-epoch)
+#    2524607999 = 2049-12-31 23:59:59 UTC (last UTCTime year)
+def test_time(): Void
+  puts("--- UTCTime / GeneralizedTime ---")
+
+  # UTCTime "260522120000Z"  ("YYMMDDhhmmssZ", year 2026 since 26 < 50).
+  var u1 = hex_decode("170d" + "3236303532323132303030305a")
+  var r1 = der_new(u1, 15)
+  check_eq_int("utctime 2026-05-22 12:00:00Z", der_read_utctime(r1), 1779451200)
+  free(u1)
+
+  # UTCTime "500101000000Z" → 1950 (since 50 >= 50). Pre-epoch → negative seconds.
+  var u2 = hex_decode("170d" + "3530303130313030303030305a")
+  var r2 = der_new(u2, 15)
+  check_eq_int("utctime 1950-01-01 00:00:00Z (pre-epoch)", der_read_utctime(r2), 0 - 631152000)
+  free(u2)
+
+  # GeneralizedTime "20260522120000Z" → same as UTCTime case above.
+  var g1 = hex_decode("180f" + "32303236303532323132303030305a")
+  var rg1 = der_new(g1, 17)
+  check_eq_int("gentime 2026-05-22 12:00:00Z", der_read_generalized_time(rg1), 1779451200)
+  free(g1)
+
+  # GeneralizedTime "20491231235959Z" → 2049-12-31 23:59:59
+  var g2 = hex_decode("180f" + "32303439313233313233353935395a")
+  var rg2 = der_new(g2, 17)
+  check_eq_int("gentime 2049-12-31 23:59:59Z", der_read_generalized_time(rg2), 2524607999)
+  free(g2)
+
+  # Reject non-Z trailing char on UTCTime.
+  var bad = hex_decode("170d" + "3236303532323132303030302b")
+  var rbad = der_new(bad, 15)
+  der_read_utctime(rbad)
+  check_eq_int("utctime non-Z reject", rbad.err, DER_ERR_VALUE())
+  free(bad)
+
+  # Reject impossible month on GeneralizedTime.
+  var bad2 = hex_decode("180f" + "32303236313330353132303030305a")  # month 13
+  var rbad2 = der_new(bad2, 17)
+  der_read_generalized_time(rbad2)
+  check_eq_int("gentime month 13 reject", rbad2.err, DER_ERR_VALUE())
+  free(bad2)
+end
+
+# =============================================================================
+# 11. skip_tlv + peek_tag + at-end behaviour
+# =============================================================================
+
+def test_skip_peek(): Void
+  puts("--- skip_tlv / peek_tag / at-end ---")
+
+  # Skip an INTEGER, then read the next OCTET STRING.
+  var b = hex_decode("020105" + "04024142")
+  var r = der_new(b, 7)
+  check_eq_int("peek INTEGER tag", der_peek_tag(r), TAG_INTEGER())
+  der_skip_tlv(r)
+  check_eq_int("after skip err", r.err, 0)
+  check_eq_int("peek OCTET tag",   der_peek_tag(r), TAG_OCTET_STRING())
+  der_read_octet_string(r)
+  check_eq_int("octet after skip", r.val_len, 2)
+  check_eq_int("at_end after both", der_at_end(r), 1)
+  free(b)
+
+  # peek_tag at end returns -1.
+  var e = malloc(1)
+  var re = der_new(e, 0)
+  check_eq_int("peek at end returns -1", der_peek_tag(re), 0 - 1)
+  check_eq_int("at_end on empty", der_at_end(re), 1)
+  free(e)
+end
+
+# =============================================================================
+# Entry point
+# =============================================================================
+
+def main(): Int
+  test_tag_length()
+  test_integer()
+  test_boolean()
+  test_null()
+  test_octet_string()
+  test_oid()
+  test_bit_string()
+  test_sequence()
+  test_close_propagation()
+  test_time()
+  test_skip_peek()
+
+  puts("")
+  puts(g_passed.to_s() + "/" + g_total.to_s() + " checks green")
+  if g_passed == g_total then return 0 end
+  return 1
+end

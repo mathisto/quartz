@@ -1,0 +1,529 @@
+## std/profile — algebraic effect for compilation-phase + bench profiling.
+##
+## Operation Piezoelectric Effects, Phase A.6 (post-audit roadmap, 2026-05-01).
+##
+## Declares the `Profile` effect with 4 ops covering point events,
+## bracketed spans, and key/value samples:
+##
+##   prof_phase(name)                    → Int  (0; point event)
+##   prof_span_begin(name)               → Int  (handle: ns timestamp)
+##   prof_span_end(begin_handle, name)   → Int  (elapsed ns)
+##   prof_sample(name, value)            → Int  (0; counter/gauge)
+##
+## Substrate for Phase C.8 statistical bench framework: warmup +
+## measure cycles install a custom handler that aggregates spans into
+## mean/median/p95/p99 distributions.
+##
+## Default handler is gate-and-emit: reads `_profile_human_enabled` +
+## `_profile_ndjson_enabled` module-globals. Both off → no-op (zero
+## overhead beyond the perform-dispatch itself). Setters flip flags:
+## `profile_set_human(1)` for `[prof]` lines on stderr (replaces
+## `--memory-stats`); `profile_set_ndjson(1)` for NDJSON events on
+## stderr (replaces `--progress`). Both can be on simultaneously.
+##
+## Spans always return real timestamps regardless of gate, so the
+## bench framework can compute durations even when default emit is off.
+##
+## Usage (custom handler):
+##
+##   import std/profile
+##
+##   def my_capture(op_name: Int, argc: Int, argv: Int): Int
+##     var op = as_string(op_name)
+##     if op.eq("prof_phase")
+##       var name = as_string(load(argv, 0))
+##       puts("got phase: #{name}")
+##     end
+##     return 0
+##   end
+##
+##   def main(): Int
+##     with Profile { prof_phase: my_capture } do ->
+##       prof_phase("init")
+##       prof_phase("lex")
+##     end
+##     return 0
+##   end
+##
+## All four ops are kind=1 (function-kind): handler runs, returns, and
+## execution continues at the perform site. No continuation capture.
+##
+## Handler ABI: `(op_name: Int, argc: Int, argv: Int): Int`. Decode
+## String args with `as_string(load(argv, i))`; decode raw Ints with
+## bare `load(argv, i)`. Two-pass fixpoint discipline mirrors
+## std/cache.qz: this file (Pass 1) declares the effect and default
+## handler; compiler source itself does NOT call any prof_* until
+## Pass 2 (single-site migration of `quartz.qz:256` mem_report("init")).
+## See `docs/design/PROFILE_EFFECT_PLAN.md` for the full plan.
+
+effect Profile
+  def prof_phase(name: String): Int
+  def prof_span_begin(name: String): Int
+  def prof_span_end(begin_handle: Int, name: String): Int
+  def prof_sample(name: String, value: Int): Int
+  def prof_alloc_site(label: String, bytes: Int): Int
+end
+
+## Output gates. Both default to 0 — the default handler is a no-op
+## unless explicitly enabled. Setters live below; CLI driver
+## (quartz.qz) calls them from arg parsing.
+var _profile_human_enabled = 0
+var _profile_ndjson_enabled = 0
+
+## Wall-time anchor (ns). Captured at first enable. Subsequent events
+## report `elapsed_ms = (time_mono_ns() - _profile_start_ns) / 1_000_000`.
+var _profile_start_ns = 0
+
+## Previous RSS reading (MB) for delta computation in human format.
+## Resets to 0 on each new compile run; first phase line prints absolute
+## RSS only, subsequent lines print `±delta`.
+var _profile_prev_rss_mb = 0
+
+## ---- Allocation-site attribution (B.1 Phase 1) ----
+##
+## Independent gate flag for `prof_alloc_site` accumulation. Default 0.
+## Tracking is opt-in — `--memory-stats`/`--progress` do NOT enable
+## it (they're for phase-boundary events). Toggled via
+## `profile_set_alloc_track(1)` or `--alloc-track` CLI flag (Phase 2).
+##
+## When OFF: prof_alloc_site default handler returns 0 immediately
+## after the gate check (one TLS-style global read + branch).
+## When ON: each call increments the (bytes, count) bucket for its label.
+var _profile_alloc_track_enabled = 0
+
+## Per-label cumulative byte total. `Map<String, Int>` — keys are
+## arbitrary instrument-site labels ("ir_buffer", "mir_instr",
+## "ast_node:typecheck"); values are total bytes recorded for that
+## label across the entire compile run. Reset via
+## `profile_alloc_reset()`.
+var _profile_alloc_bytes_by_site = map_new<String, Int>()
+
+## Per-label call count, parallel to `_profile_alloc_bytes_by_site`.
+## Lets the reporter print "<bytes> bytes (<count> calls)" so callers
+## can spot single-large vs many-small attribution shapes.
+var _profile_alloc_count_by_site = map_new<String, Int>()
+
+## Enable/disable human-readable `[prof]` line emission on stderr.
+## Captures the wall-time anchor on first enable so subsequent events
+## report a consistent elapsed-ms.
+def profile_set_human(on: Int): Void
+  _profile_human_enabled = on
+  if on == 1 and _profile_start_ns == 0
+    _profile_start_ns = time_mono_ns()
+  end
+end
+
+## Enable/disable NDJSON event emission on stderr. Same wall-anchor
+## semantics as `profile_set_human`.
+def profile_set_ndjson(on: Int): Void
+  _profile_ndjson_enabled = on
+  if on == 1 and _profile_start_ns == 0
+    _profile_start_ns = time_mono_ns()
+  end
+end
+
+## Read whether human-format emission is currently enabled.
+def profile_get_human(): Int = _profile_human_enabled
+
+## Read whether NDJSON emission is currently enabled.
+def profile_get_ndjson(): Int = _profile_ndjson_enabled
+
+## Enable/disable per-site allocation tracking. When ON, every
+## `prof_alloc_site(label, bytes)` call increments the (bytes, count)
+## bucket for `label`. When OFF, the call is a no-op after gate check.
+## Independent of human/ndjson flags — attribution data lives in
+## the accumulator regardless of stderr emission.
+def profile_set_alloc_track(on: Int): Void
+  _profile_alloc_track_enabled = on
+end
+
+## Read whether allocation-site tracking is currently enabled.
+def profile_get_alloc_track(): Int = _profile_alloc_track_enabled
+
+## Reset allocation-site accumulators. Call between distinct
+## measurement runs, or at spec test boundaries for cross-test
+## isolation. Does NOT change the gate flag.
+def profile_alloc_reset(): Void
+  _profile_alloc_bytes_by_site = map_new<String, Int>()
+  _profile_alloc_count_by_site = map_new<String, Int>()
+end
+
+## Total accumulated bytes across all sites. Useful as a sanity
+## check ("does this match peak RSS growth in this phase?").
+def profile_alloc_total_bytes(): Int
+  var total = 0
+  var keys = _profile_alloc_bytes_by_site.keys()
+  for k in keys
+    total = total + _profile_alloc_bytes_by_site.get(k).unwrap_or(0)
+  end
+  return total
+end
+
+## Total call count across all sites.
+def profile_alloc_total_calls(): Int
+  var total = 0
+  var keys = _profile_alloc_count_by_site.keys()
+  for k in keys
+    total = total + _profile_alloc_count_by_site.get(k).unwrap_or(0)
+  end
+  return total
+end
+
+## Internal: record a single (label, bytes) sample. Adds to both
+## the bytes map and the count map. Called from the default handler
+## when the gate is on. Module-private — external callers should
+## go through the effect op.
+def _profile_alloc_record(label: String, bytes: Int): Void
+  var prev_b = _profile_alloc_bytes_by_site.get(label).unwrap_or(0)
+  _profile_alloc_bytes_by_site.set(label, prev_b + bytes)
+  var prev_c = _profile_alloc_count_by_site.get(label).unwrap_or(0)
+  _profile_alloc_count_by_site.set(label, prev_c + 1)
+end
+
+## Emit the top-N sites by total bytes to stderr, sorted descending.
+## Always emits when called regardless of gate flags — this is an
+## explicit-emit reporter, not a gated one. The accumulator's gate
+## controls whether data exists to report; this controls the dump.
+##
+## Output shape (human-readable):
+##   [prof] alloc-site:report top=<N> total_bytes=<sum> total_calls=<sum>
+##   [prof] alloc-site <label>: <bytes> bytes (<count> calls)
+##   ...
+##
+## When `_profile_ndjson_enabled` is also on, additionally emits one
+## NDJSON event per top-N entry plus a header.
+def profile_alloc_top_n(n: Int): Void
+  var keys = _profile_alloc_bytes_by_site.keys()
+  var num_sites = keys.size
+
+  # Build parallel arrays of (label, bytes, count) for sortable
+  # access. Insertion-sort by bytes desc — N is small (~20 typical),
+  # total sites in the dozens, O(N^2) is fine.
+  var labels = vec_new<String>()
+  var byte_totals = vec_new<Int>()
+  var counts = vec_new<Int>()
+  for k in keys
+    labels.push(k)
+    byte_totals.push(_profile_alloc_bytes_by_site.get(k).unwrap_or(0))
+    counts.push(_profile_alloc_count_by_site.get(k).unwrap_or(0))
+  end
+
+  # B.1 Phase 4 fix: index-only insertion sort. Mutating a Vec<String>
+  # by index (`labels[j+1] = labels[j]`) crashed in heavy-workload runs
+  # with >4 entries — Phase 2 happened to dodge the swap path because
+  # its 4 keys were already in descending hash-iteration order. The
+  # safer pattern is to sort a Vec<Int> of indices and index through it
+  # at emit time; only Vec<Int> is mutated.
+  var order = vec_new<Int>()
+  var p = 0
+  while p < num_sites
+    order.push(p)
+    p = p + 1
+  end
+
+  var i = 1
+  while i < num_sites
+    var key_idx = order[i]
+    var key_b = byte_totals[key_idx]
+    var j = i - 1
+    while j >= 0 and byte_totals[order[j]] < key_b
+      order[j + 1] = order[j]
+      j = j - 1
+    end
+    order[j + 1] = key_idx
+    i = i + 1
+  end
+
+  var emit_count = n
+  if num_sites < emit_count
+    emit_count = num_sites
+  end
+
+  var total_bytes = profile_alloc_total_bytes()
+  var total_calls = profile_alloc_total_calls()
+  eputs("[prof] alloc-site:report top=#{emit_count} total_bytes=#{total_bytes} total_calls=#{total_calls}")
+  if _profile_ndjson_enabled == 1
+    eputs("{\"v\":1,\"event\":\"alloc_site_report\",\"top\":#{emit_count},\"total_bytes\":#{total_bytes},\"total_calls\":#{total_calls}}")
+  end
+
+  # B.1 Phase 4: build the whole report as a single StringBuilder using
+  # type-specialized `sb_append_int` for Int values, then emit once.
+  # The naive per-iter `eputs("...#{int_var}...")` form crashes under
+  # arena pressure because the parser-emitted `to_str(int_var)` runs at
+  # runtime and to_str's `(val & 15) == 8 && val > 65535` heuristic
+  # mis-identifies any Int satisfying both conditions (e.g. 416760,
+  # which is the real `bytes` value for `mir_new_instr` on a typical
+  # self-compile run) as a String pointer, then dereferences `[val-8]`
+  # and SIGSEGVs. The String-typed `label` argument is now correctly
+  # elided by the typecheck-time fix in `mir_is_string_expr`'s
+  # NODE_INDEX path consulting `mir_ctx_get_vec_elem_type`, but the
+  # Int-typed `bytes` and `count` interpolations cannot be elided —
+  # they truly need Int → String formatting, and the only way to skip
+  # to_str's heuristic is to dispatch through `sb_append_int` directly.
+  # Filed as `docs/bugs/PROFILE_ALLOC_TOP_N_VEC_STRING_HEISENBUG.md`
+  # with the full root cause analysis.
+  var report = sb_new()
+  defer sb_free(report)
+  var idx = 0
+  while idx < emit_count
+    var sorted_idx = order[idx]
+    var label = labels[sorted_idx]
+    var bytes = byte_totals[sorted_idx]
+    var count = counts[sorted_idx]
+    sb_append(report, "[prof] alloc-site ")
+    sb_append(report, label)
+    sb_append(report, ": ")
+    sb_append_int(report, bytes)
+    sb_append(report, " bytes (")
+    sb_append_int(report, count)
+    sb_append(report, " calls)\n")
+    if _profile_ndjson_enabled == 1
+      sb_append(report, "{\"v\":1,\"event\":\"alloc_site\",\"name\":\"")
+      sb_append(report, label)
+      sb_append(report, "\",\"bytes\":")
+      sb_append_int(report, bytes)
+      sb_append(report, ",\"count\":")
+      sb_append_int(report, count)
+      sb_append(report, "}\n")
+    end
+    idx = idx + 1
+  end
+  eputs(report.to_string())
+end
+
+## Default handler for all 4 Profile ops.
+##
+## Dispatch on op name; for span begin/end always return real
+## timestamps. For phase/sample, gate on the two output flags and emit
+## human + NDJSON formats independently when their respective flag is
+## set. When both are 0, the only work done is the gate check.
+def profile_default_handler(op_name: Int, argc: Int, argv: Int): Int
+  var op = as_string(op_name)
+
+  # Allocation-site attribution (B.1 Phase 1). Independent gate from
+  # human/ndjson — `_profile_alloc_track_enabled` controls whether the
+  # accumulator runs at all. Off path: one global read + branch.
+  if op.eq("prof_alloc_site")
+    if _profile_alloc_track_enabled == 0
+      return 0
+    end
+    var alloc_label = as_string(load(argv, 0))
+    var alloc_bytes = load(argv, 1)
+    _profile_alloc_record(alloc_label, alloc_bytes)
+    return 0
+  end
+
+  # Span ops always return real timestamps regardless of output gate.
+  # The bench framework needs durations even when emission is off.
+  if op.eq("prof_span_begin")
+    return time_mono_ns()
+  end
+  if op.eq("prof_span_end")
+    var begin = load(argv, 0)
+    var elapsed_ns = time_mono_ns() - begin
+    if _profile_human_enabled == 0 and _profile_ndjson_enabled == 0
+      return elapsed_ns
+    end
+    var name = as_string(load(argv, 1))
+    var elapsed_ms = elapsed_ns / 1000000
+    if _profile_human_enabled == 1
+      eputs("[prof] span #{name}: #{elapsed_ms}ms")
+    end
+    if _profile_ndjson_enabled == 1
+      var since_start = (time_mono_ns() - _profile_start_ns) / 1000000
+      eputs("{\"v\":1,\"event\":\"span_end\",\"name\":\"#{name}\",\"elapsed_ms\":#{elapsed_ms},\"wall_ms\":#{since_start}}")
+    end
+    return elapsed_ns
+  end
+
+  # Phase + sample ops: fast-path no-op when both gates are off.
+  if _profile_human_enabled == 0 and _profile_ndjson_enabled == 0
+    return 0
+  end
+
+  if op.eq("prof_phase")
+    var name = as_string(load(argv, 0))
+    var current_mb = mem_current_rss() / 1048576
+    var peak_mb = mem_peak_rss() / 1048576
+    var since_start = (time_mono_ns() - _profile_start_ns) / 1000000
+    if _profile_human_enabled == 1
+      if _profile_prev_rss_mb == 0
+        eputs("[prof] #{name}: #{current_mb} MB current, #{peak_mb} MB peak (#{since_start}ms)")
+      else
+        var delta = current_mb - _profile_prev_rss_mb
+        var sign = "+"
+        if delta < 0
+          sign = ""
+        end
+        eputs("[prof] #{name}: #{current_mb} MB (#{sign}#{delta}), #{peak_mb} MB peak (#{since_start}ms)")
+      end
+    end
+    if _profile_ndjson_enabled == 1
+      eputs("{\"v\":1,\"event\":\"phase\",\"name\":\"#{name}\",\"elapsed_ms\":#{since_start},\"rss_mb\":#{current_mb},\"peak_mb\":#{peak_mb}}")
+    end
+    _profile_prev_rss_mb = current_mb
+    return 0
+  end
+
+  if op.eq("prof_sample")
+    var name = as_string(load(argv, 0))
+    var value = load(argv, 1)
+    var since_start = (time_mono_ns() - _profile_start_ns) / 1000000
+    if _profile_human_enabled == 1
+      eputs("[prof] sample #{name}=#{value} (#{since_start}ms)")
+    end
+    if _profile_ndjson_enabled == 1
+      eputs("{\"v\":1,\"event\":\"sample\",\"name\":\"#{name}\",\"value\":#{value},\"elapsed_ms\":#{since_start}}")
+    end
+    return 0
+  end
+
+  return 0
+end
+
+## ---- Test-handler factories (Phase A.6 Phase 4) ----
+##
+## Three pre-built handlers for spec testing, scoped suppression, and
+## NDJSON shape validation. Install via `with Profile { op: handler }
+## do … end` exactly like the default handler. Each is a single
+## dispatcher function (same `(op_name, argc, argv): Int` ABI) so it
+## can be bound to any combination of ops.
+
+## Capture handler — appends each event to a module-level Vec<String>
+## log. Read via `profile_capture_log()` after the wrapped block
+## exits; reset via `profile_capture_reset()` for cross-test
+## isolation. Span ops still return real timestamps so duration math
+## works.
+##
+## Usage:
+##   profile_capture_reset()
+##   with Profile {
+##     prof_phase: profile_capture_handler,
+##     prof_sample: profile_capture_handler
+##   } do ->
+##     prof_phase("init")
+##     prof_sample("functions", 2440)
+##   end
+##   var log = profile_capture_log()
+##   for entry in log; puts(entry); end
+
+var _profile_capture_log = vec_new<String>()
+
+## Reset the capture log for cross-test isolation.
+def profile_capture_reset(): Void
+  _profile_capture_log = vec_new<String>()
+end
+
+## Read the accumulated capture log. Each entry is `op:args` summary.
+def profile_capture_log(): Vec<String> = _profile_capture_log
+
+def profile_capture_handler(op_name: Int, argc: Int, argv: Int): Int
+  var op = as_string(op_name)
+  if op.eq("prof_phase")
+    var name = as_string(load(argv, 0))
+    _profile_capture_log.push("phase #{name}")
+    return 0
+  end
+  if op.eq("prof_span_begin")
+    var name = as_string(load(argv, 0))
+    _profile_capture_log.push("span_begin #{name}")
+    return time_mono_ns()
+  end
+  if op.eq("prof_span_end")
+    var begin = load(argv, 0)
+    var name = as_string(load(argv, 1))
+    var elapsed = time_mono_ns() - begin
+    _profile_capture_log.push("span_end #{name}")
+    return elapsed
+  end
+  if op.eq("prof_sample")
+    var name = as_string(load(argv, 0))
+    var value = load(argv, 1)
+    _profile_capture_log.push("sample #{name}=#{value}")
+    return 0
+  end
+  if op.eq("prof_alloc_site")
+    var name = as_string(load(argv, 0))
+    var bytes = load(argv, 1)
+    _profile_capture_log.push("alloc-site #{name} bytes=#{bytes}")
+    return 0
+  end
+  return 0
+end
+
+## Silent handler — drops every event, returns 0 for phase/sample
+## and real timestamps for span begin/end. Use when imported
+## production code emits Profile events that would clutter test
+## output, but you don't want to assert anything about them.
+##
+## Usage:
+##   with Profile {
+##     prof_phase: profile_silent_handler,
+##     prof_span_begin: profile_silent_handler,
+##     prof_span_end: profile_silent_handler,
+##     prof_sample: profile_silent_handler
+##   } do ->
+##     run_code_under_test()
+##   end
+def profile_silent_handler(op_name: Int, argc: Int, argv: Int): Int
+  var op = as_string(op_name)
+  if op.eq("prof_span_begin")
+    return time_mono_ns()
+  end
+  if op.eq("prof_span_end")
+    var begin = load(argv, 0)
+    return time_mono_ns() - begin
+  end
+  return 0
+end
+
+## NDJSON handler — always emits NDJSON to stderr regardless of
+## `_profile_ndjson_enabled`. Useful for spec tests that want to
+## validate the NDJSON event shape independently of the global
+## gate. RSS data is omitted (would vary across runs and break
+## golden-output tests); only event + name + value/elapsed appear.
+##
+## Usage:
+##   with Profile {
+##     prof_phase: profile_ndjson_handler,
+##     prof_sample: profile_ndjson_handler
+##   } do ->
+##     prof_phase("test_init")
+##     prof_sample("count", 42)
+##   end
+##   # stderr now contains:
+##   # {"v":1,"event":"phase","name":"test_init"}
+##   # {"v":1,"event":"sample","name":"count","value":42}
+def profile_ndjson_handler(op_name: Int, argc: Int, argv: Int): Int
+  var op = as_string(op_name)
+  if op.eq("prof_phase")
+    var name = as_string(load(argv, 0))
+    eputs("{\"v\":1,\"event\":\"phase\",\"name\":\"#{name}\"}")
+    return 0
+  end
+  if op.eq("prof_span_begin")
+    var name = as_string(load(argv, 0))
+    eputs("{\"v\":1,\"event\":\"span_begin\",\"name\":\"#{name}\"}")
+    return time_mono_ns()
+  end
+  if op.eq("prof_span_end")
+    var begin = load(argv, 0)
+    var name = as_string(load(argv, 1))
+    var elapsed = time_mono_ns() - begin
+    eputs("{\"v\":1,\"event\":\"span_end\",\"name\":\"#{name}\"}")
+    return elapsed
+  end
+  if op.eq("prof_sample")
+    var name = as_string(load(argv, 0))
+    var value = load(argv, 1)
+    eputs("{\"v\":1,\"event\":\"sample\",\"name\":\"#{name}\",\"value\":#{value}}")
+    return 0
+  end
+  if op.eq("prof_alloc_site")
+    var name = as_string(load(argv, 0))
+    var bytes = load(argv, 1)
+    eputs("{\"v\":1,\"event\":\"alloc_site\",\"name\":\"#{name}\",\"bytes\":#{bytes}}")
+    return 0
+  end
+  return 0
+end

@@ -1,0 +1,1675 @@
+# VIGIL — Phase 1 alpha. The terminal system monitor.
+#
+# Companion to SIGIL. Composes the v0.6 cell engine, std/tui widgets,
+# the new octant-backed spark widget, and the std/sys/proc reader
+# into a four-pane live system view.
+#
+# Phase 1 alpha scope (what this commit ships):
+#   - CPU panel: aggregate %CPU sparkline (per-core on Linux when
+#     /proc/stat exposes per-CPU lines; aggregate-only on macOS until
+#     host_processor_info FFI lands in Phase 2).
+#   - MEM panel: memory used / total + a 60s sparkline of usage.
+#   - Load + status line: 1m/5m/15m load averages, process count,
+#     platform tag.
+#   - Process list: top 20 by RSS. j/k navigation. (Sort keys, kill,
+#     filter, search land in Phase 1.x — explicit follow-ups.)
+#   - Help overlay (?), quit on q / Ctrl-C.
+#   - Theme: Catppuccin-Mocha-shaped colour mapping built into the
+#     view; theme YAML loading lands in Phase 1.x.
+#
+# Out of scope for Phase 1 alpha (filed for Phase 2):
+#   - Disk / network panels (need /proc/diskstats + /proc/net/dev
+#     readers; macOS needs iostat/netstat).
+#   - GPU panel (NVIDIA via NVML FFI; Apple Silicon via powermetrics).
+#   - Container view (Docker/podman/containerd discovery).
+#   - PSI chip in the CPU/MEM/Disk panels (data already in Snapshot,
+#     just needs UI surface).
+#   - OOM event log (`/dev/kmsg` parser).
+#   - Replay log (binary frame format + scrub UI).
+#   - Mouse: SGR mouse parsing is wired in std/tui/runtime, but the
+#     Phase 1 process list doesn't dispatch on it yet — j/k only.
+#
+# Run:
+#   ./self-hosted/bin/quartz -I std examples/vigil/main.qz > /tmp/vigil.ll
+#   /opt/homebrew/opt/llvm/bin/llc -filetype=obj /tmp/vigil.ll -o /tmp/vigil.o
+#   clang /tmp/vigil.o -o /tmp/vigil -lm -lpthread
+#   /tmp/vigil
+
+import std/tui/runtime as tui
+import std/tui/widgets/spark as sp
+import std/tui/widgets/overlay as ov
+import std/tui/octant as oc
+import std/tui/layout as ly
+import std/sys/proc as ps
+import std/shell
+import std/terminal
+import time
+import style
+
+# ============================================================
+# Tunables
+# ============================================================
+
+# Sample period in milliseconds. 2s feels live but isn't expensive
+# under the macOS slow path (`top -l 1 -n 0` ≈ 470ms on this Mac;
+# 2s leaves ample headroom).
+def TICK_MS(): Int = 2000
+
+# Rolling buffer length per spark (3 minutes at 2s/tick = 90 samples).
+def SPARK_HISTORY(): Int = 90
+
+# Spark cell width — narrowed if the terminal is < 60 cols.
+def SPARK_WIDTH_CELLS(): Int = 30
+def SPARK_HEIGHT_CELLS(): Int = 2
+
+# How many processes to show. Small windows show fewer; recomputed
+# each render so resizes work cleanly.
+def PROC_LIST_DEFAULT(): Int = 20
+
+# ============================================================
+# App message type
+# ============================================================
+
+enum VMsg
+  Tick
+end
+
+# ============================================================
+# State
+# ============================================================
+
+## Sort kinds for the process list. M (memory/RSS, default), P (CPU%),
+## N (name alphabetical). Cycled by hitting the corresponding key.
+def SORT_RSS():  Int = 0
+def SORT_CPU():  Int = 1
+def SORT_NAME(): Int = 2
+
+struct VState
+  prev_snap:        ps::Snapshot
+  curr_snap:        ps::Snapshot
+  cpu_spark:        sp::Spark
+  mem_spark:        sp::Spark
+  disk_r_spark:     sp::Spark
+  disk_w_spark:     sp::Spark
+  net_rx_spark:     sp::Spark
+  net_tx_spark:     sp::Spark
+  cursor:           Int
+  scroll_off:       Int
+  show_help:        Bool
+  sort_kind:        Int
+  pending_kill_pid: Int           # 0 = no pending kill confirm
+  status_msg:       String        # transient one-line status (after kill, etc)
+  cols:             Int
+  rows:             Int
+end
+
+def initial_state(): VState
+  var empty = ps::proc_empty_snapshot()
+  # Synchronous initial snapshot — incurs the macOS `top -l 1 -n 0`
+  # cost (~470ms) at startup so the first frame shows real data
+  # rather than a 2-second-long "0%" placeholder. On Linux this is
+  # sub-ms; CPU% is 0 anyway since there's no prior snapshot to
+  # delta against, but mem/load/proclist are populated immediately.
+  var first = ps::proc_take_snapshot(empty)
+  var cpu_pct = first.cpu_aggregate.pct
+  var mem_pct = 0
+  if first.mem.total_kb > 0
+    mem_pct = first.mem.used_kb * 100 / first.mem.total_kb
+  end
+  var cpu_s = sp::spark_push(
+    sp::spark_with_capacity(
+      sp::spark_with_range(
+        sp::spark_new(SPARK_WIDTH_CELLS(), SPARK_HEIGHT_CELLS()),
+        0, 100
+      ),
+      SPARK_HISTORY()
+    ),
+    cpu_pct
+  )
+  var mem_s = sp::spark_push(
+    sp::spark_with_capacity(
+      sp::spark_with_range(
+        sp::spark_new(SPARK_WIDTH_CELLS(), SPARK_HEIGHT_CELLS()),
+        0, 100
+      ),
+      SPARK_HISTORY()
+    ),
+    mem_pct
+  )
+  # Disk sparks track aggregate R/W across all devices, in MB/s.
+  # Auto-scaled (no fixed range) since rates vary widely by device
+  # class (NVMe vs USB stick vs network mount).
+  var disk_r = sp::spark_with_capacity(
+    sp::spark_new(SPARK_WIDTH_CELLS(), 1),
+    SPARK_HISTORY()
+  )
+  var disk_w = sp::spark_with_capacity(
+    sp::spark_new(SPARK_WIDTH_CELLS(), 1),
+    SPARK_HISTORY()
+  )
+  var first_disk_rps = 0
+  var first_disk_wps = 0
+  var fi = 0
+  while fi < first.disks.size
+    first_disk_rps += first.disks[fi].read_bytes_per_sec
+    first_disk_wps += first.disks[fi].write_bytes_per_sec
+    fi += 1
+  end
+  disk_r = sp::spark_push(disk_r, first_disk_rps / (1024 * 1024))   # MB/s
+  disk_w = sp::spark_push(disk_w, first_disk_wps / (1024 * 1024))
+
+  var net_rx = sp::spark_with_capacity(
+    sp::spark_new(SPARK_WIDTH_CELLS(), 1), SPARK_HISTORY()
+  )
+  var net_tx = sp::spark_with_capacity(
+    sp::spark_new(SPARK_WIDTH_CELLS(), 1), SPARK_HISTORY()
+  )
+  var first_rx = 0
+  var first_tx = 0
+  var ni = 0
+  while ni < first.nics.size
+    first_rx += first.nics[ni].rx_bytes_per_sec
+    first_tx += first.nics[ni].tx_bytes_per_sec
+    ni += 1
+  end
+  net_rx = sp::spark_push(net_rx, first_rx / 1024)               # KB/s
+  net_tx = sp::spark_push(net_tx, first_tx / 1024)
+
+  return VState {
+    prev_snap:        empty,
+    curr_snap:        first,
+    cpu_spark:        cpu_s,
+    mem_spark:        mem_s,
+    disk_r_spark:     disk_r,
+    disk_w_spark:     disk_w,
+    net_rx_spark:     net_rx,
+    net_tx_spark:     net_tx,
+    cursor:           0,
+    scroll_off:       0,
+    show_help:        false,
+    sort_kind:        SORT_RSS(),
+    pending_kill_pid: 0,
+    status_msg:       "",
+    cols:             term_get_width(),
+    rows:             term_get_height()
+  }
+end
+
+# ============================================================
+# Cmd::Every-driven sampling
+# ============================================================
+
+def _tick_thunk(): tui::FrameMsg<VMsg> = tui::FrameMsg::App(VMsg::Tick)
+
+def _every_tick(): tui::Cmd<VMsg>
+  return tui::Cmd::Every(TICK_MS(), _tick_thunk)
+end
+
+# ============================================================
+# Update
+# ============================================================
+
+def _refresh_snapshot(s: VState): VState
+  var fresh = ps::proc_take_snapshot(s.curr_snap)
+  var cpu_pct = fresh.cpu_aggregate.pct
+  var mem_pct = 0
+  if fresh.mem.total_kb > 0
+    mem_pct = fresh.mem.used_kb * 100 / fresh.mem.total_kb
+  end
+  # Aggregate disk rates across all devices.
+  var rps = 0
+  var wps = 0
+  var i = 0
+  while i < fresh.disks.size
+    rps += fresh.disks[i].read_bytes_per_sec
+    wps += fresh.disks[i].write_bytes_per_sec
+    i += 1
+  end
+  # Aggregate net rates across all NICs.
+  var net_rx = 0
+  var net_tx = 0
+  var ni = 0
+  while ni < fresh.nics.size
+    net_rx += fresh.nics[ni].rx_bytes_per_sec
+    net_tx += fresh.nics[ni].tx_bytes_per_sec
+    ni += 1
+  end
+  return VState {
+    prev_snap:        s.curr_snap,
+    curr_snap:        fresh,
+    cpu_spark:        sp::spark_push(s.cpu_spark, cpu_pct),
+    mem_spark:        sp::spark_push(s.mem_spark, mem_pct),
+    disk_r_spark:     sp::spark_push(s.disk_r_spark, rps / (1024 * 1024)),
+    disk_w_spark:     sp::spark_push(s.disk_w_spark, wps / (1024 * 1024)),
+    net_rx_spark:     sp::spark_push(s.net_rx_spark, net_rx / 1024),
+    net_tx_spark:     sp::spark_push(s.net_tx_spark, net_tx / 1024),
+    cursor:           s.cursor,
+    scroll_off:       s.scroll_off,
+    show_help:        s.show_help,
+    sort_kind:        s.sort_kind,
+    pending_kill_pid: s.pending_kill_pid,
+    status_msg:       s.status_msg,
+    cols:             term_get_width(),
+    rows:             term_get_height()
+  }
+end
+
+def _move_cursor(s: VState, delta: Int): VState
+  var n = s.curr_snap.processes.size
+  if n == 0
+    return s
+  end
+  var c = s.cursor + delta
+  if c < 0
+    c = 0
+  end
+  if c >= n
+    c = n - 1
+  end
+  return VState {
+    prev_snap:        s.prev_snap,
+    curr_snap:        s.curr_snap,
+    cpu_spark:        s.cpu_spark,
+    mem_spark:        s.mem_spark,
+    disk_r_spark:     s.disk_r_spark,
+    disk_w_spark:     s.disk_w_spark,
+    net_rx_spark:     s.net_rx_spark,
+    net_tx_spark:     s.net_tx_spark,
+    cursor:           c,
+    scroll_off:       s.scroll_off,
+    show_help:        s.show_help,
+    sort_kind:        s.sort_kind,
+    pending_kill_pid: s.pending_kill_pid,
+    status_msg:       s.status_msg,
+    cols:             s.cols,
+    rows:             s.rows
+  }
+end
+
+def _move_cursor_to(s: VState, idx: Int): VState
+  var n = s.curr_snap.processes.size
+  var c = idx
+  if c < 0
+    c = 0
+  end
+  if c >= n
+    c = n - 1
+    if c < 0
+      c = 0
+    end
+  end
+  return VState {
+    prev_snap:        s.prev_snap,
+    curr_snap:        s.curr_snap,
+    cpu_spark:        s.cpu_spark,
+    mem_spark:        s.mem_spark,
+    disk_r_spark:     s.disk_r_spark,
+    disk_w_spark:     s.disk_w_spark,
+    net_rx_spark:     s.net_rx_spark,
+    net_tx_spark:     s.net_tx_spark,
+    cursor:           c,
+    scroll_off:       s.scroll_off,
+    show_help:        s.show_help,
+    sort_kind:        s.sort_kind,
+    pending_kill_pid: s.pending_kill_pid,
+    status_msg:       s.status_msg,
+    cols:             s.cols,
+    rows:             s.rows
+  }
+end
+
+def _toggle_help(s: VState): VState
+  return VState {
+    prev_snap:        s.prev_snap,
+    curr_snap:        s.curr_snap,
+    cpu_spark:        s.cpu_spark,
+    mem_spark:        s.mem_spark,
+    disk_r_spark:     s.disk_r_spark,
+    disk_w_spark:     s.disk_w_spark,
+    net_rx_spark:     s.net_rx_spark,
+    net_tx_spark:     s.net_tx_spark,
+    cursor:           s.cursor,
+    scroll_off:       s.scroll_off,
+    show_help:        not s.show_help,
+    sort_kind:        s.sort_kind,
+    pending_kill_pid: s.pending_kill_pid,
+    status_msg:       s.status_msg,
+    cols:             s.cols,
+    rows:             s.rows
+  }
+end
+
+def _set_sort(s: VState, sk: Int): VState
+  return VState {
+    prev_snap:        s.prev_snap,
+    curr_snap:        s.curr_snap,
+    cpu_spark:        s.cpu_spark,
+    mem_spark:        s.mem_spark,
+    disk_r_spark:     s.disk_r_spark,
+    disk_w_spark:     s.disk_w_spark,
+    net_rx_spark:     s.net_rx_spark,
+    net_tx_spark:     s.net_tx_spark,
+    cursor:           0,                    # reset cursor on re-sort
+    scroll_off:       0,
+    show_help:        s.show_help,
+    sort_kind:        sk,
+    pending_kill_pid: s.pending_kill_pid,
+    status_msg:       s.status_msg,
+    cols:             s.cols,
+    rows:             s.rows
+  }
+end
+
+def _set_pending_kill(s: VState, pid: Int): VState
+  return VState {
+    prev_snap:        s.prev_snap,
+    curr_snap:        s.curr_snap,
+    cpu_spark:        s.cpu_spark,
+    mem_spark:        s.mem_spark,
+    disk_r_spark:     s.disk_r_spark,
+    disk_w_spark:     s.disk_w_spark,
+    net_rx_spark:     s.net_rx_spark,
+    net_tx_spark:     s.net_tx_spark,
+    cursor:           s.cursor,
+    scroll_off:       s.scroll_off,
+    show_help:        s.show_help,
+    sort_kind:        s.sort_kind,
+    pending_kill_pid: pid,
+    status_msg:       s.status_msg,
+    cols:             s.cols,
+    rows:             s.rows
+  }
+end
+
+def _set_status(s: VState, msg: String): VState
+  return VState {
+    prev_snap:        s.prev_snap,
+    curr_snap:        s.curr_snap,
+    cpu_spark:        s.cpu_spark,
+    mem_spark:        s.mem_spark,
+    disk_r_spark:     s.disk_r_spark,
+    disk_w_spark:     s.disk_w_spark,
+    net_rx_spark:     s.net_rx_spark,
+    net_tx_spark:     s.net_tx_spark,
+    cursor:           s.cursor,
+    scroll_off:       s.scroll_off,
+    show_help:        s.show_help,
+    sort_kind:        s.sort_kind,
+    pending_kill_pid: 0,                   # also clears pending kill
+    status_msg:       msg,
+    cols:             s.cols,
+    rows:             s.rows
+  }
+end
+
+def _on_resize(s: VState, cols: Int, rows: Int): VState
+  return VState {
+    prev_snap:        s.prev_snap,
+    curr_snap:        s.curr_snap,
+    cpu_spark:        s.cpu_spark,
+    mem_spark:        s.mem_spark,
+    disk_r_spark:     s.disk_r_spark,
+    disk_w_spark:     s.disk_w_spark,
+    net_rx_spark:     s.net_rx_spark,
+    net_tx_spark:     s.net_tx_spark,
+    cursor:           s.cursor,
+    scroll_off:       s.scroll_off,
+    show_help:        s.show_help,
+    sort_kind:        s.sort_kind,
+    pending_kill_pid: s.pending_kill_pid,
+    status_msg:       s.status_msg,
+    cols:             cols,
+    rows:             rows
+  }
+end
+
+# Compute the 1-indexed terminal row at which the first process row
+# starts. Used by mouse hit-testing to translate a click row into a
+# process list index. Accounts for responsive top-panel layout —
+# 4-wide tiles use 4 rows, 2-wide uses 8, dense uses 11.
+def _top_panels_height(s: VState): Int
+  if s.cols >= TILE_4WIDE_MIN_COLS()
+    return 4                       # 1 row of 4 boxed tiles (top + 2 body + bottom)
+  end
+  if s.cols >= TILE_2WIDE_MIN_COLS()
+    return 4 + 1 + 4               # 2 rows of 2 boxed tiles + the \n separator
+  end
+  return 4 * 4                     # 4 stacked boxed tiles (each 4 lines)
+end
+
+def _proc_list_first_row(s: VState): Int
+  var row = 1                      # title bar
+  row += _top_panels_height(s)
+  row += 1                         # load/procs status line
+  if s.curr_snap.oom_events.size > 0
+    var n = s.curr_snap.oom_events.size
+    if n > 5
+      n = 5
+    end
+    row += 1 + n                   # 1 header + N entries
+  end
+  row += 2                         # PROCESSES heading + column header
+  return row + 1                   # first process row is one past
+end
+
+def update(msg: tui::FrameMsg<VMsg>, s: VState): (VState, tui::Cmd<VMsg>)
+  match msg
+    tui::FrameMsg::App(app_msg) => {
+      match app_msg
+        VMsg::Tick => return (_refresh_snapshot(s), tui::Cmd::None)
+      end
+    }
+    tui::FrameMsg::Key(ev) => {
+      # If a kill confirm is pending, dispatch y / Y to do it; any
+      # other key cancels.
+      if s.pending_kill_pid > 0
+        if ev.code == 121 or ev.code == 89                      # 'y' / 'Y'
+          var rc = shell::shell_exit("kill " + s.pending_kill_pid.to_s())
+          var msg = "killed pid " + s.pending_kill_pid.to_s()
+          if rc != 0
+            msg = "kill failed (rc=" + rc.to_s() + ") for pid " + s.pending_kill_pid.to_s()
+          end
+          return (_set_status(s, msg), tui::Cmd::None)
+        end
+        # Anything else cancels.
+        return (_set_status(s, "kill cancelled"), tui::Cmd::None)
+      end
+      # q or Ctrl-C → quit
+      if ev.code == 113 or ev.code == 3
+        return (s, tui::Cmd::Quit)
+      end
+      # ? → toggle help
+      if ev.code == 63
+        return (_toggle_help(s), tui::Cmd::None)
+      end
+      # j or KEY_DOWN → cursor down
+      if ev.code == 106 or ev.code == KEY_DOWN()
+        return (_move_cursor(s, 1), tui::Cmd::None)
+      end
+      # k or KEY_UP → cursor up
+      if ev.code == 107 or ev.code == KEY_UP()
+        return (_move_cursor(s, -1), tui::Cmd::None)
+      end
+      # PageDown
+      if ev.code == 6                           # Ctrl-F (page down)
+        return (_move_cursor(s, 10), tui::Cmd::None)
+      end
+      if ev.code == 2                           # Ctrl-B (page up)
+        return (_move_cursor(s, -10), tui::Cmd::None)
+      end
+      # g — top
+      if ev.code == 103
+        return (_move_cursor(s, -1000000), tui::Cmd::None)
+      end
+      # G — bottom
+      if ev.code == 71
+        return (_move_cursor(s, 1000000), tui::Cmd::None)
+      end
+      # Sort cycle: M (RSS, default), P (CPU%), N (name).
+      if ev.code == 109 or ev.code == 77        # 'm' or 'M'
+        return (_set_sort(s, SORT_RSS()), tui::Cmd::None)
+      end
+      if ev.code == 112 or ev.code == 80        # 'p' or 'P'
+        return (_set_sort(s, SORT_CPU()), tui::Cmd::None)
+      end
+      if ev.code == 110 or ev.code == 78        # 'n' or 'N'
+        return (_set_sort(s, SORT_NAME()), tui::Cmd::None)
+      end
+      # K — kill confirm on highlighted process
+      if ev.code == 75                          # 'K' (capital — to avoid colliding with 'k' nav)
+        var sorted = _top_processes(s.curr_snap.processes, 999999, s.sort_kind)
+        if s.cursor < sorted.size and s.cursor >= 0
+          return (_set_pending_kill(s, sorted[s.cursor].pid), tui::Cmd::None)
+        end
+        return (s, tui::Cmd::None)
+      end
+      return (s, tui::Cmd::None)
+    }
+    tui::FrameMsg::Mouse(m) => {
+      # Scroll wheel: navigate without needing exact row coords.
+      if m.kind is ScrollUp
+        return (_move_cursor(s, -3), tui::Cmd::None)
+      end
+      if m.kind is ScrollDown
+        return (_move_cursor(s, 3), tui::Cmd::None)
+      end
+      # Left-button press inside the process list area: jump cursor
+      # to the clicked row. Row coordinates are 1-indexed.
+      var is_left_press = false
+      if m.kind is Press
+        if m.button is Left
+          is_left_press = true
+        end
+      end
+      if is_left_press
+        var first = _proc_list_first_row(s)
+        if m.row >= first
+          var idx = m.row - first
+          var n = s.curr_snap.processes.size
+          if idx >= 0 and idx < n
+            var c = idx
+            if c >= n
+              c = n - 1
+            end
+            return (_move_cursor_to(s, c), tui::Cmd::None)
+          end
+        end
+      end
+      return (s, tui::Cmd::None)
+    }
+    tui::FrameMsg::Resize(cols, rows) => {
+      return (_on_resize(s, cols, rows), tui::Cmd::None)
+    }
+    tui::FrameMsg::Quit => return (s, tui::Cmd::Quit)
+    _ => return (s, tui::Cmd::None)
+  end
+  return (s, tui::Cmd::None)
+end
+
+# ============================================================
+# Theme — Catppuccin Mocha approximation
+# ============================================================
+
+# Use 256-colour palette indices (universal). Phase 1.x will swap to
+# theme-YAML for true CIE-Lab Catppuccin values.
+def _COL_TEAL():    Int = 116    # mocha "teal" approximation
+def _COL_GREEN():   Int = 114    # mocha "green"
+def _COL_YELLOW():  Int = 220    # mocha "yellow"
+def _COL_RED():     Int = 203    # mocha "red"
+def _COL_LAVENDER(): Int = 147   # mocha "lavender"
+def _COL_TEXT():    Int = 252    # mocha "text"
+def _COL_SUBTEXT(): Int = 246    # mocha "subtext"
+def _COL_OVERLAY(): Int = 240    # mocha "overlay"
+def _COL_BASE():    Int = 235    # mocha "base"
+
+# Pick a colour by load level. <40 green, 40..70 yellow, 70..90
+# orange, >=90 red.
+def _color_for_load(pct: Int): Int
+  if pct >= 90
+    return _COL_RED()
+  end
+  if pct >= 70
+    return 208       # 256-colour orange
+  end
+  if pct >= 40
+    return _COL_YELLOW()
+  end
+  return _COL_GREEN()
+end
+
+# ============================================================
+# View
+# ============================================================
+
+def _bar_view(width: Int, used_kb: Int, total_kb: Int): String
+  if total_kb <= 0 or width < 4
+    return str_repeat("─", width)
+  end
+  var pct = used_kb * 100 / total_kb
+  if pct < 0
+    pct = 0
+  end
+  if pct > 100
+    pct = 100
+  end
+  var fill_w = pct * (width - 2) / 100
+  if fill_w < 0
+    fill_w = 0
+  end
+  if fill_w > width - 2
+    fill_w = width - 2
+  end
+  var border_l = "▕"
+  var border_r = "▏"
+  var fill = str_repeat("█", fill_w)
+  var empty = str_repeat("░", width - 2 - fill_w)
+  var fc = _color_for_load(pct)
+  var fs = Style.new().fg(fc).bold()
+  var es = Style.new().fg(_COL_OVERLAY())
+  var bs = Style.new().fg(_COL_SUBTEXT())
+  return bs.render(border_l) + fs.render(fill) + es.render(empty) + bs.render(border_r)
+end
+
+def _format_kb(kb: Int): String
+  if kb >= 1024 * 1024
+    var gb = kb / (1024 * 1024)
+    var rem = (kb % (1024 * 1024)) * 10 / (1024 * 1024)
+    return gb.to_s() + "." + rem.to_s() + "G"
+  end
+  if kb >= 1024
+    return (kb / 1024).to_s() + "M"
+  end
+  return kb.to_s() + "K"
+end
+
+def _format_load(load_x100: Int): String
+  var int_part = load_x100 / 100
+  var frac = load_x100 % 100
+  var frac_str = ""
+  if frac < 10
+    frac_str = "0" + frac.to_s()
+  else
+    frac_str = frac.to_s()
+  end
+  return int_part.to_s() + "." + frac_str
+end
+
+def _heading_style(): Style = Style.new().fg(_COL_LAVENDER()).bold()
+def _label_style():   Style = Style.new().fg(_COL_SUBTEXT())
+def _value_style():   Style = Style.new().fg(_COL_TEXT())
+def _accent_style():  Style = Style.new().fg(_COL_TEAL())
+def _border_style():  Style = Style.new().fg(_COL_OVERLAY())
+
+# ============================================================
+# Visible-width / cell-padding helpers
+# ============================================================
+#
+# Strings rendered via Style.render contain ANSI CSI escapes that
+# don't consume terminal cells. _visible_width walks the bytes,
+# skipping CSI sequences (ESC '[' ... letter), and counts UTF-8
+# codepoints rather than bytes — so multi-byte glyphs (octants, box
+# drawing, em-dash, ellipsis) count as 1 cell each.
+#
+# Used by the tile / box layout to right-pad styled lines to a
+# uniform cell width for horizontal stacking.
+
+def _utf8_cp_len(b: Int): Int
+  if (b & 0x80) == 0
+    return 1
+  end
+  if (b & 0xE0) == 0xC0
+    return 2
+  end
+  if (b & 0xF0) == 0xE0
+    return 3
+  end
+  if (b & 0xF8) == 0xF0
+    return 4
+  end
+  return 1
+end
+
+def _visible_width(s: String): Int
+  var n = s.size
+  var i = 0
+  var w = 0
+  while i < n
+    var c = s[i]
+    if c == 27                       # ESC
+      i += 1
+      if i < n and s[i] == 91        # '['
+        i += 1
+        # Skip parameters until a final byte (0x40..0x7E).
+        while i < n and (s[i] < 64 or s[i] > 126)
+          i += 1
+        end
+        if i < n
+          i += 1
+        end
+      end
+    else
+      w += 1
+      i += _utf8_cp_len(c)
+    end
+  end
+  return w
+end
+
+## Right-pad a styled string with spaces so its visible-cell width
+## becomes `target_w`. Truncation is NOT done here — caller is
+## responsible for fitting their content first via _truncate.
+def _pad_cells(s: String, target_w: Int): String
+  var w = _visible_width(s)
+  if w >= target_w
+    return s
+  end
+  return s + str_repeat(" ", target_w - w)
+end
+
+# ============================================================
+# Box / tile helpers
+# ============================================================
+#
+# _box wraps body lines in a rounded border with a title in the top
+# edge. Width arithmetic uses cell counts (visible width), not bytes,
+# so styled and multi-byte content padded correctly.
+
+## Build a bordered tile with a styled title.
+##
+## - `title`: visible title text. May contain ANSI escapes; visible
+##           width is computed via _visible_width.
+## - `body_lines`: vec of styled lines. Each will be padded to
+##                 `inner_w` cells.
+## - `inner_w`: number of cells available between the left and right
+##              border characters. Outer width = inner_w + 2.
+##
+## Returns Vec<String> with `body_lines.size + 2` entries (top border
+## + each padded body line + bottom border).
+def _box(title: String, body_lines: Vec<String>, inner_w: Int): Vec<String>
+  var out = vec_new<String>()
+  var bs = _border_style()
+  var tw = _visible_width(title)
+  # Top: ╭─ <title> ──...──╮  (title prefixed with " ", suffixed with " ")
+  # Total inner cells consumed = 1 (─) + 1 (space) + tw + 1 (space) + N (─) = 3 + tw + N
+  # We want this to equal inner_w. So N = inner_w - 3 - tw.
+  var dashes_after = inner_w - 3 - tw
+  if dashes_after < 0
+    dashes_after = 0
+  end
+  var top = bs.render("╭─ ") + title + bs.render(" " + str_repeat("─", dashes_after) + "╮")
+  out.push(top)
+  var i = 0
+  while i < body_lines.size
+    var line = body_lines[i]
+    var padded = _pad_cells(line, inner_w)
+    out.push(bs.render("│") + padded + bs.render("│"))
+    i += 1
+  end
+  out.push(bs.render("╰" + str_repeat("─", inner_w) + "╯"))
+  return out
+end
+
+## Horizontal stack: take N tiles (each a Vec<String> of lines) and
+## merge them line-by-line with `gap` cells of spacing between
+## adjacent tiles. Returns a single \n-joined String.
+##
+## All tiles MUST have the same line count. Pads with spaces if a
+## tile has fewer lines than the tallest in the row.
+def _hzip(tiles: Vec<Vec<String>>, gap: Int, tile_widths: Vec<Int>): String
+  if tiles.size == 0
+    return ""
+  end
+  # Find max line count across tiles.
+  var max_h = 0
+  var t = 0
+  while t < tiles.size
+    if tiles[t].size > max_h
+      max_h = tiles[t].size
+    end
+    t += 1
+  end
+  var sb = sb_new()
+  var row = 0
+  while row < max_h
+    var i = 0
+    while i < tiles.size
+      var lines = tiles[i]
+      if row < lines.size
+        sb_append(sb, lines[row])
+      else
+        # Pad with empty cells matching this tile's full outer width.
+        var w = 0
+        if i < tile_widths.size
+          w = tile_widths[i]
+        end
+        sb_append(sb, str_repeat(" ", w))
+      end
+      if i < tiles.size - 1
+        sb_append(sb, str_repeat(" ", gap))
+      end
+      i += 1
+    end
+    if row < max_h - 1
+      sb_append(sb, "\n")
+    end
+    row += 1
+  end
+  return sb_to_string(sb)
+end
+
+# ============================================================
+# Anomaly chip — "this value is unusually high vs the recent window"
+# ============================================================
+#
+# Compares the current sample to the spark widget's rolling p50/p95
+# baseline. When current > p95 AND the buffer has accumulated enough
+# samples to be meaningful (≥10), surfaces an "↑" chip on the panel
+# header. Subtle: the chip is small and only appears when there's
+# real signal, so the alert pattern matches PSI's "if you see it,
+# it matters" semantics.
+#
+# Why p95 not stddev: load metrics are heavy-tailed (CPU sits at 5%
+# 95% of the time then briefly hits 80% during a build), and stddev
+# is wrong for that distribution. Percentile is robust.
+#
+# Why we don't compare to the prior tick: that's just "rising" — not
+# "unusual." The whole point is having a frame of reference.
+
+def _MIN_BASELINE_SAMPLES(): Int = 10
+
+def _anomaly_chip(spk: sp::Spark, current: Int): String
+  if sp::spark_size(spk) < _MIN_BASELINE_SAMPLES()
+    return ""
+  end
+  var p95 = sp::spark_percentile(spk, 95)
+  if current <= p95
+    return ""
+  end
+  var p50 = sp::spark_percentile(spk, 50)
+  return _label_style().render(" ") +
+    Style.new().fg(208).bold().render("↑") +    # 256-colour orange
+    _label_style().render(" p50/p95 ") +
+    Style.new().fg(_COL_OVERLAY()).render(p50.to_s() + "/" + p95.to_s())
+end
+
+# ============================================================
+# PSI chip — pressure-stall info display
+# ============================================================
+#
+# Linux 4.20+ exposes /proc/pressure/{cpu,memory,io}, each carrying
+# `some` and `full` averages over 10/60/300 seconds. `some` is the
+# fraction of recent wall-clock time during which AT LEAST ONE task
+# was stalled waiting for the resource; `full` is the fraction during
+# which ALL non-idle tasks were stalled. `full` is the killer signal:
+# it means the resource is saturated and even one priority job can't
+# get through. PSI > 0% sustained is an unambiguous "machine is
+# unhealthy" tell that nothing else exposes this directly.
+#
+# Display: small chip glued to the panel header reading
+# "psi 12/4" — the two numbers are some/full, both as integer
+# percentages from the 10-second running average. Color-graded by
+# the `full` value (the more load-bearing of the two).
+#
+# Hidden entirely on macOS (snapshot.pressure.available == false).
+# We don't say "PSI not available" — just nothing in the slot. The
+# whole chip pattern is: if you see it, the machine is stalling.
+
+def _psi_chip(some_pct: Int, full_pct: Int, available: Bool): String
+  if not available
+    return ""
+  end
+  # Pick the worse of the two for color grading; full is generally
+  # the more meaningful signal but a short spike in some without
+  # full is still worth highlighting.
+  var grade = full_pct
+  if some_pct > grade
+    grade = some_pct
+  end
+  var col = _COL_OVERLAY()                 # dim by default — 0/0 is fine
+  if grade >= 1
+    col = _COL_GREEN()
+  end
+  if grade >= 10
+    col = _COL_YELLOW()
+  end
+  if grade >= 30
+    col = 208                              # 256-colour orange
+  end
+  if grade >= 60
+    col = _COL_RED()
+  end
+  var lbl = _label_style().render(" psi ")
+  var val = Style.new().fg(col).render(some_pct.to_s() + "/" + full_pct.to_s())
+  return lbl + val
+end
+
+# Build a single-line title bar.
+# Build marker — bumped on each shareable build so recipients can
+# confirm they're on the right binary at a glance. If the title chip
+# doesn't say what the sender said it should, the binary is stale.
+def VIGIL_BUILD(): String = "v0.2 · responsive tiles · 2026-05-07 build C"
+
+def _view_title(s: VState): String
+  var title = _heading_style().render("VIGIL")
+  var platform = "?"
+  if s.curr_snap.platform == ps::PLATFORM_LINUX()
+    platform = "linux"
+  end
+  if s.curr_snap.platform == ps::PLATFORM_DARWIN()
+    platform = "darwin"
+  end
+  var plat_chip = _accent_style().render("[" + platform + "]")
+  # Narrow layouts skip the verbose " — system vigil" subtitle and the
+  # build-chip suffix to stay within one screen row.
+  if s.cols < TILE_2WIDE_MIN_COLS()
+    return title + " " + plat_chip + " " +
+      _label_style().render(VIGIL_BUILD())
+  end
+  var sub = _label_style().render(" — system vigil")
+  var build_chip = _label_style().render("  " + VIGIL_BUILD())
+  return title + sub + " " + plat_chip + build_chip
+end
+
+def _view_cpu_panel(s: VState): String
+  var cpu_pct = s.curr_snap.cpu_aggregate.pct
+  var cpu_color = _color_for_load(cpu_pct)
+  var pct_lbl = Style.new().fg(cpu_color).bold().render(cpu_pct.to_s() + "%")
+  var spark_lines = sp::spark_view(s.cpu_spark)
+  var lines = str_split(spark_lines, "\n")
+  var spark_styled = ""
+  var i = 0
+  while i < lines.size
+    if i > 0
+      spark_styled = spark_styled + "\n"
+    end
+    spark_styled = spark_styled + Style.new().fg(cpu_color).render(lines[i])
+    i += 1
+  end
+
+  var head = _heading_style().render("CPU") + " " + pct_lbl
+  var per_core_chip = ""
+  if s.curr_snap.cpu_per_core.size > 0
+    per_core_chip = " " + _label_style().render(
+      "(" + s.curr_snap.cpu_per_core.size.to_s() + " cores)"
+    )
+  end
+  var psi = _psi_chip(
+    s.curr_snap.pressure.cpu_some,
+    s.curr_snap.pressure.cpu_full,
+    s.curr_snap.pressure.available
+  )
+  var anom = _anomaly_chip(s.cpu_spark, cpu_pct)
+  return head + per_core_chip + psi + anom + "\n" + spark_styled
+end
+
+def _view_mem_panel(s: VState): String
+  var m = s.curr_snap.mem
+  var used = _format_kb(m.used_kb)
+  var total = _format_kb(m.total_kb)
+  var avail = _format_kb(m.available_kb)
+  var bar = _bar_view(SPARK_WIDTH_CELLS(), m.used_kb, m.total_kb)
+
+  var spark_lines = sp::spark_view(s.mem_spark)
+  var lines = str_split(spark_lines, "\n")
+  var spark_styled = ""
+  var i = 0
+  while i < lines.size
+    if i > 0
+      spark_styled = spark_styled + "\n"
+    end
+    spark_styled = spark_styled + Style.new().fg(_COL_TEAL()).render(lines[i])
+    i += 1
+  end
+
+  var head = _heading_style().render("MEM") + " " +
+    _value_style().render(used) + _label_style().render(" / ") +
+    _value_style().render(total) + _label_style().render("  avail ") +
+    _value_style().render(avail)
+  var psi = _psi_chip(
+    s.curr_snap.pressure.mem_some,
+    s.curr_snap.pressure.mem_full,
+    s.curr_snap.pressure.available
+  )
+  var mem_pct_now = 0
+  if m.total_kb > 0
+    mem_pct_now = m.used_kb * 100 / m.total_kb
+  end
+  var anom = _anomaly_chip(s.mem_spark, mem_pct_now)
+  return head + psi + anom + "\n" + bar + "\n" + spark_styled
+end
+
+def _format_bps(bps: Int): String
+  if bps >= 1024 * 1024
+    var mb = bps / (1024 * 1024)
+    var rem = (bps % (1024 * 1024)) * 10 / (1024 * 1024)
+    return mb.to_s() + "." + rem.to_s() + "M/s"
+  end
+  if bps >= 1024
+    return (bps / 1024).to_s() + "K/s"
+  end
+  return bps.to_s() + "B/s"
+end
+
+def _view_disk_panel(s: VState): String
+  # Aggregate current rates across devices for the header readout.
+  var rps_total = 0
+  var wps_total = 0
+  var i = 0
+  while i < s.curr_snap.disks.size
+    rps_total += s.curr_snap.disks[i].read_bytes_per_sec
+    wps_total += s.curr_snap.disks[i].write_bytes_per_sec
+    i += 1
+  end
+  var head = _heading_style().render("DISK") + " " +
+    _label_style().render("R ") + _value_style().render(_format_bps(rps_total)) +
+    _label_style().render("  W ") + _value_style().render(_format_bps(wps_total))
+  var dev_chip = ""
+  if s.curr_snap.disks.size > 0
+    dev_chip = " " + _label_style().render("(" + s.curr_snap.disks.size.to_s() + " dev)")
+  end
+  # Two single-row sparks side by side: R left, W right. Save vertical space.
+  var r_lines = str_split(sp::spark_view(s.disk_r_spark), "\n")
+  var w_lines = str_split(sp::spark_view(s.disk_w_spark), "\n")
+  var r_styled = ""
+  var k = 0
+  while k < r_lines.size
+    if k > 0
+      r_styled = r_styled + "\n"
+    end
+    r_styled = r_styled + Style.new().fg(_COL_GREEN()).render(r_lines[k])
+    k += 1
+  end
+  var w_styled = ""
+  var j = 0
+  while j < w_lines.size
+    if j > 0
+      w_styled = w_styled + "\n"
+    end
+    w_styled = w_styled + Style.new().fg(_COL_YELLOW()).render(w_lines[j])
+    j += 1
+  end
+  return head + dev_chip + "\n" +
+    _label_style().render("R ") + r_styled + "  " +
+    _label_style().render("W ") + w_styled
+end
+
+def _view_net_panel(s: VState): String
+  var rx_total = 0
+  var tx_total = 0
+  var i = 0
+  while i < s.curr_snap.nics.size
+    rx_total += s.curr_snap.nics[i].rx_bytes_per_sec
+    tx_total += s.curr_snap.nics[i].tx_bytes_per_sec
+    i += 1
+  end
+  var head = _heading_style().render("NET ") +
+    _label_style().render("RX ") + _value_style().render(_format_bps(rx_total)) +
+    _label_style().render("  TX ") + _value_style().render(_format_bps(tx_total))
+  var nic_chip = ""
+  if s.curr_snap.nics.size > 0
+    nic_chip = " " + _label_style().render("(" + s.curr_snap.nics.size.to_s() + " nic)")
+  end
+  var rx_lines = str_split(sp::spark_view(s.net_rx_spark), "\n")
+  var tx_lines = str_split(sp::spark_view(s.net_tx_spark), "\n")
+  var rx_styled = ""
+  var k = 0
+  while k < rx_lines.size
+    if k > 0
+      rx_styled = rx_styled + "\n"
+    end
+    rx_styled = rx_styled + Style.new().fg(_COL_TEAL()).render(rx_lines[k])
+    k += 1
+  end
+  var tx_styled = ""
+  var j = 0
+  while j < tx_lines.size
+    if j > 0
+      tx_styled = tx_styled + "\n"
+    end
+    tx_styled = tx_styled + Style.new().fg(_COL_LAVENDER()).render(tx_lines[j])
+    j += 1
+  end
+  return head + nic_chip + "\n" +
+    _label_style().render("RX ") + rx_styled + "  " +
+    _label_style().render("TX ") + tx_styled
+end
+
+# OOM event log panel. Renders compactly only when there are events
+# to show — empty oom_events vec means the panel is suppressed
+# entirely (cleaner than "OOM: no recent events"). Linux-only by
+# design; macOS oom_events is always empty.
+def _view_oom_panel(s: VState): String
+  if s.curr_snap.oom_events.size == 0
+    return ""
+  end
+  var sb = sb_new()
+  # Limit to most-recent 5 events to fit a tight panel.
+  var events = s.curr_snap.oom_events
+  var limit = events.size
+  if limit > 5
+    limit = 5
+  end
+  var head = Style.new().fg(_COL_RED()).bold().render("OOM ") +
+    _label_style().render("recent kernel kills (" + events.size.to_s() + ")")
+  sb_append(sb, head)
+  # Events come back in chronological order; show the most recent
+  # first by walking the tail backward.
+  var i = events.size - 1
+  var shown = 0
+  while i >= 0 and shown < limit
+    var ev = events[i]
+    sb_append(sb, "\n  ")
+    sb_append(sb, _label_style().render("pid "))
+    sb_append(sb, _value_style().render(ev.victim_pid.to_s()))
+    sb_append(sb, _label_style().render(" ("))
+    sb_append(sb, Style.new().fg(_COL_YELLOW()).render(ev.victim_name))
+    sb_append(sb, _label_style().render(")"))
+    if ev.rss_kb > 0
+      sb_append(sb, _label_style().render("  rss "))
+      sb_append(sb, _value_style().render(_format_kb(ev.rss_kb)))
+    end
+    i -= 1
+    shown += 1
+  end
+  return sb_to_string(sb)
+end
+
+# ============================================================
+# Tile builders — uniform-height boxed panels
+# ============================================================
+#
+# Each tile takes the global state and a target inner width. Returns
+# the full bordered tile as Vec<String> (top border + body lines +
+# bottom border). All tiles produce 4 lines total (2 body lines).
+
+def TILE_BODY_HEIGHT(): Int = 2
+
+# Helper: render a spark at a target width, color-styled per row.
+#
+# Quality is forced to Quadrant (BMP block characters, U+2580..U+259F)
+# rather than the higher-resolution Octant tier. Reason: Unicode 17's
+# new octant block (U+1CD00..U+1CDE5, shipped Sept 2024) doesn't have
+# wcwidth entries in many terminals' width tables yet — they fall back
+# to width=2 ("wide") as a defensive guess. That breaks the box-frame
+# alignment in the responsive tile layout because our padding math
+# counts each octant codepoint as 1 cell while the terminal renders
+# 2. Quadrant glyphs are universally width=1 and render correctly on
+# every terminal we've tested. Resolution loss: 8 vertical levels
+# per cell → 4. Still way better than block-character sparklines
+# elsewhere; users typing %CPU don't notice the difference.
+def _styled_spark(spk: sp::Spark, w: Int, color: Int): Vec<String>
+  var resized = sp::spark_with_width(spk, w)
+  var safe = sp::spark_with_quality(resized, oc::OctantQuality::Quadrant)
+  var raw = sp::spark_view(safe)
+  var lines = str_split(raw, "\n")
+  var out = vec_new<String>()
+  var i = 0
+  while i < lines.size
+    out.push(Style.new().fg(color).render(lines[i]))
+    i += 1
+  end
+  return out
+end
+
+def _tile_cpu(s: VState, inner_w: Int): Vec<String>
+  var cpu_pct = s.curr_snap.cpu_aggregate.pct
+  var col = _color_for_load(cpu_pct)
+  var pct_lbl = Style.new().fg(col).bold().render(cpu_pct.to_s() + "%")
+  # Title chips: cores (linux), PSI, anomaly.
+  var chips = ""
+  if s.curr_snap.cpu_per_core.size > 0
+    chips = chips + " " +
+      _label_style().render("(" + s.curr_snap.cpu_per_core.size.to_s() + " cores)")
+  end
+  chips = chips + _psi_chip(
+    s.curr_snap.pressure.cpu_some,
+    s.curr_snap.pressure.cpu_full,
+    s.curr_snap.pressure.available
+  )
+  chips = chips + _anomaly_chip(s.cpu_spark, cpu_pct)
+  var title = _heading_style().render("CPU") + " " + pct_lbl + chips
+
+  var spark_w = inner_w - 2
+  var spk = sp::spark_with_height(s.cpu_spark, TILE_BODY_HEIGHT())
+  var lines = _styled_spark(spk, spark_w, col)
+  # Wrap in a single-cell margin for visual breathing room.
+  var body = vec_new<String>()
+  var i = 0
+  while i < lines.size
+    body.push(" " + lines[i] + " ")
+    i += 1
+  end
+  while body.size < TILE_BODY_HEIGHT()
+    body.push("")
+  end
+  return _box(title, body, inner_w)
+end
+
+def _tile_mem(s: VState, inner_w: Int): Vec<String>
+  var m = s.curr_snap.mem
+  var used = _format_kb(m.used_kb)
+  var total = _format_kb(m.total_kb)
+  var avail = _format_kb(m.available_kb)
+  var mem_pct_now = 0
+  if m.total_kb > 0
+    mem_pct_now = m.used_kb * 100 / m.total_kb
+  end
+  var psi = _psi_chip(
+    s.curr_snap.pressure.mem_some,
+    s.curr_snap.pressure.mem_full,
+    s.curr_snap.pressure.available
+  )
+  var anom = _anomaly_chip(s.mem_spark, mem_pct_now)
+  var title = _heading_style().render("MEM") + " " +
+    _value_style().render(used) + _label_style().render("/") +
+    _value_style().render(total) + _label_style().render(" avail ") +
+    _value_style().render(avail) + psi + anom
+
+  var bar_w = inner_w - 2
+  var bar = " " + _bar_view(bar_w, m.used_kb, m.total_kb) + " "
+
+  var spark_w = inner_w - 2
+  var spk = sp::spark_with_height(s.mem_spark, 1)
+  var spark_lines = _styled_spark(spk, spark_w, _COL_TEAL())
+  var spark_line = ""
+  if spark_lines.size > 0
+    spark_line = " " + spark_lines[0] + " "
+  end
+
+  var body = vec_new<String>()
+  body.push(bar)
+  body.push(spark_line)
+  return _box(title, body, inner_w)
+end
+
+def _tile_disk(s: VState, inner_w: Int): Vec<String>
+  var rps_total = 0
+  var wps_total = 0
+  var i = 0
+  while i < s.curr_snap.disks.size
+    rps_total += s.curr_snap.disks[i].read_bytes_per_sec
+    wps_total += s.curr_snap.disks[i].write_bytes_per_sec
+    i += 1
+  end
+  var dev_chip = ""
+  if s.curr_snap.disks.size > 0
+    dev_chip = " " + _label_style().render("(" + s.curr_snap.disks.size.to_s() + " dev)")
+  end
+  var title = _heading_style().render("DISK") + " " +
+    _label_style().render("R ") + _value_style().render(_format_bps(rps_total)) +
+    _label_style().render(" W ") + _value_style().render(_format_bps(wps_total)) +
+    dev_chip
+
+  var spark_w = inner_w - 4   # account for "R " / "W " labels
+  var rspk = sp::spark_with_height(s.disk_r_spark, 1)
+  var wspk = sp::spark_with_height(s.disk_w_spark, 1)
+  var rlines = _styled_spark(rspk, spark_w, _COL_GREEN())
+  var wlines = _styled_spark(wspk, spark_w, _COL_YELLOW())
+  var r_str = ""
+  var w_str = ""
+  if rlines.size > 0
+    r_str = rlines[0]
+  end
+  if wlines.size > 0
+    w_str = wlines[0]
+  end
+  var body = vec_new<String>()
+  body.push(_label_style().render("R ") + r_str + " ")
+  body.push(_label_style().render("W ") + w_str + " ")
+  return _box(title, body, inner_w)
+end
+
+def _tile_net(s: VState, inner_w: Int): Vec<String>
+  var rx_total = 0
+  var tx_total = 0
+  var i = 0
+  while i < s.curr_snap.nics.size
+    rx_total += s.curr_snap.nics[i].rx_bytes_per_sec
+    tx_total += s.curr_snap.nics[i].tx_bytes_per_sec
+    i += 1
+  end
+  var nic_chip = ""
+  if s.curr_snap.nics.size > 0
+    nic_chip = " " + _label_style().render("(" + s.curr_snap.nics.size.to_s() + " nic)")
+  end
+  var title = _heading_style().render("NET") + " " +
+    _label_style().render("RX ") + _value_style().render(_format_bps(rx_total)) +
+    _label_style().render(" TX ") + _value_style().render(_format_bps(tx_total)) +
+    nic_chip
+
+  var spark_w = inner_w - 4
+  var rspk = sp::spark_with_height(s.net_rx_spark, 1)
+  var tspk = sp::spark_with_height(s.net_tx_spark, 1)
+  var rlines = _styled_spark(rspk, spark_w, _COL_TEAL())
+  var tlines = _styled_spark(tspk, spark_w, _COL_LAVENDER())
+  var r_str = ""
+  var t_str = ""
+  if rlines.size > 0
+    r_str = rlines[0]
+  end
+  if tlines.size > 0
+    t_str = tlines[0]
+  end
+  var body = vec_new<String>()
+  body.push(_label_style().render("RX ") + r_str + " ")
+  body.push(_label_style().render("TX ") + t_str + " ")
+  return _box(title, body, inner_w)
+end
+
+# ============================================================
+# Responsive layout dispatcher
+# ============================================================
+#
+# Three breakpoints based on terminal width:
+#   ≥ TILE_4WIDE_MIN_COLS   →  4-across boxed tiles (CPU MEM DISK NET)
+#   ≥ TILE_2WIDE_MIN_COLS   →  2x2 boxed tiles
+#   else                    →  dense single-column (current layout)
+
+def TILE_4WIDE_MIN_COLS(): Int = 240
+def TILE_2WIDE_MIN_COLS(): Int = 120
+
+def _view_top_tiles_4wide(s: VState): String
+  var gap = 1
+  var per = (s.cols - 3 * gap) / 4
+  if per < 30
+    per = 30
+  end
+  var inner = per - 2
+  var widths = vec_new<Int>()
+  widths.push(per)
+  widths.push(per)
+  widths.push(per)
+  widths.push(per)
+  var tiles = vec_new<Vec<String>>()
+  tiles.push(_tile_cpu(s, inner))
+  tiles.push(_tile_mem(s, inner))
+  tiles.push(_tile_disk(s, inner))
+  tiles.push(_tile_net(s, inner))
+  return _hzip(tiles, gap, widths)
+end
+
+def _view_top_tiles_2wide(s: VState): String
+  var gap = 1
+  var per = (s.cols - gap) / 2
+  if per < 30
+    per = 30
+  end
+  var inner = per - 2
+  var widths = vec_new<Int>()
+  widths.push(per)
+  widths.push(per)
+  var row1 = vec_new<Vec<String>>()
+  row1.push(_tile_cpu(s, inner))
+  row1.push(_tile_mem(s, inner))
+  var row2 = vec_new<Vec<String>>()
+  row2.push(_tile_disk(s, inner))
+  row2.push(_tile_net(s, inner))
+  return _hzip(row1, gap, widths) + "\n" + _hzip(row2, gap, widths)
+end
+
+# Single-column boxed-tile layout for narrow terminals (MacBook Air,
+# iPad terminal apps, splits in tmux). Each tile spans the full
+# width, vertically stacked. Trades 5 lines vs the borderless dense
+# layout for visual structure — every panel has the same rounded
+# frame and breathing room as in the wide layouts, just stacked.
+def _view_top_tiles_1wide(s: VState): String
+  var width = s.cols
+  if width < 30
+    width = 30
+  end
+  var inner = width - 2
+  var sb = sb_new()
+  var tiles = vec_new<Vec<String>>()
+  tiles.push(_tile_cpu(s, inner))
+  tiles.push(_tile_mem(s, inner))
+  tiles.push(_tile_disk(s, inner))
+  tiles.push(_tile_net(s, inner))
+  var i = 0
+  while i < tiles.size
+    var lines = tiles[i]
+    var j = 0
+    while j < lines.size
+      sb_append(sb, lines[j])
+      if j < lines.size - 1 or i < tiles.size - 1
+        sb_append(sb, "\n")
+      end
+      j += 1
+    end
+    i += 1
+  end
+  return sb_to_string(sb)
+end
+
+def _view_status_line(s: VState): String
+  var loads = _label_style().render("load") + " " +
+    _value_style().render(_format_load(s.curr_snap.load_1)) + ", " +
+    _value_style().render(_format_load(s.curr_snap.load_5)) + ", " +
+    _value_style().render(_format_load(s.curr_snap.load_15))
+  var procs = _label_style().render("  procs ") +
+    _value_style().render(s.curr_snap.processes.size.to_s())
+  return loads + procs
+end
+
+# Compare two procs under sort_kind. Returns true iff `a` should come
+# BEFORE `b` (i.e. a is "greater" for desc sorts, "less" for asc).
+def _proc_sort_lt(a: ps::ProcStat, b: ps::ProcStat, sk: Int): Bool
+  if sk == SORT_CPU()
+    return a.cpu_pct > b.cpu_pct
+  end
+  if sk == SORT_NAME()
+    # String comparison via byte-wise — Quartz's str < operator
+    # works codepoint-wise. KISS: use < directly.
+    return a.command < b.command
+  end
+  # SORT_RSS (default)
+  return a.rss_kb > b.rss_kb
+end
+
+# Sort processes by the chosen field, then return the top `n`.
+def _top_processes(procs: Vec<ps::ProcStat>, n: Int, sk: Int): Vec<ps::ProcStat>
+  var copy = vec_new<ps::ProcStat>()
+  var i = 0
+  while i < procs.size
+    copy.push(procs[i])
+    i += 1
+  end
+  # Insertion sort. Process counts are ~hundreds — fine for Phase 1.
+  var k = 1
+  while k < copy.size
+    var j = k
+    while j > 0 and _proc_sort_lt(copy[j], copy[j - 1], sk)
+      var tmp = copy[j]
+      copy[j] = copy[j - 1]
+      copy[j - 1] = tmp
+      j -= 1
+    end
+    k += 1
+  end
+  var out = vec_new<ps::ProcStat>()
+  var lim = n
+  if lim > copy.size
+    lim = copy.size
+  end
+  var p = 0
+  while p < lim
+    out.push(copy[p])
+    p += 1
+  end
+  return out
+end
+
+def _truncate(s: String, w: Int): String
+  if s.size <= w
+    return s
+  end
+  if w <= 1
+    return ""
+  end
+  var sb = sb_new()
+  var i = 0
+  while i < w - 1
+    sb_append_byte(sb, s[i])
+    i += 1
+  end
+  sb_append(sb, "…")
+  return sb_to_string(sb)
+end
+
+def _pad_right(s: String, w: Int): String
+  var n = s.size
+  if n >= w
+    return _truncate(s, w)
+  end
+  return s + str_repeat(" ", w - n)
+end
+
+def _pad_left(s: String, w: Int): String
+  var n = s.size
+  if n >= w
+    return _truncate(s, w)
+  end
+  return str_repeat(" ", w - n) + s
+end
+
+def _sort_label(sk: Int): String
+  if sk == SORT_CPU()
+    return "CPU"
+  end
+  if sk == SORT_NAME()
+    return "NAME"
+  end
+  return "RSS"
+end
+
+def _view_proc_list(s: VState): String
+  # Header(1) + title(1) + CPU(3) + MEM(4) + DISK(2) + NET(2) +
+  # status(1) + procheader(1) + footer(1) + status_msg/kill(1) ≈ 17.
+  var avail_rows = s.rows - 17
+  if avail_rows < 4
+    avail_rows = 4
+  end
+  if avail_rows > PROC_LIST_DEFAULT()
+    avail_rows = PROC_LIST_DEFAULT()
+  end
+  var top = _top_processes(s.curr_snap.processes, avail_rows, s.sort_kind)
+
+  var sb = sb_new()
+  var sort_chip = _accent_style().render("[" + _sort_label(s.sort_kind) + "]")
+  var hd = _label_style().render(_pad_right("PID", 7) + _pad_right("USER", 12) +
+    _pad_left("CPU%", 7) + _pad_left("RSS", 9) + "  COMMAND")
+  sb_append(sb, _heading_style().render("PROCESSES") + "  " + sort_chip + " " +
+    _label_style().render("(top " + avail_rows.to_s() + ")\n"))
+  sb_append(sb, hd)
+  sb_append(sb, "\n")
+
+  # PID(7) + USER(12) + CPU%(7) + RSS(9) + 2-space gap = 37 fixed
+  # cells before the command starts. Truncate the command to the
+  # remaining cell budget so the line never wraps.
+  var cmd_w = s.cols - 37
+  if cmd_w < 12
+    cmd_w = 12
+  end
+
+  var i = 0
+  while i < top.size
+    var p = top[i]
+    var line = _pad_right(p.pid.to_s(), 7) +
+               _pad_right(_truncate(p.user, 11), 12) +
+               _pad_left(p.cpu_pct.to_s() + "%", 7) +
+               _pad_left(_format_kb(p.rss_kb), 9) +
+               "  " + _truncate(p.command, cmd_w)
+    if i == s.cursor
+      var cur_style = Style.new().fg(_COL_BASE()).bg(_COL_TEAL())
+      sb_append(sb, cur_style.render(line))
+    else
+      var sty = _value_style()
+      if p.cpu_pct >= 50
+        sty = Style.new().fg(_color_for_load(p.cpu_pct))
+      end
+      sb_append(sb, sty.render(line))
+    end
+    if i < top.size - 1
+      sb_append(sb, "\n")
+    end
+    i += 1
+  end
+  return sb_to_string(sb)
+end
+
+def _view_help_overlay(): String
+  var lines = vec_new<String>()
+  lines.push("VIGIL — Phase 1 alpha")
+  lines.push("")
+  lines.push("Navigation:")
+  lines.push("  q, Ctrl-C    quit")
+  lines.push("  ?            toggle this help")
+  lines.push("  j / Down     next process")
+  lines.push("  k / Up       previous process")
+  lines.push("  Ctrl-F       page down")
+  lines.push("  Ctrl-B       page up")
+  lines.push("  g            top of list")
+  lines.push("  G            bottom of list")
+  lines.push("")
+  lines.push("Sort:")
+  lines.push("  M            by memory / RSS (default)")
+  lines.push("  P            by CPU%")
+  lines.push("  N            by name")
+  lines.push("")
+  lines.push("Action:")
+  lines.push("  K            kill highlighted process (y to confirm)")
+  lines.push("")
+  lines.push("Sampling: every 2s.")
+  lines.push("")
+  lines.push("Phase 2 adds: GPU panel, container view, network flows,")
+  lines.push("replay, mouse hit-test, theme YAML, eBPF probes.")
+  var sb = sb_new()
+  var i = 0
+  while i < lines.size
+    if i > 0
+      sb_append(sb, "\n")
+    end
+    sb_append(sb, lines[i])
+    i += 1
+  end
+  return sb_to_string(sb)
+end
+
+def _view_footer(): String
+  return _label_style().render(
+    "q quit  ? help  j/k nav  M/P/N sort  K kill"
+  )
+end
+
+# Render a one-line status row above the footer. Shows either a
+# pending-kill confirm prompt, or the most recent status message
+# (set after a successful/failed kill), or an empty placeholder.
+def _view_status_row(s: VState): String
+  if s.pending_kill_pid > 0
+    return Style.new().fg(_COL_RED()).bold().render(
+      "Kill PID " + s.pending_kill_pid.to_s() + "?  press y to confirm, anything else to cancel"
+    )
+  end
+  if s.status_msg.size > 0
+    return _accent_style().render(s.status_msg)
+  end
+  return ""
+end
+
+def _view_top_panels(s: VState): String
+  if s.cols >= TILE_4WIDE_MIN_COLS()
+    return _view_top_tiles_4wide(s)
+  end
+  if s.cols >= TILE_2WIDE_MIN_COLS()
+    return _view_top_tiles_2wide(s)
+  end
+  # Narrow: 1-wide stacked tiles. Same boxed look as the wider
+  # layouts, just vertical. Skips the borderless dense layout —
+  # the boxes give visual rhythm even on a 60-column MacBook Air.
+  return _view_top_tiles_1wide(s)
+end
+
+def view(s: VState): String
+  var sb = sb_new()
+  sb_append(sb, _view_title(s))
+  sb_append(sb, "\n")
+  sb_append(sb, _view_top_panels(s))
+  sb_append(sb, "\n")
+  var oom_panel = _view_oom_panel(s)
+  if oom_panel.size > 0
+    sb_append(sb, oom_panel)
+    sb_append(sb, "\n")
+  end
+  sb_append(sb, _view_status_line(s))
+  sb_append(sb, "\n")
+  sb_append(sb, _view_proc_list(s))
+  sb_append(sb, "\n")
+  var status_row = _view_status_row(s)
+  if status_row.size > 0
+    sb_append(sb, status_row)
+    sb_append(sb, "\n")
+  end
+  sb_append(sb, _view_footer())
+  var base = sb_to_string(sb)
+
+  if s.show_help
+    var help = ov::overlay_new(_view_help_overlay(), ov::POS_CENTER(), ly::BORDER_ROUNDED())
+    return ov::overlay_compose(base, help)
+  end
+  return base
+end
+
+# ============================================================
+# Entry
+# ============================================================
+
+def main(): Int
+  # Enable SGR mouse reporting before program_run. The DECSET writes
+  # are saved in the terminal's mode flags and survive alt-screen
+  # entry; term_exit_raw_mode (called on program_run teardown)
+  # defensively disables mouse mode so clean shutdown — and crashes —
+  # both leave the terminal in a sane state.
+  term_enable_mouse()
+  var program: tui::Program<VState, VMsg> = tui::program_new(initial_state(), update, view)
+  program = tui::program_with_init(program, _every_tick())
+  return tui::program_run(program)
+end

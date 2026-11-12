@@ -1,0 +1,294 @@
+## Regression tests for B3 / PSQ-4 — Vec element type propagation through
+## indexing and field access.
+##
+## HISTORY: PSQ-4 in the April 2026 progress sprint hit twice in commit
+## 1a60633c. Symptom: `var x = vec[i]; x.field` inside closure contexts
+## silently resolved `field` to the WRONG struct's offset when multiple
+## structs in scope shared the field name. Root cause hypothesis:
+##   1. Element type lost through `vec[i]` in closure contexts
+##   2. Name-resolution fallthrough in tc_expr_field_access picks the
+##      first struct with a matching field name
+##
+## Status on April 14, 2026: after `rm -rf .quartz-cache` + clean
+## rebuild, I was unable to reproduce the specific wrong-offset symptom
+## in isolated test cases. The top-level, closure, and for-in shapes all
+## produce correct offsets. The original PSQ-4 probably required the
+## full multi-file progress.qz context to trigger.
+##
+## These tests LOCK IN the correct current behavior for a range of
+## Vec-element-field-access shapes. If any of them start failing with
+## wrong values, PSQ-4 or a close cousin has returned. Follow-up
+## guardrail (promote struct-name fallthrough to a hard error) filed
+## as B3-HARD-ERROR-FALLBACK in ROADMAP.
+##
+## Contract:
+##   1. for item in vec_of_struct — item.field reads correct offset
+##   2. var x = vec[i] at top level — x.field reads correct offset
+##   3. var x = vec[i] inside a while loop — x.field reads correct offset
+##   4. Two structs with shared field name at different offsets — reader
+##      function over Vec<A> reads A's offset, not B's
+##   5. vec[i].field directly (no intermediate binding) — correct offset
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("Vec element type propagation through field access") do ->
+
+    it("for-in over Vec<Struct>, item.field reads correct offset") do ->
+      assert_run_exits("""
+        struct VA
+          x: Int
+          y: Int
+        end
+        def run(items: Vec<VA>): Int
+          var t = 0
+          for item in items
+            t += item.y
+          end
+          return t
+        end
+        def main(): Int
+          var va: Vec<VA> = vec_new()
+          va.push(VA { x: 1, y: 10 })
+          va.push(VA { x: 2, y: 32 })
+          return 0 if run(va) == 42
+          return 1
+        end
+        """, 0)
+    end
+
+    it("var x = vec[i] at top-level reads correct offset") do ->
+      assert_run_exits("""
+        struct VA
+          x: Int
+          y: Int
+        end
+        def main(): Int
+          var va: Vec<VA> = vec_new()
+          va.push(VA { x: 10, y: 42 })
+          var a = va[0]
+          return 0 if a.y == 42
+          return 1
+        end
+        """, 0)
+    end
+
+    it("var x = vec[i] inside while loop reads correct offset") do ->
+      assert_run_exits("""
+        struct VA
+          x: Int
+          y: Int
+        end
+        def run(items: Vec<VA>): Int
+          var t = 0
+          var i = 0
+          while i < items.size
+            var item = items[i]
+            t += item.y
+            i += 1
+          end
+          return t
+        end
+        def main(): Int
+          var va: Vec<VA> = vec_new()
+          va.push(VA { x: 1, y: 20 })
+          va.push(VA { x: 2, y: 22 })
+          return 0 if run(va) == 42
+          return 1
+        end
+        """, 0)
+    end
+
+    it("two structs with shared field name — correct offset picked") do ->
+      assert_run_exits("""
+        struct PA
+          a0: Int
+          y: Int
+        end
+        struct PB
+          b0: Int
+          b1: Int
+          b2: Int
+          y: Int
+        end
+        def sum_pa(items: Vec<PA>): Int
+          var t = 0
+          for item in items
+            t += item.y
+          end
+          return t
+        end
+        def main(): Int
+          var va: Vec<PA> = vec_new()
+          va.push(PA { a0: 99, y: 20 })
+          va.push(PA { a0: 99, y: 22 })
+          ## PB exists to tempt name-resolution fallthrough
+          var b = PB { b0: 1, b1: 2, b2: 3, y: 999 }
+          return 0 if sum_pa(va) == 42 and b.y == 999
+          return 1
+        end
+        """, 0)
+    end
+
+    it("direct vec[i].field access (B3-DIRECT-INDEX-FIELD)") do ->
+      assert_run_exits("""
+        struct VA
+          x: Int
+          y: Int
+        end
+        def main(): Int
+          var va: Vec<VA> = vec_new()
+          va.push(VA { x: 10, y: 42 })
+          return 0 if va[0].y == 42
+          return 1
+        end
+        """, 0)
+    end
+
+    it("nested struct field chain via direct vec[i].inner.field") do ->
+      assert_run_exits("""
+        struct Inner
+          v: Int
+        end
+        struct Outer
+          x: Int
+          inner: Inner
+        end
+        def main(): Int
+          var va: Vec<Outer> = vec_new()
+          va.push(Outer { x: 1, inner: Inner { v: 77 } })
+          return 0 if va[0].inner.v == 77
+          return 1
+        end
+        """, 0)
+    end
+
+    it("direct vec[i].field in arithmetic expression") do ->
+      assert_run_exits("""
+        struct VA
+          x: Int
+          y: Int
+        end
+        def main(): Int
+          var va: Vec<VA> = vec_new()
+          va.push(VA { x: 5, y: 7 })
+          va.push(VA { x: 3, y: 11 })
+          return 0 if va[0].y + va[1].y == 18
+          return 1
+        end
+        """, 0)
+    end
+
+    ## PSQ-4 WORST CASE: two structs share field name `_ended` at DIFFERENT
+    ## offsets. `Progress._ended` is at offset 5, `Live._ended` is at offset 10.
+    ## Pre-fix: `for item in Vec<Live>; item._ended` silently resolved to
+    ## `Progress._ended` via mir_find_field_globally → read offset 5 → wrong
+    ## data. This test locks in the exact repro from PROGRESS_SPRINT_QUIRKS.md.
+    it("PSQ-4 worst case: Progress declared first, read Live._ended") do ->
+      assert_run_exits("""
+        struct Progress
+          name: String
+          state: Int
+          pct: Int
+          total: Int
+          step: Int
+          _ended: Int
+        end
+        struct Live
+          screen: Int
+          a: Int
+          b: Int
+          c: Int
+          d: Int
+          e: Int
+          f: Int
+          g: Int
+          h: Int
+          i: Int
+          _ended: Int
+        end
+        def main(): Int
+          var l = Live { screen: 10, a: 0, b: 0, c: 0, d: 0, e: 0, f: 0, g: 0, h: 0, i: 0, _ended: 99 }
+          var actives: Vec<Live> = vec_new()
+          actives.push(l)
+          var total = 0
+          for item in actives
+            total += item._ended
+          end
+          return 0 if total == 99
+          return 1
+        end
+        """, 0)
+    end
+
+    it("PSQ-4 worst case: reversed declaration order — Live first") do ->
+      assert_run_exits("""
+        struct Live
+          screen: Int
+          a: Int
+          b: Int
+          c: Int
+          d: Int
+          e: Int
+          f: Int
+          g: Int
+          h: Int
+          i: Int
+          _ended: Int
+        end
+        struct Progress
+          name: String
+          state: Int
+          pct: Int
+          total: Int
+          step: Int
+          _ended: Int
+        end
+        def main(): Int
+          var p = Progress { name: "p", state: 1, pct: 2, total: 3, step: 4, _ended: 77 }
+          var bars: Vec<Progress> = vec_new()
+          bars.push(p)
+          var total = 0
+          for item in bars
+            total += item._ended
+          end
+          return 0 if total == 77
+          return 1
+        end
+        """, 0)
+    end
+
+    it("PSQ-4: both structs in scope, both Vecs iterated") do ->
+      assert_run_exits("""
+        struct SA
+          pad1: Int
+          pad2: Int
+          pad3: Int
+          mark: Int
+        end
+        struct SB
+          mark: Int
+        end
+        def main(): Int
+          var va: Vec<SA> = vec_new()
+          va.push(SA { pad1: 0, pad2: 0, pad3: 0, mark: 100 })
+          var vb: Vec<SB> = vec_new()
+          vb.push(SB { mark: 200 })
+          var ta = 0
+          for a in va
+            ta += a.mark
+          end
+          var tb = 0
+          for b in vb
+            tb += b.mark
+          end
+          return 0 if ta == 100 and tb == 200
+          return 1
+        end
+        """, 0)
+    end
+
+  end
+  return qspec_main()
+end

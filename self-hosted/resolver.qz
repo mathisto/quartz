@@ -1,0 +1,3651 @@
+##! # Import Resolution
+##!
+##! Handles finding, loading, and merging imported modules.
+##! Supports hierarchical imports and UFCS transformation.
+##!
+##! @see lexer
+##! @see parser
+##! @since 1.0.0
+
+# Import resolution for multi-module compilation
+# Finds, loads, and merges imported modules
+#
+# Hierarchical imports (e.g., `import frontend/lexer`) are supported.
+# The path separator `/` in the module name becomes a directory separator.
+#
+# Search order for `import foo`:
+#   1. base_path/foo.be
+#   2. base_path/foo/mod.be
+#   3. base_path/frontend/foo.be (subdir fallbacks for simple names only)
+#   4. base_path/backend/foo.be
+#   5. base_path/middle/foo.be
+#   6. base_path/error/foo.be
+#
+# Search order for `import frontend/lexer`:
+#   1. base_path/frontend/lexer.be (hierarchical path used directly)
+#   2. base_path/frontend/lexer/mod.be
+#   (No subdir fallbacks - path is already explicit)
+
+import ast
+import lexer
+import cst_parser
+import cst_lower
+import macro_expand
+import compiler_types
+import string_intern
+import dep_graph
+import content_hash
+import build_cache
+import std/cache
+import std/profile
+import diagnostic
+import file_io
+import qzmod_format
+import qzmod_load
+import * from str_compat
+import * from json
+import * from cimport_gen
+
+# --- Incremental compilation support ---
+# Tracks the file paths of all modules loaded during resolution.
+# Used by the build cache to compute content hashes for all source inputs.
+var resolve_loaded_paths = vec_new<String>()
+
+# Phase 1.3 (qzmod wiring-only): probe results from `qzmod_load_module` calls
+# made during resolution. Today Phase 4.0's consumer is a no-op — the hits
+# are collected but never inject into tc.registry. Phase 1.4+ flips inject on
+# once the encoder side ships the TYPES section + cross-process remap table.
+var resolve_qzmod_hits = vec_new<QzmodLoadResult>()
+
+# Tracks the short names (prefixes) of all loaded modules.
+# Used to distinguish module-qualified calls from UFCS in typechecking.
+var resolve_loaded_short_names = vec_new<String>()
+
+# Tracks all registered prefixed function names (e.g., "value$parse").
+# Used to verify UFCS→module rewrites only apply to real exported functions.
+var _resolve_known_funcs = vec_new<String>()
+
+# Tracks in-scope binding names during UFCS transform: function params +
+# lambda params + local let / var / const bindings + for-loop iter vars +
+# destructuring bindings. Used to distinguish local variables from module
+# names in dot-call syntax. Kept as a Vec used as a stack — callers
+# snapshot size, push, recurse, then truncate back via
+# `_ufcs_trunc_scope(size)`.
+var _ufcs_current_params = vec_new<String>()
+
+## Truncate the scope stack back to `target_size`. Used at block / lambda /
+## for / function exit to pop local bindings.
+def _ufcs_trunc_scope(target_size: Int): Void
+  while vec_size(_ufcs_current_params) > target_size
+    vec_pop(_ufcs_current_params)
+  end
+end
+
+## Push each comma-separated name from `names_csv` onto the scope stack.
+## Used for destructuring nodes whose str1/str2 stores `"a,b,c"` or field
+## specs like `"x:px,y:py"` (in the latter case we want the rhs alias).
+def _ufcs_push_csv(names_csv: String): Void
+  return if names_csv == ""
+  var parts = str_split(names_csv, ",")
+  for p in 0..parts.size
+    var tok = str_trim(parts[p])
+    var bind = tok
+    # Field-spec form "field:alias" — bind the alias (right of colon).
+    if str_contains(tok, ":")
+      var cp = str_split(tok, ":")
+      if cp.size >= 2
+        bind = str_trim(cp[1])
+      end
+    end
+    if bind != "" and bind != ".."
+      _ufcs_current_params.push(bind)
+    end
+  end
+end
+
+## Push any binding names a statement node introduces into the enclosing
+## block scope. Called AFTER recursing into the statement, so the binding
+## becomes visible to sibling statements that follow it — matching Quartz's
+## const-by-default sequential scoping semantics.
+def _ufcs_push_stmt_bindings(ast_store: ast::AstStorage, stmt: Int): Void
+  return if stmt <= 0
+  var kind = ast::ast_get_kind(ast_store, stmt)
+  # NODE_LET = 25 — single name in str1
+  if kind == 25
+    var name = ast::ast_get_str1(ast_store, stmt)
+    if name != ""
+      _ufcs_current_params.push(name)
+    end
+    return
+  end
+  # NODE_LET_DESTRUCTURE = 78 — comma-sep names in str1
+  if kind == 78
+    _ufcs_push_csv(ast::ast_get_str1(ast_store, stmt))
+    return
+  end
+  # NODE_STRUCT_DESTRUCTURE = 79 — field specs in str2
+  if kind == 79
+    _ufcs_push_csv(ast::ast_get_str2(ast_store, stmt))
+    return
+  end
+  # NODE_VEC_DESTRUCTURE = 80 — elem names in str1, rest name in str2
+  if kind == 80
+    _ufcs_push_csv(ast::ast_get_str1(ast_store, stmt))
+    var rest = ast::ast_get_str2(ast_store, stmt)
+    if rest != "" and rest != ".."
+      _ufcs_current_params.push(rest)
+    end
+    return
+  end
+  # NODE_CONST_DECL = 69 — file-level const, but also legal inside blocks
+  if kind == 69
+    var name = ast::ast_get_str1(ast_store, stmt)
+    if name != ""
+      _ufcs_current_params.push(name)
+    end
+    return
+  end
+  # NODE_GLOBAL_VAR = 49 — same
+  if kind == 49
+    var name = ast::ast_get_str1(ast_store, stmt)
+    if name != ""
+      _ufcs_current_params.push(name)
+    end
+    return
+  end
+end
+
+# Tracks the current parent module name for dependency edge recording.
+# Uses a Vec as a stack (push/pop) to avoid reassigning the global itself.
+var _resolve_parent_stack = vec_new<String>()
+
+# Current module file path for diagnostic context in resolve_process_imports.
+var _resolve_current_path = ""
+
+# --- Two-pass resolution support ---
+# Deferred module info for pass 2 (UFCS + rewrite).
+# Each module's AST, root, prefix, and wildcard status are recorded during
+# pass 1 (load + parse + collect), then UFCS and rewrite_calls run in pass 2
+# with the complete loaded list. This enables mutual imports between modules.
+#
+# `module_name` is the canonical import-path key (e.g. `std/ffi/socket`).
+# It doubles as a per-module index for the wildcard-vs-qualified dedup gate
+# in resolve_process_imports: multiple imports of the same module may push
+# entries with different (prefix, is_wildcard) combinations, and the gate
+# uses module_name to find prior registrations.
+struct DeferredModuleInfo
+  ast_store: ast::AstStorage
+  root: Int
+  prefix: String
+  is_wildcard: Int
+end
+
+# Parallel side-tables for the wildcard-vs-qualified dedup gate (added
+# 2026-05-23). Keyed by module_name; each entry records the cached AST
+# handles plus the (prefix, is_wildcard) combinations already collected
+# against it. When resolve_process_imports encounters a re-import that
+# would register a new combination, it appends here and re-runs
+# resolve_collect_funcs. Kept out of DeferredModuleInfo because
+# Vec<T>-of-struct field access in self-hosted Quartz loses fidelity on
+# layout changes — DeferredModuleInfo's existing four-field shape is
+# pinned for that reason.
+var _resolve_mod_reg_names = vec_new<String>()
+# PF3-P1: holds stable AstStorage *ids* (not erased `as_int` pointers). The
+# real struct is recovered via `build_cache::cache_lookup_ast_by_id`. Stays
+# `Vec<Int>` deliberately — a `Vec<AstStorage>` here would hit the
+# "Vec<T>-of-struct field-access loses fidelity on layout changes" caveat
+# noted above.
+var _resolve_mod_reg_ast_stores = vec_new<Int>()
+var _resolve_mod_reg_roots = vec_new<Int>()
+# Per-module (prefix, is_wildcard) flat-encoded as "prefix|wc" strings.
+# Multiple combos per module — one element per registered combination.
+var _resolve_mod_reg_combo_keys = vec_new<String>()  # "prefix|wc"
+var _resolve_mod_reg_combo_mods = vec_new<String>()  # parallel to combo_keys; module_name for that combo
+
+var _resolve_deferred_modules = vec_new<DeferredModuleInfo>()
+
+## Cache-ro Bug B: wildcard-import canonical mangling alias map lives in
+## compiler_types.qz (ct_func_alias_*). Both resolver.qz and mir.qz consult
+## it; placing it there avoids a backend → resolver dependency.
+
+## Cache-ro Bug B: bare-emit runtime helpers. codegen_runtime.qz emits
+## `@<name>` (bare) inline IR for these — the alias-renamed `module$<name>`
+## form wouldn't link. Keep this list in sync with `inline_ir_helpers` in
+## codegen.qz (the DCE-root list). Names prefixed with `__qz_` are also
+## skipped (via str_starts_with) since that convention is reserved for
+## runtime helpers and never produces a module-qualified call.
+def resolve_is_bare_runtime_helper(name: String): Int
+  if str_starts_with(name, "__qz_")
+    return 1
+  end
+  if name == "_scope_fire_deadline_exceeded"
+    return 1
+  end
+  return 0
+end
+
+## Compute the canonical module prefix for an ast_store, suitable for
+## mangling its function entries. Returns "" for the main module (no prefix)
+## or when the ast_store isn't registered in the dep graph.
+def resolve_canonical_prefix_for_ast_store(ast_store: ast::AstStorage): String
+  if ast_store == 0
+    return ""
+  end
+  var dg_name = dep_graph::depgraph_name_for_ast_store(ast_store)
+  if str_byte_len(dg_name) == 0
+    return ""
+  end
+  if dg_name == "__main__"
+    return ""
+  end
+  return resolve_get_short_name(dg_name)
+end
+
+## Get the list of source file paths loaded during resolution.
+def resolve_get_loaded_paths(): Vec<String> = resolve_loaded_paths
+
+## Phase 1.3 (qzmod wiring-only): probe outcomes collected during this
+## resolution pass. compile()'s Phase 4.0 consumer iterates this list; today
+## it's a no-op call into tc_inject_qzmod, so probe hits don't affect a real
+## compile. The plumbing exists so Phase 1.4+ can flip inject on without
+## touching the resolver again.
+def resolve_get_qzmod_hits(): Vec<QzmodLoadResult> = resolve_qzmod_hits
+
+def resolve_reset_qzmod_hits(): Void
+  resolve_qzmod_hits = vec_new<QzmodLoadResult>()
+end
+
+## Detect the project root from the compiler binary's location. Mirror of
+## quartz.qz `detect_project_root` — duplicated to avoid an import cycle.
+## Sentinel is `std/prelude.qz` (matches the stdlib auto-detect path).
+def _resolve_project_root(): String
+  var binary = argv(0)
+  var bin_dir = path_dir(binary)
+  var self_hosted = path_dir(bin_dir)
+  var root = path_dir(self_hosted)
+  if fio_exists("#{root}/std/prelude.qz")
+    return root
+  end
+  return ""
+end
+
+## Reset the loaded paths tracker (call before a new compilation).
+def resolve_reset_loaded_paths(): Void
+  resolve_loaded_paths = vec_new<String>()
+  resolve_loaded_short_names = vec_new<String>()
+  _resolve_known_funcs = vec_new<String>()
+  resolve_qzmod_hits = vec_new<QzmodLoadResult>()
+end
+
+## Get the short names (prefixes) of all loaded modules.
+def resolve_get_loaded_short_names(): Vec<String> = resolve_loaded_short_names
+
+## Check if a name is a registered module short name.
+def resolve_is_module_name(name: String): Bool
+  for i in 0..resolve_loaded_short_names.size()
+    if resolve_loaded_short_names.get(i) == name
+      return true
+    end
+  end
+  return false
+end
+
+## Check if a module name is hierarchical (contains path separator).
+## Hierarchical paths like "frontend/lexer" should not have subdir fallbacks applied.
+def resolve_is_hierarchical(name: String): Int
+  return 1 if str_contains(name, "/")
+  return 0
+end
+
+## Check if a name already has a module prefix (contains $).
+def resolve_has_prefix(name: String): Int
+  return 1 if str_contains(name, "$")
+  return 0
+end
+
+## Extract the short name from a hierarchical module path.
+## For "frontend/lexer" returns "lexer", for "foo" returns "foo".
+## This is used as the prefix for imported symbols (lexer$func, not frontend/lexer$func).
+def resolve_get_short_name(module_name: String): String
+  var len = str_byte_len(module_name)
+  var last_slash = -1
+  for i in 0..len
+    var c = str_byte_at(module_name, i)
+    if c == '/'
+      last_slash = i
+    end
+  end
+  # No slash found - return the whole name
+  return module_name if last_slash < 0
+  # Return everything after the last slash
+  return str_byte_slice(module_name, last_slash + 1, len)
+end
+
+## Check if a module is already loaded (by string content comparison).
+## This prevents duplicate loading and infinite recursion on circular imports.
+##
+## Parameters:
+##   loaded - Vector of already-loaded module name strings
+##   name   - Module name to check
+##
+## Returns: 1 if already loaded, 0 otherwise
+def resolve_is_loaded(loaded: Vec<String>, name: String): Int
+  return 1 if any?(loaded, s: String -> s == name)
+  return 0
+end
+
+## Build a prefixed function name: "module$func" or just "func" if no prefix.
+## This creates the qualified name used for cross-module function calls.
+##
+## Parameters:
+##   prefix    - Module name prefix (e.g., "lexer") or empty string for main module
+##   base_name - Function's original name (e.g., "tokenize")
+##
+## Returns: "lexer$tokenize" or just "tokenize" if prefix is empty
+def resolve_build_name(prefix: String, base_name: String): String
+  return base_name if str_byte_len(prefix) == 0
+  return string_intern::mangle(prefix, base_name)
+end
+
+## Build a private function name (with double $$).
+def resolve_build_private_name(prefix: String, base_name: String): String
+  return base_name if str_byte_len(prefix) == 0
+  return "#{prefix}$$#{base_name}"
+end
+
+## Load a module file and process its contents.
+##
+## For simple module names (no `/`), tries multiple search paths.
+## For hierarchical paths (e.g., `frontend/lexer`), uses the path directly.
+##
+## Parameters:
+##   loaded       - Vector of already-loaded module names (prevents duplicates)
+##   all_funcs    - Vector to collect [ast_store, func_handle, prefixed_name] entries
+##   base_path    - Directory to search from (e.g., "self-hosted/")
+##   import_paths - Vector of -I include paths to search
+##   module_name  - Module to load (e.g., "lexer" or "frontend/lexer")
+##   is_wildcard  - If 1, don't prefix (wildcard import)
+# Path-search helper extracted for Phase 5.4 FileIo migration.
+# Emits `fio_read` ops through the FileIo effect instead of direct
+# `read_file` intrinsic calls — callers install the handler at the
+# perform site to route filesystem access through the effect machinery.
+# Returns a 2-element Vec<String>: index 0 = path that succeeded (or
+# "" on miss), index 1 = source contents (or "" on miss).
+def _resolve_search_paths(base_path: String, import_paths: Vec<String>, module_name: String, is_hier: Int): Vec<String>
+  var path = ""
+  var source = ""
+
+  # 1. Direct: base_path/module_name.qz
+  path = "#{base_path}#{module_name}.qz"
+  source = fio_read(path)
+
+  # 2. Subdirectory mod: base_path/module_name/mod.qz
+  if str_byte_len(source) == 0
+    path = "#{base_path}#{module_name}/mod.qz"
+    source = fio_read(path)
+  end
+
+  # For hierarchical paths, stop here — no subdir fallbacks.
+  # (e.g., "frontend/lexer" should NOT try "frontend/frontend/lexer.qz".)
+  if is_hier == 0
+    if str_byte_len(source) == 0
+      path = "#{base_path}frontend/#{module_name}.qz"
+      source = fio_read(path)
+    end
+    if str_byte_len(source) == 0
+      path = "#{base_path}backend/#{module_name}.qz"
+      source = fio_read(path)
+    end
+    if str_byte_len(source) == 0
+      path = "#{base_path}middle/#{module_name}.qz"
+      source = fio_read(path)
+    end
+    if str_byte_len(source) == 0
+      path = "#{base_path}error/#{module_name}.qz"
+      source = fio_read(path)
+    end
+  end
+
+  # 7. Search -I include paths
+  if str_byte_len(source) == 0
+    for ip_idx in 0..import_paths.size
+      if str_byte_len(source) == 0
+        var ipath = import_paths[ip_idx]
+        path = str_concat(ipath, str_concat("/", str_concat(module_name, ".qz")))
+        source = fio_read(path)
+      end
+    end
+  end
+
+  # On miss, clear path so the caller's residual is always "".
+  if str_byte_len(source) == 0
+    path = ""
+  end
+
+  var result = vec_new<String>()
+  result.push(path)
+  result.push(source)
+  return result
+end
+
+def resolve_load_module(loaded: Vec<String>, loading: Vec<String>, all_funcs: Vec<ResolverEntry>, base_path: String, import_paths: Vec<String>, module_name: String, is_wildcard: Int, alias: String): Void
+  # Handle mutual import: module is being loaded by a caller up the stack.
+  # Its functions will be in all_funcs when it finishes loading.
+  # UFCS + rewrite_calls will run in pass 2 with the complete loaded list.
+  if resolve_is_loaded(loading, module_name)
+    return
+  end
+
+  # Mark as currently loading (before recursion)
+  loading.push(module_name)
+
+  # Try paths in order until we find the module.
+  var is_hier = resolve_is_hierarchical(module_name)
+  var _search = _resolve_search_paths(base_path, import_paths, module_name, is_hier)
+  var path = _search[0]
+  var source = _search[1]
+  
+  if str_byte_len(source) == 0
+    var d = diagnostic::diag_new_simple(diagnostic::DIAG_ERROR, "QZ0551", "cannot find module: #{module_name}")
+    # Add import chain context for better diagnostics
+    if _resolve_parent_stack.size > 0
+      var chain = ""
+      for __ci in 0.._resolve_parent_stack.size
+        if str_byte_len(chain) > 0
+          chain = "#{chain} → "
+        end
+        chain = "#{chain}#{_resolve_parent_stack[__ci]}"
+      end
+      diagnostic::diag_add_note(d, "note: imported via: #{chain} → #{module_name}")
+    end
+    diagnostic::diag_add_note(d, "help: check import paths and -I include directories")
+    diagnostic::diag_emit(d)
+    exit(1)
+  end
+
+  # Track loaded source path for incremental compilation cache
+  resolve_loaded_paths.push(path)
+
+  # Register module in dependency graph and hash source
+  dep_graph::depgraph_add_node(module_name, path)
+  var source_hash = content_hash::content_hash(source)
+  dep_graph::depgraph_set_content_hash(module_name, source_hash)
+  # Record dependency edge: parent imports this module
+  if _resolve_parent_stack.size > 0
+    var parent_name = _resolve_parent_stack[_resolve_parent_stack.size - 1]
+    dep_graph::depgraph_add_dep(parent_name, module_name)
+  end
+
+  # Try AST cache before lexing/parsing.
+  # PF3-P1: `mod_ast` is always reassigned below (cache-hit recover, or
+  # parse). The placeholder is a real (empty) AstStorage rather than an
+  # erased `as_type<AstStorage>(0)` sentinel — it carries the COW struct
+  # value cleanly and is deterministic (one extra allocation, same id bump
+  # in every compile so fixpoint holds).
+  var mod_ast: ast::AstStorage = ast::ast_new_storage()
+  var mod_root = 0
+  var ast_cache_result = cache_op_load_ast(module_name, source_hash)
+  if ast_cache_result[0] != 0
+    # Cache hit — skip lex + parse. PF3-P1: recover the real struct from the
+    # build-cache id-registry instead of `as_type<AstStorage>` on the id.
+    mod_ast = build_cache::cache_lookup_ast_by_id(ast_cache_result[0])
+    mod_root = ast_cache_result[1]
+  else
+    # Cache miss — lex and parse
+    var interner = string_intern::intern_global()
+    var lex_result = lexer::lexer_tokenize(source, interner)
+    var types = lex_result.get_types()
+    var lexemes = lex_result.get_lexemes()
+    var lines = lex_result.get_lines()
+    var cols = lex_result.get_cols()
+    var count = lex_result.token_count()
+
+    # The IMPORTED module is lowered via cst_parser -> cst_lower, mirroring
+    # quartz.qz's main-module route. Parse errors are silently tolerated
+    # (partial ASTs are processed as-is).
+    var cst_res = cst_parser::cst_parse_source(source)
+    mod_ast = ast::ast_new_storage()
+    mod_root = cst_lower::cst_lower(cst_res.parser.store, cst_res.root, mod_ast)
+
+    # Expand macros ($try, $unwrap, $assert, $debug, user-defined) in imported module
+    mod_root = macro_expand::expand_macros(mod_ast, mod_root)
+
+    # Save to AST cache for next build (with macros expanded)
+    cache_op_save_ast(module_name, source_hash, mod_ast, mod_root)
+  end
+
+  # Record ast_store → module mapping for diagnostic file attribution
+  dep_graph::depgraph_set_ast_store(module_name, mod_ast)
+
+  # Calculate new base path for THIS module's imports
+  # If we loaded "self-hosted/frontend/lexer.qz", new base is "self-hosted/frontend/"
+  var new_base_path = resolve_get_base_path(path)
+  
+  # Compute this module's prefix NOW, before processing its own imports, so
+  # `pub import X` statements inside this module can re-export X's public
+  # symbols under the correct current-module prefix. For hierarchical paths
+  # like "frontend/lexer", use the short name "lexer".
+  var prefix = ""
+  if is_wildcard == 0
+    if str_byte_len(alias) > 0
+      prefix = alias
+    else
+      prefix = resolve_get_short_name(module_name)
+    end
+  end
+
+  # Recursively process imports using the NEW base path. Pass `prefix` so
+  # `pub import` can re-export under the current module's name.
+  _resolve_current_path = path
+  _resolve_parent_stack.push(module_name)
+  resolve_process_imports(loaded, loading, all_funcs, new_base_path, import_paths, mod_ast, mod_root, prefix)
+  vec_pop(_resolve_parent_stack)
+
+  # Phase 1.4.d: probe for a `.qzmod` artifact AFTER dep recursion. Deps are
+  # now loaded; `depgraph_get_interface_hash(dep)` returns meaningful values
+  # (empty string for deps not yet emitted — which is fine: encoder writes
+  # whatever interface hashes the producer's depgraph held at emit time,
+  # and the decoder compares positionally). On hit we collect onto
+  # resolve_qzmod_hits; compile()'s Phase 4.0 consumer drives tc_inject_qzmod.
+  # On miss we silently fall through to source typecheck — the cache is
+  # advisory per design Principle #6.
+  # INC.1.5 — gate qzmod read on `cache_is_enabled()`. With `--no-cache`,
+  # both producer (`tc_emit_qzmod_modules`) and consumer must skip the .qzmod
+  # path, otherwise `quake guard`'s gen0→gen1 (cold) and gen1→gen2 (warm,
+  # reading what gen0→gen1 wrote) diverge in `prog.functions` ordering, and
+  # fixpoint fails. Pre-INC.1.5 the consumer's behavior didn't depend on
+  # cache state, so the cold/warm IR was byte-identical and fixpoint held
+  # despite the cache being written.
+  if build_cache::cache_is_enabled()
+    var _qzmod_proj_root = _resolve_project_root()
+    var _qzmod_compiler = qzmod_format::qzmod_compiler_hash()
+    # Compile-flags hash threaded through from quartz.qz `compile()` entry —
+    # rejects native-vs-cross-compile cache poisoning where the per-module
+    # MIR was emitted with a different `--target` / `--debug` / `--no-opt`
+    # set and would silently route to the wrong `@cfg` overload otherwise.
+    var _qzmod_flags = qzmod_format::qzmod_active_flags_hash()
+    var _qzmod_dir = qzmod_format::qzmod_module_dir(_qzmod_proj_root, _qzmod_compiler, module_name)
+    var _qzmod_dep_names = dep_graph::depgraph_get_deps(module_name)
+    var _qzmod_dep_hashes = vec_new<String>()
+    for _qzmod_di in 0.._qzmod_dep_names.size
+      _qzmod_dep_hashes.push(dep_graph::depgraph_get_interface_hash(_qzmod_dep_names[_qzmod_di]))
+    end
+    var _qzmod_result = qzmod_load::qzmod_load_module(_qzmod_dir, module_name, _qzmod_compiler, source_hash, _qzmod_flags, _qzmod_dep_hashes)
+    if _qzmod_result.ok == 1
+      resolve_qzmod_hits.push(_qzmod_result)
+    end
+  end
+
+  # Mark as fully loaded (after recursion completes)
+  loaded.push(module_name)
+  vec_pop(loading)
+
+  # Register the module short name for UFCS disambiguation
+  if str_byte_len(prefix) > 0 and is_wildcard == 0
+    if not resolve_is_module_name(prefix)
+      resolve_loaded_short_names.push(prefix)
+    end
+  end
+
+  # Desugar argument-position `impl Trait` to implicit generic params BEFORE
+  # multiclause merging and function collection — downstream passes must see
+  # the rewritten annotations, not the original literal "impl Trait" strings.
+  resolve_desugar_impl_trait_args(mod_ast, mod_root)
+  # Desugar multi-clause function definitions before collecting
+  resolve_desugar_multiclause(mod_ast, mod_root)
+  # Collect BEFORE rewriting so str1 reads use original bare names (no double-prefix)
+  resolve_collect_funcs(mod_ast, mod_root, all_funcs, prefix, is_wildcard)
+
+  # Record for pass 2: UFCS + rewrite_calls run after ALL modules are loaded
+  # so every module sees every other module's name (enables mutual imports).
+  # UFCS must run before rewrite_calls (otherwise intra-module rewriting
+  # claims cross-module UFCS calls before UFCS can transform them).
+  var info = DeferredModuleInfo { ast_store: mod_ast, root: mod_root, prefix: prefix, is_wildcard: is_wildcard }
+  _resolve_deferred_modules.push(info)
+  # Side-table the (module_name, ast_store, root) + initial (prefix, wc)
+  # combo so resolve_process_imports's re-import gate can find the cached
+  # AST handles and dedup repeat imports.
+  var _mr_have = 0
+  for _mr_i in 0.._resolve_mod_reg_names.size
+    if _resolve_mod_reg_names[_mr_i] == module_name
+      _mr_have = 1
+      break
+    end
+  end
+  if _mr_have == 0
+    _resolve_mod_reg_names.push(module_name)
+    # PF3-P1: register the real struct + store its stable id (not `as_int`).
+    build_cache::cache_register_ast(mod_ast)
+    _resolve_mod_reg_ast_stores.push(mod_ast.id)
+    _resolve_mod_reg_roots.push(mod_root)
+  end
+  var _mr_combo_key = "#{prefix}|#{is_wildcard}"
+  _resolve_mod_reg_combo_keys.push(_mr_combo_key)
+  _resolve_mod_reg_combo_mods.push(module_name)
+end
+
+## Sanitize a C header name into a flat Quartz module-name base.
+## "foo.h" -> "foo_h"; "sys/types.h" -> "sys_types_h".
+def _resolve_cimport_sanitize(header: String): String
+  var s = str_replace(header, "/", "_")
+  s = str_replace(s, ".", "_")
+  s = str_replace(s, "-", "_")
+  s = str_replace(s, " ", "_")
+  return s
+end
+
+## @cImport (B.11b, P3.6a): generate Quartz bindings for a non-curated C header
+## by shelling out to clang's JSON AST dump, translating it (cimport_gen), and
+## writing a generated module the normal module loader can pick up. Returns the
+## synthesized module name; pushes the generated-source directory onto
+## import_paths so resolve_load_module can find it. Exits with a diagnostic if
+## clang cannot process the header.
+def _resolve_cimport_generate(header: String, base_path: String, import_paths: Vec<String>, item: Int, ast_store: ast::AstStorage): String
+  var module_name = "__cimport_" + _resolve_cimport_sanitize(header)
+
+  # Generated-source directory: the build cache when available, else a stable
+  # dot-dir. `system mkdir -p` is idempotent and creates it if absent.
+  var gen_dir = build_cache::cache_get_dir()
+  if str_byte_len(gen_dir) == 0
+    gen_dir = ".quartz-cache"
+  end
+  system("mkdir -p " + gen_dir)
+
+  var json_tmp = gen_dir + "/" + module_name + ".json"
+  var err_tmp = gen_dir + "/" + module_name + ".clang.err"
+
+  # clang opens the MAIN input file relative to CWD (not via -I, which only
+  # affects #include resolution). So pass the header's resolved PATH: prefer the
+  # importing file's directory (sibling header), else the bare name (CWD). -I
+  # still covers headers the target #includes.
+  var inc = "-I ."
+  var hdr_arg = header
+  if str_byte_len(base_path) > 0
+    inc = "-I " + base_path + " -I ."
+    var cand = base_path + header
+    if str_byte_len(read_file(cand)) > 0
+      hdr_arg = cand
+    end
+  end
+
+  var cmd = "clang -Xclang -ast-dump=json -fsyntax-only " + inc + " " + hdr_arg + " > " + json_tmp + " 2>" + err_tmp
+  system(cmd)
+
+  var raw = read_file(json_tmp)
+  if str_byte_len(raw) == 0
+    var line = ast::ast_get_line(ast_store, item)
+    var d = diagnostic::diag_new(diagnostic::DIAG_ERROR, "QZ0552", "could not process C header '#{header}' via clang", _resolve_current_path, line, 0)
+    var details = read_file(err_tmp)
+    if str_byte_len(details) > 0
+      diagnostic::diag_add_note(d, "clang: #{details}")
+    end
+    diagnostic::diag_add_note(d, "help: ensure clang is installed and the header is on the include path (-I)")
+    diagnostic::diag_emit(d)
+    exit(1)
+  end
+
+  var tu = json_parse_or_null(raw)
+  var qsrc = cimport_translate(tu, header)
+
+  # P3.6b: object-like `#define` constants. Macros are absent from the AST dump,
+  # so this needs a separate `clang -dM -E` preprocessor pass. Diff against an
+  # empty-input baseline (`-x c /dev/null`) to drop compiler/platform builtins;
+  # `cimport_emit_macros` keeps only simple integer/hex/float/string consts.
+  var dm_tmp = gen_dir + "/" + module_name + ".dm"
+  var dmbase_tmp = gen_dir + "/" + module_name + ".dmbase"
+  system("clang -dM -E " + inc + " " + hdr_arg + " > " + dm_tmp + " 2>/dev/null")
+  system("clang -dM -E -x c /dev/null > " + dmbase_tmp + " 2>/dev/null")
+  var macros = cimport_emit_macros(read_file(dm_tmp), read_file(dmbase_tmp), qsrc)
+  if str_byte_len(macros) > 0
+    qsrc = qsrc + "\n# --- #define constants ---\n" + macros
+  end
+
+  var modfile = gen_dir + "/" + module_name + ".qz"
+  write_file(modfile, qsrc)
+
+  if resolve_is_loaded(import_paths, gen_dir) == 0
+    import_paths.push(gen_dir)
+  end
+  return module_name
+end
+
+## Process import statements in a module.
+## Iterates through program children, finds NODE_IMPORT nodes (kind=34),
+## and loads any modules that haven't been loaded yet.
+##
+## Parameters:
+##   loaded       - Vector tracking already-loaded module names
+##   all_funcs    - Vector to collect function entries
+##   base_path    - Directory to resolve relative imports from
+##   import_paths - Vector of -I include paths to search
+##   ast_store    - AST storage for this module
+##   program      - Root program node of this module
+def resolve_process_imports(loaded: Vec<String>, loading: Vec<String>, all_funcs: Vec<ResolverEntry>, base_path: String, import_paths: Vec<String>, ast_store: ast::AstStorage, program: AstNodeId, current_prefix: String): Void
+  var children = ast::ast_get_children(ast_store, program)
+  for i in 0..children.size
+    var item = children[i]
+    var kind = ast::ast_get_kind(ast_store, item)
+    # NODE_IMPORT = 48 (C-aligned: bootstrap/src/ast.h)
+    if kind == 48
+      var module_name = ast::ast_get_str1(ast_store, item)
+      var is_wildcard = ast::ast_get_int_val(ast_store, item)
+      var symbols = ast::ast_get_children(ast_store, item)
+      var is_pub = ast::ast_import_is_pub(ast_store, item)
+      # Skip empty-named imports — these are parser-error fallback nodes
+      # (parser.qz:6836,7200) emitted when a top-level decl fails to parse.
+      # The original parse error is the real diagnostic; chasing this would
+      # produce a misleading "cannot find module: <empty>" on top of it.
+      if str_byte_len(module_name) == 0
+        continue
+      end
+      # Selective import: from mod import a, b (has symbols, not wildcard)
+      var is_selective = 0
+      if is_wildcard == 0
+        if as_int(symbols) != 0
+          if symbols.size > 0
+            is_selective = 1
+          end
+        end
+      end
+      if resolve_is_loaded(loaded, module_name) == 0
+        if is_selective == 1
+          # Load into a temporary vec, then selectively copy wanted entries
+          var temp_funcs = vec_new<ResolverEntry>()
+          resolve_load_module(loaded, loading, temp_funcs, base_path, import_paths, module_name, 1, "")
+          # Filter: keep entries that:
+          # - Are type definitions / externs (tags 4-11): needed for type resolution
+          # - Are transitive/sub-module imports or this module's own impl methods
+          #   (prefixed names containing '$' that are NOT a plain own free fn)
+          # - Match a listed symbol name (the selectively imported symbols)
+          #
+          # A.42 #1: the temp load is a WILDCARD load, so cache-ro Bug B
+          # canonically promotes this module's OWN free functions to
+          # "<short>$name" (they now contain '$') AND records a global bare →
+          # canonical alias. The old "keep anything with '$'" rule therefore
+          # leaked every non-selected free function (it has a '$' now) and the
+          # leaked alias let bare `M::b()` resolve at a consumer call site even
+          # though `b` was never imported. Distinguish this module's own plain
+          # free functions (prefix$name, no further '$') — keep ONLY when
+          # selected — from impl methods (prefix$Type$method, a further '$')
+          # and genuine transitive imports (a different prefix), which stay.
+          var own_prefix = resolve_get_short_name(module_name)
+          var own_prefix_dollar = "#{own_prefix}$"
+          for j in 0..temp_funcs.size
+            var entry = temp_funcs[j]
+            var entry_name = entry.name
+            var entry_tag = entry.tag
+            var keep = 0
+            var is_own_free_fn = 0
+            # Always keep type definitions, extern fns, extern vars (tags 4-11)
+            if entry_tag >= 4
+              if entry_tag <= 11
+                keep = 1
+              end
+            end
+            if keep == 0
+              if entry_name.contains("$")
+                if entry_name.starts_with(own_prefix_dollar)
+                  var suffix = str_byte_slice(entry_name, str_byte_len(own_prefix_dollar), str_byte_len(entry_name))
+                  if suffix.contains("$")
+                    # Own impl method (prefix$Type$method) — preserve.
+                    keep = 1
+                  else
+                    # Own plain free function — selective gate applies.
+                    is_own_free_fn = 1
+                    for k in 0..symbols.size
+                      if suffix == as_string(symbols[k])
+                        keep = 1
+                      end
+                    end
+                  end
+                else
+                  # Genuine transitive / sub-module import — preserve.
+                  keep = 1
+                end
+              end
+            end
+            # Bare (non-promoted) name: keep if requested.
+            if keep == 0
+              if is_own_free_fn == 0
+                for k in 0..symbols.size
+                  if entry_name == as_string(symbols[k])
+                    keep = 1
+                  end
+                end
+              end
+            end
+            if keep == 1
+              all_funcs.push(entry)
+            else
+              # Drop the leaked bare → canonical alias for a non-selected own
+              # free function so its bare name can't resolve at a consumer.
+              if is_own_free_fn == 1
+                compiler_types::ct_func_alias_remove_canonical(entry_name)
+              end
+            end
+          end
+        else
+          # Read alias from str2 slot of import node
+          var alias = ast::ast_get_str2(ast_store, item)
+          resolve_load_module(loaded, loading, all_funcs, base_path, import_paths, module_name, is_wildcard, alias)
+        end
+      else
+        # Already-loaded re-import. resolve_process_imports was historically
+        # mode-blind here — when the FIRST import of a module set the prefix
+        # mode (wildcard vs qualified vs aliased), every later import of the
+        # same module was a no-op. That breaks any consumer whose mode wasn't
+        # the one the first-importer happened to pick: a `module::func()` call
+        # would QZ0401 because `module$func` was never registered (the first
+        # import was wildcard), or a bare `func()` would QZ0401 because only
+        # `module$func` was registered (the first import was qualified). The
+        # surfaced case (2026-05-23, std/terminal.qz wildcarding std/ffi/socket
+        # while std/net/tcp.qz qualified-imported it) is the canonical bite.
+        #
+        # Fix: compute the current import's (prefix, is_wildcard), look up
+        # the cached AST handles via the existing DeferredModuleInfo records,
+        # check if THIS combination is already registered, and if not,
+        # re-call resolve_collect_funcs against the cached AST under the new
+        # prefix. This adds tag==0 (function) entries under the new mangled
+        # name and tag==10 (extern_fn) bare-or-prefixed aliases. The internal
+        # dedup in resolve_collect_funcs handles repeat invocations idempotently.
+        #
+        # Selective imports (`from M import a, b`) are out of scope here: the
+        # filed-forward case is wildcard ↔ qualified specifically, and a
+        # selective re-import of an already-loaded module would need the same
+        # temp_funcs filter pattern threaded through the cached AST — file
+        # forward separately if it surfaces. Mixed-mode imports of modules
+        # that define types/traits/impls hit a separate ast_set_str1
+        # last-write-wins concern in Phase 4.0; functions are unaffected.
+        if is_selective == 0
+          var alias_re = ast::ast_get_str2(ast_store, item)
+          var desired_prefix = ""
+          if is_wildcard == 0
+            if str_byte_len(alias_re) > 0
+              desired_prefix = alias_re
+            else
+              desired_prefix = resolve_get_short_name(module_name)
+            end
+          end
+          # Look up the cached AST handles for this already-loaded module.
+          # PF3-P1: the registry stores stable AstStorage ids; recover the
+          # real struct via build_cache::cache_lookup_ast_by_id. A found-flag
+          # replaces the former `as_int(sample_ast_re) != 0` null test (the
+          # registry never stores id 0, so a 0 here means "not found").
+          var sample_ast_re_id = 0
+          var sample_root_re = 0
+          for _re_mi in 0.._resolve_mod_reg_names.size
+            if _resolve_mod_reg_names[_re_mi] == module_name
+              sample_ast_re_id = _resolve_mod_reg_ast_stores[_re_mi]
+              sample_root_re = _resolve_mod_reg_roots[_re_mi]
+              break
+            end
+          end
+          # Check whether this exact (prefix, is_wildcard) combo is already
+          # registered for this module.
+          var combo_seen_re = 0
+          var _re_target_key = "#{desired_prefix}|#{is_wildcard}"
+          for _re_ci in 0.._resolve_mod_reg_combo_keys.size
+            if _resolve_mod_reg_combo_mods[_re_ci] == module_name
+              if _resolve_mod_reg_combo_keys[_re_ci] == _re_target_key
+                combo_seen_re = 1
+                break
+              end
+            end
+          end
+          # Record the dep edge for the current importer — the prior load
+          # only recorded the edge for whatever module first imported this
+          # one, so incremental recompilation would miss this dependent.
+          # CRITICAL: this MUST run regardless of `combo_seen_re`. The combo
+          # gate only governs whether NEW symbols need (re)collecting under a
+          # different (prefix, is_wildcard); it has nothing to do with the
+          # dependency graph used for cache invalidation. When two modules
+          # wildcard-import the same dependency (e.g. main + reader both
+          # `import * from lib`), the second importer hits the same combo and
+          # used to skip this whole block — so its `importer -> dep` edge was
+          # never recorded. Its per-module IR cache then never invalidated when
+          # the dependency's struct layout changed, baking in stale field
+          # offsets → garbled `vec[i].field` reads after a warm-cache rebuild
+          # (the vec-of-struct-field-fidelity bug, filed 2026-05-23).
+          if _resolve_parent_stack.size > 0
+            var parent_name_re = _resolve_parent_stack[_resolve_parent_stack.size - 1]
+            dep_graph::depgraph_add_dep(parent_name_re, module_name)
+          end
+          if combo_seen_re == 0 and sample_ast_re_id != 0
+            var sample_ast_re = build_cache::cache_lookup_ast_by_id(sample_ast_re_id)
+            resolve_recollect_funcs_only(sample_ast_re, sample_root_re, all_funcs, desired_prefix, is_wildcard)
+            # Register module short name for UFCS disambiguation (mirrors
+            # resolve_load_module's post-collect block).
+            if is_wildcard == 0
+              if str_byte_len(desired_prefix) > 0
+                if not resolve_is_module_name(desired_prefix)
+                  resolve_loaded_short_names.push(desired_prefix)
+                end
+              end
+            end
+            # Intentionally do NOT push a new DeferredModuleInfo for the
+            # second mode. The first mode's pass-2 already handled rewrite
+            # for that module's internal references; running rewrite_calls
+            # AGAIN with the new prefix would mutate body IDENT refs to use
+            # the new prefix, then Phase 4.0d/e in quartz.qz would
+            # `ast_set_str1` the GLOBAL_VAR / CONST_DECL declaration nodes
+            # back to the FIRST-mode registered name — leaving body refs
+            # pointing at `<new_prefix>$_name` symbols that don't exist
+            # (the registry only has the first-mode entry). The recollected
+            # tag==0 / tag==10 entries already give qualified call sites a
+            # direct lookup target; bare call sites in the importing
+            # module fall through to mir_lower's $-suffix fallback. So no
+            # rewrite is needed under the new prefix.
+            # Mark this combo registered.
+            _resolve_mod_reg_combo_keys.push(_re_target_key)
+            _resolve_mod_reg_combo_mods.push(module_name)
+          end
+        end
+      end
+      # `pub import X` re-export: after X is loaded (or was already loaded
+      # on a previous iteration), duplicate every public prefixed entry
+      # under the current module's prefix so downstream consumers of this
+      # module see X's surface as our own. Transitivity falls out — if X
+      # itself did `pub import Y`, those entries are already under X's
+      # prefix by the time we get here.
+      if is_pub == 1 and str_byte_len(current_prefix) > 0 and is_wildcard == 0 and is_selective == 0
+        var x_alias = ast::ast_get_str2(ast_store, item)
+        var x_prefix = ""
+        if str_byte_len(x_alias) > 0
+          x_prefix = x_alias
+        else
+          x_prefix = resolve_get_short_name(module_name)
+        end
+        var x_prefix_dollar = "#{x_prefix}$"
+        var x_private_prefix = "#{x_prefix}$$"
+        var cur_prefix_dollar = "#{current_prefix}$"
+        # Snapshot size — iterate only over entries present now; new entries
+        # we push must not become re-export sources on this pass.
+        var snap = all_funcs.size
+        for j in 0..snap
+          var entry = all_funcs[j]
+          var name = entry.name
+          # Match X$... but skip X$$... (private, double-mangled).
+          if name.starts_with(x_prefix_dollar) and not name.starts_with(x_private_prefix)
+            var suffix = str_byte_slice(name, str_byte_len(x_prefix_dollar), str_byte_len(name))
+            # Skip compiler-generated internal names (start with "__" or contain further "$")
+            # — impl methods like "json$Parser$parse" would double-re-export awkwardly,
+            # but we keep them (consumers may call them via A.Parser.parse UFCS).
+            var new_name = "#{cur_prefix_dollar}#{suffix}"
+            # Conflict check: does new_name already refer to a different definition?
+            var conflict = 0
+            var already = 0
+            for k in 0..all_funcs.size
+              if all_funcs[k].name == new_name and all_funcs[k].tag == entry.tag
+                if all_funcs[k].ast_store == entry.ast_store and all_funcs[k].node_id == entry.node_id
+                  already = 1
+                else
+                  conflict = 1
+                end
+                break
+              end
+            end
+            if conflict == 1
+              var line = ast::ast_get_line(ast_store, item)
+              var d = diagnostic::diag_new(diagnostic::DIAG_ERROR, "QZ0560", "name '#{suffix}' re-exported from '#{module_name}' conflicts with existing definition under '#{current_prefix}'", _resolve_current_path, line, 0)
+              diagnostic::diag_add_note(d, "help: a `pub import` cannot silently shadow another name in the same module")
+              diagnostic::diag_emit(d)
+              exit(1)
+            end
+            if already == 0
+              var re = ResolverEntry { ast_store: entry.ast_store, node_id: entry.node_id, name: new_name, tag: entry.tag }
+              all_funcs.push(re)
+            end
+          end
+        end
+      end
+      # `pub from X import a, b` selective re-export: this runs whether or
+      # not X was freshly loaded on this pass — X's symbols might already
+      # be in all_funcs under X's short-name prefix from a prior import.
+      # For each requested symbol, look up "X$name" in all_funcs and
+      # register a "M$alias" alias where `alias` is either the original
+      # name or the user's `as`-renamed name.
+      if is_pub == 1 and str_byte_len(current_prefix) > 0 and is_selective == 1
+        var x_prefix_s = resolve_get_short_name(module_name)
+        var x_prefix_d = "#{x_prefix_s}$"
+        var cur_prefix_d = "#{current_prefix}$"
+        var aliases_vec = ast::ast_import_get_aliases(ast_store, item)
+        var has_aliases = 0
+        if as_int(aliases_vec) != 0
+          has_aliases = 1
+        end
+        for ks in 0..symbols.size
+          var want_s = as_string(symbols[ks])
+          # Resolve the published name — either the user's alias or the
+          # original when no `as` was given.
+          var publish_as = want_s
+          if has_aliases == 1
+            if ks < aliases_vec.size
+              publish_as = as_string(aliases_vec[ks])
+            end
+          end
+          var want_full = "#{x_prefix_d}#{want_s}"
+          var src_entry = ResolverEntry { ast_store: 0, node_id: 0, name: "", tag: -1 }
+          var found_s = 0
+          for qs in 0..all_funcs.size
+            if all_funcs[qs].name == want_full and all_funcs[qs].tag == 0
+              src_entry = all_funcs[qs]
+              found_s = 1
+              break
+            end
+          end
+          if found_s == 1
+            var new_name_s = "#{cur_prefix_d}#{publish_as}"
+            var conflict_s = 0
+            var already_s = 0
+            for q2s in 0..all_funcs.size
+              if all_funcs[q2s].name == new_name_s and all_funcs[q2s].tag == 0
+                if all_funcs[q2s].ast_store == src_entry.ast_store and all_funcs[q2s].node_id == src_entry.node_id
+                  already_s = 1
+                else
+                  conflict_s = 1
+                end
+                break
+              end
+            end
+            if conflict_s == 1
+              var line_s = ast::ast_get_line(ast_store, item)
+              var d_s = diagnostic::diag_new(diagnostic::DIAG_ERROR, "QZ0560", "name '#{want_s}' re-exported from '#{module_name}' conflicts with existing definition under '#{current_prefix}'", _resolve_current_path, line_s, 0)
+              diagnostic::diag_add_note(d_s, "help: a `pub from … import` cannot silently shadow another name in the same module")
+              diagnostic::diag_emit(d_s)
+              exit(1)
+            end
+            if already_s == 0
+              var re_s = ResolverEntry { ast_store: src_entry.ast_store, node_id: src_entry.node_id, name: new_name_s, tag: 0 }
+              all_funcs.push(re_s)
+            end
+          end
+        end
+      end
+    end
+    # NODE_C_IMPORT = 56 — cimport "header.h" maps to std/ffi/ stubs
+    if kind == 56
+      var header = ast::ast_get_str1(ast_store, item)
+      var mapped = ""
+      if header == "stdio.h"
+        mapped = "ffi/stdio"
+      elsif header == "stdlib.h"
+        mapped = "ffi/stdlib"
+      elsif header == "string.h"
+        mapped = "ffi/string_h"
+      elsif header == "math.h"
+        mapped = "ffi/math"
+      else
+        # Non-curated header → generate bindings from clang's AST dump (B.11b,
+        # MEMORY_MODEL_V3.md §13.6a). Returns the synthesized module name and
+        # has pushed its generated-source dir onto import_paths.
+        mapped = _resolve_cimport_generate(header, base_path, import_paths, item, ast_store)
+      end
+      if mapped != ""
+        if resolve_is_loaded(loaded, mapped) == 0
+          resolve_load_module(loaded, loading, all_funcs, base_path, import_paths, mapped, 1, "")
+        end
+      end
+    end
+  end
+end
+
+## Collect definitions from a module for cross-module registration.
+## Iterates through program children and collects:
+##   tag 0: functions (kind=34), impl methods (kind=51 children)
+##   tag 1: global vars (kind=49)
+##   tag 2: const decls (kind=69)
+##   tag 3: static asserts (kind=70)
+##   tag 4: struct defs (kind=36)
+##   tag 5: enum defs (kind=38)
+##   tag 6: type aliases (kind=64)
+##   tag 7: newtype defs (kind=65)
+##   tag 8: trait defs (kind=50)
+##   tag 9: impl blocks (kind=51)
+##
+## Multi-clause function definitions (LF2.8) are desugared before collection.
+## Consecutive same-name, same-arity NODE_FUNCTION nodes with pattern params
+## or guards are merged into a single function with internal match dispatch.
+##
+## Entry format: ResolverEntry { ast_store, node_id, name, tag }
+##
+## Check if any function in a group has pattern params or guards (multi-clause markers).
+def resolve_has_multiclause_markers(ast_store: ast::AstStorage, children: Vec<Int>, group: Vec<Int>): Int
+  for g in 0..group.size
+    var func = children[group[g]]
+    var params = ast::ast_get_left(ast_store, func)
+    if params > 0
+      for p in 0..vec_size(params)
+        if ast::ast_param_get_pattern(ast_store, params[p]) != 0
+          return 1
+        end
+      end
+    end
+    if ast::ast_func_get_guard(ast_store, func) >= 0
+      return 1
+    end
+  end
+  return 0
+end
+
+## Rewrite identifier references in a guard expression to use synthetic param names.
+## Walks the AST and replaces ident nodes whose name matches an original param name
+## with the corresponding _cpN synthetic name.
+def resolve_rewrite_guard_idents(ast_store: ast::AstStorage, node: AstNodeId, orig_names: Vec<String>, synth_names: Vec<String>): Void
+  return if node <= 0
+  var kind = ast::ast_get_kind(ast_store, node)
+
+  # NODE_IDENT = 6 — check if name matches any original param
+  if kind == 6
+    var ident_name = ast::ast_get_str1(ast_store, node)
+    for i in 0..orig_names.size
+      if orig_names[i] == ident_name
+        ast::ast_set_str1(ast_store, node, synth_names[i])
+        return
+      end
+    end
+    return
+  end
+
+  # NODE_BINARY = 8 — recurse left and right
+  if kind == 8
+    resolve_rewrite_guard_idents(ast_store, ast::ast_get_left(ast_store, node), orig_names, synth_names)
+    resolve_rewrite_guard_idents(ast_store, ast::ast_get_right(ast_store, node), orig_names, synth_names)
+    return
+  end
+
+  # NODE_UNARY = 7 — recurse left
+  if kind == 7
+    resolve_rewrite_guard_idents(ast_store, ast::ast_get_left(ast_store, node), orig_names, synth_names)
+    return
+  end
+
+  # NODE_CALL = 9 — recurse callee and args
+  if kind == 9
+    resolve_rewrite_guard_idents(ast_store, ast::ast_get_left(ast_store, node), orig_names, synth_names)
+    var args = ast::ast_get_children(ast_store, node)
+    if args != 0
+      for ai in 0..args.size
+        resolve_rewrite_guard_idents(ast_store, args[ai], orig_names, synth_names)
+      end
+    end
+    return
+  end
+
+  # NODE_FIELD_ACCESS = 15 — recurse object
+  if kind == 15
+    resolve_rewrite_guard_idents(ast_store, ast::ast_get_left(ast_store, node), orig_names, synth_names)
+    return
+  end
+
+  # NODE_INDEX = 13 — recurse array and index
+  if kind == 13
+    resolve_rewrite_guard_idents(ast_store, ast::ast_get_left(ast_store, node), orig_names, synth_names)
+    resolve_rewrite_guard_idents(ast_store, ast::ast_get_right(ast_store, node), orig_names, synth_names)
+    return
+  end
+end
+
+## Build a match arm for a single clause in a multi-clause function definition.
+## Position 0 becomes the match pattern. Positions 1+ with literal patterns become guards.
+## Named params at positions 1+ get var bindings prepended to the arm body.
+def resolve_build_clause_arm(ast_store: ast::AstStorage, func: AstNodeId, arity: Int, line: Int, col: Int): Int
+  var func_params = ast::ast_get_left(ast_store, func)
+  var orig_body = ast::ast_get_right(ast_store, func)
+
+  # Position 0: build match arm pattern
+  var pattern = 0
+  if arity > 0
+    var first_param = func_params[0]
+    var first_pat = ast::ast_param_get_pattern(ast_store, first_param)
+    if first_pat != 0
+      # Pattern param — use the parsed pattern directly
+      pattern = first_pat
+    else
+      # Regular param — use wildcard, bind via var in body
+      pattern = ast::ast_wildcard(ast_store, line, col)
+    end
+  else
+    pattern = ast::ast_wildcard(ast_store, line, col)
+  end
+
+  # Build guard conditions from positions 1+ (literal patterns become equality checks)
+  var guard = 0
+  for p in 1..arity
+    var param = func_params[p]
+    var param_pattern = ast::ast_param_get_pattern(ast_store, param)
+    if param_pattern != 0
+      # Literal pattern at position p — add guard: _cpP == literal
+      var param_ref = ast::ast_ident(ast_store, "_cp#{p}", line, col)
+      # OP_EQ = 7
+      var cond = ast::ast_binary(ast_store, param_ref, 7, param_pattern, line, col)
+      if guard == 0
+        guard = cond
+      else
+        # OP_AND = 14
+        guard = ast::ast_binary(ast_store, guard, 14, cond, line, col)
+      end
+    end
+  end
+
+  # Combine with explicit when guard (rewriting param names to synthetic names)
+  var explicit_guard = ast::ast_func_get_guard(ast_store, func)
+  if explicit_guard >= 0
+    # Build name mapping: original param names → _cpN synthetic names
+    var orig_names = vec_new<String>()
+    var synth_names = vec_new<String>()
+    for p in 0..arity
+      var param = func_params[p]
+      var param_pattern = ast::ast_param_get_pattern(ast_store, param)
+      if param_pattern == 0
+        # Regular named param — add to mapping
+        var param_name = ast::ast_get_str1(ast_store, param)
+        orig_names.push(param_name)
+        synth_names.push("_cp#{p}")
+      end
+    end
+    # Rewrite ident nodes in guard expression to use synthetic names
+    resolve_rewrite_guard_idents(ast_store, explicit_guard, orig_names, synth_names)
+
+    if guard == 0
+      guard = explicit_guard
+    else
+      # OP_AND = 14
+      guard = ast::ast_binary(ast_store, guard, 14, explicit_guard, line, col)
+    end
+  end
+
+  # Build arm body: var bindings for named params at positions 1+, then original body stmts
+  var body_stmts = vec_new()
+
+  # Add var bindings for all named params (regular params without patterns)
+  for p in 0..arity
+    var param = func_params[p]
+    var param_pattern = ast::ast_param_get_pattern(ast_store, param)
+    if param_pattern == 0
+      # Regular named param (no pattern) — bind var name = _cpP
+      var param_name = ast::ast_get_str1(ast_store, param)
+      var param_ref = ast::ast_ident(ast_store, "_cp#{p}", line, col)
+      var let_node = ast::ast_let(ast_store, param_name, "", param_ref, 0, line, col)
+      body_stmts.push(let_node)
+    end
+  end
+
+  # Copy original body statements
+  var orig_stmts = ast::ast_get_children(ast_store, orig_body)
+  if orig_stmts > 0
+    for si in 0..vec_size(orig_stmts)
+      body_stmts.push(orig_stmts[si])
+    end
+  end
+
+  var arm_body = ast::ast_block(ast_store, body_stmts, line, col)
+  return ast::ast_match_arm(ast_store, pattern, guard, arm_body, line, col)
+end
+
+## Build the fallback match arm that panics with a FunctionClauseError.
+def resolve_build_fallback_arm(ast_store: ast::AstStorage, name: String, arity: Int, line: Int, col: Int): Int
+  var pattern = ast::ast_wildcard(ast_store, line, col)
+
+  # panic("** (FunctionClauseError) no function clause matching 'name/arity'")
+  var msg = "** (FunctionClauseError) no function clause matching '#{name}/#{arity}'"
+  var msg_node = ast::ast_string_lit(ast_store, msg, line, col)
+  var panic_ref = ast::ast_ident(ast_store, "panic", line, col)
+  var panic_args = vec_new()
+  panic_args.push(msg_node)
+  var panic_call = ast::ast_call(ast_store, panic_ref, panic_args, line, col)
+
+  var body_stmts = vec_new()
+  body_stmts.push(ast::ast_expr_stmt(ast_store, panic_call, line, col))
+  var body = ast::ast_block(ast_store, body_stmts, line, col)
+
+  return ast::ast_match_arm(ast_store, pattern, 0, body, line, col)
+end
+
+## Merge a group of multi-clause function definitions into a single function
+## with internal match dispatch on position 0.
+def resolve_merge_clauses(ast_store: ast::AstStorage, children: Vec<Int>, group: Vec<Int>): Int
+  var first = children[group[0]]
+  var name = ast::ast_get_str1(ast_store, first)
+  var first_params = ast::ast_get_left(ast_store, first)
+  var arity = 0
+  if first_params > 0
+    arity = vec_size(first_params)
+  end
+  var line = ast::ast_get_line(ast_store, first)
+  var col = ast::ast_get_col(ast_store, first)
+  var is_private = ast::ast_get_int_val(ast_store, first)
+
+  # Determine param types: for each position, find first clause with explicit type
+  var param_types = vec_new<String>()
+  for p in 0..arity
+    var found_type = ""
+    for g in 0..group.size
+      var func = children[group[g]]
+      var func_params = ast::ast_get_left(ast_store, func)
+      var param = func_params[p]
+      var type_ann = ast::ast_get_str2(ast_store, param)
+      if str_byte_len(type_ann) > 0 and str_byte_len(found_type) == 0
+        found_type = type_ann
+      end
+    end
+    param_types.push(found_type)
+  end
+
+  # Create synthetic params: _cp0: Type0, _cp1: Type1, ...
+  var synth_params = vec_new()
+  for p in 0..arity
+    var synth_name = "_cp#{p}"
+    var synth_param = ast::ast_param(ast_store, synth_name, param_types[p], 0, -1, line, col)
+    synth_params.push(synth_param)
+  end
+
+  # Determine return type from first clause with explicit return type
+  var return_type = "Void"
+  for g in 0..group.size
+    var func = children[group[g]]
+    var rt = ast::ast_get_str2(ast_store, func)
+    if str_byte_len(rt) > 0
+      return_type = rt
+      break
+    end
+  end
+
+  # Build match arms from each clause
+  var arms = vec_new()
+  for g in 0..group.size
+    var func = children[group[g]]
+    var arm = resolve_build_clause_arm(ast_store, func, arity, line, col)
+    arms.push(arm)
+  end
+
+  # Add fallback arm: _ => FunctionClauseError
+  var fallback = resolve_build_fallback_arm(ast_store, name, arity, line, col)
+  arms.push(fallback)
+
+  # Create match expression on _cp0
+  var match_subject = ast::ast_ident(ast_store, "_cp0", line, col)
+  var match_node = ast::ast_match(ast_store, match_subject, arms, line, col)
+
+  # Wrap match in block as function body
+  var match_stmt = ast::ast_expr_stmt(ast_store, match_node, line, col)
+  var body_stmts = vec_new()
+  body_stmts.push(match_stmt)
+  var body = ast::ast_block(ast_store, body_stmts, line, col)
+
+  # Get type params from first clause
+  var type_params = ast::ast_func_type_params(ast_store, first)
+  var type_param_bounds = ast::ast_func_type_param_bounds(ast_store, first)
+
+  return ast::ast_function(ast_store, name, synth_params, return_type, body, is_private, type_params, type_param_bounds, line, col)
+end
+
+## Desugar multi-clause function definitions in a program.
+## Scans program children for consecutive same-name, same-arity NODE_FUNCTION nodes
+## with pattern params or guards, and merges them into single dispatch functions.
+## Desugar argument-position `impl Trait` to implicit generic parameters.
+##
+## Rewrites `def drain(src: impl MyIter)` into the equivalent
+## `def drain<_impl_0: MyIter>(src: _impl_0)` before any other pass runs.
+## This routes argument-position `impl Trait` through the existing bounded
+## generic monomorphization pipeline, so two different caller types
+## instantiate two different specialized copies of the function (probe 5).
+##
+## Multiple `impl Trait` params get `_impl_0`, `_impl_1`, …, in occurrence
+## order. Existing explicit type params are preserved; synthetic params are
+## appended after them so existing turbofish-free calls keep inferring the
+## hand-written params.
+##
+## Runs BEFORE `resolve_desugar_multiclause` because multiclause merging
+## rewrites bodies in terms of the parameter names; it needs to see the
+## annotations after impl-Trait desugaring so later passes don't observe
+## the original literal `"impl Trait"` string.
+def resolve_desugar_impl_trait_args(ast_store: ast::AstStorage, program: AstNodeId): Void
+  var children = ast::ast_get_children(ast_store, program)
+  if children == 0
+    return
+  end
+  var count = children.size
+  for i in 0..count
+    var func = children[i]
+    var kind = ast::ast_get_kind(ast_store, func)
+    # NODE_FUNCTION = 34
+    if kind == 34
+      var params = ast::ast_get_left(ast_store, func)
+      if params > 0
+        var param_count = vec_size(params)
+        if param_count > 0
+          var synth_tp = ""     # new type params to append
+          var synth_bounds = "" # new bounds to append
+          var impl_idx = 0
+          var synthesized_any = 0
+          for pi in 0..param_count
+            var param = params[pi]
+            var ann = ast::ast_get_str2(ast_store, param)
+            if str_byte_len(ann) > 5
+              if ann.starts_with("impl ")
+                var trait_raw = str_byte_slice(ann, 5, str_byte_len(ann))
+                var trait_name = trait_raw.trim()
+                var synth_name = "_impl_#{impl_idx}"
+                # Rewrite the param annotation to the synthetic type param name
+                ast::ast_set_str2(ast_store, param, synth_name)
+                if str_byte_len(synth_tp) > 0
+                  synth_tp += ","
+                  synth_bounds += ","
+                end
+                synth_tp += synth_name
+                synth_bounds += "#{synth_name}:#{trait_name}"
+                impl_idx += 1
+                synthesized_any = 1
+              end
+            end
+          end
+          if synthesized_any == 1
+            var existing_tp = ast::ast_func_type_params(ast_store, func)
+            var existing_bounds = ast::ast_func_type_param_bounds(ast_store, func)
+            var new_tp = synth_tp
+            if str_byte_len(existing_tp) > 0
+              new_tp = "#{existing_tp},#{synth_tp}"
+            end
+            var new_bounds = synth_bounds
+            if str_byte_len(existing_bounds) > 0
+              new_bounds = "#{existing_bounds},#{synth_bounds}"
+            end
+            ast::ast_set_op(ast_store, func, as_int(new_tp))
+            ast::ast_set_extra(ast_store, func, as_int(new_bounds))
+          end
+        end
+      end
+    end
+  end
+end
+
+def resolve_desugar_multiclause(ast_store: ast::AstStorage, program: AstNodeId): Void
+  var children = ast::ast_get_children(ast_store, program)
+  if children == 0
+    return
+  end
+  var count = children.size
+  if count < 2
+    return
+  end
+
+  var new_children = vec_new()
+  var i = 0
+  while i < count
+    var item = children[i]
+    var kind = ast::ast_get_kind(ast_store, item)
+    if kind != 34
+      # Not a function — keep as-is
+      new_children.push(item)
+      i += 1
+    else
+      # Look ahead for consecutive same-name, same-arity functions
+      var name = ast::ast_get_str1(ast_store, item)
+      var params = ast::ast_get_left(ast_store, item)
+      var arity = 0
+      if params > 0
+        arity = vec_size(params)
+      end
+
+      var group = vec_new()
+      group.push(i)
+      var j = i + 1
+      while j < count
+        var next = children[j]
+        var nk = ast::ast_get_kind(ast_store, next)
+        if nk != 34
+          break
+        end
+        var nn = ast::ast_get_str1(ast_store, next)
+        if nn != name
+          break
+        end
+        var np = ast::ast_get_left(ast_store, next)
+        var na = 0
+        if np > 0
+          na = vec_size(np)
+        end
+        if na != arity
+          break
+        end
+        group.push(j)
+        j += 1
+      end
+
+      if group.size < 2
+        # Single function — keep as-is
+        new_children.push(item)
+        i += 1
+      else
+        # Check if any clause has pattern params or guards
+        var has_mc = resolve_has_multiclause_markers(ast_store, children, group)
+        if has_mc == 0
+          # Multiple same-name functions without patterns — keep all (TC reports duplicates)
+          for gi in 0..group.size
+            new_children.push(children[group[gi]])
+          end
+        else
+          # Merge into single function with match dispatch
+          var merged = resolve_merge_clauses(ast_store, children, group)
+          new_children.push(merged)
+        end
+        i = j
+      end
+    end
+  end
+
+  ast::ast_set_children(ast_store, program, new_children)
+end
+
+## Re-collect FUNCTION, EXTERN_FN, and CONST_DECL entries from a cached
+## AST under a new (prefix, is_wildcard). Driven by
+## resolve_process_imports's wildcard-vs-qualified dedup gate when an
+## already-loaded module's later import asks for a prefix combination
+## that wasn't collected on the first load.
+##
+## Scope covered:
+##   - tag 0 (FUNC): Phase 4.1 registers the signature under
+##     `entry.name` without touching the AST node, so two entries
+##     pointing at the same node with different prefixed names both
+##     succeed. mir_lower emits one MirFunc per entry — two MirFuncs
+##     share the same source AST and emit identical bodies under their
+##     respective LLVM symbol names.
+##   - tag 10 (EXTERN_FN): already an established double-registration
+##     pattern in resolve_collect_funcs (bare + prefixed pushed
+##     unconditionally for any qualified load). Codegen reads the C
+##     symbol from the AST's str1, deduping declarations by C name,
+##     so a second prefixed entry adds the typecheck-resolution alias
+##     without producing a second LLVM declare.
+##   - tag 2 (CONST_DECL): Phase 4.0d does
+##     `ast_set_str1(entry.ast_store, entry.node_id, entry.name)` then
+##     `tc_stmt` per entry — two entries for the same AST end up
+##     registering both names in the typecheck registry. mir_lower
+##     PASS 0.7 / 0.5 const-eval pushes (name, value) once per entry,
+##     producing two `@const_<name>` LLVM globals with identical
+##     evaluated values. Wasteful but correct — consts are immutable
+##     and mir_const_eval_full is deterministic, so duplicated storage
+##     is observationally equivalent to a single source.
+##
+## NOT covered (filed forward):
+##   - tag 1 (GLOBAL_VAR): mutable. Two entries would emit two
+##     `@global_<name>` LLVM symbols with INDEPENDENT storage. A wild
+##     consumer writing through the bare entry and a qualified consumer
+##     reading through the prefixed entry would see different values —
+##     correctness violation of the import abstraction. Needs LLVM
+##     alias emission (one storage + N aliases) to fix properly.
+##   - tag 4-9 (STRUCT_DEF / ENUM_DEF / TYPE_ALIAS / NEWTYPE_DEF /
+##     BINARY_BLOCK / PACKED_STRUCT) and trait defs: Phase 4.0 mutates
+##     AST str1 last-write-wins and tc_register_*_def_node registers
+##     by name. Two registrations create two type entries but the
+##     SAME underlying AST has one str1 — `%struct.<name>` emission
+##     diverges from typecheck-registered name. Bigger refactor.
+def resolve_recollect_funcs_only(ast_store: ast::AstStorage, program: AstNodeId, all_funcs: Vec<ResolverEntry>, prefix: String, is_wildcard: Int): Void
+  # Cache-ro Bug B: when re-collecting under a wildcard combo (`prefix == ""`,
+  # `is_wildcard == 1`), DO NOT push duplicate bare-name entries — the first
+  # pass already pushed the canonical entry, and quartz.qz:1076's
+  # ast_set_str1 loop would be order-dependent if we added a second entry.
+  # Instead, derive the canonical_prefix from the dep graph (same convention
+  # as resolve_collect_funcs) and record bare → canonical aliases so the
+  # consumer's bare callsites resolve at mir_emit_call time.
+  # `fn_prefix` is the canonical module prefix applied to FUNCTION / method
+  # LLVM symbols when re-collecting under a wildcard combo (cache-ro Bug B).
+  # Consts / globals deliberately keep the caller's `prefix` (empty for
+  # wildcard) — they resolve by BARE ResolverEntry, not via the func alias
+  # table, exactly mirroring resolve_collect_funcs (see its 1683 comment).
+  # Overwriting `prefix` itself (the old behavior) promoted const/global
+  # names to `module$NAME` too, which then deduped against the qualified
+  # importer's already-registered `module$NAME` and was dropped — leaving
+  # the bare name the wildcard consumer needs unregistered (A.40 follow-up:
+  # qualified-first then wildcard-second const access tripped QZ0403).
+  var record_aliases = 0
+  var fn_prefix = prefix
+  if str_byte_len(prefix) == 0 and is_wildcard == 1
+    var canonical_prefix = resolve_canonical_prefix_for_ast_store(ast_store)
+    if str_byte_len(canonical_prefix) > 0
+      fn_prefix = canonical_prefix
+      record_aliases = 1
+    end
+  end
+  var children = ast::ast_get_children(ast_store, program)
+  var count = children.size
+  for i in 0..count
+    var item = children[i]
+    var kind = ast::ast_get_kind(ast_store, item)
+    # NODE_FUNCTION = 34
+    if kind == 34
+      var base_name = ast::ast_get_str1(ast_store, item)
+      var is_private = ast::ast_get_int_val(ast_store, item)
+      # Skip private through wildcard re-imports — mirrors resolve_collect_funcs
+      if is_private == 1 and is_wildcard == 1
+        # Wildcard re-export filtering: private funcs not visible
+      else
+        if ast::ast_func_is_cconv_c(ast_store, item)
+          # extern "C" def with body — keep bare C name
+          var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: base_name, tag: 0 }
+          # Dedup against existing entries
+          var ec_dup = 0
+          for ed in 0..all_funcs.size
+            if all_funcs[ed].tag == 0 and all_funcs[ed].name == base_name
+              if all_funcs[ed].ast_store == ast_store and all_funcs[ed].node_id == item
+                ec_dup = 1
+                break
+              end
+            end
+          end
+          if ec_dup == 0
+            all_funcs.push(entry)
+            _resolve_known_funcs.push(base_name)
+          end
+        else
+          # Cache-ro Bug B: skip canonical promotion + alias recording for
+          # bare-emit runtime helpers (referenced bare by codegen_runtime inline IR).
+          var rcl_effective_prefix = fn_prefix
+          var rcl_record_alias = record_aliases
+          if resolve_is_bare_runtime_helper(base_name) == 1
+            rcl_effective_prefix = ""
+            rcl_record_alias = 0
+          end
+          var final_name = ""
+          if is_private == 1
+            final_name = resolve_build_private_name(rcl_effective_prefix, base_name)
+          else
+            final_name = resolve_build_name(rcl_effective_prefix, base_name)
+          end
+          # Cache-ro Bug B: record bare → canonical alias for wildcard re-imports
+          if rcl_record_alias == 1 and is_private == 0
+            compiler_types::ct_func_alias_add(base_name, final_name)
+          end
+          # Dedup by (name, arity) — same logic as resolve_collect_funcs
+          var fn_already = 0
+          var new_params = ast::ast_get_left(ast_store, item)
+          var new_arity = 0
+          if new_params > 0
+            new_arity = vec_size(new_params)
+          end
+          for fnd in 0..all_funcs.size
+            if all_funcs[fnd].tag == 0 and all_funcs[fnd].name == final_name
+              var existing_params = ast::ast_get_left(all_funcs[fnd].ast_store, all_funcs[fnd].node_id)
+              var existing_arity = 0
+              if existing_params > 0
+                existing_arity = vec_size(existing_params)
+              end
+              if existing_arity == new_arity
+                fn_already = 1
+                break
+              end
+            end
+          end
+          if fn_already == 0
+            var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: final_name, tag: 0 }
+            all_funcs.push(entry)
+            _resolve_known_funcs.push(final_name)
+          end
+        end
+      end
+    end
+    # NODE_EXTERN_FN = 53 — extern "C" declarations (FFI)
+    if kind == 53
+      var base_name = ast::ast_get_str1(ast_store, item)
+      # The bare entry was pushed on first load (dedup'd inside
+      # resolve_collect_funcs). Only push the new prefixed alias when
+      # this re-collect uses a non-empty prefix.
+      if str_byte_len(fn_prefix) > 0
+        var prefixed_name = resolve_build_name(fn_prefix, base_name)
+        # Dedup against existing prefixed entries (defensive — different
+        # alias for the same module on a second qualified import)
+        var ex_dup = 0
+        for ed in 0..all_funcs.size
+          if all_funcs[ed].tag == 10 and all_funcs[ed].name == prefixed_name
+            if all_funcs[ed].ast_store == ast_store and all_funcs[ed].node_id == item
+              ex_dup = 1
+              break
+            end
+          end
+        end
+        if ex_dup == 0
+          var prefixed_entry = ResolverEntry { ast_store: ast_store, node_id: item, name: prefixed_name, tag: 10 }
+          all_funcs.push(prefixed_entry)
+        end
+      end
+    end
+    # NODE_CONST_DECL = 69 — `const NAME = expr` (immutable)
+    if kind == 69
+      # The base_name we read off the AST may already be prefixed if a
+      # prior pass-2 ran rewrite_calls under a different prefix and
+      # mutated str1, OR (more commonly) it's bare. Either way, strip
+      # any existing prefix so the new prefix is applied to the
+      # canonical base name.
+      var raw_name = ast::ast_get_str1(ast_store, item)
+      var base_name = raw_name
+      var dollar_pos = -1
+      for _di in 0..str_byte_len(raw_name)
+        if str_byte_at(raw_name, _di) == '$'
+          dollar_pos = _di
+        end
+      end
+      if dollar_pos >= 0
+        base_name = str_byte_slice(raw_name, dollar_pos + 1, str_byte_len(raw_name))
+      end
+      var final_name = resolve_build_name(prefix, base_name)
+      # Dedup against existing tag==2 entries.
+      var cd_dup = 0
+      for cdd in 0..all_funcs.size
+        if all_funcs[cdd].tag == 2 and all_funcs[cdd].name == final_name
+          cd_dup = 1
+          break
+        end
+      end
+      if cd_dup == 0
+        var ce = ResolverEntry { ast_store: ast_store, node_id: item, name: final_name, tag: 2 }
+        all_funcs.push(ce)
+      end
+    end
+    # NODE_GLOBAL_VAR = 49 — module-level `var X = expr` (mutable)
+    if kind == 49
+      var raw_name = ast::ast_get_str1(ast_store, item)
+      var base_name = raw_name
+      var dollar_pos = -1
+      for _gi in 0..str_byte_len(raw_name)
+        if str_byte_at(raw_name, _gi) == '$'
+          dollar_pos = _gi
+        end
+      end
+      if dollar_pos >= 0
+        base_name = str_byte_slice(raw_name, dollar_pos + 1, str_byte_len(raw_name))
+      end
+      var final_name = resolve_build_name(prefix, base_name)
+      # Dedup against existing tag==1 entries.
+      var gv_dup = 0
+      for gvd in 0..all_funcs.size
+        if all_funcs[gvd].tag == 1 and all_funcs[gvd].name == final_name
+          gv_dup = 1
+          break
+        end
+      end
+      if gv_dup == 0
+        # Tag==1 is the same kind used by resolve_collect_funcs for fresh
+        # global registrations. mir_lower PASS 0.6 detects (ast_store,
+        # node_id) collisions across tag==1 entries and segregates the
+        # duplicates as LLVM aliases — see _alias_primary_* in
+        # mir_lower.qz — so the storage stays SHARED between the
+        # wildcard and qualified consumers. Writes through either name
+        # see each other.
+        var ge = ResolverEntry { ast_store: ast_store, node_id: item, name: final_name, tag: 1 }
+        all_funcs.push(ge)
+      end
+    end
+    # Cache-ro Bug B: for wildcard re-imports, register bare → canonical
+    # aliases for impl-block and extend-block methods so UFCS-rewritten
+    # call sites in the consumer ("Type$method") resolve to the cached
+    # canonical symbol ("module$Type$method") at mir_emit_call time. We do
+    # NOT push new ResolverEntry rows — the first pass already did, and
+    # quartz.qz:1076's ast_set_str1 loop is order-dependent. At recollect
+    # time (resolve_imports PASS 1, before any Phase 4.x AST mutation),
+    # method.str1 is still the parser-bare name.
+    # NODE_IMPL_BLOCK = 51
+    if kind == 51 and record_aliases == 1
+      var for_type_re = ast::ast_get_str2(ast_store, item)
+      var methods_re = ast::ast_get_children(ast_store, item)
+      var method_count_re = methods_re.size
+      var base_type_re = for_type_re
+      if __char_index(for_type_re, '<') > 0
+        base_type_re = str_byte_slice(for_type_re, 0, __char_index(for_type_re, '<'))
+      end
+      for m in 0..method_count_re
+        var method_re = methods_re[m]
+        var method_name_re = ast::ast_get_str1(ast_store, method_re)
+        var mangled_re = "#{base_type_re}$"
+        mangled_re = "#{mangled_re}#{method_name_re}"
+        var final_name_re = resolve_build_name(fn_prefix, mangled_re)
+        compiler_types::ct_func_alias_add(mangled_re, final_name_re)
+      end
+    end
+    # NODE_EXTEND_BLOCK = 52
+    if kind == 52 and record_aliases == 1
+      var for_type_ex = ast::ast_get_str1(ast_store, item)
+      var methods_ex = ast::ast_get_children(ast_store, item)
+      var method_count_ex = methods_ex.size
+      var base_type_ex = for_type_ex
+      var angle_idx_ex = __char_index(for_type_ex, '<')
+      if angle_idx_ex > 0
+        base_type_ex = str_byte_slice(for_type_ex, 0, angle_idx_ex)
+      end
+      for m in 0..method_count_ex
+        var method_ex = methods_ex[m]
+        var method_name_ex = ast::ast_get_str1(ast_store, method_ex)
+        var mangled_ex = "#{base_type_ex}$"
+        mangled_ex = "#{mangled_ex}#{method_name_ex}"
+        var final_name_ex = resolve_build_name(fn_prefix, mangled_ex)
+        compiler_types::ct_func_alias_add(mangled_ex, final_name_ex)
+      end
+    end
+  end
+end
+
+## Parameters:
+##   ast_store - AST storage for this module
+##   program   - Root program node
+##   all_funcs - Vector to append entries to
+##   prefix    - Module prefix for function names (empty for main module)
+def resolve_collect_funcs(ast_store: ast::AstStorage, program: AstNodeId, all_funcs: Vec<ResolverEntry>, prefix: String, skip_private: Int): Void
+  # Cache-ro Bug B: when this module is loaded via wildcard (caller `prefix`
+  # empty, `skip_private == 1`), the LLVM symbol for FUNCTIONS (free + impl
+  # + extend methods) must still be the module-qualified canonical name —
+  # otherwise consumer IR diverges from the cached fragment, which was
+  # produced under a non-wildcard load. Derive `fn_prefix` from the dep
+  # graph and apply ONLY to function entries; record a bare → canonical
+  # alias so consumer call sites resolve at mir_emit_call time.
+  #
+  # Globals / consts / types deliberately keep the caller's `prefix` (empty
+  # for wildcard) — PASS 2's resolve_rewrite_calls is gated on `is_wildcard
+  # == 0` (resolver.qz:3295), so wildcard-imported module bodies don't get
+  # their global/const references rewritten; switching the entry name to
+  # qualified would mismatch the unrewritten body refs (QZ0403). The
+  # pre-existing dual-entry-plus-alias path (PASS 0.6 in mir_lower) handles
+  # qualified consumers of those globals.
+  var fn_prefix = prefix
+  var record_aliases = 0
+  if str_byte_len(prefix) == 0 and skip_private == 1
+    var canonical_prefix = resolve_canonical_prefix_for_ast_store(ast_store)
+    if str_byte_len(canonical_prefix) > 0
+      fn_prefix = canonical_prefix
+      record_aliases = 1
+    end
+  end
+  var children = ast::ast_get_children(ast_store, program)
+  var count = children.size
+  for i in 0..count
+    var item = children[i]
+    var kind = ast::ast_get_kind(ast_store, item)
+    # NODE_FUNCTION = 34 (must match C enum in ast.h)
+    if kind == 34
+      # Get the function's base name and build prefixed name
+      var base_name = ast::ast_get_str1(ast_store, item)
+      var is_private = ast::ast_get_int_val(ast_store, item)
+      # Wildcard re-export filtering: private functions are NOT re-exported to
+      # the importer's namespace. BUT the module's own pub functions may call
+      # them intra-module, so they must still be COMPILED — under the module's
+      # canonical private-mangled name `<canonical>$$name` (the else-branch
+      # builds exactly that for privates, and the alias at ~1906 is withheld
+      # for is_private, so nothing leaks to the importer). The matching
+      # intra-module body rewrite runs in pass 2 (resolve_rewrite_private_calls).
+      # When no canonical prefix is derivable (record_aliases == 0) we can't
+      # mint a safe `$$` name — `resolve_build_private_name("", base)` collapses
+      # to the bare name, which WOULD leak/collide — so keep the historical drop.
+      if is_private == 1 and skip_private == 1 and record_aliases == 0
+        # Don't export private functions through wildcard imports (no canonical
+        # prefix available — would have to register bare, which leaks/collides).
+      else
+        # extern "C" def with body: use bare C name (no module prefix)
+        # so the LLVM symbol matches what C code expects
+        if ast::ast_func_is_cconv_c(ast_store, item)
+          var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: base_name, tag: 0 }
+          all_funcs.push(entry)
+          _resolve_known_funcs.push(base_name)
+        else
+          # Cache-ro Bug B: certain names are runtime helpers referenced by
+          # bare-name inline IR emitted by codegen_runtime (see codegen.qz:190
+          # `inline_ir_helpers`). They MUST stay bare-named regardless of
+          # import topology — skip canonical promotion + alias recording.
+          var fn_effective_prefix = fn_prefix
+          var fn_record_alias = record_aliases
+          if resolve_is_bare_runtime_helper(base_name) == 1
+            fn_effective_prefix = prefix
+            fn_record_alias = 0
+          end
+          var final_name = ""
+          if is_private == 1
+            final_name = resolve_build_private_name(fn_effective_prefix, base_name)
+          else
+            final_name = resolve_build_name(fn_effective_prefix, base_name)
+          end
+          if fn_record_alias == 1 and is_private == 0
+            compiler_types::ct_func_alias_add(base_name, final_name)
+          end
+          # Deduplicate functions (diamond imports can register the same function twice)
+          # Check both name AND arity to allow arity overloading (greet/0 vs greet/1)
+          # Local definitions shadow wildcard imports (replace import with local)
+          var fn_already = 0
+          var fn_replace_idx = -1
+          var new_params = ast::ast_get_left(ast_store, item)
+          var new_arity = 0
+          if new_params > 0
+            new_arity = vec_size(new_params)
+          end
+          for fnd in 0..all_funcs.size
+            if all_funcs[fnd].tag == 0 and all_funcs[fnd].name == final_name
+              var existing_params = ast::ast_get_left(all_funcs[fnd].ast_store, all_funcs[fnd].node_id)
+              var existing_arity = 0
+              if existing_params > 0
+                existing_arity = vec_size(existing_params)
+              end
+              if existing_arity == new_arity
+                # Same name+arity: if from different AST store, local shadows import
+                if all_funcs[fnd].ast_store != ast_store
+                  fn_replace_idx = fnd
+                else
+                  fn_already = 1
+                end
+                break
+              end
+            end
+          end
+          if fn_replace_idx >= 0
+            # Replace imported function with local definition (shadowing)
+            var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: final_name, tag: 0 }
+            all_funcs[fn_replace_idx] = entry
+          end
+          if fn_already == 0 and fn_replace_idx < 0
+            var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: final_name, tag: 0 }
+            all_funcs.push(entry)
+            _resolve_known_funcs.push(final_name)
+          end
+        end
+      end
+    end
+    # NODE_EXTERN_FN = 53 - extern "C" def declarations (FFI)
+    # Extern functions keep their original C names (no module prefix)
+    # because they map to global C library symbols (accept, close, etc.)
+    if kind == 53
+      var base_name = ast::ast_get_str1(ast_store, item)
+      # Deduplicate bare extern names (two modules may extern the same C function)
+      var already = 0
+      for d in 0..all_funcs.size
+        if all_funcs[d].tag == 10 and all_funcs[d].name == base_name
+          already = 1
+          break
+        end
+      end
+      if already == 0
+        var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: base_name, tag: 10 }
+        all_funcs.push(entry)
+      end
+      # Prefixed entry always unique (prefix is per-module)
+      if str_byte_len(prefix) > 0
+        var prefixed_name = resolve_build_name(prefix, base_name)
+        var prefixed_entry = ResolverEntry { ast_store: ast_store, node_id: item, name: prefixed_name, tag: 10 }
+        all_funcs.push(prefixed_entry)
+      end
+    end
+    # NODE_EXTERN_VAR = 76 - extern var declarations (FFI global variables)
+    # Extern vars keep their original C names (no module prefix)
+    if kind == 76
+      var base_name = ast::ast_get_str1(ast_store, item)
+      var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: base_name, tag: 11 }
+      all_funcs.push(entry)
+    end
+    # NODE_GLOBAL_VAR = 49
+    if kind == 49
+      var base_name = ast::ast_get_str1(ast_store, item)
+      var final_name = resolve_build_name(prefix, base_name)
+
+      # Deduplicate global vars (diamond imports can register the same global twice)
+      var gv_already = 0
+      for gvd in 0..all_funcs.size
+        if all_funcs[gvd].tag == 1 and all_funcs[gvd].name == final_name
+          gv_already = 1
+          break
+        end
+      end
+      if gv_already == 0
+        var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: final_name, tag: 1 }
+        all_funcs.push(entry)
+      end
+    end
+    # NODE_CONST_DECL = 69
+    if kind == 69
+      var base_name = ast::ast_get_str1(ast_store, item)
+      var final_name = resolve_build_name(prefix, base_name)
+
+      # Deduplicate const decls (diamond imports)
+      var cd_already = 0
+      for cdd in 0..all_funcs.size
+        if all_funcs[cdd].tag == 2 and all_funcs[cdd].name == final_name
+          cd_already = 1
+          break
+        end
+      end
+      if cd_already == 0
+        var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: final_name, tag: 2 }
+        all_funcs.push(entry)
+      end
+    end
+    # NODE_STATIC_ASSERT = 70
+    if kind == 70
+      # Static assert doesn't have a name, use placeholder
+      var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: "__static_assert__", tag: 3 }
+      all_funcs.push(entry)
+    end
+    
+    # NODE_IMPL_BLOCK = 51 - extract methods as functions with mangled names
+    if kind == 51
+      var trait_name = ast::ast_get_str1(ast_store, item)
+      var for_type = ast::ast_get_str2(ast_store, item)
+      var methods = ast::ast_get_children(ast_store, item)
+      var method_count = methods.size
+      var is_inherent = str_byte_len(trait_name) == 0
+
+      # Strip generic type params for mangling: "GBox<T>" → "GBox"
+      var base_type = for_type
+      if __char_index(for_type, '<') > 0
+        base_type = str_byte_slice(for_type, 0, __char_index(for_type, '<'))
+      end
+
+      # Self type keeps full generic annotation for typechecker
+      var self_type = for_type
+      if is_inherent and str_byte_len(prefix) > 0
+        self_type = "#{prefix}$#{for_type}"
+      end
+
+      for m in 0..method_count
+        var method = methods[m]
+        var method_name = ast::ast_get_str1(ast_store, method)
+
+        # Build mangled name: Type$method (e.g., Point$eq)
+        var mangled = "#{base_type}$"
+        mangled = "#{mangled}#{method_name}"
+
+        # Apply prefix if present (for module-scoped impls)
+        var final_name = resolve_build_name(fn_prefix, mangled)
+
+        # Cache-ro Bug B: under wildcard load, record the bare
+        # "Type$method" → "module$Type$method" alias so the consumer's UFCS-
+        # rewritten callsite (which produces "Type$method") resolves to the
+        # cached canonical symbol at mir_emit_call time.
+        if record_aliases == 1
+          compiler_types::ct_func_alias_add(mangled, final_name)
+        end
+
+        # For inherent impls, inject self: Type as first parameter — UNLESS the
+        # user already wrote an explicit `self` (A.36). Inherent extend methods
+        # conventionally omit `self` (`def push(val: Int)`), so the resolver
+        # injects it. But an explicit `self` (`def m(self): ...`, as trait-impl
+        # methods require and as a generic-struct extend may use) must not be
+        # double-injected — that yields two `self` params → arity mismatch →
+        # crash. When self is already present, annotate it like the trait branch.
+        if is_inherent
+          var old_params = ast::ast_get_left(ast_store, method)
+          var has_explicit_self = 0
+          if old_params > 0 and vec_size(old_params) > 0
+            var fp0 = old_params[0]
+            if ast::ast_get_str1(ast_store, fp0) == "self"
+              has_explicit_self = 1
+              ast::ast_set_str2(ast_store, fp0, self_type)
+            end
+          end
+          if has_explicit_self == 0
+            var method_line = ast::ast_get_line(ast_store, method)
+            var method_col = ast::ast_get_col(ast_store, method)
+            var self_param = ast::ast_param(ast_store, "self", self_type, 0, 0, method_line, method_col)
+            var new_params = vec_new()
+            new_params.push(self_param)
+            if old_params > 0
+              var old_count = vec_size(old_params)
+              for p in 0..old_count
+                new_params.push(old_params[p])
+              end
+            end
+            ast::ast_set_left(ast_store, method, new_params)
+          end
+        else
+          # For trait impls, the self parameter is already declared in source but lacks
+          # a type annotation. Set it to the for_type so field access and .size work.
+          var old_params = ast::ast_get_left(ast_store, method)
+          if old_params > 0 and vec_size(old_params) > 0
+            var first_param = old_params[0]
+            var first_name = ast::ast_get_str1(ast_store, first_param)
+            if first_name == "self"
+              ast::ast_set_str2(ast_store, first_param, for_type)
+            end
+          end
+        end
+
+        # Store entry: ResolverEntry with tag 0 = Not a global var
+        var entry = ResolverEntry { ast_store: ast_store, node_id: method, name: final_name, tag: 0 }
+        all_funcs.push(entry)
+      end
+
+      # Only store impl block entry and synthesize defaults for trait impls
+      if is_inherent == false
+        # Also store the impl block itself for trait relationship registration
+        var impl_entry = ResolverEntry { ast_store: ast_store, node_id: item, name: for_type, tag: 9 }
+        all_funcs.push(impl_entry)
+
+        # Synthesize Type$method entries for inherited default trait methods.
+        # Search all_funcs backwards for the matching trait def (tag 8).
+        var trait_ast_store: AstStore = as_type<AstStore>(0)
+        var trait_node = 0
+        var found_trait = 0
+        var search_idx = all_funcs.size - 1
+        while search_idx >= 0 and found_trait == 0
+          var e = all_funcs[search_idx]
+          if e.tag == 8
+            var e_name = e.name
+            var trait_suffix = "$#{trait_name}"
+            if e_name == trait_name or str_ends_with(e_name, trait_suffix)
+              trait_ast_store = e.ast_store
+              trait_node = e.node_id
+              found_trait = 1
+            end
+          end
+          search_idx -= 1
+        end
+
+        if found_trait == 1
+          # Get trait method children
+          var trait_methods = ast::ast_get_children(trait_ast_store, trait_node)
+          var trait_method_count = trait_methods.size
+
+          for tm in 0..trait_method_count
+            var trait_method = trait_methods[tm]
+            var trait_method_name = ast::ast_get_str1(trait_ast_store, trait_method)
+
+            # Check if this method was overridden in the impl block
+            var overridden = 0
+            for ov in 0..method_count
+              var impl_method_name = ast::ast_get_str1(ast_store, methods[ov])
+              if impl_method_name == trait_method_name
+                overridden = 1
+              end
+            end
+
+            if overridden == 0
+              # Check if Type$method already exists from an inherent impl (auto-satisfaction)
+              var def_mangled = "#{for_type}$"
+              def_mangled = "#{def_mangled}#{trait_method_name}"
+              var def_final = resolve_build_name(fn_prefix, def_mangled)
+
+              var auto_satisfied = 0
+              for as_idx in 0..all_funcs.size
+                if all_funcs[as_idx].tag == 0 and all_funcs[as_idx].name == def_final
+                  auto_satisfied = 1
+                  break
+                end
+              end
+
+              if auto_satisfied == 0
+                # Cache-ro Bug B: alias the bare "Type$method" → "module$Type$method"
+                # for the synthesized default too.
+                if record_aliases == 1
+                  compiler_types::ct_func_alias_add(def_mangled, def_final)
+                end
+                # Not auto-satisfied — synthesize default wrapper if body exists
+                var body = ast::ast_get_right(trait_ast_store, trait_method)
+                if body >= 0
+                  # Create wrapper function with Self → for_type in params
+                  var trait_params = ast::ast_get_left(trait_ast_store, trait_method)
+                  var new_params = vec_new()
+                  var tm_line = ast::ast_get_line(trait_ast_store, trait_method)
+                  var tm_col = ast::ast_get_col(trait_ast_store, trait_method)
+                  if trait_params > 0
+                    var pc = vec_size(trait_params)
+                    for pi in 0..pc
+                      var param = trait_params[pi]
+                      var pname = ast::ast_get_str1(trait_ast_store, param)
+                      var ptype = ast::ast_get_str2(trait_ast_store, param)
+                      if pname == "self" or ptype == "Self"
+                        var new_p = ast::ast_param(trait_ast_store, pname, for_type, 0, 0, tm_line, tm_col)
+                        new_params.push(new_p)
+                      else
+                        new_params.push(param)
+                      end
+                    end
+                  end
+                  var ret_type = ast::ast_get_str2(trait_ast_store, trait_method)
+                  if ret_type == "Self"
+                    ret_type = for_type
+                  end
+                  var wrapper = ast::ast_function(trait_ast_store, trait_method_name, new_params, ret_type, body, 0, "", "", tm_line, tm_col)
+                  var def_entry = ResolverEntry { ast_store: trait_ast_store, node_id: wrapper, name: def_final, tag: 0 }
+                  all_funcs.push(def_entry)
+                end
+                # If body < 0 (abstract) and not auto-satisfied, typechecker will error
+              end
+            end
+          end
+        end
+      end
+    end
+    # NODE_EXTEND_BLOCK = 52 - extract methods from extend blocks (e.g., extend LookupResult { ... })
+    # Like the C bootstrap, we desugar extend methods into regular functions with
+    # `self: Type` prepended as the first parameter.
+    if kind == 52
+      var for_type = ast::ast_get_str1(ast_store, item)  # extend stores type in str1
+      var methods = ast::ast_get_children(ast_store, item)
+      var method_count = methods.size
+
+      # Strip generic type params for mangling: "GBox<T>" → "GBox"
+      # Callers look up "GBox$get", not "GBox<T>$get"
+      var base_type = for_type
+      var angle_idx = __char_index(for_type, '<')
+      if angle_idx > 0
+        base_type = str_byte_slice(for_type, 0, angle_idx)
+      end
+
+      # Self parameter keeps full generic type annotation (e.g., "GBox<T>")
+      # so typechecker can extract type args for field access resolution.
+      # But mangled name uses base_type so callers can find the method.
+      var self_type = for_type
+      if str_byte_len(prefix) > 0
+        self_type = "#{prefix}$#{for_type}"
+      end
+
+      for m in 0..method_count
+        var method = methods[m]
+        var method_name = ast::ast_get_str1(ast_store, method)
+
+        # Build mangled name: Type$method (e.g., LookupResult$is_found, GBox$get)
+        var mangled = "#{base_type}$"
+        mangled = "#{mangled}#{method_name}"
+
+        # Apply prefix if present (for module-scoped extends)
+        var final_name = resolve_build_name(fn_prefix, mangled)
+
+        # Cache-ro Bug B: alias the bare "Type$method" → "module$Type$method"
+        # for wildcard-imported extends.
+        if record_aliases == 1
+          compiler_types::ct_func_alias_add(mangled, final_name)
+        end
+
+        # Inject `self: Type` as the first parameter (matching C bootstrap behavior)
+        var method_line = ast::ast_get_line(ast_store, method)
+        var method_col = ast::ast_get_col(ast_store, method)
+        var self_param = ast::ast_param(ast_store, "self", self_type, 0, 0, method_line, method_col)
+
+        var old_params = ast::ast_get_left(ast_store, method)
+        var new_params = vec_new()
+        new_params.push(self_param)
+        if old_params > 0
+          var old_count = vec_size(old_params)
+          for p in 0..old_count
+            new_params.push(old_params[p])
+          end
+        end
+        ast::ast_set_left(ast_store, method, new_params)
+
+        var entry = ResolverEntry { ast_store: ast_store, node_id: method, name: final_name, tag: 0 }
+        all_funcs.push(entry)
+      end
+    end
+    # NODE_STRUCT_DEF = 36 - collect struct definitions for cross-module type registration
+    if kind == 36
+      var base_name = ast::ast_get_str1(ast_store, item)
+      var is_private = ast::ast_get_int_val(ast_store, item)
+      var final_name = ""
+      if is_private == 1
+        final_name = resolve_build_private_name(prefix, base_name)
+      else
+        final_name = resolve_build_name(prefix, base_name)
+      end
+      var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: final_name, tag: 4 }
+      all_funcs.push(entry)
+    end
+    # NODE_ENUM_DEF = 38 - collect enum definitions for cross-module type registration
+    if kind == 38
+      var base_name = ast::ast_get_str1(ast_store, item)
+      var is_private = ast::ast_get_int_val(ast_store, item)
+      var final_name = ""
+      if is_private == 1
+        final_name = resolve_build_private_name(prefix, base_name)
+      else
+        final_name = resolve_build_name(prefix, base_name)
+      end
+      var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: final_name, tag: 5 }
+      all_funcs.push(entry)
+    end
+    # NODE_TYPE_ALIAS = 64 - collect type alias definitions
+    if kind == 64
+      var base_name = ast::ast_get_str1(ast_store, item)
+      var final_name = resolve_build_name(prefix, base_name)
+      var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: final_name, tag: 6 }
+      all_funcs.push(entry)
+    end
+    # NODE_NEWTYPE_DEF = 65 - collect newtype definitions
+    if kind == 65
+      var base_name = ast::ast_get_str1(ast_store, item)
+      var final_name = resolve_build_name(prefix, base_name)
+      var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: final_name, tag: 7 }
+      all_funcs.push(entry)
+    end
+    # NODE_TRAIT_DEF = 50 - collect trait definitions
+    if kind == 50
+      var base_name = ast::ast_get_str1(ast_store, item)
+      var final_name = resolve_build_name(prefix, base_name)
+      var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: final_name, tag: 8 }
+      all_funcs.push(entry)
+    end
+    # NODE_BINARY_BLOCK = 93 — binary DSL layout, register as struct-like type
+    if kind == 93
+      var base_name = ast::ast_get_str1(ast_store, item)
+      var final_name = resolve_build_name(prefix, base_name)
+      var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: final_name, tag: 13 }
+      all_funcs.push(entry)
+    end
+    # NODE_PACKED_STRUCT = 94 — packed struct(uN), register as struct-like type
+    if kind == 94
+      var base_name = ast::ast_get_str1(ast_store, item)
+      var final_name = resolve_build_name(prefix, base_name)
+      var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: final_name, tag: 14 }
+      all_funcs.push(entry)
+    end
+    # NODE_EFFECT_DECL = 100 — algebraic effect declaration (D.7). Name
+    # is NOT module-prefixed: effect names are global (the registry is
+    # keyed by bare name, and the blessed-set runtime install targets
+    # literal "Throws"/"Log"). Stashing the bare base_name as `name`
+    # means the Phase 4.0d registration pass in quartz.qz registers the
+    # effect under its declared identifier regardless of which module
+    # declared it. Duplicate detection (QZ0612) still fires on same-name
+    # clashes across modules.
+    if kind == 100
+      var base_name = ast::ast_get_str1(ast_store, item)
+      var entry = ResolverEntry { ast_store: ast_store, node_id: item, name: base_name, tag: 15 }
+      all_funcs.push(entry)
+    end
+
+    # NODE_ACTOR_DEF = 91 - desugar actor into struct + function stubs
+    if kind == 91
+      var actor_name = ast::ast_get_str1(ast_store, item)
+      var actor_type_params = ast::ast_get_str2(ast_store, item)
+      var is_private_actor = ast::ast_get_int_val(ast_store, item)
+      var actor_children = ast::ast_get_children(ast_store, item)
+      var actor_line = ast::ast_get_line(ast_store, item)
+      var actor_col = ast::ast_get_col(ast_store, item)
+
+      # Separate fields (NODE_FIELD_DEF=37) and methods (NODE_FUNCTION=34)
+      var actor_fields = vec_new()
+      var actor_methods = vec_new()
+      var ac_count = actor_children.size
+      for ac_i in 0..ac_count
+        var ac_child = actor_children[ac_i]
+        var ac_kind = ast::ast_get_kind(ast_store, ac_child)
+        if ac_kind == 37
+          actor_fields.push(ac_child)
+        elsif ac_kind == 34
+          actor_methods.push(ac_child)
+        end
+      end
+
+      # 1. Synthesize Counter$State struct with user fields + __inbox field
+      var state_fields = vec_new()
+      var af_count = actor_fields.size
+      for af_i in 0..af_count
+        state_fields.push(actor_fields[af_i])
+      end
+      var inbox_field = ast::ast_field_def(ast_store, "__inbox", "Int", 0, actor_line, actor_col)
+      state_fields.push(inbox_field)
+
+      var state_name = "#{actor_name}$State"
+      var state_struct = ast::ast_struct_def(ast_store, state_name, state_fields, actor_type_params, 0, 0, 0, 0, 0, actor_line, actor_col)
+      var state_final_name = resolve_build_name(prefix, state_name)
+      var state_entry = ResolverEntry { ast_store: ast_store, node_id: state_struct, name: state_final_name, tag: 4 }
+      all_funcs.push(state_entry)
+
+      # 2a. Register actor as a zero-field struct type (for UFCS dispatch + isolation)
+      var actor_type_struct = ast::ast_struct_def(ast_store, actor_name, vec_new(), actor_type_params, 0, 0, 0, 0, 0, actor_line, actor_col)
+      var actor_final_name = resolve_build_name(prefix, actor_name)
+      var actor_type_entry = ResolverEntry { ast_store: ast_store, node_id: actor_type_struct, name: actor_final_name, tag: 4 }
+      all_funcs.push(actor_type_entry)
+
+      # 2b. Register actor entry (tag 12) for MIR lowering
+      var actor_entry = ResolverEntry { ast_store: ast_store, node_id: item, name: actor_final_name, tag: 12 }
+      all_funcs.push(actor_entry)
+
+      # 3a. Synthesize zero-arg spawn function: ActorName() -> ActorName (uses defaults)
+      var spawn_params = vec_new()
+      var spawn_func = ast::ast_function(ast_store, actor_name, spawn_params, actor_name, -1, is_private_actor, "", "", actor_line, actor_col)
+      ast::ast_set_int_val(ast_store, spawn_func, 3)
+      var spawn_final = resolve_build_name(prefix, actor_name)
+      var spawn_entry = ResolverEntry { ast_store: ast_store, node_id: spawn_func, name: spawn_final, tag: 0 }
+      all_funcs.push(spawn_entry)
+
+      # 3b. Synthesize init-params spawn: ActorName(field1, field2, ...) -> Int
+      if af_count > 0
+        var init_params = vec_new()
+        for ip_i in 0..af_count
+          var ip_field = actor_fields[ip_i]
+          var ip_name = ast::ast_get_str1(ast_store, ip_field)
+          var ip_type = ast::ast_get_str2(ast_store, ip_field)
+          var ip_param = ast::ast_param(ast_store, ip_name, ip_type, 0, 0, actor_line, actor_col)
+          init_params.push(ip_param)
+        end
+        var init_func = ast::ast_function(ast_store, actor_name, init_params, actor_name, -1, is_private_actor, "", "", actor_line, actor_col)
+        ast::ast_set_int_val(ast_store, init_func, 3)
+        var init_entry = ResolverEntry { ast_store: ast_store, node_id: init_func, name: spawn_final, tag: 0 }
+        all_funcs.push(init_entry)
+      end
+
+      # 4. Synthesize proxy method stubs: ActorName$method(self: ActorName, ...) -> RetType
+      var am_count = actor_methods.size
+      for am_i in 0..am_count
+        var method_node = actor_methods[am_i]
+        var method_name = ast::ast_get_str1(ast_store, method_node)
+        var method_ret = ast::ast_get_str2(ast_store, method_node)
+        if str_byte_len(method_ret) == 0
+          method_ret = "Void"
+        end
+
+        # Build proxy params: (self: ActorName, original_params...)
+        var orig_params = ast::ast_get_left(ast_store, method_node)
+        var proxy_params = vec_new()
+        var self_param = ast::ast_param(ast_store, "self", actor_name, 0, 0, actor_line, actor_col)
+        proxy_params.push(self_param)
+        if orig_params > 0
+          var op_count = vec_size(orig_params)
+          for op_i in 0..op_count
+            proxy_params.push(orig_params[op_i])
+          end
+        end
+
+        var proxy_name = "#{actor_name}$#{method_name}"
+        var proxy_func = ast::ast_function(ast_store, proxy_name, proxy_params, method_ret, -1, is_private_actor, "", "", actor_line, actor_col)
+        ast::ast_set_int_val(ast_store, proxy_func, 3)
+        var proxy_final = resolve_build_name(prefix, proxy_name)
+        var proxy_entry = ResolverEntry { ast_store: ast_store, node_id: proxy_func, name: proxy_final, tag: 0 }
+        all_funcs.push(proxy_entry)
+
+        # For non-void methods: async variant returns reply channel handle (for select)
+        var is_void_check = method_ret == "Void" or method_ret == "void" or str_byte_len(method_ret) == 0
+        if is_void_check == false
+          var async_params = vec_new()
+          var async_self = ast::ast_param(ast_store, "self", actor_name, 0, 0, actor_line, actor_col)
+          async_params.push(async_self)
+          if orig_params > 0
+            var async_op_count = vec_size(orig_params)
+            for async_op_i in 0..async_op_count
+              async_params.push(orig_params[async_op_i])
+            end
+          end
+          var async_name = "#{actor_name}$#{method_name}_async"
+          var async_func = ast::ast_function(ast_store, async_name, async_params, "Int", -1, is_private_actor, "", "", actor_line, actor_col)
+          ast::ast_set_int_val(ast_store, async_func, 3)
+          var async_final = resolve_build_name(prefix, async_name)
+          var async_entry = ResolverEntry { ast_store: ast_store, node_id: async_func, name: async_final, tag: 0 }
+          all_funcs.push(async_entry)
+        end
+      end
+
+      # 5. Synthesize stop method: ActorName$stop(self: ActorName) -> Int (synchronous shutdown)
+      var stop_params = vec_new()
+      var stop_self = ast::ast_param(ast_store, "self", actor_name, 0, 0, actor_line, actor_col)
+      stop_params.push(stop_self)
+      var stop_name = "#{actor_name}$stop"
+      var stop_func = ast::ast_function(ast_store, stop_name, stop_params, "Int", -1, is_private_actor, "", "", actor_line, actor_col)
+      ast::ast_set_int_val(ast_store, stop_func, 3)
+      var stop_final = resolve_build_name(prefix, stop_name)
+      var stop_entry = ResolverEntry { ast_store: ast_store, node_id: stop_func, name: stop_final, tag: 0 }
+      all_funcs.push(stop_entry)
+
+      # 6. Synthesize link/unlink/monitor/demonitor methods (Phase 10: Process Links & Monitors)
+      # link(self, other): bidirectional failure propagation
+      var link_params = vec_new()
+      link_params.push(ast::ast_param(ast_store, "self", actor_name, 0, 0, actor_line, actor_col))
+      link_params.push(ast::ast_param(ast_store, "other", "Int", 0, 0, actor_line, actor_col))
+      var link_name = "#{actor_name}$link"
+      var link_func = ast::ast_function(ast_store, link_name, link_params, "Void", -1, is_private_actor, "", "", actor_line, actor_col)
+      ast::ast_set_int_val(ast_store, link_func, 3)
+      var link_final = resolve_build_name(prefix, link_name)
+      all_funcs.push(ResolverEntry { ast_store: ast_store, node_id: link_func, name: link_final, tag: 0 })
+
+      # unlink(self, other): remove bidirectional link
+      var unlink_params = vec_new()
+      unlink_params.push(ast::ast_param(ast_store, "self", actor_name, 0, 0, actor_line, actor_col))
+      unlink_params.push(ast::ast_param(ast_store, "other", "Int", 0, 0, actor_line, actor_col))
+      var unlink_name = "#{actor_name}$unlink"
+      var unlink_func = ast::ast_function(ast_store, unlink_name, unlink_params, "Void", -1, is_private_actor, "", "", actor_line, actor_col)
+      ast::ast_set_int_val(ast_store, unlink_func, 3)
+      var unlink_final = resolve_build_name(prefix, unlink_name)
+      all_funcs.push(ResolverEntry { ast_store: ast_store, node_id: unlink_func, name: unlink_final, tag: 0 })
+
+      # monitor(self, target): unidirectional observation (self watches target)
+      var mon_params = vec_new()
+      mon_params.push(ast::ast_param(ast_store, "self", actor_name, 0, 0, actor_line, actor_col))
+      mon_params.push(ast::ast_param(ast_store, "target", "Int", 0, 0, actor_line, actor_col))
+      var mon_name = "#{actor_name}$monitor"
+      var mon_func = ast::ast_function(ast_store, mon_name, mon_params, "Void", -1, is_private_actor, "", "", actor_line, actor_col)
+      ast::ast_set_int_val(ast_store, mon_func, 3)
+      var mon_final = resolve_build_name(prefix, mon_name)
+      all_funcs.push(ResolverEntry { ast_store: ast_store, node_id: mon_func, name: mon_final, tag: 0 })
+
+      # demonitor(self, target): remove monitoring
+      var demon_params = vec_new()
+      demon_params.push(ast::ast_param(ast_store, "self", actor_name, 0, 0, actor_line, actor_col))
+      demon_params.push(ast::ast_param(ast_store, "target", "Int", 0, 0, actor_line, actor_col))
+      var demon_name = "#{actor_name}$demonitor"
+      var demon_func = ast::ast_function(ast_store, demon_name, demon_params, "Void", -1, is_private_actor, "", "", actor_line, actor_col)
+      ast::ast_set_int_val(ast_store, demon_func, 3)
+      var demon_final = resolve_build_name(prefix, demon_name)
+      all_funcs.push(ResolverEntry { ast_store: ast_store, node_id: demon_func, name: demon_final, tag: 0 })
+    end
+  end
+end
+
+## Extract base path from a file path (everything up to and including last /).
+## Used to calculate the directory for resolving relative imports.
+##
+## Examples:
+##   "self-hosted/frontend/lexer.qz" -> "self-hosted/frontend/"
+##   "main.qz" -> "./"
+##
+## Parameters:
+##   path - Full file path
+##
+## Returns: Directory path ending with /
+def resolve_get_base_path(path: String): String
+  var last_slash = 0
+  var len = str_byte_len(path)
+  for i in 0..len
+    var c = str_byte_at(path, i)
+    if c == '/'
+      last_slash = i
+    end
+  end
+  return "./" if last_slash == 0
+  return str_byte_slice(path, 0, last_slash + 1)
+end
+
+## Collect local function names from a module (just the names, not prefixed).
+## Used to know which calls need rewriting.
+def resolve_collect_local_func_names(ast_store: ast::AstStorage, program: AstNodeId): Vec<String>
+  var names = vec_new<String>()
+  var children = ast::ast_get_children(ast_store, program)
+  for i in 0..children.size
+    var item = children[i]
+    var kind = ast::ast_get_kind(ast_store, item)
+    # NODE_FUNCTION = 34
+    if kind == 34
+      var name = ast::ast_get_str1(ast_store, item)
+      names.push(name)
+    end
+    # NODE_ENUM_DEF = 38 - collect enum names for cross-module rewriting
+    if kind == 38
+      var name = ast::ast_get_str1(ast_store, item)
+      names.push(name)
+    end
+    # NODE_IMPL_BLOCK = 51 - collect mangled method names (Type$method)
+    if kind == 51
+      var for_type = ast::ast_get_str2(ast_store, item)
+      var methods = ast::ast_get_children(ast_store, item)
+      if methods != 0
+        for m in 0..methods.size
+          var method = methods[m]
+          var method_name = ast::ast_get_str1(ast_store, method)
+          var mangled = string_intern::mangle(for_type, method_name)
+          names.push(mangled)
+        end
+      end
+    end
+    # NODE_EXTEND_BLOCK = 52 - collect mangled method names (Type$method)
+    if kind == 52
+      var for_type = ast::ast_get_str1(ast_store, item)
+      var methods = ast::ast_get_children(ast_store, item)
+      if methods != 0
+        for m in 0..methods.size
+          var method = methods[m]
+          var method_name = ast::ast_get_str1(ast_store, method)
+          var mangled = string_intern::mangle(for_type, method_name)
+          names.push(mangled)
+        end
+      end
+    end
+  end
+  return names
+end
+
+## Collect names of private functions (those with is_private=1).
+def resolve_collect_private_func_names(ast_store: ast::AstStorage, program: AstNodeId): Vec<String>
+  var names = vec_new<String>()
+  var children = ast::ast_get_children(ast_store, program)
+  for i in 0..children.size
+    var item = children[i]
+    var kind = ast::ast_get_kind(ast_store, item)
+    if kind == 34
+      var is_private = ast::ast_get_int_val(ast_store, item)
+      if is_private == 1
+        var name = ast::ast_get_str1(ast_store, item)
+        names.push(name)
+      end
+    end
+  end
+  return names
+end
+
+## Collect local let/const variable names for ident rewriting.
+def resolve_collect_local_let_names(ast_store: ast::AstStorage, program: AstNodeId): Vec<String>
+  var names = vec_new<String>()
+  var children = ast::ast_get_children(ast_store, program)
+  for i in 0..children.size
+    var item = children[i]
+    var kind = ast::ast_get_kind(ast_store, item)
+    # NODE_LET = 25
+    if kind == 25
+      var name = ast::ast_get_str1(ast_store, item)
+      if not name.contains("$")
+        names.push(name)
+      end
+    end
+    # NODE_GLOBAL_VAR = 49
+    if kind == 49
+      var name = ast::ast_get_str1(ast_store, item)
+      if not name.contains("$")
+        names.push(name)
+      end
+    end
+    # NODE_CONST_DECL = 69
+    if kind == 69
+      var name = ast::ast_get_str1(ast_store, item)
+      if not name.contains("$")
+        names.push(name)
+      end
+    end
+  end
+  return names
+end
+
+## Collect the parameter names of a NODE_FUNCTION / method node.
+## Params live on the node's `left` slot as a Vec of NODE_PARAM ids; each
+## param's name is its `str1`. Used as a shadow-exclusion set so a bareword
+## matching a same-module free function is NOT rewritten to a func-value ref
+## when it is actually the enclosing function's parameter (innermost wins).
+def resolve_collect_param_names(ast_store: ast::AstStorage, func: AstNodeId): Vec<String>
+  var names = vec_new<String>()
+  var params = ast::ast_get_left(ast_store, func)
+  if params > 0
+    for p in 0..vec_size(params)
+      var name = ast::ast_get_str1(ast_store, params[p])
+      if str_byte_len(name) > 0
+        names.push(name)
+      end
+    end
+  end
+  return names
+end
+
+## Check if a name is in the local function list.
+def resolve_is_local_func(local_funcs: Vec<String>, name: String): Int
+  return 1 if any?(local_funcs, s: String -> s == name)
+  return 0
+end
+
+## Check if a name matches any loaded module's short name.
+## Used for UFCS→module call transformation (e.g., math.add → math$add).
+def resolve_is_module_short_name(loaded: Vec<String>, name: String): Int
+  return 1 if any?(loaded, mod_name: String -> resolve_get_short_name(mod_name).eq(name))
+  return 0
+end
+
+## Transform UFCS calls to module-qualified calls.
+## When first arg is a module name, rewrites: func(module, args) → module$func(args)
+## This must happen BEFORE type checking so the type checker sees the correct function names.
+def resolve_transform_ufcs_node(ast_store: ast::AstStorage, node: AstNodeId, loaded: Vec<String>): Void
+  return if node <= 0
+  
+  var kind = ast::ast_get_kind(ast_store, node)
+  
+  # NK_CALL = 9 - check for UFCS pattern
+  if kind == 9
+    var callee = ast::ast_get_left(ast_store, node)
+    var args = ast::ast_get_children(ast_store, node)
+    var arg_count = args.size
+    
+    # Only check calls with at least 1 arg (potential UFCS)
+    if arg_count > 0
+      var first_arg = args[0]
+      var first_kind = ast::ast_get_kind(ast_store, first_arg)
+      
+      # NK_IDENT = 6 - check if first arg is a module name
+      if first_kind == 6
+        var maybe_module = ast::ast_get_str1(ast_store, first_arg)
+        # Only remove first arg if this is a UFCS call AND first arg matches a module name
+        # This prevents breaking legitimate calls like parse(json, data) where json is a local var
+        if resolve_is_module_short_name(loaded, maybe_module)
+          # Skip module rewrite if the name matches a function parameter
+          # (it's a variable, not a module reference — prefer UFCS)
+          var is_param = any?(_ufcs_current_params, pn: String -> pn == maybe_module)
+          if is_param == false and ast::ast_call_is_ufcs(ast_store, node)
+            # Get the function name from callee
+            var callee_kind = ast::ast_get_kind(ast_store, callee)
+            if callee_kind == 6
+              var func_name = ast::ast_get_str1(ast_store, callee)
+              # Skip if already prefixed (has $)
+              if resolve_has_prefix(func_name) == 0
+                # Create new prefixed name: module$func
+                var new_name = "#{maybe_module}$"
+                new_name = "#{new_name}#{func_name}"
+                # Only rewrite if this function actually exists in the module
+                # Prevents collision when a local variable shares a module name
+                var func_exists = false
+                for _kf in 0.._resolve_known_funcs.size()
+                  if _resolve_known_funcs.get(_kf) == new_name
+                    func_exists = true
+                    break
+                  end
+                end
+                if func_exists
+                  ast::ast_set_str1(ast_store, callee, new_name)
+                  # Remove first arg (the module reference)
+                  var new_args = vec_new()
+                  for j in 1..arg_count
+                    new_args.push(args[j])
+                  end
+                  ast::ast_set_children(ast_store, node, new_args)
+                  # Update args for recursion below
+                  args = new_args
+                  arg_count = args.size
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    
+    # Recurse on callee and all args
+    resolve_transform_ufcs_node(ast_store, callee, loaded)
+    each(args, a: Int -> resolve_transform_ufcs_node(ast_store, a, loaded))
+    return
+  end
+  
+  # NK_BLOCK = 32 — recurse on children with sequential scope tracking.
+  # Each statement's bindings become visible to subsequent siblings, then
+  # the whole block's bindings pop at block exit.
+  if kind == 32
+    var children = ast::ast_get_children(ast_store, node)
+    var scope_before = vec_size(_ufcs_current_params)
+    for bi in 0..children.size
+      var child = children[bi]
+      resolve_transform_ufcs_node(ast_store, child, loaded)
+      _ufcs_push_stmt_bindings(ast_store, child)
+    end
+    _ufcs_trunc_scope(scope_before)
+    return
+  end
+
+  # NK_IF = 23
+  if kind == 23
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_right(ast_store, node), loaded)
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_extra(ast_store, node), loaded)
+    return
+  end
+
+  # NK_WHILE = 24
+  if kind == 24
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_right(ast_store, node), loaded)
+    return
+  end
+
+  # NK_FOR = 44 — walk iter first, then push loop var into scope for the body.
+  # str1 holds the loop variable name; extra holds an optional index binding
+  # (not currently set by the parser but reserved).
+  if kind == 44
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    var scope_before = vec_size(_ufcs_current_params)
+    var iter_name = ast::ast_get_str1(ast_store, node)
+    if iter_name != ""
+      _ufcs_current_params.push(iter_name)
+    end
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_right(ast_store, node), loaded)
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_extra(ast_store, node), loaded)
+    _ufcs_trunc_scope(scope_before)
+    return
+  end
+
+  # NODE_FOR_AWAIT = 86 — same shape as NODE_FOR, binding in str1.
+  if kind == 86
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    var scope_before = vec_size(_ufcs_current_params)
+    var iter_name = ast::ast_get_str1(ast_store, node)
+    if iter_name != ""
+      _ufcs_current_params.push(iter_name)
+    end
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_right(ast_store, node), loaded)
+    _ufcs_trunc_scope(scope_before)
+    return
+  end
+  
+  # NK_RETURN = 22
+  if kind == 22
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    return
+  end
+  
+  # NK_BINARY = 8, NK_UNARY = 7
+  if kind == 8 || kind == 7
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_right(ast_store, node), loaded)
+    return
+  end
+  
+  # NK_LET = 25 - value is in left slot (not right) — see resolve_rewrite_node:1024
+  if kind == 25
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    return
+  end
+
+  # NODE_LET_DESTRUCTURE = 78 — walk init expression
+  if kind == 78
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    return
+  end
+
+  # NODE_STRUCT_DESTRUCTURE = 79 / NODE_VEC_DESTRUCTURE = 80 — walk init expression
+  if kind == 79 or kind == 80
+    var init_node = ast::ast_get_left(ast_store, node)
+    if init_node > 0
+      resolve_transform_ufcs_node(ast_store, init_node, loaded)
+    end
+    return
+  end
+
+  # NK_ASSIGN = 26 - value is in left slot (not right) — see resolve_rewrite_node:1030
+  if kind == 26
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    return
+  end
+
+  # NK_INDEX_ASSIGN = 27 - target, index, AND value — see resolve_rewrite_node:1036
+  if kind == 27
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_right(ast_store, node), loaded)
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_extra(ast_store, node), loaded)
+    return
+  end
+
+  # NK_FIELD_ASSIGN = 28 - object (left) and value (extra, not right) — see resolve_rewrite_node:1044
+  if kind == 28
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_extra(ast_store, node), loaded)
+    return
+  end
+  
+  # NK_EXPR_STMT = 29
+  if kind == 29
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    return
+  end
+  
+  # NK_INDEX = 13
+  if kind == 13
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_right(ast_store, node), loaded)
+    return
+  end
+  
+  # NK_FIELD_ACCESS = 15, NK_SAFE_FIELD_ACCESS = 16
+  if kind == 15 || kind == 16
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    return
+  end
+  
+  # NODE_SPREAD = 82
+  if kind == 82
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    return
+  end
+
+  # NK_ARRAY = 10, NK_MAP_LIT = 12
+  if kind == 10 || kind == 12
+    var elements = ast::ast_get_children(ast_store, node)
+    var count = elements.size
+    each(elements, e: Int -> resolve_transform_ufcs_node(ast_store, e, loaded))
+    return
+  end
+  
+  # NK_STRUCT_INIT = 14
+  if kind == 14
+    var values = ast::ast_get_children(ast_store, node)
+    var count = values.size
+    each(values, v: Int -> resolve_transform_ufcs_node(ast_store, v, loaded))
+    # C.1 spread base lives in `lefts` until tc desugar.
+    var su_base = ast::ast_get_left(ast_store, node)
+    if su_base != 0
+      resolve_transform_ufcs_node(ast_store, su_base, loaded)
+    end
+    return
+  end
+  
+  # NK_MATCH = 40
+  if kind == 40
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    var arms = ast::ast_get_children(ast_store, node)
+    var count = arms.size
+    each(arms, arm: Int -> resolve_transform_ufcs_node(ast_store, ast::ast_get_right(ast_store, arm), loaded))
+    return
+  end
+  
+  # NK_LAMBDA = 19 — push lambda params, recurse into body, restore.
+  if kind == 19
+    var scope_before = vec_size(_ufcs_current_params)
+    var l_params = ast::ast_get_left(ast_store, node)
+    if l_params > 0
+      var l_pc = vec_size(l_params)
+      for lp_i in 0..l_pc
+        var pname = ast::ast_get_str1(ast_store, l_params[lp_i])
+        if pname != ""
+          _ufcs_current_params.push(pname)
+        end
+      end
+    end
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_right(ast_store, node), loaded)
+    _ufcs_trunc_scope(scope_before)
+    return
+  end
+  
+  # NK_COMPOUND_ASSIGN = 45
+  if kind == 45
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_right(ast_store, node), loaded)
+    return
+  end
+  
+  # NK_TRY_EXPR = 17
+  if kind == 17
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    return
+  end
+  
+  # NK_INTERP_STRING = 43
+  if kind == 43
+    var parts = ast::ast_get_children(ast_store, node)
+    var count = parts.size
+    each(parts, p: Int -> resolve_transform_ufcs_node(ast_store, p, loaded))
+    return
+  end
+  
+  # NodeFunction = 34 - recurse into function body
+  if kind == 34
+    # Extract parameter names so UFCS transform can distinguish params from modules
+    var prev_params = _ufcs_current_params
+    _ufcs_current_params = vec_new<String>()
+    var fn_params = ast::ast_get_left(ast_store, node)
+    if fn_params > 0
+      var fn_pc = vec_size(fn_params)
+      for fp_i in 0..fn_pc
+        _ufcs_current_params.push(ast::ast_get_str1(ast_store, fn_params[fp_i]))
+      end
+    end
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_right(ast_store, node), loaded)
+    _ufcs_current_params = prev_params
+    return
+  end
+  
+  # NodeConstDecl = 69 - recurse into initializer
+  if kind == 69
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_right(ast_store, node), loaded)
+    return
+  end
+  
+  # NodeStaticAssert = 70 - recurse into condition
+  if kind == 70
+    resolve_transform_ufcs_node(ast_store, ast::ast_get_left(ast_store, node), loaded)
+    return
+  end
+end
+
+## Transform all UFCS calls in a program to module-qualified calls.
+def resolve_transform_ufcs(ast_store: ast::AstStorage, program: AstNodeId, loaded: Vec<String>): Void
+  var children = ast::ast_get_children(ast_store, program)
+  each(children, c: Int -> resolve_transform_ufcs_node(ast_store, c, loaded))
+end
+
+## Recursively rewrite calls in an AST node.
+## For any call to a local function, prefix the name with module$
+## Private functions use $$ instead of $ for visibility enforcement.
+def resolve_rewrite_node(ast_store: ast::AstStorage, node: AstNodeId, prefix: String, local_funcs: Vec<String>, local_lets: Vec<String>, private_funcs: Vec<String>, param_names: Vec<String>): Void
+  return if node == 0
+
+  var kind = ast::ast_get_kind(ast_store, node)
+
+  # NK_IDENT = 6 - check if ident is a local let/const OR a local function
+  # and prefix it.
+  #
+  # Function-as-value rewrite: when a function name appears in expression
+  # position (passed as argument, used as struct-field initializer, stored
+  # in a variable), the resolver must apply the same module-prefix rewrite
+  # the CALL-position handler does. Without this, the bare name reaches
+  # mir_lower's NODE_IDENT branch unprefixed, fails the function-registry
+  # lookup (function is registered as `<prefix>$<name>`), and falls
+  # through to the const-global LOAD_VAR path — emitting
+  # `load i64, ptr %<name>` against an undefined SSA register.
+  # Discovered 2026-05-03 during TUI runtime dogfood: `Program { recorder:
+  # no_recorder }` failed with `use of undefined value '%no_recorder'`
+  # at llc time.
+  if kind == 6
+    var ident_name = ast::ast_get_str1(ast_store, node)
+    # Innermost binding wins: a param of the enclosing function shadows any
+    # same-named module-level free function. Never rewrite a param bareword to
+    # a func-value ref (silent miscompile: it would load a code address).
+    if any?(param_names, s: String -> s == ident_name)
+      return
+    end
+    if resolve_has_prefix(ident_name) == 0
+      if any?(local_lets, s: String -> s == ident_name)
+        var new_name = "#{prefix}$"
+        new_name = "#{new_name}#{ident_name}"
+        ast::ast_set_str1(ast_store, node, new_name)
+      elsif resolve_is_local_func(local_funcs, ident_name)
+        # Mirrors the CALL-position handler below: $$ for private, $ for public.
+        var sep = "$"
+        if resolve_is_local_func(private_funcs, ident_name)
+          sep = "$$"
+        end
+        var new_name = "#{prefix}#{sep}"
+        new_name = "#{new_name}#{ident_name}"
+        ast::ast_set_str1(ast_store, node, new_name)
+      end
+    end
+    return
+  end
+
+  # NK_CALL = 9 - check if callee is a local function and rewrite
+  if kind == 9
+    var callee = ast::ast_get_left(ast_store, node)
+    if callee != 0
+      var callee_kind = ast::ast_get_kind(ast_store, callee)
+      # NK_IDENT = 6 - direct function call by name
+      if callee_kind == 6
+        var call_name = ast::ast_get_str1(ast_store, callee)
+        # Skip already-prefixed names to prevent double-prefix (Bug 1)
+        # e.g., value$serialize should NOT become toml$value$serialize
+        # Innermost binding wins: a same-named param shadows the free function.
+        if resolve_has_prefix(call_name) == 0 and not any?(param_names, s: String -> s == call_name)
+          if resolve_is_local_func(local_funcs, call_name)
+            # Use $$ for private functions, $ for public (Bug 4 fix)
+            var sep = "$"
+            if resolve_is_local_func(private_funcs, call_name)
+              sep = "$$"
+            end
+            var new_name = "#{prefix}#{sep}"
+            new_name = "#{new_name}#{call_name}"
+            ast::ast_set_str1(ast_store, callee, new_name)
+          end
+        end
+      end
+      resolve_rewrite_node(ast_store,callee, prefix, local_funcs, local_lets, private_funcs, param_names)
+    end
+    # Rewrite in call arguments
+    var args = ast::ast_get_children(ast_store, node)
+    if args != 0
+      each(args, arg: Int -> resolve_rewrite_node(ast_store,arg, prefix, local_funcs, local_lets, private_funcs, param_names))
+    end
+    return
+  end
+  
+  # NK_BLOCK = 32 - rewrite in all statements
+  if kind == 32
+    var stmts = ast::ast_get_children(ast_store, node)
+    if stmts != 0
+      each(stmts, stmt: Int -> resolve_rewrite_node(ast_store,stmt, prefix, local_funcs, local_lets, private_funcs, param_names))
+    end
+    return
+  end
+  
+  # NK_IF = 23 - rewrite in condition, then, else
+  if kind == 23
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    resolve_rewrite_node(ast_store,ast::ast_get_right(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    resolve_rewrite_node(ast_store,ast::ast_get_extra(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  
+  # NK_WHILE = 24 - rewrite in condition and body
+  if kind == 24
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    resolve_rewrite_node(ast_store,ast::ast_get_right(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  
+  # NK_FOR = 44 - rewrite in iterator and body (body is slot 8, not slot 9)
+  if kind == 44
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    resolve_rewrite_node(ast_store,ast::ast_get_right(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  
+  # NK_RETURN = 22 - rewrite in value
+  if kind == 22
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  
+  # NK_BINARY = 8 - rewrite in left and right
+  if kind == 8
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    resolve_rewrite_node(ast_store,ast::ast_get_right(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  
+  # NK_UNARY = 7 - rewrite in operand
+  if kind == 7
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  
+  # NK_LET = 25 - rewrite target name (if module-level var) and initializer
+  if kind == 25
+    # Rewrite target if it refers to a module-level var/const (bare reassignment)
+    var let_name = ast::ast_get_str1(ast_store, node)
+    if resolve_has_prefix(let_name) == 0
+      if any?(local_lets, s: String -> s == let_name)
+        var new_name = "#{prefix}$"
+        new_name = "#{new_name}#{let_name}"
+        ast::ast_set_str1(ast_store, node, new_name)
+      end
+    end
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+
+  # NODE_LET_DESTRUCTURE = 78 — rewrite in init expression
+  if kind == 78
+    resolve_rewrite_node(ast_store, ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+
+  # NODE_STRUCT_DESTRUCTURE = 79 / NODE_VEC_DESTRUCTURE = 80 — rewrite in init expression
+  if kind == 79 or kind == 80
+    var init_node = ast::ast_get_left(ast_store, node)
+    if init_node > 0
+      resolve_rewrite_node(ast_store, init_node, prefix, local_funcs, local_lets, private_funcs, param_names)
+    end
+    return
+  end
+
+  # NK_ASSIGN = 26 - rewrite target name AND value (value is in slot 7/left)
+  if kind == 26
+    # Rewrite assignment target if it refers to a module-level var/const
+    var target_name = ast::ast_get_str1(ast_store, node)
+    if resolve_has_prefix(target_name) == 0
+      if any?(local_lets, s: String -> s == target_name)
+        var new_name = "#{prefix}$"
+        new_name = "#{new_name}#{target_name}"
+        ast::ast_set_str1(ast_store, node, new_name)
+      end
+    end
+    # Rewrite assignment value (existing behavior)
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  
+  # NK_INDEX_ASSIGN = 27 - rewrite in target, index, value
+  if kind == 27
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    resolve_rewrite_node(ast_store,ast::ast_get_right(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    resolve_rewrite_node(ast_store,ast::ast_get_extra(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  
+  # NK_FIELD_ASSIGN = 28 - rewrite in object and value (value is in extra slot)
+  if kind == 28
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    resolve_rewrite_node(ast_store,ast::ast_get_extra(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  
+  # NK_EXPR_STMT = 29 - rewrite in expression
+  if kind == 29
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  
+  # NK_INDEX = 13 - rewrite in array and index
+  if kind == 13
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    resolve_rewrite_node(ast_store,ast::ast_get_right(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  
+  # NK_FIELD_ACCESS = 15, NK_SAFE_FIELD_ACCESS = 16 - rewrite in object
+  if kind == 15
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  if kind == 16
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  
+  # NODE_SPREAD = 82 - rewrite inner
+  if kind == 82
+    resolve_rewrite_node(ast_store, ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+
+  # NK_ARRAY = 10, NK_MAP_LIT = 12 - rewrite in elements
+  if kind == 10
+    var elems = ast::ast_get_children(ast_store, node)
+    if elems != 0
+      each(elems, e: Int -> resolve_rewrite_node(ast_store,e, prefix, local_funcs, local_lets, private_funcs, param_names))
+    end
+    return
+  end
+  if kind == 12
+    var elems = ast::ast_get_children(ast_store, node)
+    if elems != 0
+      each(elems, e: Int -> resolve_rewrite_node(ast_store,e, prefix, local_funcs, local_lets, private_funcs, param_names))
+    end
+    return
+  end
+  
+  # NK_STRUCT_INIT = 14 - rewrite in field values.
+  #
+  # Field children are the value expressions DIRECTLY (the struct-init
+  # AST stores parallel `children` (values) and `extras` (field_names)
+  # vecs — there is no field-binding wrapper node). The pre-fix code
+  # recursed on `ast_get_right(field)` which is 0 for NODE_IDENT and
+  # most other expression nodes, so field values were silently never
+  # visited. This explains why stdlib (e.g. std/iter.qz:329) had to use
+  # lambdas instead of bare function references for Fn-typed fields:
+  # lambda nodes have non-zero right/extra slots that the buggy recursion
+  # happened to visit. Bare function references in field position fell
+  # through unprefixed and broke at codegen time.
+  # Discovered 2026-05-03 during TUI runtime dogfood.
+  if kind == 14
+    var fields = ast::ast_get_children(ast_store, node)
+    if fields != 0
+      each(fields, field: Int -> resolve_rewrite_node(ast_store, field, prefix, local_funcs, local_lets, private_funcs, param_names))
+    end
+    # C.1 spread base lives in `lefts` until tc desugar.
+    var su_base = ast::ast_get_left(ast_store, node)
+    if su_base != 0
+      resolve_rewrite_node(ast_store, su_base, prefix, local_funcs, local_lets, private_funcs, param_names)
+    end
+    return
+  end
+  
+  # NK_MATCH = 40 - rewrite in subject, arm patterns, and arm bodies
+  if kind == 40
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    var arms = ast::ast_get_children(ast_store, node)
+    if arms != 0
+      for arm_i in 0..arms.size
+        var arm = arms[arm_i]
+        # Rewrite pattern (left) — needed for enum access patterns
+        resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, arm), prefix, local_funcs, local_lets, private_funcs, param_names)
+        # Rewrite body (right)
+        resolve_rewrite_node(ast_store,ast::ast_get_right(ast_store, arm), prefix, local_funcs, local_lets, private_funcs, param_names)
+      end
+    end
+    return
+  end
+  
+  # NK_LAMBDA = 19 - rewrite in body (body is in right slot)
+  if kind == 19
+    resolve_rewrite_node(ast_store,ast::ast_get_right(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  
+  # NK_COMPOUND_ASSIGN = 45 - rewrite in value
+  if kind == 45
+    resolve_rewrite_node(ast_store,ast::ast_get_right(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  
+  # NK_TRY_EXPR = 17 - rewrite in inner expression
+  if kind == 17
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  
+  # NK_INTERP_STRING = 43 - rewrite in interpolation parts
+  if kind == 43
+    var parts = ast::ast_get_children(ast_store, node)
+    if parts != 0
+      each(parts, p: Int -> resolve_rewrite_node(ast_store,p, prefix, local_funcs, local_lets, private_funcs, param_names))
+    end
+    return
+  end
+  
+  # NodeConstDecl = 69 - rewrite in initializer
+  if kind == 69
+    resolve_rewrite_node(ast_store,ast::ast_get_right(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+  
+  # NodeStaticAssert = 70 - rewrite in condition
+  if kind == 70
+    resolve_rewrite_node(ast_store,ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+
+  # NODE_ENUM_ACCESS = 39 - rewrite enum name for cross-module refs
+  if kind == 39
+    var enum_name = ast::ast_get_str1(ast_store, node)
+    if str_byte_len(enum_name) > 0
+      if resolve_has_prefix(enum_name) == 0
+        if resolve_is_local_func(local_funcs, enum_name)
+          var new_name = "#{prefix}$#{enum_name}"
+          ast::ast_set_str1(ast_store, node, new_name)
+        end
+      end
+    end
+    # Recurse on payloads
+    var payloads = ast::ast_get_children(ast_store, node)
+    if payloads != 0
+      for pi in 0..payloads.size
+        resolve_rewrite_node(ast_store, payloads[pi], prefix, local_funcs, local_lets, private_funcs, param_names)
+      end
+    end
+    return
+  end
+
+  # NODE_GO = 85 / NODE_ASYNC_CALL = 84 — wrappers around an inner NODE_CALL
+  # held in slot `left`. Without recursion the inner call's arg list (and any
+  # bare module-level idents inside it) escapes the prefix-rewrite pass, so a
+  # `go fn(_modvar)` site stays unprefixed and breaks scope lookup once the
+  # binding has been registered as `<alias>$_modvar`. Same shape applies to
+  # `await ...`-targeted ASYNC_CALL invocations.
+  if kind == 85 or kind == 84
+    resolve_rewrite_node(ast_store, ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+
+  # NODE_AWAIT = 58 — await <expr>. Single operand in `left`.
+  if kind == 58
+    resolve_rewrite_node(ast_store, ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+
+  # NODE_YIELD = 83 — yield <expr>. Single operand in `left`.
+  if kind == 83
+    resolve_rewrite_node(ast_store, ast::ast_get_left(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    return
+  end
+
+  # NODE_TUPLE_LITERAL = 77 — children carry the elements.
+  if kind == 77
+    var tuple_elems = ast::ast_get_children(ast_store, node)
+    if tuple_elems != 0
+      each(tuple_elems, te: Int -> resolve_rewrite_node(ast_store, te, prefix, local_funcs, local_lets, private_funcs, param_names))
+    end
+    return
+  end
+
+  # NODE_WITH = 101 — handler-installation block. Right slot holds the body
+  # (body lambda OR direct expression); children carry handler op bindings,
+  # each a NODE_FIELD_DEF-shaped node whose right slot is the handler expr.
+  if kind == 101
+    resolve_rewrite_node(ast_store, ast::ast_get_right(ast_store, node), prefix, local_funcs, local_lets, private_funcs, param_names)
+    var with_handlers = ast::ast_get_children(ast_store, node)
+    if with_handlers != 0
+      for whi in 0..with_handlers.size
+        var wh = with_handlers[whi]
+        # Each handler binding: rewrite both slots conservatively.
+        resolve_rewrite_node(ast_store, ast::ast_get_left(ast_store, wh), prefix, local_funcs, local_lets, private_funcs, param_names)
+        resolve_rewrite_node(ast_store, ast::ast_get_right(ast_store, wh), prefix, local_funcs, local_lets, private_funcs, param_names)
+      end
+    end
+    return
+  end
+
+  # Other node types (literals, idents, etc.) - no recursion needed
+end
+
+## Rewrite all calls in function bodies to use prefixed names.
+## Must be called BEFORE type checking since type checker uses prefixed names.
+def resolve_rewrite_calls(ast_store: ast::AstStorage, program: AstNodeId, prefix: String): Void
+  # First collect local function names, let/const names, and private function names
+  var local_funcs = resolve_collect_local_func_names(ast_store, program)
+  var local_lets = resolve_collect_local_let_names(ast_store, program)
+  var private_funcs = resolve_collect_private_func_names(ast_store, program)
+
+  # Const/global initializers have no enclosing function → no params to shadow.
+  var empty_params = vec_new<String>()
+
+  # Now rewrite calls and ident references in each top-level item
+  var children = ast::ast_get_children(ast_store, program)
+  return if children == 0
+  var count = children.size
+  for i in 0..count
+    var item = children[i]
+    var kind = ast::ast_get_kind(ast_store, item)
+    # NODE_FUNCTION = 34 - rewrite in body
+    if kind == 34
+      var body = ast::ast_get_right(ast_store, item)
+      if body != 0
+        var fn_params = resolve_collect_param_names(ast_store, item)
+        resolve_rewrite_node(ast_store, body, prefix, local_funcs, local_lets, private_funcs, fn_params)
+      end
+    end
+    # NODE_CONST_DECL = 69 - rewrite name and initializer
+    if kind == 69
+      if str_byte_len(prefix) > 0
+        var cname = ast::ast_get_str1(ast_store, item)
+        if resolve_has_prefix(cname) == 0
+          ast::ast_set_str1(ast_store, item, resolve_build_name(prefix, cname))
+        end
+      end
+      var init = ast::ast_get_right(ast_store, item)
+      if init != 0
+        resolve_rewrite_node(ast_store, init, prefix, local_funcs, local_lets, private_funcs, empty_params)
+      end
+    end
+    # NODE_GLOBAL_VAR = 49 - rewrite name and initializer
+    if kind == 49
+      if str_byte_len(prefix) > 0
+        var gname = ast::ast_get_str1(ast_store, item)
+        if resolve_has_prefix(gname) == 0
+          ast::ast_set_str1(ast_store, item, resolve_build_name(prefix, gname))
+        end
+      end
+      var init = ast::ast_get_right(ast_store, item)
+      if init != 0
+        resolve_rewrite_node(ast_store, init, prefix, local_funcs, local_lets, private_funcs, empty_params)
+      end
+    end
+    # NODE_IMPL_BLOCK = 51 - rewrite in method bodies
+    if kind == 51
+      var methods = ast::ast_get_children(ast_store, item)
+      if methods != 0
+        for m in 0..methods.size
+          var method = methods[m]
+          var body = ast::ast_get_right(ast_store, method)
+          if body != 0
+            var m_params = resolve_collect_param_names(ast_store, method)
+            resolve_rewrite_node(ast_store, body, prefix, local_funcs, local_lets, private_funcs, m_params)
+          end
+        end
+      end
+    end
+    # NODE_EXTEND_BLOCK = 52 - rewrite in method bodies
+    if kind == 52
+      var methods = ast::ast_get_children(ast_store, item)
+      if methods != 0
+        for m in 0..methods.size
+          var method = methods[m]
+          var body = ast::ast_get_right(ast_store, method)
+          if body != 0
+            var m_params = resolve_collect_param_names(ast_store, method)
+            resolve_rewrite_node(ast_store, body, prefix, local_funcs, local_lets, private_funcs, m_params)
+          end
+        end
+      end
+    end
+  end
+end
+
+## Wildcard-import private-call rewrite (companion to resolve_rewrite_calls).
+##
+## A wildcard-imported module does NOT get resolve_rewrite_calls run over it:
+## the importer references its publics by bare name through the canonical
+## alias map, and its globals/consts deliberately stay bare (rewriting them
+## would diverge from the cached non-wildcard fragment). BUT the module's pub
+## functions may still call its PRIVATE siblings, which resolve_collect_funcs
+## compiles under `<prefix>$$name`. This pass rewrites ONLY those private
+## references — call position and value position — in the module's own
+## function/method bodies and const/global initializers, leaving every
+## public/let/global reference bare. It does this by feeding resolve_rewrite_node
+## an empty `local_lets` and a `local_funcs` set equal to `private_funcs`, so
+## only private names match (and always pick the `$$` separator). Private-only
+## scope is what makes it safe to run where the full rewrite is gated off.
+def resolve_rewrite_private_calls(ast_store: ast::AstStorage, program: AstNodeId, prefix: String): Void
+  var private_funcs = resolve_collect_private_func_names(ast_store, program)
+  return if private_funcs.size == 0
+  var no_lets = vec_new<String>()
+  var children = ast::ast_get_children(ast_store, program)
+  return if children == 0
+  var count = children.size
+  for i in 0..count
+    var item = children[i]
+    var kind = ast::ast_get_kind(ast_store, item)
+    # NODE_FUNCTION = 34 - rewrite private refs in body
+    if kind == 34
+      var body = ast::ast_get_right(ast_store, item)
+      if body != 0
+        var fn_params = resolve_collect_param_names(ast_store, item)
+        resolve_rewrite_node(ast_store, body, prefix, private_funcs, no_lets, private_funcs, fn_params)
+      end
+    end
+    # NODE_CONST_DECL = 69 / NODE_GLOBAL_VAR = 49 - initializer only (NOT the
+    # decl name; wildcard keeps those bare).
+    if kind == 69 or kind == 49
+      var init = ast::ast_get_right(ast_store, item)
+      if init != 0
+        resolve_rewrite_node(ast_store, init, prefix, private_funcs, no_lets, private_funcs, no_lets)
+      end
+    end
+    # NODE_IMPL_BLOCK = 51 / NODE_EXTEND_BLOCK = 52 - rewrite in method bodies
+    if kind == 51 or kind == 52
+      var methods = ast::ast_get_children(ast_store, item)
+      if methods != 0
+        for m in 0..methods.size
+          var method = methods[m]
+          var body = ast::ast_get_right(ast_store, method)
+          if body != 0
+            var m_params = resolve_collect_param_names(ast_store, method)
+            resolve_rewrite_node(ast_store, body, prefix, private_funcs, no_lets, private_funcs, m_params)
+          end
+        end
+      end
+    end
+  end
+end
+
+## Check if the main file is the prelude itself (to avoid circular import).
+def resolve_is_prelude(path: String): Int
+  var len = str_byte_len(path)
+  return 0 if len < 10
+  
+  # Check for "prelude.qz" suffix using str_slice(str, start, end)
+  var suffix = str_byte_slice(path, len - 10, len)
+  return 1 if suffix == "prelude.qz"
+  
+  return 0
+end
+
+## Check if prelude.qz exists in any of the import paths.
+## Returns 1 if found, 0 otherwise.
+def resolve_check_prelude_exists(import_paths: Vec<String>): Int
+  var found = 0
+  for i in 0..import_paths.size
+    if found == 0
+      var path: String = import_paths[i]
+      var prelude_path = str_concat(path, "/prelude.qz")
+      if fio_exists(prelude_path)
+        found = 1
+      end
+    end
+  end
+  return found
+end
+
+## Main entry point: resolve all imports and collect all functions.
+## This is the top-level function called by the compiler to handle multi-module
+## compilation.
+##
+## Parameters:
+##   ast_store    - AST storage for the main file
+##   program      - Root program node of the main file
+##   main_path    - File path of the main source file
+##   import_paths - Vector of -I include paths to search for modules
+##
+## Returns: Vector of [ast_store, func_handle, name] entries for ALL functions
+##          from all modules (imported functions prefixed, main functions unprefixed)
+def resolve_imports(ast_store: ast::AstStorage, program: AstNodeId, main_path: String, import_paths: Vec<String>): Vec<ResolverEntry>
+  var loaded = vec_new<String>()
+  var loading = vec_new<String>()
+  var all_funcs = vec_new<ResolverEntry>()
+  var base_path = resolve_get_base_path(main_path)
+
+  # Reset deferred modules for pass 2
+  _resolve_deferred_modules = vec_new<DeferredModuleInfo>()
+  # Reset the wildcard-vs-qualified dedup side-tables. Driven by the same
+  # compile-cycle boundary as _resolve_deferred_modules.
+  _resolve_mod_reg_names = vec_new<String>()
+  _resolve_mod_reg_ast_stores = vec_new<Int>()
+  _resolve_mod_reg_roots = vec_new<Int>()
+  _resolve_mod_reg_combo_keys = vec_new<String>()
+  _resolve_mod_reg_combo_mods = vec_new<String>()
+  # Cache-ro Bug B: reset wildcard canonical-mangling alias map.
+  compiler_types::ct_func_alias_reset()
+
+  # Auto-import prelude if available and not compiling prelude.qz itself
+  var is_prelude = resolve_is_prelude(main_path)
+  if is_prelude == 0
+    var prelude_exists = resolve_check_prelude_exists(import_paths)
+    if prelude_exists != 0
+      # Inject wildcard import at start of program
+      var prelude_import = ast::ast_import(ast_store, "prelude", "", 0, 1, 0, 0)
+      ast::ast_program_insert_first(ast_store, program, prelude_import)
+    end
+  end
+
+  # Initialize dependency graph for incremental compilation
+  dep_graph::depgraph_new()
+  dep_graph::depgraph_add_node("__main__", main_path)
+  dep_graph::depgraph_set_ast_store("__main__", ast_store)
+  vec_clear(_resolve_parent_stack)
+  _resolve_parent_stack.push("__main__")
+
+  # --- Pass 1: Load, parse, and collect all modules ---
+  # Functions are collected into all_funcs. UFCS and rewrite_calls are deferred
+  # so every module sees the complete loaded list (enables mutual imports).
+  # The `__main__` entry has no meaningful prefix to re-export under, so pass
+  # an empty current_prefix — `pub import` at the top level is a no-op.
+  resolve_process_imports(loaded, loading, all_funcs, base_path, import_paths, ast_store, program, "")
+  vec_pop(_resolve_parent_stack)
+
+  prof_phase("resolve_pass1")
+
+  # --- Pass 2: UFCS + rewrite_calls on all loaded modules ---
+  # Now that all module names are in `loaded`, UFCS can correctly resolve
+  # module.func() → module$func() for every module, including mutual imports.
+  # UFCS runs BEFORE rewrite_calls — otherwise intra-module rewriting would
+  # claim cross-module UFCS calls before UFCS can transform them.
+  for _dm_i in 0.._resolve_deferred_modules.size
+    var info = _resolve_deferred_modules[_dm_i]
+    resolve_transform_ufcs(info.ast_store, info.root, loaded)
+    if info.is_wildcard == 0
+      if str_byte_len(info.prefix) > 0
+        resolve_rewrite_calls(info.ast_store, info.root, info.prefix)
+      end
+    else
+      # Wildcard import: full resolve_rewrite_calls is intentionally skipped
+      # (it would rewrite global/const refs that wildcard deliberately leaves
+      # bare — see resolve_collect_funcs comment). But the module's own pub
+      # functions may call its PRIVATE siblings, which resolve_collect_funcs
+      # now compiles under `<canonical>$$name`. Rewrite ONLY those private
+      # references in this module's bodies to match; public/let/global refs
+      # are left untouched, so this cannot perturb the wildcard body-vs-entry
+      # invariant the full rewrite is gated off to protect.
+      var wc_prefix = resolve_canonical_prefix_for_ast_store(info.ast_store)
+      if str_byte_len(wc_prefix) > 0
+        resolve_rewrite_private_calls(info.ast_store, info.root, wc_prefix)
+      end
+    end
+  end
+
+  prof_phase("resolve_pass2")
+
+  # Main module: UFCS + collect
+  resolve_transform_ufcs(ast_store, program, loaded)
+  # Desugar argument-position `impl Trait` (see comment at import-time call site)
+  resolve_desugar_impl_trait_args(ast_store, program)
+  # Desugar multi-clause function definitions before collecting
+  resolve_desugar_multiclause(ast_store, program)
+  # Collect main file's functions (no prefix, don't skip private)
+  resolve_collect_funcs(ast_store, program, all_funcs, "", 0)
+
+  return all_funcs
+end

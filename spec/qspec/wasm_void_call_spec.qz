@@ -1,0 +1,184 @@
+## WASM `Void` Function Validation
+##
+## Pre-fix bug (`docs/bugs/WASM_VOID_CALL_STACK_MISMATCH.md`):
+##   1. `mir_func_get_return_type(func)` returns 0 (MIR_TYPE_INT) for every
+##      user function — `mir_new_function` never gets passed MIR_TYPE_VOID.
+##      The WASM backend's `if ret_type == 3` checks therefore never fired
+##      for source-level `Void` returns; user `def f(): Void` was emitted
+##      with a `(result i64)` signature, breaking the call-site stack
+##      balance and the body's terminator emission.
+##   2. `_wasm_emit_func_body` declared `num_i64_locals = num_ssa + num_vars`
+##      *before* the param-init loop added each parameter as a named local
+##      via `_wasm_var_local(pname)`. Functions with multiple params
+##      (e.g. `__qz_gen_yield_capture(op_name, argc, argv)`) overflowed the
+##      declared local count → wasm-validate reported "local index out of
+##      bounds". This was the bug filed at `WASM_IMPLICIT_IT_LOCAL_OOB.md`
+##      surfacing on every WASM program because of the std/gen.qz cascade.
+##   3. The unresolved-call panic-emit branch pushed an extra `i64.const 0`
+##      after `call $panic` even though `panic`'s synthesized signature is
+##      `(param i64) (result i64)` — `call` already pushed a result the
+##      `local.set` would consume. The duplicate push left an i64 on the
+##      stack at end of block.
+##
+## Each fix individually unblocks a different validation step. The
+## minimal repro `def main(): Int = return 0` exercises all three because
+## the std/gen.qz cascade pulls in `__qz_gen_yield_capture` which itself
+## calls source-level `Void` extern (`__qz_gen_stash`). Validation across
+## these three smoke programs is sufficient regression coverage.
+##
+## **Prerequisite**: requires a wasm-feature-enabled compiler. If the
+## binary at QUARTZ_COMPILER doesn't have `--feature wasm` the compile
+## step exits non-zero and the spec returns `"COMPILE_FAILED"`.
+
+import * from qspec
+import * from qspec/subprocess
+
+extern "C" def getpid(): CInt
+
+var _wv_tid = 0
+
+def _wv_compile_and_validate(source: String): String
+  _wv_tid += 1
+  var pid = getpid()
+  var src = "/tmp/_wv_#{pid}_#{_wv_tid}.qz"
+  var wasm = "/tmp/_wv_#{pid}_#{_wv_tid}.wasm"
+  write_file(src, source)
+  var compiler = getenv("QUARTZ_COMPILER")
+  if str_byte_len(compiler) == 0
+    compiler = "self-hosted/bin/quartz"
+  end
+  var cr = system("#{compiler} --backend wasm --no-cache -I . -I std #{src} -o #{wasm} 2>/dev/null")
+  if cr != 0
+    return "COMPILE_FAILED"
+  end
+  var vr = system("wasm-validate #{wasm} 2>/dev/null")
+  if vr != 0
+    return "VALIDATE_FAILED"
+  end
+  return "VALID"
+end
+
+def main(): Int
+  # A.28: the default qspec suite compiler is built without `--feature wasm`,
+  # so `--backend wasm` stubs out. Self-gate to it_pending; a feature-enabled
+  # CI lane provides real coverage.
+  if qspec_feature_wasm() == false
+    describe("WASM Void call (A.28: suite compiler lacks --feature wasm)") do ->
+      it_pending("`--backend wasm` unavailable in the default lane — feature-enabled lane covers it")
+    end
+    return qspec_main()
+  end
+
+  describe("WASM Void function validation") do ->
+    it("minimal Int main produces valid WASM") do ->
+      var s = """
+        def main(): Int
+          return 42
+        end
+        """
+      assert_eq_str(_wv_compile_and_validate(s), "VALID")
+    end
+
+    it("Void → Int caller produces valid WASM") do ->
+      var s = """
+        var g_counter = 0
+
+        def _inc(): Void
+          g_counter = g_counter + 1
+        end
+
+        def main(): Int
+          _inc()
+          return g_counter
+        end
+        """
+      assert_eq_str(_wv_compile_and_validate(s), "VALID")
+    end
+
+    it("Void → Void chain produces valid WASM") do ->
+      var s = """
+        var g_a = 0
+        var g_b = 0
+
+        def _set_a(): Void
+          g_a = 1
+        end
+
+        def _set_b(): Void
+          _set_a()
+          g_b = 1
+        end
+
+        def main(): Int
+          _set_b()
+          return g_a + g_b
+        end
+        """
+      assert_eq_str(_wv_compile_and_validate(s), "VALID")
+    end
+
+    it("Int → Void caller produces valid WASM") do ->
+      var s = """
+        var g_total = 0
+
+        def _add(n: Int): Void
+          g_total = g_total + n
+        end
+
+        def main(): Int
+          _add(10)
+          _add(20)
+          _add(12)
+          return g_total
+        end
+        """
+      assert_eq_str(_wv_compile_and_validate(s), "VALID")
+    end
+
+    # WASM_IMPLICIT_IT_LOCAL_OOB regression — the same `_wasm_var_local`
+    # vs `num_i64_locals` ordering fix that closed VOID_CALL also closes
+    # the implicit-`it` Vec local-OOB bug. Both surface on every WASM
+    # program because std/gen.qz's `__qz_gen_yield_capture(op_name, argc,
+    # argv)` is auto-cascaded and has the multi-param shape that exposes
+    # the count mismatch.
+    it("Vec.each() trailing block validates") do ->
+      var s = """
+        def main(): Int
+          v = [1, 2, 3]
+          v.each() { puts(\"\#{it}\") }
+          return 0
+        end
+        """
+      assert_eq_str(_wv_compile_and_validate(s), "VALID")
+    end
+
+    it("Vec.filter() with implicit `it` validates") do ->
+      var s = """
+        def main(): Int
+          var v = [10, 20, 30, 40, 50]
+          var r = v.filter() { it > 15 }
+          return r.size
+        end
+        """
+      assert_eq_str(_wv_compile_and_validate(s), "VALID")
+    end
+
+    # WASM_STRING_INTERP_PTR runtime behavior (pointer-vs-text) is a
+    # separate issue — the validation here only proves the module
+    # structure is well-formed, which it always was for this case. Runtime
+    # behavior assertion is blocked on the env::vec_sort import resolution
+    # gap (separate from these three bugs).
+    it("String interpolation produces valid WASM") do ->
+      var s = """
+        def main(): Int
+          var name = \"Quartz\"
+          puts(\"Hello, \#{name}!\")
+          return 0
+        end
+        """
+      assert_eq_str(_wv_compile_and_validate(s), "VALID")
+    end
+  end
+
+  return qspec_main()
+end

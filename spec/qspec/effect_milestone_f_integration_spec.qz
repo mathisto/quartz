@@ -1,0 +1,232 @@
+## Piezo Milestone F integration spec — exception-style algebraic effects.
+##
+## Operation Piezoelectric Effects, Phase 2, Milestone F integration.
+##
+## F.1 — parser retains op bodies (verified, no code)
+## F.2 — classifier tags kind=2 on any `resume` in decl body
+## F.3a — `resume(v)` in any function lowers to `return v`
+## F.3b — kind=2 perform stashes result + longjmps to with-block setjmp
+##
+## Together F.3a + F.3b deliver exception-style algebraic effects: a
+## kind=2 op's handler can return (via `return v` OR `resume(v)`) and
+## the enclosing `with` block unwinds to that value. Body code after
+## the op call never runs. Handlers without `resume` still work (kind=0/1
+## tail-resume semantics) so the D-era fast path is preserved.
+##
+## What's NOT covered by F.3a+F.3b (filed as F.3c-real, post-F follow-on):
+##   - Handler continues executing after `resume(v)` (requires CPS /
+##     state-machine reuse per memo §3). Today, resume is early-return.
+##   - Multi-shot resume (would need heap-allocated continuation frames).
+##   - Re-throw from a nested handler to an outer handler (would need
+##     shallow-handler semantics — temporarily uninstalling the frame
+##     before re-raising).
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("Piezo Milestone F integration") do ->
+    it("F.2 + F.3a: kind=2 op + handler using resume(v) unwinds block") do ->
+      # Classifier marks `escape` kind=2 (body contains resume). User
+      # handler uses `resume(msg_code)` instead of `return msg_code` —
+      # F.3a makes them equivalent; F.3b catches the return value and
+      # unwinds the with-block.
+      assert_run_stdout_eq("""
+effect Fatal
+  def escape(code: Int): Int = resume(0)
+end
+
+def die(op_name: Int, argc: Int, argv: Int): Int
+  resume(load(argv, 0) * 10)
+end
+
+def main(): Int
+  var r = with Fatal { escape: die } do ->
+    puts("before")
+    escape(7)
+    puts("after — unreachable")
+    999
+  end
+  puts(str_from_int(r))
+  return 0
+end
+""", "before\n70\n")
+    end
+
+    it("nested with-blocks: inner handler shadows outer for same effect") do ->
+      # Two `with Fatal { ... }` frames stacked. Inner catches first
+      # (perform walks top-down). Outer is shadowed for this op call.
+      assert_run_stdout_eq("""
+effect Fatal
+  def escape(code: Int): Int = resume(0)
+end
+
+def inner_h(op_name: Int, argc: Int, argv: Int): Int
+  return 111
+end
+
+def outer_h(op_name: Int, argc: Int, argv: Int): Int
+  return 222
+end
+
+def main(): Int
+  var r = with Fatal { escape: outer_h } do ->
+    var inner = with Fatal { escape: inner_h } do ->
+      escape(1)
+      0
+    end
+    inner
+  end
+  puts(str_from_int(r))
+  return 0
+end
+""", "111\n")
+    end
+
+    it("two effects + two with-blocks: inner effect stays local") do ->
+      # Stack: [outer Fatal, inner Bang]. Op bang matches inner. Op
+      # escape in outer scope matches outer. Each handler's return
+      # unwinds only its own block.
+      assert_run_stdout_eq("""
+effect Fatal
+  def escape(code: Int): Int = resume(0)
+end
+
+effect Bang
+  def boom(code: Int): Int = resume(0)
+end
+
+def fatal_h(op_name: Int, argc: Int, argv: Int): Int = 10
+def bang_h(op_name: Int, argc: Int, argv: Int): Int = 20
+
+def main(): Int
+  var r = with Fatal { escape: fatal_h } do ->
+    var b = with Bang { boom: bang_h } do ->
+      boom(99)
+      0
+    end
+    puts(str_from_int(b))
+    escape(99)
+    0
+  end
+  puts(str_from_int(r))
+  return 0
+end
+""", "20\n10\n")
+    end
+
+    it("F.3b preserves kind=1 tail semantics — body continues after call") do ->
+      # Regression guard: ops declared WITHOUT `resume` stay kind=1.
+      # Their handler return flows back to the call site, body keeps
+      # executing. Proves the kind=1 fast path (direct call + return)
+      # wasn't accidentally routed through the F.3b longjmp path.
+      assert_run_stdout_eq("""
+effect Meter
+  def tick(n: Int): Int
+end
+
+def counter(op_name: Int, argc: Int, argv: Int): Int
+  return load(argv, 0) + 1
+end
+
+def main(): Int
+  var total = with Meter { tick: counter } do ->
+    var a = tick(10)
+    var b = tick(20)
+    var c = tick(30)
+    a + b + c
+  end
+  puts(str_from_int(total))
+  return 0
+end
+""", "63\n")
+    end
+
+    it("can-rowed helper function propagates effect to outer with-block") do ->
+      # helper() declares `can Fatal`. It calls escape() under an
+      # outer with-block; F.3b unwinds all the way to the outer
+      # with-block's setjmp. Proves cross-frame longjmp works.
+      assert_run_stdout_eq("""
+effect Fatal
+  def escape(code: Int): Int = resume(0)
+end
+
+def helper(x: Int): Int can Fatal
+  if x < 0
+    escape(0 - x)
+  end
+  return x
+end
+
+def rescue(op_name: Int, argc: Int, argv: Int): Int
+  var decoded = load(argv, 0)
+  return 1000 + decoded
+end
+
+def main(): Int
+  var ok = with Fatal { escape: rescue } do ->
+    helper(5)
+  end
+  var err = with Fatal { escape: rescue } do ->
+    helper(0 - 42)
+  end
+  puts(str_from_int(ok))
+  puts(str_from_int(err))
+  return 0
+end
+""", "5\n1042\n")
+    end
+
+    it("F.3a resume(v) carries String value through unwind path") do ->
+      # String args + string-valued unwind. as_string decodes the i64
+      # ptr at the handler; resume(str) returns back through the D.5b
+      # arg slot, which at the with-block becomes the catch value.
+      assert_run_stdout_eq("""
+effect Tag
+  def label(name: String): String = resume("")
+end
+
+def decorate(op_name: Int, argc: Int, argv: Int): Int
+  var s = as_string(load(argv, 0))
+  var wrapped = "<" + s + ">"
+  resume(wrapped)
+end
+
+def main(): Int
+  var r = with Tag { label: decorate } do ->
+    label("important")
+    "unreachable"
+  end
+  puts(as_string(r))
+  return 0
+end
+""", "<important>\n")
+    end
+
+    it("IR emits both setjmp+longjmp runtime components for kind=2") do ->
+      # Structural assertion: a program that uses a kind=2 op must have
+      # both setjmp (in the with-block) and longjmp (in __qz_effect_perform).
+      assert_ir_contains("""
+effect Fatal
+  def escape(code: Int): Int = resume(0)
+end
+
+def h(op_name: Int, argc: Int, argv: Int): Int = 0
+
+def main(): Int
+  with Fatal { escape: h } do ->
+    escape(1)
+  end
+  return 0
+end
+""", "call i32 @setjmp")
+    end
+
+    it("IR emits stack_bufs + stack_results runtime globals") do ->
+      assert_ir_contains("""
+def main(): Int = 0
+""", "@__qz_effect_stack_results = ")
+    end
+  end
+  return qspec_main()
+end

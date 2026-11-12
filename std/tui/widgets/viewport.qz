@@ -1,0 +1,467 @@
+## std/tui/widgets/viewport.qz — scrollable read-only content area.
+##
+## Designed for combat logs, scrollback buffers, help screens, and any
+## block of content that may exceed the visible window. Stores content
+## as Vec<String> (one entry per logical line) — `set_content(s)`
+## splits on \n; streaming consumers use `append_line` /
+## `append_lines` to push new content as it's produced (the canonical
+## combat-log shape).
+##
+## Wrapping: when `soft_wrap` is on, lines longer than `width` are
+## displayed wrapped to fit. v0.3.2 recomputes the wrap on every
+## render (no cache); fine for combat-log-scale content (<200 lines).
+##
+## Follow-tail: when `follow_tail` is on, append operations
+## auto-scroll to the bottom so new content stays visible. Manual
+## scroll-up disengages tail-following until the user pages back to
+## the bottom (`viewport_at_bottom(v) == true` re-engages on the next
+## append).
+##
+## Scrollbar: a one-cell-wide indicator on the right edge showing
+## scroll position, drawn only when content overflows the window.
+##
+## Update handles Up / Down / PgUp / PgDn / Home / End. Mouse wheel
+## arrives in v0.4+ when the runtime adds mouse events.
+##
+## @since 5.28.x
+
+import std/tui/runtime as tui
+import std/terminal
+import style
+import std/tui/widgets/_string_helpers as _sh
+
+# ============================================================
+# Public types
+# ============================================================
+
+## Semantic events emitted by viewport_update. Most consumers ignore
+## the event slot; included for API uniformity with the other widgets
+## (and forward-compat with v0.3.3+ "scrolled past visible" semantics).
+##
+## - Idle: no scroll happened (key was a no-op or non-scroll key)
+## - Scrolled: y_offset changed this update
+enum ViewportEvent
+  Idle
+  Scrolled
+end
+
+## Per-slot Style values. v0.3.2 has only two: the base text style
+## and the scrollbar style.
+struct ViewportStyles
+  text:      Style
+  scrollbar: Style
+end
+
+def viewport_styles_default(): ViewportStyles
+  return ViewportStyles {
+    text:      Style.new(),
+    scrollbar: Style.new().dim()
+  }
+end
+
+## Viewport widget.
+##
+## `lines` is the canonical content store — one entry per logical
+## line (post-\n split). `y_offset` is the index of the topmost
+## visible logical line (or the topmost wrapped line when
+## `soft_wrap` is on). `width` and `height` are the cell dimensions
+## of the visible window.
+struct Viewport
+  lines:          Vec<String>
+  width:          Int
+  height:         Int
+  y_offset:       Int
+  soft_wrap:      Bool
+  follow_tail:    Bool
+  show_scrollbar: Bool
+  styles:         ViewportStyles
+end
+
+# ============================================================
+# Constructors + builders
+# ============================================================
+
+def viewport_new(): Viewport
+  return Viewport {
+    lines:          vec_new(),
+    width:          80,
+    height:         10,
+    y_offset:       0,
+    soft_wrap:      false,
+    follow_tail:    false,
+    show_scrollbar: false,
+    styles:         viewport_styles_default()
+  }
+end
+
+def viewport_with_size(v: Viewport, w: Int, h: Int): Viewport
+  return Viewport {
+    lines: v.lines, width: w, height: h, y_offset: v.y_offset,
+    soft_wrap: v.soft_wrap, follow_tail: v.follow_tail,
+    show_scrollbar: v.show_scrollbar, styles: v.styles
+  }
+end
+
+def viewport_with_soft_wrap(v: Viewport, on: Bool): Viewport
+  return Viewport {
+    lines: v.lines, width: v.width, height: v.height, y_offset: v.y_offset,
+    soft_wrap: on, follow_tail: v.follow_tail,
+    show_scrollbar: v.show_scrollbar, styles: v.styles
+  }
+end
+
+def viewport_with_follow_tail(v: Viewport, on: Bool): Viewport
+  return Viewport {
+    lines: v.lines, width: v.width, height: v.height, y_offset: v.y_offset,
+    soft_wrap: v.soft_wrap, follow_tail: on,
+    show_scrollbar: v.show_scrollbar, styles: v.styles
+  }
+end
+
+def viewport_with_scrollbar(v: Viewport, on: Bool): Viewport
+  return Viewport {
+    lines: v.lines, width: v.width, height: v.height, y_offset: v.y_offset,
+    soft_wrap: v.soft_wrap, follow_tail: v.follow_tail,
+    show_scrollbar: on, styles: v.styles
+  }
+end
+
+def viewport_with_styles(v: Viewport, s: ViewportStyles): Viewport
+  return Viewport {
+    lines: v.lines, width: v.width, height: v.height, y_offset: v.y_offset,
+    soft_wrap: v.soft_wrap, follow_tail: v.follow_tail,
+    show_scrollbar: v.show_scrollbar, styles: s
+  }
+end
+
+# ============================================================
+# Content management
+# ============================================================
+
+## Replace content. The string is split on \n; the resulting Vec
+## becomes the new lines store. y_offset is reset to 0.
+def viewport_set_content(v: Viewport, s: String): Viewport
+  var lines: Vec<String> = vec_new()
+  if not s.empty?
+    lines = str_split(s, "\n")
+  end
+  return Viewport {
+    lines: lines, width: v.width, height: v.height, y_offset: 0,
+    soft_wrap: v.soft_wrap, follow_tail: v.follow_tail,
+    show_scrollbar: v.show_scrollbar, styles: v.styles
+  }
+end
+
+## Replace content using a pre-split lines Vec. Useful when consumers
+## already have lines (e.g. via str_split) and want to skip the
+## re-split. y_offset reset to 0.
+def viewport_set_content_lines(v: Viewport, lines: Vec<String>): Viewport
+  return Viewport {
+    lines: lines, width: v.width, height: v.height, y_offset: 0,
+    soft_wrap: v.soft_wrap, follow_tail: v.follow_tail,
+    show_scrollbar: v.show_scrollbar, styles: v.styles
+  }
+end
+
+## Append a single logical line. If `follow_tail` is on, y_offset is
+## updated to keep the new line visible.
+def viewport_append_line(v: Viewport, line: String): Viewport
+  var new_lines: Vec<String> = vec_clone(v.lines)
+  new_lines.push(line)
+  var new_offset = v.y_offset
+  if v.follow_tail
+    new_offset = _viewport_max_offset_for(new_lines, v.height)
+  end
+  return Viewport {
+    lines: new_lines, width: v.width, height: v.height, y_offset: new_offset,
+    soft_wrap: v.soft_wrap, follow_tail: v.follow_tail,
+    show_scrollbar: v.show_scrollbar, styles: v.styles
+  }
+end
+
+## Append multiple lines in one shot.
+def viewport_append_lines(v: Viewport, lines: Vec<String>): Viewport
+  var new_lines: Vec<String> = vec_clone(v.lines)
+  var i = 0
+  while i < lines.size
+    new_lines.push(lines[i])
+    i = i + 1
+  end
+  var new_offset = v.y_offset
+  if v.follow_tail
+    new_offset = _viewport_max_offset_for(new_lines, v.height)
+  end
+  return Viewport {
+    lines: new_lines, width: v.width, height: v.height, y_offset: new_offset,
+    soft_wrap: v.soft_wrap, follow_tail: v.follow_tail,
+    show_scrollbar: v.show_scrollbar, styles: v.styles
+  }
+end
+
+## Empty the lines store and reset y_offset to 0.
+def viewport_clear(v: Viewport): Viewport
+  return Viewport {
+    lines: vec_new(), width: v.width, height: v.height, y_offset: 0,
+    soft_wrap: v.soft_wrap, follow_tail: v.follow_tail,
+    show_scrollbar: v.show_scrollbar, styles: v.styles
+  }
+end
+
+# ============================================================
+# Scroll commands
+# ============================================================
+
+## Scroll up by `n` lines. Clamps at 0.
+def viewport_scroll_up(v: Viewport, n: Int): Viewport
+  return _viewport_set_offset(v, v.y_offset - n)
+end
+
+## Scroll down by `n` lines. Clamps at max scroll offset.
+def viewport_scroll_down(v: Viewport, n: Int): Viewport
+  return _viewport_set_offset(v, v.y_offset + n)
+end
+
+## Scroll up by one page (height lines).
+def viewport_page_up(v: Viewport): Viewport = viewport_scroll_up(v, v.height)
+
+## Scroll down by one page.
+def viewport_page_down(v: Viewport): Viewport = viewport_scroll_down(v, v.height)
+
+## Jump to the top of content.
+def viewport_goto_top(v: Viewport): Viewport = _viewport_set_offset(v, 0)
+
+## Jump to the bottom — y_offset becomes max possible (last full
+## page visible).
+def viewport_goto_bottom(v: Viewport): Viewport
+  return _viewport_set_offset(v, _viewport_max_offset_for(v.lines, v.height))
+end
+
+## Adjust y_offset so that `line_idx` is visible. If already in view,
+## no change. If above the window, offset becomes line_idx (line at
+## top). If below, offset becomes line_idx - height + 1 (line at bottom).
+def viewport_ensure_visible(v: Viewport, line_idx: Int): Viewport
+  if line_idx < v.y_offset
+    return _viewport_set_offset(v, line_idx)
+  end
+  if line_idx >= v.y_offset + v.height
+    return _viewport_set_offset(v, line_idx - v.height + 1)
+  end
+  return v
+end
+
+# ============================================================
+# Accessors
+# ============================================================
+
+def viewport_at_top(v: Viewport): Bool = v.y_offset == 0
+def viewport_at_bottom(v: Viewport): Bool = v.y_offset >= _viewport_max_offset_for(v.lines, v.height)
+def viewport_line_count(v: Viewport): Int = v.lines.size
+
+## Scroll percent in [0, 100]. 0 = at top, 100 = at bottom. When
+## content fits the window entirely, returns 0 (nothing to scroll).
+def viewport_scroll_percent(v: Viewport): Int
+  var max_off = _viewport_max_offset_for(v.lines, v.height)
+  if max_off == 0
+    return 0
+  end
+  return (v.y_offset * 100) / max_off
+end
+
+# ============================================================
+# Update + view
+# ============================================================
+
+def viewport_update<M>(
+  v: Viewport,
+  msg: tui::FrameMsg<M>
+): (Viewport, tui::Cmd<M>, ViewportEvent)
+  match msg
+    tui::FrameMsg::Key(k) => return _viewport_handle_key(v, k.code)
+    _ => return (v, tui::Cmd::None, ViewportEvent::Idle)
+  end
+end
+
+def viewport_view(v: Viewport, _focused: Bool): String
+  if v.lines.size == 0
+    return _viewport_blank_window(v)
+  end
+
+  var visible = _viewport_visible_lines(v)
+
+  var sb = sb_new()
+  var i = 0
+  while i < v.height
+    if i > 0
+      sb_append(sb, "\n")
+    end
+    var line = ""
+    if i < visible.size
+      line = visible[i]
+    end
+    # Truncate to width (after soft-wrap when on, lines should already fit).
+    var rendered = _viewport_clip_to_width(line, v.width)
+    sb_append(sb, v.styles.text.render(rendered))
+    if v.show_scrollbar
+      sb_append(sb, _viewport_scrollbar_cell(v, i))
+    end
+    i = i + 1
+  end
+  return sb_to_string(sb)
+end
+
+def viewport_set_size(v: Viewport, w: Int, h: Int): Viewport
+  return viewport_with_size(v, w, h)
+end
+
+# ============================================================
+# Internal — key dispatch
+# ============================================================
+
+def _viewport_handle_key<M>(
+  v: Viewport,
+  code: Int
+): (Viewport, tui::Cmd<M>, ViewportEvent)
+  if code == terminal::KEY_UP()
+    return _viewport_emit_scroll(v, viewport_scroll_up(v, 1))
+  end
+  if code == terminal::KEY_DOWN()
+    return _viewport_emit_scroll(v, viewport_scroll_down(v, 1))
+  end
+  if code == terminal::KEY_HOME()
+    return _viewport_emit_scroll(v, viewport_goto_top(v))
+  end
+  if code == terminal::KEY_END()
+    return _viewport_emit_scroll(v, viewport_goto_bottom(v))
+  end
+  # PgUp / PgDn don't have dedicated KEY_* constants in std/terminal
+  # (they're typically '[5~' / '[6~' escapes). Use Ctrl-B / Ctrl-F as
+  # the canonical scrollback keys (Vim-style); apps wanting different
+  # bindings can pre-route by remapping in their own update.
+  if code == terminal::KEY_CTRL_B()
+    return _viewport_emit_scroll(v, viewport_page_up(v))
+  end
+  if code == terminal::KEY_CTRL_F()
+    return _viewport_emit_scroll(v, viewport_page_down(v))
+  end
+  return (v, tui::Cmd::None, ViewportEvent::Idle)
+end
+
+def _viewport_emit_scroll<M>(
+  before: Viewport,
+  after: Viewport
+): (Viewport, tui::Cmd<M>, ViewportEvent)
+  if after.y_offset == before.y_offset
+    return (after, tui::Cmd::None, ViewportEvent::Idle)
+  end
+  return (after, tui::Cmd::None, ViewportEvent::Scrolled)
+end
+
+# ============================================================
+# Internal — wrap + slice
+# ============================================================
+
+# Compute max valid y_offset for a given lines Vec and visible height.
+# The result is the index such that lines[idx..idx+height) fills the
+# window; if content is shorter than height, the result is 0.
+def _viewport_max_offset_for(lines: Vec<String>, height: Int): Int
+  var n = lines.size
+  if n <= height
+    return 0
+  end
+  return n - height
+end
+
+# Clamp y_offset to [0, max_offset] and return the updated viewport.
+def _viewport_set_offset(v: Viewport, raw: Int): Viewport
+  var max_off = _viewport_max_offset_for(v.lines, v.height)
+  var clamped = raw
+  if clamped < 0
+    clamped = 0
+  end
+  if clamped > max_off
+    clamped = max_off
+  end
+  return Viewport {
+    lines: v.lines, width: v.width, height: v.height, y_offset: clamped,
+    soft_wrap: v.soft_wrap, follow_tail: v.follow_tail,
+    show_scrollbar: v.show_scrollbar, styles: v.styles
+  }
+end
+
+# Compute the visible-window slice of lines, applying soft-wrap when
+# on. Returns up to `height` strings.
+def _viewport_visible_lines(v: Viewport): Vec<String>
+  if v.soft_wrap
+    return _viewport_soft_wrapped_window(v)
+  end
+  var out = vec_new<String>()
+  var i = 0
+  while i < v.height
+    var idx = v.y_offset + i
+    if idx < v.lines.size
+      out.push(v.lines[idx])
+    end
+    i = i + 1
+  end
+  return out
+end
+
+# Soft-wrap path: produce a flat Vec<wrapped-line> by walking each
+# logical line and breaking it at width boundaries (cell-width aware).
+# Then slice [y_offset, y_offset+height).
+def _viewport_soft_wrapped_window(v: Viewport): Vec<String>
+  var wrapped = vec_new<String>()
+  var i = 0
+  while i < v.lines.size
+    _sh::wrap_line_into(wrapped, v.lines[i], v.width)
+    i = i + 1
+  end
+  var out = vec_new<String>()
+  var k = 0
+  while k < v.height
+    var idx = v.y_offset + k
+    if idx < wrapped.size
+      out.push(wrapped[idx])
+    end
+    k = k + 1
+  end
+  return out
+end
+
+# Clip a line to `width` cells (accounting for wide chars). Used as
+# a final guard at render time; soft-wrap should already have done
+# the heavy lifting when it's on.
+def _viewport_clip_to_width(line: String, width: Int): String
+  return _sh::clip_to_width(line, width)
+end
+
+# Render a viewport with no content — produces `height` lines of
+# blank space (preserves layout shape so other widgets compose
+# predictably). Skips scrollbar (nothing to scroll).
+def _viewport_blank_window(v: Viewport): String
+  var sb = sb_new()
+  var i = 0
+  while i < v.height
+    if i > 0
+      sb_append(sb, "\n")
+    end
+    sb_append(sb, str_repeat(" ", v.width))
+    i = i + 1
+  end
+  return sb_to_string(sb)
+end
+
+# Scrollbar cell for visible-row `row` (0 .. height-1). Single
+# character: thumb where the percentage indicator is, track elsewhere.
+def _viewport_scrollbar_cell(v: Viewport, row: Int): String
+  var n = v.lines.size
+  if n <= v.height
+    return v.styles.scrollbar.render("│")
+  end
+  var thumb_row = (row * 100) / v.height
+  var scroll_pct = viewport_scroll_percent(v)
+  if thumb_row == scroll_pct / (100 / v.height)
+    return v.styles.scrollbar.render("█")
+  end
+  return v.styles.scrollbar.render("│")
+end

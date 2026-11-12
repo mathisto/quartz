@@ -1,0 +1,219 @@
+## Phase 6.2.b — Quake Exec effect + dry-run handler acceptance spec.
+##
+## Operation Piezoelectric Effects, Phase 6 (user-tool dogfooding),
+## subphase 6.2.b.
+##
+## Validates the migration of std/quake.qz's `sh*` family from direct
+## `system()` / `pipe_open()` calls to thin wrappers over the `Exec`
+## algebraic effect, and the introduction of `dry_run_handler` as a
+## stdlib-shipped pluggable executor that previews commands without
+## forking subprocesses.
+##
+## Migration semantics:
+## - `effect Exec { def exec(cmd: String, opts: ExecOpts): ExecResult }`
+##   is kind=1 (synchronous return). `default_exec_handler` implements
+##   the union of legacy sh/sh_capture/sh_buffered behaviors in one
+##   function, branching on `opts.capture_stdout` and `opts.step_name`.
+## - `quake_main()` installs `with Exec { exec: default_exec_handler }`
+##   inside the existing Reader/Log frames. `--dry-run`/`-n` flag
+##   swaps in `dry_run_handler` instead.
+## - `sh*` helpers carry `can Exec` instead of `can Reader` — the
+##   default handler reads verbosity via `ask()` so the Reader cascade
+##   no longer flows through every wrapper.
+##
+## What this spec covers:
+## - Module-shape sanity: std/quake compiles with the Exec effect
+##   declaration + ExecOpts/ExecResult struct definitions.
+## - Default handler: `sh("true")` under installed Exec frame returns
+##   exit_code 0; subprocess actually runs.
+## - dry_run_handler: `sh("touch /tmp/should_not_exist...")` under
+##   `with Exec { exec: dry_run_handler }` returns 0 but does NOT
+##   create the file — proves zero subprocess execution.
+## - Capture handler: user-installed Exec handler intercepts the cmd
+##   string and records it; sh() calls flow through.
+## - sh_capture under default handler: returns subprocess stdout
+##   correctly via the capture_stdout opt path.
+## - sh_buffered under default handler: returns exit_code without
+##   capturing stdout (silent on success).
+## - Composition: outer Reader + outer Log + outer Exec stack cleanly;
+##   inner sh() call reaches all three.
+##
+## What this spec does NOT cover (filed for follow-on):
+## - End-to-end via real `quake` binary `--dry-run` flag: same
+##   subprocess-args limitation as 6.2.a. Smoke-tested manually at
+##   migration time (see commit message).
+## - sh_buffered's failure UX (the `[step] FAILED (exit N)` colored
+##   banner + captured-stderr dump): asserting on stderr ANSI codes
+##   is brittle. The behavior is preserved byte-for-byte from the
+##   pre-6.2.b implementation; covered by manual `quake build` runs
+##   that exercise actual link/compile failures.
+## - Real-world `--dry-run` of a complex Quakefile: requires
+##   integration spec that loads Quakefile.qz; out of qspec scope.
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("quake Exec effect + dry-run handler (Phase 6.2.b)") do ->
+
+    it("std/quake compiles with Exec effect + structs") do ->
+      # Empty main that imports quake. Catches regressions in the
+      # ExecOpts/ExecResult struct definitions or the Exec effect
+      # declaration. Exit 0 = the import + module init runs cleanly.
+      assert_run_exits("""
+import * from quake
+
+def main(): Int
+  return 0
+end
+""", 0)
+    end
+
+    it("default Exec handler runs subprocess and returns exit_code") do ->
+      # The migration's prime invariant: behavior preservation through
+      # the indirection. `sh_maybe("true")` under default handler
+      # returns 0; `sh_maybe("false")` returns 256 — the latter is
+      # libc `system()`'s wait()-style status (1 << 8) preserved
+      # byte-for-byte from the pre-6.2.b implementation. Pre-existing
+      # wart filed under "exit-code semantics" in the followups list.
+      assert_run_stdout_eq("""
+import * from quake
+
+def main(): Int
+  with Reader(0) do ->
+    with Log { emit: _quake_log_stdout } do ->
+      with Exec { exec: default_exec_handler } do ->
+        var rc_true = sh_maybe("true")
+        var rc_false = sh_maybe("false")
+        puts("true: " + str_from_int(rc_true))
+        puts("false: " + str_from_int(rc_false))
+      end
+    end
+  end
+  return 0
+end
+""", "true: 0\nfalse: 256\n")
+    end
+
+    it("dry_run_handler returns success without forking") do ->
+      # The headline 6.2.b feature: user-installed dry_run_handler
+      # intercepts `sh(...)` and returns ExecResult { exit_code: 0,
+      # ... } WITHOUT calling system(). Proof: a touch command that
+      # would create a file does NOT create the file under dry-run.
+      assert_run_stdout_eq("""
+import * from quake
+
+def main(): Int
+  colors_disable()
+  var marker = "/tmp/_qspec_p62b_dryrun_marker.txt"
+  if file_exists(marker) == 1
+    file_delete(marker)
+  end
+  with Reader(0) do ->
+    with Log { emit: _quake_log_stdout } do ->
+      with Exec { exec: dry_run_handler } do ->
+        var _r = sh("touch " + marker)
+      end
+    end
+  end
+  if file_exists(marker) == 1
+    puts("FAIL: marker was created")
+    file_delete(marker)
+  else
+    puts("OK: no subprocess executed")
+  end
+  return 0
+end
+""", "  $ touch /tmp/_qspec_p62b_dryrun_marker.txt  [dry-run]\nOK: no subprocess executed\n")
+    end
+
+    it("custom capture handler intercepts sh() calls") do ->
+      # The test-fixture pattern: install a user handler that records
+      # every cmd string into a Vec, then assert on the recorded
+      # commands. No subprocess execution. Demonstrates the
+      # composability win: every sh*/sh_capture/sh_buffered call
+      # routes through the same `exec(cmd, opts)` op, so a single
+      # capture handler covers all of them.
+      assert_run_stdout_eq("""
+import * from quake
+
+var _captured = vec_new<String>()
+
+def cap_exec(op_name: Int, argc: Int, argv: Int): Int
+  var cmd = as_string(load(argv, 0))
+  _captured.push(cmd)
+  var r = ExecResult { exit_code: 0, stdout: "", stderr: "" }
+  return as_int(r)
+end
+
+def main(): Int
+  with Reader(0) do ->
+    with Log { emit: _quake_log_stdout } do ->
+      with Exec { exec: cap_exec } do ->
+        var _r1 = sh("first")
+        var _r2 = sh_maybe("second")
+        var _r3 = sh_quiet("third")
+      end
+    end
+  end
+  for cmd in _captured
+    puts(cmd)
+  end
+  return 0
+end
+""", "first\nsecond\nthird > /dev/null 2>&1\n")
+    end
+
+    it("sh_capture returns subprocess stdout under default handler") do ->
+      # The capture_stdout opt path runs the subprocess via pipe_open
+      # and stuffs its stdout into ExecResult.stdout. sh_capture()
+      # returns that string. Verifies the migration didn't break the
+      # capture_stdout flow.
+      assert_run_stdout_eq("""
+import * from quake
+
+def main(): Int
+  with Reader(0) do ->
+    with Log { emit: _quake_log_stdout } do ->
+      with Exec { exec: default_exec_handler } do ->
+        var out = sh_capture("printf 'one\\ntwo\\n'")
+        puts("captured: " + out)
+      end
+    end
+  end
+  return 0
+end
+""", "captured: one\ntwo\n\n")
+    end
+
+    it("composition: Reader + Log + Exec all installed simultaneously") do ->
+      # The full effect stack the launcher actually installs in
+      # production. Capture handler at the outermost Log layer sees
+      # the verbose echo emitted by the Exec default handler — proves
+      # Reader/Log/Exec compose without interference at the install
+      # site.
+      assert_run_stdout_eq("""
+import * from quake
+
+def cap_log(op_name: Int, argc: Int, argv: Int): Int
+  puts("LOG: " + as_string(load(argv, 0)))
+  return 0
+end
+
+def main(): Int
+  colors_disable()
+  with Reader(2) do ->
+    with Log { emit: cap_log } do ->
+      with Exec { exec: default_exec_handler } do ->
+        var _r = sh("true")
+      end
+    end
+  end
+  return 0
+end
+""", "LOG:   $ true\n")
+    end
+
+  end
+  return qspec_main()
+end

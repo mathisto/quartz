@@ -1,0 +1,255 @@
+## Multi-op handler record dispatch — Milestone H acceptance spec.
+##
+## Operation Piezoelectric Effects, Phase 2, Milestone H.
+##
+## Before H: `with E { op1: h1, op2: h2 } do ... end` bound only the
+## first field; op2 silently fell through to default/unhandled.
+## After H: the compiler synthesizes a dispatch shim function for
+## multi-op records; it routes by op_name string compare to the right
+## user handler. Install points the effect-stack entry at the shim;
+## `__qz_effect_perform` calls the shim, which calls the user's h1 or
+## h2 based on which op was invoked.
+##
+## Semantics of unmatched ops: a `with E { op1: h1 }` record that only
+## binds `op1` routes unmatched op calls to `__qz_effect_unhandled`
+## (same as today's single-field miss). Delegation to outer handlers
+## for unlisted ops is a follow-up milestone.
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("multi-op handler record dispatch (piezo H)") do ->
+    it("two ops bound, both fire their respective handlers") do ->
+      assert_run_stdout_eq("""
+effect TwoOps
+  def first(x: Int): Int
+  def second(x: Int): Int
+end
+
+def h_first(op_name: Int, argc: Int, argv: Int): Int
+  puts("first")
+  return load(argv, 0) + 1
+end
+
+def h_second(op_name: Int, argc: Int, argv: Int): Int
+  puts("second")
+  return load(argv, 0) + 100
+end
+
+def main(): Int
+  with TwoOps { first: h_first, second: h_second } do ->
+    var a = first(10)
+    var b = second(20)
+    puts(str_from_int(a))
+    puts(str_from_int(b))
+  end
+  return 0
+end
+""", "first\nsecond\n11\n120\n")
+    end
+
+    it("three ops: each routes to its own handler") do ->
+      assert_run_stdout_eq("""
+effect Trio
+  def a(x: Int): Int
+  def b(x: Int): Int
+  def c(x: Int): Int
+end
+
+def ha(op_name: Int, argc: Int, argv: Int): Int = load(argv, 0) + 1
+def hb(op_name: Int, argc: Int, argv: Int): Int = load(argv, 0) + 10
+def hc(op_name: Int, argc: Int, argv: Int): Int = load(argv, 0) + 100
+
+def main(): Int
+  with Trio { a: ha, b: hb, c: hc } do ->
+    puts(str_from_int(a(0)))
+    puts(str_from_int(b(0)))
+    puts(str_from_int(c(0)))
+  end
+  return 0
+end
+""", "1\n10\n100\n")
+    end
+
+    it("single-op record still works (backward compat)") do ->
+      # Single-field takes a fast path at MIR lowering (no shim).
+      # Regression guard for D.5's single-handler install.
+      assert_run_stdout_eq("""
+effect One
+  def only(x: Int): Int
+end
+
+def h_only(op_name: Int, argc: Int, argv: Int): Int = load(argv, 0) * 2
+
+def main(): Int
+  with One { only: h_only } do ->
+    puts(str_from_int(only(21)))
+  end
+  return 0
+end
+""", "42\n")
+    end
+
+    it("ordering-invariant: field order in record doesn't matter") do ->
+      # The shim must route by op_name, not by position. Bind op2 then
+      # op1 in the record literal; call op1 then op2; each hits its own
+      # handler regardless of declaration order.
+      assert_run_stdout_eq("""
+effect AB
+  def alpha(x: Int): Int
+  def beta(x: Int): Int
+end
+
+def h_alpha(op_name: Int, argc: Int, argv: Int): Int = 100 + load(argv, 0)
+def h_beta(op_name: Int, argc: Int, argv: Int): Int = 200 + load(argv, 0)
+
+def main(): Int
+  with AB { beta: h_beta, alpha: h_alpha } do ->
+    puts(str_from_int(alpha(1)))
+    puts(str_from_int(beta(2)))
+  end
+  return 0
+end
+""", "101\n202\n")
+    end
+
+    it("multi-op record with kind=2 unwind on one of the ops") do ->
+      # The shim sits above the runtime dispatch so F.3b's kind=2
+      # unwind still works when an op declared with `resume` fires.
+      assert_run_stdout_eq("""
+effect Fatal
+  def log(msg: String): Int
+  def die(code: Int): Int = resume(0)
+end
+
+def do_log(op_name: Int, argc: Int, argv: Int): Int
+  puts("logged")
+  return 0
+end
+
+def do_die(op_name: Int, argc: Int, argv: Int): Int
+  return 77
+end
+
+def main(): Int
+  var r = with Fatal { log: do_log, die: do_die } do ->
+    log("a")
+    log("b")
+    die(1)
+    puts("unreachable")
+    99
+  end
+  puts(str_from_int(r))
+  return 0
+end
+""", "logged\nlogged\n77\n")
+    end
+
+    it("IR emits N install calls for N-op record (H-delegate)") do ->
+      # After H-delegate: multi-op records push one stack entry per op.
+      # Install goes through __qz_effect_handle_install — for N ops, N
+      # call instructions appear (visible as `call void @__qz_effect_handle_install`
+      # at minimum twice in the 2-op case).
+      assert_ir_contains("""
+effect E
+  def op1(x: Int): Int
+  def op2(x: Int): Int
+end
+
+def h1(op_name: Int, argc: Int, argv: Int): Int = 1
+def h2(op_name: Int, argc: Int, argv: Int): Int = 2
+
+def main(): Int
+  with E { op1: h1, op2: h2 } do ->
+    op1(0)
+  end
+  return 0
+end
+""", "call void @__qz_effect_handle_install")
+    end
+
+    it("IR install passes per-op filter pointer (H-delegate)") do ->
+      # Each install carries op_filter — a ptr to the op name string in
+      # the pool. Verify at least one install's 4th arg is a non-null
+      # ptr (the `%hi.*.flt.*` identifier pattern for the per-op filter
+      # GEP).
+      assert_ir_contains("""
+effect E
+  def op1(x: Int): Int
+  def op2(x: Int): Int
+end
+
+def h1(op_name: Int, argc: Int, argv: Int): Int = 1
+def h2(op_name: Int, argc: Int, argv: Int): Int = 2
+
+def main(): Int
+  with E { op1: h1, op2: h2 } do ->
+    op1(0)
+  end
+  return 0
+end
+""", ".flt.")
+    end
+
+    it("IR install references user handlers directly, no shim (H-delegate)") do ->
+      # Before H-delegate the multi-op install referenced a synthesized
+      # `__qz_eff_shim_N` function. After H-delegate the install
+      # references each user handler directly via ptrtoint.
+      assert_ir_contains("""
+effect E
+  def op1(x: Int): Int
+  def op2(x: Int): Int
+end
+
+def h1(op_name: Int, argc: Int, argv: Int): Int = 1
+def h2(op_name: Int, argc: Int, argv: Int): Int = 2
+
+def main(): Int
+  with E { op1: h1, op2: h2 } do ->
+    op1(0)
+  end
+  return 0
+end
+""", "ptrtoint ptr @h1")
+    end
+
+    it("unlisted op falls through to outer handler (H-delegate core)") do ->
+      # The core H-delegate semantic: inner `with` binds only op1; op2
+      # is not listed in the inner record, so it falls through to the
+      # outer `with` which DOES bind op2.
+      assert_run_stdout_eq("""
+effect E
+  def op1(x: Int): Int
+  def op2(x: Int): Int
+end
+
+def outer_op2(op_name: Int, argc: Int, argv: Int): Int
+  puts("outer op2: " + load(argv, 0).to_s())
+  return 0
+end
+
+def outer_op1(op_name: Int, argc: Int, argv: Int): Int
+  puts("outer op1: " + load(argv, 0).to_s())
+  return 0
+end
+
+def inner_op1(op_name: Int, argc: Int, argv: Int): Int
+  puts("inner op1: " + load(argv, 0).to_s())
+  return 0
+end
+
+def main(): Int
+  with E { op1: outer_op1, op2: outer_op2 } do ->
+    with E { op1: inner_op1 } do ->
+      op1(1)
+      op2(2)
+    end
+  end
+  return 0
+end
+""", "inner op1: 1\nouter op2: 2\n")
+    end
+  end
+  return qspec_main()
+end

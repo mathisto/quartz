@@ -1,0 +1,508 @@
+# std/net/http.qz - Ergonomic HTTP/HTTPS client (Layer 3 - The Quartz Way)
+#
+# Transparently handles both http:// and https:// URLs.
+# HTTPS uses TLS with certificate verification by default.
+#
+# Example - Simple GET:
+#   import std/net/http
+#
+#   def main(): Int
+#     match http_get("https://api.github.com/repos/quartz/lang")
+#       HttpResult::Ok(response) => puts(response.body)
+#       HttpResult::Err(e) => puts(e.message)
+#     end
+#     return 0
+#   end
+
+import std/net/tcp
+import std/net/tls
+
+# =============================================================================
+# Error Type
+# =============================================================================
+
+struct HttpError
+  message: String
+  code: Int
+end
+
+def http_error(msg: String, code: Int): HttpError = HttpError { message: msg, code: code }
+
+# =============================================================================
+# Response Type
+# =============================================================================
+
+struct HttpResponse
+  status: Int
+  status_text: String
+  body: String
+  content_length: Int
+end
+
+# =============================================================================
+# Result Type
+# =============================================================================
+
+enum HttpResult
+  Ok(response: HttpResponse)
+  Err(error: HttpError)
+end
+
+# Result accessors
+def http_result_is_ok(result: HttpResult): Bool
+  match result
+    Ok(r) => true
+    Err(e) => false
+  end
+end
+
+def http_result_is_err(result: HttpResult): Bool
+  match result
+    Ok(r) => false
+    Err(e) => true
+  end
+end
+
+def http_result_body(result: HttpResult): String
+  match result
+    Ok(r) => r.body
+    Err(e) => ""
+  end
+end
+
+def http_result_status(result: HttpResult): Int
+  match result
+    Ok(r) => r.status
+    Err(e) => 0
+  end
+end
+
+# =============================================================================
+# URL Parsing
+# =============================================================================
+
+def url_host(url: String): String
+  var start = 0
+  if str_starts_with(url, "http://")
+    start = 7
+  end
+  if str_starts_with(url, "https://")
+    start = 8
+  end
+
+  len = str_byte_len(url)
+  var i = start
+  while i < len
+    c = str_byte_at(url, i)
+    if c == ':' or c == '/'
+      return str_byte_slice(url, start, i)
+    end
+    i = i + 1
+  end
+  return str_byte_slice(url, start, len)
+end
+
+def url_port(url: String): Int
+  # Check for explicit port in URL (e.g. http://example.com:8080/)
+  var start = 0
+  if str_starts_with(url, "http://")
+    start = 7
+  end
+  if str_starts_with(url, "https://")
+    start = 8
+  end
+
+  var len = str_byte_len(url)
+  var i = start
+  # Skip past host
+  while i < len
+    var c = str_byte_at(url, i)
+    if c == '/'
+      # Reached path, no port specified
+      if str_starts_with(url, "https://")
+        return 443
+      end
+      return 80
+    end
+    if c == ':'
+      # Found colon — parse port number
+      var port_start = i + 1
+      var port_end = port_start
+      while port_end < len and str_byte_at(url, port_end) >= '0' and str_byte_at(url, port_end) <= '9'
+        port_end += 1
+      end
+      if port_end > port_start
+        return str_byte_slice(url, port_start, port_end).to_i()
+      end
+    end
+    i += 1
+  end
+
+  if str_starts_with(url, "https://")
+    return 443
+  end
+  return 80
+end
+
+def url_path(url: String): String
+  var start = 0
+  if str_starts_with(url, "http://")
+    start = 7
+  end
+  if str_starts_with(url, "https://")
+    start = 8
+  end
+
+  len = str_byte_len(url)
+  var i = start
+  while i < len
+    if str_byte_at(url, i) == '/'
+      return str_byte_slice(url, i, len)
+    end
+    i = i + 1
+  end
+  return "/"
+end
+
+# Check if URL uses HTTPS
+def url_is_https(url: String): Bool = str_starts_with(url, "https://")
+
+# =============================================================================
+# Internal: Transport abstraction for HTTP over TCP or TLS
+# =============================================================================
+
+# Connection handle — wraps either TCP or TLS
+struct HttpConn
+  tcp_fd: Int      # Socket fd
+  ssl_ptr: Int     # 0 for plain TCP, SSL* for TLS
+  is_tls: Int      # 1 if TLS
+end
+
+# Read from HTTP connection
+def _http_conn_read(conn: HttpConn, max_bytes: Int): String
+  if conn.is_tls == 1
+    match tls_read(TlsStream { ssl: conn.ssl_ptr, fd: conn.tcp_fd, host: "", port: 0 }, max_bytes)
+      Ok(data) => data
+      Err(e) => ""
+    end
+  else
+    match tcp_read(TcpStream { fd: conn.tcp_fd, host: "", port: 0, connected: 1 }, max_bytes)
+      Ok(data) => data
+      Err(e) => ""
+    end
+  end
+end
+
+# Read all data from connection until EOF
+def _http_conn_read_all(conn: HttpConn): String
+  var sb = sb_new()
+  var done = 0
+  while done == 0
+    var chunk = _http_conn_read(conn, 16384)
+    if str_byte_len(chunk) == 0
+      done = 1
+    else
+      sb_append(sb, chunk)
+    end
+  end
+  return sb_to_string(sb)
+end
+
+# Write to HTTP connection
+def _http_conn_write(conn: HttpConn, data: String): Int
+  if conn.is_tls == 1
+    match tls_write_all(TlsStream { ssl: conn.ssl_ptr, fd: conn.tcp_fd, host: "", port: 0 }, data)
+      Ok(n) => n
+      Err(e) => -1
+    end
+  else
+    match tcp_write_all(TcpStream { fd: conn.tcp_fd, host: "", port: 0, connected: 1 }, data)
+      Ok(n) => n
+      Err(e) => -1
+    end
+  end
+end
+
+# Close HTTP connection
+def _http_conn_close(conn: HttpConn): Void
+  if conn.is_tls == 1
+    tls_close(TlsStream { ssl: conn.ssl_ptr, fd: conn.tcp_fd, host: "", port: 0 })
+  else
+    tcp_close(TcpStream { fd: conn.tcp_fd, host: "", port: 0, connected: 1 })
+  end
+end
+
+# TLS context — creates a fresh client context per request.
+# SSL_CTX_new is lightweight enough for typical usage.
+def _get_tls_ctx(): TlsContext
+  tls_ctx_new_client()
+end
+
+# Connect via TCP or TLS based on scheme
+def _http_connect(url: String): HttpResult
+  host = url_host(url)
+  port = url_port(url)
+
+  if url_is_https(url)
+    var ctx = _get_tls_ctx()
+    match tls_connect(ctx, host, port)
+      Ok(stream) => {
+        return HttpResult::Ok(HttpResponse {
+          status: 0,
+          status_text: "",
+          body: "",
+          content_length: tls_ssl_ptr(stream)
+        })
+      }
+      Err(e) => {
+        return HttpResult::Err(http_error("TLS connection failed: #{e.message}", e.code))
+      }
+    end
+  else
+    match tcp_connect(host, port)
+      Ok(stream) => {
+        return HttpResult::Ok(HttpResponse {
+          status: 0,
+          status_text: "",
+          body: "",
+          content_length: tcp_fd(stream)
+        })
+      }
+      Err(e) => {
+        return HttpResult::Err(http_error("Connection failed: #{e.message}", e.code))
+      }
+    end
+  end
+end
+
+# Internal: Perform HTTP request with method, url, optional body.
+# Follows redirects up to max_redirects.
+def _http_request(method: String, url: String, body: String, max_redirects: Int, timeout_ms: Int): HttpResult
+  var current_url = url
+  var redirects = 0
+  while redirects <= max_redirects
+    host = url_host(current_url)
+    port = url_port(current_url)
+    path = url_path(current_url)
+    var is_https = url_is_https(current_url)
+
+    # Connect
+    var conn = HttpConn { tcp_fd: -1, ssl_ptr: 0, is_tls: 0 }
+
+    if is_https
+      var ctx = _get_tls_ctx()
+      match tls_connect(ctx, host, port)
+        Ok(stream) => {
+          conn = HttpConn { tcp_fd: tls_fd(stream), ssl_ptr: tls_ssl_ptr(stream), is_tls: 1 }
+        }
+        Err(e) => {
+          return HttpResult::Err(http_error("TLS connection failed: #{e.message}", e.code))
+        }
+      end
+    else
+      match tcp_connect(host, port)
+        Ok(stream) => {
+          conn = HttpConn { tcp_fd: tcp_fd(stream), ssl_ptr: 0, is_tls: 0 }
+        }
+        Err(e) => {
+          return HttpResult::Err(http_error("Connection failed: #{e.message}", e.code))
+        }
+      end
+    end
+
+    # Set read/write timeout on underlying socket
+    if timeout_ms > 0
+      tcp_set_timeout(TcpStream { fd: conn.tcp_fd, host: "", port: 0, connected: 1 }, timeout_ms)
+    end
+
+    # Build request
+    var request = "#{method} #{path} HTTP/1.1\r\nHost: #{host}\r\nConnection: close\r\nUser-Agent: Quartz/1.0\r\n"
+    if method.eq("POST")
+      request = "#{request}Content-Type: application/x-www-form-urlencoded\r\nContent-Length: #{str_from_int(str_byte_len(body))}\r\n\r\n#{body}"
+    else
+      request = "#{request}\r\n"
+    end
+
+    # Send
+    if _http_conn_write(conn, request) < 0
+      _http_conn_close(conn)
+      return HttpResult::Err(http_error("Send failed", 0))
+    end
+
+    # Read full response
+    var data = _http_conn_read_all(conn)
+    _http_conn_close(conn)
+
+    if str_byte_len(data) == 0
+      return HttpResult::Err(http_error("Empty response", 0))
+    end
+
+    # Parse response
+    var status = http_parse_status(data)
+    var status_text = http_parse_status_text(data)
+
+    # Check for redirect (301, 302, 303, 307, 308)
+    if (status == 301 or status == 302 or status == 303 or status == 307 or status == 308) and redirects < max_redirects
+      var location = http_parse_header(data, "Location")
+      if str_byte_len(location) > 0
+        # Handle relative redirects
+        if str_starts_with(location, "http://") or str_starts_with(location, "https://")
+          current_url = location
+        else
+          # Relative path — construct absolute URL
+          var scheme = "http://"
+          if is_https
+            scheme = "https://"
+          end
+          current_url = "#{scheme}#{host}#{location}"
+        end
+        redirects += 1
+      else
+        # No Location header — return as-is
+        return _http_build_response(data, status, status_text)
+      end
+    else
+      return _http_build_response(data, status, status_text)
+    end
+  end
+
+  HttpResult::Err(http_error("Too many redirects", max_redirects))
+end
+
+# Build response from raw data
+def _http_build_response(data: String, status: Int, status_text: String): HttpResult
+  var body_start_opt = str_byte_find(data, "\r\n\r\n")
+  var body = ""
+  match body_start_opt
+    Some(pos) => body = str_byte_slice(data, pos + 4, str_byte_len(data))
+    None => {}
+    _ => {}
+  end
+  HttpResult::Ok(HttpResponse { status: status, status_text: status_text, body: body, content_length: str_byte_len(body) })
+end
+
+# =============================================================================
+# High-Level API
+# =============================================================================
+
+# Maximum number of redirects to follow
+def HTTP_MAX_REDIRECTS(): Int = 10
+
+# GET request to a URL (http:// or https://)
+def http_get(url: String): HttpResult
+  _http_request("GET", url, "", HTTP_MAX_REDIRECTS(), 0)
+end
+
+# POST request to a URL (http:// or https://)
+def http_post(url: String, body: String): HttpResult
+  _http_request("POST", url, body, HTTP_MAX_REDIRECTS(), 0)
+end
+
+# GET request with timeout (milliseconds). Applies to read/write.
+def http_get_timeout(url: String, timeout_ms: Int): HttpResult
+  _http_request("GET", url, "", HTTP_MAX_REDIRECTS(), timeout_ms)
+end
+
+# =============================================================================
+# Response Parsing
+# =============================================================================
+
+def http_parse_response(data: String): HttpResult
+  status = http_parse_status(data)
+  status_text = http_parse_status_text(data)
+  _http_build_response(data, status, status_text)
+end
+
+def http_parse_status(data: String): Int
+  match str_byte_find(data, " ")
+    Some(space_pos) => {
+      code_str = str_byte_slice(data, space_pos + 1, space_pos + 4)
+      code_str.to_i()
+    }
+    None => 0
+    _ => 0
+  end
+end
+
+def http_parse_status_text(data: String): String
+  match str_byte_find(data, " ")
+    Some(first_space) => {
+      rest = str_byte_slice(data, first_space + 1, str_byte_len(data))
+      match str_byte_find(rest, " ")
+        Some(second_space) => {
+          after_code = str_byte_slice(rest, second_space + 1, str_byte_len(rest))
+          match str_byte_find(after_code, "\r\n")
+            Some(newline) => str_byte_slice(after_code, 0, newline)
+            None => after_code
+            _ => after_code
+          end
+        }
+        None => ""
+        _ => ""
+      end
+    }
+    None => ""
+    _ => ""
+  end
+end
+
+# Parse a specific header from raw HTTP response data.
+# Returns the header value, or "" if not found.
+def http_parse_header(data: String, name: String): String
+  # Search for "\r\nName: " (case-insensitive on name)
+  var search = "\r\n#{name}: "
+  var pos_opt = str_byte_find(data, search)
+  match pos_opt
+    None => {
+      # Try lowercase
+      search = "\r\n#{str_downcase(name)}: "
+      pos_opt = str_byte_find(data, search)
+    }
+    Some(found) => {}
+    _ => {}
+  end
+  match pos_opt
+    None => return ""
+    Some(pos) => {
+      var value_start = pos + str_byte_len(search)
+      match str_byte_find(str_byte_slice(data, value_start, str_byte_len(data)), "\r\n")
+        Some(value_end) => return str_byte_slice(data, value_start, value_start + value_end)
+        None => return str_byte_slice(data, value_start, str_byte_len(data))
+        _ => return str_byte_slice(data, value_start, str_byte_len(data))
+      end
+    }
+    _ => return ""
+  end
+end
+
+# =============================================================================
+# Response Helpers
+# =============================================================================
+
+def http_is_ok(response: HttpResponse): Bool = response.status >= 200 and response.status < 300
+def http_is_redirect(response: HttpResponse): Bool = response.status >= 300 and response.status < 400
+def http_is_client_error(response: HttpResponse): Bool = response.status >= 400 and response.status < 500
+def http_is_server_error(response: HttpResponse): Bool = response.status >= 500 and response.status < 600
+
+# =============================================================================
+# Convenience Wrappers
+# =============================================================================
+
+# GET request — returns body on success, empty string on error
+def http_get_body(url: String): String
+  http_result_body(http_get(url))
+end
+
+# GET request — returns HttpResult (alias for clarity)
+def http_get_result(url: String): HttpResult
+  http_get(url)
+end
+
+# GET request — returns body on success, panics on error
+def http_get_or_panic(url: String): String
+  var result = http_get(url)
+  match result
+    Ok(r) => r.body
+    Err(e) => panic("http_get failed: #{e.message}")
+  end
+end

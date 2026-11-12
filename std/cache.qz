@@ -1,0 +1,288 @@
+## std/cache — algebraic effect for the build cache.
+##
+## Operation Piezoelectric Effects, Phase A.3 (post-audit roadmap, 2026-05-01).
+##
+## Declares the `Cache` effect with 6 ops mirroring the typed surface of
+## `shared/build_cache.qz`:
+##
+##   cache_op_lookup(module, hash)        → String  ("" on miss)
+##   cache_op_store(module, hash, ir)     → Int     (0 on success)
+##   cache_op_save_pool(strings)          → Int     (0 on success)
+##   cache_op_load_pool()                 → Vec<String>
+##   cache_op_save_ast(module, hash, …)   → Int     (0 on success)
+##   cache_op_load_ast(module, hash)      → Vec<Int>
+##
+## State-query functions (`cache_is_enabled`, `cache_set_explain`,
+## `cache_open`, `cache_disable`, `cache_flush`, `cache_clean`) stay
+## outside the effect — they're build-driver configuration, not cacheable
+## I/O. `with Cache.disabled do … end` is implemented as a handler that
+## returns sentinels for all 6 ops, not by toggling `_cache_enabled`.
+##
+## The default handler forwards to the existing `build_cache::cache_*`
+## impl per op. Gated on a compile-time `uses_cache` flag (mirrored from
+## `uses_intern`) so programs that never use std/cache don't force-link
+## `build_cache` + `dep_graph` + their transitive closure.
+##
+## Usage:
+##
+##   import std/cache
+##
+##   def my_mock_lookup(op_name: Int, argc: Int, argv: Int): Int
+##     return as_int("MOCK_IR")  # always hit
+##   end
+##
+##   def main(): Int
+##     with Cache { cache_op_lookup: my_mock_lookup } do ->
+##       var ir = cache_op_lookup("foo", "deadbeef")
+##       puts(ir)
+##     end
+##     return 0
+##   end
+##
+## Two-pass fixpoint discipline: this file (Pass 1) declares the effect
+## and the default handler. Compiler source itself does NOT call any
+## `cache_op_*` until Pass 2 (single-site migration of `quartz.qz:504`).
+## See `docs/design/CACHE_EFFECT_PLAN.md` for the full plan.
+##
+## Handler ABI: `(op_name: Int, argc: Int, argv: Int): Int`. Decode
+## String args with `as_string(load(argv, i))`; encode String returns
+## with `as_int(s)`. Vec<String> args/returns lift through `as_vec(int)`
+## and `as_int(vec)` — same existential-types pattern.
+##
+## All 6 op branches forward to their matching `build_cache::cache_*`
+## impl. Phase 1 wired `cache_op_lookup`. Phase 2 wired the remaining
+## five (`cache_op_store`, `cache_op_save_pool`, `cache_op_load_pool`,
+## `cache_op_save_ast`, `cache_op_load_ast`) alongside their callsite
+## migrations in `quartz.qz` and `resolver.qz`.
+
+import build_cache
+import ast
+
+effect Cache
+  def cache_op_lookup(module: String, hash: String): String
+  def cache_op_store(module: String, hash: String, ir: String): Int
+  def cache_op_save_pool(strings: Vec<String>): Int
+  def cache_op_load_pool(): Vec<String>
+  def cache_op_save_ast(module: String, hash: String, storage: ast::AstStorage, root: Int): Int
+  def cache_op_load_ast(module: String, hash: String): Vec<Int>
+end
+
+## Default handler for all 6 Cache ops.
+##
+## Dispatches on op name and forwards to the matching `build_cache::cache_*`
+## impl. Returns the underlying impl's value cast to Int (or 0 for
+## void-returning ops).
+##
+## Install at compile-pass entry or per-callsite to delegate cache I/O
+## to the existing build_cache singleton:
+##
+##   with Cache {
+##     cache_op_lookup: cache_default_handler,
+##     cache_op_store: cache_default_handler,
+##     # ... 4 more ...
+##   } do ->
+##     ... code that bare-calls cache_op_lookup(m, h) etc ...
+##   end
+def cache_default_handler(op_name: Int, argc: Int, argv: Int): Int
+  var op = as_string(op_name)
+  if op.eq("cache_op_lookup")
+    var module = as_string(load(argv, 0))
+    var hash = as_string(load(argv, 1))
+    return as_int(build_cache::cache_lookup(module, hash))
+  end
+  if op.eq("cache_op_store")
+    var module = as_string(load(argv, 0))
+    var hash = as_string(load(argv, 1))
+    var ir = as_string(load(argv, 2))
+    build_cache::cache_store(module, hash, ir)
+    return 0
+  end
+  if op.eq("cache_op_save_pool")
+    var strings = as_vec(load(argv, 0))
+    build_cache::cache_save_string_pool(strings)
+    return 0
+  end
+  if op.eq("cache_op_load_pool")
+    var pool = build_cache::cache_load_string_pool()
+    return as_int(pool)
+  end
+  if op.eq("cache_op_save_ast")
+    var module = as_string(load(argv, 0))
+    var hash = as_string(load(argv, 1))
+    var storage = as_type<AstStorage>(load(argv, 2))
+    var root = load(argv, 3)
+    build_cache::cache_save_ast(module, hash, storage, root)
+    return 0
+  end
+  if op.eq("cache_op_load_ast")
+    var module = as_string(load(argv, 0))
+    var hash = as_string(load(argv, 1))
+    var result = build_cache::cache_load_ast(module, hash)
+    return as_int(result)
+  end
+  return 0
+end
+
+## ---- Test-handler factories (Phase A.3 Phase 3) ----
+##
+## Three pre-built handlers for hermetic spec testing, scoped runtime
+## configuration, and miss debugging. Install via `with Cache { op: handler
+## } do … end` exactly like the default handler. Each is a single
+## dispatcher function (same `(op_name, argc, argv): Int` ABI) so it can be
+## bound to any combination of ops.
+
+## In-memory cache backed by module-level state. Stores IR / pool / AST
+## tuples in process memory. Hermetic across spec tests when paired with
+## `cache_in_memory_reset()` in the test harness.
+##
+## Usage:
+##   cache_in_memory_reset()
+##   with Cache {
+##     cache_op_lookup: cache_in_memory_handler,
+##     cache_op_store: cache_in_memory_handler,
+##     # ... bind all 6 ops to the same dispatcher ...
+##   } do ->
+##     cache_op_store("foo.qz", "deadbeef", "; ir body")
+##     var got = cache_op_lookup("foo.qz", "deadbeef")  # "; ir body"
+##   end
+
+var _cache_in_memory_ir = map_new<String, String>()
+var _cache_in_memory_pool = vec_new<String>()
+var _cache_in_memory_ast_storage = map_new<String, Int>()
+var _cache_in_memory_ast_root = map_new<String, Int>()
+
+## Reset all in-memory cache state. Call at the start of each spec test
+## to ensure cross-test isolation.
+def cache_in_memory_reset(): Void
+  _cache_in_memory_ir = map_new<String, String>()
+  _cache_in_memory_pool = vec_new<String>()
+  _cache_in_memory_ast_storage = map_new<String, Int>()
+  _cache_in_memory_ast_root = map_new<String, Int>()
+end
+
+def cache_in_memory_handler(op_name: Int, argc: Int, argv: Int): Int
+  var op = as_string(op_name)
+  if op.eq("cache_op_lookup")
+    var module = as_string(load(argv, 0))
+    var hash = as_string(load(argv, 1))
+    var key = "#{module}|#{hash}"
+    return as_int(_cache_in_memory_ir.get(key).unwrap_or(""))
+  end
+  if op.eq("cache_op_store")
+    var module = as_string(load(argv, 0))
+    var hash = as_string(load(argv, 1))
+    var ir = as_string(load(argv, 2))
+    var key = "#{module}|#{hash}"
+    _cache_in_memory_ir.set(key, ir)
+    return 0
+  end
+  if op.eq("cache_op_save_pool")
+    var strings = as_vec(load(argv, 0))
+    _cache_in_memory_pool = strings
+    return 0
+  end
+  if op.eq("cache_op_load_pool")
+    return as_int(_cache_in_memory_pool)
+  end
+  if op.eq("cache_op_save_ast")
+    var module = as_string(load(argv, 0))
+    var hash = as_string(load(argv, 1))
+    var storage_handle = load(argv, 2)
+    var root = load(argv, 3)
+    var key = "#{module}|#{hash}"
+    _cache_in_memory_ast_storage.set(key, storage_handle)
+    _cache_in_memory_ast_root.set(key, root)
+    return 0
+  end
+  if op.eq("cache_op_load_ast")
+    var module = as_string(load(argv, 0))
+    var hash = as_string(load(argv, 1))
+    var key = "#{module}|#{hash}"
+    var stor_opt = _cache_in_memory_ast_storage.get(key)
+    if stor_opt is None
+      return as_int(vec_new())
+    end
+    var result = vec_new<Int>()
+    result.push(stor_opt!)
+    result.push(_cache_in_memory_ast_root.get(key).unwrap_or(0))
+    return as_int(result)
+  end
+  return 0
+end
+
+## Disabled cache: every op returns sentinel-miss. Equivalent to running
+## with `--no-cache` but scoped to a `with Cache.disabled do … end` block
+## without toggling the global `_cache_enabled` state.
+##
+## Usage:
+##   with Cache {
+##     cache_op_lookup: cache_disabled_handler,
+##     # ... bind all 6 ops ...
+##   } do ->
+##     ... block runs with no cache hits ...
+##   end
+def cache_disabled_handler(op_name: Int, argc: Int, argv: Int): Int
+  var op = as_string(op_name)
+  if op.eq("cache_op_lookup")
+    return as_int("")
+  end
+  if op.eq("cache_op_load_pool")
+    return as_int(vec_new<String>())
+  end
+  if op.eq("cache_op_load_ast")
+    return as_int(vec_new())
+  end
+  # cache_op_store / cache_op_save_pool / cache_op_save_ast — all writes
+  # silently no-op (no underlying cache to write to).
+  return 0
+end
+
+## Tracing wrapper: appends each (op, key-args) tuple to a module-level
+## trace log AND forwards to `cache_default_handler` so the underlying
+## semantics are preserved. Useful for miss debugging — read the log via
+## `cache_tracing_log()` after the wrapped block exits.
+##
+## Usage:
+##   cache_tracing_reset()
+##   with Cache {
+##     cache_op_lookup: cache_tracing_handler,
+##     # ... bind all 6 ops ...
+##   } do ->
+##     ... code under trace ...
+##   end
+##   var entries = cache_tracing_log()
+##   for e in entries; puts(e); end
+
+var _cache_tracing_log = vec_new<String>()
+
+## Reset the trace log for cross-test isolation.
+def cache_tracing_reset(): Void
+  _cache_tracing_log = vec_new<String>()
+end
+
+## Read the accumulated trace log. Each entry is one `op:args` summary,
+## in call order.
+def cache_tracing_log(): Vec<String> = _cache_tracing_log
+
+def cache_tracing_handler(op_name: Int, argc: Int, argv: Int): Int
+  var op = as_string(op_name)
+  var entry = ""
+  if op.eq("cache_op_lookup")
+    entry = "lookup #{as_string(load(argv, 0))}|#{as_string(load(argv, 1))}"
+  elsif op.eq("cache_op_store")
+    entry = "store #{as_string(load(argv, 0))}|#{as_string(load(argv, 1))}"
+  elsif op.eq("cache_op_save_pool")
+    var strings = as_vec(load(argv, 0))
+    entry = "save_pool size=#{strings.size}"
+  elsif op.eq("cache_op_load_pool")
+    entry = "load_pool"
+  elsif op.eq("cache_op_save_ast")
+    entry = "save_ast #{as_string(load(argv, 0))}|#{as_string(load(argv, 1))}"
+  elsif op.eq("cache_op_load_ast")
+    entry = "load_ast #{as_string(load(argv, 0))}|#{as_string(load(argv, 1))}"
+  else
+    entry = "unknown"
+  end
+  _cache_tracing_log.push(entry)
+  return cache_default_handler(op_name, argc, argv)
+end

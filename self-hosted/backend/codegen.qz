@@ -1,0 +1,2873 @@
+##! # LLVM IR Code Generator
+##!
+##! Phase 5 (final) of the Quartz compiler: emit textual LLVM IR from MIR.
+##!
+##! This module transforms the MIR representation into LLVM IR text
+##! that can be piped to `llc` for native code generation.
+##!
+##! ## Output Format
+##!
+##! The generated IR includes:
+##! - String constants pool (declare global @str.0, @str.1, ...)
+##! - Function declarations for intrinsics
+##! - Function definitions with basic blocks
+##! - Optional DWARF debug metadata (--debug flag)
+##!
+##! ## Codegen State
+##!
+##! State is stored as a vector with 10 slots:
+##!
+##! | Index | Field | Purpose |
+##! |-------|-------|---------|
+##! | 0 | string_pool | Global string constants |
+##! | 1 | string_count | Number of strings allocated |
+##! | 2 | local_vars | Function-local variable map |
+##! | 3 | local_count | Number of locals |
+##! | 4 | label_counter | Unique label generator |
+##! | 5 | debug_mode | 0=off, 1=on (DWARF) |
+##! | 6 | source_file | Source filename for debug |
+##! | 7 | func_index | Current function being emitted |
+##! | 8 | dilocation_lines | DILocation line numbers |
+##! | 9 | dilocation_funcs | DILocation function indices |
+##!
+##! ## DWARF Debug Support
+##!
+##! When `--debug` flag is set:
+##! - DICompileUnit metadata is emitted
+##! - DISubprogram for each function
+##! - DILocation for call instructions
+##! - Source file/line info attached to functions
+##!
+##! @see mir MIR representation (Phase 4)
+##! @since 1.0.0
+
+
+import mir
+import * from mir
+import abi_classify
+import codegen_util
+import codegen_instr
+import codegen_runtime
+import std/emit
+import std/memory
+import std/alloc
+import std/profile
+import codegen_ctx
+import * from str_compat
+
+# Module-level storage for last codegen's string pool (for incremental cache save)
+var _cg_last_string_pool = vec_new<String>()
+
+# B.1 Phase 5.D — arena-bytes bookend support.
+# `__qz_effect_state_get` returns the topmost effect install's state slot.
+# When called from inside `with Alloc.in_arena(arena) do ...`, this is the
+# arena handle. cg_codegen / cg_codegen_debug capture this once at function
+# entry (BEFORE any nested install) and reuse the captured handle to read
+# `arena_bytes_used(handle)` deltas at every phase boundary. Reading
+# `arena_bytes_used(0)` returns 0 (chain-walk loop terminates immediately
+# on null head), so callers without an installed Alloc.in_arena context
+# degrade gracefully — bookends emit 0 deltas instead of segfaulting.
+extern "C" def __qz_effect_state_get(): Int
+
+## Get the string pool from the most recent codegen call.
+## Used by quartz.qz to save the pool to cache for incremental builds.
+def cg_get_last_string_pool(): Vec<String> = _cg_last_string_pool
+
+## Deep-copy the cached string pool to escape any arena it was allocated in.
+## When `cg_codegen{,_debug}` runs inside `with Alloc.in_arena(cg_arena) do`,
+## the resulting `state.string_pool` Vec and every String in it are arena-
+## resident. quartz.qz's compile() hands the arena pages back to the OS via
+## `arena_destroy(cg_arena)` after promoting llvm_ir/extern_decls; without
+## this call the cached string pool dangles into munmap'd memory and the
+## next consumer (cache_save_string_pool) reads through a freed pointer.
+##
+## Must be invoked AFTER the with-block exits but BEFORE arena_destroy so
+## arena_promote_string's str_byte_slice routes to libc (top <= bw fast path).
+def cg_promote_last_string_pool(): Void
+  var promoted = vec_new<String>()
+  for i in 0.._cg_last_string_pool.size
+    promoted.push(alloc::arena_promote_string(_cg_last_string_pool[i]))
+  end
+  _cg_last_string_pool = promoted
+end
+
+# ============================================================================
+# Register Passing Pre-Scan
+# ============================================================================
+
+## Pre-scan all functions to collect mir::MIR_FUNC_REF targets.
+## Functions used as first-class values cannot have their ABI changed.
+def cg_prescan_func_ref_targets(state: CodegenState, prog: MirProgram): Void
+  var funcs = prog.mir_get_functions()
+  var func_count = funcs.size
+  for fi in 0..func_count
+    var func = funcs[fi]
+    var blocks = func.mir_func_get_blocks()
+    var block_count = blocks.size
+    for bi in 0..block_count
+      var blk = blocks[bi]
+      var instrs = blk.mir_block_get_instructions()
+      var instr_count = instrs.size
+      for ii in 0..instr_count
+        var instr = instrs[ii]
+        if instr.mir_instr_get_kind() == mir::MIR_FUNC_REF
+          var target_name = instr.mir_instr_get_func_name()
+          state.func_ref_targets.push(target_name)
+        end
+      end
+    end
+  end
+end
+
+## Check if a function should have its @value struct params decomposed.
+## Returns 0 if function is a func_ref target (ABI must be stable).
+def cg_func_should_decompose(state: CodegenState, func: MirFunc, prog: MirProgram): Int
+  var name = func.mir_func_get_name()
+  if codegen_util::cg_is_func_ref_target(state, name)
+    return 0
+  end
+  return func.mir_func_should_decompose_value_params(prog)
+end
+
+## Whether a function uses the by-value (aggregate `{i64 x N}`) @value return
+## ABI (B.10 P2.1). This is the memory lever: an eligible function returns its
+## fields in an aggregate that LLVM lowers per the SysV classifier (registers
+## for small, sret for large) — no per-return __qz_alloc box.
+##
+## Excluded (kept on the legacy i64-pointer return path):
+##   - main / naked — entry points with fixed ABIs.
+##   - cconv-C / x86-interrupt — their return ABI is dictated by the foreign
+##     convention, not ours.
+##   - func-ref targets — addressable via fn-as-value / indirect call, whose
+##     call sites assume the `i64 (...)` signature; the return type must not change.
+##   - poll-callees — a value reconstructed in a caller's frame and held live
+##     across a `$poll` suspend would dangle on resume (§7.1). Keeping these on
+##     the heap-pointer path preserves the existing safe behavior; the value-spill
+##     fix that would let them return by value is deferred.
+##
+## Both the callee (signature) and every call site consult this predicate, so
+## the two sides always agree on the ABI for a given function.
+def cg_func_returns_byval(state: CodegenState, func: MirFunc, prog: MirProgram): Int
+  var name = func.mir_func_get_name()
+  if name == "main"
+    return 0
+  end
+  if func.mir_func_is_naked()
+    return 0
+  end
+  if func.mir_func_is_cconv_c()
+    return 0
+  end
+  if func.mir_func_is_cconv_x86_intr()
+    return 0
+  end
+  if codegen_util::cg_is_func_ref_target(state, name)
+    return 0
+  end
+  if name.mir_is_poll_callee()
+    return 0
+  end
+  return func.mir_func_returns_byval_struct(prog)
+end
+
+## B.10 P3.1 — true SysV/AAPCS layout for `extern "C"` boundaries (MEMORY_MODEL_V3
+## §13). 1 if a field type is in P3.1a's provably-correct subset: an 8-byte
+## int/double whose Quartz i64-slot memory is byte-identical to the C scalar, so
+## the register-coerced aggregate can be reconstructed by a plain reinterpret-load.
+## `CPtr` qualifies too (P3.6c-ptrfields): a C pointer is an 8-byte INTEGER
+## eightbyte on both ABIs — identical to `long`/`int64_t` — and Quartz stores a
+## CPtr field as a raw i64 slot byte-identical to the C pointer, so it crosses the
+## boundary exactly like a wide integer (no inline expansion, unlike a `String` or
+## nested struct, which Quartz stores as a pointer to a heap object that is NOT a
+## C-compatible value). Excludes narrow ints / F32 (sub-8-byte, Quartz over-widens
+## vs C packing — P3.4), String / nested structs (Quartz stores a pointer where C
+## inlines), and Bool/Char/Byte (ambiguous width). Expand with oracle coverage.
+def cg_c_abi_field_wide8(ft: String): Int
+  return 1 if ft == "Int"
+  return 1 if ft == "I64"
+  return 1 if ft == "U64"
+  return 1 if ft == "F64"
+  return 1 if ft == "CPtr"
+  return 0
+end
+
+## B.10 P3.4a — narrow (sub-8-byte) signed/unsigned integer field. A struct with
+## any narrow field uses Quartz's packed typed `%struct.Name` in-memory layout
+## (`mir_prog_struct_has_narrow_fields`), which is byte-identical to the C
+## `@repr(C)` layout — so the register-coerced aggregate the classifier picks
+## (sized to true offsets) loads correctly straight out of that memory. F32 is
+## excluded (stored as 8-byte double-bits internally, needs a boundary repack —
+## P3.4b); Bool/Char/Byte excluded (ambiguous width). Expand with oracle coverage.
+def cg_c_abi_field_narrow_int(ft: String): Int
+  return 1 if ft == "I8"
+  return 1 if ft == "U8"
+  return 1 if ft == "I16"
+  return 1 if ft == "U16"
+  return 1 if ft == "I32"
+  return 1 if ft == "U32"
+  return 0
+end
+
+## 1 if `ft` may participate in a struct crossing the C boundary by register
+## coercion: an 8-byte wide scalar (P3.1) or a narrow int (P3.4a). Floats narrower
+## than 8 bytes, pointers, and nested structs are still excluded (P3.4b+).
+def cg_c_abi_field_packable(ft: String): Int
+  return 1 if cg_c_abi_field_wide8(ft) == 1
+  return 1 if ft == "F32"
+  return cg_c_abi_field_narrow_int(ft)
+end
+
+## B.10 P3.4b — 1 if `type_name` is a struct with any F32 field. An F32 is stored
+## internally as 8-byte double-bits-in-i64 but C packs it as a 4-byte `float` at a
+## true offset, so the whole struct's C layout diverges from Quartz's i64-slot
+## layout (a later field shifts). Such a struct can't ride the byte-identical alias
+## path (P3.1/P3.4a) — it needs a field-by-field boundary repack (§13.5). Used to
+## select the repack path at the four coerce emit sites.
+def cg_c_abi_struct_has_f32(prog: MirProgram, type_name: String): Int
+  if str_contains(type_name, "<")
+    return 0
+  end
+  var fc = prog.mir_prog_get_struct_field_count(type_name)
+  if fc == 0
+    return 0
+  end
+  for i in 0..fc
+    var ft = prog.mir_prog_get_struct_field_type(type_name, i)
+    return 1 if ft == "F32"
+  end
+  return 0
+end
+
+## B.10 P3.4b — the field-conversion inner loop, Quartz→C direction: copy each
+## field from the Quartz internal struct at `qz_ptr` (a `%struct.Name*` SSA name,
+## no `%`) to its true C byte offset in the buffer at `c_buf` (a `ptr` SSA name).
+## F32 = `bitcast i64→double` + `fptrunc double→float` (8→4B); every other slot
+## stores its i64/iN bits unchanged. Shared by the ≤16B coerce pack and the >16B
+## byval/sret repack — the only difference upstream is how the C buffer is sized
+## and consumed (register load vs. byval/sret pointer).
+def cg_c_abi_emit_qz_to_c_buf(out: Int, prog: MirProgram, type_name: String, qz_ptr: String, c_buf: String, tag: String): Void
+  var fc = prog.mir_prog_get_struct_field_count(type_name)
+  var fields = vec_new()
+  for i in 0..fc
+    fields.push(prog.mir_prog_get_struct_field_type(type_name, i))
+  end
+  for fi in 0..fc
+    var ft = as_string(fields[fi])
+    var qty = mir::mir_type_name_to_llvm(ft)
+    var coff = abi_classify::abi_field_c_offset(fields, fi)
+    codegen_util::cg_emit_line(out, "  %#{tag}.qf#{fi} = getelementptr inbounds %struct.#{type_name}, %struct.#{type_name}* %#{qz_ptr}, i32 0, i32 #{fi}")
+    codegen_util::cg_emit_line(out, "  %#{tag}.ql#{fi} = load #{qty}, ptr %#{tag}.qf#{fi}")
+    codegen_util::cg_emit_line(out, "  %#{tag}.cf#{fi} = getelementptr inbounds i8, ptr %#{c_buf}, i64 #{coff}")
+    if ft == "F32"
+      codegen_util::cg_emit_line(out, "  %#{tag}.qd#{fi} = bitcast i64 %#{tag}.ql#{fi} to double")
+      codegen_util::cg_emit_line(out, "  %#{tag}.qs#{fi} = fptrunc double %#{tag}.qd#{fi} to float")
+      codegen_util::cg_emit_line(out, "  store float %#{tag}.qs#{fi}, ptr %#{tag}.cf#{fi}")
+    else
+      codegen_util::cg_emit_line(out, "  store #{qty} %#{tag}.ql#{fi}, ptr %#{tag}.cf#{fi}")
+    end
+  end
+end
+
+## B.10 P3.4b — the field-conversion inner loop, C→Quartz direction: copy each
+## field from the C-packed buffer at `c_buf` (a `ptr` SSA name) to its slot in the
+## Quartz internal struct at `qz_ptr` (a `%struct.Name*` SSA name). F32 = `fpext
+## float→double` + `bitcast double→i64`; every other slot copies its bits. Shared
+## by the ≤16B coerce unpack and the >16B byval/sret repack.
+def cg_c_abi_emit_c_to_qz_buf(out: Int, prog: MirProgram, type_name: String, c_buf: String, qz_ptr: String, tag: String): Void
+  var fc = prog.mir_prog_get_struct_field_count(type_name)
+  var fields = vec_new()
+  for i in 0..fc
+    fields.push(prog.mir_prog_get_struct_field_type(type_name, i))
+  end
+  for fi in 0..fc
+    var ft = as_string(fields[fi])
+    var qty = mir::mir_type_name_to_llvm(ft)
+    var coff = abi_classify::abi_field_c_offset(fields, fi)
+    codegen_util::cg_emit_line(out, "  %#{tag}.cf#{fi} = getelementptr inbounds i8, ptr %#{c_buf}, i64 #{coff}")
+    codegen_util::cg_emit_line(out, "  %#{tag}.qf#{fi} = getelementptr inbounds %struct.#{type_name}, %struct.#{type_name}* %#{qz_ptr}, i32 0, i32 #{fi}")
+    if ft == "F32"
+      codegen_util::cg_emit_line(out, "  %#{tag}.cl#{fi} = load float, ptr %#{tag}.cf#{fi}")
+      codegen_util::cg_emit_line(out, "  %#{tag}.cd#{fi} = fpext float %#{tag}.cl#{fi} to double")
+      codegen_util::cg_emit_line(out, "  %#{tag}.qv#{fi} = bitcast double %#{tag}.cd#{fi} to i64")
+      codegen_util::cg_emit_line(out, "  store i64 %#{tag}.qv#{fi}, ptr %#{tag}.qf#{fi}")
+    else
+      codegen_util::cg_emit_line(out, "  %#{tag}.cl#{fi} = load #{qty}, ptr %#{tag}.cf#{fi}")
+      codegen_util::cg_emit_line(out, "  store #{qty} %#{tag}.cl#{fi}, ptr %#{tag}.qf#{fi}")
+    end
+  end
+end
+
+## B.10 P3.4b — emit the Quartz→C boundary repack (PACK): build the C-packed
+## coerce value from the Quartz internal struct. `qz_val` is the SSA name (without
+## `%`) of the i64 holding the Quartz struct pointer; `coerce_type` the classifier
+## coerce type (same total size as the padded C struct); `tag` a unique SSA-name
+## prefix; `result_name` the SSA name (without `%`) to define holding the coerce
+## value. Fields are stored at their true C byte offsets into a coerce-typed
+## buffer: F32 → `bitcast i64→double` then `fptrunc double→float` (8→4 bytes), all
+## other slots store their i64/iN bits unchanged (byte-identical to the C scalar).
+## `scratch_heap` 1 → the buffer is `__qz_alloc`'d (loop-safe: a call site inside a
+## loop must not grow the stack with a fresh alloca per iteration — same reason the
+## P3.3 byval path heap-copies); 0 → `alloca` (the callee return terminator runs at
+## most once per invocation). Heap size `fc*8` ≥ the coerce/C size and stays 8-aligned.
+def cg_c_abi_emit_pack(out: Int, prog: MirProgram, type_name: String, coerce_type: String, qz_val: String, scratch_heap: Int, tag: String, result_name: String): Void
+  var fc = prog.mir_prog_get_struct_field_count(type_name)
+  if scratch_heap == 1
+    codegen_util::cg_emit_line(out, "  %#{tag}.cb = call noalias ptr @__qz_alloc(i64 #{fc * 8})")
+  else
+    codegen_util::cg_emit_line(out, "  %#{tag}.cb = alloca #{coerce_type}")
+  end
+  codegen_util::cg_emit_line(out, "  %#{tag}.qp = inttoptr i64 %#{qz_val} to %struct.#{type_name}*")
+  cg_c_abi_emit_qz_to_c_buf(out, prog, type_name, tag + ".qp", tag + ".cb", tag)
+  codegen_util::cg_emit_line(out, "  %#{result_name} = load #{coerce_type}, ptr %#{tag}.cb")
+end
+
+## B.10 P3.4b — emit the C→Quartz boundary repack (UNPACK): reconstruct the
+## Quartz internal struct from a C-packed coerce value. `coerce_val` is the SSA
+## name (without `%`) of the incoming coerce value; `alloc_heap` 1 → `__qz_alloc`
+## (survives escape: call-site return), 0 → `alloca` (frame-local: callee param);
+## `tag` a unique prefix; `result_i64` the SSA name (without `%`) to define holding
+## the i64 Quartz struct pointer. F32 fields are `fpext float→double` then
+## `bitcast double→i64` back into the internal slot; other slots copy unchanged.
+def cg_c_abi_emit_unpack(out: Int, prog: MirProgram, type_name: String, coerce_type: String, coerce_val: String, alloc_heap: Int, tag: String, result_i64: String): Void
+  var fc = prog.mir_prog_get_struct_field_count(type_name)
+  # Both the C-packed scratch (`.cb`) and the Quartz struct (`.qbuf`) follow
+  # `alloc_heap`: a call-site return reconstruct (heap=1) sits at a call that may
+  # be in a loop, so neither may be a per-iteration alloca; a callee param prelude
+  # (heap=0) runs once in the entry block. The result struct also escapes the
+  # call-site frame ⇒ must be heap there regardless.
+  if alloc_heap == 1
+    codegen_util::cg_emit_line(out, "  %#{tag}.cb = call noalias ptr @__qz_alloc(i64 #{fc * 8})")
+  else
+    codegen_util::cg_emit_line(out, "  %#{tag}.cb = alloca #{coerce_type}")
+  end
+  codegen_util::cg_emit_line(out, "  store #{coerce_type} %#{coerce_val}, ptr %#{tag}.cb")
+  if alloc_heap == 1
+    codegen_util::cg_emit_line(out, "  %#{tag}.qbuf = call noalias ptr @__qz_alloc(i64 #{fc * 8})")
+  else
+    codegen_util::cg_emit_line(out, "  %#{tag}.qbuf = alloca [#{fc} x i64]")
+  end
+  codegen_util::cg_emit_line(out, "  %#{result_i64} = ptrtoint ptr %#{tag}.qbuf to i64")
+  codegen_util::cg_emit_line(out, "  %#{tag}.qp = inttoptr i64 %#{result_i64} to %struct.#{type_name}*")
+  cg_c_abi_emit_c_to_qz_buf(out, prog, type_name, tag + ".cb", tag + ".qp", tag)
+end
+
+## The LLVM coercion type a P3.1 register-coerced `extern "C"` struct wants when
+## it crosses the boundary on `target` (e.g. "i64", "{i64, double}",
+## "[2 x double]"), or "" when the struct is not P3.1-eligible: a scalar/pointer
+## (legacy path handles it), a generic, an indirect (>16B byval/sret — P3.3), or
+## a struct with any field outside cg_c_abi_field_wide8 (narrow/float/pointer/
+## nested — P3.4+). `is_return` selects the param vs return classification (only
+## matters for the >16B case we exclude here, but kept faithful for when P3.3
+## adds sret). Caller must already know the function is cconv-C.
+def cg_c_abi_coerce(prog: MirProgram, target: String, type_name: String, is_return: Int): String
+  if str_contains(type_name, "<")
+    return ""
+  end
+  var fc = prog.mir_prog_get_struct_field_count(type_name)
+  if fc == 0
+    return ""
+  end
+  var fields = vec_new()
+  for i in 0..fc
+    var ft = prog.mir_prog_get_struct_field_type(type_name, i)
+    if cg_c_abi_field_packable(ft) == 0
+      return ""
+    end
+    fields.push(ft)
+  end
+  var info = abi_classify::abi_classify_fields(target, fields, is_return)
+  if abi_classify::abi_info_kind(info) == abi_classify::ABI_COERCE
+    return abi_classify::abi_info_coerce_type(info)
+  end
+  return ""
+end
+
+## Coerce type for a struct PARAM crossing an `extern "C"` boundary (P3.1a). The
+## same predicate drives the signature emit and the param-reconstruct prelude, so
+## both sides agree.
+def cg_c_abi_param_coerce(prog: MirProgram, target: String, type_name: String): String
+  return cg_c_abi_coerce(prog, target, type_name, 0)
+end
+
+## Coerce type for a struct RETURN crossing an `extern "C"` boundary (P3.1b). The
+## same predicate drives the return-type emit and the return terminator's
+## reinterpret-load, so both sides agree. Returns "" for a non-struct/non-eligible
+## return (the legacy ptr/void/i64 paths handle it).
+def cg_c_abi_return_coerce(prog: MirProgram, target: String, type_name: String): String
+  return cg_c_abi_coerce(prog, target, type_name, 1)
+end
+
+## The `[N x i64]` memory type for an N-field all-8-byte-field struct that crosses
+## a C boundary INDIRECTLY (byval/sret). For the all-wide8 subset the C struct's
+## in-memory layout is exactly N contiguous 8-byte words, so `[N x i64]` is
+## byte-identical to clang's named `%struct.T` — no true-offset type decl needed
+## (that is P3.4, for narrow/packed fields).
+def cg_c_abi_mem_type(fc: Int): String
+  return "[" + fc.to_s() + " x i64]"
+end
+
+## B.10 P3.4-ii — 1 if `type_name` is an indirect (>16B) struct whose Quartz
+## INTERNAL `%struct.Name` layout already equals the C `@repr(C)` layout AND so can
+## cross the boundary as a true-size `%struct.Name` byval/sret without a repack: it
+## has at least one narrow (sub-8-byte int) field and NO F32 field. Narrow ints use
+## packed `iN` slots (`%struct.N6 = {i32×6}` = 24B == C), and wide/F64 slots are
+## 8-byte-aligned identically — only F32 (8-byte double-bits slot vs 4-byte C float)
+## diverges, and that needs the P3.4-ii-b memory repack (a separate C-layout type).
+def cg_c_abi_struct_is_narrow_packed(prog: MirProgram, type_name: String): Int
+  if str_contains(type_name, "<")
+    return 0
+  end
+  var fc = prog.mir_prog_get_struct_field_count(type_name)
+  if fc == 0
+    return 0
+  end
+  var has_narrow = 0
+  for i in 0..fc
+    var ft = prog.mir_prog_get_struct_field_type(type_name, i)
+    return 0 if ft == "F32"
+    if cg_c_abi_field_narrow_int(ft) == 1
+      has_narrow = 1
+    end
+  end
+  return has_narrow
+end
+
+## B.10 P3.3 — the byval/sret memory type for a struct crossing an `extern "C"`
+## boundary INDIRECTLY (>16B, non-HFA): the caller copies it to memory and passes
+## a pointer (`byval` for a param, `sret` for a return). Returns "[N x i64]" when
+## the struct is P3.3-eligible, else "": a scalar/pointer (legacy path), a generic,
+## a small register-coerced struct (≤16B / HFA — P3.1), or a struct with any field
+## outside cg_c_abi_field_wide8 (narrow/float-packing — P3.4). `is_return` selects
+## the sret (return) vs byval (param) classification. Caller must already know the
+## function is cconv-C. The classifier is the single source of truth for the >16B
+## vs HFA-vs-MEMORY decision; this just maps its INDIRECT verdict to the LLVM type.
+def cg_c_abi_indirect(prog: MirProgram, target: String, type_name: String, is_return: Int): String
+  if str_contains(type_name, "<")
+    return ""
+  end
+  var fc = prog.mir_prog_get_struct_field_count(type_name)
+  if fc == 0
+    return ""
+  end
+  # P3.4-ii admits narrow-packed (internal %struct.Name == C layout) and F32
+  # (needs the C-layout %struct.Name.cabi + repack) structs; a field outside
+  # wide8∪narrow∪F32 (pointer/nested) keeps the legacy path.
+  var fields = vec_new()
+  for i in 0..fc
+    var ft = prog.mir_prog_get_struct_field_type(type_name, i)
+    if cg_c_abi_field_packable(ft) == 0
+      return ""
+    end
+    fields.push(ft)
+  end
+  var info = abi_classify::abi_classify_fields(target, fields, is_return)
+  var kind = abi_classify::abi_info_kind(info)
+  # F32-containing → the C-faithful `%struct.Name.cabi` (packed floats, true C
+  # size); narrow-packed → the true-size internal `%struct.Name` (24B for N6, not
+  # 48B); all-wide → `[N x i64]` (byte-identical to clang's `%struct.T`, P3.3).
+  var mem = cg_c_abi_mem_type(fc)
+  if cg_c_abi_struct_has_f32(prog, type_name) == 1
+    mem = "%struct." + type_name + ".cabi"
+  elsif cg_c_abi_struct_is_narrow_packed(prog, type_name) == 1
+    mem = "%struct." + type_name
+  end
+  if is_return == 1
+    return mem if kind == abi_classify::ABI_INDIRECT_SRET
+    return ""
+  end
+  return mem if kind == abi_classify::ABI_INDIRECT_BYVAL
+  return ""
+end
+
+## byval memory type for a struct PARAM crossing an `extern "C"` boundary (P3.3),
+## "" if not indirect-eligible. Same predicate drives signature, prelude, declare,
+## and call site so all four agree.
+def cg_c_abi_param_indirect(prog: MirProgram, target: String, type_name: String): String
+  return cg_c_abi_indirect(prog, target, type_name, 0)
+end
+
+## sret memory type for a struct RETURN crossing an `extern "C"` boundary (P3.3),
+## "" if not indirect-eligible.
+def cg_c_abi_return_indirect(prog: MirProgram, target: String, type_name: String): String
+  return cg_c_abi_indirect(prog, target, type_name, 1)
+end
+
+## B.10 P3.3 — 1 if `target` lowers an indirect (>16B) struct PARAM as a plain
+## pointer to a caller-made copy (AArch64 AAPCS), 0 if as LLVM `byval` (SysV stack
+## arg area). Thin wrapper so codegen_instr can pick the call-site encoding without
+## importing abi_classify. The sret RETURN path is identical on both targets.
+def cg_c_abi_indirect_param_is_pointer(target: String): Int
+  return abi_classify::abi_target_is_aarch64(target)
+end
+
+## The LLVM aggregate return type `{i64, i64, ..., i64}` for an N-field by-value
+## @value return. Shared by the callee signature, the return terminator, and
+## every call site so the three always emit identical type text. fc >= 1.
+def cg_byval_ret_type_str(fc: Int): String
+  var s = "{"
+  for i in 0..fc
+    if i > 0
+      s = s + ", "
+    end
+    s = s + "i64"
+  end
+  s = s + "}"
+  return s
+end
+
+# ============================================================================
+# Reachability-based DCE (Phase B)
+# ============================================================================
+#
+# Skip emission of functions that no reachable code path can call. The MIR
+# already contains every lowered function — including ones the program never
+# uses (e.g. unreferenced exports from imported modules, monomorph templates
+# that never specialised). Emitting them through cg_emit_function inflates IR
+# text, llc/opt time, and final binary size.
+#
+# Roots:
+#   - main / qz_main
+#   - __qz_module_init (called by qz_main wrapper)
+#   - All MIR_FUNC_REF targets (anything addressable via fn-as-value — the
+#     prescan already collected these into state.func_ref_targets)
+#   - All MIR_HANDLE_INSTALL handler entries (effect handlers are stashed as
+#     raw name pointers in instr.args, not as MIR_FUNC_REF; scanned here)
+#   - All MIR_PERFORM_OP static-resolved handlers (G.1 fast-path direct calls
+#     also stash the resolved name as a raw as_int pointer)
+#   - Naked, weak, x86_intrcc, and cconv_c functions — link-time entry points
+#     (kernel ISRs, ABI-exposed exports, weak-stub overrides)
+#
+# Edges:
+#   - MIR_CALL.func_name      (direct calls)
+#   - MIR_INTRINSIC.func_name (most resolve to runtime symbols outside MIR;
+#                              the few that name user functions still propagate)
+#   - MIR_FUNC_REF.func_name  (taking the address of a function)
+#
+# MIR_CALL_INDIRECT carries no name — its targets are addressable functions,
+# already pulled in via the MIR_FUNC_REF root closure.
+#
+# Conservatism is biased toward correctness: any function we cannot statically
+# rule out gets marked reachable. The cost of a false positive is a few extra
+# bytes of IR; the cost of a false negative is a link error.
+
+## Drain the BFS worklist, following MIR_CALL / MIR_INTRINSIC / MIR_FUNC_REF
+## edges and marking every newly-found callee reachable. Shared by the initial
+## reachability sweep and the item-5e post-pass Yield re-seed.
+def cg_bfs_drain(funcs: Vec<MirFunc>, func_by_name: Map<String, Int>, reachable: Map<String, Int>, worklist: Vec<String>): Void
+  while worklist.size > 0
+    var cur = worklist[worklist.size - 1]
+    worklist.pop()
+    if not func_by_name.has(cur)
+      # Not a user-defined function (extern symbol, runtime intrinsic). Skip.
+    else
+      var fidx = __map_get_raw(func_by_name, cur)
+      var func = funcs[fidx - 1]
+      var blocks = func.mir_func_get_blocks()
+      for bi in 0..blocks.size
+        var blk = blocks[bi]
+        var instrs = blk.mir_block_get_instructions()
+        for ii in 0..instrs.size
+          var instr = instrs[ii]
+          var kind = instr.mir_instr_get_kind()
+          if kind == mir::MIR_CALL or kind == mir::MIR_INTRINSIC or kind == mir::MIR_FUNC_REF
+            var callee = instr.mir_instr_get_func_name()
+            if str_byte_len(callee) > 0
+              if not reachable.has(callee)
+                reachable.set(callee, 1)
+                worklist.push(callee)
+              end
+            end
+          elsif kind == mir::MIR_HANDLE_INSTALL
+            # item 5e: effect handler fns are referenced by raw as_int(name)
+            # pointers without a MIR_FUNC_REF, so discover them as BFS edges from
+            # the (reachable) installing function rather than pre-seeding every
+            # handler in the whole program. entries = [op_filter1, handler_fn1,
+            # op_filter2, handler_fn2, ...] — handler fn at each odd index.
+            var entries = instr.mir_instr_get_args()
+            var ei = 1
+            while ei < entries.size
+              var raw = entries[ei]
+              if raw != 0
+                var hname = as_string(raw)
+                if str_byte_len(hname) > 0
+                  if not reachable.has(hname)
+                    reachable.set(hname, 1)
+                    worklist.push(hname)
+                  end
+                end
+              end
+              ei = ei + 2
+            end
+          elsif kind == mir::MIR_PERFORM_OP
+            # operand1 = lexically-resolved handler fn name (G.1 fast-path), or 0.
+            var raw_h = instr.mir_instr_get_operand1()
+            if raw_h != 0
+              var hname2 = as_string(raw_h)
+              if str_byte_len(hname2) > 0
+                if not reachable.has(hname2)
+                  reachable.set(hname2, 1)
+                  worklist.push(hname2)
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+## Compute the set of reachable functions and store it on state.
+## Must run AFTER cg_prescan_func_ref_targets (consumes state.func_ref_targets).
+## Sets state.dce_active = 1 — cg_emit_function callers gate on this.
+def cg_compute_reachable(state: CodegenState, prog: MirProgram): Void
+  var funcs = prog.mir_get_functions()
+  var func_count = funcs.size
+
+  # Build name → func index for O(1) BFS lookups. +1 offset so 0 means absent.
+  var func_by_name = map_new<String, Int>()
+  for fi in 0..func_count
+    var func = funcs[fi]
+    var fname = func.mir_func_get_name()
+    func_by_name.set(fname, fi + 1)
+  end
+
+  var reachable = map_new<String, Int>()
+  var worklist = vec_new<String>()
+
+  # Bare-name stdlib helpers called from inline IR emitted by codegen_runtime.
+  # These bypass MIR_CALL — codegen_runtime emits `call @<bare_name>` directly
+  # in the runtime install_defaults function, the deadline thread, etc. Adding
+  # them as roots is a no-op when the program doesn't link the corresponding
+  # stdlib module (the function won't exist in MIR, BFS skips it).
+  var inline_ir_helpers = vec_new<String>()
+  # item 5e (item 13): the Yield default-handler seed (__qz_gen_yield_capture)
+  # is NOT seeded here. mir_get_uses_yield is a false positive — it's set by
+  # Yield perform-ops inside std/gen functions the prelude pulls but the program
+  # never reaches, so seeding off it kept a dead fn in every program. Instead we
+  # re-derive Yield liveness from the reachable set AFTER the BFS below, then
+  # seed (and re-BFS) only when a reachable function genuinely performs Yield.
+  inline_ir_helpers.push("_scope_fire_deadline_exceeded")    # std/sync/composition/scope.qz, deadline thread
+  inline_ir_helpers.push("intern$intern_default_handler")    # std/intern.qz, install_defaults gated on uses_intern
+  inline_ir_helpers.push("cache$cache_default_handler")      # std/cache.qz, install_defaults gated on uses_cache
+  inline_ir_helpers.push("profile$profile_default_handler")  # std/profile.qz, install_defaults gated on uses_profile
+
+  # The user's `@panic_handler` function (registered via mir_set_panic_handler
+  # during mir-lower) has no static caller in user-source MIR — the panic
+  # intrinsic's emit path (cg_intrinsic_system.qz:332-339) inserts the call
+  # at codegen time, after this DCE pass has run. Without this seed, DCE
+  # drops the handler and llc rejects the IR with `use of undefined value
+  # @<handler>`. Surfaced by NET.1 Phase 1 (UDP layer in unikernel) — the
+  # unikernel's `panic_halt` was silently filtered, masked previously by
+  # the @.fmt.int.noln freestanding blocker.
+  var ph_name = mir::mir_get_panic_handler(prog)
+
+  # Seed: link-time roots (main, naked, weak, cconv variants, module_init,
+  # @panic_handler, plus the inline-IR helpers above when they're in this
+  # program's MIR).
+  for fi in 0..func_count
+    var func = funcs[fi]
+    var fname = func.mir_func_get_name()
+    var is_root = 0
+    if fname == "main"
+      is_root = 1
+    elsif fname == "__qz_module_init"
+      is_root = 1
+    elsif func.mir_func_is_naked() == 1
+      is_root = 1
+    elsif func.mir_func_is_weak() == 1
+      is_root = 1
+    elsif func.mir_func_is_cconv_x86_intr() == 1
+      is_root = 1
+    elsif func.mir_func_is_cconv_c() == 1
+      is_root = 1
+    elsif str_byte_len(ph_name) > 0 and fname == ph_name
+      is_root = 1
+    end
+    if is_root == 0
+      for hi in 0..inline_ir_helpers.size
+        if fname == inline_ir_helpers[hi]
+          is_root = 1
+        end
+      end
+    end
+    if is_root == 1
+      if not reachable.has(fname)
+        reachable.set(fname, 1)
+        worklist.push(fname)
+      end
+    end
+  end
+
+  # C3 (prelude-DCE decoupling): MIR_FUNC_REF targets are NO LONGER pre-seeded as
+  # reachability roots here. Previously this scanned state.func_ref_targets (which
+  # cg_prescan_func_ref_targets populates from EVERY function, dead ones included)
+  # and rooted every target — so a func-ref emitted inside a DEAD function (e.g.
+  # an unconditionally-synthesized __Future_prelude$*$new referencing its own
+  # $poll) permanently rooted that $poll, leaking zero-reference dead prelude/
+  # Future-poll fns into EVERY program's IR. That made program IR depend on the
+  # compiler's own fn set (the long-standing A/B-comparison confound + @.str/SSA
+  # renumber churn). MIR_FUNC_REF is ALREADY a BFS edge in cg_bfs_drain (line ~572;
+  # MIR_CALL_INDIRECT targets ride the same closure, see :546), so a func-ref
+  # target is reachable iff its referencing function is reachable — exactly the
+  # gating the item-5e handler-install fix below already applies. func_ref_targets
+  # stays populated for the ABI queries (cg_is_func_ref_target); only the root
+  # pre-seed is removed. This SHRINKS program IR (drops provably-dead fns) — a real
+  # (behavior-preserving) codegen change, not a byte-identical refactor.
+
+  # item 5e: MIR_HANDLE_INSTALL handler entries + MIR_PERFORM_OP static handlers
+  # were previously pre-seeded here by scanning EVERY function — over-approximate,
+  # since it kept handlers (e.g. std/gen's @__qz_gen_yield_capture, installed by a
+  # dead Stream$next) reachable in programs that never use the effect. That
+  # discovery is now a BFS edge in cg_bfs_drain, gated on the installing function
+  # being reachable. Soundness: every emitted function is reachable, so every
+  # emitted handle-install/perform is scanned → no live handler can be dropped.
+
+  # BFS over MIR_CALL / MIR_INTRINSIC / MIR_FUNC_REF + handler edges.
+  cg_bfs_drain(funcs, func_by_name, reachable, worklist)
+
+  # item 5e (item 13): re-derive Yield liveness against the reachable set. The
+  # prelude force-pulls std/gen, so mir_get_uses_yield is set TRUE by Yield
+  # perform-ops / handle-installs inside std/gen functions even when the user
+  # program never reaches them — a false positive that emits the
+  # @__qz_gen_yield_capture default handler (and its codegen_runtime install) as
+  # dead code in every program. Scan only the reachable functions for a genuine
+  # Yield perform/install: if found, seed the default handler and continue the
+  # BFS so its transitive callees survive (matching the still-emitted install
+  # reference); otherwise clear the flag so both the seed and the install drop
+  # and DCE removes the dead handler. Every Yield route (direct generator yield,
+  # kind=3 Stream-consumer suspend, `can Yield` helpers) goes through a
+  # MIR_PERFORM_OP with effect "Yield" (mir.qz:6017) and must be reachable to
+  # execute, so a cleared flag can never strand a live handler.
+  if prog.mir_get_uses_yield() == 1
+    var yield_live = 0
+    for fi in 0..func_count
+      var yf = funcs[fi]
+      if reachable.has(yf.mir_func_get_name())
+        var yblocks = yf.mir_func_get_blocks()
+        for ybi in 0..yblocks.size
+          var yinstrs = yblocks[ybi].mir_block_get_instructions()
+          for yii in 0..yinstrs.size
+            var yinstr = yinstrs[yii]
+            var ykind = yinstr.mir_instr_get_kind()
+            if ykind == mir::MIR_PERFORM_OP
+              var yslot = yinstr.mir_instr_get_slot2()
+              if yslot != 0 and as_string(yslot).eq("Yield")
+                yield_live = 1
+              end
+            elsif ykind == mir::MIR_HANDLE_INSTALL
+              if yinstr.mir_instr_get_func_name().eq("Yield")
+                yield_live = 1
+              end
+            end
+          end
+        end
+      end
+    end
+    if yield_live == 1
+      if not reachable.has("__qz_gen_yield_capture")
+        reachable.set("__qz_gen_yield_capture", 1)
+        worklist.push("__qz_gen_yield_capture")
+        cg_bfs_drain(funcs, func_by_name, reachable, worklist)
+      end
+    else
+      mir::mir_clear_uses_yield(prog)
+    end
+  end
+
+  state.reachable_funcs = reachable
+  state.dce_active = 1
+end
+
+## Predicate: should cg_emit_function actually emit this function?
+## Returns 1 (emit) when DCE is inactive, or when name is in the reachable set.
+def cg_is_reachable_fn(state: CodegenState, name: String): Int
+  if state.dce_active == 0
+    return 1
+  end
+  if state.reachable_funcs.has(name)
+    return 1
+  end
+  return 0
+end
+
+# ============================================================================
+# Function Emission
+# ============================================================================
+
+def cg_emit_function(state: CodegenState, out: Int, prog: MirProgram, func: MirFunc, func_idx: Int): Void can Emit
+  var name = func.mir_func_get_name()
+  var params = func.mir_func_get_params()
+  var param_count = params.size
+  var return_type = func.mir_func_get_return_type()
+
+  # Set current function and program on state for narrowing lookups
+  state.current_func = Option::Some(func)
+  state.current_prog = Option::Some(prog)
+
+  # Compute escape analysis for @value struct heap-promotion
+  # Suppress return-escape for @value struct constructors (will be alwaysinline),
+  # BUT NOT for functions called from $poll — LLVM inlines the callee into the $poll,
+  # placing the @value alloca on the $poll stack. That pointer gets saved to the heap
+  # frame on suspend and becomes dangling on resume.
+  var _ret_vs = func.mir_func_returns_value_struct(prog)
+  var _suppress_ret = 0
+  if state.stack_alloc == 1 and _ret_vs == 1 and str_byte_len(state.current_module) == 0
+    if codegen_util::cg_is_func_ref_target(state, name) == 0
+      if name.mir_is_poll_callee() == 0
+        _suppress_ret = 1
+      end
+    end
+  end
+  # B.10 P2.1 — by-value @value return ABI. When a function returns its @value
+  # fields in an aggregate (no heap box), the result-construction alloca is read
+  # at the `ret` and dies with the frame, so its return-escape must be suppressed
+  # too. This is independent of --stack-alloc: the aggregate return IS the ABI,
+  # not an opt-in optimization. alwaysinline (gated on _suppress_ret below) is
+  # NOT implied — LLVM's real return convention makes inlining unnecessary.
+  var _byval_ret = cg_func_returns_byval(state, func, prog)
+  var _esc_suppress = _suppress_ret
+  if _byval_ret == 1
+    _esc_suppress = 1
+  end
+  state.escaped_regs = func.mir_compute_escaped_regs(_esc_suppress, prog)
+  state.reg_origins = func.mir_compute_reg_origins(prog)
+
+  # Set current function index for debug info
+  codegen_util::cg_set_func_index(state, func_idx)
+
+  var is_main = name == "main"
+
+  # Rename main to qz_main (wrapper calls this)
+  var emit_name = name
+  if is_main == 1
+    emit_name = "qz_main"
+  else
+    emit_name = codegen_util::cg_sanitize_llvm_name(name)
+  end
+
+  # Naked functions starting with _ use original name without arity suffix
+  # (linker entry points like _start)
+  if func.mir_func_is_naked()
+    if str_byte_at(name, 0) == '_'
+      var dollar_idx = __char_index(name, '$')
+      if dollar_idx >= 0
+        emit_name = str_byte_slice(name, 0, dollar_idx)
+      end
+    end
+  end
+
+  # Determine return type (narrow if applicable, never narrow main)
+  var ret_type_name = func.mir_func_get_return_type_name()
+  var is_cconv_c = func.mir_func_is_cconv_c()
+  var is_cconv_x86_intr = func.mir_func_is_cconv_x86_intr()
+  var ret_llvm_type = "i64"
+  if is_main == 0
+    if is_cconv_x86_intr == 1
+      # LLVM x86_intrcc requires void return — parser enforces this at
+      # the source level, but set here too so the IR is always well-formed.
+      ret_llvm_type = "void"
+    elsif is_cconv_c == 1 and (ret_type_name == "CPtr" or ret_type_name == "String")
+      ret_llvm_type = "ptr"
+    elsif is_cconv_c == 1 and ret_type_name == "Void"
+      ret_llvm_type = "void"
+    elsif is_cconv_c == 1 and ret_type_name == "F64"
+      # B.10 P3.1b — scalar F64 return must be `double` so the value comes back
+      # in an FP register, not a GP register. (F32 is P3.4.)
+      ret_llvm_type = "double"
+    elsif ret_type_name.mir_is_narrow_fixed_width()
+      ret_llvm_type = ret_type_name.mir_type_name_to_llvm()
+    end
+  end
+  # B.10 P3.1b — extern "C" struct return: register-coerced aggregate (§13).
+  # A small (≤16B) all-8-byte-field struct returned across a C boundary lowers
+  # to the target's coerce type (i64 / {i64,i64} / {double,double} / [2 x double]
+  # …) so the foreign caller reads the right registers, not Quartz's i64 pointer.
+  # Gated on cconv-C + eligible struct, so it never fires for the compiler's own
+  # functions (zero cconv-C struct returns) ⇒ fixpoint-safe.
+  var c_ret_coerce = ""
+  if is_main == 0 and is_cconv_c == 1
+    c_ret_coerce = cg_c_abi_return_coerce(prog, state.target_triple, ret_type_name)
+    if c_ret_coerce != ""
+      ret_llvm_type = c_ret_coerce
+    end
+  end
+  # B.10 P3.3 — extern "C" struct return >16B: indirect via a hidden `sret`
+  # pointer (§13). The function returns `void` and takes `ptr sret([N x i64])
+  # %sret` as its first parameter; the return terminator copies the result struct
+  # into it. The classifier picks COERCE xor SRET, so only one of c_ret_coerce /
+  # c_ret_sret is ever non-"". Gated on cconv-C + eligible struct ⇒ fixpoint-safe.
+  var c_ret_sret = ""
+  if is_main == 0 and is_cconv_c == 1 and c_ret_coerce == ""
+    c_ret_sret = cg_c_abi_return_indirect(prog, state.target_triple, ret_type_name)
+    if c_ret_sret != ""
+      ret_llvm_type = "void"
+    end
+  end
+  # B.10 P2.1 — by-value @value return: emit the `{i64 x N}` aggregate type.
+  # Excludes cconv/main/narrow (none of the branches above fired), so this is a
+  # clean override.
+  if _byval_ret == 1
+    var _bv_fc = prog.mir_prog_get_struct_field_count(ret_type_name)
+    ret_llvm_type = cg_byval_ret_type_str(_bv_fc)
+  end
+
+  codegen_util::cg_emit(out, "define ")
+  # @weak → LLVM `weak` linkage keyword. At link time, any non-weak
+  # definition of the same symbol overrides this one. Used for kernel
+  # stubs (panic_handler, scheduler hooks) where a default must exist
+  # but should yield to a strong override.
+  if func.mir_func_is_weak()
+    codegen_util::cg_emit(out, "weak ")
+  end
+  # extern "x86-interrupt" → LLVM `x86_intrcc` calling convention.
+  # The backend emits the interrupt prologue/epilogue and `iret`
+  # instead of `ret`. Signature must match: first param is ptr to
+  # hardware-pushed frame, optional second param is error code for
+  # CPU exceptions that push one.
+  if is_cconv_x86_intr == 1
+    codegen_util::cg_emit(out, "x86_intrcc ")
+  end
+  # extern "preserve_all" / "preserve_most" → LLVM preserve_allcc /
+  # preserve_mostcc. Callee saves almost-all / most registers —
+  # kernel fast-path trampolines into slow-path handlers use this
+  # to avoid disturbing caller register state.
+  if func.mir_func_is_cconv_preserve_all()
+    codegen_util::cg_emit(out, "preserve_allcc ")
+  end
+  if func.mir_func_is_cconv_preserve_most()
+    codegen_util::cg_emit(out, "preserve_mostcc ")
+  end
+  codegen_util::cg_emit(out, ret_llvm_type)
+  codegen_util::cg_emit(out, " @")
+  codegen_util::cg_emit(out, emit_name)
+  codegen_util::cg_emit(out, "(")
+
+  # Check if this function should have @value struct params decomposed
+  var should_decompose = cg_func_should_decompose(state, func, prog)
+
+  var comma_needed = 0
+  # B.10 P3.3 — emit the hidden `sret` pointer as the first parameter for an
+  # indirect (>16B) struct return. User params keep their %p0.. indices (sret is a
+  # separate %sret), so the params loop and the prelude below are unaffected.
+  if c_ret_sret != ""
+    codegen_util::cg_emit(out, "ptr sret(")
+    codegen_util::cg_emit(out, c_ret_sret)
+    codegen_util::cg_emit(out, ") noundef %sret")
+    comma_needed = 1
+  end
+  for i in 0..param_count
+    var param_type_name = func.mir_func_get_param_type_name(i)
+    var c_param_coerce = ""
+    if is_main == 0 and is_cconv_c == 1
+      c_param_coerce = cg_c_abi_param_coerce(prog, state.target_triple, param_type_name)
+    end
+    var c_param_indirect = ""
+    if is_main == 0 and is_cconv_c == 1 and c_param_coerce == ""
+      c_param_indirect = cg_c_abi_param_indirect(prog, state.target_triple, param_type_name)
+    end
+    if c_param_coerce != ""
+      # B.10 P3.1 — extern "C" struct param: register-coerced aggregate (§13).
+      # Wins over the internal decompose path so a cconv-C @value struct uses the
+      # foreign ABI, not Quartz's field-decompose convention.
+      if comma_needed == 1
+        codegen_util::cg_emit(out, ", ")
+      end
+      codegen_util::cg_emit(out, c_param_coerce)
+      codegen_util::cg_emit(out, " noundef %p")
+      codegen_util::cg_emit_int(out, i)
+      comma_needed = 1
+    elsif c_param_indirect != ""
+      # B.10 P3.3 — extern "C" struct param >16B: indirect, but the LLVM encoding
+      # DIFFERS by target (clang-verified; §13.4). SysV AMD64 passes a MEMORY-class
+      # aggregate in the stack argument area — `byval([N x i64])` models that. The
+      # AArch64 AAPCS "indirect" convention instead passes a plain POINTER (in a GP
+      # register) to a caller-made copy; `byval` there means stack-arg-area, the
+      # wrong place, so the callee reads a null register and crashes. Either way the
+      # prelude binds the incoming pointer (which points to a private copy).
+      if comma_needed == 1
+        codegen_util::cg_emit(out, ", ")
+      end
+      if abi_classify::abi_target_is_aarch64(state.target_triple) == 1
+        codegen_util::cg_emit(out, "ptr noundef %p")
+        codegen_util::cg_emit_int(out, i)
+      else
+        codegen_util::cg_emit(out, "ptr byval(")
+        codegen_util::cg_emit(out, c_param_indirect)
+        codegen_util::cg_emit(out, ") noundef %p")
+        codegen_util::cg_emit_int(out, i)
+      end
+      comma_needed = 1
+    elsif is_main == 0 and should_decompose == 1 and func.mir_func_param_is_decomposed(prog, i)
+      # Decompose @value struct param into individual register params
+      var field_count = prog.mir_prog_get_struct_field_count(param_type_name)
+      for fi in 0..field_count
+        if comma_needed == 1
+          codegen_util::cg_emit(out, ", ")
+        end
+        codegen_util::cg_emit(out, "i64 noundef %p")
+        codegen_util::cg_emit_int(out, i)
+        codegen_util::cg_emit(out, ".f")
+        codegen_util::cg_emit_int(out, fi)
+        comma_needed = 1
+      end
+    else
+      if comma_needed == 1
+        codegen_util::cg_emit(out, ", ")
+      end
+      if is_main == 0
+        if is_cconv_x86_intr == 1 and i == 0
+          # LLVM x86_intrcc requires first param to be `ptr byval(T)` where
+          # T describes the hardware-pushed interrupt stack frame. Use
+          # [5 x i64] matching the x86_64 frame (RIP, CS, RFLAGS, RSP, SS).
+          # User sees it as an Int — we ptrtoint in the param-store prelude.
+          codegen_util::cg_emit(out, "ptr byval([5 x i64]) %p")
+          codegen_util::cg_emit_int(out, i)
+        elsif is_cconv_c == 1 and (param_type_name == "CPtr" or param_type_name == "String")
+          # C calling convention: pointer types use ptr
+          codegen_util::cg_emit(out, "ptr noundef %p")
+          codegen_util::cg_emit_int(out, i)
+        elsif is_cconv_c == 1 and param_type_name == "F64"
+          # B.10 P3.1b — C passes F64 in an FP register; the param must be typed
+          # `double` so the foreign caller's SSE/FP-register value is read, not a
+          # GP register. (F32 scalar params are P3.4.) Bitcast to i64 in prologue.
+          codegen_util::cg_emit(out, "double noundef %p")
+          codegen_util::cg_emit_int(out, i)
+        elsif param_type_name.mir_is_narrow_fixed_width()
+          codegen_util::cg_emit(out, param_type_name.mir_type_name_to_llvm())
+          codegen_util::cg_emit(out, " noundef %p")
+          codegen_util::cg_emit_int(out, i)
+        else
+          codegen_util::cg_emit(out, "i64 noundef %p")
+          codegen_util::cg_emit_int(out, i)
+        end
+      else
+        codegen_util::cg_emit(out, "i64 noundef %p")
+        codegen_util::cg_emit_int(out, i)
+      end
+      comma_needed = 1
+    end
+  end
+
+  codegen_util::cg_emit(out, ") nounwind \"frame-pointer\"=\"all\"")
+
+  # `noredzone` for freestanding targets (kernel / bare-metal). The SysV
+  # ABI's 128-byte redzone below RSP is unsafe when interrupts deliver on
+  # the same stack — the hardware iret-frame push (5 qwords at RSP-0x28..
+  # RSP-8) lands directly in the redzone of any active leaf function,
+  # clobbering whatever the leaf stored there. Our baremetal kernel uses
+  # IST=0 for every IDT vector (hello_x86.qz:1153 — same-stack interrupts),
+  # so every leaf needs `noredzone`. Mirrors the `-mno-red-zone` clang flag
+  # we apply to libc_stubs.c in Quakefile.qz. See
+  # feedback_kern_slab_2_redzone_and_arena_drain_gp.md.
+  if codegen_util::cg_state_is_freestanding(state) == 1
+    codegen_util::cg_emit(out, " noredzone")
+  end
+
+  # Emit naked attribute if applicable
+  if func.mir_func_is_naked()
+    codegen_util::cg_emit(out, " naked")
+  end
+
+  # Emit noinline attribute if applicable
+  if func.mir_func_is_noinline()
+    codegen_util::cg_emit(out, " noinline")
+  end
+
+  # Emit alwaysinline for @value struct returning functions (stack alloc optimization)
+  if _suppress_ret == 1
+    codegen_util::cg_emit(out, " alwaysinline")
+  end
+
+  # Add !dbg attachment to function definition
+  if codegen_util::cg_get_debug_mode(state)
+    codegen_util::cg_emit(out, " !dbg !")
+    codegen_util::cg_emit(out, (10 + func_idx).to_s())
+  end
+
+  codegen_util::cg_emit_line(out, " {")
+
+  # Seed a function-entry debug-location sentinel so the prologue instructions
+  # (allocas, parameter stores) emitted before the first MIR instruction still
+  # carry a `!dbg`. cg_emit_instr emits a fresh sentinel per MIR instruction.
+  if codegen_util::cg_get_debug_mode(state)
+    codegen_util::cg_emit_dbg_sentinel(out, codegen_util::cg_get_dilocation(state, func.mir_func_get_line(), func_idx))
+  end
+
+  # Collect all variables that need allocation
+  codegen_util::cg_collect_vars(state, func)
+
+  # Emit entry block label and variable allocations
+  # Use fn_entry to avoid conflicts with variables named 'entry'
+  codegen_util::cg_emit_line(out, "fn_entry:")
+
+  # Skip alloca and parameter stores for naked functions
+  if func.mir_func_is_naked() == 0
+    # Allocate all local variables (narrow types get sized allocas)
+    var alloca_locals = codegen_util::cg_get_local_vars(state)
+    var alloca_count = alloca_locals.size
+    for alloca_i in 0..alloca_count
+      var var_name = alloca_locals[alloca_i]
+      var local_type = func.mir_func_get_local_type(var_name)
+      codegen_util::cg_emit(out, "  %")
+      codegen_util::cg_emit(out, codegen_util::cg_sanitize_var_name(var_name))
+      if local_type.mir_is_narrow_fixed_width()
+        codegen_util::cg_emit(out, " = alloca ")
+        codegen_util::cg_emit_line(out, local_type.mir_type_name_to_llvm())
+      else
+        codegen_util::cg_emit_line(out, " = alloca i64")
+      end
+    end
+  end
+
+  # Store parameters into their alloca'd slots (with narrow extension if needed)
+  # Skip for naked functions (no alloca, no parameter stores)
+  if func.mir_func_is_naked() == 0
+    for i in 0..param_count
+      var pname = params[i]
+      var safe_pname = codegen_util::cg_sanitize_var_name(pname)
+      var param_type_name = func.mir_func_get_param_type_name(i)
+      var c_param_coerce = ""
+      if is_main == 0 and is_cconv_c == 1
+        c_param_coerce = cg_c_abi_param_coerce(prog, state.target_triple, param_type_name)
+      end
+      var c_param_indirect = ""
+      if is_main == 0 and is_cconv_c == 1 and c_param_coerce == ""
+        c_param_indirect = cg_c_abi_param_indirect(prog, state.target_triple, param_type_name)
+      end
+      if c_param_coerce != "" and cg_c_abi_struct_has_f32(prog, param_type_name) == 1
+        # B.10 P3.4b — F32 struct param: the coerce value's C-packed bytes can't
+        # alias the Quartz [N x i64] layout (F32 is 4 bytes in C, 8 internally), so
+        # boundary-repack field-by-field into a fresh frame-local struct, then bind.
+        var idx_str = i.to_s()
+        cg_c_abi_emit_unpack(out, prog, param_type_name, c_param_coerce, "p" + idx_str, 0, "p" + idx_str + ".up", "p" + idx_str + ".qi")
+        codegen_util::cg_emit(out, "  store i64 %p")
+        codegen_util::cg_emit(out, idx_str)
+        codegen_util::cg_emit(out, ".qi, ptr %")
+        codegen_util::cg_emit(out, safe_pname)
+        codegen_util::cg_emit_line(out, ", align 8")
+      elsif c_param_coerce != ""
+        # B.10 P3.1 — reconstruct the struct from its register-coerced param:
+        # store the coerced aggregate to a stack slot whose memory aliases the
+        # struct's [N x i64] layout (all-wide fields), then bind the pointer.
+        var idx_str = i.to_s()
+        codegen_util::cg_emit(out, "  %p")
+        codegen_util::cg_emit(out, idx_str)
+        codegen_util::cg_emit(out, ".cs = alloca ")
+        codegen_util::cg_emit_line(out, c_param_coerce)
+        codegen_util::cg_emit(out, "  store ")
+        codegen_util::cg_emit(out, c_param_coerce)
+        codegen_util::cg_emit(out, " %p")
+        codegen_util::cg_emit(out, idx_str)
+        codegen_util::cg_emit(out, ", ptr %p")
+        codegen_util::cg_emit(out, idx_str)
+        codegen_util::cg_emit_line(out, ".cs, align 8")
+        codegen_util::cg_emit(out, "  %p")
+        codegen_util::cg_emit(out, idx_str)
+        codegen_util::cg_emit(out, ".ptr = ptrtoint ptr %p")
+        codegen_util::cg_emit(out, idx_str)
+        codegen_util::cg_emit_line(out, ".cs to i64")
+        codegen_util::cg_emit(out, "  store i64 %p")
+        codegen_util::cg_emit(out, idx_str)
+        codegen_util::cg_emit(out, ".ptr, ptr %")
+        codegen_util::cg_emit(out, safe_pname)
+        codegen_util::cg_emit_line(out, ", align 8")
+      elsif c_param_indirect != "" and cg_c_abi_struct_has_f32(prog, param_type_name) == 1
+        # B.10 P3.4-ii-b — F32 byval param: %pI points to a C-layout
+        # %struct.Name.cabi buffer (packed floats), NOT the Quartz internal layout.
+        # Reconstruct the internal struct (fpext each F32) into a frame-local buffer,
+        # then bind it. (Param prelude runs once per invocation ⇒ alloca is fine.)
+        var idx_str = i.to_s()
+        codegen_util::cg_emit_line(out, "  %p#{idx_str}.iqb = alloca [#{prog.mir_prog_get_struct_field_count(param_type_name)} x i64]")
+        codegen_util::cg_emit_line(out, "  %p#{idx_str}.iqi = ptrtoint ptr %p#{idx_str}.iqb to i64")
+        codegen_util::cg_emit_line(out, "  %p#{idx_str}.iqp = inttoptr i64 %p#{idx_str}.iqi to %struct.#{param_type_name}*")
+        cg_c_abi_emit_c_to_qz_buf(out, prog, param_type_name, "p#{idx_str}", "p#{idx_str}.iqp", "p#{idx_str}.iqr")
+        codegen_util::cg_emit(out, "  store i64 %p")
+        codegen_util::cg_emit(out, idx_str)
+        codegen_util::cg_emit(out, ".iqi, ptr %")
+        codegen_util::cg_emit(out, safe_pname)
+        codegen_util::cg_emit_line(out, ", align 8")
+      elsif c_param_indirect != ""
+        # B.10 P3.3 — byval param: %pI is a pointer to the caller's copy of the
+        # struct (the backend materialized it in this frame). Bind it directly as
+        # the struct's i64 pointer slot — no reconstruct, the memory already aliases
+        # the [N x i64] layout (frame-local, consistent with the P3.1 coerce path).
+        var idx_str = i.to_s()
+        codegen_util::cg_emit(out, "  %p")
+        codegen_util::cg_emit(out, idx_str)
+        codegen_util::cg_emit(out, ".bvi = ptrtoint ptr %p")
+        codegen_util::cg_emit(out, idx_str)
+        codegen_util::cg_emit_line(out, " to i64")
+        codegen_util::cg_emit(out, "  store i64 %p")
+        codegen_util::cg_emit(out, idx_str)
+        codegen_util::cg_emit(out, ".bvi, ptr %")
+        codegen_util::cg_emit(out, safe_pname)
+        codegen_util::cg_emit_line(out, ", align 8")
+      elsif is_main == 0 and should_decompose == 1 and func.mir_func_param_is_decomposed(prog, i)
+        # Reconstruct @value struct from decomposed register params
+        var field_count = prog.mir_prog_get_struct_field_count(param_type_name)
+        var idx_str = i.to_s()
+        codegen_util::cg_emit(out, "  %p")
+        codegen_util::cg_emit(out, idx_str)
+        codegen_util::cg_emit(out, ".struct = alloca i64, i64 ")
+        codegen_util::cg_emit_line(out, field_count.to_s())
+        for fi in 0..field_count
+          var fis = fi.to_s()
+          codegen_util::cg_emit(out, "  %p")
+          codegen_util::cg_emit(out, idx_str)
+          codegen_util::cg_emit(out, ".gep")
+          codegen_util::cg_emit(out, fis)
+          codegen_util::cg_emit(out, " = getelementptr inbounds i64, ptr %p")
+          codegen_util::cg_emit(out, idx_str)
+          codegen_util::cg_emit(out, ".struct, i64 ")
+          codegen_util::cg_emit_line(out, fis)
+          codegen_util::cg_emit(out, "  store i64 %p")
+          codegen_util::cg_emit(out, idx_str)
+          codegen_util::cg_emit(out, ".f")
+          codegen_util::cg_emit(out, fis)
+          codegen_util::cg_emit(out, ", ptr %p")
+          codegen_util::cg_emit(out, idx_str)
+          codegen_util::cg_emit(out, ".gep")
+          codegen_util::cg_emit(out, fis)
+          codegen_util::cg_emit_line(out, ", align 8")
+        end
+        codegen_util::cg_emit(out, "  %p")
+        codegen_util::cg_emit(out, idx_str)
+        codegen_util::cg_emit(out, ".ptr = ptrtoint ptr %p")
+        codegen_util::cg_emit(out, idx_str)
+        codegen_util::cg_emit_line(out, ".struct to i64")
+        codegen_util::cg_emit(out, "  store i64 %p")
+        codegen_util::cg_emit(out, idx_str)
+        codegen_util::cg_emit(out, ".ptr")
+        codegen_util::cg_emit(out, ", ptr %")
+        codegen_util::cg_emit(out, safe_pname)
+        codegen_util::cg_emit_line(out, ", align 8")
+      else
+        if is_main == 0
+          if is_cconv_x86_intr == 1 and i == 0
+            # x86_intrcc first param is `ptr byval(...)` — ptrtoint to i64
+            # for the Quartz-visible param slot (user sees it as Int).
+            codegen_util::cg_emit(out, "  %p")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit(out, ".ext = ptrtoint ptr %p")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit_line(out, " to i64")
+            codegen_util::cg_emit(out, "  store i64 %p")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit(out, ".ext")
+            codegen_util::cg_emit(out, ", ptr %")
+            codegen_util::cg_emit(out, safe_pname)
+            codegen_util::cg_emit_line(out, ", align 8")
+          elsif is_cconv_c == 1 and (param_type_name == "CPtr" or param_type_name == "String")
+            # C calling convention: convert ptr param to i64 via ptrtoint
+            codegen_util::cg_emit(out, "  %p")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit(out, ".ext = ptrtoint ptr %p")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit_line(out, " to i64")
+            codegen_util::cg_emit(out, "  store i64 %p")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit(out, ".ext")
+            codegen_util::cg_emit(out, ", ptr %")
+            codegen_util::cg_emit(out, safe_pname)
+            codegen_util::cg_emit_line(out, ", align 8")
+          elsif is_cconv_c == 1 and param_type_name == "F64"
+            # B.10 P3.1b — the param arrived as `double`; Quartz stores floats as
+            # their i64 bit pattern in the local slot. Bitcast double->i64.
+            codegen_util::cg_emit(out, "  %p")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit(out, ".bc = bitcast double %p")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit_line(out, " to i64")
+            codegen_util::cg_emit(out, "  store i64 %p")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit(out, ".bc")
+            codegen_util::cg_emit(out, ", ptr %")
+            codegen_util::cg_emit(out, safe_pname)
+            codegen_util::cg_emit_line(out, ", align 8")
+          elsif param_type_name.mir_is_narrow_fixed_width()
+            # Extend narrow param to i64 before storing
+            var narrow_type = param_type_name.mir_type_name_to_llvm()
+            var ext_op = "sext"
+            if param_type_name.mir_is_unsigned_type()
+              ext_op = "zext"
+            end
+            codegen_util::cg_emit(out, "  %p")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit(out, ".ext = ")
+            codegen_util::cg_emit(out, ext_op)
+            codegen_util::cg_emit(out, " ")
+            codegen_util::cg_emit(out, narrow_type)
+            codegen_util::cg_emit(out, " %p")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit_line(out, " to i64")
+            codegen_util::cg_emit(out, "  store i64 %p")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit(out, ".ext")
+            codegen_util::cg_emit(out, ", ptr %")
+            codegen_util::cg_emit(out, safe_pname)
+            codegen_util::cg_emit_line(out, ", align 8")
+          else
+            codegen_util::cg_emit(out, "  store i64 %p")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit(out, ", ptr %")
+            codegen_util::cg_emit(out, safe_pname)
+            codegen_util::cg_emit_line(out, ", align 8")
+          end
+        else
+          codegen_util::cg_emit(out, "  store i64 %p")
+          codegen_util::cg_emit_int(out, i)
+          codegen_util::cg_emit(out, ", ptr %")
+          codegen_util::cg_emit(out, safe_pname)
+          codegen_util::cg_emit_line(out, ", align 8")
+        end
+      end
+    end
+  end
+
+  # Call __qz_module_init at the start of main (qz_main) to initialize globals
+  if is_main == 1
+    codegen_util::cg_emit_line(out, "  call i64 @__qz_module_init()")
+  end
+
+  # Hoist all integer/bool constants to fn_entry block.
+  # Constants are side-effect-free and fn_entry dominates all blocks,
+  # so this prevents LLVM "instruction does not dominate all uses" errors
+  # when constants are emitted inside conditional branches but used after merge.
+  var blocks = func.mir_func_get_blocks()
+  var block_count = blocks.size
+  for _hoist_bi in 0..block_count
+    var _hoist_block = blocks[_hoist_bi]
+    var _hoist_instrs = _hoist_block.mir_block_get_instructions()
+    var _hoist_count = _hoist_instrs.size
+    for _hoist_ii in 0.._hoist_count
+      var _hoist_instr = _hoist_instrs[_hoist_ii]
+      var _hoist_kind = _hoist_instr.mir_instr_get_kind()
+      if _hoist_kind == mir::MIR_CONST_INT
+        var _hoist_dest = _hoist_instr.mir_instr_get_dest_id()
+        var _hoist_val = _hoist_instr.mir_instr_get_int_val()
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, _hoist_dest)
+        codegen_util::cg_emit(out, " = add i64 0, ")
+        codegen_util::cg_emit_line(out, _hoist_val.to_s())
+      end
+      if _hoist_kind == mir::MIR_CONST_BOOL
+        var _hoist_dest = _hoist_instr.mir_instr_get_dest_id()
+        var _hoist_val = _hoist_instr.mir_instr_get_int_val()
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, _hoist_dest)
+        codegen_util::cg_emit(out, " = add i64 0, ")
+        codegen_util::cg_emit_line(out, _hoist_val.to_s())
+      end
+    end
+  end
+
+  # Hoist non-escaped mir::MIR_ALLOC_STACK to fn_entry block.
+  # This makes them static allocas so LLVM's inliner won't insert stacksave/stackrestore
+  # — critical for alwaysinline @value struct returning functions (M.R.8).
+  var _esc = state.escaped_regs
+  for _hoist_bi2 in 0..block_count
+    var _hoist_block2 = blocks[_hoist_bi2]
+    var _hoist_instrs2 = _hoist_block2.mir_block_get_instructions()
+    var _hoist_count2 = _hoist_instrs2.size
+    for _hoist_ii2 in 0.._hoist_count2
+      var _hoist_instr2 = _hoist_instrs2[_hoist_ii2]
+      if _hoist_instr2.mir_instr_get_kind() == mir::MIR_ALLOC_STACK
+        var _hoist_dest2 = _hoist_instr2.mir_instr_get_dest_id()
+        var _hoist_esc = 0
+        if _hoist_dest2 < _esc.size
+          _hoist_esc = _esc[_hoist_dest2]
+        end
+        if _hoist_esc == 0
+          var _hw = _hoist_instr2.mir_instr_get_slot1()
+          var _hd = _hoist_dest2.to_s()
+          # SYS.1 item 4 — honor struct-level @align(N) when present.
+          # MIR_ALLOC_STACK carries the struct name in operand1;
+          # mir_get_struct_align returns the declared alignment or
+          # 0 if none. Fall back to 8 (default slot alignment).
+          var _h_align_str = "8"
+          var _h_sname_int = _hoist_instr2.mir_instr_get_operand1()
+          if _h_sname_int != 0
+            var _h_sname = as_string(_h_sname_int)
+            var _h_declared = mir::mir_get_struct_align(_h_sname)
+            if _h_declared > 8
+              _h_align_str = _h_declared.to_s()
+            end
+          end
+          codegen_util::cg_emit(out, "  %alloc_")
+          codegen_util::cg_emit(out, _hd)
+          codegen_util::cg_emit(out, ".p = alloca [")
+          codegen_util::cg_emit_int(out, _hw)
+          codegen_util::cg_emit(out, " x i64], align ")
+          codegen_util::cg_emit_line(out, _h_align_str)
+          codegen_util::cg_emit(out, "  %alloc_")
+          codegen_util::cg_emit(out, _hd)
+          codegen_util::cg_emit(out, " = bitcast [")
+          codegen_util::cg_emit_int(out, _hw)
+          codegen_util::cg_emit(out, " x i64]* %alloc_")
+          codegen_util::cg_emit(out, _hd)
+          codegen_util::cg_emit_line(out, ".p to ptr")
+        end
+      end
+    end
+  end
+
+  # Hoist by-value-return call reconstruct buffers to fn_entry (B.10 P2.1).
+  # A call to a by-value-return function yields a `{i64 x N}` aggregate that the
+  # call site stores into a buffer to recover a struct pointer. When the result
+  # does NOT escape, that buffer is a static stack alloca — hoisted here so it
+  # dominates every block (§7.3), exactly like the MIR_ALLOC_STACK case above.
+  # Escaped results heap-allocate at the call site instead (no alloca hoisted).
+  # Guarded on @value presence: zero alloca emitted for the compiler's own build.
+  if mir::mir_prog_has_value_struct(prog) == 1
+    for _hb_bi in 0..block_count
+      var _hb_block = blocks[_hb_bi]
+      var _hb_instrs = _hb_block.mir_block_get_instructions()
+      var _hb_count = _hb_instrs.size
+      for _hb_ii in 0.._hb_count
+        var _hb_instr = _hb_instrs[_hb_ii]
+        if _hb_instr.mir_instr_get_kind() == mir::MIR_CALL
+          var _hb_callee_opt = mir::mir_prog_find_function(prog, _hb_instr.mir_instr_get_func_name())
+          if _hb_callee_opt.is_some() and cg_func_returns_byval(state, _hb_callee_opt.unwrap(), prog) == 1
+            var _hb_callee = _hb_callee_opt.unwrap()
+            var _hb_dest = _hb_instr.mir_instr_get_dest_id()
+            var _hb_esc = 0
+            if _hb_dest < _esc.size
+              _hb_esc = _esc[_hb_dest]
+            end
+            if _hb_esc == 0
+              var _hb_rt = _hb_callee.mir_func_get_return_type_name()
+              var _hb_fc = prog.mir_prog_get_struct_field_count(_hb_rt)
+              var _hb_ds = _hb_dest.to_s()
+              codegen_util::cg_emit(out, "  %vret_")
+              codegen_util::cg_emit(out, _hb_ds)
+              codegen_util::cg_emit(out, ".p = alloca [")
+              codegen_util::cg_emit_int(out, _hb_fc)
+              codegen_util::cg_emit_line(out, " x i64], align 8")
+              codegen_util::cg_emit(out, "  %vret_")
+              codegen_util::cg_emit(out, _hb_ds)
+              codegen_util::cg_emit(out, " = bitcast [")
+              codegen_util::cg_emit_int(out, _hb_fc)
+              codegen_util::cg_emit(out, " x i64]* %vret_")
+              codegen_util::cg_emit(out, _hb_ds)
+              codegen_util::cg_emit_line(out, ".p to ptr")
+            end
+          end
+        end
+      end
+    end
+  end
+
+  # Hoist mir::MIR_HANDLE_INSTALL allocas (%wb.jmpbuf.<dest> and
+  # %wb.result_slot.<dest>) to fn_entry. The body's wb.body / wb.catch /
+  # wb.done blocks read these slots; in async $poll variants the resume
+  # entry path can re-enter from poll_switch back into a wb.done.* without
+  # passing through the block where the inline alloca would otherwise live,
+  # producing an SSA dominance violation at llc time. fn_entry dominates
+  # every block unconditionally, so lifting is correct for all functions.
+  # See docs/bugs/POLL_BODY_WB_RESULT_SLOT_DOMINANCE.md.
+  for _hoist_bi3 in 0..block_count
+    var _hoist_block3 = blocks[_hoist_bi3]
+    var _hoist_instrs3 = _hoist_block3.mir_block_get_instructions()
+    var _hoist_count3 = _hoist_instrs3.size
+    for _hoist_ii3 in 0.._hoist_count3
+      var _hoist_instr3 = _hoist_instrs3[_hoist_ii3]
+      if _hoist_instr3.mir_instr_get_kind() == mir::MIR_HANDLE_INSTALL
+        var _hoist_eff3 = _hoist_instr3.mir_instr_get_func_name()
+        var _hoist_entries3 = _hoist_instr3.mir_instr_get_args()
+        # Mirror the inline emission gate: only with non-empty effect
+        # name AND at least one entry does the install materialize the
+        # alloca pair. Empty-effect / zero-entry installs fall through
+        # to a no-op (the inline path emits only an `add 0, 0` for the
+        # dest), so no slot is needed.
+        if str_byte_len(_hoist_eff3) > 0 and (_hoist_entries3.size / 2) > 0
+          var _hoist_dest3 = _hoist_instr3.mir_instr_get_dest_id()
+          codegen_util::cg_emit(out, "  %wb.jmpbuf.")
+          codegen_util::cg_emit_int(out, _hoist_dest3)
+          codegen_util::cg_emit_line(out, " = alloca [32 x i64], align 8")
+          codegen_util::cg_emit(out, "  %wb.result_slot.")
+          codegen_util::cg_emit_int(out, _hoist_dest3)
+          codegen_util::cg_emit_line(out, " = alloca i64, align 8")
+          # POLL_BODY_WB_PRETOP_DOMINANCE: spill slot for the install's
+          # pretop (effect-stack index). The VALUE %wb.pretop.<dest> is a
+          # load emitted inline at the install block; the perform static
+          # fast path consumes it to set @__qz_effect_current_install_idx,
+          # and that perform can sit in a poll-resume block that bypasses
+          # the install block (when the with-body suspends, then performs
+          # again after the resume) → SSA dominance violation. Unlike the
+          # jmpbuf/result_slot allocas, the pretop VALUE can't be hoisted
+          # (nested installs have different pretops), so the install stores
+          # it into this hoisted slot and the perform fast path reloads it.
+          # See docs/bugs/POLL_BODY_WB_PRETOP_DOMINANCE.md.
+          codegen_util::cg_emit(out, "  %wb.pretop_slot.")
+          codegen_util::cg_emit_int(out, _hoist_dest3)
+          codegen_util::cg_emit_line(out, " = alloca i64, align 8")
+        end
+      end
+    end
+  end
+
+  # Branch to first MIR block (entry block needs terminator)
+  if block_count > 0
+    var first_block = blocks[0]
+    var first_label = first_block.mir_block_get_label()
+    codegen_util::cg_emit(out, "  br label %")
+    codegen_util::cg_emit_line(out, first_label)
+  end
+
+  # Emit all blocks
+  each(blocks, block: MirBlock -> codegen_instr::cg_emit_block(state, out, prog, block))
+
+  codegen_util::cg_emit_line(out, "}")
+  codegen_util::cg_emit_line(out, "")
+end
+
+
+## Emit global variable declarations
+def cg_emit_global_vars(out: Int, prog: MirProgram): Void
+  var names = prog.mir_get_global_names()
+  var inits = prog.mir_get_global_inits()
+  var tl_flags = prog.mir_get_global_thread_locals()
+  var count = names.size
+
+  if count > 0
+    codegen_util::cg_emit_line(out, "; Global Variables")
+  end
+
+  for i in 0..count
+    var name = names[i]
+    var init_val = inits[i]
+    codegen_util::cg_emit(out, "@global_")
+    codegen_util::cg_emit(out, name)
+    if tl_flags[i] == 1
+      codegen_util::cg_emit(out, " = thread_local global i64 ")
+    else
+      codegen_util::cg_emit(out, " = global i64 ")
+    end
+    codegen_util::cg_emit_line(out, init_val.to_s())
+  end
+
+  # Emit LLVM aliases for globals shared across multiple import prefixes.
+  # Driven by the resolver wildcard-vs-qualified dedup: when the same
+  # module's `var X` is imported both bare and as `m::X`, mir_lower
+  # PASS 0.6 records one primary `@global_X` and one alias entry
+  # `(m$X, X)` here. Emitting an LLVM alias preserves shared storage —
+  # a write through either name is visible to reads through the other.
+  var alias_names = prog.mir_get_global_alias_names()
+  var alias_targets = prog.mir_get_global_alias_targets()
+  var alias_count = alias_names.size
+  for ai in 0..alias_count
+    codegen_util::cg_emit(out, "@global_")
+    codegen_util::cg_emit(out, alias_names[ai])
+    codegen_util::cg_emit(out, " = alias i64, ptr @global_")
+    codegen_util::cg_emit_line(out, alias_targets[ai])
+  end
+
+  if count > 0 or alias_count > 0
+    codegen_util::cg_emit_line(out, "")
+  end
+end
+
+## Emit const declarations as immutable globals
+def cg_emit_const_decls(out: Int, prog: MirProgram): Void
+  var names = prog.mir_get_const_names()
+  var values = prog.mir_get_const_values()
+  var count = names.size
+  
+  if count > 0
+    codegen_util::cg_emit_line(out, "; Constants")
+  end
+  
+  for i in 0..count
+    var name = names[i]
+    var value = values[i]
+    # @const_name = constant i64 <value>
+    codegen_util::cg_emit(out, "@const_")
+    codegen_util::cg_emit(out, name)
+    codegen_util::cg_emit(out, " = constant i64 ")
+    codegen_util::cg_emit_line(out, value.to_s())
+  end
+  
+  if count > 0
+    codegen_util::cg_emit_line(out, "")
+  end
+end
+
+## If the MIR pass created a __qz_module_init function (for complex global
+## inits like vec_new()), it will be emitted by normal function codegen.
+## This fallback handles programs with only string literal globals.
+def cg_emit_module_init(state: CodegenState, out: Int, prog: MirProgram): Void
+  # Check if MIR already synthesized __qz_module_init
+  var funcs = prog.mir_get_functions()
+  var func_count = funcs.size
+  for fi in 0..func_count
+    var f = funcs[fi]
+    var fname = f.mir_func_get_name()
+    if fname == "__qz_module_init"
+      return  # Already emitted by normal function codegen
+    end
+  end
+
+  var names = prog.mir_get_global_names()
+  var str_inits = prog.mir_get_global_str_inits()
+  var count = names.size
+
+  # Check if any globals need string initialization
+  var has_str_init = 0
+  for i in 0..count
+    if str_byte_len(str_inits[i]) > 0
+      has_str_init = 1
+    end
+  end
+
+  # Emit __qz_module_init stub (qz_main calls it)
+  codegen_util::cg_emit_line(out, "")
+  codegen_util::cg_emit_line(out, "define i64 @__qz_module_init() nounwind {")
+  codegen_util::cg_emit_line(out, "entry_init:")
+
+  if has_str_init == 1
+    var reg_idx = 0
+    for i in 0..count
+      if str_byte_len(str_inits[i]) > 0
+        var name = names[i]
+        var str_val = str_inits[i]
+        # Add to string pool and get index
+        var str_idx = codegen_util::cg_add_string(state, str_val)
+        var slen = str_byte_len(str_val) + 1
+        # Emit: %vN.ptr = getelementptr <{ i64, [K x i8] }>, <{ i64, [K x i8] }>* @.str.M, i64 0, i32 1, i64 0
+        codegen_util::cg_emit(out, "  %ginit")
+        codegen_util::cg_emit_int(out, reg_idx)
+        codegen_util::cg_emit(out, ".ptr = getelementptr <{ i64, [")
+        codegen_util::cg_emit_int(out, slen)
+        codegen_util::cg_emit(out, " x i8] }>, <{ i64, [")
+        codegen_util::cg_emit_int(out, slen)
+        codegen_util::cg_emit(out, " x i8] }>* @.str.")
+        codegen_util::cg_emit_int(out, str_idx)
+        codegen_util::cg_emit_line(out, ", i64 0, i32 1, i64 0")
+        # Emit: %vN = ptrtoint i8* %vN.ptr to i64
+        codegen_util::cg_emit(out, "  %ginit")
+        codegen_util::cg_emit_int(out, reg_idx)
+        codegen_util::cg_emit(out, " = ptrtoint ptr %ginit")
+        codegen_util::cg_emit_int(out, reg_idx)
+        codegen_util::cg_emit_line(out, ".ptr to i64")
+        # Emit: store i64 %vN, i64* @global_NAME
+        codegen_util::cg_emit(out, "  store i64 %ginit")
+        codegen_util::cg_emit_int(out, reg_idx)
+        codegen_util::cg_emit(out, ", ptr @global_")
+        codegen_util::cg_emit_line(out, name)
+        reg_idx += 1
+      end
+    end
+  end
+
+  codegen_util::cg_emit_line(out, "  ret i64 0")
+  codegen_util::cg_emit_line(out, "}")
+end
+
+## Emit DWARF debug metadata (DICompileUnit, DIFile, DISubprogram, DILocation)
+def cg_emit_debug_metadata(state: CodegenState, out: Int, prog: MirProgram, source_file: String): Void
+  var funcs = prog.mir_get_functions()
+  var func_count = funcs.size
+
+  codegen_util::cg_emit_line(out, "")
+  codegen_util::cg_emit_line(out, "; Debug Metadata")
+
+  # Module flags for debug info
+  codegen_util::cg_emit_line(out, "!llvm.dbg.cu = !{!0}")
+  codegen_util::cg_emit_line(out, "!llvm.module.flags = !{!1, !2, !3}")
+  codegen_util::cg_emit_line(out, "")
+
+  # !0 = DICompileUnit
+  codegen_util::cg_emit(out, "!0 = distinct !DICompileUnit(language: DW_LANG_C99, file: !5, producer: \"Quartz self-hosted compiler\", ")
+  codegen_util::cg_emit_line(out, "isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug)")
+
+  # Module flags
+  codegen_util::cg_emit_line(out, "!1 = !{i32 7, !\"Dwarf Version\", i32 4}")
+  codegen_util::cg_emit_line(out, "!2 = !{i32 2, !\"Debug Info Version\", i32 3}")
+  codegen_util::cg_emit_line(out, "!3 = !{i32 1, !\"wchar_size\", i32 4}")
+  
+  # !5 = DIFile
+  codegen_util::cg_emit(out, "!5 = !DIFile(filename: \"")
+  codegen_util::cg_emit(out, source_file)
+  codegen_util::cg_emit_line(out, "\", directory: \".\")")
+  
+  # !7 = Subroutine type (void function type placeholder)
+  codegen_util::cg_emit_line(out, "!7 = !DISubroutineType(types: !8)")
+  codegen_util::cg_emit_line(out, "!8 = !{null}")
+  codegen_util::cg_emit_line(out, "")
+  
+  # Emit DISubprogram for each function starting at !10
+  for f in 0..func_count
+    var func = funcs[f]
+    var func_name = func.mir_func_get_name()
+    var func_line = func.mir_func_get_line()
+    if func_line <= 0
+      func_line = 1
+    end
+    
+    codegen_util::cg_emit(out, "!")
+    codegen_util::cg_emit(out, (10 + f).to_s())
+    codegen_util::cg_emit(out, " = distinct !DISubprogram(name: \"")
+    codegen_util::cg_emit(out, func_name)
+    codegen_util::cg_emit(out, "\", scope: !5, file: !5, line: ")
+    codegen_util::cg_emit_int(out, func_line)
+    codegen_util::cg_emit(out, ", type: !7, scopeLine: ")
+    codegen_util::cg_emit_int(out, func_line)
+    codegen_util::cg_emit_line(out, ", spFlags: DISPFlagDefinition, unit: !0)")
+  end
+  
+  # Emit DILocation entries using pre-assigned metadata IDs from shared counter
+  var loc_lines = state.dilocation_lines
+  var loc_funcs = state.dilocation_funcs
+  var loc_ids = state.dilocation_ids
+  var loc_count = loc_lines.size
+
+  for i in 0..loc_count
+    var line = loc_lines[i]
+    var func_idx = loc_funcs[i]
+    var scope_id = 10 + func_idx
+
+    codegen_util::cg_emit(out, "!")
+    codegen_util::cg_emit(out, loc_ids[i].to_s())
+    codegen_util::cg_emit(out, " = !DILocation(line: ")
+    codegen_util::cg_emit_int(out, line)
+    codegen_util::cg_emit(out, ", column: 1, scope: !")
+    codegen_util::cg_emit_int(out, scope_id)
+    codegen_util::cg_emit_line(out, ")")
+  end
+end
+
+## Returns 1 if the bytes of `src` at `pos` match the literal `lit` without
+## running past `limit`, 0 otherwise.
+def cg_dbg_match_at(src: String, pos: Int, limit: Int, lit: String): Int
+  var ll = str_byte_len(lit)
+  if pos + ll > limit
+    return 0
+  end
+  var k = 0
+  while k < ll
+    if str_byte_at(src, pos + k) != str_byte_at(lit, k)
+      return 0
+    end
+    k = k + 1
+  end
+  return 1
+end
+
+## Parse the integer following a `; __qzdbgloc ` sentinel prefix. `body` is the
+## index of the first digit (i.e. past the 13-byte prefix).
+def cg_dbg_parse_int(src: String, body: Int, limit: Int): Int
+  var p = body
+  var v = 0
+  while p < limit
+    var c = str_byte_at(src, p)
+    if c < 48 or c > 57
+      break
+    end
+    v = (v * 10) + (c - 48)
+    p = p + 1
+  end
+  return v
+end
+
+## Post-pass: stamp `!dbg` debug locations onto every emitted instruction.
+##
+## Codegen emits `  ; __qzdbgloc N` sentinel comments — one per MIR instruction
+## plus one per function entry (see cg_emit_dbg_sentinel). This pass walks the
+## finished IR line by line, tracks the active DILocation id from the most
+## recent sentinel, appends `, !dbg !N` to every instruction line, and strips
+## the sentinels. Runs only for `--debug` builds.
+##
+## Classifier: a line is an instruction iff it is indented (LLVM IR indents
+## every instruction with two spaces) and is not a `;` comment. Labels,
+## `define`, `}`, globals, types, and metadata all sit at column 0 and are
+## copied verbatim. `cur_loc` resets to 0 at each `define` so a synthesized
+## function with no sentinels yields bare (locationless) — but still valid —
+## instructions rather than inheriting the previous function's location.
+def cg_apply_debug_locations(src: String): String
+  var n = str_byte_len(src)
+  var result = sb_new_with_capacity(n + (n / 8))
+  var cur_loc = 0
+  # `switch` is the one multi-line LLVM instruction this emitter produces:
+  # a `... [` header, indented case lines, then a `]` close. `!dbg` must land
+  # after the `]`, not on the header or cases.
+  var in_switch = 0
+  var i = 0
+  while i < n
+    var line_start = i
+    var line_end = i
+    while line_end < n and str_byte_at(src, line_end) != 10
+      line_end = line_end + 1
+    end
+    var next = line_end
+    if next < n
+      next = next + 1
+    end
+
+    # Count leading spaces.
+    var lead = line_start
+    while lead < line_end and str_byte_at(src, lead) == 32
+      lead = lead + 1
+    end
+
+    var emitted = 0
+    if lead < line_end
+      var first = str_byte_at(src, lead)
+      if lead > line_start
+        # Indented line: comment or instruction.
+        if first == 59  # ';'
+          if cg_dbg_match_at(src, lead, line_end, "; __qzdbgloc ")
+            cur_loc = cg_dbg_parse_int(src, lead + 13, line_end)
+            emitted = 1  # strip the sentinel
+          end
+        else
+          # Indented non-comment => instruction.
+          # Trailing-space-trimmed last byte classifies switch boundaries.
+          var last = line_end - 1
+          while last > lead and str_byte_at(src, last) == 32
+            last = last - 1
+          end
+          var last_ch = str_byte_at(src, last)
+          if in_switch == 1
+            # Inside a switch's `[ ... ]` body.
+            sb_append(result, str_byte_slice(src, line_start, line_end))
+            if last_ch == 93  # ']' — closes the switch; stamp the whole instr
+              if cur_loc != 0
+                sb_append(result, ", !dbg !")
+                sb_append_int(result, cur_loc)
+              end
+              in_switch = 0
+            end
+            if line_end < n
+              sb_append(result, "\n")
+            end
+          elsif last_ch == 91  # '[' — switch header; locationless, copy verbatim
+            sb_append(result, str_byte_slice(src, line_start, next))
+            in_switch = 1
+          else
+            # Ordinary single-line instruction. Stamp it.
+            sb_append(result, str_byte_slice(src, line_start, line_end))
+            if cur_loc != 0
+              sb_append(result, ", !dbg !")
+              sb_append_int(result, cur_loc)
+            end
+            if line_end < n
+              sb_append(result, "\n")
+            end
+          end
+          emitted = 1
+        end
+      else
+        # Column-0 line: a `define` opens a new function scope.
+        if cg_dbg_match_at(src, line_start, line_end, "define ")
+          cur_loc = 0
+          in_switch = 0
+        end
+      end
+    end
+
+    if emitted == 0
+      sb_append(result, str_byte_slice(src, line_start, next))
+    end
+
+    i = next
+  end
+  var out_str = result.to_string()
+  sb_free(result)
+  return out_str
+end
+
+## Generates LLVM IR from a MIR program.
+##
+## This is the main codegen entry point for release builds.
+## For debug builds with DWARF info, use `cg_codegen_debug`.
+##
+## @param prog MIR program handle from mir_lower_program
+# ============================================================================
+# FFI Extern Function Declarations (moved earlier for C bootstrap compatibility)
+# ============================================================================
+
+## Map Quartz FFI types to LLVM types
+def cg_be_type_to_llvm(be_type: String): String
+  return "i64" if be_type == "Int"
+  return "i64" if be_type == "CInt"
+  return "i64" if be_type == "CSize"
+  return "i8" if be_type == "CChar"
+  return "ptr" if be_type == "CPtr"
+  return "float" if be_type == "CFloat"
+  return "double" if be_type == "CDouble"
+  # An `extern "C"` signature using the Quartz float types denotes the
+  # matching C ABI type — F64 is a C `double`, F32 a C `float`. Without
+  # this they fell through to the `i64` default, so the FFI call read the
+  # result from the integer return register, not the FP register (xmm0
+  # on x86-64) — HB-DOG.14.
+  return "double" if be_type == "F64"
+  return "double" if be_type == "Float"
+  return "float" if be_type == "F32"
+  return "void" if be_type == "Void"
+  return "ptr" if be_type == "String"
+  return "i1" if be_type == "Bool"
+  return "i8" if be_type == "U8"
+  return "i8" if be_type == "I8"
+  return "i16" if be_type == "U16"
+  return "i16" if be_type == "I16"
+  return "i32" if be_type == "U32"
+  return "i32" if be_type == "I32"
+  # Default: treat as i64
+  return "i64"
+end
+
+## Binary DSL — emit a comment manifest of every registered layout.
+## Sub-phase 1.3 — the manifest is the observable artifact while real
+## codegen (shift/mask emission) is still pending.
+def cg_emit_binary_layout_manifest(out: Int, prog: mir::MirProgram): Void
+  var layout_count = mir::mir_binary_layout_count(prog)
+  return if layout_count == 0
+  codegen_util::cg_emit_line(out, "; === Binary DSL Layouts ===")
+  for li in 0..layout_count
+    var lname = mir::mir_binary_layout_name(prog, li)
+    var lkind = mir::mir_binary_layout_kind(prog, li)
+    var lback = mir::mir_binary_layout_backing(prog, li)
+    var lfields = mir::mir_binary_layout_field_count(prog, li)
+    var kind_str = "binary"
+    if lkind == 2
+      kind_str = "packed"
+    end
+    var total_bits = 0
+    for fi in 0..lfields
+      var w = mir::mir_binary_layout_field_width(prog, li, fi)
+      if w > 0
+        total_bits = total_bits + w
+      end
+    end
+    codegen_util::cg_emit(out, "; binary_layout[")
+    codegen_util::cg_emit_int(out, li)
+    codegen_util::cg_emit(out, "] = ")
+    codegen_util::cg_emit(out, lname)
+    codegen_util::cg_emit(out, " (")
+    codegen_util::cg_emit(out, kind_str)
+    if lkind == 2
+      codegen_util::cg_emit(out, ", backing=u")
+      codegen_util::cg_emit_int(out, lback)
+    end
+    codegen_util::cg_emit(out, ", fields=")
+    codegen_util::cg_emit_int(out, lfields)
+    codegen_util::cg_emit(out, ", fixed_bits=")
+    codegen_util::cg_emit_int(out, total_bits)
+    codegen_util::cg_emit_line(out, ")")
+  end
+  codegen_util::cg_emit_line(out, "")
+end
+
+## INC.1.11 — single-pass scan over `existing_ir_sb` to collect names that
+## appear after `declare ` or `define ` keywords at line start. Without this
+## helper, the per-extern dedup loop in `cg_emit_extern_declarations` ran
+## `__sb_index_from` for every `@name(` occurrence in the IR per extern,
+## visiting every call site for any extern that wasn't actually
+## declared/defined. Quadratic in (externs × IR_size × refs_per_name); on
+## warm-mod-1 of qzmod_inject_spec.qz that cost 30s out of a 31.8s wall.
+def _cg_collect_ir_defined_funcs(existing_ir_sb: Int, defined: Map<String, Int>): Void
+  var ir_len = sb_size(existing_ir_sb)
+  if ir_len == 0
+    return
+  end
+  # `\ndeclare ` and `\ndefine ` open every declaration/definition. Each is
+  # followed by a return type, then `@<name>(`. Scan for both, then for each
+  # match jump to the next `@` and read up to the following `(`.
+  var keys = vec_new<String>()
+  keys.push("\ndeclare ")
+  keys.push("\ndefine ")
+  for ki in 0..keys.size
+    var keyword = keys[ki]
+    var keyword_len = str_byte_len(keyword)
+    var pos = __sb_index_from(existing_ir_sb, keyword, 0)
+    while pos >= 0
+      var at_pos = __sb_index_from(existing_ir_sb, "@", pos + keyword_len)
+      break if at_pos < 0
+      var paren_pos = __sb_index_from(existing_ir_sb, "(", at_pos)
+      break if paren_pos < 0
+      var name_buf = sb_new()
+      var ni = at_pos + 1
+      while ni < paren_pos
+        sb_append_byte(name_buf, sb_byte_at(existing_ir_sb, ni))
+        ni += 1
+      end
+      var name = name_buf.to_string()
+      sb_free(name_buf)
+      defined.set(name, 1)
+      pos = __sb_index_from(existing_ir_sb, keyword, paren_pos + 1)
+    end
+  end
+end
+
+## Emit extern function declarations for FFI
+## existing_ir: the already-emitted LLVM IR, used to skip duplicate declares
+## prog / target: B.10 P3.1c — used to classify struct-by-value params/returns
+## crossing the C boundary so the `declare` line names the target's coerce type
+## (e.g. `{i64, i64}` / `[2 x double]`) instead of the legacy opaque i64. Gated
+## on the classifier returning a coerce type (scalars/non-eligible → legacy
+## path), so self-compile (zero struct-by-value externs) is byte-identical.
+def cg_emit_extern_declarations(all_funcs: Vec<ResolverEntry>, existing_ir_sb: Int, prog: MirProgram, target: String): String
+  var out = sb_new()
+  defer sb_free(out)
+  # B.1 Phase 5.D: arena-bytes bookend. GATED on --alloc-track. Called from
+  # inside the same `with Alloc.in_arena(cg_arena)` install as cg_codegen —
+  # capture handle before any nested install. arena_bytes_used(0) returns 0
+  # safely (chain walk terminates on null head), so OFF-mode pays only one
+  # global-read + branch.
+  var alloc_track = profile::profile_get_alloc_track()
+  var arena_handle = 0
+  if alloc_track == 1
+    arena_handle = __qz_effect_state_get()
+  end
+  var pre_arena = arena_bytes_used(arena_handle)
+  out.append("\n; === User FFI Declarations ===\n")
+  # INC.1.11 — build a name-set of every function already declared or
+  # defined in `existing_ir_sb` via a single forward scan. Replaces the
+  # per-extern quadratic walk that previously dominated warm-mod-1 wall.
+  var ir_defined_funcs = map_new<String, Int>()
+  _cg_collect_ir_defined_funcs(existing_ir_sb, ir_defined_funcs)
+  # Track emitted extern names to prevent duplicate declarations when the same
+  # extern "C" symbol is declared in multiple imported modules (e.g. fcntl in
+  # both ffi/event.qz and ffi/socket.qz).
+  var emitted = map_new()
+
+  var func_count = all_funcs.size
+  for i in 0..func_count
+    var entry = all_funcs[i]
+    if entry.tag == 10
+      var mod_ast_storage = entry.ast_store
+      var func_handle = entry.node_id
+      # Get extern function details
+      var name = ast::ast_get_str1(mod_ast_storage, func_handle)
+
+      # Skip if this function is already declared or defined in the existing
+      # IR. INC.1.11: O(1) map lookup, replacing the prior per-extern walk
+      # over every `@name(` occurrence in the IR.
+      var already_exists = 0
+      if ir_defined_funcs.has(name)
+        already_exists = 1
+      end
+      # Also skip if we already emitted this name earlier in this loop
+      if already_exists == 0 and map_has(emitted, name)
+        already_exists = 1
+      end
+      if already_exists == 0
+        map_set(emitted, name, 1)
+        var return_type = ast::ast_get_str2(mod_ast_storage, func_handle)
+        var params = ast::ast_get_children(mod_ast_storage, func_handle)
+        var is_variadic = ast::ast_extern_fn_is_variadic(mod_ast_storage, func_handle)
+        
+        var ret_llvm = cg_be_type_to_llvm(return_type)
+        # B.10 P3.1c — a struct-by-value return crosses the C boundary as the
+        # target's coerce aggregate, not the opaque i64 default.
+        var ret_coerce = cg_c_abi_return_coerce(prog, target, return_type)
+        if ret_coerce != ""
+          ret_llvm = ret_coerce
+        end
+        # B.10 P3.3 — a >16B struct return is indirect: the declare returns `void`
+        # and leads with a hidden `ptr sret([N x i64])` parameter.
+        var ret_sret = ""
+        if ret_coerce == ""
+          ret_sret = cg_c_abi_return_indirect(prog, target, return_type)
+          if ret_sret != ""
+            ret_llvm = "void"
+          end
+        end
+
+        out.append("declare ")
+        out.append(ret_llvm)
+        out.append(" @")
+        out.append(name)
+        out.append("(")
+
+        var dparam_comma = 0
+        if ret_sret != ""
+          out.append("ptr sret(")
+          out.append(ret_sret)
+          out.append(")")
+          dparam_comma = 1
+        end
+        var param_count = vec_size(params)
+        for j in 0..param_count
+          if dparam_comma == 1
+            out.append(", ")
+          end
+          dparam_comma = 1
+          var param_handle = params[j]
+          var param_type = ast::ast_get_str2(mod_ast_storage, param_handle)
+          var param_llvm = cg_be_type_to_llvm(param_type)
+          # B.10 P3.1c — struct-by-value param → target coerce aggregate.
+          var param_coerce = cg_c_abi_param_coerce(prog, target, param_type)
+          # B.10 P3.3 — >16B struct param → `ptr byval([N x i64])`.
+          var param_indirect = ""
+          if param_coerce == ""
+            param_indirect = cg_c_abi_param_indirect(prog, target, param_type)
+          end
+          if param_coerce != ""
+            param_llvm = param_coerce
+          elsif param_indirect != ""
+            # B.10 P3.3 — SysV byval vs AArch64 plain-ptr (caller-copied); see the
+            # callee signature emit for why these diverge.
+            if abi_classify::abi_target_is_aarch64(target) == 1
+              param_llvm = "ptr"
+            else
+              param_llvm = "ptr byval(" + param_indirect + ")"
+            end
+          end
+          out.append(param_llvm)
+        end
+
+        # Handle variadic functions
+        if is_variadic == 1
+          if dparam_comma == 1
+            out.append(", ")
+          end
+          out.append("...")
+        end
+
+        out.append(")\n")
+      end
+    end
+  end
+  # Also emit extern var declarations (tag 11)
+  for i in 0..func_count
+    var entry = all_funcs[i]
+    if entry.tag == 11
+      var mod_ast_storage = entry.ast_store
+      var var_handle = entry.node_id
+      var name = ast::ast_get_str1(mod_ast_storage, var_handle)
+      # Check if already declared (sb-direct scan; B.1 Phase 5.E)
+      var at_name = "@#{name}"
+      if __sb_contains(existing_ir_sb, at_name) == 0
+        out.append("@")
+        out.append(name)
+        out.append(" = external global i64\n")
+      end
+    end
+  end
+
+  var result = out.to_string()
+  prof_alloc_site("phase_extern_decls", str_byte_len(result))
+  prof_alloc_site("arena_extern_decls", arena_bytes_used(arena_handle) - pre_arena)
+  return result
+end
+
+# ============================================================================
+# Extern Variadic Info Collection
+# ============================================================================
+
+## Collect extern function info for correct call emission.
+## Collects ALL externs (variadic and non-variadic) so call sites emit
+## proper C types (i8*, i32, etc.) instead of all-i64.
+## Must be called before emitting mir::MIR_CALL instructions.
+def cg_collect_extern_info(state: CodegenState, all_funcs: Vec<ResolverEntry>): Void
+  var func_count = all_funcs.size
+  var flat_offset = 0
+  for i in 0..func_count
+    var entry = all_funcs[i]
+    if entry.tag == 10
+      var mod_ast_storage = entry.ast_store
+      var func_handle = entry.node_id
+      var is_variadic = ast::ast_extern_fn_is_variadic(mod_ast_storage, func_handle)
+      var c_name = ast::ast_get_str1(mod_ast_storage, func_handle)
+      var lookup_name = entry.name
+      var return_type = ast::ast_get_str2(mod_ast_storage, func_handle)
+      var params = ast::ast_get_children(mod_ast_storage, func_handle)
+      var param_count = params.size
+
+      # Skip duplicate lookup keys (diamond imports can register the same
+      # bare-name entry twice). Prefixed entries use unique per-module names.
+      var dup = 0
+      for d in 0..state.extern_var_names.size
+        if state.extern_var_names[d].eq(lookup_name)
+          dup = 1
+          break
+        end
+      end
+      if dup == 1
+        continue
+      end
+
+      state.extern_var_names.push(lookup_name)
+      state.extern_var_c_names.push(c_name)
+      state.extern_var_pcounts.push(param_count)
+      state.extern_var_rtypes.push(cg_be_type_to_llvm(return_type))
+      # B.10 P3.1c — keep the Quartz type NAME alongside the lowered LLVM type so
+      # the call site / declare emit can recover struct-by-value identity (lost
+      # to "i64" in cg_be_type_to_llvm) and run the C-ABI classifier on it.
+      state.extern_var_ret_qtypes.push(return_type)
+      state.extern_var_offsets.push(flat_offset)
+      state.extern_var_is_variadic.push(is_variadic)
+
+      for j in 0..param_count
+        var param_handle = params[j]
+        var param_type = ast::ast_get_str2(mod_ast_storage, param_handle)
+        state.extern_var_flat_ptypes.push(cg_be_type_to_llvm(param_type))
+        state.extern_var_flat_pqtypes.push(param_type)
+      end
+      flat_offset += param_count
+    end
+  end
+end
+
+# ============================================================================
+# Main Codegen Entry Points
+# ============================================================================
+
+## Generate complete LLVM IR from MIR program into the caller-provided
+## `out: StringBuilder` sink.
+##
+## **B.1 Phase 5.E (2026-05-02)** — `out` is now a parameter rather than an
+## internal `sb_new_with_capacity(...)` allocation, and the function returns
+## `Void` rather than the to_string'd result. The caller (typically
+## `quartz.qz`) allocates `out` BEFORE the `with Alloc.in_arena(cg_arena)`
+## install, so its 128 MB pre-grown buffer lives on the default heap rather
+## than getting absorbed by cg_arena. The caller is also responsible for
+## calling `out.to_string()` AFTER the with-block exits — at that point the
+## resulting String is allocated on the default heap, eliminating the in-
+## arena to_string copy and the redundant `arena_promote_string` step that
+## previously doubled ~80 MB of IR text at codegen peak.
+def cg_codegen(out: Int, prog: MirProgram, target: String, all_funcs: Vec<ResolverEntry>, overflow_check: Int, stack_alloc: Int, race_mode: Int, cache_dir: String, exclusivity_check: Int): Void
+
+  # B.1 Phase 4 Path B: per-phase IR-text-emit attribution.
+  # `pre` is rebound at each phase boundary; `prof_alloc_site(<label>, sb_size(out) - pre)`
+  # records bytes-added-to-master-out per phase. Combined with Phase 2's
+  # cg_emit_line/cg_emit/cg_emit_int chokepoints (which sum across all callers),
+  # this localizes which post-loop / pre-loop emits dominate codegen's IR-text
+  # contribution and which phases run with high allocation pressure relative
+  # to their text output.
+  var pre = 0
+
+  # B.1 Phase 5.D: per-phase arena-bytes attribution. GATED on --alloc-track
+  # because empirical OFF-mode measurement showed the un-gated bookends added
+  # +279 MB peak / +5s wall regression vs the Phase 5.A baseline (mechanism
+  # under investigation; likely the per-call arena chain-walk × 32 bookends
+  # × wall-time effects on cg_arena page residency). Gating restores Phase
+  # 5.A's 2330 MB OFF peak and preserves the attribution capability under
+  # `--alloc-track`. Capture happens before any nested install so
+  # __qz_effect_state_get returns the Alloc install's state slot = the
+  # cg_arena handle (per quartz.qz:1018). `pre_arena` is rebound at each
+  # phase boundary alongside `pre`; the parallel
+  # `prof_alloc_site("arena_<phase>", arena_bytes_used(arena_handle) - pre_arena)`
+  # records cumulative bytes allocated INTO cg_arena per phase, subsuming
+  # IR text + interp intermediates + master-out grow leaks + state Vec
+  # growths — every allocation routed through the arena handler.
+  var alloc_track = profile::profile_get_alloc_track()
+  var arena_handle = 0
+  if alloc_track == 1
+    arena_handle = __qz_effect_state_get()
+  end
+  var pre_arena = 0
+
+  # Set target-aware constants for arena mmap flags
+  codegen_intrinsics::cg_intrinsics_set_target(target)
+
+  # Emit header
+  codegen_util::cg_emit_line(out, "; Generated by Quartz self-hosted compiler")
+  codegen_util::cg_emit_line(out, "")
+
+  # Binary DSL (sub-phase 1.3): emit a comment manifest for every registered
+  # `binary {}` / `packed struct(uN)` layout. Codegen itself is stubbed until
+  # sub-phase 1.4 — the manifest gives tests a reliable handle to assert
+  # against and documents the registry for humans reading the IR.
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  cg_emit_binary_layout_manifest(out, prog)
+  prof_alloc_site("phase_binary_layout_manifest", sb_size(out) - pre)
+  prof_alloc_site("arena_binary_layout_manifest", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit runtime declarations
+  var tg_flag = prog.mir_get_uses_task_group()
+  var sched_flag = prog.mir_get_uses_scheduler()
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  codegen_runtime::cg_emit_runtime_decls(out, target, tg_flag, sched_flag, prog.mir_get_uses_scope_deadline())
+  prof_alloc_site("phase_runtime_decls", sb_size(out) - pre)
+  prof_alloc_site("arena_runtime_decls", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit struct type definitions for narrow-field structs
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  codegen_runtime::cg_emit_struct_types(out, prog)
+  prof_alloc_site("phase_struct_types", sb_size(out) - pre)
+  prof_alloc_site("arena_struct_types", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit global variable declarations
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  cg_emit_global_vars(out, prog)
+  prof_alloc_site("phase_global_vars", sb_size(out) - pre)
+  prof_alloc_site("arena_global_vars", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit const declarations
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  cg_emit_const_decls(out, prog)
+  prof_alloc_site("phase_const_decls", sb_size(out) - pre)
+  prof_alloc_site("arena_const_decls", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Initialize codegen state
+  var state = codegen_util::cg_new_state()
+  codegen_util::cg_set_overflow_check(state, overflow_check)
+  codegen_util::cg_set_exclusivity_check(state, exclusivity_check)
+  codegen_util::cg_set_stack_alloc(state, stack_alloc)
+  codegen_util::cg_set_race_mode(state, race_mode)
+  codegen_util::cg_set_target_triple(state, target)
+  cg_collect_extern_info(state, all_funcs)
+
+  # Pre-scan for mir::MIR_FUNC_REF targets (must happen before function emission)
+  cg_prescan_func_ref_targets(state, prog)
+
+  # Phase B: reachability-based DCE. Skip emission of functions no reachable
+  # path can call. Roots = main + handlers + funcref targets + naked/weak/cconv.
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  cg_compute_reachable(state, prog)
+  prof_alloc_site("phase_dce", sb_size(out) - pre)
+  prof_alloc_site("arena_dce", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit all functions.
+  # INC.1.7: when `cache_dir` is non-empty, also collect per-module
+  # fragment builders + their loop-metadata IDs so warm-mod-1 finds
+  # `<cache_dir>/modules/<short>.ll` + `.format_v2` after this cold
+  # compile. Without these artifacts the safety net in `quartz.qz`
+  # forces every module into `changed_modules`, defeating the warm
+  # speedup; see `feedback_inc_1_warm_recompile_set_over_invalidation.md`.
+  # Mirrors `cg_codegen_incremental`'s per-function temp-SB pattern.
+  #
+  # Phase 5.3 / Option Z: ambient Emit install. All codegen fns called
+  # transitively from here can declare `can Emit` and call bare
+  # `emit("...")` — the handlers forward through `cg_ctx_get()` (set
+  # to `out` below) into `codegen_util::cg_emit*`. Migrated helpers
+  # thus drop their per-fn body-wrap and cascade `can Emit` upward to
+  # this single install point.
+  var funcs = prog.mir_get_functions()
+  var func_count = funcs.size
+  codegen_ctx::cg_ctx_set(out)
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  var fresh_mod_names = vec_new<String>()
+  var fresh_mod_builders = vec_new()
+  var fresh_mod_meta = vec_new()
+  var collect_frags = 0
+  if str_byte_len(cache_dir) > 0
+    collect_frags = 1
+  end
+  with Emit {
+    emit: codegen_ctx::cg_ctx_emit_handler,
+    emit_line: codegen_ctx::cg_ctx_emit_line_handler,
+    emit_int: codegen_ctx::cg_ctx_emit_int_handler
+  } do ->
+    for i in 0..func_count
+      var func = funcs[i]
+      var fname = func.mir_func_get_name()
+      var is_reachable = cg_is_reachable_fn(state, fname)
+      # Bug A.1 — full-surface fragment emission. User-source functions
+      # (origin_module non-empty) always land in their module's fragment
+      # so cache consumers see the complete module surface even when the
+      # producing program (e.g. _qspec_prewarm.qz) didn't reach every fn.
+      # Synthetic functions (lambdas, async ctors, __qz_module_init, etc.)
+      # leave origin_module == "" and are NOT cacheable across compiles
+      # — only emitted when reachable in the current compile.
+      var has_origin = str_byte_len(func.mir_func_get_origin_module()) > 0
+      var emit_to_main = is_reachable == 1
+      var emit_to_frag = collect_frags == 1 and has_origin == 1
+      if emit_to_main == 0 and emit_to_frag == 0
+        continue
+      end
+      if collect_frags == 1
+        var prev_md_count = state.loop_metadata_ids.size
+        var func_buf = sb_new()
+        cg_emit_function(state, func_buf, prog, func, i)
+        var func_ir = sb_to_string(func_buf)
+        sb_free(func_buf)
+        var marker = ";;FN #{fname};;\n"
+        if emit_to_main == 1
+          sb_append(out, marker)
+          sb_append(out, func_ir)
+        end
+        if emit_to_frag == 1
+          var fmod = codegen_util::cg_extract_module(fname)
+          var found_fm = -1
+          for fmi in 0..fresh_mod_names.size
+            if fresh_mod_names[fmi].eq(fmod)
+              found_fm = fmi
+              break
+            end
+          end
+          if found_fm >= 0
+            var esb = fresh_mod_builders[found_fm]
+            sb_append(esb, marker)
+            sb_append(esb, func_ir)
+            var existing_meta = fresh_mod_meta[found_fm]
+            var mdi = prev_md_count
+            while mdi < state.loop_metadata_ids.size
+              vec_push(existing_meta, state.loop_metadata_ids[mdi])
+              mdi += 1
+            end
+          else
+            fresh_mod_names.push(fmod)
+            var nsb = sb_new()
+            sb_append(nsb, marker)
+            sb_append(nsb, func_ir)
+            fresh_mod_builders.push(nsb)
+            var new_meta = vec_new()
+            var mdi = prev_md_count
+            while mdi < state.loop_metadata_ids.size
+              new_meta.push(state.loop_metadata_ids[mdi])
+              mdi += 1
+            end
+            fresh_mod_meta.push(new_meta)
+          end
+        end
+      else
+        cg_emit_function(state, out, prog, func, i)
+      end
+    end
+  end
+  prof_alloc_site("phase_function_loop", sb_size(out) - pre)
+  prof_alloc_site("arena_function_loop", arena_bytes_used(arena_handle) - pre_arena)
+
+  # INC.1.7: write per-module fragments + `.format_v2` sentinel so the
+  # next warm-spec-modified compile finds `<cache_dir>/modules/<short>.ll`
+  # and `cg_codegen_incremental` can fragment-load instead of fresh-emit.
+  if collect_frags == 1
+    codegen_util::cg_write_module_fragments(fresh_mod_names, fresh_mod_builders, fresh_mod_meta, cache_dir)
+  end
+
+  # Emit module init function (must come before string constants)
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  cg_emit_module_init(state, out, prog)
+  prof_alloc_site("phase_module_init", sb_size(out) - pre)
+  prof_alloc_site("arena_module_init", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit string constants at the end
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  codegen_util::cg_emit_string_constants(state, out)
+  prof_alloc_site("phase_string_constants", sb_size(out) - pre)
+  prof_alloc_site("arena_string_constants", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit FNV-1a string hash helper
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  codegen_runtime::cg_emit_str_hash_helper(out, 0)
+  prof_alloc_site("phase_str_hash_helper", sb_size(out) - pre)
+  prof_alloc_site("arena_str_hash_helper", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit effect-dispatch runtime (Milestone D.1). Hosted only —
+  # uses @write + @exit. Freestanding gets no effect runtime since
+  # effects aren't used in kernel builds (stdlib doesn't use them yet).
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  if codegen_runtime::cg_is_freestanding(target) == 0
+    codegen_runtime::cg_emit_effect_runtime(out, 0, prog.mir_get_uses_scheduler(), prog.mir_get_uses_intern(), prog.mir_get_uses_cache(), prog.mir_get_uses_profile(), prog.mir_get_uses_yield())
+  end
+  prof_alloc_site("phase_effect_runtime", sb_size(out) - pre)
+  prof_alloc_site("arena_effect_runtime", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit per-struct hash/eq functions and custom-key map runtime
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  codegen_runtime::cg_emit_struct_hash_eq_functions(out, prog)
+  prof_alloc_site("phase_struct_hash_eq", sb_size(out) - pre)
+  prof_alloc_site("arena_struct_hash_eq", arena_bytes_used(arena_handle) - pre_arena)
+
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  codegen_runtime::cg_emit_custom_map_functions(out)
+  prof_alloc_site("phase_custom_map", sb_size(out) - pre)
+  prof_alloc_site("arena_custom_map", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit panic + backtrace helpers. Freestanding / kernel builds get
+  # stubs with `unreachable` bodies (no libc refs); hosted builds get
+  # the libc-backed versions that write to stderr and abort / longjmp.
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  if codegen_runtime::cg_is_freestanding(target) == 1
+    codegen_runtime::cg_emit_freestanding_panic_stubs(out, 0)
+  else
+    if state.overflow_check == 1
+      codegen_runtime::cg_emit_overflow_panic_helper(out, 0)
+    end
+    if state.exclusivity_check == 1
+      codegen_runtime::cg_emit_access_head_tls(out, target, 0)
+      codegen_runtime::cg_emit_exclusivity_panic_helper(out, 0)
+    end
+    codegen_runtime::cg_emit_bounds_panic_helper(out, 0)
+    codegen_runtime::cg_emit_map_key_panic_helper(out, 0)
+    codegen_runtime::cg_emit_async_lock_drain_panic_helper(out, 0)
+    codegen_runtime::cg_emit_backtrace_helper(out, 0, target)
+  end
+  prof_alloc_site("phase_panic_helpers", sb_size(out) - pre)
+  prof_alloc_site("arena_panic_helpers", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit main wrapper that calls qz_main (skip for freestanding)
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  if codegen_runtime::cg_is_freestanding(target) == 0
+    codegen_util::cg_emit_line(out, "")
+    codegen_util::cg_emit_line(out, "; Main entry point wrapper")
+    if codegen_runtime::cg_is_wasi(target)
+      codegen_util::cg_emit_line(out, "define void @_start() {")
+      codegen_util::cg_emit_line(out, "  %result = call i64 @qz_main()")
+      codegen_util::cg_emit_line(out, "  ret void")
+      codegen_util::cg_emit_line(out, "}")
+    else
+      codegen_util::cg_emit_line(out, "define i32 @main(i32 %argc, ptr %argv) {")
+      codegen_util::cg_emit_line(out, "  %argc64 = sext i32 %argc to i64")
+      codegen_util::cg_emit_line(out, "  store i64 %argc64, ptr @qz_argc")
+      codegen_util::cg_emit_line(out, "  store ptr %argv, ptr @qz_argv")
+      if state.race_mode == 1
+        codegen_util::cg_emit_line(out, "  call void @__qz_race_init()")
+      end
+      # Effects D.4: initialize effect runtime + register default handlers
+      # for blessed effects (Throws, Log). Must precede qz_main so any
+      # top-level op call has a default handler to fall through to.
+      codegen_runtime::cg_emit_effect_main_prelude(out, prog.mir_get_uses_intern(), prog.mir_get_uses_cache(), prog.mir_get_uses_profile())
+      codegen_util::cg_emit_line(out, "  %result = call i64 @qz_main()")
+      codegen_util::cg_emit_line(out, "  %result32 = trunc i64 %result to i32")
+      if sched_flag == 1
+        # Go-style exit: flush stdout, then _exit() to kill all threads instantly.
+        # Avoids races with sched_shutdown (cancel_token_free UAF, active_tasks underflow).
+        codegen_util::cg_emit_line(out, "  call i32 @fflush(ptr null)")
+        codegen_util::cg_emit_line(out, "  call void @_exit(i32 %result32)")
+        codegen_util::cg_emit_line(out, "  unreachable")
+      end
+      codegen_util::cg_emit_line(out, "  ret i32 %result32")
+      codegen_util::cg_emit_line(out, "}")
+    end
+  end
+  prof_alloc_site("phase_main_wrapper", sb_size(out) - pre)
+  prof_alloc_site("arena_main_wrapper", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit race detector runtime if enabled
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  if state.race_mode == 1
+    codegen_runtime::cg_emit_race_detector_runtime(out, target)
+  end
+  prof_alloc_site("phase_race_detector", sb_size(out) - pre)
+  prof_alloc_site("arena_race_detector", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit loop vectorization metadata
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  codegen_util::cg_emit_loop_metadata(state, out)
+  prof_alloc_site("phase_loop_metadata", sb_size(out) - pre)
+  prof_alloc_site("arena_loop_metadata", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Save string pool for incremental cache
+  _cg_last_string_pool = state.string_pool
+end
+
+## Generates LLVM IR with DWARF debug information into the caller-provided
+## `out: StringBuilder` sink. See `cg_codegen` for the Phase 5.E rationale
+## on caller-managed `out`.
+def cg_codegen_debug(out: Int, prog: MirProgram, source_file: String, target: String, all_funcs: Vec<ResolverEntry>, overflow_check: Int, stack_alloc: Int, race_mode: Int, cache_dir: String, exclusivity_check: Int): Void
+  # B.1 Phase 4 Path B: per-phase IR-text-emit attribution (mirrors cg_codegen).
+  var pre = 0
+
+  # B.1 Phase 5.D: per-phase arena-bytes attribution (mirrors cg_codegen).
+  # GATED on --alloc-track per cg_codegen rationale. With handle=0 the per-site
+  # `arena_bytes_used(0)` chain walks terminate immediately, so per-site reads
+  # are free in OFF mode. See cg_codegen for full design rationale.
+  var alloc_track = profile::profile_get_alloc_track()
+  var arena_handle = 0
+  if alloc_track == 1
+    arena_handle = __qz_effect_state_get()
+  end
+  var pre_arena = 0
+
+  # Emit header
+  codegen_util::cg_emit_line(out, "; Generated by Quartz self-hosted compiler (with debug info)")
+  codegen_util::cg_emit_line(out, "")
+
+  # Emit runtime declarations
+  var tg_flag_dbg = prog.mir_get_uses_task_group()
+  var sched_flag_dbg = prog.mir_get_uses_scheduler()
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  codegen_runtime::cg_emit_runtime_decls(out, target, tg_flag_dbg, sched_flag_dbg, prog.mir_get_uses_scope_deadline())
+  prof_alloc_site("phase_runtime_decls", sb_size(out) - pre)
+  prof_alloc_site("arena_runtime_decls", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit struct type definitions for narrow-field structs
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  codegen_runtime::cg_emit_struct_types(out, prog)
+  prof_alloc_site("phase_struct_types", sb_size(out) - pre)
+  prof_alloc_site("arena_struct_types", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit global variable declarations
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  cg_emit_global_vars(out, prog)
+  prof_alloc_site("phase_global_vars", sb_size(out) - pre)
+  prof_alloc_site("arena_global_vars", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit const declarations
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  cg_emit_const_decls(out, prog)
+  prof_alloc_site("phase_const_decls", sb_size(out) - pre)
+  prof_alloc_site("arena_const_decls", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Initialize codegen state with debug mode enabled
+  var state = codegen_util::cg_new_state()
+  codegen_util::cg_set_debug_mode(state, 1)
+  codegen_util::cg_set_overflow_check(state, overflow_check)
+  codegen_util::cg_set_exclusivity_check(state, exclusivity_check)
+  codegen_util::cg_set_stack_alloc(state, stack_alloc)
+  codegen_util::cg_set_race_mode(state, race_mode)
+  codegen_util::cg_set_source_file(state, source_file)
+  codegen_util::cg_set_target_triple(state, target)
+  cg_collect_extern_info(state, all_funcs)
+
+  # Pre-scan for mir::MIR_FUNC_REF targets (must happen before function emission)
+  cg_prescan_func_ref_targets(state, prog)
+
+  # Phase B: reachability-based DCE. See cg_codegen for the rationale.
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  cg_compute_reachable(state, prog)
+  prof_alloc_site("phase_dce", sb_size(out) - pre)
+  prof_alloc_site("arena_dce", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit all functions
+  var funcs = prog.mir_get_functions()
+  var func_count = funcs.size
+
+  # Initialize shared metadata counter — reserves IDs for fixed metadata + DISubprograms
+  codegen_util::cg_init_metadata_counter(state, func_count)
+
+  # P5.3.d.2 backbone sweep: ambient Emit install mirrors cg_codegen so
+  # cg_emit_function (and its `can Emit` transitive callees) typechecks.
+  codegen_ctx::cg_ctx_set(out)
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  # INC.1.7: same per-module fragment collection as `cg_codegen` so the
+  # `--debug` path (the default for `quake build`) also writes
+  # `<cache_dir>/modules/<short>.ll` + `.format_v2`. Without it,
+  # debug-mode cold runs leave the warm-mod-1 safety net firing on
+  # every module.
+  var fresh_mod_names_dbg = vec_new<String>()
+  var fresh_mod_builders_dbg = vec_new()
+  var fresh_mod_meta_dbg = vec_new()
+  var collect_frags_dbg = 0
+  if str_byte_len(cache_dir) > 0
+    collect_frags_dbg = 1
+  end
+  with Emit {
+    emit: codegen_ctx::cg_ctx_emit_handler,
+    emit_line: codegen_ctx::cg_ctx_emit_line_handler,
+    emit_int: codegen_ctx::cg_ctx_emit_int_handler
+  } do ->
+    for i in 0..func_count
+      var func = funcs[i]
+      var fname = func.mir_func_get_name()
+      var is_reachable = cg_is_reachable_fn(state, fname)
+      # Bug A.1 — full-surface fragment emission. See cg_codegen above.
+      var has_origin = str_byte_len(func.mir_func_get_origin_module()) > 0
+      var emit_to_main = is_reachable == 1
+      var emit_to_frag = collect_frags_dbg == 1 and has_origin == 1
+      if emit_to_main == 0 and emit_to_frag == 0
+        continue
+      end
+      if collect_frags_dbg == 1
+        var prev_md_count = state.loop_metadata_ids.size
+        var func_buf = sb_new()
+        cg_emit_function(state, func_buf, prog, func, i)
+        var func_ir = sb_to_string(func_buf)
+        sb_free(func_buf)
+        var marker = ";;FN #{fname};;\n"
+        if emit_to_main == 1
+          sb_append(out, marker)
+          sb_append(out, func_ir)
+        end
+        if emit_to_frag == 1
+          var fmod = codegen_util::cg_extract_module(fname)
+          var found_fm = -1
+          for fmi in 0..fresh_mod_names_dbg.size
+            if fresh_mod_names_dbg[fmi].eq(fmod)
+              found_fm = fmi
+              break
+            end
+          end
+          if found_fm >= 0
+            var esb = fresh_mod_builders_dbg[found_fm]
+            sb_append(esb, marker)
+            sb_append(esb, func_ir)
+            var existing_meta = fresh_mod_meta_dbg[found_fm]
+            var mdi = prev_md_count
+            while mdi < state.loop_metadata_ids.size
+              vec_push(existing_meta, state.loop_metadata_ids[mdi])
+              mdi += 1
+            end
+          else
+            fresh_mod_names_dbg.push(fmod)
+            var nsb = sb_new()
+            sb_append(nsb, marker)
+            sb_append(nsb, func_ir)
+            fresh_mod_builders_dbg.push(nsb)
+            var new_meta = vec_new()
+            var mdi = prev_md_count
+            while mdi < state.loop_metadata_ids.size
+              new_meta.push(state.loop_metadata_ids[mdi])
+              mdi += 1
+            end
+            fresh_mod_meta_dbg.push(new_meta)
+          end
+        end
+      else
+        cg_emit_function(state, out, prog, func, i)
+      end
+    end
+  end
+  prof_alloc_site("phase_function_loop", sb_size(out) - pre)
+  prof_alloc_site("arena_function_loop", arena_bytes_used(arena_handle) - pre_arena)
+
+  if collect_frags_dbg == 1
+    codegen_util::cg_write_module_fragments(fresh_mod_names_dbg, fresh_mod_builders_dbg, fresh_mod_meta_dbg, cache_dir)
+  end
+
+  # Emit module init function (must come before string constants)
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  cg_emit_module_init(state, out, prog)
+  prof_alloc_site("phase_module_init", sb_size(out) - pre)
+  prof_alloc_site("arena_module_init", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit string constants
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  codegen_util::cg_emit_string_constants(state, out)
+  prof_alloc_site("phase_string_constants", sb_size(out) - pre)
+  prof_alloc_site("arena_string_constants", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit FNV-1a string hash helper
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  codegen_runtime::cg_emit_str_hash_helper(out, 0)
+  prof_alloc_site("phase_str_hash_helper", sb_size(out) - pre)
+  prof_alloc_site("arena_str_hash_helper", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit effect-dispatch runtime (Milestone D.1). Hosted only —
+  # uses @write + @exit. Freestanding gets no effect runtime since
+  # effects aren't used in kernel builds (stdlib doesn't use them yet).
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  if codegen_runtime::cg_is_freestanding(target) == 0
+    codegen_runtime::cg_emit_effect_runtime(out, 0, prog.mir_get_uses_scheduler(), prog.mir_get_uses_intern(), prog.mir_get_uses_cache(), prog.mir_get_uses_profile(), prog.mir_get_uses_yield())
+  end
+  prof_alloc_site("phase_effect_runtime", sb_size(out) - pre)
+  prof_alloc_site("arena_effect_runtime", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit per-struct hash/eq functions and custom-key map runtime
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  codegen_runtime::cg_emit_struct_hash_eq_functions(out, prog)
+  prof_alloc_site("phase_struct_hash_eq", sb_size(out) - pre)
+  prof_alloc_site("arena_struct_hash_eq", arena_bytes_used(arena_handle) - pre_arena)
+
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  codegen_runtime::cg_emit_custom_map_functions(out)
+  prof_alloc_site("phase_custom_map", sb_size(out) - pre)
+  prof_alloc_site("arena_custom_map", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit panic + backtrace helpers. Freestanding / kernel builds get
+  # stubs with `unreachable` bodies (no libc refs); hosted builds get
+  # the libc-backed versions that write to stderr and abort / longjmp.
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  if codegen_runtime::cg_is_freestanding(target) == 1
+    codegen_runtime::cg_emit_freestanding_panic_stubs(out, 0)
+  else
+    if state.overflow_check == 1
+      codegen_runtime::cg_emit_overflow_panic_helper(out, 0)
+    end
+    if state.exclusivity_check == 1
+      codegen_runtime::cg_emit_access_head_tls(out, target, 0)
+      codegen_runtime::cg_emit_exclusivity_panic_helper(out, 0)
+    end
+    codegen_runtime::cg_emit_bounds_panic_helper(out, 0)
+    codegen_runtime::cg_emit_map_key_panic_helper(out, 0)
+    codegen_runtime::cg_emit_async_lock_drain_panic_helper(out, 0)
+    codegen_runtime::cg_emit_backtrace_helper(out, 0, target)
+  end
+  prof_alloc_site("phase_panic_helpers", sb_size(out) - pre)
+  prof_alloc_site("arena_panic_helpers", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit main wrapper that calls qz_main (skip for freestanding)
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  if codegen_runtime::cg_is_freestanding(target) == 0
+    codegen_util::cg_emit_line(out, "")
+    codegen_util::cg_emit_line(out, "; Main entry point wrapper")
+    if codegen_runtime::cg_is_wasi(target)
+      codegen_util::cg_emit_line(out, "define void @_start() {")
+      codegen_util::cg_emit_line(out, "  %result = call i64 @qz_main()")
+      codegen_util::cg_emit_line(out, "  ret void")
+      codegen_util::cg_emit_line(out, "}")
+    else
+      codegen_util::cg_emit_line(out, "define i32 @main(i32 %argc, ptr %argv) {")
+      codegen_util::cg_emit_line(out, "  %argc64 = sext i32 %argc to i64")
+      codegen_util::cg_emit_line(out, "  store i64 %argc64, ptr @qz_argc")
+      codegen_util::cg_emit_line(out, "  store ptr %argv, ptr @qz_argv")
+      if state.race_mode == 1
+        codegen_util::cg_emit_line(out, "  call void @__qz_race_init()")
+      end
+      # Effects D.4: initialize effect runtime + register default handlers
+      # for blessed effects (Throws, Log). Must precede qz_main so any
+      # top-level op call has a default handler to fall through to.
+      codegen_runtime::cg_emit_effect_main_prelude(out, prog.mir_get_uses_intern(), prog.mir_get_uses_cache(), prog.mir_get_uses_profile())
+      codegen_util::cg_emit_line(out, "  %result = call i64 @qz_main()")
+      codegen_util::cg_emit_line(out, "  %result32 = trunc i64 %result to i32")
+      codegen_util::cg_emit_line(out, "  call i32 @fflush(ptr null)")
+      if sched_flag_dbg == 1
+        codegen_util::cg_emit_line(out, "  call void @_exit(i32 %result32)")
+        codegen_util::cg_emit_line(out, "  unreachable")
+      end
+      codegen_util::cg_emit_line(out, "  ret i32 %result32")
+      codegen_util::cg_emit_line(out, "}")
+    end
+  end
+  prof_alloc_site("phase_main_wrapper", sb_size(out) - pre)
+  prof_alloc_site("arena_main_wrapper", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit race detector runtime if enabled
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  if state.race_mode == 1
+    codegen_runtime::cg_emit_race_detector_runtime(out, target)
+  end
+  prof_alloc_site("phase_race_detector", sb_size(out) - pre)
+  prof_alloc_site("arena_race_detector", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit debug metadata at the end
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  cg_emit_debug_metadata(state, out, prog, source_file)
+  prof_alloc_site("phase_debug_metadata", sb_size(out) - pre)
+  prof_alloc_site("arena_debug_metadata", arena_bytes_used(arena_handle) - pre_arena)
+
+  # Emit loop vectorization metadata
+  pre = sb_size(out)
+  pre_arena = arena_bytes_used(arena_handle)
+  codegen_util::cg_emit_loop_metadata(state, out)
+  prof_alloc_site("phase_loop_metadata", sb_size(out) - pre)
+  prof_alloc_site("arena_loop_metadata", arena_bytes_used(arena_handle) - pre_arena)
+end
+
+# ============================================================================
+# Main entry point for testing
+# ============================================================================
+
+## Main entry point for the codegen module (testing only).
+def main(): Int
+  puts("Quartz codegen module loaded")
+  return 0
+end

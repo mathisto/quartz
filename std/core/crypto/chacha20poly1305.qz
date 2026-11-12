@@ -1,0 +1,302 @@
+## std/core/crypto/chacha20poly1305 — ChaCha20-Poly1305 AEAD (RFC 8439 §2.8)
+##
+## NET.1 Phase 2 Step 2.15: ALL three primitives in this AEAD are now native
+## Quartz — `std/core/crypto/chacha20` (Step 2.14) for the stream cipher,
+## `std/core/crypto/poly1305` (Step 2.15) for the MAC, and the §2.8
+## composition in this file. Drops `Hacl_MAC_Poly1305.c`; HACL closure is
+## now 2 files (Curve25519 + Memzero), with Step 2.16 to fully retire HACL.
+##
+## Composition (RFC 8439 §2.8):
+##
+##   poly_key  = ChaCha20-Block(key, counter=0, nonce)[0..32]
+##   ciphertext = ChaCha20-Encrypt(key, counter=1, nonce, plaintext)
+##   mac_data  = aad || pad16(aad) || ct || pad16(ct) || le64(aad_len) || le64(ct_len)
+##   tag       = Poly1305-MAC(mac_data, poly_key)
+##
+##   pad16(x)  = (16 − (len(x) mod 16)) mod 16 zero bytes
+##
+## Decrypt verifies the tag (constant-time compare via `subtle::ct_eq_bytes`)
+## BEFORE returning success. The plaintext is computed regardless — XOR is
+## involutive, so the operation is symmetric and the bottleneck stays
+## constant-time. Caller MUST treat output as undefined on failure.
+##
+## Buffers are caller-owned `(ptr, len)` pairs. Key: 32 bytes. Nonce: 12 bytes
+## (RFC 8439 IV format). Tag: 16 bytes.
+##
+## Also exposes XChaCha20-Poly1305 (24-byte nonce), composed from
+## native `hchacha20` + the AEAD above. WireGuard cookie reply consumes this.
+##
+## See:
+## - RFC 8439 §2.8 (AEAD construction)
+## - draft-irtf-cfrg-xchacha-03 §2.1 (XChaCha20-Poly1305)
+## - docs/design/CRYPTO_STDLIB_DESIGN.md (Phase 2 native-primitive plan)
+
+import std/core/crypto/chacha20   # chacha20_block, chacha20_encrypt, hchacha20
+import std/core/crypto/poly1305   # poly1305_mac (native, Step 2.15)
+import std/core/crypto/subtle     # ct_eq_bytes
+import * from std/core/crypto/secret  # Secret<Int> + secret_(wrap|unwrap)_ptr (NET.4.1 B)
+import * from ffi/socket           # malloc/free/memcpy/memset
+
+# =============================================================================
+# AEAD composition — native, RFC 8439 §2.8.
+# =============================================================================
+
+# Build the Poly1305 input buffer per RFC 8439 §2.8:
+#   aad || pad16(aad) || ct || pad16(ct) || le64(aad_len) || le64(ct_len)
+# Returns the populated buffer + writes the total length to `out_len_ptr` via
+# the caller's `var len = ...` shape (Quartz lacks out-params; we return both
+# in a paired allocation: caller frees `buf`, len is the function return).
+def _build_mac_data(
+  aad: Int, aad_len: Int,
+  ct: Int, ct_len: Int,
+  out_buf: Int  # must be at least: aad_len + pad(aad) + ct_len + pad(ct) + 16
+): Int
+  var aad_pad = (16 - (aad_len & 15)) & 15
+  var ct_pad = (16 - (ct_len & 15)) & 15
+  var off = 0
+  if aad_len > 0
+    memcpy(out_buf, aad, aad_len)
+    off = aad_len
+  end
+  var i = 0
+  while i < aad_pad
+    ptr_write_byte(out_buf + off + i, 0)
+    i += 1
+  end
+  off = off + aad_pad
+  if ct_len > 0
+    memcpy(out_buf + off, ct, ct_len)
+    off = off + ct_len
+  end
+  i = 0
+  while i < ct_pad
+    ptr_write_byte(out_buf + off + i, 0)
+    i += 1
+  end
+  off = off + ct_pad
+  # le64(aad_len)
+  var v = aad_len
+  i = 0
+  while i < 8
+    ptr_write_byte(out_buf + off + i, v & 255)
+    v = v >> 8
+    i += 1
+  end
+  off = off + 8
+  # le64(ct_len)
+  v = ct_len
+  i = 0
+  while i < 8
+    ptr_write_byte(out_buf + off + i, v & 255)
+    v = v >> 8
+    i += 1
+  end
+  off = off + 8
+  return off
+end
+
+# Allocate, fill with the 32-byte Poly1305 key for (key, nonce).
+# Caller frees. Output is the first 32 bytes of ChaCha20-Block(key, 0, nonce);
+# the trailing 32 bytes of the block are discarded per RFC 8439 §2.6.
+#
+# NET.4.1 B: `key` carries the Secret<Int> discipline; one unwrap at the
+# chacha20_block boundary. The returned `poly_key` is a derived one-shot
+# value local to one AEAD operation — it stays Int and is wiped at the
+# end of the calling function.
+def _derive_poly_key(key: Secret<Int>, nonce: Int): Int
+  var blk = malloc(64)
+  chacha20_block(secret_unwrap(key), 0, nonce, blk)
+  var poly_key = malloc(32)
+  memcpy(poly_key, blk, 32)
+  # Wipe the full block — bytes 32..64 are also keystream-correlated.
+  var i = 0
+  while i < 64
+    ptr_write_byte(blk + i, 0)
+    i += 1
+  end
+  free(blk)
+  return poly_key
+end
+
+## Encrypt `input_len` bytes from `input` to `output` using `key` (32 bytes)
+## and `nonce` (12 bytes). Authenticates `aad` (may be empty: aad=0, aad_len=0).
+## Writes 16 authentication-tag bytes to `tag`.
+##
+## NET.4.1 B: `key` carries the Secret<Int> discipline. The wire-bound
+## output/tag/aad parameters stay Int (those are public-by-construction in
+## the AEAD model — the tag binds to the ciphertext, both broadcast).
+## Internal chacha20_encrypt/_block calls unwrap once at the seam.
+def chacha20poly1305_encrypt(
+  output: Int,
+  tag: Int,
+  input: Int,
+  input_len: Int,
+  aad: Int,
+  aad_len: Int,
+  key: Secret<Int>,
+  nonce: Int
+): Void
+  # Step 1: derive Poly1305 key from ChaCha20-Block at counter=0.
+  var poly_key = _derive_poly_key(key, nonce)
+
+  # Step 2: encrypt plaintext with counter=1.
+  chacha20_encrypt(output, input, input_len, secret_unwrap(key), 1, nonce)
+
+  # Step 3: build MAC input + compute tag.
+  var aad_pad = (16 - (aad_len & 15)) & 15
+  var ct_pad = (16 - (input_len & 15)) & 15
+  var mac_buf_cap = aad_len + aad_pad + input_len + ct_pad + 16
+  var mac_buf = malloc(mac_buf_cap)
+  var mac_len = _build_mac_data(aad, aad_len, output, input_len, mac_buf)
+  poly1305_mac(tag, mac_buf, mac_len, poly_key)
+
+  # Wipe poly_key + mac_buf — both are correlated with secret material.
+  var i = 0
+  while i < 32
+    ptr_write_byte(poly_key + i, 0)
+    i += 1
+  end
+  free(poly_key)
+  free(mac_buf)
+end
+
+## Decrypt + verify. Returns 0 on success, non-zero on tag-mismatch failure.
+## On failure the caller MUST treat `output` as undefined (zero or discard it).
+##
+## Tag is checked in constant time after the plaintext is computed; the
+## overall operation is constant-time over input_len, never branches on
+## key/plaintext bits.
+##
+## NET.4.1 B: `key` carries the Secret<Int> discipline (see encrypt above).
+def chacha20poly1305_decrypt(
+  output: Int,
+  input: Int,
+  input_len: Int,
+  aad: Int,
+  aad_len: Int,
+  key: Secret<Int>,
+  nonce: Int,
+  tag: Int
+): Int
+  # Step 1: derive Poly1305 key.
+  var poly_key = _derive_poly_key(key, nonce)
+
+  # Step 2: compute expected tag over (aad || pad || ct || pad || lens).
+  var aad_pad = (16 - (aad_len & 15)) & 15
+  var ct_pad = (16 - (input_len & 15)) & 15
+  var mac_buf_cap = aad_len + aad_pad + input_len + ct_pad + 16
+  var mac_buf = malloc(mac_buf_cap)
+  var mac_len = _build_mac_data(aad, aad_len, input, input_len, mac_buf)
+  var expected_tag = malloc(16)
+  poly1305_mac(expected_tag, mac_buf, mac_len, poly_key)
+
+  # Step 3: constant-time tag compare. ct_eq_bytes returns 1 on match.
+  var ok = ct_eq_bytes(expected_tag, tag, 16)
+
+  # Step 4: decrypt only if tag matched. Even on mismatch we wipe scratch
+  # before returning; output is left undefined (per RFC 8439 §2.8 caller
+  # contract).
+  if ok == 1
+    chacha20_encrypt(output, input, input_len, secret_unwrap(key), 1, nonce)
+  end
+
+  # Wipe scratch.
+  var i = 0
+  while i < 32
+    ptr_write_byte(poly_key + i, 0)
+    i += 1
+  end
+  free(poly_key)
+  free(mac_buf)
+  free(expected_tag)
+
+  if ok == 1
+    return 0
+  end
+  return 0 - 1
+end
+
+# =============================================================================
+# XChaCha20-Poly1305 (24-byte nonce) — draft-irtf-cfrg-xchacha §2.1
+# =============================================================================
+#
+# Construction:
+#   1. subkey  = HChaCha20(key, nonce[0..16])
+#   2. ck_nonce = 0x00 0x00 0x00 0x00 || nonce[16..24]   (12 bytes)
+#   3. AEAD    = ChaCha20-Poly1305(subkey, ck_nonce, ...)
+#
+# WireGuard cookie reply (paper §5.4.7) is the only Phase 1+2 consumer.
+
+## Build the 12-byte ChaCha20 nonce from the low 8 bytes of an XChaCha20 nonce:
+##   `out_12` := 0x00 0x00 0x00 0x00 || xnonce[16..24]
+def _xc_chacha_nonce(xnonce: Int, out_12: Int): Void
+  ptr_write_byte(out_12, 0)
+  ptr_write_byte(out_12 + 1, 0)
+  ptr_write_byte(out_12 + 2, 0)
+  ptr_write_byte(out_12 + 3, 0)
+  memcpy(out_12 + 4, xnonce + 16, 8)
+end
+
+## XChaCha20-Poly1305 encrypt + authenticate. Args mirror chacha20poly1305_encrypt
+## except `nonce` is 24 bytes (XChaCha20).
+##
+## NET.4.1 B: `key` carries the Secret<Int> discipline. The derived `subkey`
+## is wrapped immediately at the AEAD-call boundary — itself a secret value
+## even though local to this function, so the wrap documents that fact.
+def xchacha20poly1305_encrypt(
+  output: Int,
+  tag: Int,
+  input: Int,
+  input_len: Int,
+  aad: Int,
+  aad_len: Int,
+  key: Secret<Int>,
+  nonce: Int
+): Void
+  var subkey = malloc(32)
+  hchacha20(secret_unwrap(key), nonce, subkey)
+  var ck_nonce = malloc(12)
+  _xc_chacha_nonce(nonce, ck_nonce)
+  chacha20poly1305_encrypt(
+    output, tag, input, input_len, aad, aad_len, secret_wrap(subkey), ck_nonce
+  )
+  # Wipe the derived subkey + chacha-nonce — they leak the XChaCha20 nonce.
+  var i = 0
+  while i < 32
+    ptr_write_byte(subkey + i, 0)
+    i += 1
+  end
+  free(subkey)
+  free(ck_nonce)
+end
+
+## XChaCha20-Poly1305 decrypt + verify. Returns 0 on success, non-zero on
+## tag-mismatch failure. Caller MUST treat `output` as undefined on failure.
+##
+## NET.4.1 B: `key` carries the Secret<Int> discipline.
+def xchacha20poly1305_decrypt(
+  output: Int,
+  input: Int,
+  input_len: Int,
+  aad: Int,
+  aad_len: Int,
+  key: Secret<Int>,
+  nonce: Int,
+  tag: Int
+): Int
+  var subkey = malloc(32)
+  hchacha20(secret_unwrap(key), nonce, subkey)
+  var ck_nonce = malloc(12)
+  _xc_chacha_nonce(nonce, ck_nonce)
+  var rc = chacha20poly1305_decrypt(
+    output, input, input_len, aad, aad_len, secret_wrap(subkey), ck_nonce, tag
+  )
+  var i = 0
+  while i < 32
+    ptr_write_byte(subkey + i, 0)
+    i += 1
+  end
+  free(subkey)
+  free(ck_nonce)
+  return rc
+end

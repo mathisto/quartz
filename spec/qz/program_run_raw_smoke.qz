@@ -1,0 +1,104 @@
+## program_run_raw live-loop smoke test.
+##
+## Sets up a held-open pipe as stdin so the input pump parks
+## indefinitely (no data, no EOF). program_run_raw spawns the input
+## pump + tick pump (50ms cadence) under its own scope, hands
+## (msg_ch, scope) to the body, which recv's three FrameMsg::Tick
+## events, then returns 0. The helper cancels the scope, the pumps
+## unwind via Throws, terminal state is restored.
+##
+## Asserts:
+##   - body return value (0) propagates as program_run_raw's return.
+##   - wall-clock duration in [120ms, 1000ms] — 3 ticks at 50ms is
+##     150ms minimum; tolerance accounts for scheduler jitter and
+##     OS overhead.
+##   - tick payloads are increasing (epoch_ms is monotonic per call).
+##
+## Standalone (not qspec): qspec inline `go` doesn't spawn real
+## worker-thread tasks; the tick pump + input pump need real threads
+## to fire concurrently with the body's recv loop. See feedback
+## memory "Spec authoring caveat for go fn() inside qspec lambdas".
+
+import * from std/sync/composition/scope
+import * from std/throws
+import * from std/terminal
+import * from std/ffi/socket
+import std/tui/runtime as tui
+
+extern "C" def dup2(oldfd: CInt, newfd: CInt): CInt
+
+# Module-level state captured by the body lambda. Module globals
+# instead of capture-by-ref because the body runs on the main
+# thread (no worker-stack capture issues) and we need to read
+# results after program_run_raw returns.
+var _ticks_seen = 0
+var _last_epoch_ms = 0
+var _epoch_monotonic = 1
+var _saw_resize = 0
+var _saw_quit = 0
+
+# Body — recv 3 ticks, then return. The helper teardown will cancel
+# the scope and unwind the goroutines.
+def _smoke_body(msg_ch: Int, scope: Int): Int
+  while _ticks_seen < 3
+    var raw = recv(msg_ch)
+    var msg: tui::FrameMsg<Void> = as_type<tui::FrameMsg<Void>>(raw)
+    match msg
+      tui::FrameMsg::Tick(ms) =>
+        if ms < _last_epoch_ms
+          _epoch_monotonic = 0
+        end
+        _last_epoch_ms = ms
+        _ticks_seen = _ticks_seen + 1
+      tui::FrameMsg::Quit => _saw_quit = 1
+      tui::FrameMsg::Resize(_, _) => _saw_resize = 1
+      _ => _ticks_seen = _ticks_seen
+    end
+  end
+  return 0
+end
+
+def main(): Int
+  var fds = pipe_create()
+  if fds.size != 2
+    puts("FAIL: pipe_create returned size #{str_from_int(fds.size)}")
+    return 10
+  end
+  if dup2(fds[0], 0) < 0
+    puts("FAIL: dup2 returned <0")
+    return 11
+  end
+
+  var t0 = time_mono_ns()
+  var rc = tui::program_run_raw<Void>(50, _smoke_body)
+  var elapsed_ms = (time_mono_ns() - t0) / 1_000_000
+
+  if rc != 0
+    puts("FAIL: program_run_raw returned #{str_from_int(rc)} (expected 0)")
+    return 1
+  end
+
+  if _ticks_seen < 3
+    puts("FAIL: only saw #{str_from_int(_ticks_seen)} ticks (expected 3)")
+    return 2
+  end
+
+  # 3 ticks at 50ms = 150ms minimum; allow up to 1000ms for jitter
+  # plus the input-pump-spawn + scope-cancel teardown overhead.
+  if elapsed_ms < 120
+    puts("FAIL: completed in #{str_from_int(elapsed_ms)}ms (< 120ms — ticks may not have fired at the documented cadence)")
+    return 3
+  end
+  if elapsed_ms > 1000
+    puts("FAIL: completed in #{str_from_int(elapsed_ms)}ms (> 1000ms — teardown blocked, scope cancel may not be reaching the pumps)")
+    return 4
+  end
+
+  if _epoch_monotonic == 0
+    puts("FAIL: tick payloads were not monotonic (clock-skew or wrong intrinsic?)")
+    return 5
+  end
+
+  puts("OK: program_run_raw 3-tick smoke completed in #{str_from_int(elapsed_ms)}ms (3 * 50ms = 150ms minimum)")
+  return 0
+end

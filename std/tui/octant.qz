@@ -1,0 +1,1470 @@
+## std/tui/octant.qz — sub-cell pixel blitter (Phase 6.6 of v0.6).
+##
+## An `OctantBlitter` carries a `pixel_w × pixel_h` boolean pixel
+## grid. `octant_blit_to_plane` downsamples that grid into one cell
+## per (2 cols × 4 rows) of pixels, choosing a glyph for each cell
+## based on which sub-pixels are filled. Output cell dimensions are
+## `pixel_w / 2` wide × `pixel_h / 4` tall.
+##
+## **Why sub-cell pixels.** Modern terminals draw one glyph per
+## monospace cell. With careful glyph choice (block characters,
+## quadrants, octants), each cell can carry up to 8 binary
+## "sub-pixels" while preserving cell semantics — mouse hit-testing,
+## focus, cursor positioning, attribute boundaries all still work at
+## the cell level. For dashboards, sparklines, roguelike weather
+## effects, and any "graphics-shaped" use case, this is the most
+## resolution you can get without escaping into Sixel / Kitty graphics
+## protocol territory.
+##
+## **Quality tiers.** Apps pick their tradeoff at blit time:
+##
+## - `Octant` — full 2×4 sub-cell resolution, Unicode 16 octants
+##   (Sept 2024). All 256 patterns covered: 230 new codepoints in
+##   U+1CD00..U+1CDE5 plus 26 reused codepoints from earlier blocks
+##   (16 quadrant-clean from U+2580..U+259F, plus 8 from
+##   U+1CEA0..U+1CEAB / U+1FB82 / U+1FB85 / U+1FBE6 / U+1FBE7, plus 2
+##   from U+2582 and U+2586). Full coverage shipped in v0.6.6.1 — the
+##   visceral fidelity payoff for cell-level lighting + roguelike
+##   rendering.
+## - `Quadrant` — 2×2 sub-cell resolution. Maps the 8 octant pixels to
+##   4 quadrant pixels (each quadrant ON if any of its 2 octant pixels
+##   is on), then picks one of 16 BMP block characters. Universal
+##   support — every modern terminal and most legacy ones.
+## - `Half` — 1×2 sub-cell resolution (top half / bottom half). Maps
+##   the 8 octant pixels to 2 half pixels. Picks one of 4 chars (full,
+##   upper-half, lower-half, space). Maximum compat.
+## - `Ascii` — 1×1 (the entire cell is on or off). `#` for any-on,
+##   space for all-off. For terminals that don't render any block
+##   characters at all (vanishingly rare in 2026 but kept for true
+##   degraded-terminal cases like log files / scriptable test output).
+##
+## **Coordinate system.** The pixel grid uses `(px, py)` where
+## `px ∈ [0, pixel_w)` is column and `py ∈ [0, pixel_h)` is row, both
+## 0-indexed. Pixel `(px, py)` corresponds to bit
+## `(py % 4) * 2 + (px % 2)` within its containing octant cell — the
+## standard Unicode octant bit ordering (top-left first, then right,
+## then row-by-row down to bottom-right).
+##
+## **Why 2×4 not 4×2.** The Unicode 16 octant block lays out cells as
+## 2 columns × 4 rows of subpixels (matching how a monospace cell is
+## ~2× taller than wide). The original v0.6 design memo sketched
+## "4w × 2h pixels per cell" which was a notation slip — the actual
+## Unicode geometry is 2×4. Rectifying here.
+##
+## See `docs/design/TUI_V06_CELL_ENGINE.md` D6 for the design rationale,
+## and Unicode 16/17 charts U+1CC00..U+1CEBF (Symbols for Legacy
+## Computing Supplement) for the codepoint reference.
+##
+## @since 5.28.x
+
+import std/tui/cell as cl
+import std/tui/plane as pl
+
+# =============================================================================
+# OctantQuality — caller-selected resolution / compatibility tier
+# =============================================================================
+
+## Picks how `octant_blit_to_plane` chooses a glyph per output cell.
+## Tiers are ordered by descending resolution; higher tiers may need
+## newer fonts, lower tiers degrade gracefully on legacy terminals.
+enum OctantQuality
+  Octant      # 2×4 sub-cells (Unicode 16; partial coverage in v0.6.6.0)
+  Quadrant    # 2×2 sub-cells (BMP block characters; full coverage)
+  Half        # 1×2 sub-cells (upper / lower halves)
+  Ascii       # 1×1 (#-or-space)
+end
+
+# =============================================================================
+# OctantBlitter struct
+# =============================================================================
+
+## A boolean pixel grid that downsamples to monospace cells via
+## `octant_blit_to_plane`. Cell-output dimensions are `pixel_w / 2 ×
+## pixel_h / 4` (regardless of quality tier).
+##
+## - `pixels`: row-major `pixel_w × pixel_h` `Vec<Bool>`. Pixel
+##   `(px, py)` lives at `pixels[py * pixel_w + px]`.
+## - `pixel_w`, `pixel_h`: dimensions in pixels (sub-cell units).
+##   Should be multiples of 2 and 4 respectively for clean cell
+##   boundaries; non-aligned dimensions are silently rounded down at
+##   blit time.
+struct OctantBlitter
+  pixels:  Vec<Bool>
+  pixel_w: Int
+  pixel_h: Int
+end
+
+## Construct a blank (all-off) blitter at `pixel_w × pixel_h`.
+def octant_blitter_new(pixel_w: Int, pixel_h: Int): OctantBlitter
+  var pw = pixel_w
+  var ph = pixel_h
+  if pw < 0
+    pw = 0
+  end
+  if ph < 0
+    ph = 0
+  end
+  var n = pw * ph
+  var px = vec_new<Bool>()
+  var i = 0
+  while i < n
+    px.push(false)
+    i += 1
+  end
+  return OctantBlitter {
+    pixels:  px,
+    pixel_w: pw,
+    pixel_h: ph
+  }
+end
+
+## Read pixel `(px, py)`. Returns `false` for OOB queries.
+def octant_get(b: OctantBlitter, px: Int, py: Int): Bool
+  if px < 0 or py < 0 or px >= b.pixel_w or py >= b.pixel_h
+    return false
+  end
+  var v = b.pixels
+  return v[py * b.pixel_w + px]
+end
+
+## Set pixel `(px, py)` to `on`. Returns a fresh blitter with the
+## change. OOB writes are silent no-ops (the original blitter is
+## returned, dimensions unchanged).
+def octant_set(b: OctantBlitter, px: Int, py: Int, on: Bool): OctantBlitter
+  if px < 0 or py < 0 or px >= b.pixel_w or py >= b.pixel_h
+    return b
+  end
+  # Copy pixel buffer, mutate the copy.
+  var src = b.pixels
+  var n = src.size
+  var copy = vec_new<Bool>()
+  var i = 0
+  while i < n
+    copy.push(src[i])
+    i += 1
+  end
+  copy[py * b.pixel_w + px] = on
+  return OctantBlitter {
+    pixels:  copy,
+    pixel_w: b.pixel_w,
+    pixel_h: b.pixel_h
+  }
+end
+
+## Set every pixel in the blitter to `on`. Useful for clearing or
+## flooding before targeted edits.
+def octant_fill(b: OctantBlitter, on: Bool): OctantBlitter
+  var n = b.pixels.size
+  var px = vec_new<Bool>()
+  var i = 0
+  while i < n
+    px.push(on)
+    i += 1
+  end
+  return OctantBlitter {
+    pixels:  px,
+    pixel_w: b.pixel_w,
+    pixel_h: b.pixel_h
+  }
+end
+
+## Output cell width: how many cells wide an octant blit produces.
+## Equal to `pixel_w / 2` (rounded down).
+def octant_cell_w(b: OctantBlitter): Int = b.pixel_w / 2
+
+## Output cell height: how many cells tall an octant blit produces.
+## Equal to `pixel_h / 4` (rounded down).
+def octant_cell_h(b: OctantBlitter): Int = b.pixel_h / 4
+
+# =============================================================================
+# Internal: pattern extraction
+# =============================================================================
+
+## Read the 8-bit octant pattern for cell `(cx, cy)` from the blitter.
+##
+## Bit ordering (Unicode-standard for octants):
+##   bit 0 = pixel (2*cx + 0, 4*cy + 0)  — top-left
+##   bit 1 = pixel (2*cx + 1, 4*cy + 0)  — top-right
+##   bit 2 = pixel (2*cx + 0, 4*cy + 1)
+##   bit 3 = pixel (2*cx + 1, 4*cy + 1)
+##   bit 4 = pixel (2*cx + 0, 4*cy + 2)
+##   bit 5 = pixel (2*cx + 1, 4*cy + 2)
+##   bit 6 = pixel (2*cx + 0, 4*cy + 3)  — bottom-left
+##   bit 7 = pixel (2*cx + 1, 4*cy + 3)  — bottom-right
+##
+## OOB cells return 0 (octant_get clamps individual pixel reads to false).
+def octant_pattern_at(b: OctantBlitter, cx: Int, cy: Int): Int
+  var pat = 0
+  var dy = 0
+  while dy < 4
+    var dx = 0
+    while dx < 2
+      if octant_get(b, 2 * cx + dx, 4 * cy + dy)
+        pat = pat | (1 << (dy * 2 + dx))
+      end
+      dx += 1
+    end
+    dy += 1
+  end
+  return pat
+end
+
+# =============================================================================
+# Pattern → glyph for each quality tier
+# =============================================================================
+
+## Quadrant bit packing — collapse 8 octant bits to 4 quadrant bits.
+##
+##   quad bit 0 = UL set (any of octant bits 0, 2)
+##   quad bit 1 = UR set (any of octant bits 1, 3)
+##   quad bit 2 = LL set (any of octant bits 4, 6)
+##   quad bit 3 = LR set (any of octant bits 5, 7)
+def _quadrant_bits(pat: Int): Int
+  var q = 0
+  if (pat & 0x05) != 0
+    q = q | 1
+  end
+  if (pat & 0x0A) != 0
+    q = q | 2
+  end
+  if (pat & 0x50) != 0
+    q = q | 4
+  end
+  if (pat & 0xA0) != 0
+    q = q | 8
+  end
+  return q
+end
+
+## Half-block bit packing — collapse 8 octant bits to 2 half bits.
+##
+##   half bit 0 = upper half (any of octant bits 0..3)
+##   half bit 1 = lower half (any of octant bits 4..7)
+def _half_bits(pat: Int): Int
+  var h = 0
+  if (pat & 0x0F) != 0
+    h = h | 1
+  end
+  if (pat & 0xF0) != 0
+    h = h | 2
+  end
+  return h
+end
+
+## Map a 4-bit quadrant pattern to its block-character glyph.
+##
+## Table (q-bit numbering: 1=UL, 2=UR, 4=LL, 8=LR):
+##   0x0  →  " "      (space)
+##   0x1  →  "▘"      (U+2598)
+##   0x2  →  "▝"      (U+259D)
+##   0x3  →  "▀"      (U+2580 upper half)
+##   0x4  →  "▖"      (U+2596)
+##   0x5  →  "▌"      (U+258C left half)
+##   0x6  →  "▞"      (U+259E)
+##   0x7  →  "▛"      (U+259B)
+##   0x8  →  "▗"      (U+2597)
+##   0x9  →  "▚"      (U+259A)
+##   0xA  →  "▐"      (U+2590 right half)
+##   0xB  →  "▜"      (U+259C)
+##   0xC  →  "▄"      (U+2584 lower half)
+##   0xD  →  "▙"      (U+2599)
+##   0xE  →  "▟"      (U+259F)
+##   0xF  →  "█"      (U+2588 full block)
+def _quadrant_glyph(q: Int): String
+  if q == 0x0
+    return " "
+  end
+  if q == 0x1
+    return "▘"
+  end
+  if q == 0x2
+    return "▝"
+  end
+  if q == 0x3
+    return "▀"
+  end
+  if q == 0x4
+    return "▖"
+  end
+  if q == 0x5
+    return "▌"
+  end
+  if q == 0x6
+    return "▞"
+  end
+  if q == 0x7
+    return "▛"
+  end
+  if q == 0x8
+    return "▗"
+  end
+  if q == 0x9
+    return "▚"
+  end
+  if q == 0xA
+    return "▐"
+  end
+  if q == 0xB
+    return "▜"
+  end
+  if q == 0xC
+    return "▄"
+  end
+  if q == 0xD
+    return "▙"
+  end
+  if q == 0xE
+    return "▟"
+  end
+  return "█"
+end
+
+## Map a 2-bit half-block pattern to its glyph.
+def _half_glyph(h: Int): String
+  if h == 0
+    return " "
+  end
+  if h == 1
+    return "▀"
+  end
+  if h == 2
+    return "▄"
+  end
+  return "█"
+end
+
+# =============================================================================
+# Full Unicode 16/17 octant codepoint table (Phase 6.6.1)
+# =============================================================================
+#
+# 256 patterns map to 230 NEW Unicode 17 codepoints in U+1CD00..U+1CDE5
+# plus 26 reused codepoints from earlier blocks:
+#
+#   - 16 quadrant-clean patterns (halves, quadrants, full block, space)
+#     reuse the existing Block Elements range U+2580..U+259F.
+#   - 8 patterns reuse the Symbols-for-Legacy-Computing range
+#     (U+1CEA0..U+1CEAB, U+1FB82, U+1FB85, U+1FBE6, U+1FBE7) for shapes
+#     that already had glyphs in Unicode 13 / 16 elsewhere.
+#   - 2 patterns reuse U+2582 (LOWER ONE QUARTER BLOCK) and U+2586
+#     (LOWER THREE QUARTERS BLOCK) for the bottom-row-only and
+#     bottom-three-rows patterns.
+#
+# Bit ordering (`octant_pattern_at` in this module):
+#   bit 0=top-left, 1=top-right, 2=upper-mid-left, 3=upper-mid-right,
+#   bit 4=lower-mid-left, 5=lower-mid-right, 6=bottom-left, 7=bottom-right.
+#
+# Source: Bobby-Miller's community-curated octant lookup gist
+# (https://gist.github.com/Bobby-Miller/d48dabce3179f328b15db4737740fd55),
+# transcribed from the Unicode 17 chart at U+1CC00 (Symbols for Legacy
+# Computing Supplement). One typo in the gist was corrected: the
+# top-3-rows pattern (my-bit 0x3F) maps to U+1FB85 (UPPER THREE QUARTERS
+# BLOCK), not U+2586 (which is LOWER THREE QUARTERS — already used by
+# the bottom-3-rows pattern at my-bit 0xFC). Cross-validated against
+# the Unicode "BLOCK OCTANT-DIGITS" naming convention for the 16
+# canonical reused patterns + several representative new octants
+# (U+1CD00 = OCTANT-3, U+1CDE5 = OCTANT-2345678).
+#
+# Dispatched as 16 helper functions keyed by high nibble (each handles
+# 16 low-nibble cases). This shape is mechanical to verify — every
+# `if lo == 0xN / return 0x...` line corresponds 1:1 to a row in the
+# generator script that built this table.
+
+def _oct_cp_h0(lo: Int): Int
+  if lo == 0x0
+    return 0x20
+  end
+  if lo == 0x1
+    return 0x1CEA8
+  end
+  if lo == 0x2
+    return 0x1CEAB
+  end
+  if lo == 0x3
+    return 0x1FB82
+  end
+  if lo == 0x4
+    return 0x1CD00
+  end
+  if lo == 0x5
+    return 0x2598
+  end
+  if lo == 0x6
+    return 0x1CD01
+  end
+  if lo == 0x7
+    return 0x1CD02
+  end
+  if lo == 0x8
+    return 0x1CD03
+  end
+  if lo == 0x9
+    return 0x1CD04
+  end
+  if lo == 0xA
+    return 0x259D
+  end
+  if lo == 0xB
+    return 0x1CD05
+  end
+  if lo == 0xC
+    return 0x1CD06
+  end
+  if lo == 0xD
+    return 0x1CD07
+  end
+  if lo == 0xE
+    return 0x1CD08
+  end
+  if lo == 0xF
+    return 0x2580
+  end
+  return 0x20
+end
+
+def _oct_cp_h1(lo: Int): Int
+  if lo == 0x0
+    return 0x1CD09
+  end
+  if lo == 0x1
+    return 0x1CD0A
+  end
+  if lo == 0x2
+    return 0x1CD0B
+  end
+  if lo == 0x3
+    return 0x1CD0C
+  end
+  if lo == 0x4
+    return 0x1FBE6
+  end
+  if lo == 0x5
+    return 0x1CD0D
+  end
+  if lo == 0x6
+    return 0x1CD0E
+  end
+  if lo == 0x7
+    return 0x1CD0F
+  end
+  if lo == 0x8
+    return 0x1CD10
+  end
+  if lo == 0x9
+    return 0x1CD11
+  end
+  if lo == 0xA
+    return 0x1CD12
+  end
+  if lo == 0xB
+    return 0x1CD13
+  end
+  if lo == 0xC
+    return 0x1CD14
+  end
+  if lo == 0xD
+    return 0x1CD15
+  end
+  if lo == 0xE
+    return 0x1CD16
+  end
+  if lo == 0xF
+    return 0x1CD17
+  end
+  return 0x20
+end
+
+def _oct_cp_h2(lo: Int): Int
+  if lo == 0x0
+    return 0x1CD18
+  end
+  if lo == 0x1
+    return 0x1CD19
+  end
+  if lo == 0x2
+    return 0x1CD1A
+  end
+  if lo == 0x3
+    return 0x1CD1B
+  end
+  if lo == 0x4
+    return 0x1CD1C
+  end
+  if lo == 0x5
+    return 0x1CD1D
+  end
+  if lo == 0x6
+    return 0x1CD1E
+  end
+  if lo == 0x7
+    return 0x1CD1F
+  end
+  if lo == 0x8
+    return 0x1FBE7
+  end
+  if lo == 0x9
+    return 0x1CD20
+  end
+  if lo == 0xA
+    return 0x1CD21
+  end
+  if lo == 0xB
+    return 0x1CD22
+  end
+  if lo == 0xC
+    return 0x1CD23
+  end
+  if lo == 0xD
+    return 0x1CD24
+  end
+  if lo == 0xE
+    return 0x1CD25
+  end
+  if lo == 0xF
+    return 0x1CD26
+  end
+  return 0x20
+end
+
+def _oct_cp_h3(lo: Int): Int
+  if lo == 0x0
+    return 0x1CD27
+  end
+  if lo == 0x1
+    return 0x1CD28
+  end
+  if lo == 0x2
+    return 0x1CD29
+  end
+  if lo == 0x3
+    return 0x1CD2A
+  end
+  if lo == 0x4
+    return 0x1CD2B
+  end
+  if lo == 0x5
+    return 0x1CD2C
+  end
+  if lo == 0x6
+    return 0x1CD2D
+  end
+  if lo == 0x7
+    return 0x1CD2E
+  end
+  if lo == 0x8
+    return 0x1CD2F
+  end
+  if lo == 0x9
+    return 0x1CD30
+  end
+  if lo == 0xA
+    return 0x1CD31
+  end
+  if lo == 0xB
+    return 0x1CD32
+  end
+  if lo == 0xC
+    return 0x1CD33
+  end
+  if lo == 0xD
+    return 0x1CD34
+  end
+  if lo == 0xE
+    return 0x1CD35
+  end
+  if lo == 0xF
+    return 0x1FB85
+  end
+  return 0x20
+end
+
+def _oct_cp_h4(lo: Int): Int
+  if lo == 0x0
+    return 0x1CEA3
+  end
+  if lo == 0x1
+    return 0x1CD36
+  end
+  if lo == 0x2
+    return 0x1CD37
+  end
+  if lo == 0x3
+    return 0x1CD38
+  end
+  if lo == 0x4
+    return 0x1CD39
+  end
+  if lo == 0x5
+    return 0x1CD3A
+  end
+  if lo == 0x6
+    return 0x1CD3B
+  end
+  if lo == 0x7
+    return 0x1CD3C
+  end
+  if lo == 0x8
+    return 0x1CD3D
+  end
+  if lo == 0x9
+    return 0x1CD3E
+  end
+  if lo == 0xA
+    return 0x1CD3F
+  end
+  if lo == 0xB
+    return 0x1CD40
+  end
+  if lo == 0xC
+    return 0x1CD41
+  end
+  if lo == 0xD
+    return 0x1CD42
+  end
+  if lo == 0xE
+    return 0x1CD43
+  end
+  if lo == 0xF
+    return 0x1CD44
+  end
+  return 0x20
+end
+
+def _oct_cp_h5(lo: Int): Int
+  if lo == 0x0
+    return 0x2596
+  end
+  if lo == 0x1
+    return 0x1CD45
+  end
+  if lo == 0x2
+    return 0x1CD46
+  end
+  if lo == 0x3
+    return 0x1CD47
+  end
+  if lo == 0x4
+    return 0x1CD48
+  end
+  if lo == 0x5
+    return 0x258C
+  end
+  if lo == 0x6
+    return 0x1CD49
+  end
+  if lo == 0x7
+    return 0x1CD4A
+  end
+  if lo == 0x8
+    return 0x1CD4B
+  end
+  if lo == 0x9
+    return 0x1CD4C
+  end
+  if lo == 0xA
+    return 0x259E
+  end
+  if lo == 0xB
+    return 0x1CD4D
+  end
+  if lo == 0xC
+    return 0x1CD4E
+  end
+  if lo == 0xD
+    return 0x1CD4F
+  end
+  if lo == 0xE
+    return 0x1CD50
+  end
+  if lo == 0xF
+    return 0x259B
+  end
+  return 0x20
+end
+
+def _oct_cp_h6(lo: Int): Int
+  if lo == 0x0
+    return 0x1CD51
+  end
+  if lo == 0x1
+    return 0x1CD52
+  end
+  if lo == 0x2
+    return 0x1CD53
+  end
+  if lo == 0x3
+    return 0x1CD54
+  end
+  if lo == 0x4
+    return 0x1CD55
+  end
+  if lo == 0x5
+    return 0x1CD56
+  end
+  if lo == 0x6
+    return 0x1CD57
+  end
+  if lo == 0x7
+    return 0x1CD58
+  end
+  if lo == 0x8
+    return 0x1CD59
+  end
+  if lo == 0x9
+    return 0x1CD5A
+  end
+  if lo == 0xA
+    return 0x1CD5B
+  end
+  if lo == 0xB
+    return 0x1CD5C
+  end
+  if lo == 0xC
+    return 0x1CD5D
+  end
+  if lo == 0xD
+    return 0x1CD5E
+  end
+  if lo == 0xE
+    return 0x1CD5F
+  end
+  if lo == 0xF
+    return 0x1CD60
+  end
+  return 0x20
+end
+
+def _oct_cp_h7(lo: Int): Int
+  if lo == 0x0
+    return 0x1CD61
+  end
+  if lo == 0x1
+    return 0x1CD62
+  end
+  if lo == 0x2
+    return 0x1CD63
+  end
+  if lo == 0x3
+    return 0x1CD64
+  end
+  if lo == 0x4
+    return 0x1CD65
+  end
+  if lo == 0x5
+    return 0x1CD66
+  end
+  if lo == 0x6
+    return 0x1CD67
+  end
+  if lo == 0x7
+    return 0x1CD68
+  end
+  if lo == 0x8
+    return 0x1CD69
+  end
+  if lo == 0x9
+    return 0x1CD6A
+  end
+  if lo == 0xA
+    return 0x1CD6B
+  end
+  if lo == 0xB
+    return 0x1CD6C
+  end
+  if lo == 0xC
+    return 0x1CD6D
+  end
+  if lo == 0xD
+    return 0x1CD6E
+  end
+  if lo == 0xE
+    return 0x1CD6F
+  end
+  if lo == 0xF
+    return 0x1CD70
+  end
+  return 0x20
+end
+
+def _oct_cp_h8(lo: Int): Int
+  if lo == 0x0
+    return 0x1CEA0
+  end
+  if lo == 0x1
+    return 0x1CD71
+  end
+  if lo == 0x2
+    return 0x1CD72
+  end
+  if lo == 0x3
+    return 0x1CD73
+  end
+  if lo == 0x4
+    return 0x1CD74
+  end
+  if lo == 0x5
+    return 0x1CD75
+  end
+  if lo == 0x6
+    return 0x1CD76
+  end
+  if lo == 0x7
+    return 0x1CD77
+  end
+  if lo == 0x8
+    return 0x1CD78
+  end
+  if lo == 0x9
+    return 0x1CD79
+  end
+  if lo == 0xA
+    return 0x1CD7A
+  end
+  if lo == 0xB
+    return 0x1CD7B
+  end
+  if lo == 0xC
+    return 0x1CD7C
+  end
+  if lo == 0xD
+    return 0x1CD7D
+  end
+  if lo == 0xE
+    return 0x1CD7E
+  end
+  if lo == 0xF
+    return 0x1CD7F
+  end
+  return 0x20
+end
+
+def _oct_cp_h9(lo: Int): Int
+  if lo == 0x0
+    return 0x1CD80
+  end
+  if lo == 0x1
+    return 0x1CD81
+  end
+  if lo == 0x2
+    return 0x1CD82
+  end
+  if lo == 0x3
+    return 0x1CD83
+  end
+  if lo == 0x4
+    return 0x1CD84
+  end
+  if lo == 0x5
+    return 0x1CD85
+  end
+  if lo == 0x6
+    return 0x1CD86
+  end
+  if lo == 0x7
+    return 0x1CD87
+  end
+  if lo == 0x8
+    return 0x1CD88
+  end
+  if lo == 0x9
+    return 0x1CD89
+  end
+  if lo == 0xA
+    return 0x1CD8A
+  end
+  if lo == 0xB
+    return 0x1CD8B
+  end
+  if lo == 0xC
+    return 0x1CD8C
+  end
+  if lo == 0xD
+    return 0x1CD8D
+  end
+  if lo == 0xE
+    return 0x1CD8E
+  end
+  if lo == 0xF
+    return 0x1CD8F
+  end
+  return 0x20
+end
+
+def _oct_cp_hA(lo: Int): Int
+  if lo == 0x0
+    return 0x2597
+  end
+  if lo == 0x1
+    return 0x1CD90
+  end
+  if lo == 0x2
+    return 0x1CD91
+  end
+  if lo == 0x3
+    return 0x1CD92
+  end
+  if lo == 0x4
+    return 0x1CD93
+  end
+  if lo == 0x5
+    return 0x259A
+  end
+  if lo == 0x6
+    return 0x1CD94
+  end
+  if lo == 0x7
+    return 0x1CD95
+  end
+  if lo == 0x8
+    return 0x1CD96
+  end
+  if lo == 0x9
+    return 0x1CD97
+  end
+  if lo == 0xA
+    return 0x2590
+  end
+  if lo == 0xB
+    return 0x1CD98
+  end
+  if lo == 0xC
+    return 0x1CD99
+  end
+  if lo == 0xD
+    return 0x1CD9A
+  end
+  if lo == 0xE
+    return 0x1CD9B
+  end
+  if lo == 0xF
+    return 0x259C
+  end
+  return 0x20
+end
+
+def _oct_cp_hB(lo: Int): Int
+  if lo == 0x0
+    return 0x1CD9C
+  end
+  if lo == 0x1
+    return 0x1CD9D
+  end
+  if lo == 0x2
+    return 0x1CD9E
+  end
+  if lo == 0x3
+    return 0x1CD9F
+  end
+  if lo == 0x4
+    return 0x1CDA0
+  end
+  if lo == 0x5
+    return 0x1CDA1
+  end
+  if lo == 0x6
+    return 0x1CDA2
+  end
+  if lo == 0x7
+    return 0x1CDA3
+  end
+  if lo == 0x8
+    return 0x1CDA4
+  end
+  if lo == 0x9
+    return 0x1CDA5
+  end
+  if lo == 0xA
+    return 0x1CDA6
+  end
+  if lo == 0xB
+    return 0x1CDA7
+  end
+  if lo == 0xC
+    return 0x1CDA8
+  end
+  if lo == 0xD
+    return 0x1CDA9
+  end
+  if lo == 0xE
+    return 0x1CDAA
+  end
+  if lo == 0xF
+    return 0x1CDAB
+  end
+  return 0x20
+end
+
+def _oct_cp_hC(lo: Int): Int
+  if lo == 0x0
+    return 0x2582
+  end
+  if lo == 0x1
+    return 0x1CDAC
+  end
+  if lo == 0x2
+    return 0x1CDAD
+  end
+  if lo == 0x3
+    return 0x1CDAE
+  end
+  if lo == 0x4
+    return 0x1CDAF
+  end
+  if lo == 0x5
+    return 0x1CDB0
+  end
+  if lo == 0x6
+    return 0x1CDB1
+  end
+  if lo == 0x7
+    return 0x1CDB2
+  end
+  if lo == 0x8
+    return 0x1CDB3
+  end
+  if lo == 0x9
+    return 0x1CDB4
+  end
+  if lo == 0xA
+    return 0x1CDB5
+  end
+  if lo == 0xB
+    return 0x1CDB6
+  end
+  if lo == 0xC
+    return 0x1CDB7
+  end
+  if lo == 0xD
+    return 0x1CDB8
+  end
+  if lo == 0xE
+    return 0x1CDB9
+  end
+  if lo == 0xF
+    return 0x1CDBA
+  end
+  return 0x20
+end
+
+def _oct_cp_hD(lo: Int): Int
+  if lo == 0x0
+    return 0x1CDBB
+  end
+  if lo == 0x1
+    return 0x1CDBC
+  end
+  if lo == 0x2
+    return 0x1CDBD
+  end
+  if lo == 0x3
+    return 0x1CDBE
+  end
+  if lo == 0x4
+    return 0x1CDBF
+  end
+  if lo == 0x5
+    return 0x1CDC0
+  end
+  if lo == 0x6
+    return 0x1CDC1
+  end
+  if lo == 0x7
+    return 0x1CDC2
+  end
+  if lo == 0x8
+    return 0x1CDC3
+  end
+  if lo == 0x9
+    return 0x1CDC4
+  end
+  if lo == 0xA
+    return 0x1CDC5
+  end
+  if lo == 0xB
+    return 0x1CDC6
+  end
+  if lo == 0xC
+    return 0x1CDC7
+  end
+  if lo == 0xD
+    return 0x1CDC8
+  end
+  if lo == 0xE
+    return 0x1CDC9
+  end
+  if lo == 0xF
+    return 0x1CDCA
+  end
+  return 0x20
+end
+
+def _oct_cp_hE(lo: Int): Int
+  if lo == 0x0
+    return 0x1CDCB
+  end
+  if lo == 0x1
+    return 0x1CDCC
+  end
+  if lo == 0x2
+    return 0x1CDCD
+  end
+  if lo == 0x3
+    return 0x1CDCE
+  end
+  if lo == 0x4
+    return 0x1CDCF
+  end
+  if lo == 0x5
+    return 0x1CDD0
+  end
+  if lo == 0x6
+    return 0x1CDD1
+  end
+  if lo == 0x7
+    return 0x1CDD2
+  end
+  if lo == 0x8
+    return 0x1CDD3
+  end
+  if lo == 0x9
+    return 0x1CDD4
+  end
+  if lo == 0xA
+    return 0x1CDD5
+  end
+  if lo == 0xB
+    return 0x1CDD6
+  end
+  if lo == 0xC
+    return 0x1CDD7
+  end
+  if lo == 0xD
+    return 0x1CDD8
+  end
+  if lo == 0xE
+    return 0x1CDD9
+  end
+  if lo == 0xF
+    return 0x1CDDA
+  end
+  return 0x20
+end
+
+def _oct_cp_hF(lo: Int): Int
+  if lo == 0x0
+    return 0x2584
+  end
+  if lo == 0x1
+    return 0x1CDDB
+  end
+  if lo == 0x2
+    return 0x1CDDC
+  end
+  if lo == 0x3
+    return 0x1CDDD
+  end
+  if lo == 0x4
+    return 0x1CDDE
+  end
+  if lo == 0x5
+    return 0x2599
+  end
+  if lo == 0x6
+    return 0x1CDDF
+  end
+  if lo == 0x7
+    return 0x1CDE0
+  end
+  if lo == 0x8
+    return 0x1CDE1
+  end
+  if lo == 0x9
+    return 0x1CDE2
+  end
+  if lo == 0xA
+    return 0x259F
+  end
+  if lo == 0xB
+    return 0x1CDE3
+  end
+  if lo == 0xC
+    return 0x2586
+  end
+  if lo == 0xD
+    return 0x1CDE4
+  end
+  if lo == 0xE
+    return 0x1CDE5
+  end
+  if lo == 0xF
+    return 0x2588
+  end
+  return 0x20
+end
+
+## Pattern → Unicode codepoint dispatch. Combines the high-nibble +
+## low-nibble lookup. Public (non-`_`-prefixed) so the spec can verify
+## individual entries directly without going through the glyph emitter.
+def octant_codepoint(pat: Int): Int
+  var hi = (pat >> 4) & 0xF
+  var lo = pat & 0xF
+  if hi == 0x0
+    return _oct_cp_h0(lo)
+  end
+  if hi == 0x1
+    return _oct_cp_h1(lo)
+  end
+  if hi == 0x2
+    return _oct_cp_h2(lo)
+  end
+  if hi == 0x3
+    return _oct_cp_h3(lo)
+  end
+  if hi == 0x4
+    return _oct_cp_h4(lo)
+  end
+  if hi == 0x5
+    return _oct_cp_h5(lo)
+  end
+  if hi == 0x6
+    return _oct_cp_h6(lo)
+  end
+  if hi == 0x7
+    return _oct_cp_h7(lo)
+  end
+  if hi == 0x8
+    return _oct_cp_h8(lo)
+  end
+  if hi == 0x9
+    return _oct_cp_h9(lo)
+  end
+  if hi == 0xA
+    return _oct_cp_hA(lo)
+  end
+  if hi == 0xB
+    return _oct_cp_hB(lo)
+  end
+  if hi == 0xC
+    return _oct_cp_hC(lo)
+  end
+  if hi == 0xD
+    return _oct_cp_hD(lo)
+  end
+  if hi == 0xE
+    return _oct_cp_hE(lo)
+  end
+  return _oct_cp_hF(lo)
+end
+
+# =============================================================================
+# UTF-8 encoder for octant codepoints
+# =============================================================================
+#
+# Octant codepoints span four UTF-8 length classes:
+#   - 1 byte:  U+0020 (space, only one in the table)
+#   - 3 bytes: U+2580..U+259F (Block Elements range)
+#   - 4 bytes: U+1CD00..U+1CDE5 (new octants), U+1CEA0..U+1CEAB,
+#              U+1FB82, U+1FB85, U+1FBE6, U+1FBE7
+#
+# Encoding follows RFC 3629:
+#   0x00..0x7F      → 1 byte  (cp)
+#   0x80..0x7FF     → 2 bytes (110xxxxx 10xxxxxx)
+#   0x800..0xFFFF   → 3 bytes (1110xxxx 10xxxxxx 10xxxxxx)
+#   0x10000..       → 4 bytes (11110xxx 10xxxxxx 10xxxxxx 10xxxxxx)
+
+## Encode a Unicode codepoint as a UTF-8 String.
+##
+## Quartz's `StringBuilder.append_char` already takes a Unicode
+## codepoint and emits the correct UTF-8 byte sequence. We just hand
+## the codepoint over and trust the builder. (An earlier version of
+## this helper hand-rolled the UTF-8 byte arithmetic and then called
+## `append_char` per byte — that double-encoded every high-bit byte
+## because `append_char` treated the byte as a codepoint and re-
+## emitted it as a 2-byte UTF-8 sequence.)
+def codepoint_to_utf8(cp: Int): String
+  var sb = sb_new()
+  sb.append_char(cp)
+  return sb.to_string()
+end
+
+## Map an 8-bit octant pattern to a glyph at full Unicode 17 fidelity.
+##
+## Every pattern (256 total) lands on either a new octant codepoint
+## (U+1CD00..U+1CDE5, 230 patterns) or a reused codepoint from the
+## Block Elements / Symbols-for-Legacy-Computing ranges (26 patterns).
+## See the table comment block above for the bit-ordering convention
+## and source provenance.
+##
+## v0.6.6.0 covered only the 16 quadrant-clean reused patterns and
+## fell back to the `Quadrant` quality glyph for the remaining 240.
+## v0.6.6.1 (this implementation) closes the gap with the full
+## Unicode 17 codepoint table.
+def _octant_glyph(pat: Int): String
+  return codepoint_to_utf8(octant_codepoint(pat))
+end
+
+## Map an 8-bit octant pattern to its ASCII representation.
+##   0x00       → " "
+##   anything   → "#"
+def _ascii_glyph(pat: Int): String
+  if pat == 0
+    return " "
+  end
+  return "#"
+end
+
+## Dispatch: pattern + quality → glyph.
+def _glyph_for(pat: Int, q: OctantQuality): String
+  if q is Octant
+    return _octant_glyph(pat)
+  end
+  if q is Quadrant
+    return _quadrant_glyph(_quadrant_bits(pat))
+  end
+  if q is Half
+    return _half_glyph(_half_bits(pat))
+  end
+  return _ascii_glyph(pat)
+end
+
+# =============================================================================
+# Public API: blit blitter onto a plane
+# =============================================================================
+
+## Render the blitter's pixels onto `plane` starting at `(dst_x, dst_y)`,
+## one cell per (2 cols × 4 rows) of pixels. Cells outside `plane`'s
+## rectangle are clipped silently. Each output cell uses `fg` and `bg`
+## as its foreground / background channels and 0 for attributes.
+##
+## Cell footprint: `octant_cell_w(b) × octant_cell_h(b)`.
+##
+## Quality controls only the choice of glyph per cell — the same
+## blitter renders to the same number of output cells under any
+## quality. `Quadrant`, `Half`, `Ascii` provide full-coverage fallbacks
+## for terminals lacking Unicode 16 / block-character support; in
+## practice every modern terminal handles `Quadrant` correctly.
+##
+## Returns a fresh `Plane`. The input is unchanged.
+def octant_blit_to_plane(
+  b: OctantBlitter, plane: pl::Plane,
+  dst_x: Int, dst_y: Int,
+  quality: OctantQuality,
+  fg: cl::Channel, bg: cl::Channel
+): pl::Plane
+  var cw = octant_cell_w(b)
+  var ch = octant_cell_h(b)
+  var out = plane
+  var cy = 0
+  while cy < ch
+    var cx = 0
+    while cx < cw
+      var pat = octant_pattern_at(b, cx, cy)
+      var glyph = _glyph_for(pat, quality)
+      var cell = cl::Cell {
+        egc:   glyph,
+        fg:    fg,
+        bg:    bg,
+        attrs: 0
+      }
+      out = pl::plane_putc(out, dst_x + cx, dst_y + cy, cell)
+      cx += 1
+    end
+    cy += 1
+  end
+  return out
+end
+
+## Multi-blitter layered render: one blitter drives the cell footprint +
+## glyph; a `fg_picker` callback receives all blitters' patterns at the
+## current cell and returns the foreground colour as an Int (the integer
+## carried by `cl::Channel`'s underlying RGB packing — produce one with
+## `cl::channel_rgb(rgb)` and pass that channel through `Channel`'s Int
+## representation, OR have the picker close over a few precomputed
+## `cl::Channel` ints).
+##
+## Use case — the brogue-tribute minimap idiom: a "memory" blitter drives
+## the layout (so visited geometry persists), while a "currently visible"
+## blitter picks bright vs. dim fg at each cell. The picker is one line:
+##
+## ```be
+## var picker = (cx, cy, pats) -> {
+##   if pats[1] != 0 { return fg_bright_int } else { return fg_dim_int }
+## }
+## octant_blit_layered(
+##   vec![mem_blitter, fov_blitter], 0, picker, bg, plane, 0, 0, quality
+## )
+## ```
+##
+## ### Semantics
+##
+## - For each cell `(cx, cy)` in the area covered by
+##   `blitters[layout_blitter_idx]` (i.e., `octant_cell_w × octant_cell_h`
+##   of that blitter):
+##   1. Read `octant_pattern_at(blitters[i], cx, cy)` for every `i` →
+##      `pats: Vec<Int>`.
+##   2. Take the glyph from `pats[layout_blitter_idx]` rendered at the
+##      requested `quality`.
+##   3. Call `fg_picker(cx, cy, pats)` for the cell's fg colour as an Int
+##      and wrap with `cl::Channel { value: fg_int, alpha: ... }` —
+##      see implementation: we build the channel via `cl::channel_rgb`
+##      below from the picker's returned RGB int.
+##   4. Composite a single cell at `(dst_x + cx, dst_y + cy)` with that
+##      fg + the given `bg`, attrs cleared.
+##
+## ### Edge cases
+##
+## - Empty `blitters` (size 0): no-op. Returns `plane` unchanged. There is
+##   no layout blitter to size the loop, so the function has nothing to
+##   do.
+## - `layout_blitter_idx` out-of-bounds: same no-op. Defensive — caller
+##   bug, but a silent return keeps the contract simple.
+## - Cells outside `plane`'s rectangle: clipped silently by `plane_putc`,
+##   matching `octant_blit_to_plane`.
+##
+## Returns a fresh `Plane`. All inputs unchanged.
+def octant_blit_layered(
+  blitters: Vec<OctantBlitter>,
+  layout_blitter_idx: Int,
+  fg_picker: Fn(Int, Int, Vec<Int>): Int,
+  bg: cl::Channel,
+  plane: pl::Plane,
+  dst_x: Int, dst_y: Int,
+  quality: OctantQuality
+): pl::Plane
+  var n = blitters.size
+  if n == 0
+    return plane
+  end
+  if layout_blitter_idx < 0 or layout_blitter_idx >= n
+    return plane
+  end
+  var layout = blitters[layout_blitter_idx]
+  var cw = octant_cell_w(layout)
+  var ch = octant_cell_h(layout)
+  var out = plane
+  var cy = 0
+  while cy < ch
+    var cx = 0
+    while cx < cw
+      var pats = vec_new<Int>()
+      var i = 0
+      while i < n
+        var bi = blitters[i]
+        pats.push(octant_pattern_at(bi, cx, cy))
+        i += 1
+      end
+      var glyph = _glyph_for(pats[layout_blitter_idx], quality)
+      var fg_int = fg_picker(cx, cy, pats)
+      var fg = cl::channel_rgb(fg_int)
+      var cell = cl::Cell {
+        egc:   glyph,
+        fg:    fg,
+        bg:    bg,
+        attrs: 0
+      }
+      out = pl::plane_putc(out, dst_x + cx, dst_y + cy, cell)
+      cx += 1
+    end
+    cy += 1
+  end
+  return out
+end

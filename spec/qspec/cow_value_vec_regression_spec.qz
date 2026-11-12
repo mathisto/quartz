@@ -1,0 +1,426 @@
+## CoW value-Vec regression specs (roadmap item-4 / R3 lock-in)
+##
+## Under the LANDED F4 value-default flip, a PLAIN struct (no `@value`) gets
+## value layout by default. A plain struct STRICTLY LARGER than 16 bytes takes
+## CoW (copy-on-write) layout: the Vec slot holds a refcounted buffer pointer,
+## and reading an element interior field must go through `buf + offset`, while
+## extracting an element yields an INDEPENDENT copy (the CoW guarantee).
+##
+## item-4 was ">16B CoW @value Vec-element field-read", verified to ALREADY WORK
+## after fixes 23/40/42/50 — no compiler change. This spec promotes the R3 repros
+## into permanent coverage so the CoW-interior read path can't silently regress.
+##
+## Struct sizes exercised:
+##   Big3 = 3 Int = 24B  > 16B => CoW
+##   Big5 = 5 Int = 40B  > 16B => CoW
+##
+## Both are PLAIN structs (no @value) to lock the DEFAULT-flip path specifically.
+import * from qspec
+
+# Plain struct, 24 bytes (3 Int) -> CoW layout under the value-default flip.
+struct Big3
+  a: Int
+  b: Int
+  c: Int
+end
+
+# Plain struct, 40 bytes (5 Int) -> CoW layout under the value-default flip.
+struct Big5
+  a: Int
+  b: Int
+  c: Int
+  d: Int
+  e: Int
+end
+
+# Plain struct, 16 bytes (2 Int) -> INLINE (<=16B) value layout, NOT CoW.
+# Guards item-50's inline first()/last() by-address path against regression from
+# the item-2a CoW first()/last() fix.
+struct Small2
+  a: Int
+  b: Int
+end
+
+# -- 1. CoW extract-then-mutate independence --
+
+# Extract an element into a var, mutate a FIELD, assert the Vec's original
+# element is UNCHANGED (independent copy) and the local holds the new value.
+def test_cow_extract_mutate_independence_3field(): Void
+  var v = vec_new<Big3>()
+  v.push(Big3 { a: 1, b: 2, c: 3 })
+  v.push(Big3 { a: 4, b: 5, c: 6 })
+  var x = v[0]
+  x.a = 999
+  x.c = 777
+  # Local holds the mutated values.
+  assert_eq(x.a, 999)
+  assert_eq(x.c, 777)
+  assert_eq(x.b, 2)
+  # Original Vec element is UNCHANGED (CoW copy is independent).
+  var orig = v[0]
+  assert_eq(orig.a, 1)
+  assert_eq(orig.b, 2)
+  assert_eq(orig.c, 3)
+  # Sibling element untouched.
+  var sib = v[1]
+  assert_eq(sib.a, 4)
+  assert_eq(sib.c, 6)
+end
+
+def test_cow_extract_mutate_independence_5field(): Void
+  var v = vec_new<Big5>()
+  v.push(Big5 { a: 10, b: 20, c: 30, d: 40, e: 50 })
+  v.push(Big5 { a: 11, b: 21, c: 31, d: 41, e: 51 })
+  var x = v[1]
+  x.a = -1
+  x.e = -5
+  assert_eq(x.a, -1)
+  assert_eq(x.e, -5)
+  assert_eq(x.c, 31)
+  # Vec element unchanged.
+  var orig = v[1]
+  assert_eq(orig.a, 11)
+  assert_eq(orig.c, 31)
+  assert_eq(orig.e, 51)
+  # Sibling untouched.
+  var sib = v[0]
+  assert_eq(sib.a, 10)
+  assert_eq(sib.e, 50)
+end
+
+# -- 2. HOFs over Vec<BigStruct> (CoW-interior read through closure boundary) --
+
+# .map { it.a + it.e } sums two fields per element; result is Vec<Int>.
+def test_cow_map_field_sum(): Void
+  var v = vec_new<Big5>()
+  v.push(Big5 { a: 1, b: 0, c: 0, d: 0, e: 10 })
+  v.push(Big5 { a: 2, b: 0, c: 0, d: 0, e: 20 })
+  v.push(Big5 { a: 3, b: 0, c: 0, d: 0, e: 30 })
+  var sums = v.map { it.a + it.e }
+  assert_eq(sums.size, 3)
+  assert_eq(sums[0], 11)
+  assert_eq(sums[1], 22)
+  assert_eq(sums[2], 33)
+end
+
+# .filter { it.a > K } counts matching elements; result is Vec<Big5>, and the
+# surviving elements must still read their fields correctly.
+def test_cow_filter_field_predicate(): Void
+  var v = vec_new<Big5>()
+  v.push(Big5 { a: 1, b: 0, c: 0, d: 0, e: 100 })
+  v.push(Big5 { a: 5, b: 0, c: 0, d: 0, e: 200 })
+  v.push(Big5 { a: 9, b: 0, c: 0, d: 0, e: 300 })
+  var kept = v.filter { it.a > 3 }
+  assert_eq(kept.size, 2)
+  # Surviving CoW elements read their fields correctly.
+  var k0 = kept[0]
+  var k1 = kept[1]
+  assert_eq(k0.a, 5)
+  assert_eq(k0.e, 200)
+  assert_eq(k1.a, 9)
+  assert_eq(k1.e, 300)
+end
+
+# .each reads CoW-interior fields through the closure, pushing each element's
+# (a + c) into an outer Vec (a reference, so the appends persist). This exercises
+# the CoW-interior element read inside the .each closure body.
+def test_cow_each_field_read(): Void
+  var v = vec_new<Big3>()
+  v.push(Big3 { a: 1, b: 2, c: 3 })
+  v.push(Big3 { a: 4, b: 5, c: 6 })
+  v.push(Big3 { a: 7, b: 8, c: 9 })
+  var acc = vec_new<Int>()
+  v.each { acc.push(it.a + it.c) }
+  assert_eq(acc.size, 3)
+  # (1+3), (4+6), (7+9)
+  assert_eq(acc[0], 4)
+  assert_eq(acc[1], 10)
+  assert_eq(acc[2], 16)
+  assert_eq(acc.sum(), 30)
+end
+
+# .map { it.a + it.c } then .sum() folds CoW-interior reads.
+def test_cow_map_reduce(): Void
+  var v = vec_new<Big3>()
+  v.push(Big3 { a: 1, b: 2, c: 3 })
+  v.push(Big3 { a: 4, b: 5, c: 6 })
+  var mapped = v.map { it.a + it.c }
+  assert_eq(mapped.sum(), 14)  # (1+3) + (4+6)
+end
+
+# -- 3. Round-trip / positional reads --
+
+def test_cow_index_reads(): Void
+  var v = vec_new<Big5>()
+  v.push(Big5 { a: 1, b: 2, c: 3, d: 4, e: 5 })
+  v.push(Big5 { a: 6, b: 7, c: 8, d: 9, e: 10 })
+  var r0 = v[0]
+  var r1 = v[1]
+  assert_eq(r0.a, 1)
+  assert_eq(r0.c, 3)
+  assert_eq(r0.e, 5)
+  assert_eq(r1.a, 6)
+  assert_eq(r1.d, 9)
+  assert_eq(r1.e, 10)
+end
+
+# Positional first/last-element reads via indexing (v[0], v[size-1]).
+def test_cow_positional_first_last_reads(): Void
+  var v = vec_new<Big3>()
+  v.push(Big3 { a: 100, b: 200, c: 300 })
+  v.push(Big3 { a: 400, b: 500, c: 600 })
+  var f = v[0]
+  var l = v[v.size - 1]
+  assert_eq(f.a, 100)
+  assert_eq(f.c, 300)
+  assert_eq(l.a, 400)
+  assert_eq(l.c, 600)
+end
+
+# -- 3b. `.get(i)` UFCS accessor over CoW (>16B) elements (item-2b) --
+#
+# item-2b was reported as "v.get(i).unwrap() over Vec<CoW-struct> SIGSEGVs",
+# on the premise that Vec `.get(i)` returns `Option<T>`. That premise is FALSE
+# for Quartz: `v.get(i)` desugars to the `vec_get` intrinsic which returns the
+# element `T` DIRECTLY and is PANIC-only on out-of-bounds (docs/QUARTZ_REFERENCE
+# "Subscript vs .get() — Vec by-index access (v[i] and v.get(i)) is panic-only").
+# There is no Option boxing on this path, hence no CoW-Option payload SIGSEGV.
+# (A genuine `Option<Big3>` payload — e.g. a function returning `Option<Big3>` —
+#  already unwraps correctly via the items 23/40/42 payload-extraction surface.)
+# These cases lock in the genuinely-correct CoW `.get(i)` read: it returns the
+# same value as `v[i]`, reads interior fields correctly, and yields an
+# independent copy.
+
+def test_cow_get_accessor_3field(): Void
+  var v = vec_new<Big3>()
+  v.push(Big3 { a: 100, b: 200, c: 300 })
+  v.push(Big3 { a: 400, b: 500, c: 600 })
+  var g0 = v.get(0)
+  var g1 = v.get(1)
+  assert_eq(g0.a, 100)
+  assert_eq(g0.b, 200)
+  assert_eq(g0.c, 300)
+  assert_eq(g1.a, 400)
+  assert_eq(g1.b, 500)
+  assert_eq(g1.c, 600)
+end
+
+def test_cow_get_accessor_5field(): Void
+  var v = vec_new<Big5>()
+  v.push(Big5 { a: 1, b: 2, c: 3, d: 4, e: 5 })
+  v.push(Big5 { a: 6, b: 7, c: 8, d: 9, e: 10 })
+  var g0 = v.get(0)
+  var g1 = v.get(1)
+  assert_eq(g0.a, 1)
+  assert_eq(g0.c, 3)
+  assert_eq(g0.e, 5)
+  assert_eq(g1.a, 6)
+  assert_eq(g1.d, 9)
+  assert_eq(g1.e, 10)
+end
+
+# `.get(i)` and `v[i]` must agree element-for-element and field-for-field.
+def test_cow_get_matches_index(): Void
+  var v = vec_new<Big5>()
+  v.push(Big5 { a: 11, b: 22, c: 33, d: 44, e: 55 })
+  v.push(Big5 { a: 66, b: 77, c: 88, d: 99, e: 100 })
+  var gi = v.get(1)
+  var xi = v[1]
+  assert_eq(gi.a, xi.a)
+  assert_eq(gi.b, xi.b)
+  assert_eq(gi.c, xi.c)
+  assert_eq(gi.d, xi.d)
+  assert_eq(gi.e, xi.e)
+  assert_eq(gi.a, 66)
+  assert_eq(gi.e, 100)
+end
+
+# `.get(i)` yields an INDEPENDENT copy: mutating the read-out struct leaves the
+# Vec element unchanged (the CoW guarantee, same as v[i]).
+def test_cow_get_extract_independence(): Void
+  var v = vec_new<Big3>()
+  v.push(Big3 { a: 1, b: 2, c: 3 })
+  var x = v.get(0)
+  x.a = 999
+  x.c = 777
+  assert_eq(x.a, 999)
+  assert_eq(x.c, 777)
+  assert_eq(x.b, 2)
+  var orig = v.get(0)
+  assert_eq(orig.a, 1)
+  assert_eq(orig.b, 2)
+  assert_eq(orig.c, 3)
+end
+
+# -- 4. .first() / .last() INTRINSICS over CoW (>16B) elements (item-2a) --
+#
+# Before item-2a, `v.first()` / `v.last()` over a >16B CoW struct returned a
+# garbage word (the buffer's refcount, read at offset+0 with no COW +1 shift)
+# because the readout bind wasn't recognized as a cow-collection readout, so the
+# element was tracked as a plain (non-cow) struct. item-2a routes cow first/last
+# through the same readout path as v[i]: the bound var is marked cow-layout (so
+# `.field` reads apply the +1 refcount shift + make-unique), a retain fires, and
+# the intrinsic panics-on-empty so the retained pointer is always valid.
+
+def test_cow_first_intrinsic_3field(): Void
+  var v = vec_new<Big3>()
+  v.push(Big3 { a: 100, b: 200, c: 300 })
+  var f = v.first()
+  assert_eq(f.a, 100)
+  assert_eq(f.b, 200)
+  assert_eq(f.c, 300)
+end
+
+def test_cow_last_intrinsic_3field(): Void
+  var v = vec_new<Big3>()
+  v.push(Big3 { a: 100, b: 200, c: 300 })
+  v.push(Big3 { a: 400, b: 500, c: 600 })
+  var l = v.last()
+  assert_eq(l.a, 400)
+  assert_eq(l.b, 500)
+  assert_eq(l.c, 600)
+end
+
+def test_cow_first_intrinsic_5field(): Void
+  var v = vec_new<Big5>()
+  v.push(Big5 { a: 1, b: 2, c: 3, d: 4, e: 5 })
+  v.push(Big5 { a: 6, b: 7, c: 8, d: 9, e: 10 })
+  var f = v.first()
+  assert_eq(f.a, 1)
+  assert_eq(f.c, 3)
+  assert_eq(f.e, 5)
+end
+
+def test_cow_last_intrinsic_5field(): Void
+  var v = vec_new<Big5>()
+  v.push(Big5 { a: 1, b: 2, c: 3, d: 4, e: 5 })
+  v.push(Big5 { a: 6, b: 7, c: 8, d: 9, e: 10 })
+  var l = v.last()
+  assert_eq(l.a, 6)
+  assert_eq(l.c, 8)
+  assert_eq(l.e, 10)
+end
+
+# first() and last() of a single-element CoW Vec resolve to the SAME element.
+def test_cow_first_last_single_element(): Void
+  var v = vec_new<Big5>()
+  v.push(Big5 { a: 11, b: 22, c: 33, d: 44, e: 55 })
+  var f = v.first()
+  var l = v.last()
+  assert_eq(f.a, 11)
+  assert_eq(f.e, 55)
+  assert_eq(l.a, 11)
+  assert_eq(l.e, 55)
+end
+
+# item-50 GUARD: first()/last() over an INLINE (<=16B) value struct must STILL
+# read correctly (the item-2a cow fix is gated on cow-layout, so the inline
+# by-address path is untouched).
+def test_inline_first_last_intrinsic_small(): Void
+  var v = vec_new<Small2>()
+  v.push(Small2 { a: 7, b: 8 })
+  v.push(Small2 { a: 9, b: 10 })
+  var f = v.first()
+  var l = v.last()
+  assert_eq(f.a, 7)
+  assert_eq(f.b, 8)
+  assert_eq(l.a, 9)
+  assert_eq(l.b, 10)
+end
+
+def test_cow_forin_reads(): Void
+  var v = vec_new<Big5>()
+  v.push(Big5 { a: 1, b: 0, c: 0, d: 0, e: 2 })
+  v.push(Big5 { a: 3, b: 0, c: 0, d: 0, e: 4 })
+  v.push(Big5 { a: 5, b: 0, c: 0, d: 0, e: 6 })
+  var sum_a = 0
+  var sum_e = 0
+  for item in v
+    sum_a += item.a
+    sum_e += item.e
+  end
+  assert_eq(sum_a, 9)   # 1+3+5
+  assert_eq(sum_e, 12)  # 2+4+6
+end
+
+def main(): Int
+  describe("CoW value-Vec regression (item-4)") do ->
+    it("extract-then-mutate is independent (3-field / 24B)") do ->
+      test_cow_extract_mutate_independence_3field()
+    end
+
+    it("extract-then-mutate is independent (5-field / 40B)") do ->
+      test_cow_extract_mutate_independence_5field()
+    end
+
+    it("map reads CoW-interior fields through closure") do ->
+      test_cow_map_field_sum()
+    end
+
+    it("filter reads CoW-interior fields through closure") do ->
+      test_cow_filter_field_predicate()
+    end
+
+    it("each reads CoW-interior fields through closure") do ->
+      test_cow_each_field_read()
+    end
+
+    it("map then sum folds CoW-interior reads") do ->
+      test_cow_map_reduce()
+    end
+
+    it("index reads correct CoW fields") do ->
+      test_cow_index_reads()
+    end
+
+    it("positional first/last (index) read correct CoW fields") do ->
+      test_cow_positional_first_last_reads()
+    end
+
+    it(".get(i) accessor reads correct CoW fields (3-field / 24B)") do ->
+      test_cow_get_accessor_3field()
+    end
+
+    it(".get(i) accessor reads correct CoW fields (5-field / 40B)") do ->
+      test_cow_get_accessor_5field()
+    end
+
+    it(".get(i) agrees with v[i] element/field-wise (CoW)") do ->
+      test_cow_get_matches_index()
+    end
+
+    it(".get(i) yields an independent CoW copy") do ->
+      test_cow_get_extract_independence()
+    end
+
+    it("for-in reads correct CoW fields") do ->
+      test_cow_forin_reads()
+    end
+
+    it("first() intrinsic reads correct CoW fields (3-field / 24B)") do ->
+      test_cow_first_intrinsic_3field()
+    end
+
+    it("last() intrinsic reads correct CoW fields (3-field / 24B)") do ->
+      test_cow_last_intrinsic_3field()
+    end
+
+    it("first() intrinsic reads correct CoW fields (5-field / 40B)") do ->
+      test_cow_first_intrinsic_5field()
+    end
+
+    it("last() intrinsic reads correct CoW fields (5-field / 40B)") do ->
+      test_cow_last_intrinsic_5field()
+    end
+
+    it("first()/last() resolve the same single CoW element") do ->
+      test_cow_first_last_single_element()
+    end
+
+    it("first()/last() over INLINE <=16B value struct stay correct (item-50 guard)") do ->
+      test_inline_first_last_intrinsic_small()
+    end
+  end
+
+  return qspec_main()
+end

@@ -1,0 +1,150 @@
+## std/sync/composition/signal — SignalSelectable for `select` (C.13 Phase 5)
+##
+## Race signal delivery against other Selectables in `select`:
+##
+##   import * from std/sync/composition/signal
+##
+##   var sigint = signalable(SIGINT)
+##
+##   loop
+##     select
+##       case sig = sigint => graceful_shutdown(sig)
+##       case msg = recvable(work_queue) => process(msg)
+##       case _ = deadline_ms(1000) => heartbeat()
+##     end
+##   end
+##
+## Built on the existing `signal_on_flag(sig, flag)` async-signal-safe
+## trampoline (`std/concurrency`-adjacent): an atomic int slot per
+## (signum) that the trampoline stores `1` to from the signal context.
+## `try_poll` does a `1 → 0` CAS to consume; on success the signal is
+## reported to the winning arm, on miss the arm reports None.
+##
+## **Latency**: Phase 5 stub `register_waker` — `try_poll` fires only
+## from the select's chunked-poll cadence (sched_yield-bounded,
+## typically ~10ms). Signal handlers cannot safely call `sched_wake`
+## from the async-signal-safe trampoline (lock-order hazards with the
+## scheduler's internal mutexes), so we don't. A future enhancement
+## could use a self-pipe written from the trampoline composed with
+## `IoReadySelectable` for sub-millisecond latency, but ~10ms is
+## imperceptible to a human pressing Ctrl-C and acceptable for the
+## typical graceful-shutdown / heartbeat use case.
+##
+## **Handler installation**: `signalable(sig)` installs a process-wide
+## signal handler (the trampoline) that maps `sig` → an internal
+## atomic flag slot. The trampoline table is keyed by signum; calling
+## `signalable(sig)` twice on the same signal replaces the flag,
+## orphaning the prior one. For one-shot or single-consumer usage
+## this is fine; for multi-consumer race-on-same-signal, the most
+## recently installed handler is the one that fires.
+##
+## **Allocation**: each `signalable(sig)` call allocates one
+## `AtomicInt` (8 bytes) that lives forever (the signal handler may
+## fire at any time and writes to it). For high-frequency `signalable`
+## calls inside hot loops, this is a small leak — cache the result at
+## module scope and reuse instead:
+##
+##   var sigint = signalable(SIGINT)  # module init — install once
+##
+##   loop
+##     select
+##       case _ = sigint => ...       # reuse the cached Selectable
+##     end
+##   end
+
+import * from std/selectable
+
+## POSIX signal number constants. Stable across Linux + macOS for the
+## ones below; for less common signals consult `signal(7)`.
+##
+## Per Quartz paren-elision (v5.28+), bareword `SIGINT` resolves to the
+## function value, not 2 — call sites MUST use `SIGINT()`. Convention:
+## `signalable(SIGTERM())` reads idiomatically and matches `F_GETFL()` /
+## `O_NONBLOCK()` from `std/ffi/event.qz`.
+def SIGHUP(): Int = 1
+def SIGINT(): Int = 2
+def SIGQUIT(): Int = 3
+def SIGILL(): Int = 4
+def SIGTRAP(): Int = 5
+def SIGABRT(): Int = 6
+def SIGFPE(): Int = 8
+def SIGKILL(): Int = 9
+def SIGUSR1(): Int = 10
+def SIGSEGV(): Int = 11
+def SIGUSR2(): Int = 12
+def SIGPIPE(): Int = 13
+def SIGALRM(): Int = 14
+def SIGTERM(): Int = 15
+def SIGCHLD(): Int = 17
+def SIGCONT(): Int = 18
+def SIGSTOP(): Int = 19
+def SIGTSTP(): Int = 20
+def SIGTTIN(): Int = 21
+def SIGTTOU(): Int = 22
+
+## A Selectable that observes "POSIX signal `sig` has been delivered
+## to this process since the last successful `try_poll`". Use as the
+## right-hand side of `case s = signalable(SIGINT) => ...` in `select`.
+##
+## The bound `s` is the signal number (same value as the `sig` field).
+## Like FutureSelectable, the user's pattern binding is sourced from
+## try_poll's Option payload, not from `complete`'s return value.
+##
+## **Cancellation semantics**: `try_poll` consumes the flag (1 → 0
+## CAS). If the same `SignalSelectable` is polled in concurrent
+## `select`s on different threads, exactly one will see the signal —
+## the CAS arbitrates. If multiple distinct `SignalSelectable`s exist
+## on the same signum (orphaned older instances), only the most
+## recently installed gets the trampoline writes.
+struct SignalSelectable
+  sig: Int
+  flag_handle: Int
+end
+
+extend SignalSelectable with Selectable<Int>
+  ## try_poll: 1 → 0 CAS on the atomic flag. Returns `Some(sig)` if
+  ## the signal was delivered since the last successful try_poll,
+  ## `None` otherwise.
+  def try_poll(self): Option<Int>
+    # Consume the flag via 1→0 CAS on the underlying heap cell. We
+    # bypass `atomic_cas(AtomicInt, ...)` because the AtomicInt type
+    # is lost when its handle is stored as an Int struct field; the
+    # raw `atomic_cas_u64(Ptr, exp, new)` form accepts the i64
+    # address directly (same value, just a different name).
+    if atomic_cas_u64(@flag_handle, 1, 0)
+      return option_some(@sig)
+    end
+    return option_none()
+  end
+
+  ## register_waker: Phase 5 stub. The async-signal-safe trampoline
+  ## cannot safely call `sched_wake` from signal context, so we rely
+  ## on the select's chunked-poll cadence (~10ms typical) to observe
+  ## the flag flip. Future: self-pipe + IoReadySelectable composition.
+  def register_waker(self, frame: Int): Void
+    return
+  end
+
+  ## unregister_waker: stub. See register_waker.
+  def unregister_waker(self, frame: Int): Void
+    return
+  end
+
+  ## complete: no-op. The signal number lives in the Option payload
+  ## set by try_poll; the user's pattern binding is sourced from
+  ## there, not from this return.
+  def complete(self): Int
+    return 0
+  end
+end
+
+## Install a POSIX signal handler for `sig` and return a Selectable
+## that fires when the signal is delivered. Allocates one `AtomicInt`
+## as the trampoline's flag slot (do not free — signal may fire at
+## any time). The handler replaces any prior installation for the
+## same signum; for repeat-use, cache the result at module scope.
+def signalable(sig: Int): SignalSelectable
+  var flag = atomic_new(0)
+  signal_on_flag(sig, flag)
+  return SignalSelectable { sig: sig, flag_handle: as_int_generic(flag) }
+end

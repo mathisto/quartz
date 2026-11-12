@@ -1,0 +1,199 @@
+## QSpec coverage for Phase E.4.a slice 1 — String returns from goroutines.
+##
+## Phase E.1.b (2026-04-28) shipped auto-arena via the `go` keyword for
+## value-typed-return goroutines, conservatively gating off reference-typed
+## returns (would dangle after `arena_destroy` until E.4 lands escape).
+## Phase E.4.a slice 1 (this spec): the gate now ACCEPTS `String` returns
+## by synthesizing an `arena_promote_string(r)` deep-copy between the
+## `with Alloc.in_arena` exit and `arena_destroy`. The promote runs OUTSIDE
+## the with-block, so `str_byte_slice` routes through the parent's installed
+## `Alloc` (E.1.c.b's spawn-time snapshot keeps the parent's handler routed).
+##
+## What these tests prove:
+##
+##   E4a.s1.a — `go fn(): String` body's allocations are absorbed by the
+##              per-task arena (outer Alloc tracking handler observes far
+##              fewer allocations than direct call), AND the returned String
+##              survives `arena_destroy` (deep-copied to parent's heap).
+##   E4a.s1.b — Multi-worker (sched_init(0)) — parallel String-returning
+##              goroutines each get their own per-task arena, results are
+##              correct, no cross-task leakage.
+##   E4a.s1.c — String-returning goroutine that allocates internally via
+##              interpolation + concatenation — the body's many small
+##              allocations are bulk-absorbed by the arena; the final
+##              String is the only thing that crosses the boundary.
+##   E4a.s1.d — Lifetime regression: 100 sequential String-returning
+##              goroutines, each allocating ~100 bytes internally. RSS
+##              stays bounded (per-task arenas freed eagerly via
+##              arena_destroy after each await).
+
+import * from qspec
+import * from qspec/subprocess
+
+# -----------------------------------------------------------------------------
+# E4a.s1.a — absorbed-vs-direct: String-returning goroutine body's
+# allocations don't bleed to outer handler; final String survives await.
+# -----------------------------------------------------------------------------
+
+var _ABSORBED_AND_SURVIVES: String = """import * from std/sync/composition/go
+import * from std/alloc
+
+def heavy_string(): String
+  var v = vec_new<Int>()
+  for i in 0..50
+    v.push(i)
+  end
+  return \"size=\" + str_from_int(v.size)
+end
+
+def main(): Int
+  sched_init(1)
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    # Direct call — handler sees all body allocations.
+    alloc_reset_tracking()
+    var direct_s = heavy_string()
+    var direct_count = alloc_tracking_alloc_count()
+
+    # `go fn(): String` — auto-arena absorbs body allocations. Outer
+    # handler sees only spawn-time + arena bulk-block + promote (one
+    # str_byte_slice).
+    alloc_reset_tracking()
+    var fut = go heavy_string()
+    var go_s = await fut
+    var go_count = alloc_tracking_alloc_count()
+
+    # Two checks: (1) returned String matches direct (no UAF on promote),
+    # (2) go_count strictly less than direct_count (body absorbed).
+    if go_s == \"size=50\" and go_s == direct_s and go_count < direct_count
+      puts(\"absorbed-and-survives\")
+    else
+      puts(\"failed:go_s=\" + go_s + \",direct=\" + str_from_int(direct_count) + \",go=\" + str_from_int(go_count))
+    end
+    0
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E4a.s1.b — multi-worker safety: parallel String-returning goroutines under
+# sched_init(0). Each per-task arena is per-worker; promote runs in each
+# worker's TLS context with parent's snapshot active.
+# -----------------------------------------------------------------------------
+
+var _PARALLEL_STRINGS: String = """import * from std/sync/composition/go
+import * from std/alloc
+
+def labeled(n: Int): String
+  return \"task-\" + str_from_int(n)
+end
+
+def main(): Int
+  sched_init(0)
+  var f1 = go labeled(1)
+  var f2 = go labeled(2)
+  var f3 = go labeled(3)
+  var f4 = go labeled(4)
+  var s1 = await f1
+  var s2 = await f2
+  var s3 = await f3
+  var s4 = await f4
+  if s1 == \"task-1\" and s2 == \"task-2\" and s3 == \"task-3\" and s4 == \"task-4\"
+    puts(\"parallel-strings-ok\")
+  else
+    puts(\"failed:\" + s1 + \",\" + s2 + \",\" + s3 + \",\" + s4)
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E4a.s1.c — interpolation-heavy String return: many small inner allocations
+# all absorbed into per-task arena; only the final String crosses via promote.
+# -----------------------------------------------------------------------------
+
+var _INTERPOLATION_HEAVY: String = """import * from std/sync/composition/go
+import * from std/alloc
+
+def build_message(): String
+  var parts = vec_new<String>()
+  for i in 0..5
+    parts.push(\"chunk\" + str_from_int(i))
+  end
+  var result = \"\"
+  for p in parts
+    result = result + p + \"-\"
+  end
+  return result
+end
+
+def main(): Int
+  sched_init(1)
+  var fut = go build_message()
+  var s = await fut
+  if s == \"chunk0-chunk1-chunk2-chunk3-chunk4-\"
+    puts(\"interp-ok\")
+  else
+    puts(\"failed:\" + s)
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E4a.s1.d — lifetime regression: 100 sequential spawn+await cycles, each
+# returning a String built from interpolation. Per-task arenas are freed
+# eagerly after each await; no leak across iterations.
+# -----------------------------------------------------------------------------
+
+var _LIFETIME_LOOP: String = """import * from std/sync/composition/go
+import * from std/alloc
+
+def stamped(n: Int): String
+  return \"iter-\" + str_from_int(n) + \"-done\"
+end
+
+def main(): Int
+  sched_init(1)
+  var ok_count = 0
+  for i in 0..100
+    var fut = go stamped(i)
+    var s = await fut
+    var expected = \"iter-\" + str_from_int(i) + \"-done\"
+    if s == expected
+      ok_count = ok_count + 1
+    end
+  end
+  if ok_count == 100
+    puts(\"lifetime-ok\")
+  else
+    puts(\"failed:ok=\" + str_from_int(ok_count))
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+def main(): Int
+  describe("Phase E.4.a slice 1 — String returns from goroutines via per-task arena + promote") do ->
+    it("absorbed-vs-direct: body allocations absorbed by per-task arena; result survives await") do ->
+      assert_run_stdout_eq(_ABSORBED_AND_SURVIVES, "absorbed-and-survives\n")
+    end
+
+    it("parallel String-returning goroutines under multi-worker scheduler (sched_init(0))") do ->
+      assert_run_stdout_eq(_PARALLEL_STRINGS, "parallel-strings-ok\n")
+    end
+
+    it("interpolation-heavy String body — many inner allocations absorbed, final String crosses via promote") do ->
+      assert_run_stdout_eq(_INTERPOLATION_HEAVY, "interp-ok\n")
+    end
+
+    it("100 sequential spawn+await cycles — per-task arenas freed eagerly between iterations") do ->
+      assert_run_stdout_eq(_LIFETIME_LOOP, "lifetime-ok\n")
+    end
+  end
+  return qspec_main()
+end

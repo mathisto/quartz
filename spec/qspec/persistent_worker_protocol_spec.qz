@@ -1,0 +1,220 @@
+## Persistent Worker Protocol — round-trip + edge-case tests
+##
+## Verifies the wire format defined in
+## `self-hosted/shared/persistent_worker_protocol.qz` (Phase 5.0a of the
+## qspec daemon work; see `docs/design/QUARTZD.md`).
+##
+## Contract:
+##   1. Encode then decode of a typical compile request preserves all
+##      fields byte-for-byte.
+##   2. Same for a typical compile response, including non-ASCII text.
+##   3. Length-prefix is little-endian (b0 = low byte).
+##   4. Truncated frames are rejected, not crashed.
+##   5. Malformed JSON bodies are rejected.
+##   6. Empty argv vectors round-trip (the cancel/ping/shutdown shape).
+
+import * from qspec
+import * from persistent_worker_protocol
+
+def main(): Int
+  describe("persistent_worker_protocol — encoders") do ->
+
+    it("typical compile request round-trips") do ->
+      var argv = vec_new<String>()
+      argv.push("spec/qspec/foo_spec.qz")
+      argv.push("-I")
+      argv.push("std")
+      argv.push("-I")
+      argv.push(".")
+      var req = WorkRequest {
+        request_id: 42,
+        kind: REQ_COMPILE(),
+        argv: argv,
+        cwd: "/path/to/quartz",
+        path_env: "/opt/homebrew/opt/llvm/bin:/usr/bin",
+        stderr_path: "/tmp/quartzd-r42.err",
+      }
+      var encoded = encode_request(req)
+      var dec = decode_request(encoded)
+      _check_ok(dec)
+      assert_eq(dec.request.request_id, 42)
+      assert_eq_str(dec.request.kind, REQ_COMPILE())
+      assert_eq(dec.request.argv.size, 5)
+      assert_eq_str(dec.request.argv[0], "spec/qspec/foo_spec.qz")
+      assert_eq_str(dec.request.argv[1], "-I")
+      assert_eq_str(dec.request.argv[4], ".")
+      assert_eq_str(dec.request.cwd, "/path/to/quartz")
+      assert_eq_str(dec.request.path_env, "/opt/homebrew/opt/llvm/bin:/usr/bin")
+      assert_eq_str(dec.request.stderr_path, "/tmp/quartzd-r42.err")
+    end
+
+    it("cancel request (empty argv) round-trips") do ->
+      var req = WorkRequest {
+        request_id: 99,
+        kind: REQ_CANCEL(),
+        argv: vec_new<String>(),
+        cwd: "",
+        path_env: "",
+        stderr_path: "",
+      }
+      var dec = decode_request(encode_request(req))
+      _check_ok(dec)
+      assert_eq(dec.request.request_id, 99)
+      assert_eq_str(dec.request.kind, REQ_CANCEL())
+      assert_eq(dec.request.argv.size, 0)
+      assert_eq_str(dec.request.stderr_path, "")
+    end
+
+    it("typical compile response round-trips") do ->
+      var resp = WorkResponse {
+        request_id: 17,
+        status: RESP_OK(),
+        exit_code: 0,
+        stdout: "",
+        stderr: "warning: unused variable foo\n",
+        stderr_path: "",
+        ir_path: "/tmp/quartzd-r17.ll",
+        duration_ms: 1234,
+      }
+      var dec = decode_response(encode_response(resp))
+      _check_ok(dec)
+      assert_eq(dec.response.request_id, 17)
+      assert_eq_str(dec.response.status, RESP_OK())
+      assert_eq(dec.response.exit_code, 0)
+      assert_eq_str(dec.response.stderr, "warning: unused variable foo\n")
+      assert_eq_str(dec.response.ir_path, "/tmp/quartzd-r17.ll")
+      assert_eq(dec.response.duration_ms, 1234)
+    end
+
+    it("response with stderr containing JSON metacharacters round-trips") do ->
+      var tricky = "expected \"foo\", got 'bar'\n  at line 42, col 3"
+      var resp = WorkResponse {
+        request_id: 1,
+        status: RESP_ERROR(),
+        exit_code: 1,
+        stdout: "",
+        stderr: tricky,
+        stderr_path: "",
+        ir_path: "",
+        duration_ms: 5,
+      }
+      var dec = decode_response(encode_response(resp))
+      _check_ok(dec)
+      assert_eq_str(dec.response.stderr, tricky)
+    end
+
+  end
+
+  describe("persistent_worker_protocol — framing") do ->
+
+    it("length prefix is little-endian — body length 1") do ->
+      # 1-char body produces a 1-byte JSON encoding (e.g. "\"\"" is 2 chars, but
+      # we test with a tiny request whose JSON body is at least 4 bytes).
+      var req = WorkRequest {
+        request_id: 0,
+        kind: REQ_PING(),
+        argv: vec_new<String>(),
+        cwd: "",
+        path_env: "",
+        stderr_path: "",
+      }
+      var encoded = encode_request(req)
+      var b0 = str_byte_at(encoded, 0)
+      var b1 = str_byte_at(encoded, 1)
+      var b2 = str_byte_at(encoded, 2)
+      var b3 = str_byte_at(encoded, 3)
+      var declared = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+      assert_eq(read_frame_length(encoded), declared)
+      assert_eq(str_byte_len(encoded), 4 + declared)
+      # Sanity: high bytes zero for short payloads
+      assert_eq(b3, 0)
+      assert_eq(b2, 0)
+    end
+
+    it("frame_total_length matches encoded byte length") do ->
+      var argv = vec_new<String>()
+      argv.push("a.qz")
+      var req = WorkRequest {
+        request_id: 7,
+        kind: REQ_COMPILE(),
+        argv: argv,
+        cwd: "/x",
+        path_env: "",
+        stderr_path: "",
+      }
+      var encoded = encode_request(req)
+      var body_len = read_frame_length(encoded)
+      assert_eq(frame_total_length(body_len), str_byte_len(encoded))
+    end
+
+  end
+
+  describe("persistent_worker_protocol — error paths") do ->
+
+    it("truncated length prefix is reported, not crashed") do ->
+      var dec = decode_request("XYZ")  # only 3 bytes, need 4 for length
+      _check_fail(dec)
+      assert_output_contains_substr(dec.error_msg, "truncated length prefix")
+    end
+
+    it("truncated body is reported, not crashed") do ->
+      # Length prefix says 100 bytes follow; we provide 0
+      var sb = sb_new()
+      sb_append_byte(sb, 100)
+      sb_append_byte(sb, 0)
+      sb_append_byte(sb, 0)
+      sb_append_byte(sb, 0)
+      var dec = decode_request(sb_to_string(sb))
+      _check_fail(dec)
+      assert_output_contains_substr(dec.error_msg, "truncated body")
+    end
+
+    it("malformed JSON body is reported") do ->
+      var body = "{not valid json"
+      var len = str_byte_len(body)
+      var sb = sb_new()
+      sb_append_byte(sb, len & 0xFF)
+      sb_append_byte(sb, (len >> 8) & 0xFF)
+      sb_append_byte(sb, (len >> 16) & 0xFF)
+      sb_append_byte(sb, (len >> 24) & 0xFF)
+      sb_append(sb, body)
+      var dec = decode_request(sb_to_string(sb))
+      _check_fail(dec)
+      assert_output_contains_substr(dec.error_msg, "malformed JSON")
+    end
+
+  end
+
+  return qspec_main()
+end
+
+# Substring assertion helper — qspec ships assert_output_contains for stdout
+# capture but no inline String-substring assertion. Inline helper.
+def assert_output_contains_substr(haystack: String, needle: String): Void
+  if str_contains(haystack, needle) == 1
+    return
+  end
+  puts("    expected substring \"#{needle}\" not found in \"#{haystack}\"")
+  assert_eq(0, 1)  # force fail
+end
+
+# Helpers that branch on dec.ok via `if`. Inline `dec.ok.to_int()` inside a
+# qspec `do -> ... end` lambda is silently miscompiled (always evaluates to 0),
+# so we route every Bool-field check through these named helpers. The check
+# fns themselves work correctly — the quirk is method-call-on-Bool-field
+# inside lambdas only.
+def _check_ok(dec: DecodeResult): Void
+  if dec.ok
+    return
+  end
+  puts("    DECODE FAILED: #{dec.error_msg}")
+  assert_eq(0, 1)
+end
+
+def _check_fail(dec: DecodeResult): Void
+  if dec.ok
+    puts("    EXPECTED DECODE FAIL but got OK")
+    assert_eq(0, 1)
+  end
+end
+

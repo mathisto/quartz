@@ -1,0 +1,330 @@
+# Phase 5e++ — Windows TCP echo smoke (synchronous, two-process)
+#
+# Drives the full ws2_32 user-facing surface (socket + bind + listen +
+# accept + connect + send + recv + setsockopt + closesocket) end-to-end
+# on a real Windows host. Single binary, two modes selected by argv:
+#
+#   server mode: socket → setsockopt(SO_REUSEADDR) → bind → listen →
+#                accept → recv → send (echo) → close client → close
+#                listener
+#   client mode: socket → connect → send → recv → assert payload → close
+#
+# Cross-compile from Darwin and run on Windows in TWO cmd windows:
+#
+#   ./self-hosted/bin/quake xbuild:windows SRC=examples/windows/tcp_echo_smoke.qz
+#   copy tmp\xbuild-windows\tcp_echo_smoke.exe C:\tmp\
+#
+#   :: Terminal 1 (server)
+#   C:\tmp>tcp_echo_smoke.exe server 8765
+#
+#   :: Terminal 2 (client)
+#   C:\tmp>tcp_echo_smoke.exe client 127.0.0.1 8765
+#
+# Expected payload: client sends "hello quartz on windows\n", server
+# echoes the same bytes back, client asserts byte-for-byte match.
+#
+# Why blocking sockets, not async? The Phase 5e AFD.SYS scheduler integration
+# needs a cross-platform `tcp.qz` refactor before `go fn()` + non-blocking
+# accept/recv can be portable; that's a separate epic. This probe verifies
+# the ws2_32 SURFACE is correct end-to-end without touching the scheduler.
+#
+# Native (macOS / Linux) runs the same way — POSIX FFI path via the
+# socket_* cross-platform helpers. Useful as a self-test on the dev host.
+
+import * from std/ffi/socket
+
+# Payload baked into the binary so server + client agree without I/O.
+def echo_payload(): String = "hello quartz on windows\n"
+def echo_payload_len(): Int = 24
+
+# Allocate and fill a 16-byte sockaddr_in pointing at <ip_oct1>.<ip_oct2>.
+# <ip_oct3>.<ip_oct4>:<port>. Network byte order for both fields. Layout is
+# identical across macOS/Linux/Windows — the macOS sin_len byte at offset 0
+# is benign (kernel ignores it when 0; both Windows and Linux skip the byte
+# entirely since sin_family is u16 there).
+def make_sockaddr_in(ip0: Int, ip1: Int, ip2: Int, ip3: Int, port: Int): Int
+  var sa = mem_alloc(16)
+  # sin_family = AF_INET = 2 (u16, little-endian)
+  ptr_write_byte(sa, 2)
+  ptr_write_byte(ptr_add(sa, 1), 0)
+  # sin_port (network byte order — big-endian)
+  ptr_write_byte(ptr_add(sa, 2), band(shr(port, 8), 255))
+  ptr_write_byte(ptr_add(sa, 3), band(port, 255))
+  # sin_addr (network byte order — most-significant octet first)
+  ptr_write_byte(ptr_add(sa, 4), ip0)
+  ptr_write_byte(ptr_add(sa, 5), ip1)
+  ptr_write_byte(ptr_add(sa, 6), ip2)
+  ptr_write_byte(ptr_add(sa, 7), ip3)
+  # sin_zero[8] = 0
+  var i = 8
+  while i < 16
+    ptr_write_byte(ptr_add(sa, i), 0)
+    i = i + 1
+  end
+  return sa
+end
+
+# Compare `len` bytes between two pointers. Returns 1 if equal, 0 otherwise.
+def bytes_equal(a: Int, b: Int, len: Int): Int
+  var i = 0
+  while i < len
+    if ptr_read_byte(ptr_add(a, i)) != ptr_read_byte(ptr_add(b, i))
+      return 0
+    end
+    i = i + 1
+  end
+  return 1
+end
+
+# Copy a string's bytes into a malloc'd buffer of size `len`. Caller frees.
+def string_to_buf(s: String, len: Int): Int
+  var p = mem_alloc(len)
+  var i = 0
+  while i < len
+    ptr_write_byte(ptr_add(p, i), str_byte_at(s, i))
+    i = i + 1
+  end
+  return p
+end
+
+def run_server(port: Int): Int
+  puts("server: starting on port #{port}")
+
+  var rc = socket_init_once()
+  if rc != 0
+    puts("server: WSAStartup FAILED rc=#{rc}")
+    return 1
+  end
+
+  var listener = socket(AF_INET(), SOCK_STREAM(), 0)
+  if listener < 0
+    puts("server: socket FAILED err=#{socket_last_error()}")
+    return 2
+  end
+
+  # SO_REUSEADDR so a Ctrl-C'd server can re-bind immediately.
+  var one_buf = mem_alloc(4)
+  ptr_write_byte(one_buf, 1)
+  ptr_write_byte(ptr_add(one_buf, 1), 0)
+  ptr_write_byte(ptr_add(one_buf, 2), 0)
+  ptr_write_byte(ptr_add(one_buf, 3), 0)
+  setsockopt(listener, SOL_SOCKET(), SO_REUSEADDR(), int_to_cptr(one_buf), 4)
+  qz_free(one_buf)
+
+  # Bind 0.0.0.0:<port> so connections from any interface are accepted.
+  # (Loopback-only would be 127.0.0.1; both work for a same-host smoke.)
+  var sa = make_sockaddr_in(0, 0, 0, 0, port)
+  var br = bind(listener, int_to_cptr(sa), 16)
+  qz_free(sa)
+  if br != 0
+    puts("server: bind FAILED err=#{socket_last_error()}")
+    socket_close(listener)
+    return 3
+  end
+  puts("server: bound 0.0.0.0:#{port}")
+
+  var lr = listen(listener, 1)
+  if lr != 0
+    puts("server: listen FAILED err=#{socket_last_error()}")
+    socket_close(listener)
+    return 4
+  end
+  puts("server: listening; waiting for accept...")
+
+  # accept() blocks until a client connects.
+  var client = socket_accept(listener, 0, 0)
+  if client < 0
+    puts("server: accept FAILED err=#{socket_last_error()}")
+    socket_close(listener)
+    return 5
+  end
+  puts("server: accepted client fd")
+
+  # recv up to 256 bytes — payload is 24, this is just slack.
+  var rbuf = mem_alloc(256)
+  var nr = socket_recv(client, rbuf, 256, 0)
+  if nr <= 0
+    puts("server: recv FAILED n=#{nr} err=#{socket_last_error()}")
+    socket_close(client)
+    socket_close(listener)
+    qz_free(rbuf)
+    return 6
+  end
+  puts("server: recv #{nr} bytes")
+
+  # Echo the same bytes back.
+  var ns = socket_send(client, rbuf, nr, 0)
+  if ns != nr
+    puts("server: send short ns=#{ns} expected=#{nr} err=#{socket_last_error()}")
+    socket_close(client)
+    socket_close(listener)
+    qz_free(rbuf)
+    return 7
+  end
+  puts("server: echo #{ns} bytes")
+  qz_free(rbuf)
+
+  socket_close(client)
+  socket_close(listener)
+  puts("server: done")
+  return 0
+end
+
+def run_client(ip0: Int, ip1: Int, ip2: Int, ip3: Int, port: Int): Int
+  puts("client: connecting to #{ip0}.#{ip1}.#{ip2}.#{ip3}:#{port}")
+
+  var rc = socket_init_once()
+  if rc != 0
+    puts("client: WSAStartup FAILED rc=#{rc}")
+    return 1
+  end
+
+  var fd = socket(AF_INET(), SOCK_STREAM(), 0)
+  if fd < 0
+    puts("client: socket FAILED err=#{socket_last_error()}")
+    return 2
+  end
+
+  var sa = make_sockaddr_in(ip0, ip1, ip2, ip3, port)
+  var cr = connect(fd, int_to_cptr(sa), 16)
+  qz_free(sa)
+  if cr != 0
+    puts("client: connect FAILED err=#{socket_last_error()}")
+    socket_close(fd)
+    return 3
+  end
+  puts("client: connected")
+
+  var plen = echo_payload_len()
+  var payload = string_to_buf(echo_payload(), plen)
+
+  var ns = socket_send(fd, payload, plen, 0)
+  if ns != plen
+    puts("client: send short ns=#{ns} expected=#{plen} err=#{socket_last_error()}")
+    qz_free(payload)
+    socket_close(fd)
+    return 4
+  end
+  puts("client: sent #{ns} bytes")
+
+  # Receive the echo. May come in pieces — loop until we have plen bytes
+  # or a recv returns 0 (peer closed) / -1 (error).
+  var rbuf = mem_alloc(plen)
+  var total = 0
+  while total < plen
+    var nr = socket_recv(fd, ptr_add(rbuf, total), plen - total, 0)
+    if nr <= 0
+      puts("client: recv FAILED at total=#{total} nr=#{nr} err=#{socket_last_error()}")
+      qz_free(payload)
+      qz_free(rbuf)
+      socket_close(fd)
+      return 5
+    end
+    total = total + nr
+  end
+  puts("client: recv #{total} bytes")
+
+  var ok = bytes_equal(payload, rbuf, plen)
+  qz_free(payload)
+  qz_free(rbuf)
+  socket_close(fd)
+
+  if ok == 1
+    puts("client: payload MATCH — TCP echo verified")
+    return 0
+  else
+    puts("client: payload MISMATCH")
+    return 6
+  end
+end
+
+def usage(): Void
+  puts("usage:")
+  puts("  tcp_echo_smoke server <port>")
+  puts("  tcp_echo_smoke client <ip> <port>  (ip as 127.0.0.1)")
+end
+
+# Tiny IP parser: a.b.c.d → (a, b, c, d). Returns 0 on success, -1 on
+# malformed input. The four octets are written into the caller's 4-byte
+# buffer at `out_ip` (one byte per octet).
+def parse_ip(s: String, out_ip: Int): Int
+  var len = str_byte_len(s)
+  var i = 0
+  var octet_idx = 0
+  var cur = 0
+  var digits = 0
+  while i < len
+    var c = str_byte_at(s, i)
+    if c == 46  # '.'
+      if digits == 0
+        return -1
+      end
+      if octet_idx >= 4
+        return -1
+      end
+      ptr_write_byte(ptr_add(out_ip, octet_idx), cur)
+      octet_idx = octet_idx + 1
+      cur = 0
+      digits = 0
+    else
+      if c < 48 or c > 57  # not '0'..'9'
+        return -1
+      end
+      cur = cur * 10 + (c - 48)
+      if cur > 255
+        return -1
+      end
+      digits = digits + 1
+    end
+    i = i + 1
+  end
+  if digits == 0 or octet_idx != 3
+    return -1
+  end
+  ptr_write_byte(ptr_add(out_ip, 3), cur)
+  return 0
+end
+
+def main(): Int
+  var n = argc()
+  if n < 3
+    usage()
+    return 100
+  end
+  var mode = argv(1)
+  if mode == "server"
+    var port = str_to_int(argv(2))
+    if port <= 0 or port > 65535
+      puts("server: bad port #{port}")
+      return 101
+    end
+    return run_server(port)
+  end
+  if mode == "client"
+    if n < 4
+      usage()
+      return 102
+    end
+    var ip_buf = mem_alloc(4)
+    var pr = parse_ip(argv(2), ip_buf)
+    if pr != 0
+      puts("client: bad ip #{argv(2)}")
+      qz_free(ip_buf)
+      return 103
+    end
+    var port = str_to_int(argv(3))
+    if port <= 0 or port > 65535
+      puts("client: bad port #{port}")
+      qz_free(ip_buf)
+      return 104
+    end
+    var ip0 = ptr_read_byte(ip_buf)
+    var ip1 = ptr_read_byte(ptr_add(ip_buf, 1))
+    var ip2 = ptr_read_byte(ptr_add(ip_buf, 2))
+    var ip3 = ptr_read_byte(ptr_add(ip_buf, 3))
+    qz_free(ip_buf)
+    return run_client(ip0, ip1, ip2, ip3, port)
+  end
+  usage()
+  return 105
+end

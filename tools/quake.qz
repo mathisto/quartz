@@ -1,0 +1,569 @@
+##! # Quake Launcher
+##!
+##! Finds a `Quakefile.qz` in the current directory or parent directories,
+##! compiles it with caching (content-hash based), and executes the result
+##! with forwarded CLI arguments.
+##!
+##! ## Usage
+##!
+##!   ```sh
+##!   quake [task] [options]       # Find, compile, and run Quakefile.qz
+##!   quake --file path/to/f.qz   # Use a specific Quakefile
+##!   ```
+##!
+##! @since Quartz 5.14.0
+
+import * from colors
+import content_hash
+
+# =============================================================================
+# Configuration
+# =============================================================================
+#
+# Launcher cache lives under the same top-level `.quartz-cache/` directory
+# as the compiler's own incremental cache — one cache root per project,
+# orthogonal subdirs for orthogonal concerns (Cargo pattern). The launcher
+# owns `.quartz-cache/launcher/`; the compiler owns everything else.
+#
+# Invalidation is content-hash based (FNV-1a, same primitive the compiler
+# cache uses). The manifest file lists every transitively-imported source
+# path alongside its hash; on each launcher invocation we hash the files on
+# disk and compare against the stored hashes. A miss on any entry triggers
+# recompile. This is mtime-independent: `touch` without content change is
+# a cache hit, `git checkout` with identical content is a cache hit,
+# coarse-grained filesystem timestamps don't matter.
+
+QUAKEFILE_NAME = "Quakefile.qz"
+CACHE_DIR      = ".quartz-cache"
+BIN_DIR        = ".quartz-cache/launcher"
+
+# =============================================================================
+# Entry Point
+# =============================================================================
+
+def main(): Int
+  colors_auto()
+
+  # Find the Quartz compiler
+  var compiler = find_compiler()
+  if compiler.empty?
+    eputs(red("Error: ") + "Cannot find Quartz compiler. Ensure 'quartz' is in your PATH")
+    eputs(red("       ") + "or QUARTZ_HOME is set.")
+    return 1
+  end
+
+  # Parse launcher-specific args (before forwarding to Quakefile)
+  var quakefile_path = ""
+  var forward_args = vec_new<String>()
+  var show_help = 0
+
+  var n = argc()
+  var i = 1
+  while i < n
+    var arg = argv(i)
+    if arg == "--file" or arg == "-f"
+      i = i + 1
+      if i < n
+        quakefile_path = argv(i)
+      else
+        eputs(red("Error: --file requires a path argument"))
+        return 1
+      end
+    elsif arg == "--quake-help"
+      show_help = 1
+    else
+      forward_args.push(arg)
+    end
+    i = i + 1
+  end
+
+  if show_help == 1
+    print_launcher_help()
+    return 0
+  end
+
+  # Discover Quakefile
+  if quakefile_path.empty?
+    quakefile_path = discover_quakefile()
+  end
+  if quakefile_path.empty?
+    eputs(red("Error: ") + "No " + bold(QUAKEFILE_NAME) + " found in current directory or parents")
+    eputs(dim("  Create a Quakefile.qz or use --file to specify one"))
+    return 1
+  end
+
+  # Get the project root (directory containing the Quakefile)
+  var project_dir = path_dir(quakefile_path)
+  if project_dir.empty?
+    project_dir = "."
+  end
+
+  # Ensure cache directory exists
+  var cache_bin_dir = "#{project_dir}/#{BIN_DIR}"
+  mkdir("#{project_dir}/#{CACHE_DIR}")
+  mkdir(cache_bin_dir)
+
+  # Check if cached binary is up-to-date via the content-hash manifest.
+  # First-run or any source content drift → recompile.
+  var binary_path = "#{cache_bin_dir}/quakefile"
+  var manifest_path = "#{cache_bin_dir}/quakefile.manifest"
+  var needs_compile = check_needs_compile(binary_path, manifest_path)
+
+  if needs_compile == 1
+    eprint(dim("  Compiling ") + bold(path_basename(quakefile_path)) + "... ")
+    var result = compile_quakefile(compiler, quakefile_path, binary_path, project_dir)
+    if result != 0
+      eputs("")
+      eputs(red("Error: ") + "Failed to compile " + quakefile_path)
+      return 1
+    end
+    eputs(green("✓"))
+  end
+
+  # Execute the cached binary, forwarding all args
+  var cmd = binary_path
+  var fcount = forward_args.size
+  for j in 0..fcount
+    cmd = "#{cmd} #{forward_args[j]}"
+  end
+
+  # Change to project directory so tasks run from project root
+  var original_dir = getcwd()
+  if project_dir != "."
+    var _cd = chdir(project_dir)
+  end
+
+  var raw = system(cmd)
+
+  # Restore original directory
+  if project_dir != "."
+    var _cd2 = chdir(original_dir)
+  end
+
+  # libc system(3) returns wait-status format; decode so the shell's 0..255
+  # `$?` mask doesn't drop low-byte exits to 0. Mirrors std/shell::shell_exit.
+  var sig = band(raw, 127)
+  if sig != 0
+    return 128 + sig
+  end
+  return band(shr(raw, 8), 255)
+end
+
+# =============================================================================
+# Quakefile Discovery
+# =============================================================================
+
+## Walk up from cwd looking for Quakefile.qz
+def discover_quakefile(): String
+  var dir = getcwd()
+  var max_depth = 20
+  var depth = 0
+  while depth < max_depth
+    var candidate = "#{dir}/#{QUAKEFILE_NAME}"
+    if file_exists(candidate) == 1
+      return candidate
+    end
+    # Move to parent
+    var parent = path_dir(dir)
+    if parent == dir
+      # Reached root
+      return ""
+    end
+    dir = parent
+    depth = depth + 1
+  end
+  return ""
+end
+
+# =============================================================================
+# Compile-and-Cache
+# =============================================================================
+
+## Check whether the cached Quakefile binary is still valid for the given
+## source. Returns 1 if a recompile is needed, 0 if the cache is hot.
+##
+## Strategy: read the manifest file (path|hash per line) written by the
+## previous successful compile, hash each listed file from disk, compare.
+## Any mismatch — missing file, content drift, corrupted manifest —
+## triggers a recompile. No fallback: the manifest fully describes the
+## dependency set.
+##
+## First-run case: binary or manifest missing → recompile.
+##
+## Content-hash based (FNV-1a via std/content_hash), so:
+## - `touch` without content change is a cache hit
+## - `git checkout` to a commit with identical file content is a cache hit
+## - Coarse-grained filesystem mtimes don't cause false invalidations
+def check_needs_compile(binary: String, manifest: String): Int
+  if file_exists(binary) == 0
+    return 1
+  end
+  if file_exists(manifest) == 0
+    return 1
+  end
+  var manifest_content = read_file(manifest)
+  if manifest_content.empty?
+    return 1
+  end
+  var lines = str_split(manifest_content, "\n")
+  for li in 0..lines.size
+    var line = lines[li]
+    if line.empty?
+      continue
+    end
+    var parts = str_split(line, "|")
+    if parts.size < 2
+      # Corrupt line — treat as cache miss
+      return 1
+    end
+    var path = parts[0]
+    var stored_hash = parts[1]
+    var current_hash = content_hash::content_hash_file(path)
+    if current_hash.empty?
+      # File disappeared since last compile
+      return 1
+    end
+    if current_hash != stored_hash
+      return 1
+    end
+  end
+  return 0
+end
+
+## Write a manifest atomically: write to a .tmp sibling, then rename into
+## place. POSIX rename(2) is atomic within a single filesystem, so readers
+## never see a half-written manifest even if the launcher is interrupted.
+def write_manifest_atomic(manifest: String, content: String): Int
+  var tmp = "#{manifest}.tmp"
+  var _w = write_file(tmp, content)
+  # `mv` is atomic rename on POSIX. Using system() because std/fs doesn't
+  # expose rename yet; this is the launcher's only external shell call.
+  return system("mv #{tmp} #{manifest}")
+end
+
+## Build the manifest string for a freshly-compiled Quakefile.
+##
+## Invokes `quartz --emit-deps` to get the full resolved import graph,
+## reads the resulting path list, content-hashes each file, and returns
+## the formatted manifest ready to write. Returns "" on failure (caller
+## should skip the atomic write in that case — missing manifest just
+## means the next launcher run will recompile, which is safe).
+## Build the `-I` flag set for compiling a Quakefile. Always includes the
+## stdlib + project root; conditionally adds `project_dir/self-hosted/shared`
+## when that directory exists, so Quakefiles in the Quartz repo itself can
+## `import * from persistent_worker_protocol` (and any future shared modules)
+## without per-task -I plumbing. Other projects with no self-hosted/shared
+## directory are unaffected.
+def _quake_include_flags(std_dir: String, project_dir: String): String
+  var sb = sb_new()
+  sb.append("-I ")
+  sb.append(std_dir)
+  sb.append(" -I ")
+  sb.append(project_dir)
+  # file_exists wraps access(F_OK) which returns 0 for both files and dirs.
+  var shared_dir = "#{project_dir}/self-hosted/shared"
+  if file_exists(shared_dir) == 1
+    sb.append(" -I ")
+    sb.append(shared_dir)
+  end
+  return sb.to_string()
+end
+
+def build_manifest(compiler: String, source: String, project_dir: String, std_dir: String, binary: String): String
+  var deps_path = "#{binary}.d"
+  var include_flags = _quake_include_flags(std_dir, project_dir)
+  var deps_cmd = "#{compiler} --emit-deps #{deps_path} --no-cache #{include_flags} #{source} 2>/dev/null"
+  var rc = system(deps_cmd)
+  if rc != 0
+    return ""
+  end
+  if file_exists(deps_path) == 0
+    return ""
+  end
+  var deps_content = read_file(deps_path)
+  file_delete(deps_path)
+  var paths = str_split(deps_content, "\n")
+  var sb = sb_new()
+  for pi in 0..paths.size
+    var p = paths[pi]
+    if p.empty?
+      continue
+    end
+    var h = content_hash::content_hash_file(p)
+    if h.empty?
+      # File unhashable — skip. Worst case is under-coverage, which is
+      # harmless: the worst a skipped file can do is let a future edit
+      # slip through, but then the next real recompile catches it.
+      continue
+    end
+    sb.append(p)
+    sb.append("|")
+    sb.append(h)
+    sb.append("\n")
+  end
+  return sb.to_string()
+end
+
+## Compile a Quakefile through the full pipeline: quartz → llc → clang
+def compile_quakefile(compiler: String, source: String, binary: String, project_dir: String): Int
+  var ir_path = "#{binary}.ll"
+  var obj_path = "#{binary}.o"
+
+  # Step 1: Quartz → LLVM IR
+  # Include both the std directory AND the project root, so that stdlib
+  # cross-imports using `import std/foo` resolve correctly in addition to
+  # the bare `import foo` form. Without `-I project_dir`, files like
+  # std/style.qz that say `import std/terminal` cannot be loaded by the
+  # launcher, even though they work fine under direct compilation.
+  var std_dir = find_std_dir(compiler)
+  var err_path = "#{binary}.err"
+  var include_flags = _quake_include_flags(std_dir, project_dir)
+  var compile_cmd = "#{compiler} --no-cache #{include_flags} #{source} > #{ir_path} 2>#{err_path}"
+  var result = system(compile_cmd)
+  if result != 0
+    # Show compiler errors from stderr capture
+    var errors = read_file(err_path)
+    eputs("")
+    eputs(errors)
+    file_delete(err_path)
+    return 1
+  end
+  file_delete(err_path)
+
+  # Step 2a: opt --passes=always-inline (A.4)
+  # Inlines `linkonce_odr alwaysinline` helpers — most importantly the
+  # `@__qz_alloc` / `@__qz_dealloc` allocation wrappers (codegen_runtime.qz
+  # A.3.c + A.4). Without this, every alloc site pays a function-call hop
+  # to the wrapper. With it, the wrapper folds and the routing-off path is
+  # byte-equivalent to a direct `@malloc`.
+  #
+  # Same multi-path lookup pattern as llc — try PATH first, then the
+  # common Homebrew + Linux install locations. Fall through to llc on the
+  # original IR if `opt` isn't installed (degraded perf, still correct).
+  var opt_paths = vec_new<String>()
+  opt_paths.push("opt")
+  opt_paths.push("/opt/homebrew/opt/llvm/bin/opt")
+  opt_paths.push("/usr/lib/llvm-20/bin/opt")
+  opt_paths.push("/usr/lib/llvm-19/bin/opt")
+  var opt_path = "#{binary}.opt.ll"
+  var opt_err_path = "#{binary}.opt.err"
+  var llc_input = ir_path
+  for opti in 0..opt_paths.size
+    var opt_bin = opt_paths[opti]
+    var opt_try = "#{opt_bin} --passes=always-inline #{ir_path} -o #{opt_path} -S 2>#{opt_err_path}"
+    var opt_result = system(opt_try)
+    if opt_result == 127
+      continue
+    end
+    if opt_result == 0
+      llc_input = opt_path
+      break
+    end
+    # opt ran and failed — surface stderr; abort.
+    var opt_errs = ""
+    if file_exists(opt_err_path) == 1
+      opt_errs = read_file(opt_err_path)
+    end
+    eputs(red("\n[opt] FAILED (exit #{str_from_int(opt_result)}) — #{opt_bin} rejected #{ir_path}"))
+    if not opt_errs.empty?
+      eputs(opt_errs)
+    end
+    if file_exists(opt_err_path) == 1
+      file_delete(opt_err_path)
+    end
+    return 1
+  end
+  if file_exists(opt_err_path) == 1
+    file_delete(opt_err_path)
+  end
+
+  # Step 2b: LLVM IR → Object file
+  # Try llc from PATH first, then common install locations. This used to
+  # mask real llc failures (malformed IR, assembler errors) as "llc not
+  # found" because every attempt redirected stderr to /dev/null. The fix:
+  # capture stderr to a tempfile per attempt, and distinguish "command
+  # not found" (shell exit 127) from "command ran, exited non-zero".
+  # If llc is actually installed but rejects the IR, we surface the real
+  # error immediately instead of falling through to the next path.
+  var llc_paths = vec_new<String>()
+  llc_paths.push("llc")
+  llc_paths.push("/opt/homebrew/opt/llvm/bin/llc")
+  llc_paths.push("/usr/lib/llvm-20/bin/llc")
+  llc_paths.push("/usr/lib/llvm-19/bin/llc")
+  var llc_err_path = "#{binary}.llc.err"
+  var llc_found = 0
+  var llc_ran = 0
+  var llc_last_result = 0
+  for llci in 0..llc_paths.size
+    var llc_bin = llc_paths[llci]
+    var llc_try = "#{llc_bin} -filetype=obj #{llc_input} -o #{obj_path} 2>#{llc_err_path}"
+    var llc_result = system(llc_try)
+    llc_last_result = llc_result
+    # Exit 127 = shell could not find the command. Anything else means
+    # the process actually ran (even "file not found" errors from a fork
+    # failure are exit 127; llc's own "no such file" errors are exit 1).
+    if llc_result == 127
+      continue
+    end
+    llc_found = 1
+    if llc_result == 0
+      llc_ran = 1
+      break
+    end
+    # llc ran and failed — surface its stderr immediately. Do NOT try
+    # alternate paths: if llc-from-PATH rejects the IR, llc-from-Homebrew
+    # will reject it the same way, and repeating the attempt just
+    # obscures the real error.
+    var llc_errs = ""
+    if file_exists(llc_err_path) == 1
+      llc_errs = read_file(llc_err_path)
+    end
+    eputs(red("\n[llc] FAILED (exit #{str_from_int(llc_result)}) — #{llc_bin} rejected #{ir_path}"))
+    if not llc_errs.empty?
+      eputs(llc_errs)
+    else
+      eputs(dim("  (no stderr captured)"))
+    end
+    if file_exists(llc_err_path) == 1
+      file_delete(llc_err_path)
+    end
+    return 1
+  end
+  if file_exists(llc_err_path) == 1
+    file_delete(llc_err_path)
+  end
+  if llc_ran == 0
+    if llc_found == 0
+      eputs(red("Error: llc not found in any of: llc, /opt/homebrew/opt/llvm/bin/llc, /usr/lib/llvm-20/bin/llc, /usr/lib/llvm-19/bin/llc"))
+      eputs(dim("  Install LLVM or set PATH."))
+    else
+      eputs(red("Error: llc failed (exit #{str_from_int(llc_last_result)}) with no captured stderr"))
+    end
+    return 1
+  end
+
+  # Step 3: Object file → Binary
+  # Use system clang on macOS (Homebrew LLVM clang can hang on LLVM 21+)
+  var linker = "clang"
+  if file_exists("/usr/bin/clang") == 1
+    linker = "/usr/bin/clang"
+  end
+  var link_err_path = "#{binary}.link.err"
+  var link_cmd = "#{linker} #{obj_path} -o #{binary} 2>#{link_err_path}"
+  result = system(link_cmd)
+  if result != 0
+    var link_errs = ""
+    if file_exists(link_err_path) == 1
+      link_errs = read_file(link_err_path)
+    end
+    eputs(red("\n[link] FAILED (exit #{str_from_int(result)}) — #{linker} rejected #{obj_path}"))
+    if not link_errs.empty?
+      eputs(link_errs)
+    else
+      eputs(dim("  (no stderr captured)"))
+    end
+    if file_exists(link_err_path) == 1
+      file_delete(link_err_path)
+    end
+    return 1
+  end
+  if file_exists(link_err_path) == 1
+    file_delete(link_err_path)
+  end
+
+  # Clean up intermediate files
+  file_delete(ir_path)
+  file_delete(obj_path)
+  if file_exists(opt_path) == 1
+    file_delete(opt_path)
+  end
+
+  # Write the cache manifest: invoke `quartz --emit-deps` for the resolved
+  # import graph, content-hash each file, persist the result atomically.
+  # If --emit-deps fails for any reason, we leave the manifest absent and
+  # the next launcher run will recompile — safe degradation, no silent
+  # staleness.
+  var manifest_path = "#{binary}.manifest"
+  var manifest_body = build_manifest(compiler, source, project_dir, std_dir, binary)
+  if not manifest_body.empty?
+    var _w = write_manifest_atomic(manifest_path, manifest_body)
+  end
+  return 0
+end
+
+# =============================================================================
+# Compiler Discovery
+# =============================================================================
+
+## Find the Quartz compiler binary
+def find_compiler(): String
+  # 1. Check QUARTZ_HOME env var
+  var home = getenv("QUARTZ_HOME")
+  if not home.empty?
+    var candidate = "#{home}/self-hosted/bin/quartz"
+    if file_exists(candidate) == 1
+      return candidate
+    end
+  end
+
+  # 2. Check relative to this binary (tools/quake → self-hosted/bin/quartz)
+  var self_dir = getcwd()
+  var candidate2 = "#{self_dir}/self-hosted/bin/quartz"
+  if file_exists(candidate2) == 1
+    return candidate2
+  end
+
+  # 3. Check PATH via which
+  var handle = pipe_open("which quartz 2>/dev/null", "r")
+  if handle != 0
+    var path = fread(handle, 4096)
+    pipe_close(handle)
+    if str_byte_len(path) > 1
+      # Strip trailing newline
+      return str_byte_slice(path, 0, str_byte_len(path) - 1)
+    end
+  end
+
+  return ""
+end
+
+## Find the std library directory relative to the compiler
+def find_std_dir(compiler: String): String
+  # Compiler is at <root>/self-hosted/bin/quartz
+  # std is at <root>/std
+  var compiler_dir = path_dir(compiler)
+  var bin_dir = path_dir(compiler_dir)
+  var root = path_dir(bin_dir)
+  var std_dir = "#{root}/std"
+  if file_exists("#{std_dir}/quake.qz") == 1
+    return std_dir
+  end
+  # Fallback: try "std" relative to cwd
+  if file_exists("std/quake.qz") == 1
+    return "std"
+  end
+  return "std"
+end
+
+# =============================================================================
+# Help
+# =============================================================================
+
+def print_launcher_help(): Void
+  eputs(bold("Quake Launcher") + " — The Quartz Build System")
+  eputs("")
+  eputs(bold("Usage:") + " quake [task] [options]")
+  eputs("")
+  eputs(bold("Launcher Options:"))
+  eputs("  -f, --file FILE    Use a specific Quakefile instead of auto-discovery")
+  eputs("  --quake-help       Show this launcher help (not task help)")
+  eputs("")
+  eputs(bold("Task Options ") + dim("(forwarded to Quakefile)") + bold(":"))
+  eputs("  -l, --list         List all tasks")
+  eputs("  -v, --verbose      Verbose output")
+  eputs("  -q, --quiet        Quiet output")
+  eputs("  -h, --help         Show task help")
+  eputs("")
+  eputs(dim("The launcher finds Quakefile.qz by walking up from the current"))
+  eputs(dim("directory. It compiles and caches the result in .quake/bin/."))
+end

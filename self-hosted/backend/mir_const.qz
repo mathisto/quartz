@@ -1,0 +1,669 @@
+##! # MIR Compile-Time Constant Evaluation
+##!
+##! Evaluates constant expressions at compile time.
+##! Supports integer/bool literals, arithmetic, comparison, logical, and bitwise ops.
+
+import ast
+import op_constants
+import node_constants
+import compiler_types
+import diagnostic
+
+## Evaluate a const expression at compile time.
+## Supports integer/bool literals, arithmetic, comparison, logical, and bitwise ops.
+## Returns the evaluated integer value.
+def mir_const_eval(ast_store: ast::AstStorage, node: AstNodeId, const_names: Vec<String>, const_values: Vec<Int>): Int
+  if node < 0
+    return 0
+  end
+  var kind = ast::ast_get_kind(ast_store, node)
+  
+  if kind == node_constants::NODE_INT_LIT
+    return ast::ast_get_int_val(ast_store, node)
+  end
+  
+  if kind == node_constants::NODE_BOOL_LIT
+    return ast::ast_get_int_val(ast_store, node)
+  end
+  
+  # node_constants$NodeIdent = 6 - look up in const environment
+  if kind == node_constants::NODE_IDENT
+    var name = ast::ast_get_str1(ast_store, node)
+    var count = const_names.size
+    for i in 0..count
+      if const_names[i].eq(name)
+        return const_values[i]
+      end
+    end
+    puts("const_eval: undefined constant: ")
+    puts(name)
+    puts("\n")
+    return 0
+  end
+  
+  if kind == node_constants::NODE_UNARY
+    var operand = mir_const_eval(ast_store, ast::ast_get_left(ast_store, node), const_names, const_values)
+    var op = ast::ast_get_op(ast_store, node)
+    if op == op_constants::OP_NEG
+      return 0 - operand
+    end
+    if op == op_constants::OP_NOT
+      if operand == 0
+        return 1
+      end
+      return 0
+    end
+    return operand
+  end
+
+  if kind == node_constants::NODE_BINARY
+    var left = mir_const_eval(ast_store, ast::ast_get_left(ast_store, node), const_names, const_values)
+    var right = mir_const_eval(ast_store, ast::ast_get_right(ast_store, node), const_names, const_values)
+    var op = ast::ast_get_op(ast_store, node)
+    if op == op_constants::OP_ADD
+      return left + right
+    end
+    if op == op_constants::OP_SUB
+      return left - right
+    end
+    if op == op_constants::OP_MUL
+      return left * right
+    end
+    if op == op_constants::OP_DIV
+      if right != 0
+        return left / right
+      end
+      return 0
+    end
+    if op == op_constants::OP_MOD
+      if right != 0
+        return left % right
+      end
+      return 0
+    end
+    if op == op_constants::OP_EQ
+      if left == right
+        return 1
+      end
+      return 0
+    end
+    if op == op_constants::OP_NE
+      if left != right
+        return 1
+      end
+      return 0
+    end
+    if op == op_constants::OP_LT
+      if left < right
+        return 1
+      end
+      return 0
+    end
+    if op == op_constants::OP_LE
+      if left <= right
+        return 1
+      end
+      return 0
+    end
+    if op == op_constants::OP_GT
+      if left > right
+        return 1
+      end
+      return 0
+    end
+    if op == op_constants::OP_GE
+      if left >= right
+        return 1
+      end
+      return 0
+    end
+    if op == op_constants::OP_AND
+      if left != 0
+        if right != 0
+          return 1
+        end
+      end
+      return 0
+    end
+    if op == op_constants::OP_OR
+      if left != 0
+        return 1
+      end
+      if right != 0
+        return 1
+      end
+      return 0
+    end
+    if op == op_constants::OP_BIT_AND
+      return band(left, right)
+    end
+    if op == op_constants::OP_BIT_OR
+      return bor(left, right)
+    end
+    if op == op_constants::OP_BIT_XOR
+      return bxor(left, right)
+    end
+    if op == op_constants::OP_SHL
+      return shl(left, right)
+    end
+    if op == op_constants::OP_SHR
+      return shr(left, right)
+    end
+    return 0
+  end
+  
+  # Not constant-foldable as an integer. This is NOT an error — the caller
+  # falls back to runtime lowering. NEVER write a diagnostic to stdout here:
+  # stdout is the IR channel, so any text corrupts the emitted `.ll`.
+  return 0
+end
+
+## Find the index of a local variable by name (reverse search for shadowing).
+## Returns the index, or -1 if not found.
+def mir_const_eval_find_local_idx(local_names: Vec<String>, name: String): Int
+  var lcount = local_names.size
+  for li in 0..lcount
+    var idx = lcount - 1 - li
+    if local_names[idx].eq(name)
+      return idx
+    end
+  end
+  return -1
+end
+
+## Update a local variable value by name (most recent binding).
+def mir_const_eval_update_local(local_names: Vec<String>, local_values: Vec<Int>, target: String, value: Int): Void
+  var idx = mir_const_eval_find_local_idx(local_names, target)
+  if idx >= 0
+    local_values.set(idx, value)
+  end
+end
+
+## Handle a const function call. Evaluates args, binds params, executes body.
+def mir_const_eval_call(caller_store: ast::AstStorage, call_node: AstNodeId, fn_idx: Int, const_names: Vec<String>, const_values: Vec<Int>, local_names: Vec<String>, local_values: Vec<Int>, fn_names: Vec<String>, fn_stores: Vec<Int>, fn_nodes: Vec<Int>, eval_state: Vec<Int>): Int
+  var depth = eval_state[0]
+  if depth >= 32
+    puts("const_eval_full: max call depth exceeded\n")
+    return 0
+  end
+  var fn_store: ast::AstStorage = as_type<ast::AstStorage>(fn_stores[fn_idx])
+  var fn_node = fn_nodes[fn_idx]
+  var fn_body = ast::ast_get_right(fn_store, fn_node)
+  var fn_params = ast::ast_get_left(fn_store, fn_node)
+  var args = ast::ast_get_children(caller_store, call_node)
+  var arg_count = 0
+  if args >= 0
+    arg_count = args.size
+  end
+  var call_locals_n = vec_new<String>()
+  var call_locals_v = vec_new()
+  if fn_params >= 0
+    var param_count = vec_size(fn_params)
+    for pi in 0..param_count
+      var param = fn_params[pi]
+      var param_name = ast::ast_get_str1(fn_store, param)
+      call_locals_n.push(param_name)
+      if pi < arg_count
+        var arg_val = mir_const_eval_full(caller_store, args[pi], const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+        call_locals_v.push(arg_val)
+      else
+        call_locals_v.push(0)
+      end
+    end
+  end
+  eval_state.set(0, depth + 1)
+  eval_state.set(1, 0)
+  eval_state.set(2, 0)
+  mir_const_eval_body(fn_store, fn_body, const_names, const_values, call_locals_n, call_locals_v, fn_names, fn_stores, fn_nodes, eval_state)
+  var result = eval_state[2]
+  eval_state.set(0, depth)
+  eval_state.set(1, 0)
+  eval_state.set(2, 0)
+  return result
+end
+
+## Evaluate a const expression at compile time with full support for
+## local variables, function calls, if-expressions, and blocks.
+## eval_state: Vec<Int> with [0]=call_depth, [1]=has_returned, [2]=return_value
+def mir_const_eval_full(ast_store: ast::AstStorage, node: AstNodeId, const_names: Vec<String>, const_values: Vec<Int>, local_names: Vec<String>, local_values: Vec<Int>, fn_names: Vec<String>, fn_stores: Vec<Int>, fn_nodes: Vec<Int>, eval_state: Vec<Int>): Int
+  if node < 0
+    return 0
+  end
+  var kind = ast::ast_get_kind(ast_store, node)
+  
+  if kind == node_constants::NODE_INT_LIT
+    return ast::ast_get_int_val(ast_store, node)
+  end
+  
+  if kind == node_constants::NODE_BOOL_LIT
+    return ast::ast_get_int_val(ast_store, node)
+  end
+  
+  # node_constants$NodeIdent = 6 - look up in local scope first, then const environment
+  if kind == node_constants::NODE_IDENT
+    var name = ast::ast_get_str1(ast_store, node)
+    var local_idx = mir_const_eval_find_local_idx(local_names, name)
+    if local_idx >= 0
+      return local_values[local_idx]
+    end
+    var ccount = const_names.size
+    for ci in 0..ccount
+      if const_names[ci].eq(name)
+        return const_values[ci]
+      end
+    end
+    # Emit proper compile error via diagnostic formatter
+    if eval_state.size > 3
+      var cname = as_string(eval_state[3])
+      if str_byte_len(cname) > 0
+        var d = diagnostic::diag_new_simple(diagnostic::DIAG_ERROR, "QZ0600", "in const '#{cname}': '#{name}' is not a compile-time constant")
+        diagnostic::diag_emit(d)
+        exit(1)
+      end
+    end
+    var d = diagnostic::diag_new_simple(diagnostic::DIAG_ERROR, "QZ0600", "'#{name}' is not a compile-time constant")
+    diagnostic::diag_emit(d)
+    exit(1)
+    return 0
+  end
+  
+  if kind == node_constants::NODE_UNARY
+    var operand = mir_const_eval_full(ast_store, ast::ast_get_left(ast_store, node), const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    var op = ast::ast_get_op(ast_store, node)
+    if op == op_constants::OP_NEG
+      return 0 - operand
+    end
+    if op == op_constants::OP_NOT
+      if operand == 0
+        return 1
+      end
+      return 0
+    end
+    return operand
+  end
+
+  if kind == node_constants::NODE_BINARY
+    var left = mir_const_eval_full(ast_store, ast::ast_get_left(ast_store, node), const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    var right = mir_const_eval_full(ast_store, ast::ast_get_right(ast_store, node), const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    var op = ast::ast_get_op(ast_store, node)
+    if op == op_constants::OP_ADD
+      return left + right
+    end
+    if op == op_constants::OP_SUB
+      return left - right
+    end
+    if op == op_constants::OP_MUL
+      return left * right
+    end
+    if op == op_constants::OP_DIV
+      if right != 0
+        return left / right
+      end
+      return 0
+    end
+    if op == op_constants::OP_MOD
+      if right != 0
+        return left % right
+      end
+      return 0
+    end
+    if op == op_constants::OP_EQ
+      if left == right
+        return 1
+      end
+      return 0
+    end
+    if op == op_constants::OP_NE
+      if left != right
+        return 1
+      end
+      return 0
+    end
+    if op == op_constants::OP_LT
+      if left < right
+        return 1
+      end
+      return 0
+    end
+    if op == op_constants::OP_LE
+      if left <= right
+        return 1
+      end
+      return 0
+    end
+    if op == op_constants::OP_GT
+      if left > right
+        return 1
+      end
+      return 0
+    end
+    if op == op_constants::OP_GE
+      if left >= right
+        return 1
+      end
+      return 0
+    end
+    if op == op_constants::OP_AND
+      if left != 0
+        if right != 0
+          return 1
+        end
+      end
+      return 0
+    end
+    if op == op_constants::OP_OR
+      if left != 0
+        return 1
+      end
+      if right != 0
+        return 1
+      end
+      return 0
+    end
+    if op == op_constants::OP_BIT_AND
+      return band(left, right)
+    end
+    if op == op_constants::OP_BIT_OR
+      return bor(left, right)
+    end
+    if op == op_constants::OP_BIT_XOR
+      return bxor(left, right)
+    end
+    if op == op_constants::OP_SHL
+      return shl(left, right)
+    end
+    if op == op_constants::OP_SHR
+      return shr(left, right)
+    end
+    return 0
+  end
+
+  # node_constants$NodeCall = 9 - call a const function, including bitwise intrinsics
+  if kind == node_constants::NODE_CALL
+    var callee_node = ast::ast_get_left(ast_store, node)
+    var callee_name = ast::ast_get_str1(ast_store, callee_node)
+
+    # Handle bitwise intrinsic calls: band, bor, bxor, shl, shr
+    var args = ast::ast_get_children(ast_store, node)
+    if args >= 0
+      if args.size == 2
+        if callee_name == "band" or callee_name == "bor" or callee_name == "bxor" or callee_name == "shl" or callee_name == "shr"
+          var a = mir_const_eval_full(ast_store, args[0], const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+          var b = mir_const_eval_full(ast_store, args[1], const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+          if callee_name == "band"
+            return band(a, b)
+          end
+          if callee_name == "bor"
+            return bor(a, b)
+          end
+          if callee_name == "bxor"
+            return bxor(a, b)
+          end
+          if callee_name == "shl"
+            return shl(a, b)
+          end
+          if callee_name == "shr"
+            return shr(a, b)
+          end
+        end
+      end
+    end
+
+    var fn_count = fn_names.size
+    for fi in 0..fn_count
+      if fn_names[fi].eq(callee_name)
+        return mir_const_eval_call(ast_store, node, fi, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+      end
+    end
+    # Emit proper compile error via diagnostic formatter
+    if eval_state.size > 3
+      var cname_fn = as_string(eval_state[3])
+      if str_byte_len(cname_fn) > 0
+        var d = diagnostic::diag_new_simple(diagnostic::DIAG_ERROR, "QZ0601", "in const '#{cname_fn}': function '#{callee_name}' is not a const function")
+        diagnostic::diag_emit(d)
+        exit(1)
+      end
+    end
+    var d = diagnostic::diag_new_simple(diagnostic::DIAG_ERROR, "QZ0601", "function '#{callee_name}' is not a const function")
+    diagnostic::diag_emit(d)
+    exit(1)
+    return 0
+  end
+  
+  # node_constants$NodeIf = 23 - if as expression
+  if kind == node_constants::NODE_IF
+    # Skip pattern binding ifs in const eval
+    return 0 if ast::ast_get_int_val(ast_store, node) == 1
+    var cond_node = ast::ast_get_left(ast_store, node)
+    var cond_val = mir_const_eval_full(ast_store, cond_node, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    if cond_val != 0
+      var then_node = ast::ast_get_right(ast_store, node)
+      return mir_const_eval_full(ast_store, then_node, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    else
+      var else_node = ast::ast_get_extra(ast_store, node)
+      if else_node >= 0
+        return mir_const_eval_full(ast_store, else_node, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+      end
+    end
+    return 0
+  end
+  
+  # node_constants$NodeBlock = 32 - evaluate block as expression
+  if kind == node_constants::NODE_BLOCK
+    mir_const_eval_body(ast_store, node, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    return eval_state[2]
+  end
+  
+  # The init is not constant-foldable as an integer — e.g. a string or float
+  # literal, struct/array init, or any runtime expression. This is NOT an
+  # error: the module-const folding pass (mir_lower PASS 0.7/0.8) routes a
+  # 0-valued const to the string-literal global path (NODE_STRING_LIT →
+  # gstr_inits) or the runtime-init global path (everything else — the same
+  # lowering a module-level `var` uses). We MUST fall back silently: stdout is
+  # the IR channel, so any diagnostic text here corrupts the emitted `.ll`.
+  return 0
+end
+
+## Helper: evaluate a while loop body repeatedly until condition is false.
+def mir_const_eval_while_loop(ast_store: ast::AstStorage, stmt: Int, const_names: Vec<String>, const_values: Vec<Int>, local_names: Vec<String>, local_values: Vec<Int>, fn_names: Vec<String>, fn_stores: Vec<Int>, fn_nodes: Vec<Int>, eval_state: Vec<Int>): Void
+  for wi in 0..1000000
+    var cond_node = ast::ast_get_left(ast_store, stmt)
+    var cond_val = mir_const_eval_full(ast_store, cond_node, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    if cond_val == 0
+      return
+    end
+    var body = ast::ast_get_right(ast_store, stmt)
+    mir_const_eval_body(ast_store, body, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    if eval_state[1] != 0
+      return
+    end
+  end
+  puts("const_eval: while loop exceeded 1000000 iterations\n")
+end
+
+## Helper: evaluate a for loop over a range.
+def mir_const_eval_for_loop(ast_store: ast::AstStorage, stmt: Int, const_names: Vec<String>, const_values: Vec<Int>, local_names: Vec<String>, local_values: Vec<Int>, fn_names: Vec<String>, fn_stores: Vec<Int>, fn_nodes: Vec<Int>, eval_state: Vec<Int>): Void
+  var var_name = ast::ast_get_str1(ast_store, stmt)
+  var range_node = ast::ast_get_left(ast_store, stmt)
+  var start_val = mir_const_eval_full(ast_store, ast::ast_get_left(ast_store, range_node), const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+  var raw_end = mir_const_eval_full(ast_store, ast::ast_get_right(ast_store, range_node), const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+  var range_op = ast::ast_get_op(ast_store, range_node)
+
+  # Extract step value (default 1)
+  var step_val = 1
+  var ce_step_node = ast::ast_get_int_val(ast_store, stmt)
+  if ce_step_node > 0
+    step_val = mir_const_eval_full(ast_store, ce_step_node, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+  end
+
+  # For inclusive range, adjust end
+  var is_inclusive = range_op == op_constants::OP_RANGE_INCLUSIVE
+  var body_node = ast::ast_get_right(ast_store, stmt)
+  var saved_count = local_names.size
+  # Add loop variable to scope
+  local_names.push(var_name)
+  local_values.push(start_val)
+  var var_idx = saved_count
+
+  if step_val == 0
+    # Zero step — skip loop
+    local_names.pop()
+    local_values.pop()
+    return
+  end
+
+  # Check iteration limit
+  var iter_count = 0
+  var fi = start_val
+  while iter_count < 1000000
+    # Direction-aware condition
+    if step_val > 0
+      if is_inclusive
+        if fi > raw_end
+          break
+        end
+      else
+        if fi >= raw_end
+          break
+        end
+      end
+    else
+      if is_inclusive
+        if fi < raw_end
+          break
+        end
+      else
+        if fi <= raw_end
+          break
+        end
+      end
+    end
+
+    local_values.set(var_idx, fi)
+    mir_const_eval_body(ast_store, body_node, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    if eval_state[1] != 0
+      # Restore scope on early return
+      while local_names.size > saved_count
+        local_names.pop()
+        local_values.pop()
+      end
+      return
+    end
+    # Clean up locals added by body (keep loop variable)
+    while local_names.size > saved_count + 1
+      local_names.pop()
+      local_values.pop()
+    end
+    fi += step_val
+    iter_count += 1
+  end
+  if iter_count >= 1000000
+    var d = diagnostic::diag_new_simple(diagnostic::DIAG_ERROR, "QZ0602", "const-eval iteration limit exceeded (1000000)")
+    diagnostic::diag_emit(d)
+    exit(1)
+  end
+  # Remove loop variable
+  local_names.pop()
+  local_values.pop()
+  return
+end
+
+## Evaluate a block or single statement for const evaluation.
+## Handles Block(32), Return(22), If(23), While(24), For(44),
+## Let(25), Assign(26), ExprStmt(29).
+## Updates eval_state: [0]=call_depth, [1]=has_returned, [2]=return_value
+def mir_const_eval_body(ast_store: ast::AstStorage, node: AstNodeId, const_names: Vec<String>, const_values: Vec<Int>, local_names: Vec<String>, local_values: Vec<Int>, fn_names: Vec<String>, fn_stores: Vec<Int>, fn_nodes: Vec<Int>, eval_state: Vec<Int>): Void
+  if node < 0
+    return
+  end
+  var kind = ast::ast_get_kind(ast_store, node)
+  
+  # node_constants$NodeBlock = 32 - iterate children
+  if kind == node_constants::NODE_BLOCK
+    var stmts = ast::ast_get_children(ast_store, node)
+    var stmt_count = stmts.size
+    for si in 0..stmt_count
+      if eval_state[1] != 0
+        return
+      end
+       mir_const_eval_body(ast_store, stmts[si], const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    end
+    return
+  end
+  
+  if kind == node_constants::NODE_RETURN
+    var ret_expr = ast::ast_get_left(ast_store, node)
+    if ret_expr >= 0
+      var val = mir_const_eval_full(ast_store, ret_expr, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+      eval_state.set(2, val)
+    end
+    eval_state.set(1, 1)
+    return
+  end
+  
+  # node_constants$NodeIf = 23 - if as statement (handles elsif via recursive else)
+  if kind == node_constants::NODE_IF
+    # Skip pattern binding ifs in const eval
+    return if ast::ast_get_int_val(ast_store, node) == 1
+    var cond_node = ast::ast_get_left(ast_store, node)
+    var cond_val = mir_const_eval_full(ast_store, cond_node, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    if cond_val != 0
+      var then_node = ast::ast_get_right(ast_store, node)
+      mir_const_eval_body(ast_store, then_node, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    else
+      var else_node = ast::ast_get_extra(ast_store, node)
+      if else_node >= 0
+        mir_const_eval_body(ast_store, else_node, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+      end
+    end
+    return
+  end
+  
+  if kind == node_constants::NODE_WHILE
+    mir_const_eval_while_loop(ast_store, node, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    return
+  end
+  
+  # node_constants$NodeLet = 25 - variable declaration
+  # In Quartz, `x = expr` is always parsed as NODE_LET even for
+  # reassignment. If x already exists as a local, update it
+  # (like NODE_ASSIGN) instead of creating a shadowing binding.
+  if kind == node_constants::NODE_LET
+    var name = ast::ast_get_str1(ast_store, node)
+    var init = ast::ast_get_left(ast_store, node)
+    var val = 0
+    if init >= 0
+      val = mir_const_eval_full(ast_store, init, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    end
+    # Try to update existing local first (reassignment case)
+    var existing_idx = mir_const_eval_find_local_idx(local_names, name)
+    if existing_idx >= 0
+      local_values.set(existing_idx, val)
+    else
+      local_names.push(name)
+      local_values.push(val)
+    end
+    return
+  end
+  
+  # node_constants$NodeAssign = 26 - variable reassignment
+  if kind == node_constants::NODE_ASSIGN
+    var target = ast::ast_get_str1(ast_store, node)
+    var value = mir_const_eval_full(ast_store, ast::ast_get_left(ast_store, node), const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    mir_const_eval_update_local(local_names, local_values, target, value)
+    return
+  end
+  
+  # node_constants$NodeExprStmt = 29 - expression as statement
+  if kind == node_constants::NODE_EXPR_STMT
+    var expr = ast::ast_get_left(ast_store, node)
+    mir_const_eval_full(ast_store, expr, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    return
+  end
+  
+  # node_constants$NodeFor = 44 - for loop
+  if kind == node_constants::NODE_FOR
+    mir_const_eval_for_loop(ast_store, node, const_names, const_values, local_names, local_values, fn_names, fn_stores, fn_nodes, eval_state)
+    return
+  end
+end

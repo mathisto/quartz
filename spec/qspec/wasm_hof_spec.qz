@@ -1,0 +1,290 @@
+## WASM Higher-Order Vec Op Synthesis (each / find)
+##
+## Pre-fix: The WASM backend emitted unsynth `env::each` and `env::find`
+## imports for `v.each() { ... }` and `v.find() { ... }` because
+## `wasm_runtime.qz` had no synth bodies for HOFs that take closures.
+## Plain `wasmtime program.wasm` rejected every program using these.
+##
+## Fix: `_wasm_synth_each` and `_wasm_synth_find` synthesize WASM bodies
+## that mirror the closure-dispatch shape from
+## `codegen_wasm.qz::MIR_CALL_INDIRECT` (low-bit tag selects closure vs
+## plain; closure call passes `(env, val)`, plain passes `(val)`). The
+## function-table type indices are registered via
+## `wasm_runtime::_wasm_get_type_idx` (relocated from `codegen_wasm.qz`
+## so synth bodies could call it without a circular import).
+##
+## **Prerequisites**: `QUARTZ_COMPILER` pointing at `--feature wasm`
+## build; `wasmtime` on PATH.
+
+import * from qspec
+import * from qspec/subprocess
+
+extern "C" def getpid(): CInt
+
+var _wh_tid = 0
+
+def _wh_compile_and_run(source: String): String
+  _wh_tid += 1
+  var pid = getpid()
+  var src = "/tmp/_wh_#{pid}_#{_wh_tid}.qz"
+  var wasm = "/tmp/_wh_#{pid}_#{_wh_tid}.wasm"
+  write_file(src, source)
+  var compiler = getenv("QUARTZ_COMPILER")
+  if str_byte_len(compiler) == 0
+    compiler = "self-hosted/bin/quartz"
+  end
+  var compile_argv = vec_new<String>(); compile_argv.push(compiler); compile_argv.push("--backend"); compile_argv.push("wasm"); compile_argv.push("--no-cache"); compile_argv.push("-I"); compile_argv.push("."); compile_argv.push("-I"); compile_argv.push("std"); compile_argv.push(src); compile_argv.push("-o"); compile_argv.push(wasm)
+  var compile_result = subprocess_exec_argv("nested-compile", compile_argv)
+  file_delete(src)
+  if compile_result.exit_code != 0
+    file_delete(wasm)
+    return "COMPILE_FAILED"
+  end
+  var validate_argv = vec_new<String>(); validate_argv.push("wasm-validate"); validate_argv.push(wasm)
+  var validate_result = subprocess_exec_argv("nested-validate", validate_argv)
+  if validate_result.exit_code != 0
+    file_delete(wasm)
+    return "VALIDATE_FAILED"
+  end
+  var run_argv = vec_new<String>(); run_argv.push("wasmtime"); run_argv.push(wasm)
+  var run_result = subprocess_exec_argv("nested-run", run_argv)
+  file_delete(wasm)
+  if run_result.exit_code != 0
+    return "NO_RUNTIME"
+  end
+  return run_result.stdout_content
+end
+
+def _wh_chomp(s: String): String
+  var n = str_byte_len(s)
+  return s if n == 0
+  var last = str_byte_at(s, n - 1)
+  return str_byte_slice(s, 0, n - 1) if last == 10
+  return s
+end
+
+def main(): Int
+  if qspec_feature_wasm() == false
+    puts("[skip] wasm_hof_spec: set QUARTZ_COMPILER to a --feature wasm build to run")
+    return qspec_exclude_feature("wasm")
+  end
+  describe("WASM higher-order Vec ops") do ->
+    it("each() iterates with side effects") do ->
+      var s = """
+        def main(): Int
+          var v = [1, 2, 3, 4, 5]
+          v.each() { puts(\"\#{it}\") }
+          return 0
+        end
+        """
+      var result = _wh_compile_and_run(s)
+      assert_eq_str(_wh_chomp(result), "1\n2\n3\n4\n5")
+    end
+
+    it("each() handles empty vec without trapping") do ->
+      var s = """
+        def main(): Int
+          var v = vec_new<Int>()
+          v.each() { puts(\"unreachable\") }
+          puts(\"done\")
+          return 0
+        end
+        """
+      var result = _wh_compile_and_run(s)
+      assert_eq_str(_wh_chomp(result), "done")
+    end
+
+    it("find() returns first matching value") do ->
+      var s = """
+        def main(): Int
+          var v = [10, 20, 30, 40, 50]
+          var found: Int = v.find() { it == 30 }
+          puts(\"\#{found}\")
+          return 0
+        end
+        """
+      var result = _wh_compile_and_run(s)
+      assert_eq_str(_wh_chomp(result), "30")
+    end
+
+    it("find() returns 0 when no match") do ->
+      var s = """
+        def main(): Int
+          var v = [1, 2, 3]
+          var r: Int = v.find() { it > 100 }
+          puts(\"\#{r}\")
+          return 0
+        end
+        """
+      var result = _wh_compile_and_run(s)
+      assert_eq_str(_wh_chomp(result), "0")
+    end
+
+    it("find() returns first match (not last)") do ->
+      var s = """
+        def main(): Int
+          var v = [5, 10, 15, 10, 20]
+          var r: Int = v.find() { it == 10 }
+          puts(\"\#{r}\")
+          return 0
+        end
+        """
+      var result = _wh_compile_and_run(s)
+      assert_eq_str(_wh_chomp(result), "10")
+    end
+
+    it("each() and find() compose without env imports") do ->
+      var s = """
+        def main(): Int
+          var v = [1, 2, 3, 4, 5]
+          var sum = 0
+          v.each() { puts(\"v=\#{it}\") }
+          var first_even: Int = v.find() { it == 2 }
+          puts(\"first_even=\#{first_even}\")
+          return 0
+        end
+        """
+      var result = _wh_compile_and_run(s)
+      assert_eq_str(_wh_chomp(result), "v=1\nv=2\nv=3\nv=4\nv=5\nfirst_even=2")
+    end
+
+    it("map() returns transformed Vec") do ->
+      var s = """
+        def main(): Int
+          var v = [1, 2, 3]
+          var d: Vec<Int> = v.map() { it * 10 }
+          d.each() { puts(\"\#{it}\") }
+          return 0
+        end
+        """
+      var result = _wh_compile_and_run(s)
+      assert_eq_str(_wh_chomp(result), "10\n20\n30")
+    end
+
+    it("map() with captured variable") do ->
+      var s = """
+        def main(): Int
+          var factor = 3
+          var v = [1, 2, 3]
+          var r: Vec<Int> = v.map() { it * factor }
+          r.each() { puts(\"\#{it}\") }
+          return 0
+        end
+        """
+      var result = _wh_compile_and_run(s)
+      assert_eq_str(_wh_chomp(result), "3\n6\n9")
+    end
+
+    it("filter() keeps matching elements") do ->
+      var s = """
+        def main(): Int
+          var v = [1, 2, 3, 4, 5]
+          var r: Vec<Int> = v.filter() { it > 2 }
+          r.each() { puts(\"\#{it}\") }
+          return 0
+        end
+        """
+      var result = _wh_compile_and_run(s)
+      assert_eq_str(_wh_chomp(result), "3\n4\n5")
+    end
+
+    it("reduce() folds with explicit 2-arg closure") do ->
+      var s = """
+        def main(): Int
+          var v = [1, 2, 3, 4, 5]
+          var sum: Int = v.reduce(0, (a, x) -> a + x)
+          puts(\"\#{sum}\")
+          return 0
+        end
+        """
+      var result = _wh_compile_and_run(s)
+      assert_eq_str(_wh_chomp(result), "15")
+    end
+
+    it("reduce() with closure capture") do ->
+      var s = """
+        def main(): Int
+          var mult = 2
+          var v = [1, 2, 3]
+          var r: Int = v.reduce(0, (a, x) -> a + x * mult)
+          puts(\"\#{r}\")
+          return 0
+        end
+        """
+      var result = _wh_compile_and_run(s)
+      assert_eq_str(_wh_chomp(result), "12")
+    end
+
+    it("unique() returns sorted+deduped Vec") do ->
+      var s = """
+        def main(): Int
+          var v = [3, 1, 2, 3, 1, 2, 5]
+          var u: Vec<Int> = unique(v)
+          u.each() { puts(\"\#{it}\") }
+          return 0
+        end
+        """
+      var result = _wh_compile_and_run(s)
+      assert_eq_str(_wh_chomp(result), "1\n2\n3\n5")
+    end
+
+    it("zip() builds pair Vecs") do ->
+      var s = """
+        def main(): Int
+          var a = [10, 20, 30]
+          var b = [1, 2, 3]
+          var p: Vec<Int> = a.zip(b)
+          p.each() { puts(\"\#{it[0]}+\#{it[1]}\") }
+          return 0
+        end
+        """
+      var result = _wh_compile_and_run(s)
+      assert_eq_str(_wh_chomp(result), "10+1\n20+2\n30+3")
+    end
+
+    it("enumerate() pairs index with value") do ->
+      var s = """
+        def main(): Int
+          var v = [100, 200, 300]
+          var e: Vec<Int> = v.enumerate()
+          e.each() { puts(\"\#{it[0]}=\#{it[1]}\") }
+          return 0
+        end
+        """
+      var result = _wh_compile_and_run(s)
+      assert_eq_str(_wh_chomp(result), "0=100\n1=200\n2=300")
+    end
+
+    it("zip() truncates to shorter Vec") do ->
+      var s = """
+        def main(): Int
+          var a = [1, 2, 3, 4, 5]
+          var b = [10, 20]
+          var p: Vec<Int> = a.zip(b)
+          puts(\"size=\#{p.size}\")
+          p.each() { puts(\"\#{it[0]},\#{it[1]}\") }
+          return 0
+        end
+        """
+      var result = _wh_compile_and_run(s)
+      assert_eq_str(_wh_chomp(result), "size=2\n1,10\n2,20")
+    end
+
+    it("HOF chain: map then filter then reduce") do ->
+      var s = """
+        def main(): Int
+          var v = [1, 2, 3, 4, 5]
+          var doubled: Vec<Int> = v.map() { it * 2 }
+          var big: Vec<Int> = doubled.filter() { it > 4 }
+          var sum: Int = big.reduce(0, (a, x) -> a + x)
+          puts(\"sum=\#{sum}\")
+          return 0
+        end
+        """
+      var result = _wh_compile_and_run(s)
+      assert_eq_str(_wh_chomp(result), "sum=24")
+    end
+  end
+
+  return qspec_main()
+end

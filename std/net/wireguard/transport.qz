@@ -1,0 +1,258 @@
+## std/net/wireguard/transport - WireGuard data-packet encrypt/decrypt
+##
+## After Noise IKpsk2 completes (handshake.qz), data packets are
+## ChaCha20-Poly1305 AEAD with the per-direction Session keys. Each packet
+## carries a monotonically-increasing counter used both as the AEAD nonce
+## and for replay defense via the RFC 6479 sliding-window check that lives
+## in session.qz.
+##
+## Wire format (per WG paper §5.4.6):
+##
+##   [0]      type = 0x04 (DATA_PACKET)
+##   [1..4]   reserved = 0,0,0
+##   [4..8]   receiver_index   — peer's local_index for this session (u32 LE)
+##   [8..16]  counter          — sender's per-direction counter (u64 LE);
+##                              also used as ChaCha20 nonce
+##   [16..N)  encrypted_payload — AEAD ciphertext of zero-padded plaintext
+##   [N..N+16) tag              — Poly1305 tag (16 bytes)
+##
+## Plaintext padding: WG pads inner-IP plaintext to a 16-byte multiple before
+## AEAD-encrypting, as a traffic-analysis countermeasure (observers see only
+## ±15 bytes of size resolution). The receiver decrypts the padded plaintext
+## as-is; stripping is the inner-IP layer's job (the IP header carries its
+## own length field).
+##
+## Counter limits:
+##   - Encrypt rejects when counter would exceed REKEY_AFTER_MESSAGES = 2^60.
+##     The higher layer (Step 2.3 timers.qz) initiates a new handshake well
+##     before this is hit; we treat this as a hard wall.
+##   - Decrypt rejects negative counters (Quartz Int wrap from u64 high bit).
+##     The replay-window check rejects counters more than W=2048 below the
+##     current top.
+##
+## Order of operations in decrypt: AEAD-verify FIRST, then replay-mark.
+## (Per WG paper §5.4.6 — checking replay before AEAD lets an attacker poison
+## the bitmap with forged counters; this implementation gets it right.)
+##
+## See:
+## - std/crypto/noise (the handshake that produces Sessions)
+## - std/net/wireguard/session (Session struct + replay-window primitive)
+## - WG paper §5.4.6
+## - https://www.wireguard.com/papers/wireguard.pdf
+
+import std/core/crypto/chacha20poly1305
+import * from std/core/crypto/secret  # Secret<Int> + secret_wrap (NET.4.1 B)
+import std/net/wireguard/session
+import * from ffi/socket  # malloc/free/memcpy/memset
+
+# =============================================================================
+# Wire-format constants
+# =============================================================================
+
+def WG_DATA_PACKET_TYPE(): Int = 4
+def WG_DATA_HEADER_LEN(): Int = 16
+def WG_TAG_LEN(): Int = 16
+
+## REKEY_AFTER_MESSAGES — hard counter wall. After this many messages on a
+## single session, encryption refuses (initiator should have rekeyed before
+## hitting this). 2^60 = 1152921504606846976.
+def WG_REKEY_AFTER_MESSAGES(): Int = 1152921504606846976
+
+## Pad an inner-plaintext length up to the next 16-byte multiple.
+def wg_padded_len(pt_len: Int): Int
+  return ((pt_len + 15) / 16) * 16
+end
+
+## Total wire length of a data packet carrying `pt_len` bytes of plaintext
+## (header + padded ciphertext + tag).
+def wg_data_packet_total_len(pt_len: Int): Int
+  return WG_DATA_HEADER_LEN() + wg_padded_len(pt_len) + WG_TAG_LEN()
+end
+
+# =============================================================================
+# Internal helpers
+# =============================================================================
+
+## Build the 12-byte ChaCha20-Poly1305 nonce: 4 zero bytes || 8-byte counter LE.
+def _build_nonce(counter: Int, nonce_out: Int): Void
+  ptr_write_byte(nonce_out, 0)
+  ptr_write_byte(nonce_out + 1, 0)
+  ptr_write_byte(nonce_out + 2, 0)
+  ptr_write_byte(nonce_out + 3, 0)
+  var i = 0
+  while i < 8
+    ptr_write_byte(nonce_out + 4 + i, (counter >> (i * 8)) & 255)
+    i += 1
+  end
+end
+
+## Read u64 little-endian from 8 bytes at `p`.
+def _read_u64_le(p: Int): Int
+  var v = 0
+  var i = 7
+  while i >= 0
+    v = (v * 256) | ptr_read_byte(p + i)
+    i -= 1
+  end
+  return v
+end
+
+## Read u32 little-endian from 4 bytes at `p`.
+def _read_u32_le(p: Int): Int
+  var b0 = ptr_read_byte(p)
+  var b1 = ptr_read_byte(p + 1)
+  var b2 = ptr_read_byte(p + 2)
+  var b3 = ptr_read_byte(p + 3)
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+end
+
+## Write u32 little-endian to 4 bytes at `p`.
+def _write_u32_le(p: Int, v: Int): Void
+  ptr_write_byte(p, v & 255)
+  ptr_write_byte(p + 1, (v >> 8) & 255)
+  ptr_write_byte(p + 2, (v >> 16) & 255)
+  ptr_write_byte(p + 3, (v >> 24) & 255)
+end
+
+## Write u64 little-endian to 8 bytes at `p`.
+def _write_u64_le(p: Int, v: Int): Void
+  var i = 0
+  while i < 8
+    ptr_write_byte(p + i, (v >> (i * 8)) & 255)
+    i += 1
+  end
+end
+
+# =============================================================================
+# Encrypt
+# =============================================================================
+
+## Encrypt and frame a data packet for transmission.
+##
+## Args:
+## - s: live Session in transport mode.
+## - pt: pointer to plaintext (an inner IP packet, typically). May be 0 when
+##       pt_len == 0 (keepalive — empty payload, just header + tag).
+## - pt_len: plaintext byte count. Padded internally to 16-byte multiple.
+## - msg_out: output buffer; must be at least `wg_data_packet_total_len(pt_len)`
+##           bytes.
+##
+## Returns the wire length on success (== `wg_data_packet_total_len(pt_len)`),
+## or -1 if the session's send_counter has reached REKEY_AFTER_MESSAGES (the
+## higher layer must rekey).
+def wg_encrypt_data_packet(s: Session, pt: Int, pt_len: Int, msg_out: Int): Int
+  if session_send_counter(s) >= WG_REKEY_AFTER_MESSAGES()
+    return 0 - 1
+  end
+  var counter = session_next_send_counter(s)
+
+  # Header
+  ptr_write_byte(msg_out, WG_DATA_PACKET_TYPE())
+  ptr_write_byte(msg_out + 1, 0)
+  ptr_write_byte(msg_out + 2, 0)
+  ptr_write_byte(msg_out + 3, 0)
+  _write_u32_le(msg_out + 4, s.peer_index)
+  _write_u64_le(msg_out + 8, counter)
+
+  var padded = wg_padded_len(pt_len)
+
+  # Stage padded plaintext (zero-extend) in a temp buffer; HACL* AEAD writes
+  # ciphertext to `out` and tag separately.
+  var nonce = malloc(12)
+  _build_nonce(counter, nonce)
+
+  # NET.4.1 B: transport key (T_send) is the per-direction AEAD key the
+  # noise_split derived; the session holds it as raw Int (filed forward as
+  # field-level annotation). Wrap at the AEAD boundary.
+  if padded == 0
+    # Keepalive — 0-byte plaintext, AEAD writes only the tag.
+    chacha20poly1305_encrypt(msg_out + 16, msg_out + 16, msg_out + 16, 0,
+                             0, 0, secret_wrap(session_t_send(s)), nonce)
+  else
+    var pad_buf = malloc(padded)
+    if pt_len > 0
+      memcpy(pad_buf, pt, pt_len)
+    end
+    if padded > pt_len
+      memset(pad_buf + pt_len, 0, padded - pt_len)
+    end
+    chacha20poly1305_encrypt(msg_out + 16,                    # ct out
+                             msg_out + 16 + padded,           # tag out
+                             pad_buf, padded,
+                             0, 0,                            # no AAD
+                             secret_wrap(session_t_send(s)), nonce)
+    free(pad_buf)
+  end
+  free(nonce)
+
+  return WG_DATA_HEADER_LEN() + padded + WG_TAG_LEN()
+end
+
+# =============================================================================
+# Decrypt
+# =============================================================================
+
+## Verify and decrypt an incoming data packet.
+##
+## Validates: type byte, receiver_index matches `s.local_index`, AEAD tag,
+## then (only after AEAD success) marks the counter in the replay window.
+##
+## Args:
+## - s: live Session.
+## - msg_in: input buffer.
+## - msg_in_len: total wire length (header + ct + tag); must be >= 32 and
+##              `(msg_in_len - 32) % 16 == 0`.
+## - pt_out: output buffer for decrypted (still-padded) plaintext; must be at
+##          least `msg_in_len - 32` bytes. Caller strips padding via inner-IP
+##          length field.
+##
+## Returns padded-plaintext byte count on success (`msg_in_len - 32`); -1 on
+## any failure (length malformed, type mismatch, receiver_index mismatch,
+## AEAD tag mismatch, counter replay or out-of-window-old).
+def wg_decrypt_data_packet(s: Session, msg_in: Int, msg_in_len: Int, pt_out: Int): Int
+  # Length sanity: header + (multiple-of-16 ct) + tag.
+  if msg_in_len < 32
+    return 0 - 1
+  end
+  var ct_len = msg_in_len - WG_DATA_HEADER_LEN() - WG_TAG_LEN()
+  if (ct_len & 15) != 0
+    return 0 - 1
+  end
+
+  # Type byte must be DATA_PACKET.
+  if ptr_read_byte(msg_in) != WG_DATA_PACKET_TYPE()
+    return 0 - 1
+  end
+
+  # Receiver index must match this session's local_index.
+  if _read_u32_le(msg_in + 4) != s.local_index
+    return 0 - 1
+  end
+
+  var counter = _read_u64_le(msg_in + 8)
+
+  var nonce = malloc(12)
+  _build_nonce(counter, nonce)
+
+  # NET.4.1 B: same secret wrap as on the send path.
+  var rc = chacha20poly1305_decrypt(pt_out,                     # pt out
+                                    msg_in + 16,                # ct
+                                    ct_len,
+                                    0, 0,                       # no AAD
+                                    secret_wrap(session_t_recv(s)),
+                                    nonce,
+                                    msg_in + 16 + ct_len)       # tag
+  free(nonce)
+  if rc != 0
+    return 0 - 1
+  end
+
+  # AEAD verified — only NOW commit the counter to the replay window. Order
+  # matters: replay-mark before AEAD-verify would let an attacker fill the
+  # bitmap with forged counters and squeeze out legitimate retransmissions.
+  if session_check_and_set_recv(s, counter) != 0
+    return 0 - 1
+  end
+
+  return ct_len
+end

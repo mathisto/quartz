@@ -1,0 +1,270 @@
+## QSpec coverage for Phase E.1 — per-task arenas via `go_arena(f)`.
+##
+## Phase E.1 (2026-04-28): the `Alloc` initiative's headline capability —
+## `go_arena(f)` wraps `f`'s body in `with Alloc.in_arena(arena_new(8192))
+## do -> f() end`, then destroys the arena when `f` returns. Allocations
+## made inside the task body land in a per-task arena. Bounded memory
+## under task churn — Erlang/BEAM-style structured memory.
+##
+## Why `go_arena(f)` and not the `go` keyword auto-wrap?
+##
+##   The `go` keyword is parsed as TOK_GO and lowered in `mir_lower.qz`
+##   directly to async-frame allocation + `Async.spawn` perform. Adding
+##   automatic arena lifecycle to the keyword path requires (a) extending
+##   the 56-byte frame layout with an arena slot and (b) injecting
+##   install/uninstall + arena_destroy into the generated $poll prologue/
+##   epilogue. Both are real compiler changes filed as Phase E.1.b.
+##
+##   E.1.a (this commit) ships the capability via stdlib opt-in. Users
+##   opt into per-task arena semantics with `go_arena(f)` instead of
+##   `go f()`. Same structured-memory win; no compiler change.
+##
+## Limitations (filed as Phase E.4 follow-up — escape mechanism):
+##   - Tasks must return `Int` or other value-typed data. Reference-typed
+##     returns (String, Vec) live in the per-task arena and dangle after
+##     `arena_destroy`. The `await` boundary auto-promote is E.4.
+##   - Heavy-allocating tasks (>50K allocations) can trigger the latent
+##     `arena_destroy` corruption bug filed in
+##     `docs/bugs/D2_ARENA_DESTROY_AT_TC_SCALE_CORRUPTS_HEAP.md`. Phase
+##     E.5 is the bug fix; E.1.a's task workloads are bounded and small
+##     enough not to hit it.
+##
+## What these tests prove:
+##
+##   E1.a — `go_arena(f)` runs and returns the right Int (sanity).
+##   E1.b — Inside the task body, an outer tracking handler observes far
+##           fewer allocations than from a direct call → per-task arena
+##           is absorbing the bulk of the allocations.
+##   E1.c — Two parallel `go_arena` tasks each Vec.push 100 ints; both
+##           return correct values → per-task arenas are isolated.
+##   E1.d — 50 sequential tasks each Vec.push 50 ints, total `await` sum
+##           matches expected → arenas don't leak, repeated alloc/dealloc
+##           cycles work.
+##   E1.e — `go_arena(f)` returning -1 after Int Vec build still returns
+##           -1 → sentinel return values aren't disturbed by teardown.
+
+import * from qspec
+import * from qspec/subprocess
+
+# -----------------------------------------------------------------------------
+# E1.a — basic smoke: go(f) runs, task body's vec_push works, await returns.
+# -----------------------------------------------------------------------------
+
+var _BASIC_SMOKE: String = """import std/sync/composition/go
+
+def task_body(): Int
+  var v = vec_new<Int>()
+  for i in 0..10
+    v.push(i * 7)
+  end
+  return v[9]
+end
+
+def main(): Int
+  sched_init(0)
+  var t = go_arena(task_body)
+  var r = await t
+  puts(str_from_int(r))
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E1.b — outer tracking handler does NOT observe inner task allocations
+# (per-task arena absorbs them). Compares direct call vs go-wrapped call.
+# -----------------------------------------------------------------------------
+
+var _OUTER_HANDLER_ISOLATED: String = """import std/sync/composition/go
+import std/alloc
+
+def heavy_alloc(): Int
+  var v = vec_new<Int>()
+  for i in 0..2000
+    v.push(i)
+  end
+  return v[1999]
+end
+
+def main(): Int
+  # Force single-worker scheduler — multi-worker `_PARALLEL_ISOLATION`
+  # below is the parallel proof; this test isolates allocation counting
+  # from the worker-vs-main effect-stack race documented in
+  # docs/bugs/EFFECT_STACK_TOP_GLOBAL_MULTI_WORKER_RACE.md. With one
+  # worker, the per-task install is on the same thread as main → outer
+  # tracking sees deterministic counts.
+  sched_init(1)
+
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    heavy_alloc()
+    0
+  end
+  var direct = alloc_tracking_alloc_count()
+
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    var t = go_arena(heavy_alloc)
+    var r = await t
+    0
+  end
+  var via_go = alloc_tracking_alloc_count()
+
+  # Direct call: every Vec.push grow goes through tracking → ~10 allocs
+  # for 2000 pushes (vec hdr + 8 grows: 8→16→...→2048).
+  # Via go_arena: per-task arena absorbs ALL Vec.push grows; tracking
+  # sees only the spawn-side + arena_new overhead. Differential proves
+  # the bulk of inner allocations no longer reach the outer handler.
+  if direct >= 8 and (direct - via_go) >= 4
+    puts(\"isolated\")
+  else
+    puts(\"direct=\" + str_from_int(direct) + \" via_go=\" + str_from_int(via_go))
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E1.c — two parallel tasks return correct independent values; per-task
+# arenas don't cross-pollute. Uses sched_init(0) (multi-worker default) to
+# exercise truly-parallel execution across worker threads.
+#
+# Pre-Phase-E.1.c, this test forced `sched_init(1)` because the effect-stack
+# global arrays raced across worker threads. Phase E.1.c (2026-04-28) made
+# `__qz_effect_stack_top` / `_names` / `_handlers` / `_op_filters` /
+# `_alloc_blessed_watermark` thread-local AND added a per-worker prelude
+# install of the blessed defaults at `__qz_sched_worker` entry — each
+# worker now has its own effect-stack view, so per-task `with E {...}`
+# installs are no longer racy. Bug doc: docs/bugs/EFFECT_STACK_TOP_GLOBAL_
+# MULTI_WORKER_RACE.md (RESOLVED).
+# -----------------------------------------------------------------------------
+
+var _PARALLEL_ISOLATION: String = """import std/sync/composition/go
+
+def task_a(): Int
+  var v = vec_new<Int>()
+  for i in 0..100
+    v.push(i * 3)
+  end
+  return v[99]
+end
+
+def task_b(): Int
+  var v = vec_new<Int>()
+  for i in 0..100
+    v.push(i * 5)
+  end
+  return v[99]
+end
+
+def main(): Int
+  sched_init(0)
+  var ta = go_arena(task_a)
+  var tb = go_arena(task_b)
+  var ra = await ta
+  var rb = await tb
+  # task_a: 99*3 = 297; task_b: 99*5 = 495.
+  if ra == 297 and rb == 495
+    puts(\"parallel_ok\")
+  else
+    puts(\"a=\" + str_from_int(ra) + \" b=\" + str_from_int(rb))
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E1.d — 50 sequential tasks each Vec.push 50 ints; arenas alloc + free
+# repeatedly without leak or crash. Sum verifies all returned correctly.
+# -----------------------------------------------------------------------------
+
+var _SEQUENTIAL_LOOP: String = """import std/sync/composition/go
+
+def task_func(): Int
+  var v = vec_new<Int>()
+  for i in 0..50
+    v.push(i)
+  end
+  return v[49]
+end
+
+def main(): Int
+  sched_init(0)
+  var sum = 0
+  for k in 0..50
+    var t = go_arena(task_func)
+    var r = await t
+    sum += r
+  end
+  # Each task returns 49. 50 tasks * 49 = 2450.
+  puts(str_from_int(sum))
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E1.e — sentinel return values pass through the arena teardown unchanged.
+# -1 (panic sentinel) and 0 (common success) MUST round-trip cleanly.
+# -----------------------------------------------------------------------------
+
+var _SENTINEL_RETURNS: String = """import std/sync/composition/go
+
+def returns_neg1(): Int
+  var v = vec_new<Int>()
+  v.push(42)
+  return -1
+end
+
+def returns_zero(): Int
+  var v = vec_new<Int>()
+  v.push(99)
+  return 0
+end
+
+def main(): Int
+  sched_init(0)
+  var r1 = await go_arena(returns_neg1)
+  var r2 = await go_arena(returns_zero)
+  if r1 == -1 and r2 == 0
+    puts(\"sentinels_ok\")
+  else
+    puts(\"r1=\" + str_from_int(r1) + \" r2=\" + str_from_int(r2))
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# =============================================================================
+# Spec entry point
+# =============================================================================
+
+def main(): Int
+  describe("Phase E.1 — go_arena(f) installs a per-task Alloc.in_arena handler") do ->
+
+    it("basic — go_arena(f) returns Int from a Vec-allocating task body") do ->
+      assert_run_stdout_eq(_BASIC_SMOKE, "63\n")
+    end
+
+    it("outer Alloc handler does not observe task-body allocations") do ->
+      assert_run_stdout_eq(_OUTER_HANDLER_ISOLATED, "isolated\n")
+    end
+
+    it("two parallel go_arena tasks return correct independent values") do ->
+      assert_run_stdout_eq(_PARALLEL_ISOLATION, "parallel_ok\n")
+    end
+
+    it("50 sequential tasks each Vec.push 50 ints — no leak, sum correct") do ->
+      assert_run_stdout_eq(_SEQUENTIAL_LOOP, "2450\n")
+    end
+
+    it("sentinel return values (-1, 0) pass through arena teardown") do ->
+      assert_run_stdout_eq(_SENTINEL_RETURNS, "sentinels_ok\n")
+    end
+
+  end
+  return qspec_main()
+end

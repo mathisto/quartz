@@ -1,0 +1,248 @@
+import * from qspec
+import * from std/actor
+import * from time
+
+# ============================================================================
+# C.14 Phase 1–2 — actor Supervisor (std/actor.qz)
+#
+# Phase 1: static one_for_one supervisor over a fixed set of actor spawn
+# closures. Death detection via channel_closed(inbox); fresh spawn via
+# the closure. Intensity escalation: > max_restarts within period_ms →
+# watcher exits.
+#
+# Phase 2 (this file extension): one_for_all + rest_for_one strategies
+# plus active-wake retrofit on the `@inbox | 2` close-event waker.
+# ============================================================================
+
+extern "C" def usleep(us: Int): Int
+
+actor Pinger
+  var n: Int = 0
+  def ping(): Void
+    n += 1
+  end
+  def get(): Int = n
+end
+
+def spawn_pinger(): Int = Pinger()
+
+def _qspec_is_slow(): Int = 1
+
+def main(): Int
+  describe("actor Supervisor (Phase 1 — one_for_one, permanent)") do ->
+    it("supervisor_new spawns the children up-front") do ->
+      var spawns = vec_new()
+      spawns.push(spawn_pinger)
+      spawns.push(spawn_pinger)
+      var sup = supervisor_new(spawns, 5, 10000)
+      var c0 = supervisor_child(sup, 0)
+      var c1 = supervisor_child(sup, 1)
+      c0.ping()
+      c1.ping()
+      c1.ping()
+      assert_eq(c0.get(), 1)
+      assert_eq(c1.get(), 2)
+      supervisor_stop(sup)
+    end
+
+    it("on .stop() of a child, supervisor respawns with fresh state") do ->
+      var spawns = vec_new()
+      spawns.push(spawn_pinger)
+      var sup = supervisor_new(spawns, 5, 10000)
+      var c1 = supervisor_child(sup, 0)
+      c1.ping()
+      c1.ping()
+      c1.ping()
+      assert_eq(c1.get(), 3)
+      c1.stop()
+      # Give the watcher a moment to detect inbox-close + respawn.
+      usleep(20000)
+      var c2 = supervisor_child(sup, 0)
+      assert_eq(c2.get(), 0)  # OTP semantics: fresh state on restart
+      assert_eq(supervisor_restart_count(sup), 1)
+      supervisor_stop(sup)
+    end
+
+    it("supervisor_alive is 1 while active, 0 after supervisor_stop") do ->
+      var spawns = vec_new()
+      spawns.push(spawn_pinger)
+      var sup = supervisor_new(spawns, 5, 10000)
+      assert_eq(supervisor_alive(sup), 1)
+      supervisor_stop(sup)
+      assert_eq(supervisor_alive(sup), 0)
+    end
+
+    it("supervisor_stop is idempotent") do ->
+      var spawns = vec_new()
+      spawns.push(spawn_pinger)
+      var sup = supervisor_new(spawns, 5, 10000)
+      supervisor_stop(sup)
+      supervisor_stop(sup)  # second call: no-op
+      assert_eq(supervisor_alive(sup), 0)
+    end
+
+    it("intensity escalation: > max_restarts within period_ms exits watcher") do ->
+      var spawns = vec_new()
+      spawns.push(spawn_pinger)
+      # max_restarts=2 within 60s → third death escalates.
+      var sup = supervisor_new(spawns, 2, 60000)
+      var i = 0
+      while i < 3
+        var c = supervisor_child(sup, 0)
+        c.stop()
+        usleep(30000)
+        i = i + 1
+      end
+      # After 3 deaths and 2 allowed restarts, watcher should have escalated.
+      # Brief settle window — the third death triggers escalation on the next
+      # watcher iteration, which may take a sched_yield cycle.
+      var attempts = 0
+      while supervisor_alive(sup) == 1 and attempts < 50
+        usleep(2000)
+        attempts = attempts + 1
+      end
+      assert_eq(supervisor_alive(sup), 0)
+      assert_eq(supervisor_restart_count(sup), 3)
+    end
+
+    it("link-cascade close of a supervised actor also triggers respawn") do ->
+      var spawns = vec_new()
+      spawns.push(spawn_pinger)
+      var sup = supervisor_new(spawns, 5, 10000)
+      var supervised = supervisor_child(sup, 0)
+      var external = Pinger()
+      # Bidirectional link: external.stop() should cascade-close supervised's inbox.
+      supervised.link(external)
+      external.stop()
+      # Watcher should detect supervised's inbox close + respawn.
+      usleep(30000)
+      var fresh = supervisor_child(sup, 0)
+      fresh.ping()
+      assert_eq(fresh.get(), 1)
+      assert_eq(supervisor_restart_count(sup), 1)
+      supervisor_stop(sup)
+    end
+  end
+
+  describe("actor Supervisor — strategies (Phase 2)") do ->
+    it("one_for_all: stopping one child restarts ALL children with fresh state") do ->
+      var spawns = vec_new()
+      spawns.push(spawn_pinger)
+      spawns.push(spawn_pinger)
+      spawns.push(spawn_pinger)
+      var sup = supervisor_with_strategy(spawns, SUPERVISOR_ONE_FOR_ALL, 5, 10000)
+      var c0 = supervisor_child(sup, 0)
+      var c1 = supervisor_child(sup, 1)
+      var c2 = supervisor_child(sup, 2)
+      c0.ping()
+      c1.ping()
+      c1.ping()
+      c2.ping()
+      c2.ping()
+      c2.ping()
+      assert_eq(c0.get(), 1)
+      assert_eq(c1.get(), 2)
+      assert_eq(c2.get(), 3)
+      # Stop child 1 — strategy should restart c0, c1, c2 (all fresh).
+      c1.stop()
+      usleep(60000)
+      var c0b = supervisor_child(sup, 0)
+      var c1b = supervisor_child(sup, 1)
+      var c2b = supervisor_child(sup, 2)
+      assert_eq(c0b.get(), 0)  # restarted (fresh state)
+      assert_eq(c1b.get(), 0)  # restarted (the trigger)
+      assert_eq(c2b.get(), 0)  # restarted (fresh state)
+      supervisor_stop(sup)
+    end
+
+    it("rest_for_one: stopping child i restarts children at index >= i") do ->
+      var spawns = vec_new()
+      spawns.push(spawn_pinger)
+      spawns.push(spawn_pinger)
+      spawns.push(spawn_pinger)
+      var sup = supervisor_with_strategy(spawns, SUPERVISOR_REST_FOR_ONE, 5, 10000)
+      var c0 = supervisor_child(sup, 0)
+      var c1 = supervisor_child(sup, 1)
+      var c2 = supervisor_child(sup, 2)
+      c0.ping()
+      c1.ping()
+      c1.ping()
+      c2.ping()
+      c2.ping()
+      c2.ping()
+      assert_eq(c0.get(), 1)
+      assert_eq(c1.get(), 2)
+      assert_eq(c2.get(), 3)
+      # Stop child 1 — c0 should keep state, c1 + c2 restart fresh.
+      c1.stop()
+      usleep(60000)
+      var c0b = supervisor_child(sup, 0)
+      var c1b = supervisor_child(sup, 1)
+      var c2b = supervisor_child(sup, 2)
+      assert_eq(c0b.get(), 1)  # NOT restarted (lower-index sibling)
+      assert_eq(c1b.get(), 0)  # restarted (the trigger)
+      assert_eq(c2b.get(), 0)  # restarted (index > trigger)
+      supervisor_stop(sup)
+    end
+
+    it("rest_for_one: stopping last child only restarts that one") do ->
+      var spawns = vec_new()
+      spawns.push(spawn_pinger)
+      spawns.push(spawn_pinger)
+      spawns.push(spawn_pinger)
+      var sup = supervisor_with_strategy(spawns, SUPERVISOR_REST_FOR_ONE, 5, 10000)
+      var c0 = supervisor_child(sup, 0)
+      var c1 = supervisor_child(sup, 1)
+      var c2 = supervisor_child(sup, 2)
+      c0.ping()
+      c1.ping()
+      c1.ping()
+      c2.ping()
+      c2.stop()
+      usleep(40000)
+      var c0b = supervisor_child(sup, 0)
+      var c1b = supervisor_child(sup, 1)
+      var c2b = supervisor_child(sup, 2)
+      assert_eq(c0b.get(), 1)
+      assert_eq(c1b.get(), 2)
+      assert_eq(c2b.get(), 0)
+      supervisor_stop(sup)
+    end
+  end
+
+  describe("actor Supervisor — active-wake latency (Phase 2)") do ->
+    it("watcher wakes within active-wake budget on inbox close") do ->
+      # Active-wake: channel_close emits notify_all(@inbox | 2) which
+      # sched_wakes the watcher's pending sched_sleep. Observation should
+      # be ~us, not the SUPERVISOR_PARK_MS (50ms) long-poll cadence.
+      # Test budget: 25ms — generous for scheduler jitter, well under the
+      # 50ms long-poll fallback that would catch us if active-wake regressed.
+      var spawns = vec_new()
+      spawns.push(spawn_pinger)
+      var sup = supervisor_new(spawns, 5, 10000)
+      # Give the watcher a moment to register its close-event waker.
+      usleep(20000)
+      var c = supervisor_child(sup, 0)
+      var t0 = time_mono_ns()
+      c.stop()
+      # Spin until the supervisor reports a restart. Bounded at 100ms.
+      var attempts = 0
+      while supervisor_restart_count(sup) == 0 and attempts < 100
+        usleep(1000)
+        attempts = attempts + 1
+      end
+      var elapsed_ms = (time_mono_ns() - t0) / 1_000_000
+      assert_eq(supervisor_restart_count(sup), 1)
+      # Active-wake should observe close in well under the 50ms park
+      # budget. Allow 25ms slack for scheduler scheduling + actor stop
+      # round-trip (the stop protocol blocks for an ack reply).
+      if elapsed_ms > 25
+        puts("WARN: active-wake latency #{elapsed_ms}ms — expected < 25ms (50ms park budget)")
+      end
+      assert_eq(elapsed_ms < 50, true)
+      supervisor_stop(sup)
+    end
+  end
+
+  return qspec_main()
+end

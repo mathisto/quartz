@@ -1,0 +1,198 @@
+# QSpec coverage for self-hosted/backend/niche.qz — the Phase 4 niche query +
+# single-payload enum layout decision (B.10 §14). Pure core: given a type name,
+# report its extra-inhabitant run; given an enum's shape, decide niche-vs-tag.
+# Tested standalone (no MirContext). N0 is decision-logic only — NOT wired into
+# codegen — so these verdicts are the contract N1 will make codegen obey.
+
+import * from qspec
+import niche as nm
+import mir
+import ast
+
+# ----------------------------------------------------------------------------
+# B.10 §14 N3 (item 6.1) — boxed-pointer null-niche classifier truth table.
+# `mir_payload_is_boxed_classify` is the flag-INDEPENDENT core of the boxedness
+# predicate. The niche has since LANDED: `mir_boxed_niche_enabled()` is 1, so the
+# flag-gated `mir_payload_is_boxed` wrapper now delegates to classify (gated per
+# class — String/struct/clean-builtin gates are all live). Testing the classify
+# helper directly exercises the carve-out soundness boundary; the wrapper block
+# below asserts the LIVE (flag-on) delegation.
+# ----------------------------------------------------------------------------
+
+## A fresh MirContext with two registered structs: a BOXED user struct (`Point`)
+## and an @value (inline) struct (`Vec2`), so the struct→1 / @value→0 rows are
+## testable. mir_register_struct's is_value flag (arg 6) is the discriminator.
+def _niche_ctx(): mir::MirContext
+  var prog = mir::mir_new_program()
+  var ctx = mir::mir_new_context(prog)
+  var store = ast::ast_new_storage()
+  # Boxed user struct: is_value = 0.
+  mir::mir_ctx_register_struct(ctx, "Point", ["x", "y"], ["Int", "Int"], 0, 0, 0, [], store)
+  # @value inline struct: is_value = 1.
+  mir::mir_ctx_register_struct(ctx, "Vec2", ["x", "y"], ["Int", "Int"], 0, 0, 1, [], store)
+  return ctx
+end
+
+def main(): Int
+  describe("type_niche — extra-inhabitant query") do ->
+    it("Bool → niche {2..255} (254 values; only 0/1 valid in i8)") do ->
+      var b = nm::type_niche("Bool")
+      assert_eq(nm::niche_has(b), 1)
+      assert_eq(nm::niche_start(b), 2)
+      assert_eq(nm::niche_count(b), 254)
+    end
+
+    it("&T → niche {0} (borrows are never null)") do ->
+      var r = nm::type_niche("&T")
+      assert_eq(nm::niche_has(r), 1)
+      assert_eq(nm::niche_start(r), 0)
+      assert_eq(nm::niche_count(r), 1)
+    end
+
+    it("&mut T → niche {0} (mutable borrow, also non-null)") do ->
+      var r = nm::type_niche("&mut Point")
+      assert_eq(nm::niche_has(r), 1)
+      assert_eq(nm::niche_count(r), 1)
+    end
+
+    it("Int → no niche (a full 64-bit integer occupies every pattern)") do ->
+      assert_eq(nm::niche_has(nm::type_niche("Int")), 0)
+    end
+
+    it("I64/U64 → no niche") do ->
+      assert_eq(nm::niche_has(nm::type_niche("I64")), 0)
+      assert_eq(nm::niche_has(nm::type_niche("U64")), 0)
+    end
+
+    it("CPtr → no niche (FFI null is a legitimate sentinel — never niche it)") do ->
+      assert_eq(nm::niche_has(nm::type_niche("CPtr")), 0)
+    end
+
+    it("a struct/other type name → no niche in N0") do ->
+      assert_eq(nm::niche_has(nm::type_niche("Point")), 0)
+      assert_eq(nm::niche_has(nm::type_niche("F64")), 0)
+    end
+  end
+
+  describe("enum_layout — single-payload enum decision") do ->
+    it("Option<Bool> (1 payload + 1 dataless, Bool niche) → NICHE at 2") do ->
+      var l = nm::enum_layout(1, 1, "Bool")
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_NICHE)
+      assert_eq(nm::enum_layout_niche_start(l), 2)
+      assert_eq(nm::enum_layout_dataless_used(l), 1)
+    end
+
+    it("Option<&T> (1 payload + 1 dataless, null niche) → NICHE at 0") do ->
+      var l = nm::enum_layout(1, 1, "&T")
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_NICHE)
+      assert_eq(nm::enum_layout_niche_start(l), 0)
+    end
+
+    it("Option<Int> (no payload niche) → SPILL (today's tag layout)") do ->
+      var l = nm::enum_layout(1, 1, "Int")
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_SPILL)
+    end
+
+    it("multi-payload enum (2 payload variants) → SPILL") do ->
+      var l = nm::enum_layout(2, 0, "Bool")
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_SPILL)
+    end
+
+    it("no dataless variant (not Option-shaped) → SPILL") do ->
+      var l = nm::enum_layout(1, 0, "Bool")
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_SPILL)
+    end
+
+    it("more dataless variants than niche values → SPILL (&T has only 1)") do ->
+      var l = nm::enum_layout(1, 2, "&T")
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_SPILL)
+    end
+
+    it("2 dataless over Bool (254 niches) → NICHE, ascending from 2") do ->
+      var l = nm::enum_layout(1, 2, "Bool")
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_NICHE)
+      assert_eq(nm::enum_layout_niche_start(l), 2)
+      assert_eq(nm::enum_layout_dataless_used(l), 2)
+    end
+  end
+
+  describe("mir_payload_is_boxed_classify — N3 boxedness truth table (flag-independent)") do ->
+    it("boxed user struct (non-@value) → 1") do ->
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "Point"), 1)
+    end
+
+    it("@value (inline) struct → 0 (not a boxed pointer)") do ->
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "Vec2"), 0)
+    end
+
+    it("CPtr → 0 (FFI null is a legitimate sentinel, stays tagged)") do ->
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "CPtr"), 0)
+    end
+
+    it("nested Option<…> → 0 (only the innermost niches; soundness)") do ->
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "Option<String>"), 0)
+    end
+
+    it("String → 1 (boxed heap builtin)") do ->
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "String"), 1)
+    end
+
+    it("Vec / Vec<…> → 1 (boxed heap builtin, bare + generic)") do ->
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "Vec"), 1)
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "Vec<Int>"), 1)
+    end
+
+    it("Map / Set / IntMap → 1 (boxed heap builtins)") do ->
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "Map<String, Int>"), 1)
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "Set<Int>"), 1)
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "IntMap"), 1)
+    end
+
+    it("Int / I64 / Bool / NonZero → 0 (scalars; not boxed)") do ->
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "Int"), 0)
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "I64"), 0)
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "Bool"), 0)
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "NonZero"), 0)
+    end
+
+    it("MirBlock / AstStorage → 0 (sanctioned handles; 0 is a structural sentinel)") do ->
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "MirBlock"), 0)
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "AstStorage"), 0)
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "mir$MirBlock"), 0)
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "ast$AstStorage"), 0)
+    end
+
+    it("unregistered non-builtin name → 0 (not a known boxed type)") do ->
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), "Widget"), 0)
+    end
+
+    it("empty payload type → 0") do ->
+      assert_eq(mir::mir_payload_is_boxed_classify(_niche_ctx(), ""), 0)
+    end
+  end
+
+  describe("mir_payload_is_boxed — flag-gated wrapper is LIVE (niche LANDED)") do ->
+    it("master flag is ON (1)") do ->
+      assert_eq(mir::mir_boxed_niche_enabled(), 1)
+    end
+
+    it("wrapper niches boxed builtins/structs while flag on (matches classify)") do ->
+      # Flag on ⇒ the wrapper delegates to mir_payload_is_boxed_classify. String
+      # (6.4b), non-@value user structs (Phase 3), and clean heap builtins (6.4a)
+      # all have LIVE per-class gates, so each niches → 1.
+      assert_eq(mir::mir_payload_is_boxed(_niche_ctx(), "String"), 1)
+      assert_eq(mir::mir_payload_is_boxed(_niche_ctx(), "Point"), 1)
+      assert_eq(mir::mir_payload_is_boxed(_niche_ctx(), "Vec<Int>"), 1)
+    end
+
+    it("wrapper stays 0 for non-niche payloads (matches classify, flag-on)") do ->
+      # CPtr (FFI sentinel), scalars, and @value structs never niche even with the
+      # flag on — the wrapper passes them straight through classify to 0.
+      assert_eq(mir::mir_payload_is_boxed(_niche_ctx(), "CPtr"), 0)
+      assert_eq(mir::mir_payload_is_boxed(_niche_ctx(), "Int"), 0)
+      assert_eq(mir::mir_payload_is_boxed(_niche_ctx(), "Vec2"), 0)
+    end
+  end
+
+  return qspec_main()
+end

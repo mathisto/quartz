@@ -1,0 +1,196 @@
+## Regression spec for using a top-level function name as a struct-field
+## initializer.
+##
+## Pre-fix bug: the resolver had two compounding holes —
+##
+##   1. resolve_rewrite_node's NK_STRUCT_INIT branch recursed on
+##      `ast_get_right(field)`, but field children of NODE_STRUCT_INIT
+##      ARE the value expressions themselves (NODE_IDENT, etc.) — not
+##      wrapped in any field-binding node. NODE_IDENT.right is 0, so
+##      the recursion no-op'd and the value never got rewritten.
+##
+##   2. resolve_rewrite_node's NK_IDENT branch only rewrote names
+##      matching `local_lets` (let/const declarations). Function names
+##      used in expression position — passed as argument, stored as
+##      struct field, etc. — never got the module prefix even when the
+##      bug above was bypassed.
+##
+## Together these meant: bare function references in struct-field-init
+## position survived to mir_lower as unprefixed NODE_IDENTs, failed
+## function-registry lookup (function was registered as `<prefix>$<name>`),
+## and fell through to the const-global LOAD_VAR path. llc rejected the
+## resulting IR with `use of undefined value '%<name>'`. Stdlib silently
+## worked around this for years by always using lambdas (e.g.,
+## `next_fn: -> src.next()` in std/iter.qz:329).
+##
+## Discovered 2026-05-03 during TUI runtime dogfood (`Program { recorder:
+## no_recorder }` failed at link time despite typechecking cleanly).
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("function-as-value in struct-field-init position") do ->
+
+    it("uses a same-module top-level function as field initializer") do ->
+      var files: Vec = vec_new()
+      vec_push(files, as_int("main.qz"))
+      var src = """
+def make_value(): Int = 42
+
+struct Holder
+  f: Fn(): Int
+end
+
+def make_holder(): Holder = Holder { f: make_value }
+
+def main(): Int
+  var h = make_holder()
+  return (h.f)()
+end
+"""
+      vec_push(files, as_int(src))
+      assert_multi_run_exits(files, 0, 42)
+    end
+
+    it("uses an imported-module function as field initializer") do ->
+      var files: Vec = vec_new()
+      vec_push(files, as_int("provider.qz"))
+      var provider_src = """
+def supply(): Int = 99
+"""
+      vec_push(files, as_int(provider_src))
+      vec_push(files, as_int("main.qz"))
+      var main_src = """
+import * from provider
+
+struct Holder
+  f: Fn(): Int
+end
+
+def main(): Int
+  var h = Holder { f: supply }
+  return (h.f)()
+end
+"""
+      vec_push(files, as_int(main_src))
+      assert_multi_run_exits(files, 1, 99)
+    end
+
+    it("uses a qualified-import function as field initializer (HB-DOG.12)") do ->
+      # `import provider` (qualified) registers the function under the
+      # module-prefixed name `provider$supply`. Used by its bare name as
+      # a *value*, mir_lower's NODE_IDENT path missed `mir_lookup_function`
+      # and fell through to a bogus `load %supply` → llc `use of undefined
+      # value`. The NODE_CALL path already suffix-searched `all_funcs`;
+      # the fix mirrors that search in the function-as-value path.
+      var files: Vec = vec_new()
+      vec_push(files, as_int("provider.qz"))
+      var provider_src = """
+def supply(): Int = 77
+"""
+      vec_push(files, as_int(provider_src))
+      vec_push(files, as_int("main.qz"))
+      var main_src = """
+import provider
+
+struct Holder
+  f: Fn(): Int
+end
+
+def main(): Int
+  var h = Holder { f: supply }
+  return (h.f)()
+end
+"""
+      vec_push(files, as_int(main_src))
+      assert_multi_run_exits(files, 1, 77)
+    end
+
+    it("uses a generic function as field initializer in a generic struct") do ->
+      var files: Vec = vec_new()
+      vec_push(files, as_int("main.qz"))
+      var src = """
+def double(x: Int): Int = x * 2
+
+struct Mapper<T>
+  f: Fn(T): T
+end
+
+def make_mapper<T>(): Mapper<T> = Mapper { f: double }
+
+def main(): Int
+  var m = make_mapper<Int>()
+  return (m.f)(11)
+end
+"""
+      vec_push(files, as_int(src))
+      assert_multi_run_exits(files, 0, 22)
+    end
+
+    it("an inferred local bound from a non-Int Fn field keeps its return type (HB-DOG.13)") do ->
+      # `f = d.clock` (no explicit annotation) infers f's type from the
+      # `Fn(): F64` field. The binding's type_ann was reconstructed via
+      # tc_type_name_full, which rendered the Fn ptype as garbage
+      # (`Function<Int>`) — so the later call `f()` defaulted to an Int
+      # return and `return f()` failed QZ0200 (expected F64, got Int).
+      # Fixed by rendering Fn ptypes as their real `Fn(...): R` annotation.
+      var files: Vec = vec_new()
+      vec_push(files, as_int("main.qz"))
+      var src = """
+struct Dev
+  clock: Fn(): F64
+end
+
+def real_clock(): F64 = 2.5
+
+def use_dev(d: Dev): F64
+  f = d.clock
+  return f()
+end
+
+def main(): Int
+  var d = Dev { clock: real_clock }
+  return to_int(use_dev(d) * 2.0)
+end
+"""
+      vec_push(files, as_int(src))
+      assert_multi_run_exits(files, 0, 5)
+    end
+
+    it("preserves the working pattern of lambdas as field initializers") do ->
+      var files: Vec = vec_new()
+      vec_push(files, as_int("main.qz"))
+      var src = """
+struct Holder
+  f: Fn(): Int
+end
+
+def main(): Int
+  var h = Holder { f: -> 7 }
+  return (h.f)()
+end
+"""
+      vec_push(files, as_int(src))
+      assert_multi_run_exits(files, 0, 7)
+    end
+
+    it("preserves call-position function references (regression)") do ->
+      var files: Vec = vec_new()
+      vec_push(files, as_int("provider.qz"))
+      var provider_src = """
+def supply(): Int = 13
+"""
+      vec_push(files, as_int(provider_src))
+      vec_push(files, as_int("main.qz"))
+      var main_src = """
+import * from provider
+def main(): Int = supply()
+"""
+      vec_push(files, as_int(main_src))
+      assert_multi_run_exits(files, 1, 13)
+    end
+
+  end
+  return qspec_main()
+end

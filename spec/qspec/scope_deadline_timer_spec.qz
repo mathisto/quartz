@@ -1,0 +1,139 @@
+## scope deadline timer (B.7 Phase 4d)
+##
+## A scope with a deadline registers a background pthread (via the
+## `scope_register_deadline` intrinsic) that proactively fires the cancel
+## walk when the deadline arrives. Without this timer, the cancel only
+## propagates lazily — when something on the polled scope's path calls
+## `is_cancelled` or `check`. This spec exercises the proactive guarantee
+## by setting up scenes where lazy fire alone would leave the parent's
+## atom unset, then asserting that the parent's reason and cancelled_at
+## are populated WITHOUT the test ever polling the parent first.
+##
+## Each test waits ~80ms past a 50ms deadline so the timer thread has
+## ample time to fire on a CI machine; longer waits guard against
+## scheduler jitter without inflating the suite runtime materially.
+
+import * from qspec
+import * from std/sync/composition/scope
+
+# Module-level helpers — keep closures small for runner sanity.
+
+def is_in_range(v: Int, lo: Int, hi: Int): Int
+  if v >= lo and v <= hi
+    return 1
+  end
+  return 0
+end
+
+def main(): Int
+  describe("scope deadline timer (B.7 Phase 4d)") do ->
+
+    it("scope_timeout fires proactively after the deadline (no polling required)") do ->
+      var s = scope_timeout(scope_root(), 50)
+      sleep_ms(120)
+      # We never polled `s` between creation and this read — the only thing
+      # that could have set the cancel atom proactively is the deadline
+      # thread. Lazy fire would also pass this assertion (the read calls
+      # is_cancelled internally) so this is a smoke check, not the
+      # discriminator.
+      assert_eq(scope_is_cancelled(s), true)
+      assert_eq_str(scope_cancel_reason(s), "deadline_exceeded")
+    end
+
+    it("parent's deadline timer cancels sibling children without anyone polling parent") do ->
+      # Parent has the deadline; children are scope_with_cancel (no own
+      # deadline registered). With lazy fire alone, polling child_a sets
+      # child_a's atom but does NOT set child_b's — siblings don't cascade
+      # across each other. The proactive timer fires the parent, which
+      # walks ALL children under the tree mutex and stamps each one with
+      # reason "deadline_exceeded".
+      var parent = scope_timeout(scope_root(), 50)
+      var child_a = scope_with_cancel(parent)
+      var child_b = scope_with_cancel(parent)
+      sleep_ms(120)
+      # We poll child_b FIRST — without the timer, child_a would still be
+      # un-stamped (atom 0, reason "") because no one polled it and no
+      # parent walk fired. With the timer, parent.cancel walked both
+      # before we got here, so child_a is fully stamped.
+      assert_eq(scope_is_cancelled(child_b), true)
+      assert_eq(scope_is_cancelled(child_a), true)
+      assert_eq_str(scope_cancel_reason(child_a), "deadline_exceeded")
+      assert_eq_str(scope_cancel_reason(child_b), "deadline_exceeded")
+      # Parent itself — never polled until now — must also be stamped.
+      assert_eq_str(scope_cancel_reason(parent), "deadline_exceeded")
+      var at = scope_cancelled_at(parent)
+      var have_stamp = 0
+      if at > 0
+        have_stamp = 1
+      end
+      assert_eq(have_stamp, 1)
+    end
+
+    it("tighter child timer fires before looser parent timer") do ->
+      # Parent: 5s deadline (won't fire during this test). Child: 50ms.
+      # Child registers its own timer because parent_dl > child_dl. Child's
+      # timer fires; parent stays alive.
+      var parent = scope_timeout(scope_root(), 5_000)
+      var child = scope_timeout(parent, 50)
+      sleep_ms(120)
+      assert_eq(scope_is_cancelled(child), true)
+      assert_eq_str(scope_cancel_reason(child), "deadline_exceeded")
+      # Parent should still be alive (its deadline is ~5s out).
+      assert_eq(scope_is_cancelled(parent), false)
+      var rem = scope_deadline_remaining_ms(parent)
+      # Parent has ~4880ms remaining (5000 - 120). Allow a wide range.
+      assert_eq(is_in_range(rem, 4_500, 5_000), 1)
+    end
+
+    it("child inheriting parent's deadline does NOT register a duplicate timer") do ->
+      # Parent: 50ms. Child: scope_with_cancel inherits parent's deadline.
+      # Child should NOT register a timer (parent_dl == child_dl). The
+      # observable consequence: when parent's timer fires, the cancel
+      # walk reaches the child via descendant traversal — not via a
+      # second independent thread. Both stamps must come from the same
+      # walk (same reason, both within the same time window).
+      var parent = scope_timeout(scope_root(), 50)
+      var child = scope_with_cancel(parent)
+      sleep_ms(120)
+      # Parent first so we see the stamp from the timer-driven walk.
+      assert_eq_str(scope_cancel_reason(parent), "deadline_exceeded")
+      assert_eq_str(scope_cancel_reason(child), "deadline_exceeded")
+      # Both stamps should be very close (same descendant walk under
+      # the tree mutex) — within a few ms of each other.
+      var p_at = scope_cancelled_at(parent)
+      var c_at = scope_cancelled_at(child)
+      var diff = c_at - p_at
+      if diff < 0
+        diff = -diff
+      end
+      # 5ms = 5_000_000 ns. Sufficient for the cas + store sequence.
+      var close = 0
+      if diff < 5_000_000
+        close = 1
+      end
+      assert_eq(close, 1)
+    end
+
+    it("scope_deadline (absolute ns) registers a timer that fires") do ->
+      var abs_ns = time_mono_ns() + 50 * 1_000_000
+      var s = scope_deadline(scope_root(), abs_ns)
+      sleep_ms(120)
+      assert_eq(scope_is_cancelled(s), true)
+      assert_eq_str(scope_cancel_reason(s), "deadline_exceeded")
+    end
+
+    it("explicit cancel before deadline beats the timer; reason stays user-supplied") do ->
+      # Timer fires at +50ms. We cancel at +0ms with our own reason.
+      # Because _scope_fire_cancel is atomic-cas-and-skip-if-not-winner,
+      # the timer's later fire is a no-op — our reason stays.
+      var s = scope_timeout(scope_root(), 50)
+      scope_cancel_with(s, "user kicked it")
+      assert_eq_str(scope_cancel_reason(s), "user kicked it")
+      sleep_ms(120)
+      # Timer has fired by now but lost the cas — reason unchanged.
+      assert_eq_str(scope_cancel_reason(s), "user kicked it")
+    end
+
+  end
+  return qspec_main()
+end

@@ -1,0 +1,591 @@
+## std/tui/widgets/list.qz — vertical scrollable single-select list.
+##
+## Generic over Item — the consumer supplies an ItemDelegate that
+## teaches the list how to render an Item value to a String. This
+## decouples list mechanics (selection, scrolling, key dispatch) from
+## item appearance.
+##
+## Selection is index-based (`selected: Option<Int>`); the
+## consumer can read the current item via `list_selected_item(l)`.
+## Items setter clamps selection to the new range.
+##
+## Two semantic events:
+##   - Highlighted(item): cursor moved (preview-on-highlight pattern)
+##   - Selected(item):    Enter pressed (commit-on-select pattern)
+##
+## v0.3.2 ships minimal: items + cursor + offset + delegate + styles.
+## No filter (consumers compose TextInput + List), no title, no
+## status bar, no help — those are separate widgets in v0.3.3+. The
+## one feature kept inline is `wrap_around` (cursor wraps from last
+## to first on Down past end) — it's a 5-line addition and a
+## conventional list expectation.
+##
+## @since 5.28.x
+
+import std/tui/runtime as tui
+import std/terminal
+import style
+import std/tui/widgets/_string_helpers as _sh
+
+# ============================================================
+# Public types
+# ============================================================
+
+## ItemDelegate teaches List how to render an Item.
+##
+## The delegate carries a `show: Fn(Item): String` that produces the
+## item's content as a String, and a `height: Int` indicating how many
+## lines that String spans. List applies the cursor indicator gutter,
+## selection styling, and per-line width clipping above the delegate's
+## output — the delegate just describes "what does an Item look like
+## as height-many lines of text."
+##
+## For card-style rendering (height>1), `show(item)` should return a
+## String with `\n` separators between rows; List splits, pads with
+## blank lines if fewer than `height`, and truncates if more. Selection
+## styling spans every row of the selected item; the cursor indicator
+## ("▶ ") only renders on the first row.
+##
+## (A richer delegate signature taking `is_selected` + `width` so
+## delegates can do their own selection-aware rendering exists in
+## bubbletea's bubbles. We tried it; the closure-stored-in-struct
+## codegen path tripped a Quartz IR-emit dominance bug for lambdas
+## that capture an outer Fn parameter and end up in a struct field.
+## Filed. The single-show + height-rows model lets us ship card-style
+## rendering today without that codegen bug — the cost is that the
+## delegate can't customize per-row styling based on is_selected, but
+## that's a List-layer concern anyway.)
+struct ItemDelegate<Item>
+  show: Fn(Item): String
+  height: Int
+end
+
+## Convenience factory: build a height-1 delegate from a show function.
+def item_delegate_simple<Item>(show: Fn(Item): String): ItemDelegate<Item>
+  return ItemDelegate { show: show, height: 1 }
+end
+
+## Build a multi-row card delegate. `show(item)` should return a String
+## with `\n` between rows. height < 1 clamps to 1.
+def item_delegate_card<Item>(show: Fn(Item): String, height: Int): ItemDelegate<Item>
+  var h = height
+  if h < 1
+    h = 1
+  end
+  return ItemDelegate { show: show, height: h }
+end
+
+## ListEvent — semantic events emitted by list_update. `Idle` means
+## no semantic event happened (key was a no-op or just moved cursor
+## without producing a meaningful event for the parent).
+##
+## `Highlighted(item)` fires when the cursor moves and lands on a
+## different item — preview-on-highlight pattern. `Selected(item)`
+## fires when Enter is pressed on the highlighted item.
+enum ListEvent<Item>
+  Idle
+  Highlighted(item: Item)
+  Selected(item: Item)
+end
+
+## Per-slot Style values for rendering rows.
+struct ListStyles
+  cursor:      Style    # cursor indicator gutter (e.g. "▶ ")
+  cursor_text: Style    # text styling on the selected row
+  text:        Style    # text styling on unselected rows
+  scrollbar:   Style
+end
+
+def list_styles_default(): ListStyles
+  return ListStyles {
+    cursor:      Style.new().bold(),
+    cursor_text: Style.new().bold().inverse(),
+    text:        Style.new(),
+    scrollbar:   Style.new().dim()
+  }
+end
+
+## List<Item> widget.
+struct List<Item>
+  items:          Vec<Item>
+  delegate:       ItemDelegate<Item>
+  selected:       Option<Int>
+  offset:         Int
+  width:          Int
+  height:         Int
+  show_scrollbar: Bool
+  wrap_around:    Bool
+  styles:         ListStyles
+end
+
+# ============================================================
+# Constructors + builders
+# ============================================================
+
+## Construct a List with the given items and delegate. Initial
+## selection is Some(0) if items is non-empty, None otherwise.
+## offset starts at 0.
+def list_new<Item>(items: Vec<Item>, delegate: ItemDelegate<Item>): List<Item>
+  var sel = Option::None
+  if items.size > 0
+    sel = Option::Some(0)
+  end
+  return List {
+    items: items, delegate: delegate, selected: sel, offset: 0,
+    width: 60, height: 10, show_scrollbar: false,
+    wrap_around: false, styles: list_styles_default()
+  }
+end
+
+def list_with_size<Item>(l: List<Item>, w: Int, h: Int): List<Item>
+  return List {
+    items: l.items, delegate: l.delegate, selected: l.selected,
+    offset: l.offset, width: w, height: h,
+    show_scrollbar: l.show_scrollbar, wrap_around: l.wrap_around,
+    styles: l.styles
+  }
+end
+
+def list_with_scrollbar<Item>(l: List<Item>, on: Bool): List<Item>
+  return List {
+    items: l.items, delegate: l.delegate, selected: l.selected,
+    offset: l.offset, width: l.width, height: l.height,
+    show_scrollbar: on, wrap_around: l.wrap_around, styles: l.styles
+  }
+end
+
+def list_with_wrap_around<Item>(l: List<Item>, on: Bool): List<Item>
+  return List {
+    items: l.items, delegate: l.delegate, selected: l.selected,
+    offset: l.offset, width: l.width, height: l.height,
+    show_scrollbar: l.show_scrollbar, wrap_around: on, styles: l.styles
+  }
+end
+
+def list_with_styles<Item>(l: List<Item>, s: ListStyles): List<Item>
+  return List {
+    items: l.items, delegate: l.delegate, selected: l.selected,
+    offset: l.offset, width: l.width, height: l.height,
+    show_scrollbar: l.show_scrollbar, wrap_around: l.wrap_around, styles: s
+  }
+end
+
+# ============================================================
+# Items management
+# ============================================================
+
+## Replace items. Selection is clamped: if the previously-selected
+## index is still in range, it survives; otherwise it's adjusted to
+## the last valid index (or None if items is empty). offset is
+## clamped to keep the selection visible.
+def list_set_items<Item>(l: List<Item>, items: Vec<Item>): List<Item>
+  var n = items.size
+  if n == 0
+    return List {
+      items: items, delegate: l.delegate, selected: Option::None,
+      offset: 0, width: l.width, height: l.height,
+      show_scrollbar: l.show_scrollbar, wrap_around: l.wrap_around,
+      styles: l.styles
+    }
+  end
+  var new_sel = Option::Some(0)
+  match l.selected
+    Some(idx) =>
+      if idx < n
+        new_sel = Option::Some(idx)
+      else
+        new_sel = Option::Some(n - 1)
+      end
+    None =>
+      new_sel = Option::Some(0)
+  end
+  var clamped_offset = _list_clamp_offset(l.offset, n, _list_visible_items(l))
+  return List {
+    items: items, delegate: l.delegate, selected: new_sel,
+    offset: clamped_offset, width: l.width, height: l.height,
+    show_scrollbar: l.show_scrollbar, wrap_around: l.wrap_around,
+    styles: l.styles
+  }
+end
+
+# ============================================================
+# Accessors
+# ============================================================
+
+def list_selected_index<Item>(l: List<Item>): Option<Int> = l.selected
+def list_size<Item>(l: List<Item>): Int = l.items.size
+def list_offset<Item>(l: List<Item>): Int = l.offset
+
+## Return the currently-selected item, or None if no selection.
+def list_selected_item<Item>(l: List<Item>): Option<Item>
+  match l.selected
+    Some(idx) => return Option::Some(l.items[idx])
+    None      => return Option::None
+  end
+end
+
+# ============================================================
+# State setters
+# ============================================================
+
+## Set the selected index. Out-of-range indices clamp; calling on
+## empty list is a no-op (selected stays None). Offset adjusts to
+## keep selection visible.
+def list_set_selected<Item>(l: List<Item>, idx: Int): List<Item>
+  var n = l.items.size
+  if n == 0
+    return l
+  end
+  var clamped = idx
+  if clamped < 0
+    clamped = 0
+  end
+  if clamped >= n
+    clamped = n - 1
+  end
+  var new_offset = _list_ensure_visible(l.offset, clamped, _list_visible_items(l))
+  return List {
+    items: l.items, delegate: l.delegate, selected: Option::Some(clamped),
+    offset: new_offset, width: l.width, height: l.height,
+    show_scrollbar: l.show_scrollbar, wrap_around: l.wrap_around,
+    styles: l.styles
+  }
+end
+
+def list_select_first<Item>(l: List<Item>): List<Item> = list_set_selected(l, 0)
+def list_select_last<Item>(l: List<Item>): List<Item> = list_set_selected(l, l.items.size - 1)
+
+## Move selection forward by 1. Wraps to first if `wrap_around` is on
+## and we're at the last item.
+def list_select_next<Item>(l: List<Item>): List<Item>
+  var n = l.items.size
+  if n == 0
+    return l
+  end
+  match l.selected
+    Some(idx) =>
+      var next = idx + 1
+      if next >= n
+        if l.wrap_around
+          return list_set_selected(l, 0)
+        end
+        return l
+      end
+      return list_set_selected(l, next)
+    None =>
+      return list_set_selected(l, 0)
+  end
+end
+
+## Move selection back by 1. Wraps to last if `wrap_around` is on
+## and we're at the first item.
+def list_select_prev<Item>(l: List<Item>): List<Item>
+  var n = l.items.size
+  if n == 0
+    return l
+  end
+  match l.selected
+    Some(idx) =>
+      if idx == 0
+        if l.wrap_around
+          return list_set_selected(l, n - 1)
+        end
+        return l
+      end
+      return list_set_selected(l, idx - 1)
+    None =>
+      return list_set_selected(l, 0)
+  end
+end
+
+# ============================================================
+# Update + view
+# ============================================================
+
+def list_update<Item, M>(
+  l: List<Item>,
+  msg: tui::FrameMsg<M>
+): (List<Item>, tui::Cmd<M>, ListEvent<Item>)
+  match msg
+    tui::FrameMsg::Key(k) => return _list_handle_key(l, k.code)
+    _ => return (l, tui::Cmd::None, ListEvent::Idle)
+  end
+end
+
+def list_view<Item>(l: List<Item>, _focused: Bool): String
+  if l.items.size == 0
+    return _list_blank_window(l)
+  end
+  var sb = sb_new()
+  var item_height = l.delegate.height
+  if item_height < 1
+    item_height = 1
+  end
+  var i = 0
+  while i < l.height
+    if i > 0
+      sb_append(sb, "\n")
+    end
+    var item_offset = i / item_height
+    var row_within = i % item_height
+    var idx = l.offset + item_offset
+    if idx < l.items.size
+      var is_selected = false
+      match l.selected
+        Some(s) => is_selected = (s == idx)
+        None    => is_selected = false
+      end
+      sb_append(sb, _list_render_item_row(l, idx, row_within, is_selected))
+    else
+      sb_append(sb, str_repeat(" ", l.width))
+    end
+    if l.show_scrollbar
+      sb_append(sb, _list_scrollbar_cell(l, i))
+    end
+    i = i + 1
+  end
+  return sb_to_string(sb)
+end
+
+def list_set_size<Item>(l: List<Item>, w: Int, h: Int): List<Item>
+  return list_with_size(l, w, h)
+end
+
+# ============================================================
+# Internal — key dispatch
+# ============================================================
+
+def _list_handle_key<Item, M>(
+  l: List<Item>,
+  code: Int
+): (List<Item>, tui::Cmd<M>, ListEvent<Item>)
+  if code == terminal::KEY_UP()
+    return _list_emit_highlight(l, list_select_prev(l))
+  end
+  if code == terminal::KEY_DOWN()
+    return _list_emit_highlight(l, list_select_next(l))
+  end
+  if code == terminal::KEY_HOME()
+    return _list_emit_highlight(l, list_select_first(l))
+  end
+  if code == terminal::KEY_END()
+    return _list_emit_highlight(l, list_select_last(l))
+  end
+  if code == terminal::KEY_CTRL_B()
+    return _list_emit_highlight(l, _list_page_up(l))
+  end
+  if code == terminal::KEY_CTRL_F()
+    return _list_emit_highlight(l, _list_page_down(l))
+  end
+  if code == terminal::KEY_ENTER()
+    match l.selected
+      Some(idx) => return (l, tui::Cmd::None, ListEvent::Selected(l.items[idx]))
+      None      => return (l, tui::Cmd::None, ListEvent::Idle)
+    end
+  end
+  return (l, tui::Cmd::None, ListEvent::Idle)
+end
+
+# Emit Highlighted(item) when selection changed, else Idle. Highlight
+# events are how preview-on-cursor-move flows reach the parent.
+def _list_emit_highlight<Item, M>(
+  before: List<Item>,
+  after: List<Item>
+): (List<Item>, tui::Cmd<M>, ListEvent<Item>)
+  var changed = false
+  match before.selected
+    Some(b) =>
+      match after.selected
+        Some(a) => changed = (a != b)
+        None    => changed = true
+      end
+    None =>
+      match after.selected
+        Some(_a) => changed = true
+        None     => changed = false
+      end
+  end
+  if changed
+    match after.selected
+      Some(idx) => return (after, tui::Cmd::None, ListEvent::Highlighted(after.items[idx]))
+      None      => return (after, tui::Cmd::None, ListEvent::Idle)
+    end
+  end
+  return (after, tui::Cmd::None, ListEvent::Idle)
+end
+
+def _list_page_up<Item>(l: List<Item>): List<Item>
+  var vis = _list_visible_items(l)
+  if vis < 1
+    vis = 1
+  end
+  match l.selected
+    Some(idx) => return list_set_selected(l, idx - vis)
+    None      => return list_set_selected(l, 0)
+  end
+end
+
+def _list_page_down<Item>(l: List<Item>): List<Item>
+  var vis = _list_visible_items(l)
+  if vis < 1
+    vis = 1
+  end
+  match l.selected
+    Some(idx) => return list_set_selected(l, idx + vis)
+    None      => return list_set_selected(l, 0)
+  end
+end
+
+# ============================================================
+# Internal — scroll / offset math
+# ============================================================
+
+## Count of items that fit in the visible window. With a single-row
+## delegate this equals l.height; with a multi-row delegate it's
+## `l.height / delegate.height` (rounded down — partial last items
+## are not shown).
+def _list_visible_items<Item>(l: List<Item>): Int
+  var ih = l.delegate.height
+  if ih < 1
+    ih = 1
+  end
+  return l.height / ih
+end
+
+def _list_max_offset(n: Int, vis_items: Int): Int
+  if n <= vis_items
+    return 0
+  end
+  return n - vis_items
+end
+
+def _list_clamp_offset(raw: Int, n: Int, vis_items: Int): Int
+  var max_off = _list_max_offset(n, vis_items)
+  var clamped = raw
+  if clamped < 0
+    clamped = 0
+  end
+  if clamped > max_off
+    clamped = max_off
+  end
+  return clamped
+end
+
+def _list_ensure_visible(offset: Int, sel: Int, vis_items: Int): Int
+  if sel < offset
+    return sel
+  end
+  if sel >= offset + vis_items
+    return sel - vis_items + 1
+  end
+  return offset
+end
+
+# ============================================================
+# Internal — render
+# ============================================================
+
+## Render one output row for a (possibly multi-row) item. `row_within`
+## indexes which line of the item's `show()` output this row carries
+## — 0 is the first row, delegate.height-1 is the last. The cursor
+## indicator ("▶ ") only renders on row_within == 0; selection
+## styling spans every row of the selected item.
+##
+## If `show(item)` returns fewer lines than delegate.height, missing
+## rows render as blank-padded; extra lines are truncated.
+def _list_render_item_row<Item>(l: List<Item>, idx: Int, row_within: Int, is_selected: Bool): String
+  var show: Fn(Item): String = l.delegate.show
+  var content_width = l.width
+  if l.show_scrollbar
+    content_width = content_width - 1
+  end
+  # Reserve 2 cells for cursor indicator gutter ("▶ " or "  ").
+  var inner_width = content_width - 2
+  if inner_width < 1
+    inner_width = 1
+  end
+
+  # Pick the appropriate line from the item's rendered content. For
+  # height=1, this is just the whole show() output. For multi-row,
+  # split on \n and pick the row_within-th line (or "" if there's no
+  # corresponding line — pad rows render as blank).
+  var rendered = show(l.items[idx])
+  var line_text = ""
+  var item_height = l.delegate.height
+  if item_height <= 1
+    if row_within == 0
+      line_text = rendered
+    end
+  else
+    var lines = str_split(rendered, "\n")
+    if row_within < lines.size
+      line_text = lines[row_within]
+    end
+  end
+
+  var clipped = _sh::clip_to_width(line_text, inner_width)
+  # Pad the body to inner_width so the row is uniform width.
+  var body_width = _sh::visible_width(clipped)
+  var padding = inner_width - body_width
+  if padding < 0
+    padding = 0
+  end
+  var padded = clipped + str_repeat(" ", padding)
+
+  var indicator = "  "
+  if is_selected and row_within == 0
+    indicator = "▶ "
+  end
+
+  # Extract Styles to locals before .render — chained method calls on
+  # struct-field paths of generic-erased structs trip a Quartz codegen
+  # bug; local-bind first.
+  #
+  # Render results are concatenated with a literal "" between them to
+  # dodge STYLE_RENDER_CONCAT_CORRUPTION
+  # (`docs/bugs/STYLE_RENDER_CONCAT_CORRUPTION.md`). The bug fires for
+  # both `render(a) + render(b)` (direct, SEGV/garbage) AND
+  # `sb_append(sb, render(a)); sb_append(sb, render(b))` (intervening
+  # side-effecting call: silent data loss). The `+ "" +` shape keeps
+  # an empty-string literal in between as the documented workaround
+  # (per the bug doc's "s1 + literal + s2 works correctly" entry).
+  if is_selected
+    var s_cursor: Style = l.styles.cursor
+    var s_text: Style = l.styles.cursor_text
+    return s_cursor.render(indicator) + "" + s_text.render(padded)
+  end
+  var s_plain: Style = l.styles.text
+  return s_plain.render(indicator) + "" + s_plain.render(padded)
+end
+
+def _list_blank_window<Item>(l: List<Item>): String
+  var sb = sb_new()
+  var i = 0
+  while i < l.height
+    if i > 0
+      sb_append(sb, "\n")
+    end
+    sb_append(sb, str_repeat(" ", l.width))
+    i = i + 1
+  end
+  return sb_to_string(sb)
+end
+
+def _list_scrollbar_cell<Item>(l: List<Item>, row: Int): String
+  var s_bar: Style = l.styles.scrollbar
+  var n = l.items.size
+  var vis = _list_visible_items(l)
+  if vis < 1
+    vis = 1
+  end
+  if n <= vis
+    return s_bar.render("│")
+  end
+  var max_off = _list_max_offset(n, vis)
+  var pct = (l.offset * 100) / max_off
+  var thumb_row = (row * 100) / l.height
+  if thumb_row == pct / (100 / l.height)
+    return s_bar.render("█")
+  end
+  return s_bar.render("│")
+end

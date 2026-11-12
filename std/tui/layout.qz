@@ -1,0 +1,944 @@
+## std/tui/layout.qz — Lipgloss-shaped composition primitives for TUI views.
+##
+## "Cleavage" — the way crystals split along defined planes. The module
+## name itself stays `layout` for skim-ability; the joke lives here.
+##
+## All functions are pure value transformers: take a String, return a
+## String. Multi-line content uses `\n` as the line separator. The
+## TUI runtime (`std/tui/runtime.qz` `_render`) translates bare `\n`
+## to `\r\n` at write time so layout stays line-separator-agnostic.
+##
+## Width measurement is wcwidth-style: per-codepoint cell count via
+## `unicode_width` from `std/unicode`. Combining marks and zero-width
+## controls count as 0 cells; East Asian Wide / Fullwidth and
+## Emoji_Presentation count as 2; everything else counts as 1.
+## Grapheme-cluster width (ZWJ-glued emoji rendering as one cell pair)
+## is a v0.3+ follow-up if misalignment surfaces in real use.
+##
+## Inspired by Lipgloss (Go) for shape and naming. Function-style API
+## rather than chainable Style builder — the builder can come later if
+## composition friction surfaces in real use.
+##
+## Usage:
+##
+##   import std/tui/layout as ly
+##
+##   var hud = ly::border(
+##     ly::pad_uniform("Cookies: 42\nYield: 1/tick", 1)
+##   )
+##   var help = "[↑ buy upgrade · Ctrl-C quit]"
+##   return ly::join_vertical(vec_of(hud, help))
+##
+## @since 5.28.x
+
+import std/string
+import std/unicode/width
+import std/terminal
+
+# UTF-8 walking is done via the byte-offset intrinsics:
+#   str_codepoint_at(s, byte_idx)        → decode codepoint at byte
+#   str_codepoint_byte_len(s, byte_idx)  → UTF-8 stride (1/2/3/4)
+#
+# `std/unicode/width` provides `unicode_width` (wcwidth-style cell count)
+# without dragging in case-folding or grapheme tables. Phase B's
+# reachability-based IR-emit DCE handles emit cost, but parse +
+# typecheck still walk every imported module, so layout takes the
+# narrowest import that covers it.
+
+# ============================================================
+# Border styles
+# ============================================================
+
+## Border drawing characters: top-left, top, top-right, right,
+## bottom-right, bottom, bottom-left, left. Loaded once per kind
+## via the BorderStyle constants and consumed by `border_with`.
+struct BorderChars
+  tl: String
+  t:  String
+  tr: String
+  r:  String
+  br: String
+  b:  String
+  bl: String
+  l:  String
+end
+
+## Border style identifiers. Pass to `border_with` to pick the
+## drawing-character set. `BORDER_NONE` is the no-op (returns the
+## content untouched — useful for conditional borders).
+def BORDER_NONE():    Int = 0
+def BORDER_THIN():    Int = 1
+def BORDER_THICK():   Int = 2
+def BORDER_ROUNDED(): Int = 3
+def BORDER_DOUBLE():  Int = 4
+
+def _border_chars(style: Int): BorderChars
+  if style == BORDER_THIN()
+    return BorderChars { tl: "┌", t: "─", tr: "┐", r: "│", br: "┘", b: "─", bl: "└", l: "│" }
+  end
+  if style == BORDER_THICK()
+    return BorderChars { tl: "┏", t: "━", tr: "┓", r: "┃", br: "┛", b: "━", bl: "┗", l: "┃" }
+  end
+  if style == BORDER_ROUNDED()
+    return BorderChars { tl: "╭", t: "─", tr: "╮", r: "│", br: "╯", b: "─", bl: "╰", l: "│" }
+  end
+  if style == BORDER_DOUBLE()
+    return BorderChars { tl: "╔", t: "═", tr: "╗", r: "║", br: "╝", b: "═", bl: "╚", l: "║" }
+  end
+  # BORDER_NONE — sentinel; border_with short-circuits before reaching here
+  return BorderChars { tl: "", t: "", tr: "", r: "", br: "", b: "", bl: "", l: "" }
+end
+
+# ============================================================
+# Alignment positions
+# ============================================================
+
+## Horizontal alignment within a fixed-width container.
+def ALIGN_LEFT():   Int = 0
+def ALIGN_CENTER(): Int = 1
+def ALIGN_RIGHT():  Int = 2
+
+# ============================================================
+# Measurement
+# ============================================================
+
+## Visible cell width of a single line (no \n). Sums per-codepoint
+## widths via `unicode_width`: combining marks 0, East Asian Wide /
+## Fullwidth / Emoji_Presentation 2, ambiguous + everything else 1.
+##
+## ANSI CSI escape sequences (`ESC [ ... <final>`) and lone ESC bytes
+## are skipped — they contribute zero visible cells. Without this,
+## styled lines (selection highlights, color spans) measure too wide,
+## and `_align_line` underpads them, leading to ragged borders /
+## misaligned join columns when a styled line lives next to plain
+## text. Mirrors the CSI-skip logic in `strip_styles`.
+def _line_width(line: String): Int
+  var w = 0
+  var i = 0
+  var len = str_byte_len(line)
+  while i < len
+    var b = str_byte_at(line, i)
+    if b == 0x1B
+      if i + 1 < len and str_byte_at(line, i + 1) == 0x5B
+        # ESC [ ... <final byte 0x40..0x7E>
+        i = i + 2
+        while i < len
+          var cb = str_byte_at(line, i)
+          i = i + 1
+          if cb >= 0x40 and cb <= 0x7E
+            break
+          end
+        end
+      else
+        # Lone ESC — drop one byte, contribute 0.
+        i = i + 1
+      end
+    else
+      var cp = str_codepoint_at(line, i)
+      w = w + unicode_width(cp)
+      i = i + str_codepoint_byte_len(line, i)
+    end
+  end
+  return w
+end
+
+## Visible width of (possibly multi-line) `s` — the maximum
+## per-line width in cells. See `_line_width`.
+def visible_width(s: String): Int
+  if str_byte_len(s) == 0
+    return 0
+  end
+  var lines = str_split(s, "\n")
+  var max_w = 0
+  var i = 0
+  while i < lines.size
+    var w = _line_width(lines[i])
+    if w > max_w
+      max_w = w
+    end
+    i = i + 1
+  end
+  return max_w
+end
+
+## Number of lines in `s`. An empty string has 0 lines; a string
+## with no `\n` has 1 line; each `\n` adds a line.
+def line_count(s: String): Int
+  if str_byte_len(s) == 0
+    return 0
+  end
+  var lines = str_split(s, "\n")
+  return lines.size
+end
+
+# ============================================================
+# Style stripping
+# ============================================================
+
+## Remove ANSI escape sequences (CSI / SGR) from `s`, returning the
+## plain-text equivalent. Used by widget view tests to assert
+## structural content (cursor position, selection highlight) without
+## tying tests to specific escape codes — strip the styles, then
+## substring-match the underlying text.
+##
+## Recognises CSI sequences: `ESC [` followed by parameter bytes
+## (`0x30..0x3F`) and intermediate bytes (`0x20..0x2F`), terminated by
+## a final byte (`0x40..0x7E`). Covers SGR (`m`), cursor positioning
+## (`H`, `f`, `A`-`F`), erase (`J`, `K`), and friends.
+##
+## Stray `ESC` bytes not followed by `[` are dropped (one byte each)
+## — better than emitting them and confusing the consumer.
+def strip_styles(s: String): String
+  var len = str_byte_len(s)
+  if len == 0
+    return s
+  end
+  var sb = sb_new()
+  var i = 0
+  while i < len
+    var b = str_byte_at(s, i)
+    if b == 0x1B
+      # ESC: peek next byte. If `[`, this is a CSI sequence — skip until final byte.
+      if i + 1 < len and str_byte_at(s, i + 1) == 0x5B
+        i = i + 2  # past ESC + [
+        # CSI parameter / intermediate bytes are 0x20..0x3F; final byte is 0x40..0x7E.
+        while i < len
+          var cb = str_byte_at(s, i)
+          i = i + 1
+          if cb >= 0x40 and cb <= 0x7E
+            break
+          end
+        end
+      else
+        # Lone ESC or unknown sequence — drop the ESC byte alone.
+        i = i + 1
+      end
+    else
+      sb_append_byte(sb, b)
+      i = i + 1
+    end
+  end
+  return sb_to_string(sb)
+end
+
+# ============================================================
+# Internal helpers
+# ============================================================
+
+# Repeat a 1-codepoint string `n` times. Used for filling spans
+# (border edges, alignment padding). Falls back to space if `s` is
+# empty.
+def _fill(s: String, n: Int): String
+  if n <= 0
+    return ""
+  end
+  if str_byte_len(s) == 0
+    return str_repeat(" ", n)
+  end
+  return str_repeat(s, n)
+end
+
+# Pad a single line to exactly `width` codepoints by appending or
+# prepending spaces according to `position`. If the line is already
+# at or beyond `width`, returns it unchanged.
+def _align_line(line: String, width: Int, position: Int): String
+  var w = _line_width(line)
+  if w >= width
+    return line
+  end
+  var deficit = width - w
+  if position == ALIGN_LEFT()
+    return line + str_repeat(" ", deficit)
+  end
+  if position == ALIGN_RIGHT()
+    return str_repeat(" ", deficit) + line
+  end
+  # ALIGN_CENTER — split surplus, with extra space biased to the right
+  var left_pad  = deficit / 2
+  var right_pad = deficit - left_pad
+  return str_repeat(" ", left_pad) + line + str_repeat(" ", right_pad)
+end
+
+# Join lines with \n. Empty input returns empty.
+def _lines_to_string(lines: Vec<String>): String = str_join(lines, "\n")
+
+# ============================================================
+# Padding
+# ============================================================
+
+## Pad `content` with the given number of blank cells on each side.
+## Top/bottom add blank lines; left/right add spaces per line. The
+## content is FIRST aligned to its own visible width (so all lines
+## are the same length) before left/right padding is applied —
+## otherwise short lines wouldn't reach the right padding column.
+def pad(content: String, top: Int, right: Int, bottom: Int, left: Int): String
+  if top <= 0 and right <= 0 and bottom <= 0 and left <= 0
+    return content
+  end
+  var w = visible_width(content)
+  var lines = str_split(content, "\n")
+  var padded_lines = vec_new()
+  var i = 0
+  while i < lines.size
+    var line = _align_line(lines[i], w, ALIGN_LEFT())
+    var padded = ""
+    if left > 0
+      padded = padded + str_repeat(" ", left)
+    end
+    padded = padded + line
+    if right > 0
+      padded = padded + str_repeat(" ", right)
+    end
+    padded_lines.push(padded)
+    i = i + 1
+  end
+  var blank_w = w + left + right
+  var blank = str_repeat(" ", blank_w)
+  var out = vec_new()
+  var ti = 0
+  while ti < top
+    out.push(blank)
+    ti = ti + 1
+  end
+  var pi = 0
+  while pi < padded_lines.size
+    out.push(padded_lines[pi])
+    pi = pi + 1
+  end
+  var bi = 0
+  while bi < bottom
+    out.push(blank)
+    bi = bi + 1
+  end
+  return _lines_to_string(out)
+end
+
+## Pad `content` uniformly on all four sides by `n` cells.
+def pad_uniform(content: String, n: Int): String =
+  pad(content, n, n, n, n)
+
+## Pad horizontally only — `n` cells on each of left and right.
+def pad_horizontal(content: String, n: Int): String =
+  pad(content, 0, n, 0, n)
+
+## Pad vertically only — `n` blank lines top and bottom.
+def pad_vertical(content: String, n: Int): String =
+  pad(content, n, 0, n, 0)
+
+# ============================================================
+# Border
+# ============================================================
+
+## Wrap `content` in a border using the given style. `BORDER_NONE`
+## returns the content unchanged. Multi-line content is bordered as a
+## block — all lines are aligned to the maximum width first so the
+## right edge is straight.
+def border_with(content: String, style: Int): String
+  if style == BORDER_NONE()
+    return content
+  end
+  var bc = _border_chars(style)
+  var w = visible_width(content)
+  var lines = str_split(content, "\n")
+  var out = vec_new()
+  out.push(bc.tl + _fill(bc.t, w) + bc.tr)
+  var i = 0
+  while i < lines.size
+    var line = _align_line(lines[i], w, ALIGN_LEFT())
+    out.push(bc.l + line + bc.r)
+    i = i + 1
+  end
+  out.push(bc.bl + _fill(bc.b, w) + bc.br)
+  return _lines_to_string(out)
+end
+
+## Wrap `content` in a thin Unicode box border. Equivalent to
+## `border_with(content, BORDER_THIN())`.
+def border(content: String): String =
+  border_with(content, BORDER_THIN())
+
+# ============================================================
+# Alignment
+# ============================================================
+
+## Left-align each line of `content` within a field of `width` cells.
+## Lines shorter than `width` are right-padded with spaces; lines
+## already at or beyond `width` are returned unchanged.
+def align_left(content: String, width: Int): String
+  var lines = str_split(content, "\n")
+  var out = vec_new()
+  var i = 0
+  while i < lines.size
+    out.push(_align_line(lines[i], width, ALIGN_LEFT()))
+    i = i + 1
+  end
+  return _lines_to_string(out)
+end
+
+## Center-align each line of `content` within a field of `width` cells.
+def align_center(content: String, width: Int): String
+  var lines = str_split(content, "\n")
+  var out = vec_new()
+  var i = 0
+  while i < lines.size
+    out.push(_align_line(lines[i], width, ALIGN_CENTER()))
+    i = i + 1
+  end
+  return _lines_to_string(out)
+end
+
+## Right-align each line of `content` within a field of `width` cells.
+def align_right(content: String, width: Int): String
+  var lines = str_split(content, "\n")
+  var out = vec_new()
+  var i = 0
+  while i < lines.size
+    out.push(_align_line(lines[i], width, ALIGN_RIGHT()))
+    i = i + 1
+  end
+  return _lines_to_string(out)
+end
+
+# ============================================================
+# Joining
+# ============================================================
+
+## Stack `parts` vertically with each part left-aligned to the widest
+## part's width. Each part may itself be multi-line. Joins with a
+## single `\n` between parts (no extra blank lines).
+def join_vertical(parts: Vec<String>): String
+  if parts.size == 0
+    return ""
+  end
+  if parts.size == 1
+    return parts[0]
+  end
+  # Compute the union width across all parts.
+  var max_w = 0
+  var i = 0
+  while i < parts.size
+    var w = visible_width(parts[i])
+    if w > max_w
+      max_w = w
+    end
+    i = i + 1
+  end
+  var out = vec_new()
+  var pi = 0
+  while pi < parts.size
+    var aligned = align_left(parts[pi], max_w)
+    var lines = str_split(aligned, "\n")
+    var li = 0
+    while li < lines.size
+      out.push(lines[li])
+      li = li + 1
+    end
+    pi = pi + 1
+  end
+  return _lines_to_string(out)
+end
+
+## Lay `parts` side-by-side, top-aligned. Each part is padded
+## vertically (with blank lines of its own visible width) to match
+## the tallest part's height. Lines from each row are concatenated
+## left-to-right with no separator. Multi-line parts work — e.g.
+## two bordered HUD panels render as a single two-column row.
+def join_horizontal(parts: Vec<String>): String
+  if parts.size == 0
+    return ""
+  end
+  if parts.size == 1
+    return parts[0]
+  end
+  # Per-part: visible width, line list, padded line count.
+  var max_h = 0
+  var i = 0
+  while i < parts.size
+    var h = line_count(parts[i])
+    if h > max_h
+      max_h = h
+    end
+    i = i + 1
+  end
+  # Per row, concatenate the i-th line of each part (or blank-line
+  # filler at that part's width if i >= part's height).
+  var out = vec_new()
+  var row = 0
+  while row < max_h
+    var combined = ""
+    var pi = 0
+    while pi < parts.size
+      var w = visible_width(parts[pi])
+      var part_lines = str_split(parts[pi], "\n")
+      var line = ""
+      if row < part_lines.size
+        line = _align_line(part_lines[row], w, ALIGN_LEFT())
+      else
+        line = str_repeat(" ", w)
+      end
+      combined = combined + line
+      pi = pi + 1
+    end
+    out.push(combined)
+    row = row + 1
+  end
+  return _lines_to_string(out)
+end
+
+# ============================================================
+# Truncation
+# ============================================================
+
+# Decide whether a CSI sequence with parameter bytes [start, end) and a
+# final byte at index `final_i` is an SGR-reset (`\x1b[m` or all-zero
+# params like `\x1b[0m`, `\x1b[0;0m`). Non-`m` CSI sequences (cursor
+# moves, erase, etc.) are not SGR and counted as non-reset for the
+# tracking purpose — but the "saw_non_reset_sgr" flag below is named
+# loosely; what we actually care about is "did we leave terminal state
+# changed in a way a stray reset is worth appending". A cursor-position
+# escape doesn't leave colour state, so we only flip the flag for SGR
+# sequences (final byte == 'm').
+def _csi_is_sgr_reset(s: String, params_start: Int, final_i: Int): Bool
+  var i = params_start
+  while i < final_i
+    var b = str_byte_at(s, i)
+    if b != 0x30 and b != 0x3B
+      # Non-zero digit (0x31..0x39) or other param byte → not a reset.
+      return false
+    end
+    i = i + 1
+  end
+  return true
+end
+
+# Walk a single line up to `max_width` visible cells, treating CSI
+# escapes as zero-width pass-through. Returns the kept-prefix byte
+# count and a flag indicating whether the prefix contained at least
+# one non-reset SGR (the trigger for appending `\x1b[0m` when the
+# line actually had to be cut).
+def _truncate_walk(line: String, max_width: Int): (Int, Bool)
+  var len = str_byte_len(line)
+  var byte_i = 0
+  var taken_w = 0
+  var saw_non_reset_sgr = false
+  while byte_i < len
+    var b = str_byte_at(line, byte_i)
+    if b == 0x1B
+      if byte_i + 1 < len and str_byte_at(line, byte_i + 1) == 0x5B
+        var params_start = byte_i + 2
+        var j = params_start
+        var final_i = -1
+        while j < len
+          var cb = str_byte_at(line, j)
+          if cb >= 0x40 and cb <= 0x7E
+            final_i = j
+            break
+          end
+          j = j + 1
+        end
+        if final_i < 0
+          # Unterminated CSI — bail out, treat the rest as zero-width.
+          byte_i = len
+        else
+          if str_byte_at(line, final_i) == 0x6D
+            if not _csi_is_sgr_reset(line, params_start, final_i)
+              saw_non_reset_sgr = true
+            end
+          end
+          byte_i = final_i + 1
+        end
+      else
+        byte_i = byte_i + 1
+      end
+    else
+      var cp = str_codepoint_at(line, byte_i)
+      var cw = unicode_width(cp)
+      if taken_w + cw > max_width
+        break
+      end
+      taken_w = taken_w + cw
+      byte_i = byte_i + str_codepoint_byte_len(line, byte_i)
+    end
+  end
+  return (byte_i, saw_non_reset_sgr)
+end
+
+## Truncate each line of `content` to at most `max_width` visible
+## cells. Lines already within bounds are returned unchanged. No
+## ellipsis is added — callers can post-process if they want a "…"
+## indicator.
+##
+## Style-aware: SGR escape sequences are passed through verbatim and
+## counted as zero-width. If a line has to be cut and the kept prefix
+## contains at least one non-reset SGR, `\x1b[0m` is appended so the
+## terminal's colour state doesn't bleed into whatever the caller
+## emits next. Non-SGR CSI (cursor moves, erase) is preserved but
+## doesn't trigger the reset.
+def truncate(content: String, max_width: Int): String
+  var lines = str_split(content, "\n")
+  var out = vec_new()
+  var i = 0
+  while i < lines.size
+    var line = lines[i]
+    if _line_width(line) <= max_width
+      out.push(line)
+    else
+      var walk = _truncate_walk(line, max_width)
+      var byte_i = walk.0
+      var saw_non_reset_sgr = walk.1
+      var prefix = str_byte_slice(line, 0, byte_i)
+      if saw_non_reset_sgr
+        prefix = prefix + "\x1b[0m"
+      end
+      out.push(prefix)
+    end
+    i = i + 1
+  end
+  return _lines_to_string(out)
+end
+
+# ============================================================
+# Word-wrap
+# ============================================================
+
+# A single token in a line: either a word (printable run between
+# whitespace boundaries) or a whitespace run. `bytes` includes any
+# SGR escapes that landed inside the token; `width` is its visible
+# cell count (SGR contributes 0).
+struct _WrapToken
+  bytes: String
+  width: Int
+  is_ws: Bool
+end
+
+# Tokenise a line into alternating word / whitespace runs. SGR
+# sequences are emitted into whichever token contains the byte after
+# them — SGR before a word folds into the word; SGR after a space
+# folds into the run that follows. The visible-width sum of all
+# tokens equals `_line_width(line)`.
+def _wrap_tokenise(line: String): Vec<_WrapToken>
+  var out = vec_new<_WrapToken>()
+  var len = str_byte_len(line)
+  if len == 0
+    return out
+  end
+  var sb = sb_new()
+  var cur_w = 0
+  var cur_is_ws = false
+  var have_visible = false
+  var i = 0
+  while i < len
+    var b = str_byte_at(line, i)
+    if b == 0x1B
+      if i + 1 < len and str_byte_at(line, i + 1) == 0x5B
+        sb_append_byte(sb, b)
+        sb_append_byte(sb, 0x5B)
+        i = i + 2
+        while i < len
+          var cb = str_byte_at(line, i)
+          sb_append_byte(sb, cb)
+          i = i + 1
+          if cb >= 0x40 and cb <= 0x7E
+            break
+          end
+        end
+      else
+        sb_append_byte(sb, b)
+        i = i + 1
+      end
+    else
+      var cp = str_codepoint_at(line, i)
+      var stride = str_codepoint_byte_len(line, i)
+      var is_ws = (cp == 0x20 or cp == 0x09)
+      if have_visible and is_ws != cur_is_ws
+        out.push(_WrapToken { bytes: sb_to_string(sb), width: cur_w, is_ws: cur_is_ws })
+        sb = sb_new()
+        cur_w = 0
+      end
+      cur_is_ws = is_ws
+      have_visible = true
+      var k = 0
+      while k < stride
+        sb_append_byte(sb, str_byte_at(line, i + k))
+        k = k + 1
+      end
+      cur_w = cur_w + unicode_width(cp)
+      i = i + stride
+    end
+  end
+  var trailing = sb_to_string(sb)
+  if str_byte_len(trailing) > 0
+    out.push(_WrapToken { bytes: trailing, width: cur_w, is_ws: cur_is_ws })
+  end
+  return out
+end
+
+# Detect whether `s` ends with an SGR reset (`\x1b[0m` etc). Used to
+# decide if a wrapped segment needs a synthetic reset appended so an
+# open style doesn't bleed past the wrap point. We don't track full
+# SGR state across wraps (that would need a stack); we just check
+# whether the segment carries any SGR at all and, if so, whether its
+# tail already resets. A segment whose tail SGR is itself a reset
+# leaves no open style.
+def _segment_needs_reset(s: String): Bool
+  var len = str_byte_len(s)
+  var i = 0
+  var saw_sgr = false
+  var last_was_reset = false
+  while i < len
+    var b = str_byte_at(s, i)
+    if b == 0x1B and i + 1 < len and str_byte_at(s, i + 1) == 0x5B
+      var params_start = i + 2
+      var j = params_start
+      var final_i = -1
+      while j < len
+        var cb = str_byte_at(s, j)
+        if cb >= 0x40 and cb <= 0x7E
+          final_i = j
+          break
+        end
+        j = j + 1
+      end
+      if final_i < 0
+        i = len
+      else
+        if str_byte_at(s, final_i) == 0x6D
+          saw_sgr = true
+          last_was_reset = _csi_is_sgr_reset(s, params_start, final_i)
+        end
+        i = final_i + 1
+      end
+    else
+      i = i + 1
+    end
+  end
+  return saw_sgr and not last_was_reset
+end
+
+# Hard-cut a single oversized word into segments of at most `width`
+# visible cells, preserving SGR pass-through semantics. Returns one
+# or more segments — each at most `width` cells, last one possibly
+# shorter.
+def _wrap_hard_cut(token: _WrapToken, width: Int): Vec<String>
+  var out = vec_new<String>()
+  var src = token.bytes
+  var len = str_byte_len(src)
+  if len == 0 or width <= 0
+    out.push(src)
+    return out
+  end
+  var sb = sb_new()
+  var cur_w = 0
+  var i = 0
+  while i < len
+    var b = str_byte_at(src, i)
+    if b == 0x1B and i + 1 < len and str_byte_at(src, i + 1) == 0x5B
+      sb_append_byte(sb, b)
+      sb_append_byte(sb, 0x5B)
+      i = i + 2
+      while i < len
+        var cb = str_byte_at(src, i)
+        sb_append_byte(sb, cb)
+        i = i + 1
+        if cb >= 0x40 and cb <= 0x7E
+          break
+        end
+      end
+    else
+      var cp = str_codepoint_at(src, i)
+      var cw = unicode_width(cp)
+      if cur_w + cw > width
+        out.push(sb_to_string(sb))
+        sb = sb_new()
+        cur_w = 0
+      end
+      var stride = str_codepoint_byte_len(src, i)
+      var k = 0
+      while k < stride
+        sb_append_byte(sb, str_byte_at(src, i + k))
+        k = k + 1
+      end
+      cur_w = cur_w + cw
+      i = i + stride
+    end
+  end
+  var tail = sb_to_string(sb)
+  if str_byte_len(tail) > 0
+    out.push(tail)
+  end
+  return out
+end
+
+# Append `\x1b[0m` to `s` if it carries an open (non-reset) SGR.
+def _maybe_close_sgr(s: String): String
+  if _segment_needs_reset(s)
+    return s + "\x1b[0m"
+  end
+  return s
+end
+
+## Greedy word-wrap a single line to lines of at most `width` visible
+## cells. Whitespace runs are preserved when they fit on the current
+## line; when they would overflow, they're dropped at the wrap point
+## (mirroring the conventional "fold at space" behaviour). Words
+## longer than `width` are hard-cut at `width`.
+##
+## ANSI styling is preserved verbatim — SGR escapes contribute zero
+## visible cells and pass through into the segment they belong to.
+## When a styled span crosses a wrap point, every wrapped segment that
+## carries an open (non-reset) SGR has `\x1b[0m` appended so colours
+## don't bleed into following lines.
+##
+## A `\n` in `s` is treated as content, not a wrap directive — call
+## `str_split(s, "\n")` first if you want each pre-existing line wrapped
+## independently.
+def wrap_line(s: String, width: Int): Vec<String>
+  var out = vec_new<String>()
+  if str_byte_len(s) == 0
+    out.push("")
+    return out
+  end
+  if width <= 0
+    out.push(s)
+    return out
+  end
+
+  var tokens = _wrap_tokenise(s)
+  var cur = sb_new()
+  var cur_w = 0
+  var pending_ws_bytes = ""
+  var pending_ws_w = 0
+  var ti = 0
+  while ti < tokens.size
+    var tok: _WrapToken = tokens[ti]
+    if tok.is_ws
+      pending_ws_bytes = pending_ws_bytes + tok.bytes
+      pending_ws_w = pending_ws_w + tok.width
+    else
+      if cur_w == 0 and tok.width > width
+        # Oversized word at start of empty line — hard-cut.
+        var pieces = _wrap_hard_cut(tok, width)
+        var pi = 0
+        while pi < pieces.size - 1
+          out.push(_maybe_close_sgr(pieces[pi]))
+          pi = pi + 1
+        end
+        sb_append(cur, pieces[pieces.size - 1])
+        var last_w = 0
+        var last_bytes = pieces[pieces.size - 1]
+        var bi = 0
+        var blen = str_byte_len(last_bytes)
+        while bi < blen
+          var bb = str_byte_at(last_bytes, bi)
+          if bb == 0x1B and bi + 1 < blen and str_byte_at(last_bytes, bi + 1) == 0x5B
+            bi = bi + 2
+            while bi < blen
+              var cb = str_byte_at(last_bytes, bi)
+              bi = bi + 1
+              if cb >= 0x40 and cb <= 0x7E
+                break
+              end
+            end
+          else
+            var cpx = str_codepoint_at(last_bytes, bi)
+            last_w = last_w + unicode_width(cpx)
+            bi = bi + str_codepoint_byte_len(last_bytes, bi)
+          end
+        end
+        cur_w = last_w
+        pending_ws_bytes = ""
+        pending_ws_w = 0
+      else
+        var needed = pending_ws_w + tok.width
+        if cur_w + needed > width
+          # Flush current line, drop pending whitespace at wrap point.
+          out.push(_maybe_close_sgr(sb_to_string(cur)))
+          cur = sb_new()
+          cur_w = 0
+          pending_ws_bytes = ""
+          pending_ws_w = 0
+          if tok.width > width
+            var pieces2 = _wrap_hard_cut(tok, width)
+            var pj = 0
+            while pj < pieces2.size - 1
+              out.push(_maybe_close_sgr(pieces2[pj]))
+              pj = pj + 1
+            end
+            var tail = pieces2[pieces2.size - 1]
+            sb_append(cur, tail)
+            var tw = 0
+            var bj = 0
+            var tlen = str_byte_len(tail)
+            while bj < tlen
+              var bb2 = str_byte_at(tail, bj)
+              if bb2 == 0x1B and bj + 1 < tlen and str_byte_at(tail, bj + 1) == 0x5B
+                bj = bj + 2
+                while bj < tlen
+                  var cb2 = str_byte_at(tail, bj)
+                  bj = bj + 1
+                  if cb2 >= 0x40 and cb2 <= 0x7E
+                    break
+                  end
+                end
+              else
+                var cpy = str_codepoint_at(tail, bj)
+                tw = tw + unicode_width(cpy)
+                bj = bj + str_codepoint_byte_len(tail, bj)
+              end
+            end
+            cur_w = tw
+          else
+            sb_append(cur, tok.bytes)
+            cur_w = tok.width
+          end
+        else
+          sb_append(cur, pending_ws_bytes)
+          sb_append(cur, tok.bytes)
+          cur_w = cur_w + needed
+          pending_ws_bytes = ""
+          pending_ws_w = 0
+        end
+      end
+    end
+    ti = ti + 1
+  end
+  # Trailing whitespace folds onto the current line if it fits;
+  # otherwise we simply drop it (a trailing whitespace-only line
+  # carries no useful information).
+  if pending_ws_w > 0 and cur_w + pending_ws_w <= width
+    sb_append(cur, pending_ws_bytes)
+    cur_w = cur_w + pending_ws_w
+  end
+  if cur_w > 0 or out.size == 0
+    out.push(_maybe_close_sgr(sb_to_string(cur)))
+  end
+  return out
+end
+
+# ============================================================
+# Terminal width helper
+# ============================================================
+
+## Query the terminal's actual width, subtract 2 cells for the box
+## border, and clamp the result to `[min, max]`. Every TUI consumer
+## that wraps its body in a border wants this exact pattern: "use
+## the terminal's width but bound it" — narrow enough that content
+## stays readable on a wide screen, wide enough that a small
+## terminal (or a failed `term_get_width` query that returns 80)
+## still produces a non-cramped layout.
+##
+## `min` is also the floor when `term_get_width()` would yield a
+## value below `min + 2`. This means a 30-column terminal still
+## gets `min` inner cells — content overflows the screen rather
+## than the box collapsing to nothing. Apps that want strict
+## fit-to-terminal can call `term_get_width` directly.
+def clamp_to_terminal_width(min: Int, max: Int): Int
+  var w = terminal::term_get_width() - 2
+  if w < min
+    return min
+  end
+  if w > max
+    return max
+  end
+  return w
+end

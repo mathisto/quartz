@@ -1,0 +1,614 @@
+## CHIP-8 emulator — Quartz reference implementation.
+##
+## Target architecture: classic CHIP-8 (COSMAC VIP, 1977). 4 KiB RAM,
+## 16 general-purpose 8-bit registers V0-VF, 12-bit index register I,
+## 12-bit program counter starting at 0x200, 64×32 monochrome display,
+## 16-key hex keypad, delay + sound timers decrementing at 60 Hz.
+##
+## Everything is `Int` at runtime (existential typing — no user-visible
+## widths). Byte semantics are recovered by masking with `& 0xFF` at
+## every store into a 1-byte slot. This keeps the LLVM path simple and
+## the WASM path avoids any sign-extension surprises.
+##
+## Phase 2 of the CHIP-8 WASM demo. The LLVM backend runs this as a
+## standalone binary driven by `test_chip8.qz`. Phase 3 re-exposes the
+## same functions with `@export` for the browser.
+
+# =============================================================================
+# State — module-level globals, initialized lazily by chip8_init()
+# =============================================================================
+
+var g_ram     = vec_new<Int>()   # 4 KiB RAM
+var g_v       = vec_new<Int>()   # V0-VF (16 bytes)
+var g_stack   = vec_new<Int>()   # 16 return addresses
+var g_display = vec_new<Int>()   # 64×32, one byte per pixel (0 or 1)
+var g_keys    = vec_new<Int>()   # 16 keys (0 or 1)
+
+var g_i         = 0              # index register (12-bit)
+var g_pc        = 0x200          # program counter
+var g_sp        = 0              # stack pointer
+var g_delay     = 0              # delay timer (60 Hz countdown)
+var g_sound     = 0              # sound timer (60 Hz countdown)
+var g_wait_key  = -1             # Fx0A state: -1 = not waiting, 0..15 = Vx index
+var g_rng_state = 0xCAFEBABE     # LCG seed
+var g_halt      = 0              # 1 on unrecoverable error
+var g_initialized = 0            # one-shot allocation flag
+var g_rom_size  = 0              # set by chip8_load_rom
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+def RAM_BYTES(): Int = 4096
+def DISPLAY_W(): Int = 64
+def DISPLAY_H(): Int = 32
+def DISPLAY_BYTES(): Int = 2048
+def ROM_START(): Int = 0x200
+def CYCLES_PER_FRAME(): Int = 10
+
+# =============================================================================
+# One-shot allocator — called from chip8_init the first time through.
+# Subsequent inits just zero the existing buffers.
+# =============================================================================
+
+# NOTE: every `_chip8_*` helper returns `Int` (always 0) purely to dodge
+# a WASM backend bug where calling a user `Void` function produces invalid
+# WASM. See docs/bugs/WASM_VOID_CALL_STACK_MISMATCH.md. LLVM is unaffected;
+# this is cheap and reverts cleanly when the backend is fixed.
+
+def _chip8_alloc(): Int
+  var i = 0
+  while i < RAM_BYTES()
+    g_ram.push(0)
+    i += 1
+  end
+  i = 0
+  while i < 16
+    g_v.push(0)
+    g_stack.push(0)
+    g_keys.push(0)
+    i += 1
+  end
+  i = 0
+  while i < DISPLAY_BYTES()
+    g_display.push(0)
+    i += 1
+  end
+  g_initialized = 1
+  return 0
+end
+
+def _chip8_zero(): Int
+  var i = 0
+  while i < RAM_BYTES()
+    g_ram[i] = 0
+    i += 1
+  end
+  i = 0
+  while i < 16
+    g_v[i] = 0
+    g_stack[i] = 0
+    g_keys[i] = 0
+    i += 1
+  end
+  i = 0
+  while i < DISPLAY_BYTES()
+    g_display[i] = 0
+    i += 1
+  end
+  return 0
+end
+
+# =============================================================================
+# Font — 16 hex glyphs × 5 bytes each, loaded at RAM[0x000] so the Fx29
+# "set I to font glyph" opcode can point at them.
+# =============================================================================
+
+def _chip8_load_font(): Int
+  var font = vec_new<Int>()
+  # 0
+  font.push(0xF0); font.push(0x90); font.push(0x90); font.push(0x90); font.push(0xF0)
+  # 1
+  font.push(0x20); font.push(0x60); font.push(0x20); font.push(0x20); font.push(0x70)
+  # 2
+  font.push(0xF0); font.push(0x10); font.push(0xF0); font.push(0x80); font.push(0xF0)
+  # 3
+  font.push(0xF0); font.push(0x10); font.push(0xF0); font.push(0x10); font.push(0xF0)
+  # 4
+  font.push(0x90); font.push(0x90); font.push(0xF0); font.push(0x10); font.push(0x10)
+  # 5
+  font.push(0xF0); font.push(0x80); font.push(0xF0); font.push(0x10); font.push(0xF0)
+  # 6
+  font.push(0xF0); font.push(0x80); font.push(0xF0); font.push(0x90); font.push(0xF0)
+  # 7
+  font.push(0xF0); font.push(0x10); font.push(0x20); font.push(0x40); font.push(0x40)
+  # 8
+  font.push(0xF0); font.push(0x90); font.push(0xF0); font.push(0x90); font.push(0xF0)
+  # 9
+  font.push(0xF0); font.push(0x90); font.push(0xF0); font.push(0x10); font.push(0xF0)
+  # A
+  font.push(0xF0); font.push(0x90); font.push(0xF0); font.push(0x90); font.push(0x90)
+  # B
+  font.push(0xE0); font.push(0x90); font.push(0xE0); font.push(0x90); font.push(0xE0)
+  # C
+  font.push(0xF0); font.push(0x80); font.push(0x80); font.push(0x80); font.push(0xF0)
+  # D
+  font.push(0xE0); font.push(0x90); font.push(0x90); font.push(0x90); font.push(0xE0)
+  # E
+  font.push(0xF0); font.push(0x80); font.push(0xF0); font.push(0x80); font.push(0xF0)
+  # F
+  font.push(0xF0); font.push(0x80); font.push(0xF0); font.push(0x80); font.push(0x80)
+  var i = 0
+  while i < font.size
+    g_ram[i] = font[i]
+    i += 1
+  end
+  return 0
+end
+
+# =============================================================================
+# Public API — chip8_init, chip8_load_rom, chip8_reset, chip8_step,
+# chip8_step_frame, chip8_tick_timers
+# =============================================================================
+
+@export def chip8_init(): Int
+  if g_initialized == 0
+    _chip8_alloc()
+  else
+    _chip8_zero()
+  end
+  _chip8_load_font()
+  g_pc = ROM_START()
+  g_sp = 0
+  g_i  = 0
+  g_delay = 0
+  g_sound = 0
+  g_wait_key = -1
+  g_halt = 0
+  g_rom_size = 0
+  return 0
+end
+
+## Load `len` bytes of ROM already written into g_ram[0x200..0x200+len].
+## Caller (JS host or test harness) is responsible for placing the bytes;
+## this just records size + resets PC. Returns 0 on success, -1 on size
+## overflow.
+@export def chip8_load_rom(len: Int): Int
+  if len < 0
+    return -1
+  end
+  if ROM_START() + len > RAM_BYTES()
+    return -1
+  end
+  g_rom_size = len
+  g_pc = ROM_START()
+  return 0
+end
+
+@export def chip8_reset(): Int
+  _chip8_zero()
+  _chip8_load_font()
+  g_pc = ROM_START()
+  g_sp = 0
+  g_i  = 0
+  g_delay = 0
+  g_sound = 0
+  g_wait_key = -1
+  g_halt = 0
+  return 0
+end
+
+@export def chip8_tick_timers(): Int
+  if g_delay > 0
+    g_delay -= 1
+  end
+  if g_sound > 0
+    g_sound -= 1
+  end
+  return 0
+end
+
+@export def chip8_sound_playing(): Int
+  if g_sound > 0
+    return 1
+  end
+  return 0
+end
+
+# =============================================================================
+# Small helpers
+# =============================================================================
+
+def _u8(n: Int): Int = n & 0xFF
+def _u12(n: Int): Int = n & 0xFFF
+
+## LCG PRNG — 32-bit truncated, MMIX-style constants. Deterministic so
+## golden traces reproduce across runs / backends.
+def _rand_byte(): Int
+  g_rng_state = (g_rng_state * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF
+  return (g_rng_state >> 33) & 0xFF
+end
+
+def _stack_push(addr: Int): Int
+  if g_sp >= 16
+    g_halt = 1
+    return -1
+  end
+  g_stack[g_sp] = addr & 0xFFFF
+  g_sp += 1
+  return 0
+end
+
+def _stack_pop(): Int
+  if g_sp <= 0
+    g_halt = 1
+    return -1
+  end
+  g_sp -= 1
+  return g_stack[g_sp]
+end
+
+def _skip_if(cond: Int): Int
+  if cond != 0
+    g_pc = (g_pc + 2) & 0xFFF
+  end
+  return 0
+end
+
+# =============================================================================
+# Draw sprite (Dxyn) — XOR n rows of 8-pixel sprite starting at I, at
+# screen position (Vx, Vy). VF = 1 if any pixel was erased, else 0.
+# CHIP-8 wraps sprites at screen edges.
+# =============================================================================
+
+def _draw_sprite(vx: Int, vy: Int, n: Int): Int
+  var collision = 0
+  var row = 0
+  while row < n
+    var sprite_byte = g_ram[(g_i + row) & 0xFFF]
+    var py = (vy + row) % DISPLAY_H()
+    var col = 0
+    while col < 8
+      var pixel_on = (sprite_byte >> (7 - col)) & 1
+      if pixel_on == 1
+        var px = (vx + col) % DISPLAY_W()
+        var idx = py * DISPLAY_W() + px
+        if g_display[idx] == 1
+          collision = 1
+        end
+        g_display[idx] = g_display[idx] ^ 1
+      end
+      col += 1
+    end
+    row += 1
+  end
+  g_v[0xF] = collision
+  return 0
+end
+
+# =============================================================================
+# Arithmetic group — 8xy[0..E]
+# =============================================================================
+
+def _arith_op(x: Int, y: Int, n: Int): Int
+  var vx = g_v[x]
+  var vy = g_v[y]
+  if n == 0x0
+    g_v[x] = vy
+  end
+  if n == 0x1
+    g_v[x] = vx | vy
+  end
+  if n == 0x2
+    g_v[x] = vx & vy
+  end
+  if n == 0x3
+    g_v[x] = vx ^ vy
+  end
+  if n == 0x4
+    var sum = vx + vy
+    g_v[x] = sum & 0xFF
+    if sum > 0xFF
+      g_v[0xF] = 1
+    else
+      g_v[0xF] = 0
+    end
+  end
+  if n == 0x5
+    g_v[x] = (vx - vy) & 0xFF
+    if vx >= vy
+      g_v[0xF] = 1
+    else
+      g_v[0xF] = 0
+    end
+  end
+  if n == 0x6
+    g_v[0xF] = vx & 1
+    g_v[x] = (vx >> 1) & 0xFF
+  end
+  if n == 0x7
+    g_v[x] = (vy - vx) & 0xFF
+    if vy >= vx
+      g_v[0xF] = 1
+    else
+      g_v[0xF] = 0
+    end
+  end
+  if n == 0xE
+    g_v[0xF] = (vx >> 7) & 1
+    g_v[x] = (vx << 1) & 0xFF
+  end
+  return 0
+end
+
+# =============================================================================
+# F-group — Fx07, Fx0A, Fx15, Fx18, Fx1E, Fx29, Fx33, Fx55, Fx65
+# =============================================================================
+
+def _f_op(x: Int, kk: Int): Int
+  if kk == 0x07
+    g_v[x] = g_delay
+  end
+  if kk == 0x0A
+    # Wait for key press. If any key already held, take it; else park.
+    var pressed = -1
+    var i = 0
+    while i < 16
+      if g_keys[i] == 1
+        pressed = i
+        i = 16
+      else
+        i += 1
+      end
+    end
+    if pressed >= 0
+      g_v[x] = pressed
+      g_wait_key = -1
+    else
+      g_wait_key = x
+      # Rewind PC so this instruction re-executes next frame.
+      g_pc = (g_pc - 2) & 0xFFF
+    end
+  end
+  if kk == 0x15
+    g_delay = _u8(g_v[x])
+  end
+  if kk == 0x18
+    g_sound = _u8(g_v[x])
+  end
+  if kk == 0x1E
+    g_i = (g_i + g_v[x]) & 0xFFF
+  end
+  if kk == 0x29
+    # Set I to the font glyph for V[x] — each glyph is 5 bytes at RAM[0].
+    g_i = (g_v[x] & 0xF) * 5
+  end
+  if kk == 0x33
+    # BCD representation of V[x] into I, I+1, I+2 (hundreds, tens, ones).
+    var val = g_v[x]
+    g_ram[g_i & 0xFFF]       = val / 100
+    g_ram[(g_i + 1) & 0xFFF] = (val / 10) % 10
+    g_ram[(g_i + 2) & 0xFFF] = val % 10
+  end
+  if kk == 0x55
+    # Store V0..Vx into RAM starting at I.
+    var i = 0
+    while i <= x
+      g_ram[(g_i + i) & 0xFFF] = g_v[i]
+      i += 1
+    end
+  end
+  if kk == 0x65
+    # Load V0..Vx from RAM starting at I.
+    var i = 0
+    while i <= x
+      g_v[i] = g_ram[(g_i + i) & 0xFFF]
+      i += 1
+    end
+  end
+  return 0
+end
+
+# =============================================================================
+# Main decode + step loop
+# =============================================================================
+
+@export def chip8_step(): Int
+  if g_halt != 0
+    return -1
+  end
+  # Fetch big-endian 16-bit opcode.
+  var op = (g_ram[g_pc & 0xFFF] << 8) | g_ram[(g_pc + 1) & 0xFFF]
+  g_pc = (g_pc + 2) & 0xFFF
+
+  var nibble = (op >> 12) & 0xF
+  var x = (op >> 8) & 0xF
+  var y = (op >> 4) & 0xF
+  var n = op & 0xF
+  var kk = op & 0xFF
+  var nnn = op & 0xFFF
+
+  if nibble == 0x0
+    if op == 0x00E0
+      # CLS — clear display
+      var i = 0
+      while i < DISPLAY_BYTES()
+        g_display[i] = 0
+        i += 1
+      end
+    elsif op == 0x00EE
+      # RET
+      var addr = _stack_pop()
+      if addr >= 0
+        g_pc = addr & 0xFFF
+      end
+    end
+    # 0nnn (SYS addr) is intentionally a no-op — legacy machine-call
+    # into the host OS, meaningless on modern interpreters.
+    return 0
+  end
+  if nibble == 0x1
+    g_pc = nnn
+    return 0
+  end
+  if nibble == 0x2
+    _stack_push(g_pc)
+    g_pc = nnn
+    return 0
+  end
+  if nibble == 0x3
+    if g_v[x] == kk
+      _skip_if(1)
+    end
+    return 0
+  end
+  if nibble == 0x4
+    if g_v[x] != kk
+      _skip_if(1)
+    end
+    return 0
+  end
+  if nibble == 0x5
+    if g_v[x] == g_v[y]
+      _skip_if(1)
+    end
+    return 0
+  end
+  if nibble == 0x6
+    g_v[x] = kk
+    return 0
+  end
+  if nibble == 0x7
+    g_v[x] = (g_v[x] + kk) & 0xFF
+    return 0
+  end
+  if nibble == 0x8
+    _arith_op(x, y, n)
+    return 0
+  end
+  if nibble == 0x9
+    if g_v[x] != g_v[y]
+      _skip_if(1)
+    end
+    return 0
+  end
+  if nibble == 0xA
+    g_i = nnn
+    return 0
+  end
+  if nibble == 0xB
+    g_pc = (nnn + g_v[0]) & 0xFFF
+    return 0
+  end
+  if nibble == 0xC
+    g_v[x] = _rand_byte() & kk
+    return 0
+  end
+  if nibble == 0xD
+    _draw_sprite(g_v[x], g_v[y], n)
+    return 0
+  end
+  if nibble == 0xE
+    if kk == 0x9E
+      if g_keys[g_v[x] & 0xF] == 1
+        _skip_if(1)
+      end
+    end
+    if kk == 0xA1
+      if g_keys[g_v[x] & 0xF] == 0
+        _skip_if(1)
+      end
+    end
+    return 0
+  end
+  if nibble == 0xF
+    _f_op(x, kk)
+    return 0
+  end
+
+  # Shouldn't reach here — all nibbles covered.
+  g_halt = 1
+  return -1
+end
+
+@export def chip8_step_frame(): Int
+  var i = 0
+  while i < CYCLES_PER_FRAME()
+    var rc = chip8_step()
+    if rc < 0
+      return rc
+    end
+    # Fx0A parked — stop running more cycles this frame so JS has a
+    # chance to press a key before we return.
+    if g_wait_key >= 0
+      return 0
+    end
+    i += 1
+  end
+  return 0
+end
+
+# =============================================================================
+# Test-harness helpers. Not intended for WASM export; they're here so
+# `test_chip8.qz` can poke state directly without going through linear
+# memory. Phase 3 replaces these with the chip8_ram_addr / chip8_display_addr
+# getters once @export lands on the emulator side.
+# =============================================================================
+
+@export def chip8_ram_read(addr: Int): Int = g_ram[addr & 0xFFF]
+
+@export def chip8_ram_write(addr: Int, val: Int): Int
+  g_ram[addr & 0xFFF] = val & 0xFF
+  return 0
+end
+
+@export def chip8_display_read(idx: Int): Int = g_display[idx & 0x7FF]
+
+@export def chip8_key_set(key: Int, val: Int): Int
+  g_keys[key & 0xF] = val & 1
+  return 0
+end
+
+@export def chip8_pc(): Int = g_pc
+
+@export def chip8_v(idx: Int): Int = g_v[idx & 0xF]
+
+@export def chip8_halted(): Int = g_halt
+
+@export def chip8_delay(): Int = g_delay
+
+# =============================================================================
+# `main` exists only so this file compiles as a standalone program for the
+# WASM backend, which requires a `_start` entry. JS drives the emulator via
+# the @export'd functions; main is a one-shot init so module instantiation
+# leaves the emulator ready-to-step.
+# =============================================================================
+
+def main(): Int
+  chip8_init()
+  return 0
+end
+
+## One-shot self-test so wasmtime --invoke (which discards state between
+## calls) can still verify the WASM build is sound. Does init + load +
+## step + check in a single call, returns V0 at the end. Expected: 0x43.
+@export def chip8_self_test(): Int
+  chip8_init()
+  # LD V0, 0x42 ; ADD V0, 1
+  chip8_ram_write(0x200, 0x60)
+  chip8_ram_write(0x201, 0x42)
+  chip8_ram_write(0x202, 0x70)
+  chip8_ram_write(0x203, 0x01)
+  chip8_step()
+  chip8_step()
+  return chip8_v(0)
+end
+
+## Even simpler: return what RAM[0x200] holds after chip8_init +
+## chip8_ram_write. Expected: 0x60 (the `LD V0, kk` opcode high byte).
+## If this returns something else, the read-after-write path is broken.
+@export def chip8_probe_ram(): Int
+  chip8_init()
+  chip8_ram_write(0x200, 0x60)
+  return chip8_ram_read(0x200)
+end

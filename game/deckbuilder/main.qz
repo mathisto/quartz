@@ -1,0 +1,952 @@
+## Deckbuilder v0.2 — multi-combat with screen-as-state.
+##
+## A Slay-the-Spire-shaped combat with a meta-loop: win → next fight
+## (same deck, fresh combat); lose → game over → restart (fresh fight,
+## win counter resets). Multi-screen state lives in a top-level Game
+## struct with a Screen tag; update and view dispatch on the tag.
+## v0.3 will add card-pick rewards on this same scaffolding.
+##
+## Combat:
+##   5-card hand vs. 30HP enemy. Energy 3/turn. Block reduces incoming
+##   damage and resets each turn. Enemy follows a fixed 3-turn cycle
+##   (Strike 6, Strike 6, Big Strike 11) telegraphed via intent line.
+##
+## Keys (combat):
+##   ↑↓     navigate hand
+##   Enter  play selected card
+##   E      end turn (enemy attacks, discard hand, draw 5)
+##   Q      quit
+##
+## Keys (victory / defeat):
+##   R      next fight (or restart from defeat)
+##   Q      quit
+##
+## Driving project for the TUI framework. Single file, pure-data state,
+## no async, no RNG (draw is LIFO from a fixed deck order — replay-clean).
+
+import std/tui/runtime as tui
+import std/terminal
+import std/tui/layout as ly
+import std/tui/widgets/list as ls
+import std/tui/widgets/overlay as ov
+import std/tui/widgets/progress as pg
+import std/tui/widgets/confirm as cf
+import std/tui/widgets/toast as tt
+import std/tui/widgets/status_bar as sb
+import std/tui/help as hp
+import style
+import * from std/vec
+
+# ----- Types -----
+
+struct Card
+  name:   String
+  cost:   Int
+  damage: Int
+  heal:   Int
+  block:  Int
+end
+
+enum GameState
+  Playing
+  Victory
+  Defeat
+end
+
+struct Combat
+  hand:    List<Card>
+  draw:    Vec<Card>
+  discard: Vec<Card>
+  energy:        Int
+  energy_max:    Int
+  player_hp:     Int
+  player_hp_max: Int
+  player_block:  Int
+  enemy_hp:      Int
+  enemy_hp_max:  Int
+  turn:    Int
+  status:  String
+  status_kind: Int
+  state:   GameState
+end
+
+# Status-line semantic class. Drives the color the » prefix line
+# renders in. Kept as flat Int constants instead of an enum because
+# it is set at six call sites and the enum-pattern overhead would
+# only multiply boilerplate.
+def STATUS_INFO():    Int = 0
+def STATUS_SUCCESS(): Int = 1
+def STATUS_WARNING(): Int = 2
+def STATUS_ERROR():   Int = 3
+
+enum AppMsg
+  Noop
+  ToastExpired(seq: Int)
+end
+
+# ----- Top-level multi-screen Game state -----
+
+enum Screen
+  CombatScreen
+  RewardScreen
+  DefeatScreen
+end
+
+struct Reward
+  choices: List<Card>
+end
+
+struct Game
+  screen:                Screen
+  combat:                Combat
+  reward:                Reward
+  deck:                  Vec<Card>
+  fights_won:            Int
+  help_visible:          Bool
+  quit_confirm:          cf::Confirm
+  quit_confirm_visible:  Bool
+  toast:                 tt::Toast
+  toast_visible:         Bool
+  toast_seq:             Int
+end
+
+# ----- Card data -----
+
+def card_strike(): Card =
+  Card { name: "Strike", cost: 1, damage: 6, heal: 0, block: 0 }
+
+def card_heavy_strike(): Card =
+  Card { name: "Heavy Strike", cost: 2, damage: 9, heal: 0, block: 0 }
+
+def card_bash(): Card =
+  Card { name: "Bash", cost: 2, damage: 8, heal: 0, block: 0 }
+
+def card_mend(): Card =
+  Card { name: "Mend", cost: 1, damage: 0, heal: 5, block: 0 }
+
+def card_defend(): Card =
+  Card { name: "Defend", cost: 1, damage: 0, heal: 0, block: 5 }
+
+def card_iron_wave(): Card =
+  Card { name: "Iron Wave", cost: 1, damage: 5, heal: 0, block: 5 }
+
+# ----- Reward pool (drawn between combats) -----
+
+def card_strike_plus(): Card =
+  Card { name: "Strike+", cost: 1, damage: 9, heal: 0, block: 0 }
+
+def card_defend_plus(): Card =
+  Card { name: "Defend+", cost: 1, damage: 0, heal: 0, block: 8 }
+
+def card_iron_wave_plus(): Card =
+  Card { name: "Iron Wave+", cost: 1, damage: 8, heal: 0, block: 8 }
+
+def card_mend_plus(): Card =
+  Card { name: "Mend+", cost: 1, damage: 0, heal: 8, block: 0 }
+
+def card_hover(): Card =
+  Card { name: "Hover", cost: 1, damage: 0, heal: 0, block: 12 }
+
+def card_doublestrike(): Card =
+  Card { name: "Doublestrike", cost: 2, damage: 12, heal: 0, block: 0 }
+
+def reward_choices_for(fights_won: Int): Vec<Card>
+  ## Three hand-curated reward sets cycled deterministically by
+  ## fights_won. Replay-clean (no RNG); the same win count always
+  ## offers the same three choices.
+  var v = vec_new<Card>()
+  var phase = fights_won % 3
+  if phase == 1
+    v.push(card_defend_plus())
+    v.push(card_strike_plus())
+    v.push(card_iron_wave_plus())
+    return v
+  end
+  if phase == 2
+    v.push(card_mend_plus())
+    v.push(card_hover())
+    v.push(card_doublestrike())
+    return v
+  end
+  ## phase == 0 (3rd, 6th, ... fight)
+  v.push(card_strike_plus())
+  v.push(card_mend_plus())
+  v.push(card_doublestrike())
+  return v
+end
+
+def starting_deck(): Vec<Card>
+  ## Draw is LIFO (pop from end). Cards pushed LAST come out FIRST,
+  ## so the bottom of the file is the top of the deck. 12-card deck;
+  ## opening hand (last 5 pushed → first 5 drawn) is Defend, Defend,
+  ## Strike, Strike, Strike — enough to read the enemy intent and time
+  ## a block against the turn-3 Big Strike.
+  var v = vec_new<Card>()
+  v.push(card_heavy_strike())
+  v.push(card_bash())
+  v.push(card_iron_wave())
+  v.push(card_mend())
+  v.push(card_mend())
+  v.push(card_strike())
+  v.push(card_strike())
+  v.push(card_strike())     # opening hand bottom (drawn 5th):
+  v.push(card_strike())     # Strike
+  v.push(card_strike())     # Strike
+  v.push(card_defend())     # Defend
+  v.push(card_defend())     # Defend  ← top of deck, drawn first
+  return v
+end
+
+# ----- Card rendering -----
+
+def show_card(c: Card): String
+  var name_field = ly::align_left(c.name, 14)
+  var parts = vec_new<String>()
+  if c.damage > 0
+    parts.push("deal " + c.damage.to_s())
+  end
+  if c.block > 0
+    parts.push("block " + c.block.to_s())
+  end
+  if c.heal > 0
+    parts.push("heal " + c.heal.to_s())
+  end
+  var blurb = str_join(parts, " · ")
+  var cost = Style.new().bold().render("(" + c.cost.to_s() + ")")
+  return name_field + "  " + cost + "  " + blurb
+end
+
+# ----- Pure helpers -----
+#
+# Vec-shape transforms (clone, remove-at, concat, pop-from-end) are
+# now in std/vec.qz as Vec<T> generics — vec_clone, vec_remove_at,
+# vec_concat, vec_pop_n_from_end. The deckbuilder consumes them
+# directly; no Card-specialized wrappers needed.
+
+def _hand_list(cards: Vec<Card>): List<Card>
+  var l = ls::list_new(cards, ls::item_delegate_simple(show_card))
+  l = ls::list_with_size(l, 50, 5)
+  l = ls::list_with_wrap_around(l, true)
+  return l
+end
+
+def _reward_list(cards: Vec<Card>): List<Card>
+  var l = ls::list_new(cards, ls::item_delegate_simple(show_card))
+  l = ls::list_with_size(l, 50, 3)
+  l = ls::list_with_wrap_around(l, true)
+  return l
+end
+
+def combat_from_deck(deck: Vec<Card>): Combat
+  ## Build a fresh Combat from any deck (starter or grown). Enemy
+  ## scaling stays flat in v0.3 — meta-loop validation, not balance
+  ## tuning. Player HP also resets to full each fight; carrying HP
+  ## across fights is a v0.4+ decision.
+  var split = vec_pop_n_from_end(deck, 5)
+  var hand_cards = split.0
+  var draw_left  = split.1
+  return Combat {
+    hand: _hand_list(hand_cards),
+    draw: draw_left,
+    discard: vec_new<Card>(),
+    energy: 3, energy_max: 3,
+    player_hp: 50, player_hp_max: 50, player_block: 0,
+    enemy_hp: 30,  enemy_hp_max: 30,
+    turn: 1,
+    status: "Your move.",
+    status_kind: STATUS_INFO(),
+    state: GameState::Playing
+  }
+end
+
+def initial_combat(): Combat = combat_from_deck(starting_deck())
+
+def make_reward(fights_won: Int): Reward
+  return Reward { choices: _reward_list(reward_choices_for(fights_won)) }
+end
+
+# ----- Enemy intent (derived from turn number; replay-clean) -----
+
+def enemy_intent_for(turn: Int): (String, Int)
+  ## Three-turn cycle: Strike 6, Strike 6, Big Strike 11.
+  var phase = (turn - 1) % 3
+  if phase == 2
+    return ("Big Strike", 11)
+  end
+  return ("Strike", 6)
+end
+
+# ----- Turn logic (pure transitions on Combat) -----
+
+def play_card_at(c: Combat, idx: Int): Combat
+  var hand_list: List<Card> = c.hand
+  var hand_cards: Vec<Card> = hand_list.items
+  if idx < 0
+    return c
+  end
+  if idx >= hand_cards.size
+    return c
+  end
+  var played = hand_cards[idx]
+  if played.cost > c.energy
+    return Combat {
+      hand: c.hand, draw: c.draw, discard: c.discard,
+      energy: c.energy, energy_max: c.energy_max,
+      player_hp: c.player_hp, player_hp_max: c.player_hp_max,
+      player_block: c.player_block,
+      enemy_hp: c.enemy_hp, enemy_hp_max: c.enemy_hp_max,
+      turn: c.turn,
+      status: "Not enough energy for " + played.name + ".",
+      status_kind: STATUS_WARNING(),
+      state: c.state
+    }
+  end
+  var new_enemy_hp = c.enemy_hp - played.damage
+  if new_enemy_hp < 0
+    new_enemy_hp = 0
+  end
+  var new_player_hp = c.player_hp + played.heal
+  if new_player_hp > c.player_hp_max
+    new_player_hp = c.player_hp_max
+  end
+  var new_block = c.player_block + played.block
+  var new_hand_cards = vec_remove_at(hand_cards, idx)
+  var new_discard = vec_clone(c.discard)
+  new_discard.push(played)
+
+  var new_state = c.state
+  var new_status = ""
+  if played.damage > 0
+    new_status = "Played " + played.name + " for " + played.damage.to_s() + " damage."
+  end
+  if played.heal > 0
+    new_status = "Played " + played.name + " — healed " + played.heal.to_s() + "."
+  end
+  if played.block > 0
+    if played.damage > 0
+      new_status = new_status + " (+" + played.block.to_s() + " block)"
+    end
+    if played.damage == 0
+      new_status = "Played " + played.name + " — gained " + played.block.to_s() + " block."
+    end
+  end
+  if new_enemy_hp == 0
+    new_state = GameState::Victory
+    new_status = "You defeated the enemy!"
+  end
+
+  return Combat {
+    hand: _hand_list(new_hand_cards),
+    draw: c.draw,
+    discard: new_discard,
+    energy: c.energy - played.cost, energy_max: c.energy_max,
+    player_hp: new_player_hp, player_hp_max: c.player_hp_max,
+    player_block: new_block,
+    enemy_hp: new_enemy_hp, enemy_hp_max: c.enemy_hp_max,
+    turn: c.turn,
+    status: new_status,
+    status_kind: STATUS_SUCCESS(),
+    state: new_state
+  }
+end
+
+def end_turn(c: Combat): Combat
+  if c.state is Victory
+    return c
+  end
+  if c.state is Defeat
+    return c
+  end
+  # Enemy attacks first; block absorbs damage, then resets.
+  var intent = enemy_intent_for(c.turn)
+  var attack_label  = intent.0
+  var attack_damage = intent.1
+  var absorbed = attack_damage
+  if absorbed > c.player_block
+    absorbed = c.player_block
+  end
+  var taken = attack_damage - absorbed
+  var hp_after_hit = c.player_hp - taken
+  var hit_status = "Enemy " + attack_label + " → -" + taken.to_s() + " HP"
+  if absorbed > 0
+    hit_status = hit_status + " (" + absorbed.to_s() + " blocked)"
+  end
+  if hp_after_hit <= 0
+    return Combat {
+      hand: c.hand, draw: c.draw, discard: c.discard,
+      energy: c.energy, energy_max: c.energy_max,
+      player_hp: 0, player_hp_max: c.player_hp_max,
+      player_block: 0,
+      enemy_hp: c.enemy_hp, enemy_hp_max: c.enemy_hp_max,
+      turn: c.turn,
+      status: hit_status + " You fall.",
+      status_kind: STATUS_ERROR(),
+      state: GameState::Defeat
+    }
+  end
+  # Discard the rest of the hand, recycle discard into draw if needed,
+  # draw 5 fresh cards.
+  var hand_list: List<Card> = c.hand
+  var current_hand: Vec<Card> = hand_list.items
+  var post_discard = vec_concat(c.discard, current_hand)
+  var draw = c.draw
+  var discard = post_discard
+  if draw.size < 5
+    draw = vec_concat(draw, discard)
+    discard = vec_new<Card>()
+  end
+  var split = vec_pop_n_from_end(draw, 5)
+  var new_hand_cards = split.0
+  var new_draw       = split.1
+  return Combat {
+    hand: _hand_list(new_hand_cards),
+    draw: new_draw,
+    discard: discard,
+    energy: c.energy_max, energy_max: c.energy_max,
+    player_hp: hp_after_hit, player_hp_max: c.player_hp_max,
+    player_block: 0,
+    enemy_hp: c.enemy_hp,    enemy_hp_max: c.enemy_hp_max,
+    turn: c.turn + 1,
+    status: hit_status,
+    status_kind: if taken > 0 then STATUS_ERROR() else STATUS_WARNING() end,
+    state: GameState::Playing
+  }
+end
+
+# ----- Update -----
+
+def update_combat(msg: tui::FrameMsg<AppMsg>, c: Combat): Combat
+  match msg
+    tui::FrameMsg::Key(k) =>
+      if k.code == 101  # 'e' — end turn
+        return end_turn(c)
+      end
+      if k.code == terminal::KEY_ENTER()
+        match ls::list_selected_index(c.hand)
+          Some(i) => return play_card_at(c, i)
+          None    => return c
+        end
+      end
+      # Any other key: forward to the hand list (↑↓ etc.).
+      var triple = ls::list_update(c.hand, msg)
+      var next_hand = triple.0
+      return Combat {
+        hand: next_hand,
+        draw: c.draw, discard: c.discard,
+        energy: c.energy, energy_max: c.energy_max,
+        player_hp: c.player_hp, player_hp_max: c.player_hp_max,
+        player_block: c.player_block,
+        enemy_hp: c.enemy_hp, enemy_hp_max: c.enemy_hp_max,
+        turn: c.turn, status: c.status, status_kind: c.status_kind, state: c.state
+      }
+    _ => return c
+  end
+end
+
+## Default quit confirm — "Quit run?" with No selected so a stray
+## Enter doesn't end the run by accident.
+def _make_quit_confirm(): cf::Confirm =
+  cf::confirm_with_default(cf::confirm_new("Quit run? Progress will be lost."), false)
+
+## Initial blank toast value. Game struct requires a non-Option Toast,
+## so we seed with an empty Info-level placeholder; toast_visible=false
+## suppresses rendering until a real toast fires.
+def _blank_toast(): tt::Toast = tt::toast_new("", tt::ToastLevel::Info)
+
+## Map combat status_kind → ToastLevel so status-delta detection in
+## update can produce a toast with the right colour.
+def _toast_level_for(kind: Int): tt::ToastLevel
+  if kind == STATUS_SUCCESS()
+    return tt::ToastLevel::Success
+  end
+  if kind == STATUS_WARNING()
+    return tt::ToastLevel::Warning
+  end
+  if kind == STATUS_ERROR()
+    return tt::ToastLevel::Error
+  end
+  return tt::ToastLevel::Info
+end
+
+def _start_next_combat(deck: Vec<Card>, fights_won: Int): Game
+  return Game {
+    screen: Screen::CombatScreen,
+    combat: combat_from_deck(deck),
+    reward: make_reward(fights_won),    # placeholder; refreshed at next victory
+    deck: deck,
+    fights_won: fights_won,
+    help_visible: false,
+    quit_confirm: _make_quit_confirm(),
+    quit_confirm_visible: false,
+    toast: _blank_toast(),
+    toast_visible: false,
+    toast_seq: 0,
+  }
+end
+
+def _commit_reward_pick(g: Game, picked: Card): Game
+  ## Add the picked card to the deck and start the next combat.
+  var new_deck = vec_clone(g.deck)
+  new_deck.push(picked)
+  return _start_next_combat(new_deck, g.fights_won)
+end
+
+def _toggle_help(g: Game): Game
+  return Game {
+    screen: g.screen,
+    combat: g.combat,
+    reward: g.reward,
+    deck:   g.deck,
+    fights_won:   g.fights_won,
+    help_visible: not g.help_visible,
+    quit_confirm: g.quit_confirm,
+    quit_confirm_visible: g.quit_confirm_visible,
+    toast: g.toast,
+    toast_visible: g.toast_visible,
+    toast_seq: g.toast_seq,
+  }
+end
+
+## Re-arm the quit-confirm overlay (No selected, freshly built) and
+## flip its visibility flag. Routing 'q' through this puts a guard
+## between the user and abrupt termination.
+def _show_quit_confirm(g: Game): Game
+  return Game {
+    screen: g.screen,
+    combat: g.combat,
+    reward: g.reward,
+    deck:   g.deck,
+    fights_won:   g.fights_won,
+    help_visible: g.help_visible,
+    quit_confirm: _make_quit_confirm(),
+    quit_confirm_visible: true,
+    toast: g.toast,
+    toast_visible: g.toast_visible,
+    toast_seq: g.toast_seq,
+  }
+end
+
+def _hide_quit_confirm(g: Game): Game
+  return Game {
+    screen: g.screen,
+    combat: g.combat,
+    reward: g.reward,
+    deck:   g.deck,
+    fights_won:   g.fights_won,
+    help_visible: g.help_visible,
+    quit_confirm: g.quit_confirm,
+    quit_confirm_visible: false,
+    toast: g.toast,
+    toast_visible: g.toast_visible,
+    toast_seq: g.toast_seq,
+  }
+end
+
+def _set_quit_confirm(g: Game, c: cf::Confirm): Game
+  return Game {
+    screen: g.screen,
+    combat: g.combat,
+    reward: g.reward,
+    deck:   g.deck,
+    fights_won:   g.fights_won,
+    help_visible: g.help_visible,
+    quit_confirm: c,
+    quit_confirm_visible: g.quit_confirm_visible,
+    toast: g.toast,
+    toast_visible: g.toast_visible,
+    toast_seq: g.toast_seq,
+  }
+end
+
+## Build a Cmd::After whose thunk emits FrameMsg::App(ToastExpired(seq))
+## with the supplied sequence number captured into the closure env.
+## The seq lets the receiver (`_clear_toast`) ignore stale expirations
+## from older toasts that have been replaced by a fresher one.
+def _expire_cmd(ttl_ms: Int, seq: Int): tui::Cmd<AppMsg>
+  var thunk: Fn(): tui::FrameMsg<AppMsg> =
+    -> tui::FrameMsg::App(AppMsg::ToastExpired(seq))
+  return tui::Cmd::After(ttl_ms, thunk)
+end
+
+## Replace combat AND fire a toast on status delta. If next_combat's
+## status differs from the prior frame and is non-empty, build a
+## fresh Toast at the right level and dispatch a Cmd::After that
+## clears it after the ttl elapses. Each fresh toast bumps
+## `toast_seq` so the expiration thunk for an older toast that
+## was replaced mid-flight gets ignored when it eventually fires.
+def _apply_combat_with_toast(g: Game, next_combat: Combat): (Game, tui::Cmd<AppMsg>)
+  var prev_status = g.combat.status
+  var status_changed = next_combat.status != prev_status and next_combat.status.size > 0
+  if status_changed
+    var lvl = _toast_level_for(next_combat.status_kind)
+    var t = tt::toast_with_ttl(tt::toast_new(next_combat.status, lvl), 2200)
+    var next_seq = g.toast_seq + 1
+    var g2 = Game {
+      screen: g.screen,
+      combat: next_combat,
+      reward: g.reward,
+      deck:   g.deck,
+      fights_won:   g.fights_won,
+      help_visible: g.help_visible,
+      quit_confirm: g.quit_confirm,
+      quit_confirm_visible: g.quit_confirm_visible,
+      toast: t,
+      toast_visible: true,
+      toast_seq: next_seq,
+    }
+    return (g2, _expire_cmd(2200, next_seq))
+  end
+  return (Game {
+    screen: g.screen,
+    combat: next_combat,
+    reward: g.reward,
+    deck:   g.deck,
+    fights_won:   g.fights_won,
+    help_visible: g.help_visible,
+    quit_confirm: g.quit_confirm,
+    quit_confirm_visible: g.quit_confirm_visible,
+    toast: g.toast,
+    toast_visible: g.toast_visible,
+    toast_seq: g.toast_seq,
+  }, tui::Cmd::None)
+end
+
+## Replace screen + combat (used on Victory / Defeat transitions),
+## detecting status delta the same way _apply_combat_with_toast does.
+def _apply_screen_combat_with_toast(g: Game, screen: Screen, next_combat: Combat,
+                                     reward: Reward, fights_won: Int): (Game, tui::Cmd<AppMsg>)
+  var prev_status = g.combat.status
+  var status_changed = next_combat.status != prev_status and next_combat.status.size > 0
+  if status_changed
+    var lvl = _toast_level_for(next_combat.status_kind)
+    var t = tt::toast_with_ttl(tt::toast_new(next_combat.status, lvl), 2200)
+    var next_seq = g.toast_seq + 1
+    var g2 = Game {
+      screen: screen,
+      combat: next_combat,
+      reward: reward,
+      deck:   g.deck,
+      fights_won: fights_won,
+      help_visible: g.help_visible,
+      quit_confirm: g.quit_confirm,
+      quit_confirm_visible: g.quit_confirm_visible,
+      toast: t,
+      toast_visible: true,
+      toast_seq: next_seq,
+    }
+    return (g2, _expire_cmd(2200, next_seq))
+  end
+  return (Game {
+    screen: screen,
+    combat: next_combat,
+    reward: reward,
+    deck:   g.deck,
+    fights_won: fights_won,
+    help_visible: g.help_visible,
+    quit_confirm: g.quit_confirm,
+    quit_confirm_visible: g.quit_confirm_visible,
+    toast: g.toast,
+    toast_visible: g.toast_visible,
+    toast_seq: g.toast_seq,
+  }, tui::Cmd::None)
+end
+
+## ToastExpired arrives after the toast's ttl elapses. Only clears
+## visibility when the expiring toast's seq matches the current seq;
+## a stale expiration (from an older toast that was replaced before
+## its ttl elapsed) is dropped. Without this guard, a fast back-to-
+## back toast would see the older expire stomp the newer toast a few
+## hundred ms early.
+def _clear_toast(g: Game, seq: Int): Game
+  if seq != g.toast_seq
+    return g
+  end
+  return Game {
+    screen: g.screen,
+    combat: g.combat,
+    reward: g.reward,
+    deck:   g.deck,
+    fights_won:   g.fights_won,
+    help_visible: g.help_visible,
+    quit_confirm: g.quit_confirm,
+    quit_confirm_visible: g.quit_confirm_visible,
+    toast: g.toast,
+    toast_visible: false,
+    toast_seq: g.toast_seq,
+  }
+end
+
+def update(msg: tui::FrameMsg<AppMsg>, g: Game): (Game, tui::Cmd<AppMsg>)
+  match msg
+    tui::FrameMsg::App(app_msg) =>
+      ## ToastExpired clears the active toast — but only when the
+      ## expiring toast's seq matches the current `g.toast_seq`. A
+      ## stale expire from an older toast that was replaced before
+      ## its ttl elapsed is dropped, so a fresh toast that just
+      ## landed isn't stomped a few hundred ms early.
+      match app_msg
+        AppMsg::ToastExpired(seq) => return (_clear_toast(g, seq), tui::Cmd::None)
+        _                         => return (g, tui::Cmd::None)
+      end
+    tui::FrameMsg::Key(k) =>
+      ## Ctrl-C bypasses the confirm dialog — emergency exit.
+      if k.code == terminal::KEY_CTRL_C()
+        return (g, tui::Cmd::Quit)
+      end
+      ## Quit confirm has hard modal priority — when visible, it eats
+      ## every key except Ctrl-C (handled above). Confirmed → Quit;
+      ## Cancelled → dismiss; Idle → keep updated dialog state.
+      if g.quit_confirm_visible
+        var triple = cf::confirm_update(g.quit_confirm, msg)
+        var next_confirm = triple.0
+        var ev = triple.2
+        match ev
+          cf::ConfirmEvent::Confirmed => return (g, tui::Cmd::Quit)
+          cf::ConfirmEvent::Cancelled => return (_hide_quit_confirm(g), tui::Cmd::None)
+          cf::ConfirmEvent::Idle      => return (_set_quit_confirm(g, next_confirm), tui::Cmd::None)
+        end
+      end
+      if k.code == 113  # 'q' — open quit confirm (was: immediate Quit)
+        return (_show_quit_confirm(g), tui::Cmd::None)
+      end
+      if k.code == 63   # '?' — toggle help modal (works on every screen)
+        return (_toggle_help(g), tui::Cmd::None)
+      end
+      ## When help is visible, every other key is swallowed (modal capture).
+      ## This mirrors a true modal overlay — the underlying screen doesn't
+      ## react until help is dismissed.
+      if g.help_visible
+        return (g, tui::Cmd::None)
+      end
+      if g.screen is RewardScreen
+        if k.code == 115  # 's' — skip reward
+          return (_start_next_combat(g.deck, g.fights_won), tui::Cmd::None)
+        end
+        if k.code == terminal::KEY_ENTER()
+          var choices: List<Card> = g.reward.choices
+          var items: Vec<Card> = choices.items
+          match ls::list_selected_index(choices)
+            Some(i) => return (_commit_reward_pick(g, items[i]), tui::Cmd::None)
+            None    => return (g, tui::Cmd::None)
+          end
+        end
+        # Any other key: forward to the choices list for ↑↓ navigation.
+        var triple = ls::list_update(g.reward.choices, msg)
+        var next_choices = triple.0
+        return (Game {
+          screen: g.screen,
+          combat: g.combat,
+          reward: Reward { choices: next_choices },
+          deck:   g.deck,
+          fights_won:   g.fights_won,
+          help_visible: g.help_visible,
+          quit_confirm: g.quit_confirm,
+          quit_confirm_visible: g.quit_confirm_visible,
+          toast: g.toast,
+          toast_visible: g.toast_visible,
+          toast_seq: g.toast_seq,
+        }, tui::Cmd::None)
+      end
+      if g.screen is DefeatScreen
+        if k.code == 114  # 'r' — restart run
+          return (_start_next_combat(starting_deck(), 0), tui::Cmd::None)
+        end
+        return (g, tui::Cmd::None)
+      end
+      # Combat screen: delegate, then check for state transitions.
+      # _apply_*_with_toast helpers detect status delta vs prior frame
+      # and fire a Cmd::After when status text changes.
+      var next_combat = update_combat(msg, g.combat)
+      if next_combat.state is Victory
+        var next_won = g.fights_won + 1
+        return _apply_screen_combat_with_toast(g, Screen::RewardScreen,
+          next_combat, make_reward(next_won), next_won)
+      end
+      if next_combat.state is Defeat
+        return _apply_screen_combat_with_toast(g, Screen::DefeatScreen,
+          next_combat, g.reward, g.fights_won)
+      end
+      return _apply_combat_with_toast(g, next_combat)
+    _ => return (g, tui::Cmd::None)
+  end
+end
+
+# ----- View -----
+
+## Inner box width. Bounded so the box never sprawls across very
+## wide terminals and never collapses on very narrow ones.
+def view_inner_width(): Int = ly::clamp_to_terminal_width(40, 60)
+
+## Render an HP-style bar via the progress_bar widget. The widget's
+## auto-gradient (red <25, yellow <50, green ≥50) handles the
+## semantic colouring; the deckbuilder appends its own "cur/max"
+## label after the bar (so we strip the widget's count by passing
+## the bar through `_strip_count` below).
+def hp_bar(cur: Int, max: Int, width: Int): String
+  if max <= 0
+    return ""
+  end
+  var p = pg::progress_bar_with_size(pg::progress_bar_new(cur, max), width)
+  return _bar_only(pg::progress_bar_view(p))
+end
+
+# The widget renders `[bar] cur/max`; the combat view already
+# composes its own count next to the bar, so trim everything from
+# the closing `]` onward back to just `[bar]`. Byte-indexed because
+# the bar contains SGR escape bytes — codepoint slicing would
+# misread the offset of the `]` after a multibyte UTF-8 fill char.
+def _bar_only(s: String): String
+  var len = str_byte_len(s)
+  var i = 0
+  while i < len
+    if str_byte_at(s, i) == ']'
+      return str_byte_slice(s, 0, i + 1)
+    end
+    i = i + 1
+  end
+  return s
+end
+
+def view_combat(c: Combat, fights_won: Int): String
+  var muted = Style.muted()
+  var energy_style = Style.new().fg(style::Yellow()).bold()
+  var block_style  = Style.new().fg(style::Cyan()).bold()
+  ## Header is a status_bar — left segment names the screen, center
+  ## tracks run progress, right shows the help affordance. Each
+  ## segment renders independently with the muted style; status_bar's
+  ## str_join-with-spacers path keeps the styled-render concats safe
+  ## under STYLE_RENDER_CONCAT_CORRUPTION.
+  var bar = sb::status_bar_append(sb::status_bar_new(),
+    sb::status_segment_with_style(
+      sb::status_segment_left("Combat — Turn " + c.turn.to_s()), muted))
+  bar = sb::status_bar_append(bar,
+    sb::status_segment_with_style(
+      sb::status_segment_center("Fights won: " + fights_won.to_s()), muted))
+  bar = sb::status_bar_append(bar,
+    sb::status_segment_with_style(
+      sb::status_segment_right("[?] help"), muted))
+  var header = sb::status_bar_view(bar, view_inner_width())
+  var block_str = ""
+  if c.player_block > 0
+    block_str = "    " + block_style.render("Block " + c.player_block.to_s())
+  end
+  var energy_label = energy_style.render(
+    "Energy " + c.energy.to_s() + "/" + c.energy_max.to_s()
+  )
+  var you   = "You    " + hp_bar(c.player_hp, c.player_hp_max, 16) +
+              "  " + c.player_hp.to_s() + "/" + c.player_hp_max.to_s() +
+              "    " + energy_label +
+              block_str
+  var intent = enemy_intent_for(c.turn)
+  var enemy = "Enemy  " + hp_bar(c.enemy_hp, c.enemy_hp_max, 16) +
+              "  " + c.enemy_hp.to_s() + "/" + c.enemy_hp_max.to_s() +
+              "    Next: " + intent.0 + " (" + intent.1.to_s() + ")"
+  var hand_block = ls::list_view(c.hand, true)
+  var pile_line = muted.render(
+    "Draw " + c.draw.size.to_s() + " · Discard " + c.discard.size.to_s()
+  )
+
+  ## Status row removed in v0.5 — status text now flashes as a
+  ## transient toast (see view's overlay composition + toast widget
+  ## wiring in update). Combat.status / Combat.status_kind stay set
+  ## by the combat transitions to drive the toast contents.
+  var parts = vec_new<String>()
+  parts.push(header)
+  parts.push(you)
+  parts.push(enemy)
+  parts.push("")
+  parts.push(hand_block)
+  parts.push(pile_line)
+
+  var body = ly::align_left(ly::join_vertical(parts), view_inner_width())
+  return ly::border_with(body, ly::BORDER_ROUNDED())
+end
+
+def view_reward(g: Game): String
+  var headline = Style.success().render("*** VICTORY ***")
+  var meta = Style.muted().render("    Fights won: " + g.fights_won.to_s() +
+             "    Deck: " + g.deck.size.to_s() + " cards    [?] help")
+  var header = headline + meta
+  var prompt = "Pick a card to add to your deck:"
+  var choices_block = ls::list_view(g.reward.choices, true)
+
+  var parts = vec_new<String>()
+  parts.push(header)
+  parts.push("")
+  parts.push(prompt)
+  parts.push(choices_block)
+  var body = ly::align_left(ly::join_vertical(parts), view_inner_width())
+  return ly::border_with(body, ly::BORDER_ROUNDED())
+end
+
+def view_defeat(c: Combat, fights_won: Int): String
+  var parts = vec_new<String>()
+  var head = Style.error().render("*** DEFEAT ***") + Style.muted().render("    [?] help")
+  parts.push(head)
+  parts.push("")
+  parts.push("You fell on turn " + c.turn.to_s() +
+                  " · Fights won this run: " + fights_won.to_s())
+  var body = ly::align_left(ly::join_vertical(parts), view_inner_width())
+  return ly::border_with(ly::pad_uniform(body, 1), ly::BORDER_ROUNDED())
+end
+
+def help_overlay(): ov::Overlay
+  ## Declarative help — keymaps per surface, hp::help_modal turns the
+  ## list into a centred rounded-border Overlay. Adding a new screen's
+  ## keys is a single keymap_append chain; help text stays in sync
+  ## with the surfaces by construction.
+  var combat = hp::keymap_new("Combat")
+  combat = hp::keymap_append(combat, "↑↓",    "navigate hand")
+  combat = hp::keymap_append(combat, "Enter", "play card")
+  combat = hp::keymap_append(combat, "E",     "end turn")
+
+  var reward = hp::keymap_new("Reward")
+  reward = hp::keymap_append(reward, "↑↓",    "navigate")
+  reward = hp::keymap_append(reward, "Enter", "pick")
+  reward = hp::keymap_append(reward, "S",     "skip")
+
+  var anywhere = hp::keymap_new("Anywhere")
+  anywhere = hp::keymap_append(anywhere, "?", "toggle help")
+  anywhere = hp::keymap_append(anywhere, "Q", "quit")
+
+  var maps = vec_new<hp::KeyMap>()
+  maps.push(combat)
+  maps.push(reward)
+  maps.push(anywhere)
+  return hp::help_modal(maps)
+end
+
+def view(g: Game): String
+  var base = ""
+  if g.screen is RewardScreen
+    base = view_reward(g)
+  elsif g.screen is DefeatScreen
+    base = view_defeat(g.combat, g.fights_won)
+  else
+    base = view_combat(g.combat, g.fights_won)
+  end
+  ## Z-order: base → toast → quit_confirm → help.
+  ## Help is the topmost layer when visible — it interrupts every
+  ## other surface ("stop the world and read"). When help isn't
+  ## showing, toast and quit_confirm compose normally.
+  if g.help_visible
+    return ov::overlay_compose(base, help_overlay())
+  end
+  var with_toast = base
+  if g.toast_visible
+    with_toast = ov::overlay_compose(base, tt::toast_overlay(g.toast))
+  end
+  if g.quit_confirm_visible
+    return ov::overlay_compose(with_toast, cf::confirm_overlay(g.quit_confirm))
+  end
+  return with_toast
+end
+
+# ----- Entry -----
+
+def initial_game(): Game = _start_next_combat(starting_deck(), 0)
+
+def main(): Int
+  var p = tui::program_new(initial_game(), update, view)
+  return tui::program_run(p)
+end

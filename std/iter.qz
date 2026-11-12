@@ -1,0 +1,530 @@
+## Standard Iterator Library
+##
+## Provides composable lazy iteration over sequences.
+##
+## Every adapter constructor and terminal operation is bounded by
+## `<I: Iterator<Int>>` and takes a concrete iterator value. The public
+## API has zero `Fn(): Option<Int>` signatures — the closure plumbing is
+## an internal implementation detail. Users build chains like:
+##
+##   import iter
+##   var r = range_iter(0, 10)
+##   var doubled = iter_map(r, x -> x * 2)
+##   var evens = iter_filter(doubled, x -> x % 4 == 0)
+##   var sum = iter_sum(evens)
+##
+## Or inline:
+##
+##   var sum = iter_sum(iter_filter(iter_map(range_iter(0, 10), x -> x * 2),
+##                                  x -> x % 4 == 0))
+##
+## How it works internally: each adapter constructor wraps the source
+## iterator's `next()` method in a closure (`-> src.next()`) and stores
+## that closure in the adapter struct. The adapter struct's own `next()`
+## impl invokes the stored closure, applies the adapter's transformation,
+## and returns. This sidesteps two compiler limitations:
+##
+##   1. Impl methods of bounded-generic structs are emitted ONCE, not
+##      per-monomorphization, so a generic `MapIter<I>::next` cannot
+##      dispatch to a different `I::next` per call site.
+##   2. `Iterator<Int>`-bounded generic functions go through the
+##      iterator-closure synthesis path at the call site, so passing a
+##      concrete iterator to a bounded-generic terminal "just works":
+##      the compiler builds the `-> src.next()` closure for you.
+##
+## The result: callers see clean, type-safe APIs (no closure args, no
+## `c_next: Fn()...` boilerplate), and the implementation rides on top
+## of the existing closure-based dispatch that the compiler already
+## handles correctly through nested chains.
+##
+## Core types:
+##   MapIter        — transforms each element via a function
+##   FilterIter     — keeps elements matching a predicate
+##   TakeIter       — yields at most N elements
+##   SkipIter       — skips the first N elements
+##   TakeWhileIter  — yields elements while predicate holds
+##   EnumerateIter  — pairs each element with its index
+##   ZipIter        — pairs elements from two iterators
+##   ChainIter      — concatenates two iterators
+##   FlatMapIter    — maps each element to a Vec<Int> and flattens
+##   ScanIter       — stateful fold yielding intermediate accumulators
+##   VecIter        — iterates over Vec elements
+##   RangeIter      — iterates over a numeric range
+
+import traits
+
+# ============================================================================
+# Adapter Structs — closure-based dispatch (internal)
+# ============================================================================
+#
+# These structs are still closure-based at the field level. The reason is
+# that impl methods of bounded-generic structs are not currently
+# monomorphized per concrete type parameter — see the doc header. Closures
+# in fields work because they're invoked through indirect-call dispatch,
+# which is type-erased and consistent.
+#
+# Users never construct or pass these structs directly. The bounded-generic
+# constructor functions (`iter_map`, `iter_filter`, etc.) build them.
+
+## MapIter — transforms each element via a function.
+struct MapIter
+  next_fn: Fn(): Option<Int>
+  f: Fn(Int): Int
+end
+
+extend MapIter with Iterator<Int>
+  def next(self): Option<Int>
+    var get_next: Fn(): Option<Int> = self.next_fn
+    var val = try get_next()
+    var transform: Fn(Int): Int = self.f
+    return Option::Some(transform(val))
+  end
+end
+
+## FilterIter — keeps elements matching a predicate.
+struct FilterIter
+  next_fn: Fn(): Option<Int>
+  pred: Fn(Int): Bool
+end
+
+extend FilterIter with Iterator<Int>
+  def next(self): Option<Int>
+    while true
+      var get_next: Fn(): Option<Int> = self.next_fn
+      var val = try get_next()
+      var predicate: Fn(Int): Bool = self.pred
+      if predicate(val)
+        return Option::Some(val)
+      end
+    end
+    return Option::None
+  end
+end
+
+## TakeIter — yields at most N elements from the inner iterator.
+struct TakeIter
+  next_fn: Fn(): Option<Int>
+  remaining: Int
+end
+
+extend TakeIter with Iterator<Int>
+  def next(&mut self): Option<Int>
+    if self.remaining <= 0
+      return Option::None
+    end
+    self.remaining = self.remaining - 1
+    var get_next: Fn(): Option<Int> = self.next_fn
+    return get_next()
+  end
+end
+
+## SkipIter — skips the first N elements, then yields the rest.
+struct SkipIter
+  next_fn: Fn(): Option<Int>
+  remaining: Int
+end
+
+extend SkipIter with Iterator<Int>
+  def next(&mut self): Option<Int>
+    while self.remaining > 0
+      self.remaining = self.remaining - 1
+      var get_next: Fn(): Option<Int> = self.next_fn
+      try get_next()
+    end
+    var get_next2: Fn(): Option<Int> = self.next_fn
+    return get_next2()
+  end
+end
+
+## TakeWhileIter — yields elements while predicate holds, then stops.
+struct TakeWhileIter
+  next_fn: Fn(): Option<Int>
+  pred: Fn(Int): Bool
+  done: Bool
+end
+
+extend TakeWhileIter with Iterator<Int>
+  def next(&mut self): Option<Int>
+    if self.done
+      return Option::None
+    end
+    var get_next: Fn(): Option<Int> = self.next_fn
+    var result = get_next()
+    match result
+      Some(val) => {
+        var predicate: Fn(Int): Bool = self.pred
+        if predicate(val)
+          return Option::Some(val)
+        end
+        self.done = true
+        return Option::None
+      }
+      None => {
+        self.done = true
+        return Option::None
+      }
+      _ => {
+        self.done = true
+        return Option::None
+      }
+    end
+  end
+end
+
+## EnumerateIter — yields (index, element) tuples.
+struct EnumerateIter
+  next_fn: Fn(): Option<Int>
+  index: Int
+end
+
+extend EnumerateIter with Iterator<Int>
+  def next(&mut self): Option<Int>
+    var get_next: Fn(): Option<Int> = self.next_fn
+    var val = try get_next()
+    var pair = (self.index, val)
+    self.index = self.index + 1
+    return Option::Some(pair)
+  end
+end
+
+## ZipIter — yields (a, b) tuples from two iterators. Stops when either is exhausted.
+struct ZipIter
+  next_a: Fn(): Option<Int>
+  next_b: Fn(): Option<Int>
+end
+
+extend ZipIter with Iterator<Int>
+  def next(self): Option<Int>
+    var get_a: Fn(): Option<Int> = self.next_a
+    var get_b: Fn(): Option<Int> = self.next_b
+    var va = try get_a()
+    var vb = try get_b()
+    return Option::Some((va, vb))
+  end
+end
+
+## ChainIter — concatenates two iterators: yields all from first, then all from second.
+struct ChainIter
+  first: Fn(): Option<Int>
+  second: Fn(): Option<Int>
+  first_done: Bool
+end
+
+extend ChainIter with Iterator<Int>
+  def next(&mut self): Option<Int>
+    if not self.first_done
+      var get_first: Fn(): Option<Int> = self.first
+      var result = get_first()
+      match result
+        Some(val) => return Option::Some(val)
+        None => self.first_done = true
+        _ => self.first_done = true
+      end
+    end
+    var get_second: Fn(): Option<Int> = self.second
+    return get_second()
+  end
+end
+
+## FlatMapIter — maps each element to a Vec<Int> and flattens.
+## Maintains an internal buffer of the current expansion.
+struct FlatMapIter
+  next_fn: Fn(): Option<Int>
+  f: Fn(Int): Vec<Int>
+  buffer: Vec<Int>
+  buf_idx: Int
+end
+
+extend FlatMapIter with Iterator<Int>
+  def next(&mut self): Option<Int>
+    while true
+      if self.buf_idx < self.buffer.size
+        var val = self.buffer[self.buf_idx]
+        self.buf_idx = self.buf_idx + 1
+        return Option::Some(val)
+      end
+      var get_next: Fn(): Option<Int> = self.next_fn
+      var val = try get_next()
+      var mapper: Fn(Int): Vec<Int> = self.f
+      self.buffer = mapper(val)
+      self.buf_idx = 0
+    end
+    return Option::None
+  end
+end
+
+## ScanIter — stateful fold yielding each intermediate accumulator value.
+## Given f(acc, elem) -> new_acc, yields new_acc after each element.
+struct ScanIter
+  next_fn: Fn(): Option<Int>
+  acc: Int
+  f: Fn(Int, Int): Int
+end
+
+extend ScanIter with Iterator<Int>
+  def next(&mut self): Option<Int>
+    var get_next: Fn(): Option<Int> = self.next_fn
+    var val = try get_next()
+    var fold_fn: Fn(Int, Int): Int = self.f
+    self.acc = fold_fn(self.acc, val)
+    return Option::Some(self.acc)
+  end
+end
+
+# ============================================================================
+# Collection Iterators
+# ============================================================================
+
+## VecIter — iterates over Vec<Int> elements by index.
+struct VecIter
+  data: Vec<Int>
+  index: Int
+end
+
+extend VecIter with Iterator<Int>
+  def next(&mut self): Option<Int>
+    if self.index < self.data.size
+      var val = self.data[self.index]
+      self.index = self.index + 1
+      return Option::Some(val)
+    end
+    return Option::None
+  end
+end
+
+## Create an iterator from a Vec<Int>.
+def vec_iter(v: Vec<Int>): VecIter
+  return VecIter { data: v, index: 0 }
+end
+
+## RangeIter — iterates over a numeric range [start, stop).
+struct RangeIter
+  current: Int
+  stop: Int
+end
+
+extend RangeIter with Iterator<Int>
+  def next(&mut self): Option<Int>
+    if self.current < self.stop
+      var val = self.current
+      self.current = self.current + 1
+      return Option::Some(val)
+    end
+    return Option::None
+  end
+end
+
+## Create a range iterator from start (inclusive) to stop (exclusive).
+def range_iter(start: Int, stop: Int): RangeIter
+  return RangeIter { current: start, stop: stop }
+end
+
+# ============================================================================
+# Adapter Constructors — bounded-generic public API
+# ============================================================================
+
+## Transform each element using a function.
+## Usage: iter_map(counter, x -> x * 2)
+def iter_map<I: Iterator<Int>>(src: I, f: Fn(Int): Int): MapIter
+  return MapIter { next_fn: -> src.next(), f: f }
+end
+
+## Keep only elements matching a predicate.
+def iter_filter<I: Iterator<Int>>(src: I, pred: Fn(Int): Bool): FilterIter
+  return FilterIter { next_fn: -> src.next(), pred: pred }
+end
+
+## Yield at most N elements.
+def iter_take<I: Iterator<Int>>(src: I, n: Int): TakeIter
+  return TakeIter { next_fn: -> src.next(), remaining: n }
+end
+
+## Skip the first N elements.
+def iter_skip<I: Iterator<Int>>(src: I, n: Int): SkipIter
+  return SkipIter { next_fn: -> src.next(), remaining: n }
+end
+
+## Yield elements while predicate holds.
+def iter_take_while<I: Iterator<Int>>(src: I, pred: Fn(Int): Bool): TakeWhileIter
+  return TakeWhileIter { next_fn: -> src.next(), pred: pred, done: false }
+end
+
+## Pair each element with its index: yields (index, value) tuples.
+def iter_enumerate<I: Iterator<Int>>(src: I): EnumerateIter
+  return EnumerateIter { next_fn: -> src.next(), index: 0 }
+end
+
+## Zip two iterators together: yields (a, b) tuples. Stops when either is exhausted.
+def iter_zip<A: Iterator<Int>, B: Iterator<Int>>(a: A, b: B): ZipIter
+  return ZipIter { next_a: -> a.next(), next_b: -> b.next() }
+end
+
+## Chain two iterators: yields all elements from the first, then all from the second.
+def iter_chain<A: Iterator<Int>, B: Iterator<Int>>(a: A, b: B): ChainIter
+  return ChainIter { first: -> a.next(), second: -> b.next(), first_done: false }
+end
+
+## FlatMap: maps each element to a Vec<Int> and flattens the results.
+## The mapping function produces a Vec<Int> for each input element.
+def iter_flat_map<I: Iterator<Int>>(src: I, f: Fn(Int): Vec<Int>): FlatMapIter
+  return FlatMapIter { next_fn: -> src.next(), f: f, buffer: vec_new(), buf_idx: 0 }
+end
+
+## Scan: stateful fold that yields each intermediate accumulator value.
+## Like fold, but produces a sequence of partial results instead of a final value.
+def iter_scan<I: Iterator<Int>>(src: I, init: Int, f: Fn(Int, Int): Int): ScanIter
+  return ScanIter { next_fn: -> src.next(), acc: init, f: f }
+end
+
+# ============================================================================
+# Terminal Operations — bounded-generic public API
+# ============================================================================
+
+## Collect all elements into a Vec<Int>.
+def iter_collect<I: Iterator<Int>>(src: I): Vec<Int>
+  var result: Vec<Int> = vec_new()
+  while true
+    match src.next()
+      Some(val) => result.push(val)
+      None => return result
+      _ => return result
+    end
+  end
+  return result
+end
+
+## Sum all elements.
+def iter_sum<I: Iterator<Int>>(src: I): Int
+  var total = 0
+  while true
+    match src.next()
+      Some(val) => total = total + val
+      None => return total
+      _ => return total
+    end
+  end
+  return total
+end
+
+## Count all elements.
+def iter_count<I: Iterator<Int>>(src: I): Int
+  var n = 0
+  while true
+    match src.next()
+      Some(_) => n = n + 1
+      None => return n
+      _ => return n
+    end
+  end
+  return n
+end
+
+## Left fold with accumulator.
+def iter_fold<I: Iterator<Int>>(src: I, init: Int, f: Fn(Int, Int): Int): Int
+  var acc = init
+  while true
+    match src.next()
+      Some(val) => {
+        var fold_fn: Fn(Int, Int): Int = f
+        acc = fold_fn(acc, val)
+      }
+      None => return acc
+      _ => return acc
+    end
+  end
+  return acc
+end
+
+## Returns true if any element matches the predicate.
+def iter_any<I: Iterator<Int>>(src: I, pred: Fn(Int): Bool): Bool
+  while true
+    match src.next()
+      Some(val) => {
+        var predicate: Fn(Int): Bool = pred
+        if predicate(val)
+          return true
+        end
+      }
+      None => return false
+      _ => return false
+    end
+  end
+  return false
+end
+
+## Returns true if all elements match the predicate.
+def iter_all<I: Iterator<Int>>(src: I, pred: Fn(Int): Bool): Bool
+  while true
+    match src.next()
+      Some(val) => {
+        var predicate: Fn(Int): Bool = pred
+        if predicate(val) == false
+          return false
+        end
+      }
+      None => return true
+      _ => return true
+    end
+  end
+  return true
+end
+
+## Find the first element matching a predicate.
+def iter_find<I: Iterator<Int>>(src: I, pred: Fn(Int): Bool): Option<Int>
+  while true
+    var val = try src.next()
+    var predicate: Fn(Int): Bool = pred
+    if predicate(val)
+      return Option::Some(val)
+    end
+  end
+  return Option::None
+end
+
+## Apply a function to each element (eager, for side effects).
+def iter_for_each<I: Iterator<Int>>(src: I, f: Fn(Int): Void): Void
+  while true
+    match src.next()
+      Some(val) => {
+        var callback: Fn(Int): Void = f
+        callback(val)
+      }
+      None => return
+      _ => return
+    end
+  end
+end
+
+## Find the minimum element (returns Option::None for empty iterators).
+def iter_min<I: Iterator<Int>>(src: I): Option<Int>
+  var min_val = try src.next()
+  while true
+    match src.next()
+      Some(v) => {
+        if v < min_val
+          min_val = v
+        end
+      }
+      None => return Option::Some(min_val)
+      _ => return Option::Some(min_val)
+    end
+  end
+  return Option::Some(min_val)
+end
+
+## Find the maximum element (returns Option::None for empty iterators).
+def iter_max<I: Iterator<Int>>(src: I): Option<Int>
+  var max_val = try src.next()
+  while true
+    match src.next()
+      Some(v) => {
+        if v > max_val
+          max_val = v
+        end
+      }
+      None => return Option::Some(max_val)
+      _ => return Option::Some(max_val)
+    end
+  end
+  return Option::Some(max_val)
+end

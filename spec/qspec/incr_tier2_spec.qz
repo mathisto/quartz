@@ -1,0 +1,289 @@
+## P.2 Tier 2: Selective TypeCheck + MIR Skip Tests
+##
+## Tests incremental compilation Tier 2 — skipping TC body-checking and MIR
+## warning suppression for unchanged modules. Uses multi-build orchestration
+## with isolated cache directories.
+##
+## Contract:
+##   1. Tier 0 cache.
+##   2. Tier 2 selective TC skip.
+##   3. Tier 2 correctness.
+##   4. Interface change propagation.
+##   5. --no-cache flag.
+
+import * from qspec
+import * from qspec/subprocess
+
+## Helper: compile a multi-file project from a temp directory.
+## Uses cd to isolate .quartz-cache in the temp dir.
+## Returns SubResult with IR in stdout_content, cache diagnostics in stderr_content.
+def _incr_compile(dir: String, main_file: String, flags: String): SubResult
+  _sub_init()
+  var compiler = _sub_compiler_str
+  if compiler.size == 0
+    return SubResult {
+      exit_code: -1,
+      stdout_content: "",
+      stderr_content: "QUARTZ_COMPILER not set"
+    }
+  end
+  # Make compiler path absolute (cd into temp dir breaks relative paths)
+  if not str_starts_with(compiler, "/")
+    compiler = getcwd() + "/" + compiler
+  end
+  var ir_path = dir + "/out.ll"
+  var err_path = dir + "/out.err"
+  var cmd = "cd " + dir + " && " + compiler + " -I " + dir + " " + flags + " " + main_file + " > " + ir_path + " 2> " + err_path
+  var raw = system(cmd)
+  var signaled = band(raw, 127)
+  var exit_code = 0
+  if signaled != 0
+    exit_code = 128 + signaled
+  else
+    exit_code = band(shr(raw, 8), 255)
+  end
+  var ir_content = read_file(ir_path)
+  var err_content = read_file(err_path)
+  return SubResult {
+    exit_code: exit_code,
+    stdout_content: ir_content,
+    stderr_content: err_content
+  }
+end
+
+## Helper: set up a multi-file project in a temp directory.
+## Returns the temp directory path.
+def _incr_setup(): String
+  var dir = "/tmp/_qspec_incr_tier2"
+  var _discard = system("rm -rf " + dir)
+  mkdir(dir)
+  return dir
+end
+
+## Helper: clean up the temp directory.
+def _incr_cleanup(dir: String): Void
+  var _discard = system("rm -rf " + dir)
+end
+
+def main(): Int
+  # ==========================================================================
+  # Category 1: Tier 0 whole-program cache (no-change case)
+  # ==========================================================================
+
+  describe("Tier 0 cache") do ->
+    it("returns cached IR on no-change second build") do ->
+      var dir = _incr_setup()
+      write_file(dir + "/main.qz", """
+        def main(): Int
+          return 42
+        end
+      """)
+      var r1 = _incr_compile(dir, dir + "/main.qz", "")
+      assert_eq(r1.exit_code, 0)
+      var r2 = _incr_compile(dir, dir + "/main.qz", "")
+      assert_eq(r2.exit_code, 0)
+      if not str_contains(r1.stdout_content, "@main")
+        _record_failure("Build 1 IR missing @main")
+      end
+      if not str_contains(r2.stdout_content, "@main")
+        _record_failure("Build 2 cached IR missing @main")
+      end
+      _incr_cleanup(dir)
+    end
+  end
+
+  # ==========================================================================
+  # Category 2: Tier 2 — selective TC skip on leaf module change
+  # ==========================================================================
+
+  describe("Tier 2 selective TC skip") do ->
+    it("produces correct IR after leaf module body change") do ->
+      var dir = _incr_setup()
+      write_file(dir + "/helper.qz", """
+        def helper_val(): Int = 10
+      """)
+      write_file(dir + "/main.qz", """
+        import helper
+        def main(): Int
+          return helper::helper_val()
+        end
+      """)
+      # Build 1+2: cold + populate cache
+      _incr_compile(dir, dir + "/main.qz", "")
+      _incr_compile(dir, dir + "/main.qz", "")
+      # Modify helper body (interface unchanged)
+      write_file(dir + "/helper.qz", """
+        def helper_val(): Int = 99
+      """)
+      # Build 3: incremental should pick up new body
+      var r3 = _incr_compile(dir, dir + "/main.qz", "")
+      assert_eq(r3.exit_code, 0)
+      if not str_contains(r3.stdout_content, "99")
+        _record_failure("Incremental IR missing updated value 99")
+      end
+      _incr_cleanup(dir)
+    end
+
+    it("shows explain-cache Tier 2 output") do ->
+      var dir = _incr_setup()
+      write_file(dir + "/lib.qz", """
+        def lib_greet(): String = "hello"
+      """)
+      write_file(dir + "/main.qz", """
+        import lib
+        def main(): Int
+          puts(lib::lib_greet())
+          return 0
+        end
+      """)
+      # Build 1 + 2: populate cache and fragments
+      _incr_compile(dir, dir + "/main.qz", "")
+      _incr_compile(dir, dir + "/main.qz", "")
+      # Modify leaf body only
+      write_file(dir + "/lib.qz", """
+        def lib_greet(): String = "world"
+      """)
+      # Build 3: incremental with explain
+      var r3 = _incr_compile(dir, dir + "/main.qz", "--explain-cache")
+      assert_eq(r3.exit_code, 0)
+      # Stderr should mention Tier 2 skip
+      if not str_contains(r3.stderr_content, "Tier 2")
+        _record_failure("Expected --explain-cache to show Tier 2 info but stderr was: " + r3.stderr_content)
+      end
+      _incr_cleanup(dir)
+    end
+
+    it("skips TC for unchanged module's functions") do ->
+      var dir = _incr_setup()
+      write_file(dir + "/stable.qz", """
+        def stable_fn(): Int = 100
+      """)
+      write_file(dir + "/changing.qz", """
+        def changing_fn(): Int = 1
+      """)
+      write_file(dir + "/main.qz", """
+        import stable
+        import changing
+        def main(): Int
+          return stable::stable_fn() + changing::changing_fn()
+        end
+      """)
+      _incr_compile(dir, dir + "/main.qz", "")
+      _incr_compile(dir, dir + "/main.qz", "")
+      write_file(dir + "/changing.qz", """
+        def changing_fn(): Int = 2
+      """)
+      var r3 = _incr_compile(dir, dir + "/main.qz", "--explain-cache")
+      assert_eq(r3.exit_code, 0)
+      if not str_contains(r3.stdout_content, "changing_fn")
+        _record_failure("Incremental IR missing changing_fn")
+      end
+      _incr_cleanup(dir)
+    end
+  end
+
+  # ==========================================================================
+  # Category 3: Correctness — incremental output matches clean build
+  # ==========================================================================
+
+  describe("Tier 2 correctness") do ->
+    it("incremental IR matches clean build") do ->
+      var dir = _incr_setup()
+      write_file(dir + "/math.qz", """
+        def math_add(a: Int, b: Int): Int = a + b
+      """)
+      write_file(dir + "/main.qz", """
+        import math
+        def main(): Int
+          puts(str_from_int(math::math_add(10, 20)))
+          return 0
+        end
+      """)
+      # Build 1+2: cold + fragment creation
+      _incr_compile(dir, dir + "/main.qz", "")
+      _incr_compile(dir, dir + "/main.qz", "")
+      # Modify math body (keep interface stable)
+      write_file(dir + "/math.qz", """
+        def math_add(a: Int, b: Int): Int = a + b + 1
+      """)
+      # Build 3: incremental
+      var r_incr = _incr_compile(dir, dir + "/main.qz", "")
+      assert_eq(r_incr.exit_code, 0)
+      # Build 4: clean (no cache)
+      var r_clean = _incr_compile(dir, dir + "/main.qz", "--no-cache")
+      assert_eq(r_clean.exit_code, 0)
+      # Both should contain the +1 version of math_add
+      if not str_contains(r_incr.stdout_content, "add i64 0, 1")
+        _record_failure("Incremental IR missing +1 body change")
+      end
+      if not str_contains(r_clean.stdout_content, "add i64 0, 1")
+        _record_failure("Clean IR missing +1 body change")
+      end
+      _incr_cleanup(dir)
+    end
+  end
+
+  # ==========================================================================
+  # Category 4: Interface change propagation
+  # ==========================================================================
+
+  describe("interface change propagation") do ->
+    it("recompiles dependents when interface changes") do ->
+      var dir = _incr_setup()
+      write_file(dir + "/api.qz", """
+        def api_value(): Int = 5
+      """)
+      write_file(dir + "/main.qz", """
+        import api
+        def main(): Int
+          return api::api_value()
+        end
+      """)
+      _incr_compile(dir, dir + "/main.qz", "")
+      _incr_compile(dir, dir + "/main.qz", "")
+      write_file(dir + "/api.qz", """
+        def api_value(n: Int): Int = n + 5
+      """)
+      write_file(dir + "/main.qz", """
+        import api
+        def main(): Int
+          return api::api_value(10)
+        end
+      """)
+      var r3 = _incr_compile(dir, dir + "/main.qz", "")
+      assert_eq(r3.exit_code, 0)
+      if not str_contains(r3.stdout_content, "api_value")
+        _record_failure("Recompiled IR missing api_value")
+      end
+      _incr_cleanup(dir)
+    end
+  end
+
+  # ==========================================================================
+  # Category 5: --no-cache disables incremental
+  # ==========================================================================
+
+  describe("--no-cache flag") do ->
+    it("disables incremental compilation entirely") do ->
+      var dir = _incr_setup()
+      write_file(dir + "/mod.qz", """
+        def mod_val(): Int = 1
+      """)
+      write_file(dir + "/main.qz", """
+        import mod
+        def main(): Int
+          return mod::mod_val()
+        end
+      """)
+      # Build with --no-cache
+      var r1 = _incr_compile(dir, dir + "/main.qz", "--no-cache")
+      assert_eq(r1.exit_code, 0)
+      # No cache directory should exist
+      var cache_exists = file_exists(dir + "/.quartz-cache")
+      assert_eq(cache_exists, 0)
+      _incr_cleanup(dir)
+    end
+  end
+
+  return qspec_main()
+end

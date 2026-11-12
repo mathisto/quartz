@@ -1,0 +1,364 @@
+##! # Set Intrinsics
+##!
+##! Emits LLVM IR for hash set operations.
+##!
+##! A Set<T> is backed by the integer-keyed open-addressing hash table
+##! (`intmap_*`, cg_intrinsic_intmap.qz): the set element is stored as the
+##! intmap KEY, with the same element re-used as a throwaway value (a Set
+##! only cares about key presence). Set elements are always i64 values
+##! (Int, or a String/pointer handle compared by identity — the same i64
+##! `icmp eq` semantics the old flat-array implementation used), so the
+##! multiplicative-hash + separate `used` byte-array intmap correctly
+##! handles ANY element value including 0 and 1.
+##!
+##! This replaces the previous flat-array implementation, which:
+##!   - had O(n) linear-scan add/has/delete, and
+##!   - performed an OUT-OF-BOUNDS heap write once more than the fixed
+##!     initial capacity (16) elements were added — `set_add` stored at
+##!     `data[size]` with no `size >= cap` check and no growth. The intmap
+##!     backing grows/rehashes (intmap_set resize at 3/4 load), so the OOB
+##!     is gone and add/has/delete are O(1) amortized.
+##!
+##! Set algebra (union/intersection/difference/is_subset) and the
+##! qz_set_add_helper/qz_set_has_helper runtime functions that back them
+##! live in codegen_runtime.qz and iterate the SAME intmap layout.
+##!
+##! @see codegen_intrinsics Main intrinsic dispatcher
+##! @see cg_intrinsic_intmap Integer-key map IR emission (the backing store)
+##! @see codegen_util Shared codegen utilities
+
+import mir
+import codegen_util
+import cg_intrinsic_intmap
+import cg_intrinsic_data
+import * from str_compat
+
+# ============================================================================
+# WS1 — value-layout struct Set elements → field-deep custom-hashmap runtime
+# ============================================================================
+#
+# A Set<Struct> where the element is a VALUE-LAYOUT, all-hashable user struct
+# must compare members by VALUE (field-deep), not by pointer identity. The
+# default intmap backing stores the element as a raw i64 (the struct pointer)
+# and compares with `icmp eq` → two distinct instances of the same value are
+# treated as DIFFERENT members. WS1 routes such sets to the SAME field-deep
+# `@qz_map_custom_*` runtime that Map already uses for value-layout struct keys
+# (item R1b), threading the per-struct `@qz_hash_<Name>` / `@qz_eq_<Name>`
+# emitters (item 51b). The set is backed by the string-hashmap layout
+# ([cap, size, keys, vals]) because that is the layout `@qz_map_custom_*`
+# operates on; the element is stored as BOTH key and value (a set only cares
+# about key presence). new/size/clear/free/members are key-agnostic over that
+# layout and delegate to the string hashmap emitter; only the key-hashing ops
+# (add/has/delete) route to the custom runtime.
+#
+# Int / String / pointer-identity Set elements are NOT struct keys → the
+# predicate below returns "" and every op lowers BYTE-IDENTICAL to the existing
+# intmap path. INERT at gate 0 (mir_prog_is_value_layout_type == 0).
+
+## Resolve a Set element annotation to the struct name IFF it is a value-layout,
+## all-hashable user struct (the exact set for which codegen emits
+## `@qz_hash_<Name>` / `@qz_eq_<Name>`). Returns "" for anything else. Mirrors
+## `_map_struct_key_name` in cg_intrinsic_map.qz EXACTLY.
+def _set_struct_elem_name(prog: mir::MirProgram, elem_type: String): String
+  if str_byte_len(elem_type) == 0
+    return ""
+  end
+  # Int/String annotations are never struct elements.
+  if elem_type == "Int" or elem_type == "String"
+    return ""
+  end
+  # Strip any generic args (registry keys are the bare struct name).
+  var name = elem_type
+  var lt = __char_index(name, '<')
+  if lt > 0
+    name = str_byte_slice(name, 0, lt)
+  end
+  if str_byte_len(name) == 0
+    return ""
+  end
+  # Must be value-layout on the prog side. INERT at gate 0 → returns "".
+  if mir::mir_prog_is_value_layout_type(prog, name) == 0
+    return ""
+  end
+  # Must be a known struct whose every field is hashable (mirror the emission
+  # gate in cg_emit_struct_hash_eq_functions EXACTLY, incl. narrow ints), else
+  # qz_hash_<Name>/qz_eq_<Name> are not emitted and the call would dangle.
+  var struct_defs = mir::mir_get_struct_defs(prog)
+  if as_int(struct_defs) == 0
+    return ""
+  end
+  var count = struct_defs.size
+  for i in 0..count
+    var entry = struct_defs[i]
+    if entry.name == name
+      var field_types = entry.field_types
+      var fc = vec_size(field_types)
+      if fc == 0
+        return ""
+      end
+      for j in 0..fc
+        var ft = as_string(field_types[j])
+        if ft != "Int" and ft != "Bool" and ft != "String" and ft != "Symbol" and mir::mir_is_narrow_fixed_width(ft) == 0
+          return ""
+        end
+      end
+      return name
+    end
+  end
+  return ""
+end
+
+## Emit a struct-element set op via the field-deep custom-hashmap runtime.
+## The set is backed by the string-hashmap layout; the element is stored as
+## both key and value. Key-agnostic ops (new/size/clear/free/members) delegate
+## to the string hashmap emitter; add/has/delete thread the struct hash/eq fns.
+def _cg_emit_set_custom_elem(state: CodegenState, out: Int, prog: mir::MirProgram, instr: mir::MirInstr, dest: Int, name: String, args: Vec<Int>, argc: Int, d: String, _elem_type: String, sname: String): Void can Emit
+  # set_new() → hashmap_new() (identical [cap,size,keys,vals] header).
+  if name == "set_new"
+    var hm_args = vec_new<Int>()
+    cg_intrinsic_data::cg_emit_map_str_key(state, out, prog, instr, dest, "hashmap_new", hm_args, 0, d, _elem_type)
+    return
+  end
+
+  # set_size(s) → hashmap_size(s)
+  if name == "set_size"
+    var ss_args = [args[0]]
+    cg_intrinsic_data::cg_emit_map_str_key(state, out, prog, instr, dest, "hashmap_size", ss_args, 1, d, _elem_type)
+    return
+  end
+
+  # set_clear(s) → hashmap_clear(s)
+  if name == "set_clear"
+    var sc_args = [args[0]]
+    cg_intrinsic_data::cg_emit_map_str_key(state, out, prog, instr, dest, "hashmap_clear", sc_args, 1, d, _elem_type)
+    return
+  end
+
+  # set_free(s) → hashmap_free(s)
+  if name == "set_free"
+    var sf_args = [args[0]]
+    cg_intrinsic_data::cg_emit_map_str_key(state, out, prog, instr, dest, "hashmap_free", sf_args, 1, d, _elem_type)
+    return
+  end
+
+  # set_members(s) → hashmap_keys(s)  (present element pointers; unordered)
+  if name == "set_members"
+    var sm_args = [args[0]]
+    cg_intrinsic_data::cg_emit_map_str_key(state, out, prog, instr, dest, "hashmap_keys", sm_args, 1, d, _elem_type)
+    return
+  end
+
+  # set_add(s, v) → qz_map_custom_set(s, v, v, hash, eq)  (key = value = element)
+  if name == "set_add"
+    codegen_util::cg_emit(out, "  call void @qz_map_custom_set(i64 %v")
+    codegen_util::cg_emit_int(out, args[0])
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_int(out, args[1])
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_int(out, args[1])
+    codegen_util::cg_emit(out, ", ptr @qz_hash_#{sname}, ptr @qz_eq_#{sname})")
+    codegen_util::cg_emit_line(out, "")
+    # set_add has an i64 dest slot in MIR; give it a defined value like intmap_set.
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, " = add i64 0, 0")
+    return
+  end
+
+  # set_has(s, v) → qz_map_custom_has(s, v, hash, eq) -> i64 (0/1)
+  if name == "set_has"
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, " = call i64 @qz_map_custom_has(i64 %v")
+    codegen_util::cg_emit_int(out, args[0])
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_int(out, args[1])
+    codegen_util::cg_emit(out, ", ptr @qz_hash_#{sname}, ptr @qz_eq_#{sname})")
+    codegen_util::cg_emit_line(out, "")
+    return
+  end
+
+  # set_delete(s, v) → qz_map_custom_delete(s, v, hash, eq) -> void
+  if name == "set_delete"
+    codegen_util::cg_emit(out, "  call void @qz_map_custom_delete(i64 %v")
+    codegen_util::cg_emit_int(out, args[0])
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_int(out, args[1])
+    codegen_util::cg_emit(out, ", ptr @qz_hash_#{sname}, ptr @qz_eq_#{sname})")
+    codegen_util::cg_emit_line(out, "")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, " = add i64 0, 0")
+    return
+  end
+
+  # WS3 — Set algebra (union/intersection/difference/is_subset) over VALUE-LAYOUT
+  # struct sets routes to the value-compare @qz_set_custom_* runtime helpers, which
+  # iterate the SAME [cap,size,keys,vals] custom-key layout and thread the per-struct
+  # @qz_hash_<Name>/@qz_eq_<Name> fn pointers (the intmap-layout @qz_set_* helpers
+  # read a `used` byte-array this layout lacks AND compare by identity).
+  if name == "set_union" or name == "set_intersection" or name == "set_difference" or name == "set_is_subset"
+    var fn = "qz_set_custom_union"
+    if name == "set_intersection"
+      fn = "qz_set_custom_intersection"
+    elsif name == "set_difference"
+      fn = "qz_set_custom_difference"
+    elsif name == "set_is_subset"
+      fn = "qz_set_custom_is_subset"
+    end
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, " = call i64 @#{fn}(i64 %v")
+    codegen_util::cg_emit_int(out, args[0])
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_int(out, args[1])
+    codegen_util::cg_emit(out, ", ptr @qz_hash_#{sname}, ptr @qz_eq_#{sname})")
+    codegen_util::cg_emit_line(out, "")
+    return
+  end
+
+  # Any remaining op (should not occur — all set ops handled above) falls back to
+  # the identity path defensively.
+  cg_emit_intrinsic_set_default(state, out, prog, instr, dest, name, args, argc, d, _elem_type)
+end
+
+# ============================================================================
+# Set Intrinsics — thin delegation onto the intmap (int-keyed hash table)
+# ============================================================================
+
+## Dispatch a set_* intrinsic. WS1: value-layout hashable struct elements route
+## to the field-deep custom-hashmap runtime (value compare); everything else
+## (Int / String / pointer identity) lowers BYTE-IDENTICAL via the intmap path.
+def cg_emit_intrinsic_set(state: CodegenState, out: Int, prog: mir::MirProgram, instr: mir::MirInstr, dest: Int, name: String, args: Vec<Int>, argc: Int, d: String, _elem_type: String): Void can Emit
+  # WS1 — empty result ⇒ not a value-layout struct element ⇒ identity intmap path.
+  var elem_name = _set_struct_elem_name(prog, _elem_type)
+  if str_byte_len(elem_name) > 0
+    _cg_emit_set_custom_elem(state, out, prog, instr, dest, name, args, argc, d, _elem_type, elem_name)
+    return
+  end
+  cg_emit_intrinsic_set_default(state, out, prog, instr, dest, name, args, argc, d, _elem_type)
+end
+
+## The default identity-compare set path (intmap-backed). Int / String / pointer
+## elements. Byte-identical to the pre-WS1 behavior.
+def cg_emit_intrinsic_set_default(state: CodegenState, out: Int, prog: mir::MirProgram, instr: mir::MirInstr, dest: Int, name: String, args: Vec<Int>, argc: Int, d: String, _elem_type: String): Void can Emit
+  # set_new() -> intmap_new()
+  if name == "set_new"
+    var im_args = vec_new<Int>()
+    cg_intrinsic_intmap::cg_emit_map_int_key(state, out, prog, instr, dest, "intmap_new", im_args, 0, d, _elem_type)
+    return
+  end
+
+  # set_add(s, v) -> intmap_set(s, v, v)   (key = element; value unused)
+  if name == "set_add"
+    var s = args[0]
+    var v = args[1]
+    var im_args = [s, v, v]
+    cg_intrinsic_intmap::cg_emit_map_int_key(state, out, prog, instr, dest, "intmap_set", im_args, 3, d, _elem_type)
+    return
+  end
+
+  # set_has(s, v) -> intmap_has(s, v)
+  if name == "set_has"
+    var s = args[0]
+    var v = args[1]
+    var im_args = [s, v]
+    cg_intrinsic_intmap::cg_emit_map_int_key(state, out, prog, instr, dest, "intmap_has", im_args, 2, d, _elem_type)
+    return
+  end
+
+  # set_delete(s, v) -> intmap_delete(s, v)
+  if name == "set_delete"
+    var s = args[0]
+    var v = args[1]
+    var im_args = [s, v]
+    cg_intrinsic_intmap::cg_emit_map_int_key(state, out, prog, instr, dest, "intmap_delete", im_args, 2, d, _elem_type)
+    return
+  end
+
+  # set_size(s) -> intmap_size(s)
+  if name == "set_size"
+    var s = args[0]
+    var im_args = [s]
+    cg_intrinsic_intmap::cg_emit_map_int_key(state, out, prog, instr, dest, "intmap_size", im_args, 1, d, _elem_type)
+    return
+  end
+
+  # set_clear(s) -> intmap_clear(s)
+  if name == "set_clear"
+    var s = args[0]
+    var im_args = [s]
+    cg_intrinsic_intmap::cg_emit_map_int_key(state, out, prog, instr, dest, "intmap_clear", im_args, 1, d, _elem_type)
+    return
+  end
+
+  # set_free(s) -> intmap_free(s)
+  if name == "set_free"
+    var s = args[0]
+    var im_args = [s]
+    cg_intrinsic_intmap::cg_emit_map_int_key(state, out, prog, instr, dest, "intmap_free", im_args, 1, d, _elem_type)
+    return
+  end
+
+  # set_members(s) -> intmap_keys(s)  (Vec of all present elements; unordered)
+  if name == "set_members"
+    var s = args[0]
+    var im_args = [s]
+    cg_intrinsic_intmap::cg_emit_map_int_key(state, out, prog, instr, dest, "intmap_keys", im_args, 1, d, _elem_type)
+    return
+  end
+
+  # Set algebra — runtime helpers in codegen_runtime.qz iterate the intmap layout.
+  if name == "set_union"
+    var a = args[0]
+    var b = args[1]
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, " = call i64 @qz_set_union(i64 %v")
+    codegen_util::cg_emit_int(out, a)
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_int(out, b)
+    codegen_util::cg_emit_line(out, ")")
+    return
+  end
+
+  if name == "set_intersection"
+    var a = args[0]
+    var b = args[1]
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, " = call i64 @qz_set_intersection(i64 %v")
+    codegen_util::cg_emit_int(out, a)
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_int(out, b)
+    codegen_util::cg_emit_line(out, ")")
+    return
+  end
+
+  if name == "set_difference"
+    var a = args[0]
+    var b = args[1]
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, " = call i64 @qz_set_difference(i64 %v")
+    codegen_util::cg_emit_int(out, a)
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_int(out, b)
+    codegen_util::cg_emit_line(out, ")")
+    return
+  end
+
+  if name == "set_is_subset"
+    var a = args[0]
+    var b = args[1]
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, " = call i64 @qz_set_is_subset(i64 %v")
+    codegen_util::cg_emit_int(out, a)
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_int(out, b)
+    codegen_util::cg_emit_line(out, ")")
+    return
+  end
+
+end

@@ -1,0 +1,792 @@
+# TUI runtime — TEA-shaped (Model / Update / View / Cmd) event loop for
+# terminal apps. v0.1 ships in three commits; this commit (1/3) is data
+# types and constructors only. The event loop (program_run) ships in
+# commit 2/3, end-to-end smoke test (counter dogfood) in commit 3/3.
+#
+# Design memo: docs/design/TUI_RUNTIME.md
+#
+# Two non-negotiable contracts (program_run will enforce them; documenting
+# here so the data types are read in the right context):
+#
+# 1. Crash safety. program_run MUST restore raw mode on any throw —
+#    no path leaves a terminal stuck in raw mode after exit.
+#
+# 2. Determinism. The user's `update` function MUST be pure:
+#      - no clock reads (time_*),
+#      - no randomness (random_*),
+#      - no global mutation,
+#      - no I/O.
+#    All non-determinism enters as messages. Cmd::Run closures may do
+#    impure work; their results re-enter as messages, captured by the
+#    optional recorder. This is what makes record/replay deterministic.
+#
+# Importing convention:
+#   import std/tui/runtime as tui
+#   ... tui::FrameMsg<MyMsg>, tui::Cmd<MyMsg>, tui::program_new, ...
+
+import std/throws
+import std/terminal
+import time
+import * from std/sync/composition/scope
+
+# SIGWINCH — sent by the kernel when the controlling tty's window size
+# changes. Same number on macOS and Linux.
+def _SIGWINCH(): Int = 28
+
+# How often the resize poller checks the flag set by the SIGWINCH
+# trampoline. 100ms is comfortably below human resize granularity and
+# adds bounded latency to scope-cancel teardown (the goroutine
+# unwinds within one chunk via scope_sleep_ms).
+def _RESIZE_POLL_MS(): Int = 100
+
+## A keystroke event captured from the terminal in raw mode.
+##
+## `code` is one of the KEY_* constants from std/terminal (KEY_UP,
+## KEY_CTRL_C, etc.) for special keys, or a Unicode codepoint for
+## printable characters.
+##
+## `modifiers` is a bitmask: 1 = ctrl, 2 = alt, 4 = shift.
+## v0.1 fills these on a best-effort basis from terminal escape
+## sequences; richer modifier detection is v0.2.
+struct KeyEvent
+  code: Int
+  modifiers: Int
+end
+
+## Build a KeyEvent. Ergonomic constructor; fields are public so direct
+## struct-literal construction is also valid.
+def key_event(code: Int, modifiers: Int): KeyEvent
+  return KeyEvent { code: code, modifiers: modifiers }
+end
+
+## Framework messages delivered to the user's `update` function.
+## Generic over M — the user's app-specific message type.
+##
+## v0.1 produces only `Key` and `Quit`. `Resize` and `Tick` variants
+## exist as reserved space for v0.2's SIGWINCH and Cmd::Every producers;
+## v0.1's runtime never delivers them, so user code may pattern-match
+## them as a no-op fallthrough.
+enum FrameMsg<M>
+  Key(event: KeyEvent)
+  Mouse(event: MouseEvent)
+  Resize(cols: Int, rows: Int)
+  Tick(epoch_ms: Int)
+  App(msg: M)
+  Quit
+end
+
+## Commands describe effectful work for the runtime to perform.
+## Pure values; never executed inside `update`.
+##
+## - None: do nothing. Returned when no effect is needed.
+## - Quit: initiate clean shutdown. Runtime delivers FrameMsg::Quit
+##   to update once (so apps can save state), then tears down.
+## - Batch: run all children; results feed back as messages, ordering
+##   is NOT guaranteed (children run concurrently).
+## - Run: execute a closure on a goroutine; its return value becomes
+##   a message. May block, sleep, do I/O — none of that affects update
+##   latency. Closures should use scope-aware blocking helpers so they
+##   unwind cleanly on runtime teardown.
+## - After: send the thunk's result as a message after `ms` milliseconds.
+##   Cancellable: program_run teardown unwinds the timer goroutine via
+##   scope cancel before the thunk fires.
+## - Every: send the thunk's result as a message every `ms` milliseconds
+##   until program_run terminates. Cancellable on teardown. Use this for
+##   animation tweens, idle-tick counters, status auto-clear, etc. Idiom
+##   for time-based ticks: `-> FrameMsg::Tick(time_epoch_ms())`.
+enum Cmd<M>
+  None
+  Quit
+  Batch(cmds: Vec<Cmd<M>>)
+  Run(thunk: Fn(): FrameMsg<M>)
+  After(ms: Int, thunk: Fn(): FrameMsg<M>)
+  Every(ms: Int, thunk: Fn(): FrameMsg<M>)
+end
+
+## Default no-op recorder. Used when no recorder is supplied.
+def no_recorder<M>(msg: FrameMsg<M>): Void
+end
+
+## Opaque handle for pushing FrameMsg values into a running runtime
+## from a goroutine outside the runtime's event loop. Obtained via
+## `program_run_with_sender`'s `on_ready` callback. Concurrency-safe:
+## sender_send goes through the same scope-aware channel send the
+## runtime's own goroutines use, so cancel/teardown unwinds the
+## external sender cleanly.
+##
+## The Int field is the runtime's msg_ch handle. It's exposed as a
+## struct rather than a bare Int to keep the type system honest and
+## leave room for future fields (e.g. a back-reference to the runtime
+## scope for opt-in lifetime guarantees).
+struct Sender<M>
+  ch: Int
+end
+
+## Push a message into the running runtime from outside the event
+## loop. Returns 0 (matches scope_send's no-meaningful-return shape);
+## reserved as Int for future error reporting.
+##
+## If the runtime has torn down, scope_send unwinds the goroutine via
+## Throws — callers should wrap external-sender goroutines in
+## `with Throws { throw: ... } do -> ... end` to absorb the unwind
+## cleanly. The runtime's own goroutines do this; mirror the pattern
+## for consistency.
+def sender_send<M>(s: Sender<M>, msg: FrameMsg<M>): Int
+  scope_send(s.ch, msg)
+  return 0
+end
+
+## A TUI program: pure state, pure update, pure view, optional recorder,
+## optional init Cmd dispatched at program startup.
+##
+## `init` is the canonical bootstrap point for Cmd::Every-driven idle
+## ticks, Cmd::After-based delayed startup messages, Cmd::Run-based
+## initial data fetches, etc. Defaults to Cmd::None (no startup work).
+## Mirrors Bubbletea's `Model.Init() tea.Cmd`.
+struct Program<S, M>
+  initial:  S
+  init:     Cmd<M>
+  update:   Fn(FrameMsg<M>, S): (S, Cmd<M>)
+  view:     Fn(S): String
+  recorder: Fn(FrameMsg<M>): Void
+end
+
+## Build a Program with a no-op recorder and Cmd::None as init.
+def program_new<S, M>(
+  initial: S,
+  update: Fn(FrameMsg<M>, S): (S, Cmd<M>),
+  view: Fn(S): String
+): Program<S, M>
+  return Program {
+    initial: initial,
+    init: Cmd::None,
+    update: update,
+    view: view,
+    recorder: no_recorder
+  }
+end
+
+## Attach a recorder to a Program. Returns a new Program; the input
+## is unchanged.
+def program_with_recorder<S, M>(
+  p: Program<S, M>,
+  recorder: Fn(FrameMsg<M>): Void
+): Program<S, M>
+  return Program {
+    initial: p.initial,
+    init: p.init,
+    update: p.update,
+    view: p.view,
+    recorder: recorder
+  }
+end
+
+## Attach a startup Cmd to a Program. The Cmd is executed once before
+## the main loop begins blocking on input — use this to start
+## Cmd::Every clocks, fire Cmd::After delayed startup messages, kick
+## off a Cmd::Run data fetch, etc. Returns a new Program; the input
+## is unchanged.
+def program_with_init<S, M>(
+  p: Program<S, M>,
+  init: Cmd<M>
+): Program<S, M>
+  return Program {
+    initial: p.initial,
+    init: init,
+    update: p.update,
+    view: p.view,
+    recorder: p.recorder
+  }
+end
+
+# ============================================================
+# program_run — TEA event loop (commit 2/3)
+# ============================================================
+#
+# Architecture: one input goroutine pumps key events into a bounded
+# (64-slot) channel; the main loop blocks on recv, dispatches to the
+# user's update, renders, and executes any returned Cmd. Cmd::Run
+# closures spawn additional goroutines that send their result back
+# into the same channel. The loop terminates when a FrameMsg::Quit
+# is dispatched (either from EOF, user-initiated Cmd::Quit, or v0.2's
+# external send-into-runtime API).
+#
+# v0.2 closes the v0.1 input-pump-blocks-past-loop-exit hole:
+# program_run owns a per-run scope (scope_with_cancel) that the input
+# pump observes via term_read_key_cancellable(scope). On clean exit
+# (Cmd::Quit or EOF), program_run cancels the scope; the pump wakes
+# within ~50ms (chunk_ms), unwinds via Throws, returns 0. No leaks
+# across program_run boundary.
+
+# Render a frame: home cursor + clear screen + new view content.
+#
+# Views use bare \n as the line separator. The terminal's OPOST/ONLCR
+# (still active in raw mode — term_enter_raw_mode disables ICANON +
+# ECHO + ISIG + IEXTEN + ICRNL but leaves OPOST alone) translates
+# output \n to \r\n on the way out, which is what the cursor-at-
+# column-0 reset relies on. v0.1's "use \r\n in views" advice blamed
+# ICRNL (the INPUT side), but ICRNL has nothing to do with output
+# rendering; ONLCR is the actual mechanism.
+#
+# A previous v0.3 attempt added a `_normalize_to_crlf` translation
+# in this function, producing `\r\n` explicitly. ONLCR then doubled
+# the `\r` to `\r\r\n` — harmless on most terminals but interacted
+# poorly with at least one (Ghostty), where the dogfood would render
+# nothing and appear hung. Removing the translation restored
+# rendering. The right architectural fix is to also disable OPOST
+# in `term_enter_raw_mode` (matching cfmakeraw semantics), at which
+# point we'd need to emit `\r\n` ourselves. Filed as a v0.4 cleanup.
+#
+# Naive full-redraw per frame; cell-level diffing is v0.4+.
+#
+# Synchronized output (DEC 2026 / "Begin Synchronized Update"): wrap
+# the clear+write in `\x1b[?2026h` / `\x1b[?2026l` so the terminal
+# commits the whole frame atomically. Without it, the clear-then-
+# redraw cycle is briefly visible — overlays in particular can
+# flicker during rapid state changes (e.g. fast arrow-key mashing
+# in a confirm dialog) because the base renders before the absolute-
+# positioning overlay rows. Supported by Ghostty, iTerm2 (3.5+),
+# kitty (0.21+), WezTerm, Alacritty (0.13+), modern VTE (0.74+);
+# older terminals silently ignore the escape and fall back to the
+# unsynchronized behaviour.
+def _render(s: String): Void
+  term_write("\x1b[?2026h\x1b[H\x1b[2J")
+  term_write(s)
+  term_write("\x1b[?2026l")
+end
+
+# Silently absorb scope-cancel throws from term_read_key_cancellable.
+# When program_run cancels the runtime scope on teardown, the pump's
+# pending read unwinds via Throws — that throw is expected, not an
+# error, and must not propagate to the goroutine's default handler.
+def _pump_throw_handler(op_name: Int, argc: Int, argv: Int): Int
+  return 0
+end
+
+# Input goroutine body. Reads keys until EOF or scope cancel, sending
+# each as a FrameMsg::Key (or FrameMsg::Quit on EOF) into msg_ch.
+#
+# Wraps the inner loop in `scope_with(scope_with_cancel(runtime_scope), ...)` —
+# a CHILD scope of runtime_scope. This shape is critical: scope_with's
+# documented contract is to scope_cancel its argument when the body
+# returns normally. Using runtime_scope directly would mean any
+# goroutine's normal exit cancels the SHARED runtime scope, killing
+# every other goroutine spawned under it. Spawning a per-goroutine
+# child scope keeps cancel-on-exit local; cancel still propagates DOWN
+# from runtime_scope when program_run tears down (parent → child).
+#
+# Returns 0 on clean exit.
+def _pump_keys<M>(msg_ch: Int, runtime_scope: Int): Int
+  with Throws { throw: _pump_throw_handler } do ->
+    scope_with(scope_with_cancel(runtime_scope)) do ->
+      loop
+        var key = term_read_key_cancellable(current_scope())
+        if key == KEY_EOF()
+          send(msg_ch, FrameMsg::Quit)
+          break
+        end
+        if key == KEY_MOUSE_EVENT()
+          # Mouse seq parser stashes the event in module-level state;
+          # term_last_mouse_event() reads it. Single-threaded — only
+          # this goroutine drives the parser, so no race.
+          send(msg_ch, FrameMsg::Mouse(term_last_mouse_event()))
+        else
+          send(msg_ch, FrameMsg::Key(KeyEvent { code: key, modifiers: 0 }))
+        end
+      end
+      0
+    end
+    0
+  end
+  return 0
+end
+
+# Cmd::Run wrapper — invoke thunk, send its result back as a message.
+# Spawned per Run cmd via `go`. Uses scope_send so a stale send to a
+# torn-down msg_ch doesn't block the goroutine indefinitely. Throws
+# from inside `thunk` propagate to _pump_throw_handler which absorbs
+# scope-cancel-shaped throws silently.
+#
+# Wraps in `scope_with(scope_with_cancel(runtime_scope), ...)` — a
+# CHILD scope of runtime_scope, so the goroutine's normal exit cancels
+# only its own child, not the shared runtime_scope. See _pump_keys
+# for the rationale on this pattern.
+def _run_thunk<M>(thunk: Fn(): FrameMsg<M>, msg_ch: Int, runtime_scope: Int): Int
+  with Throws { throw: _pump_throw_handler } do ->
+    scope_with(scope_with_cancel(runtime_scope)) do ->
+      var result_msg = thunk()
+      scope_send(msg_ch, result_msg)
+      0
+    end
+    0
+  end
+  return 0
+end
+
+# Cmd::After wrapper — sleep for `ms`, then send `thunk()` once.
+# scope_sleep_ms throws on scope cancel, exiting the goroutine before
+# the thunk fires. scope_send guards against the channel being torn
+# down during the sleep. Child-scope wrap (see _pump_keys).
+def _run_after<M>(ms: Int, thunk: Fn(): FrameMsg<M>, msg_ch: Int, runtime_scope: Int): Int
+  with Throws { throw: _pump_throw_handler } do ->
+    scope_with(scope_with_cancel(runtime_scope)) do ->
+      scope_sleep_ms(ms)
+      scope_send(msg_ch, thunk())
+      0
+    end
+    0
+  end
+  return 0
+end
+
+# SIGWINCH poller — every _RESIZE_POLL_MS, check the resize flag set
+# by the trampoline. If set, atomic-clear it and emit a Resize message
+# carrying the current terminal dimensions. Same scope discipline as
+# the other goroutines: child-scope wrap so the poller's normal exit
+# doesn't cascade-cancel the shared runtime scope, and so cancel-from-
+# above unwinds via scope_sleep_ms within one chunk.
+#
+# The flag is set unconditionally to 1 inside the signal handler — a
+# burst of resize signals collapses into a single poll cycle. That's
+# the desired semantics: consumers want the latest dimensions, not a
+# count of resize events. The atomic_load + atomic_store(0) pair is
+# benign-racy with the handler (a signal landing between the two ops
+# leaves the flag at 1 for next cycle); same outcome either way.
+# `flag` is the AtomicInt handle (module-level `_winch_handle`).
+def _poll_resize<M>(msg_ch: Int, runtime_scope: Int, flag: Int): Int
+  with Throws { throw: _pump_throw_handler } do ->
+    scope_with(scope_with_cancel(runtime_scope)) do ->
+      loop
+        scope_sleep_ms(_RESIZE_POLL_MS())
+        if atomic_load(flag) == 1
+          atomic_store(flag, 0)
+          var cols = term_get_width()
+          var rows = term_get_height()
+          scope_send(msg_ch, FrameMsg::Resize(cols, rows))
+        end
+      end
+      0
+    end
+    0
+  end
+  return 0
+end
+
+# Cmd::Every wrapper — fire `thunk()` every `ms` milliseconds until
+# scope cancel. Both scope_sleep_ms and scope_send observe cancel, so
+# the goroutine unwinds within ~50ms (chunk_ms) of program_run teardown
+# regardless of where in the loop we are. Child-scope wrap (see
+# _pump_keys) — without it, scope_with's cancel-on-exit semantics
+# would propagate the goroutine's normal termination upward and kill
+# the runtime scope, freezing every other goroutine.
+def _run_every<M>(ms: Int, thunk: Fn(): FrameMsg<M>, msg_ch: Int, runtime_scope: Int): Int
+  with Throws { throw: _pump_throw_handler } do ->
+    scope_with(scope_with_cancel(runtime_scope)) do ->
+      loop
+        scope_sleep_ms(ms)
+        scope_send(msg_ch, thunk())
+      end
+      0
+    end
+    0
+  end
+  return 0
+end
+
+# Cmd dispatcher. None and Quit are observed by the caller (the loop
+# treats Quit as an injection trigger and None as a no-op); this helper
+# implements Batch (recursive), Run / After / Every (each spawns a
+# scope-aware goroutine that unwinds cleanly on program_run teardown).
+# Catch-all for the pre-existing Maranget-on-generic-enum bug.
+def _execute_cmd<M>(cmd: Cmd<M>, msg_ch: Int, runtime_scope: Int): Void
+  match cmd
+    Cmd::Batch(cs) =>
+      var i = 0
+      while i < cs.size
+        _execute_cmd(cs[i], msg_ch, runtime_scope)
+        i = i + 1
+      end
+    Cmd::Run(thunk) =>
+      go _run_thunk(thunk, msg_ch, runtime_scope)
+      return
+    Cmd::After(ms, thunk) =>
+      go _run_after(ms, thunk, msg_ch, runtime_scope)
+      return
+    Cmd::Every(ms, thunk) =>
+      go _run_every(ms, thunk, msg_ch, runtime_scope)
+      return
+    _ =>
+      return
+  end
+end
+
+# Module-level relay between the panic handler and program_run's post-
+# with-block code. The handler can't re-throw directly — the same with-
+# Throws frame would catch its own throw and infinite-loop. Capture-
+# and-rethrow-after-the-with is the canonical kind=2 unwind shape.
+var _runtime_crashed = 0
+var _runtime_crash_msg = ""
+
+# SIGWINCH atomic flag — set to 1 by the per-signum signal trampoline
+# (codegen_runtime.qz) when the controlling tty resizes; cleared and
+# observed by _poll_resize. Lazy-initialised in program_run on first
+# call; the handle persists across program_run invocations.
+var _winch_handle = 0
+
+# Crash-safety handler. Capture the message, restore terminal state,
+# return 0 — the with-block unwinds to its catch, the handler's return
+# value becomes the with-block value, and program_run continues past
+# the with-block where it inspects _runtime_crashed and re-throws.
+#
+# Restore order: cursor visible → leave alt-screen → exit raw mode.
+# Leaving alt-screen drops the user back to their shell scrollback,
+# unblemished by the crashed app's render output.
+def _runtime_panic_handler(op_name: Int, argc: Int, argv: Int): Int
+  _runtime_crash_msg = as_string(load(argv, 0))
+  _runtime_crashed = 1
+  term_write("\x1b[?25h")
+  term_write("\x1b[?1049l")
+  term_exit_raw_mode()
+  return 0
+end
+
+# Event loop body. Carved out into a helper so the surrounding `with
+# Throws` body terminus is a bare expression (avoids the body-wrap-
+# last-stmt SSA-dominance gotcha — see feedback memory).
+def _runtime_loop<S, M>(p: Program<S, M>, msg_ch: Int, runtime_scope: Int): Int
+  var update_fn: Fn(FrameMsg<M>, S): (S, Cmd<M>) = p.update
+  var view_fn: Fn(S): String = p.view
+  var recorder_fn: Fn(FrameMsg<M>): Void = p.recorder
+  var state = p.initial
+  loop
+    var raw = recv(msg_ch)
+    var msg: FrameMsg<M> = as_type<FrameMsg<M>>(raw)
+    recorder_fn(msg)
+    var pair = update_fn(msg, state)
+    state = pair.0
+    var cmd: Cmd<M> = pair.1
+    _render(view_fn(state))
+
+    # Quit terminates the loop regardless of source (EOF, user-injected,
+    # or v0.2 external). update has now had its single shot to do save-
+    # state. Any returned cmd is silently discarded per the doc contract.
+    if msg is Quit
+      break
+    end
+
+    match cmd
+      Cmd::Quit =>
+        send(msg_ch, FrameMsg::Quit)
+      _ =>
+        _execute_cmd(cmd, msg_ch, runtime_scope)
+    end
+  end
+  return 0
+end
+
+# Run a TUI Program until clean Quit.
+#
+# Setup: enter raw mode, hide cursor, spawn input goroutine, render
+# initial view. Main work happens inside `with Throws { ... } do`.
+# Teardown: restore cursor + raw mode (always; both clean and panic
+# paths route through this).
+#
+# Returns 0 on clean Quit. On uncaught throw, _runtime_panic_handler
+# restores terminal state and re-throws — the caller never sees a
+# clean return after a crash; the default Throws handler prints the
+# message and exits 66.
+# No-op on_ready callback. Used by program_run, which is the
+# zero-sender variant of program_run_with_sender.
+def _no_on_ready<M>(s: Sender<M>): Void
+end
+
+def program_run<S, M>(p: Program<S, M>): Int
+  return program_run_with_sender(p, _no_on_ready)
+end
+
+## Run a TUI Program until clean Quit, exposing a Sender<M> for
+## external goroutines to push messages into the runtime.
+##
+## `on_ready` fires once after the runtime has set up its msg_ch but
+## before the main event loop begins blocking on recv — a one-shot
+## opportunity to stash the Sender (or spawn goroutines that hold it)
+## so the runtime can be driven by network input, file watchers, IPC,
+## or any goroutine outside the runtime's own bookkeeping.
+##
+## The Sender is alive only for the duration of program_run; on clean
+## Quit (or panic), the runtime scope cancels and any goroutines using
+## the Sender unwind via Throws. External-sender goroutines should
+## therefore wrap in `with Throws { throw: handler } do -> ... end` —
+## see _pump_throw_handler for the canonical absorb pattern.
+##
+## Returns 0 on clean Quit. Same crash semantics as program_run.
+def program_run_with_sender<S, M>(
+  p: Program<S, M>,
+  on_ready: Fn(Sender<M>): Void
+): Int
+  sched_init(0)
+  _runtime_crashed = 0
+  _runtime_crash_msg = ""
+  term_enter_raw_mode()
+  # Enter alt-screen and clear before any user output. Without this
+  # the runtime overwrites the shell's main scrollback as ticks come
+  # in, AND on some terminals (Ghostty observed) the main-screen
+  # buffer maintains a separate charset state from alt-screen — so
+  # multi-byte UTF-8 (octant glyphs, em-dash, ellipsis) decodes as
+  # Latin-1 unless we toggle into alt-screen first. program_run_raw
+  # has always done this; program_run was missing it.
+  term_write("\x1b[?1049h")
+  term_write("\x1b[?25l")
+  term_write("\x1b[H\x1b[2J")
+  var s = scope_with_cancel(current_scope())
+  var prev_scope = current_scope_load()
+  current_scope_store(s)
+  var msg_ch = channel_new(64)
+  # Hand the user a Sender before the main loop starts so external
+  # goroutines can begin producing messages immediately. The init Cmd
+  # below also runs on this side of the loop, so user-spawned goroutines
+  # and Cmd::Every / Cmd::After producers race naturally — both end up
+  # in the bounded msg_ch.
+  var sender: Sender<M> = Sender { ch: msg_ch }
+  on_ready(sender)
+  go _pump_keys(msg_ch, s)
+  # SIGWINCH: lazy-init the atomic flag handle on first run, clear stale
+  # state, install the trampoline, spawn the poller. The handler is
+  # async-signal-safe (per-signum table in the runtime, atomic-store
+  # only), so we can install it freely without coordinating with the
+  # input pump.
+  if _winch_handle == 0
+    _winch_handle = atomic_new(0)
+  end
+  atomic_store(_winch_handle, 0)
+  signal_on_flag(_SIGWINCH(), _winch_handle)
+  go _poll_resize(msg_ch, s, _winch_handle)
+  var view_fn: Fn(S): String = p.view
+  _render(view_fn(p.initial))
+  # Dispatch the Program's init Cmd so any Cmd::Every / Cmd::After /
+  # Cmd::Run starts producing messages before the loop blocks on recv.
+  # init is Cmd::None by default — zero overhead when unused.
+  var init_cmd: Cmd<M> = p.init
+  _execute_cmd(init_cmd, msg_ch, s)
+  with Throws { throw: _runtime_panic_handler } do ->
+    _runtime_loop(p, msg_ch, s)
+    0
+  end
+  # Cancel the runtime scope so the pump (and any in-flight Cmd::Run
+  # goroutines that observe scope) wakes within ~50ms, unwinds, and
+  # exits before program_run returns. Bounds goroutine lifetime to
+  # the program_run call.
+  scope_cancel(s)
+  current_scope_store(prev_scope)
+  # Idempotent — handler already restored these on the panic path.
+  # Order matters: restore cursor → leave alt-screen → exit raw mode.
+  term_write("\x1b[?25h")
+  term_write("\x1b[?1049l")
+  term_exit_raw_mode()
+  if _runtime_crashed == 1
+    throw(_runtime_crash_msg)
+  end
+  return 0
+end
+
+# ============================================================
+# program_run_raw — non-TEA runtime helper
+# ============================================================
+#
+# Sibling of program_run for apps that own their own render loop and
+# can't fit the TEA `view: Fn(S): String` shape — e.g. cell-engine /
+# diff-renderer apps that emit per-cell escape sequences instead of
+# full-frame strings (the brogue-tribute pattern).
+#
+# Sets up the same scaffolding as program_run — raw mode, alt screen,
+# cursor hide, per-run scope, input pump goroutine, optional tick pump
+# goroutine — then hands `(msg_ch, scope)` to the user's body. The
+# body owns the main loop; it recv's from msg_ch, dispatches keys /
+# ticks / EOF, and returns when ready to tear down.
+#
+# On body return (clean OR throw), program_run_raw cancels the scope
+# (so goroutines unwind via Throws within ~50ms), restores terminal
+# state, and re-throws if the cause was a panic. The terminal is
+# always left in a sane state — no path leaves raw mode stuck on.
+#
+# Tick pump is opt-in: `tick_ms == 0` skips spawning the tick goroutine
+# entirely (zero overhead). When enabled, the pump emits FrameMsg::Tick
+# carrying the current epoch_ms every `tick_ms` milliseconds.
+#
+# Channel messages are FrameMsg<M>: Key, Quit, Tick, Resize. The body
+# materialises them via `as_type<FrameMsg<M>>(recv(msg_ch))` and
+# dispatches on the variant. M is open to the caller — pass <Void>
+# (or any nominal type) when not using FrameMsg::App.
+#
+# Example (brogue-tribute-shaped):
+#   program_run_raw<Void>(125) do msg_ch, scope ->
+#     var world = world_init()
+#     var renderer = renderer_new(80, 24)
+#     loop
+#       var raw = recv(msg_ch)
+#       var msg: FrameMsg<Void> = as_type<FrameMsg<Void>>(raw)
+#       match msg
+#         FrameMsg::Quit => break
+#         FrameMsg::Key(ev) => world = world_handle_key(world, ev.code)
+#         FrameMsg::Tick(_) => world = world_tick(world)
+#         _ => 0
+#       end
+#       term_write(renderer_diff(renderer))
+#     end
+#     0
+#   end
+
+# Tick pump goroutine. Sleeps `ms`, then emits FrameMsg::Tick with the
+# current epoch_ms. Loops until scope cancel; both scope_sleep_ms and
+# scope_send unwind via Throws on cancel within one chunk (~50ms).
+# Child-scope wrap (see _pump_keys) — without it, normal exit would
+# cascade-cancel runtime_scope and freeze every other goroutine.
+def _pump_ticks_raw<M>(ms: Int, msg_ch: Int, runtime_scope: Int): Int
+  with Throws { throw: _pump_throw_handler } do ->
+    scope_with(scope_with_cancel(runtime_scope)) do ->
+      loop
+        scope_sleep_ms(ms)
+        scope_send(msg_ch, FrameMsg::Tick(time_epoch_ms()))
+      end
+      0
+    end
+    0
+  end
+  return 0
+end
+
+# Effect handler for capture-and-rethrow in program_run_raw's body
+# wrap. Same shape as _runtime_panic_handler (writes to module-level
+# _runtime_crashed / _runtime_crash_msg) but restores alt-screen too —
+# program_run_raw enters alt-screen, program_run does not.
+def _runtime_raw_panic_handler(op_name: Int, argc: Int, argv: Int): Int
+  _runtime_crash_msg = as_string(load(argv, 0))
+  _runtime_crashed = 1
+  term_write("\x1b[?25h")
+  term_write("\x1b[?1049l")
+  term_exit_raw_mode()
+  return 0
+end
+
+## Run a non-TEA TUI app: input pump + optional tick pump + scope-aware
+## teardown, with the caller owning the main loop.
+##
+## `tick_ms`: tick period in milliseconds. Pass 0 to skip the tick pump
+## entirely (no goroutine spawned, no FrameMsg::Tick traffic).
+##
+## `body`: callback receiving `(msg_ch, scope)`. The body recv's from
+## msg_ch and runs the app's main loop; it returns the program exit
+## code when ready to tear down. Throws inside `body` propagate up
+## through program_run_raw after terminal cleanup.
+##
+## Returns whatever `body` returns. On uncaught throw, the terminal is
+## restored and the throw is re-raised — callers that want a return
+## code regardless of crash should wrap their body in their own
+## `with Throws { throw: ... } do ... end`.
+def program_run_raw<M>(tick_ms: Int, body: Fn(Int, Int): Int): Int
+  sched_init(0)
+  _runtime_crashed = 0
+  _runtime_crash_msg = ""
+  term_enter_raw_mode()
+  term_write("\x1b[?1049h")
+  term_write("\x1b[?25l")
+  term_write("\x1b[H\x1b[2J")
+  var s = scope_with_cancel(current_scope())
+  var prev_scope = current_scope_load()
+  current_scope_store(s)
+  var msg_ch = channel_new(64)
+  go _pump_keys(msg_ch, s)
+  if tick_ms > 0
+    go _pump_ticks_raw<M>(tick_ms, msg_ch, s)
+  end
+  # SIGWINCH: lazy-init the atomic flag handle on first run, clear stale
+  # state, install the trampoline, spawn the poller. Mirrors
+  # program_run_with_sender — handler is async-signal-safe so install
+  # is unconditional.
+  if _winch_handle == 0
+    _winch_handle = atomic_new(0)
+  end
+  atomic_store(_winch_handle, 0)
+  signal_on_flag(_SIGWINCH(), _winch_handle)
+  go _poll_resize<M>(msg_ch, s, _winch_handle)
+  var rc = 0
+  with Throws { throw: _runtime_raw_panic_handler } do ->
+    rc = body(msg_ch, s)
+    0
+  end
+  # Cancel the scope so input pump + tick pump + resize poller all
+  # unwind within ~50ms. Bounds goroutine lifetime to this call.
+  scope_cancel(s)
+  current_scope_store(prev_scope)
+  # Idempotent — handler already restored these on the panic path.
+  term_write("\x1b[?25h")
+  term_write("\x1b[?1049l")
+  term_exit_raw_mode()
+  if _runtime_crashed == 1
+    throw(_runtime_crash_msg)
+  end
+  return rc
+end
+
+# ============================================================
+# program_replay — deterministic re-run of a recorded session
+# ============================================================
+#
+# Bug-report reproduction for record/replay-driven debugging. Iterates
+# `msgs` through `update` exactly the same as program_run's main loop,
+# but with three deterministic differences:
+#
+#   1. Message source is the supplied Vec, not a live input goroutine.
+#      No raw mode, no terminal I/O, no goroutines — fully synchronous.
+#
+#   2. Cmd::Run / Cmd::After / Cmd::Every closures DO NOT EXECUTE.
+#      Their results were already in the original message log; the
+#      replay loop just sees those result-messages in sequence.
+#      Side effects happen exactly once — at record time.
+#
+#   3. Cmd::Quit terminates the replay at that point regardless of
+#      whether more messages remain (matches program_run's quit
+#      semantics; messages after the synthetic Quit are unreachable
+#      in the original session by definition).
+#
+# `view` is NOT called during replay. The replay's purpose is to
+# reproduce the state evolution, not to render frames. If a debugger
+# wants to see intermediate views, it can call `p.view(state)`
+# externally between message dispatches.
+#
+# `recorder` is NOT called during replay. Re-recording during replay
+# would produce a duplicate log; if you want to re-record (e.g. to
+# verify the recorder is deterministic), build a new Program with the
+# desired recorder and run program_replay separately.
+#
+# Returns the final state after dispatching all messages (or after
+# Cmd::Quit, whichever comes first).
+def program_replay<S, M>(p: Program<S, M>, msgs: Vec<FrameMsg<M>>): S
+  var update_fn: Fn(FrameMsg<M>, S): (S, Cmd<M>) = p.update
+  var state = p.initial
+  var i = 0
+  var done = 0
+  while i < msgs.size and done == 0
+    var msg = msgs[i]
+    var pair = update_fn(msg, state)
+    state = pair.0
+    var cmd: Cmd<M> = pair.1
+    # Quit detection — explicit qualified match. The `is X` predicate now
+    # dispatches by (enum, tag) post-IS_PREDICATE_CROSS_ENUM_TAG_COLLISION,
+    # but only when the subject carries enum identity into scope. Vec
+    # indexing (`msgs[i]`) doesn't currently stamp the element type onto
+    # the resulting local's binding, so `msg is Quit` would fall back to
+    # the legacy global search. Use explicit match arms here for clarity
+    # and to avoid coupling correctness to that gap.
+    match msg
+      FrameMsg::Quit => done = 1
+      _ =>
+        match cmd
+          Cmd::Quit => done = 1
+          _ => done = done
+        end
+    end
+    i = i + 1
+  end
+  return state
+end

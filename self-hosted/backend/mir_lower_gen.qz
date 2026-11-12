@@ -1,0 +1,1618 @@
+##! # MIR Lower Generator & Async State Machine
+##!
+##! Transforms generator and async functions into state machine frames.
+##! Owns all generator state globals and provides accessor functions.
+##!
+##! @see mir_lower Main MIR lowering module
+##! @see mir_lower_async_registry Async function tracking
+
+import mir
+import * from mir
+import ast
+import node_constants
+import op_constants
+import type_constants
+import token_constants
+import diagnostic
+import mir_lower_async_registry
+import mir_lower
+import dep_graph
+import * from str_compat
+
+# Phase 4D.5b: `_generator_func_names` and `_async_gen_func_names`
+# registries deleted. Source of truth for "is this an (async) generator?"
+# is now the function's return-type annotation (str2 on the AST node),
+# checked via `mir::mir_func_annotation_is_generator` /
+# `mir_func_annotation_is_async_generator` at each dispatch site. The
+# canonical annotation forms are `impl Iterator<...>` (sync) and
+# `impl AsyncIterator<...>` (async); the row-poly form
+# `impl Iterator<T> can Async` is rewritten by typecheck (4D.3 stamp,
+# typecheck_walk.qz) to the canonical async form before MIR runs.
+
+# Shared $poll-shape lowering state — set by any of {mir_lower_async_poll,
+# mir_lower_actor_poll, mir_lower_generator_effect (sync + async, post-4D.5c.5)}
+# and read by mir_emit_async_suspend_point / mir_emit_kind3_perform_suspend /
+# mir_lower_stmt_yield during body lowering.
+#
+# _gen_frame_var: name of the frame pointer variable (e.g., "self")
+# _gen_local_names: list of local variable names in frame order
+# _gen_local_offsets: parallel list of frame offsets for each local
+# _gen_yield_counter: incremented at each suspend point, used as next state number
+# _gen_resume_blocks: blocks to jump to for each state (indexed by state number)
+# _gen_active: 0=inactive, 2=$poll rebuild (unified post-4.B.7: async fns,
+#              impl Iterator, impl AsyncIterator — all use kind=3 for yield).
+#              Values 1 (legacy sync state-machine, 4.B.7.a) and 3 (legacy
+#              async-gen state-machine, 4.B.7.b) have been retired.
+var _gen_active = 0
+var _gen_frame_var = ""
+var _gen_local_names = vec_new<String>()
+var _gen_local_offsets = vec_new()
+var _gen_yield_counter = 0
+var _gen_resume_blocks = vec_new()
+# Tracks the next available frame offset for dynamically registered locals
+var _gen_next_offset = 0
+# Set of known local names (for dedup)
+var _gen_known_locals = map_new<String, Int>()
+# When _gen_active==2, tracks the original async function name (for suspendable analysis)
+var _gen_async_func_name = ""
+# go-lambda cooperative yield: when > 0, insert sched_yield() at loop back-edges
+# even outside async $poll mode. Used by `go do...end` blocks.
+var _go_lambda_yield_depth = 0
+
+# Extra frame padding for dynamic locals (for-in temps, etc.)
+const GEN_FRAME_PADDING = 32
+
+# ============================================================================
+# Accessor Functions — used by mir_lower.qz to read/write generator state
+# ============================================================================
+
+def mir_gen_is_active(): Int = _gen_active
+
+def mir_gen_set_active(val: Int): Void
+  _gen_active = val
+end
+
+def mir_go_lambda_yield_enter(): Void
+  _go_lambda_yield_depth += 1
+end
+
+def mir_go_lambda_yield_exit(): Void
+  _go_lambda_yield_depth -= 1
+end
+
+def mir_go_lambda_yield_is_active(): Int = _go_lambda_yield_depth
+
+def mir_gen_get_frame_var(): String = _gen_frame_var
+
+def mir_gen_get_async_func_name(): String = _gen_async_func_name
+
+def mir_gen_get_yield_counter(): Int = _gen_yield_counter
+
+def mir_gen_inc_yield_counter(): Int
+  _gen_yield_counter = _gen_yield_counter + 1
+  return _gen_yield_counter
+end
+
+def mir_gen_add_resume_block(block: mir::MirBlock): Void
+  _gen_resume_blocks.push(block)
+end
+
+def mir_gen_get_resume_blocks(): Vec<mir::MirBlock> = _gen_resume_blocks
+
+def mir_gen_get_next_offset(): Int = _gen_next_offset
+
+def mir_gen_get_local_names(): Vec<String> = _gen_local_names
+
+def mir_gen_get_local_offsets(): Vec<Int> = _gen_local_offsets
+
+## Pause the async/generator lowering mode for the duration of a nested
+## sync body — e.g., when `mir_lower_lambda` emits a separate plain-lambda
+## function from inside a $poll-lowered outer function. Without this pause,
+## all `mir_gen_is_active() >= 2` gates inside the nested body fire, and
+## the lambda emits `%self` loads + POLL_READY returns that refer to the
+## outer $poll's frame (which is not a parameter of the nested lambda).
+## Returns the prior `_gen_active` value so callers can restore it.
+def mir_gen_pause_active(): Int
+  var prev = _gen_active
+  _gen_active = 0
+  return prev
+end
+
+def mir_gen_resume_active(prev: Int): Void
+  _gen_active = prev
+end
+
+## Full snapshot of the generator/async lowering state. Needed to make
+## nested $poll synthesis re-entrant: `mir_lower_go_lambda_poll` sets up a
+## fresh state machine and `_gen_clear()`s it on exit. When a `go
+## <capturing-lambda>` is lowered while an enclosing async function's body
+## is still being lowered (e.g. `return go (-> body(f))`), that inner
+## `_gen_clear()` would otherwise wipe the enclosing fn's `_gen_frame_var`,
+## and the enclosing `return` handler then emits `load_var("")`.
+struct GenSnapshot
+  active: Int
+  frame_var: String
+  async_func_name: String
+  local_names: Vec<String>
+  local_offsets: Vec
+  yield_counter: Int
+  resume_blocks: Vec
+  next_offset: Int
+  known_locals: Map<String, Int>
+end
+
+def mir_gen_snapshot(): GenSnapshot
+  return GenSnapshot {
+    active: _gen_active,
+    frame_var: _gen_frame_var,
+    async_func_name: _gen_async_func_name,
+    local_names: _gen_local_names,
+    local_offsets: _gen_local_offsets,
+    yield_counter: _gen_yield_counter,
+    resume_blocks: _gen_resume_blocks,
+    next_offset: _gen_next_offset,
+    known_locals: _gen_known_locals
+  }
+end
+
+def mir_gen_restore(snap: GenSnapshot): Void
+  _gen_active = snap.active
+  _gen_frame_var = snap.frame_var
+  _gen_async_func_name = snap.async_func_name
+  _gen_local_names = snap.local_names
+  _gen_local_offsets = snap.local_offsets
+  _gen_yield_counter = snap.yield_counter
+  _gen_resume_blocks = snap.resume_blocks
+  _gen_next_offset = snap.next_offset
+  _gen_known_locals = snap.known_locals
+end
+
+## Phase 9 (Actor M:N): additional setters for async state machine context.
+## Used by mir_lower_actor_poll to set up $poll state machine around actor recv loop.
+def mir_gen_set_frame_var(name: String): Void
+  _gen_frame_var = name
+end
+
+def mir_gen_set_locals(names: Vec<String>, offsets: Vec<Int>): Void
+  _gen_local_names = names
+  _gen_local_offsets = offsets
+  _gen_known_locals = map_new<String, Int>()
+  for i in 0..names.size
+    map_set(_gen_known_locals, names[i], offsets[i])
+  end
+end
+
+def mir_gen_set_next_offset(offset: Int): Void
+  _gen_next_offset = offset
+end
+
+def mir_gen_init_state_machine(name: String): Void
+  _gen_async_func_name = name
+  _gen_yield_counter = 0
+  _gen_resume_blocks = vec_new()
+end
+
+def mir_gen_build_dispatch(ctx: MirContext, poll_entry: mir::MirBlock, done_block: mir::MirBlock): Void
+  # Build O(1) state dispatch via switch instruction in poll_entry block
+  ctx.mir_switch_to_block(poll_entry)
+  var self_val = ctx.mir_emit_load_var("self")
+  var state_val = ctx.mir_emit_load_offset(self_val, 0)
+  var is_done = ctx.mir_emit_binary(op_constants::OP_LT, state_val, ctx.mir_emit_const_int(0))
+
+  if _gen_resume_blocks.size == 1
+    var entry_block = ctx.mir_ctx_get_block()
+    mir_block_set_branch(entry_block, is_done, done_block, _gen_resume_blocks[0])
+  else
+    # O(1) switch dispatch: state_val loaded in entry, dominates switch block
+    var switch_block = ctx.mir_create_block("poll_switch")
+    var entry_block = ctx.mir_ctx_get_block()
+    mir_block_set_branch(entry_block, is_done, done_block, switch_block)
+    var case_vals = vec_new()
+    var case_targets = vec_new()
+    for ri in 0.._gen_resume_blocks.size
+      case_vals.push(ri)
+      case_targets.push(_gen_resume_blocks[ri])
+    end
+    # Use state_val from entry block (dominates switch_block, valid SSA)
+    mir_block_set_switch(switch_block, state_val, case_vals, case_targets, done_block)
+  end
+  _gen_clear()
+end
+
+# Phase 4D.5b: `mir_gen_is_generator_function` and
+# `mir_gen_is_async_generator_function` deleted. Callers now use
+# `mir::mir_func_annotation_is_generator` /
+# `mir_func_annotation_is_async_generator` against the function's
+# return-type annotation (looked up by name via
+# `mir::mir_func_lookup_annotation` for sites without an AST iter node).
+
+# ============================================================================
+# Generator/Async Helper Functions — MIR emission helpers
+# ============================================================================
+
+## Emit cancel token check at an async resume point.
+## If frame[3] (cancel_token) is non-zero and cancelled, sets state=-1, result=-1, returns 1.
+## Must be called after locals are restored in a resume block. Continues in a new block.
+def mir_emit_cancel_check(ctx: MirContext): Void
+  var self_val = ctx.mir_emit_load_var(_gen_frame_var)
+  var cancel_raw = ctx.mir_emit_load_offset(self_val, 3)
+  var zero = ctx.mir_emit_const_int(0)
+  # Skip cancel check for actor sentinel (-999) — not a real cancel token
+  var actor_sentinel = ctx.mir_emit_const_int(-999)
+  var is_actor = ctx.mir_emit_binary(op_constants::OP_EQ, cancel_raw, actor_sentinel)
+  var not_actor = ctx.mir_emit_binary(op_constants::OP_EQ, is_actor, zero)
+  var has_token = ctx.mir_emit_binary(op_constants::OP_NE, cancel_raw, zero)
+  var should_check = ctx.mir_emit_binary(op_constants::OP_AND, has_token, not_actor)
+  var check_block = ctx.mir_create_block("cancel_check")
+  var continue_block = ctx.mir_create_block("cancel_continue")
+  var cur = ctx.mir_ctx_get_block()
+  mir_block_set_branch(cur, should_check, check_block, continue_block)
+  # In check_block: compute abs(frame[3]) — negative encodes cancel_on_success
+  ctx.mir_switch_to_block(check_block)
+  var neg_tok = ctx.mir_emit_binary(op_constants::OP_SUB, zero, cancel_raw)
+  var is_neg = ctx.mir_emit_binary(op_constants::OP_LT, cancel_raw, zero)
+  var cancel_tok = ctx.mir_emit_select(is_neg, neg_tok, cancel_raw)
+  var check_args = vec_new()
+  check_args.push(cancel_tok)
+  var is_cancelled = ctx.mir_emit_intrinsic("cancel_token_is_cancelled", check_args)
+  var cancelled_block = ctx.mir_create_block("cancelled")
+  var check_cur = ctx.mir_ctx_get_block()
+  mir_block_set_branch(check_cur, is_cancelled, cancelled_block, continue_block)
+  # In cancelled_block: set state=-1, result=-1, return 1 (POLL_READY)
+  ctx.mir_switch_to_block(cancelled_block)
+  var self2 = ctx.mir_emit_load_var(_gen_frame_var)
+  ctx.mir_emit_store_offset(self2, 0, ctx.mir_emit_const_int(-1))
+  ctx.mir_emit_store_offset(self2, 1, ctx.mir_emit_const_int(-1))
+  var cancelled_ret = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(cancelled_ret, mir::TERM_RETURN, ctx.mir_emit_const_int(1))
+  # Continue block: normal execution resumes here
+  ctx.mir_switch_to_block(continue_block)
+end
+
+## Emit an async suspend point: save all locals to frame, set state, return, create resume block.
+## fd_val: >=0 → I/O suspend (return -(fd+2)), <0 → yield (return 0)
+## resume_target: block to jump to after resume, or 0 for inline resume (caller continues in resume block)
+## Returns: the resume block (caller can emit code after it)
+## REQUIRES: _gen_active == 2 (post-4.B.7.b: value 3 retired with the legacy
+## async-gen state machine; sync gens, async gens, and async fns all share the
+## kind=3 $poll-rebuild contract under value 2)
+def mir_emit_async_suspend_point(ctx: MirContext, fd_val: Int, resume_target: mir::MirBlock): Int
+  # Compute return value: -(fd+2) for I/O suspend, 0 for yield
+  var ret_val = ctx.mir_emit_const_int(0)
+  if fd_val >= 0
+    var fd_plus_2 = ctx.mir_emit_binary(op_constants::OP_ADD, fd_val, ctx.mir_emit_const_int(2))
+    ret_val = ctx.mir_emit_binary(op_constants::OP_SUB, ctx.mir_emit_const_int(0), fd_plus_2)
+  end
+  # Pick resume-block label by fd kind for IR readability.
+  var resume_label = "io_resume"
+  if fd_val < 0
+    resume_label = "yield_resume"
+  end
+  return mir_emit_async_suspend_point_raw(ctx, ret_val, resume_target, resume_label)
+end
+
+## 4D.5c.1: raw-rv variant — takes a dynamic SSA register holding the rv to
+## return, instead of computing it from an fd. Same scaffold as
+## mir_emit_async_suspend_point: save locals to frame, set state, ret %raw_rv,
+## create resume block with locals-reload + cancel check. Used by
+## __qz_async_park_propagate(rv) — the consumer-side park bridge for
+## Stream.next() and other Quartz code that needs to propagate a park encoding
+## received as an i64 value rather than computed from a known fd.
+##
+## resume_label: short string used to name the resume block in IR dumps. Pass
+## "park_resume" for the propagate case; mir_emit_async_suspend_point passes
+## "io_resume" or "yield_resume" depending on fd_val.
+def mir_emit_async_suspend_point_raw(ctx: MirContext, raw_rv: Int, resume_target: mir::MirBlock, resume_label: String): Int
+  # Record this function as a suspendable leaf
+  if str_byte_len(_gen_async_func_name) > 0
+    mir_lower_async_registry::mir_record_suspendable_leaf(_gen_async_func_name)
+  end
+  # Increment yield counter to get next state
+  _gen_yield_counter = _gen_yield_counter + 1
+  var next_state = _gen_yield_counter
+  # Save all locals to frame
+  var self_val = ctx.mir_emit_load_var(_gen_frame_var)
+  for _aspi in 0.._gen_local_names.size
+    var local_val = ctx.mir_emit_load_var(_gen_local_names[_aspi])
+    ctx.mir_emit_store_offset(self_val, _gen_local_offsets[_aspi], local_val)
+  end
+  # Set state = next_state
+  ctx.mir_emit_store_offset(self_val, 0, ctx.mir_emit_const_int(next_state))
+  var block = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(block, mir::TERM_RETURN, raw_rv)
+  # Create resume block
+  var resume_block = ctx.mir_create_block(resume_label)
+  _gen_resume_blocks.push(resume_block)
+  ctx.mir_switch_to_block(resume_block)
+  # Restore all locals from frame at resume point
+  var self_resume = ctx.mir_emit_load_var(_gen_frame_var)
+  for _aspj in 0.._gen_local_names.size
+    var restored = ctx.mir_emit_load_offset(self_resume, _gen_local_offsets[_aspj])
+    ctx.mir_emit_store_var(_gen_local_names[_aspj], restored)
+  end
+  # Check cancel token at resume — abort if cancelled
+  ctx.mir_emit_cancel_check()
+  # If resume_target specified, jump to it
+  if resume_target > 0
+    var resume_cur = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(resume_cur, mir::TERM_JUMP, resume_target)
+  end
+  return resume_block
+end
+
+## Emit a kind=3 perform suspension point inside an async $poll body.
+## Effects-system Phase 3 P3.0c-perform.
+##
+## Unlike io_suspend's sentinel-return suspension (where the scheduler
+## loop re-enters poll), kind=3 perform is a synchronous nested resume:
+##   1. The OUTER $poll saves state+locals, stores %self into TLS
+##      @__qz_effect_current_cont_frame, and emits MIR_PERFORM_OP.
+##   2. Perform dispatches to the user handler. The handler eventually
+##      calls resume(v).
+##   3. resume(v) at runtime (via __qz_effect_resume_cont) stashes v into
+##      TLS @__qz_effect_current_resume_val and calls poll(self) — a
+##      NESTED invocation of the same $poll function. The nested poll's
+##      state dispatcher jumps to this perform site's resume block,
+##      which loads v from TLS and continues the body.
+##   4. Nested body runs to end, writes body_rv into frame[1], returns.
+##   5. resume_cont reads frame[1] as body_rv, stashes to results[idx],
+##      sets resumed[idx]=1, returns.
+##   6. Handler continues past `resume(v)`, may do work, returns handler_rv.
+##   7. Perform sees kind=3 + resumed=1, returns normally to the OUTER
+##      poll invocation's perform call site.
+##   8. Outer poll loads frame[1] (body_rv from step 4) and `ret`s it —
+##      this is crucial: we do NOT fall through to run post-perform
+##      code in the outer invocation (the nested invocation already
+##      ran it).
+##
+## op_name/eff_name identify the op; args are the lowered argument
+## registers. Returns the SSA register holding the perform-expression
+## value — the v stashed in TLS by resume_cont, reloaded in the resume
+## block.
+def mir_emit_kind3_perform_suspend(ctx: MirContext, op_name: String, eff_name: String, args: Vec<Int>): Int
+  # Record the enclosing async function as a suspendable leaf so the
+  # existing effect-propagation (PASS 1.3) catches callers.
+  if str_byte_len(_gen_async_func_name) > 0
+    mir_lower_async_registry::mir_record_suspendable_leaf(_gen_async_func_name)
+  end
+  # Bump the yield counter → pick a fresh state label for post-perform.
+  _gen_yield_counter = _gen_yield_counter + 1
+  var next_state = _gen_yield_counter
+  # Spill all live locals into the caller's frame (same pattern as
+  # mir_emit_async_suspend_point).
+  var self_val = ctx.mir_emit_load_var(_gen_frame_var)
+  for _k3i in 0.._gen_local_names.size
+    var local_val = ctx.mir_emit_load_var(_gen_local_names[_k3i])
+    ctx.mir_emit_store_offset(self_val, _gen_local_offsets[_k3i], local_val)
+  end
+  # frame[0] = next_state so the nested poll invocation's dispatcher
+  # lands in the resume block we're about to create.
+  ctx.mir_emit_store_offset(self_val, 0, ctx.mir_emit_const_int(next_state))
+  # Concurrency fix (Apr 22 2026): save outer cont_frame before
+  # clobber. Under nested kind=3 perform (e.g. busy-poll handler for
+  # `await h` polls `h$poll` which performs `suspend`), the inner
+  # perform's set_cont_frame(r1) overwrote the outer's set_cont_frame(f1).
+  # Consequence: do_await's resume_cont then recursively re-entered r1
+  # (already done) instead of f1 (still paused). f1's state never
+  # transitioned to -1, worker saw it as I/O-parked (state=1 +
+  # park_rv=-(fd+2)), registered on kqueue. The dead byte in the pipe
+  # caused kev_imm to fire immediately the first time but with scheduler
+  # contention the reenqueue was racy — tasks were lost roughly 7%/100
+  # on 3-task / 4-worker workloads. Saving + restoring cont_frame around
+  # each kind=3 perform is a local, lexically-scoped fix that preserves
+  # the nested handler's view of its own continuation while letting the
+  # outer handler's resume_cont find the right frame.
+  var get_old_args = vec_new<Int>()
+  var old_cont = ctx.mir_emit_call("__qz_effect_get_cont_frame", get_old_args)
+  # Write %self to TLS so __qz_effect_resume_cont (called from the
+  # handler's resume(v)) can locate this frame's poll_fn at frame[2].
+  var set_args = vec_new<Int>()
+  set_args.push(self_val)
+  ctx.mir_emit_call("__qz_effect_set_cont_frame", set_args)
+  # Effects P3.E-runtime: reset the park-rv TLS slot to POLL_READY (1)
+  # before perform. If the handler calls __qz_effect_park(fd), it
+  # overwrites this with -(fd+2) (scheduler-park encoding). If the
+  # handler resumes synchronously (P3.C await pattern), TLS stays at
+  # POLL_READY and outer ret matches today's hard-coded behavior.
+  var reset_args = vec_new<Int>()
+  ctx.mir_emit_call("__qz_effect_park_reset", reset_args)
+  # Actually dispatch the op. The runtime's perform helper runs the
+  # handler, which (in the resume case) synchronously re-enters this
+  # $poll via __qz_effect_resume_cont — that nested invocation lands
+  # in the resume block (state=next_state) below, runs the rest of
+  # the body, writes frame[1], and returns. When the outer invocation
+  # resumes after perform returns, frame[1] holds body_rv. In the
+  # abort case, perform longjmps out of this frame entirely — we never
+  # reach the code after.
+  ctx.mir_emit_perform_op(op_name, eff_name, 3, args)
+  # Effects P3.E-runtime: outer-invocation exit returns whatever the
+  # handler's park/resume decision put in TLS. POLL_READY (default) →
+  # scheduler marks task done. `-(fd+2)` (from __qz_effect_park) →
+  # scheduler parks task on fd/pid/timer. This is the single-point
+  # extension enabling async I/O via effect handlers without special-
+  # casing suspend at the kind=3 call site.
+  # Crucial — we do NOT fall through to post-perform code; the nested
+  # invocation already ran it (and wrote body_rv → frame[1] +
+  # state=-1 → frame[0] via the body-end path). Falling through would
+  # execute the body twice. If handler aborted without resume
+  # (kind=2-style unwind), perform longjmps out of this frame entirely
+  # and we never reach this ret.
+  var get_park_args = vec_new<Int>()
+  var park_rv = ctx.mir_emit_call("__qz_effect_park_get_rv", get_park_args)
+  # Restore the outer cont_frame on the OUTER-invocation exit path. This
+  # is the lexical post-perform point; we execute it before `ret` so any
+  # enclosing $poll (if this perform is nested inside another $poll's
+  # kind=3 perform) sees its own cont_frame preserved. For the nested
+  # invocation the resume_block handles its own exit, and we explicitly
+  # restore there too (below).
+  var restore_args = vec_new<Int>()
+  restore_args.push(old_cont)
+  ctx.mir_emit_call("__qz_effect_set_cont_frame", restore_args)
+  var outer_block = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(outer_block, mir::TERM_RETURN, park_rv)
+  # Create the resume block for the NESTED invocation. The state-
+  # machine switch at poll_entry will dispatch here when state ==
+  # next_state. Subsequent user-body statements lower into this block.
+  var resume_block = ctx.mir_create_block("k3_perform_resume")
+  _gen_resume_blocks.push(resume_block)
+  ctx.mir_switch_to_block(resume_block)
+  # Restore locals.
+  var self_resume = ctx.mir_emit_load_var(_gen_frame_var)
+  for _k3j in 0.._gen_local_names.size
+    var restored = ctx.mir_emit_load_offset(self_resume, _gen_local_offsets[_k3j])
+    ctx.mir_emit_store_var(_gen_local_names[_k3j], restored)
+  end
+  # Cancel check (parity with mir_emit_async_suspend_point).
+  ctx.mir_emit_cancel_check()
+  # Load the resume value from TLS — this is what the perform
+  # expression evaluates to.
+  var rval_args = vec_new<Int>()
+  var resume_val = ctx.mir_emit_call("__qz_effect_get_resume_val", rval_args)
+  return resume_val
+end
+
+## Emit a preemption check at a loop back-edge in async $poll context.
+## Every 64 iterations, yields to the scheduler to prevent CPU starvation.
+## back_edge_target: the block to jump to for the next iteration (cond_block).
+## The current block must NOT have a terminator yet — this function sets it.
+def mir_emit_preemption_check(ctx: MirContext, back_edge_target: mir::MirBlock): Void
+  if _gen_active < 2
+    return
+  end
+  # Register __preempt_ctr as dynamic local (saved/restored across suspension)
+  mir_gen_register_dynamic_local("__preempt_ctr")
+  # Increment counter
+  var ctr = ctx.mir_emit_load_var("__preempt_ctr")
+  var one = ctx.mir_emit_const_int(1)
+  var ctr1 = ctx.mir_emit_binary(op_constants::OP_ADD, ctr, one)
+  ctx.mir_emit_store_var("__preempt_ctr", ctr1)
+  # Check: (ctr1 & 63) == 0 → time to yield
+  var mask = ctx.mir_emit_binary(op_constants::OP_BIT_AND, ctr1, ctx.mir_emit_const_int(63))
+  var need_yield = ctx.mir_emit_binary(op_constants::OP_EQ, mask, ctx.mir_emit_const_int(0))
+  var yield_block = ctx.mir_create_block("preempt_yield")
+  var continue_block = ctx.mir_create_block("preempt_continue")
+  var cur = ctx.mir_ctx_get_block()
+  mir_block_set_branch(cur, need_yield, yield_block, continue_block)
+  # Yield block: cooperative yield (sched_yield intercepted by async state machine)
+  ctx.mir_switch_to_block(yield_block)
+  ctx.mir_emit_async_suspend_point(-1, back_edge_target)
+  # Continue block: proceed to back-edge
+  ctx.mir_switch_to_block(continue_block)
+  mir_block_set_terminator(continue_block, mir::TERM_JUMP, back_edge_target)
+end
+
+## Emit cooperative yield for go-lambda blocks at loop back-edges.
+## Calls sched_yield() every 64 iterations. Simpler than async preemption
+## (no state machine suspend/resume) but sufficient to prevent starvation.
+def mir_emit_go_lambda_yield(ctx: MirContext, back_edge_target: mir::MirBlock): Void
+  if _go_lambda_yield_depth <= 0
+    return
+  end
+  # Use a module-level counter variable (not saved across suspend — no suspend here)
+  var ctr_name = "__go_yield_ctr"
+  var ctr = ctx.mir_emit_load_var(ctr_name)
+  var one = ctx.mir_emit_const_int(1)
+  var ctr1 = ctx.mir_emit_binary(op_constants::OP_ADD, ctr, one)
+  ctx.mir_emit_store_var(ctr_name, ctr1)
+  # Check: (ctr1 & 63) == 0 → time to yield
+  var mask = ctx.mir_emit_binary(op_constants::OP_BIT_AND, ctr1, ctx.mir_emit_const_int(63))
+  var need_yield = ctx.mir_emit_binary(op_constants::OP_EQ, mask, ctx.mir_emit_const_int(0))
+  var yield_block = ctx.mir_create_block("go_yield")
+  var continue_block = ctx.mir_create_block("go_continue")
+  var cur = ctx.mir_ctx_get_block()
+  mir_block_set_branch(cur, need_yield, yield_block, continue_block)
+  # Yield block: call sched_yield() then jump to back-edge
+  ctx.mir_switch_to_block(yield_block)
+  var yield_args = vec_new()
+  ctx.mir_emit_intrinsic("sched_yield", yield_args)
+  mir_block_set_terminator(ctx.mir_ctx_get_block(), mir::TERM_JUMP, back_edge_target)
+  # Continue block: proceed to back-edge without yielding
+  ctx.mir_switch_to_block(continue_block)
+  mir_block_set_terminator(ctx.mir_ctx_get_block(), mir::TERM_JUMP, back_edge_target)
+end
+
+## Emit the completion-watch-and-block pattern for non-async await.
+## Replaces busy-poll with pipe-based blocking: check-then-park via OS read().
+## Returns the MIR value for the result (frame[1]).
+def mir_emit_completion_await(ctx: MirContext, handle_val: Int): Int
+  # Freestanding (kernel): there is no pipe / @__qz_completion_map / blocking
+  # read() to park on — that is the hosted multi-worker completion-pipe
+  # machinery. The awaited handle is also NOT an async Future frame here: on the
+  # kernel, `async f()` / `go f()` (B.5e.2-5) returns a real scheduler TASK
+  # pointer (go_fn / kern_go_closure), whose completion is task_state DEAD/FREE,
+  # not `frame[0] == -1`. So we delegate to the kernel's `kern_await(handle)`,
+  # which owns the task-struct layout + the recycled-TASK_ID staleness guard and
+  # busy-yields until the task is done. Same kern_* link contract as
+  # kern_go_closure: the freestanding consumer (the kernel) supplies the body.
+  if mir_lower::mir_is_freestanding() == 1
+    var ka_args = vec_new()
+    ka_args.push(handle_val)
+    return ctx.mir_emit_call("kern_await", ka_args)
+  end
+  # Fast check: if frame[0] == -1, task already done
+  var ca_state = ctx.mir_emit_load_offset(handle_val, 0)
+  var ca_neg1 = ctx.mir_emit_const_int(-1)
+  var ca_is_done = ctx.mir_emit_binary(op_constants::OP_EQ, ca_state, ca_neg1)
+
+  var ca_fast_done = ctx.mir_create_block("ca_fast_done")
+  var ca_watch = ctx.mir_create_block("ca_watch")
+  var ca_result = ctx.mir_create_block("ca_result")
+  mir_block_set_branch(ctx.mir_ctx_get_block(), ca_is_done, ca_fast_done, ca_watch)
+
+  # Watch block: register completion pipe, then TOCTOU guard
+  ctx.mir_switch_to_block(ca_watch)
+  var watch_args = vec_new()
+  watch_args.push(handle_val)
+  var ca_read_fd = ctx.mir_emit_intrinsic("completion_watch", watch_args)
+
+  # TOCTOU guard: re-check state after registering watcher
+  var ca_state2 = ctx.mir_emit_load_offset(handle_val, 0)
+  var ca_done_after = ctx.mir_emit_binary(op_constants::OP_EQ, ca_state2, ca_neg1)
+  var ca_cleanup = ctx.mir_create_block("ca_cleanup")
+  var ca_block = ctx.mir_create_block("ca_block")
+  mir_block_set_branch(ctx.mir_ctx_get_block(), ca_done_after, ca_cleanup, ca_block)
+
+  # Block: read(read_fd) — OS blocks calling thread until scheduler writes
+  ctx.mir_switch_to_block(ca_block)
+  var block_args = vec_new()
+  block_args.push(ca_read_fd)
+  ctx.mir_emit_intrinsic("completion_block", block_args)
+  mir_block_set_terminator(ctx.mir_ctx_get_block(), mir::TERM_JUMP, ca_cleanup)
+
+  # Cleanup: completion_unwatch + fd_close
+  ctx.mir_switch_to_block(ca_cleanup)
+  var unwatch_args = vec_new()
+  unwatch_args.push(handle_val)
+  ctx.mir_emit_intrinsic("completion_unwatch", unwatch_args)
+  var close_args = vec_new()
+  close_args.push(ca_read_fd)
+  ctx.mir_emit_intrinsic("fd_close", close_args)
+  mir_block_set_terminator(ctx.mir_ctx_get_block(), mir::TERM_JUMP, ca_result)
+
+  # Fast-done path: no pipe needed, jump to result
+  ctx.mir_switch_to_block(ca_fast_done)
+  mir_block_set_terminator(ctx.mir_ctx_get_block(), mir::TERM_JUMP, ca_result)
+
+  # Result: load frame[1]
+  ctx.mir_switch_to_block(ca_result)
+  return ctx.mir_emit_load_offset(handle_val, 1)
+end
+
+## Register a dynamically created local variable in the generator frame.
+## Called when lowering creates temp variables (e.g., for-in __citer, __copt)
+## that need to be saved/restored across yields.
+## No-op if not inside a generator or if the name is already registered.
+def mir_gen_register_dynamic_local(name: String): Void
+  if _gen_active == 0
+    return
+  end
+  if map_has(_gen_known_locals, name)
+    return
+  end
+  map_set(_gen_known_locals, name, _gen_next_offset)
+  _gen_local_names.push(name)
+  _gen_local_offsets.push(_gen_next_offset)
+  _gen_next_offset = _gen_next_offset + 1
+end
+
+def _gen_clear(): Void
+  _gen_active = 0
+  _gen_async_func_name = ""
+  _gen_frame_var = ""
+  _gen_local_names = vec_new<String>()
+  _gen_local_offsets = vec_new()
+  _gen_yield_counter = 0
+  _gen_resume_blocks = vec_new()
+  _gen_next_offset = 0
+  _gen_known_locals = map_new<String, Int>()
+end
+
+# ============================================================================
+# Generator Lowering — State Machine Transformation
+# ============================================================================
+
+## Check if an AST block/node contains a return statement.
+def mir_block_contains_return(s: ast::AstStorage, node: AstNodeId): Bool
+  if node < 0
+    return false
+  end
+  var kind = ast::ast_get_kind(s, node)
+  if kind == node_constants::NODE_RETURN
+    return true
+  end
+  if kind == node_constants::NODE_BLOCK
+    var stmts = ast::ast_get_children(s, node)
+    if stmts != 0
+      var cnt = stmts.size
+      for i in 0..cnt
+        if mir_block_contains_return(s, stmts[i])
+          return true
+        end
+      end
+    end
+    return false
+  end
+  if kind == node_constants::NODE_IF
+    var then_node = ast::ast_get_right(s, node)
+    var else_node = ast::ast_get_extra(s, node)
+    if mir_block_contains_return(s, then_node)
+      return true
+    end
+    if mir_block_contains_return(s, else_node)
+      return true
+    end
+    return false
+  end
+  return false
+end
+
+# Scan AST body for local variable names (NODE_LET bindings).
+# Returns a Vec<String> of unique local variable names in order of first appearance.
+def mir_collect_generator_locals(s: ast::AstStorage, body: AstNodeId): Vec<String>
+  var locals = vec_new<String>()
+  var seen = map_new<String, Int>()
+
+  var kind = ast::ast_get_kind(s, body)
+  if kind == node_constants::NODE_LET
+    var name = ast::ast_get_str1(s, body)
+    if not map_has(seen, name)
+      locals.push(name)
+      map_set(seen, name, 1)
+    end
+    return locals
+  end
+  # Expression used in statement position (a bare `with ... do ... end`, a
+  # `match`-statement, etc.) is wrapped in NODE_EXPR_STMT whose inner expression
+  # is the left child. Without unwrapping it the collector never reaches the
+  # NODE_WITH / NODE_MATCH inside, so locals declared in their bodies were never
+  # added to the generator save set → garbage (or, for a loop counter, a hang)
+  # after a suspend nested inside. Recurse into the inner expression.
+  if kind == node_constants::NODE_EXPR_STMT
+    var es_inner = ast::ast_get_left(s, body)
+    if es_inner >= 0
+      return mir_collect_generator_locals(s, es_inner)
+    end
+    return locals
+  end
+  if kind == node_constants::NODE_BLOCK
+    var stmts = ast::ast_get_children(s, body)
+    if stmts > 0
+      for i in 0..stmts.size
+        var sub = mir_collect_generator_locals(s, stmts[i])
+        for j in 0..sub.size
+          if not map_has(seen, sub[j])
+            locals.push(sub[j])
+            map_set(seen, sub[j], 1)
+          end
+        end
+      end
+    end
+    return locals
+  end
+  # For-in range loops: collect loop variable AND synthesized __gen_end_ variable
+  if kind == node_constants::NODE_FOR
+    var for_var = ast::ast_get_str1(s, body)
+    if not map_has(seen, for_var)
+      locals.push(for_var)
+      map_set(seen, for_var, 1)
+    end
+    # Check if iterator is a range — if so, add __gen_end_ for the end value
+    var for_iter = ast::ast_get_left(s, body)
+    if for_iter >= 0
+      var for_iter_kind = ast::ast_get_kind(s, for_iter)
+      if for_iter_kind == node_constants::NODE_BINARY
+        var for_op = ast::ast_get_op(s, for_iter)
+        if for_op == op_constants::OP_RANGE or for_op == op_constants::OP_RANGE_INCLUSIVE
+          var end_name = "__gen_end_#{for_var}"
+          if not map_has(seen, end_name)
+            locals.push(end_name)
+            map_set(seen, end_name, 1)
+          end
+        end
+      end
+    end
+  end
+  # For-await loops: collect loop variable AND synthesized __fa_ch_ variable
+  if kind == node_constants::NODE_FOR_AWAIT
+    var fa_var = ast::ast_get_str1(s, body)
+    if not map_has(seen, fa_var)
+      locals.push(fa_var)
+      map_set(seen, fa_var, 1)
+    end
+    var fa_ch_name = "__fa_ch_#{fa_var}"
+    if not map_has(seen, fa_ch_name)
+      locals.push(fa_ch_name)
+      map_set(seen, fa_ch_name, 1)
+    end
+    # Recurse into body (right child)
+    var fa_body = ast::ast_get_right(s, body)
+    if fa_body >= 0
+      var sub = mir_collect_generator_locals(s, fa_body)
+      for j in 0..sub.size
+        if not map_has(seen, sub[j])
+          locals.push(sub[j])
+          map_set(seen, sub[j], 1)
+        end
+      end
+    end
+  end
+  # Match expressions/statements: collect locals declared inside arm bodies
+  # AND the arm pattern bindings — both are live across any suspend nested in
+  # that arm and must be saved to the generator frame. The pre-fix collector
+  # had no NODE_MATCH case, so a `var` (or enum-payload binding) declared in a
+  # match arm with an `await`/suspend nested in the same arm was never added to
+  # the save/restore set → garbage after resume (silent miscompile; the async
+  # TLS server `var tls_ctx = ...; match tls_accept_async(...)...; tls_ctx_free`
+  # crash). The scrutinee (left) is an expression — no NODE_LETs there.
+  if kind == node_constants::NODE_MATCH
+    var m_arms = ast::ast_get_children(s, body)
+    if m_arms > 0
+      for m_ai in 0..m_arms.size
+        var m_arm = m_arms[m_ai]
+        var m_pat = ast::ast_get_left(s, m_arm)
+        if m_pat >= 0
+          var m_pk = ast::ast_get_kind(s, m_pat)
+          # Enum-constructor payload bindings (e.g. `Ok(stream)`,
+          # `ListenResult::Ok(listener)`) live in the pattern's extras slot.
+          if m_pk == node_constants::NODE_ENUM_ACCESS
+            var m_bnames = ast::ast_get_bound_names(s, m_pat)
+            if m_bnames > 0
+              for m_bi in 0..m_bnames.size
+                var m_bn = as_string(m_bnames[m_bi])
+                if str_byte_len(m_bn) > 0 and not map_has(seen, m_bn)
+                  locals.push(m_bn)
+                  map_set(seen, m_bn, 1)
+                end
+              end
+            end
+          end
+          # Wildcard arm binding (`x =>`) is stored on the arm node str1.
+          if m_pk == node_constants::NODE_WILDCARD
+            var m_wn = ast::ast_get_str1(s, m_arm)
+            if str_byte_len(m_wn) > 0 and not map_has(seen, m_wn)
+              locals.push(m_wn)
+              map_set(seen, m_wn, 1)
+            end
+          end
+        end
+        # Recurse into the arm body (right child) for NODE_LET locals.
+        var m_body = ast::ast_get_right(s, m_arm)
+        if m_body >= 0
+          var m_sub = mir_collect_generator_locals(s, m_body)
+          for m_j in 0..m_sub.size
+            if not map_has(seen, m_sub[m_j])
+              locals.push(m_sub[m_j])
+              map_set(seen, m_sub[m_j], 1)
+            end
+          end
+        end
+      end
+    end
+    return locals
+  end
+  # `with`-blocks (effect handlers AND `with Scoped do v -> body end`): collect
+  # the bound param name (`v`) plus any locals declared inside the body. Both are
+  # live across a suspend nested in the body and must round-trip through the
+  # generator frame. Without this case a `var i` inside `with Scoped do tag ->
+  # while .. sched_yield() .. end end` was never added to the save set, so each
+  # resume re-read a fresh (uninitialized) stack alloca — the loop counter never
+  # advanced and the $poll state machine spun at the same suspend state forever
+  # (deterministic hang at llc -O0; -O2 masked it by folding the undef read).
+  # The synthesized guard-self / unnamed-v slots are registered dynamically by
+  # mir_lower_with_scoped (they don't exist in the AST). left = handler expr
+  # (an expression — no NODE_LETs), right = body.
+  if kind == node_constants::NODE_WITH
+    var w_bound = ast::ast_with_bound_param(s, body)
+    if w_bound != -1
+      var w_bn = ast::ast_get_str1(s, w_bound)
+      if str_byte_len(w_bn) > 0 and not map_has(seen, w_bn)
+        locals.push(w_bn)
+        map_set(seen, w_bn, 1)
+      end
+    end
+    var w_body = ast::ast_get_right(s, body)
+    if w_body >= 0
+      var w_sub = mir_collect_generator_locals(s, w_body)
+      for w_j in 0..w_sub.size
+        if not map_has(seen, w_sub[w_j])
+          locals.push(w_sub[w_j])
+          map_set(seen, w_sub[w_j], 1)
+        end
+      end
+    end
+    return locals
+  end
+  # Recurse into control flow nodes (left/right). NODE_FOR's `extra` slot is
+  # mutated by typecheck_walk to hold a ptype id (not an AST handle) for MIR
+  # iterator dispatch — see typecheck_walk.qz `ast_set_extra(node, iter_type)`.
+  # Walking that as an AST node id can recurse back into a parent block when
+  # the ptype id collides with a parent AST handle (deterministic SIGSEGV
+  # for `var v = vec_new<Int>(); 3× v.push(); for x in v; yield x;` inside an
+  # `impl Iterator` body — see VEC_NEW_TYARG_IN_GEN_BODY_CRASH.md). NODE_WHILE
+  # and NODE_IF keep `extra` as an AST handle (else-branch / loop-condition).
+  if kind == node_constants::NODE_WHILE or kind == node_constants::NODE_IF or kind == node_constants::NODE_FOR
+    var left = ast::ast_get_left(s, body)
+    var right = ast::ast_get_right(s, body)
+    if left >= 0
+      var sub = mir_collect_generator_locals(s, left)
+      for j in 0..sub.size
+        if not map_has(seen, sub[j])
+          locals.push(sub[j])
+          map_set(seen, sub[j], 1)
+        end
+      end
+    end
+    if right >= 0
+      var sub = mir_collect_generator_locals(s, right)
+      for j in 0..sub.size
+        if not map_has(seen, sub[j])
+          locals.push(sub[j])
+          map_set(seen, sub[j], 1)
+        end
+      end
+    end
+    if kind != node_constants::NODE_FOR
+      var extra = ast::ast_get_extra(s, body)
+      if extra >= 0
+        var sub = mir_collect_generator_locals(s, extra)
+        for j in 0..sub.size
+          if not map_has(seen, sub[j])
+            locals.push(sub[j])
+            map_set(seen, sub[j], 1)
+          end
+        end
+      end
+    end
+  end
+  return locals
+end
+
+# Locate `tp_name:<trait>` inside a comma-separated type-param-bounds string
+# and return the trait name, or "" if not present. Handles generic args via
+# nesting depth tracking so `T:Iter<Int, String>,U:Eq` returns "Iter<Int, String>"
+# for "T" and "Eq" for "U".
+def _mlg_bound_trait_for(bounds: String, tp_name: String): String
+  var bl = str_byte_len(bounds)
+  var needle = "#{tp_name}:"
+  var nl = str_byte_len(needle)
+  if bl < nl
+    return ""
+  end
+  var bi = 0
+  while bi + nl <= bl
+    var matched = 1
+    for ni in 0..nl
+      if str_byte_at(bounds, bi + ni) != str_byte_at(needle, ni)
+        matched = 0
+      end
+    end
+    if matched == 1
+      # Prefix is a valid match only if it's at start or preceded by ','
+      var ok = 0
+      if bi == 0
+        ok = 1
+      elsif str_byte_at(bounds, bi - 1) == ','
+        ok = 1
+      end
+      if ok == 1
+        var ts = bi + nl
+        var te = ts
+        var depth = 0
+        while te < bl
+          var c = str_byte_at(bounds, te)
+          var stop = 0
+          if c == '<'
+            depth = depth + 1
+          elsif c == '>'
+            depth = depth - 1
+          elsif c == ',' and depth == 0
+            stop = 1
+          end
+          if stop == 1
+            te = bl
+          else
+            te = te + 1
+          end
+        end
+        # Find actual end (te may have jumped to bl on comma)
+        var real_end = ts
+        var scan = ts
+        var d2 = 0
+        while scan < bl
+          var c2 = str_byte_at(bounds, scan)
+          if c2 == '<'
+            d2 = d2 + 1
+          elsif c2 == '>'
+            d2 = d2 - 1
+          elsif c2 == ',' and d2 == 0
+            scan = bl
+          end
+          if scan < bl
+            real_end = scan + 1
+            scan = scan + 1
+          end
+        end
+        return str_byte_slice(bounds, ts, real_end)
+      end
+    end
+    bi = bi + 1
+  end
+  return ""
+end
+
+# Lowering for generator constructors — sync `impl Iterator<T>` and async
+# `impl AsyncIterator<T>` both land here (Phase 4D.5c.5; the two flavors
+# became byte-identical in 4D.5c.3 once the async ctor was switched to the
+# Stream<T,e> wrapper shape, so they were folded into one function).
+#
+# Skips the legacy state-machine emission. Instead:
+#   1. Registers `name` as an async target. For sync `impl Iterator<T>`
+#      this is the only registration path. For async `impl AsyncIterator<T>`
+#      PASS 0.99b's `__qz_yield_marker__` suspend-propagation also auto-
+#      registers; `mir_record_async_target` deduplicates by name so the
+#      two paths compose safely.
+#      PASS 1.2a then synthesizes `__Future_<name>$poll` from the AST body
+#      (NODE_YIELD routes through kind=3 perform via `mir_lower_stmt_yield`
+#      once `_gen_active == 2`). PASS 1.3c synthesizes `__Future_<name>$new`
+#      (the async-style frame allocator — pre-poll is skipped because the
+#      body is suspendable via the kind3 leaf record).
+#   2. Emits a thin `<name>` constructor — the user-facing symbol callers
+#      reach via `var s = gen()`. Calls `__Future_<name>$new(params...)`
+#      to allocate the $poll frame, then wraps the frame in a 2-word
+#      `Stream<T,e>` `{frame@0: CPtr, step@1: Fn(CPtr): Int}` struct
+#      pointing at `__Future_<name>$poll`.
+#
+# Consumer dispatch: `Stream.next()` in std/gen.qz installs a Yield-capture
+# handler around `self.step(self.frame)`. Each `yield v` in the body
+# performs kind=3 on the Yield effect; the handler stashes `v` and returns
+# POLL_SUSPENDED(0). For async generators consumed by for-await, the same
+# Stream<T,e> handle drives `lower_stream_async_iteration` (4D.5c.4), which
+# polls via `step(frame)` and propagates park encodings via
+# `mir_emit_async_suspend_point_raw`. POLL_READY(1) means body completion
+# in both flavors.
+def mir_lower_generator_effect(ctx: MirContext, s: ast::AstStorage, node: AstNodeId, name: String): Void
+  # Register so PASS 1.2a (poll) + PASS 1.3c (new) take over body lowering.
+  mir_lower_async_registry::mir_record_async_target(name, s)
+  # Phase 4D.5b: `_generator_func_names` push removed. For-in dispatch
+  # now reads the function's return-type annotation directly via
+  # `mir_func_annotation_is_generator` (mir.qz) — same answer, no cache.
+
+  # Collect params for the user-facing constructor.
+  var params = ast::ast_get_left(s, node)
+  var param_names = vec_new<String>()
+  if params >= 0
+    for i in 0..vec_size(params)
+      var p = params[i]
+      param_names.push(ast::ast_get_str1(s, p))
+    end
+  end
+
+  # --- Emit `<name>` constructor (the user-facing entry point) ---
+  ctx.reset_droppables()
+  ctx.reset_defers()
+  ctx.reset_string_vars()
+  ctx.reset_float_vars()
+  ctx.reset_vec_elem_types()
+  ctx.reset_map_key_types()
+  ctx.mir_ctx_clear_iterator_bound_params()
+  ctx.bindings = vec_new()
+
+  var prog = ctx.mir_ctx_get_program()
+  var ctor_func = mir_new_function(name, mir::MIR_TYPE_INT)
+  mir_get_functions(prog).push(ctor_func)
+  ctx.mir_ctx_set_func(ctor_func)
+
+  for i in 0..param_names.size
+    mir_func_add_param(ctor_func, param_names[i], mir::MIR_TYPE_INT)
+    var slot = ctx.mir_ctx_alloc_slot()
+    ctx.mir_ctx_bind_var(param_names[i], slot)
+  end
+
+  var ctor_entry = ctx.mir_create_block("entry")
+  ctx.mir_switch_to_block(ctor_entry)
+
+  # Call __Future_<name>$new(params...) → returns $poll frame pointer.
+  var new_name = "__Future_#{name}$new"
+  var new_args = vec_new<Int>()
+  for i in 0..param_names.size
+    new_args.push(ctx.mir_emit_load_var(param_names[i]))
+  end
+  var frame_ptr = ctx.mir_emit_call(new_name, new_args)
+
+  # Wrap in 2-word Stream<T> struct: [frame@0, step@1]. `step` is a
+  # direct reference to __Future_<name>$poll so Stream.next() can
+  # dispatch via `self.step(self.frame)` (the Fn-typed-field path in
+  # typecheck_expr_handlers.qz:2646).
+  var stream_ptr = ctx.mir_emit_alloc(2)
+  ctx.mir_emit_store_offset(stream_ptr, 0, frame_ptr)
+  var poll_name = "__Future_#{name}$poll"
+  var step_ref = ctx.mir_emit_func_ref(poll_name)
+  ctx.mir_emit_store_offset(stream_ptr, 1, step_ref)
+
+  var block = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(block, mir::TERM_RETURN, stream_ptr)
+end
+
+# --- Async state machine lowering ---
+
+## Generate async $new constructor for a function.
+## Emits __Future_name$new(params...) which allocates a frame and stores params.
+## Frame layout: [state@0, result@1, poll_fn@2, params@3..., locals@3+P..., padding]
+## Safe to call before PASS 1 — does NOT lower the function body.
+def mir_lower_async_constructor(ctx: MirContext, s: ast::AstStorage, node: AstNodeId, name: String): Void
+  # Collect params for frame layout
+  var params = ast::ast_get_left(s, node)
+  var body = ast::ast_get_right(s, node)
+  var param_names = vec_new<String>()
+  if params >= 0
+    for i in 0..vec_size(params)
+      var p = params[i]
+      param_names.push(ast::ast_get_str1(s, p))
+    end
+  end
+  var local_names = vec_new<String>()
+  if body >= 0
+    local_names = mir_collect_generator_locals(s, body)
+  end
+
+  # Frame layout: [state@0, result@1, poll_fn@2, cancel_token@3, task_id@4, park_state@5, params@6..., locals@6+P..., padding]
+  var PARAM_BASE = 6
+  var frame_size = PARAM_BASE + param_names.size + local_names.size + GEN_FRAME_PADDING
+
+  # --- Emit __Future_name$new constructor function ---
+  ctx.reset_droppables()
+  ctx.reset_defers()
+  ctx.reset_string_vars()
+  ctx.reset_float_vars()
+  ctx.reset_vec_elem_types()
+  ctx.reset_map_key_types()
+  ctx.mir_ctx_clear_iterator_bound_params()
+  ctx.bindings = vec_new()
+
+  var prog = ctx.mir_ctx_get_program()
+  var ctor_name = "__Future_#{name}$new"
+  var ctor_func = mir_new_function(ctor_name, mir::MIR_TYPE_INT)
+  mir::mir_func_set_origin_module(ctor_func, dep_graph::depgraph_name_for_ast_store(s))
+  mir_get_functions(prog).push(ctor_func)
+  ctx.mir_ctx_set_func(ctor_func)
+
+  # Add params to constructor (same params as original function)
+  for i in 0..param_names.size
+    mir_func_add_param(ctor_func, param_names[i], mir::MIR_TYPE_INT)
+    var slot = ctx.mir_ctx_alloc_slot()
+    ctx.mir_ctx_bind_var(param_names[i], slot)
+  end
+
+  var ctor_entry = ctx.mir_create_block("entry")
+  ctx.mir_switch_to_block(ctor_entry)
+
+  # Allocate frame: [state@0, result@1, poll_fn@2, cancel_token@3, task_id@4, park_state@5, params@6..., locals..., padding]
+  var frame_ptr = ctx.mir_emit_alloc(frame_size)
+  # Store state = 0 (initial, not yet polled)
+  ctx.mir_emit_store_offset(frame_ptr, 0, ctx.mir_emit_const_int(0))
+  # Store result = 0 (placeholder)
+  ctx.mir_emit_store_offset(frame_ptr, 1, ctx.mir_emit_const_int(0))
+  # Store poll function pointer at offset 2
+  var poll_fn_name = "__Future_#{name}$poll"
+  var poll_fn_ref = ctx.mir_emit_func_ref(poll_fn_name)
+  ctx.mir_emit_store_offset(frame_ptr, 2, poll_fn_ref)
+  # Store cancel_token = 0 (no parent) at offset 3
+  ctx.mir_emit_store_offset(frame_ptr, 3, ctx.mir_emit_const_int(0))
+  # Assign unique task_id via atomic increment at offset 4
+  var tid_args = vec_new()
+  var tid_val = ctx.mir_emit_intrinsic("task_id_next", tid_args)
+  ctx.mir_emit_store_offset(frame_ptr, 4, tid_val)
+  # Park state = 0 (RUNNING)
+  ctx.mir_emit_store_offset(frame_ptr, 5, ctx.mir_emit_const_int(0))
+  # Store params into frame at offset 6+
+  for i in 0..param_names.size
+    var param_val = ctx.mir_emit_load_var(param_names[i])
+    ctx.mir_emit_store_offset(frame_ptr, PARAM_BASE + i, param_val)
+  end
+  # Conditional pre-poll: only for pure (non-suspendable) functions.
+  # Pure functions complete on first poll → eager pre-poll for zero overhead.
+  # Suspendable functions skip pre-poll → lazy Future driven by a worker.
+  # "Suspendable" covers both cooperative yields (io_suspend / sched_yield)
+  # AND blocking C-level syscalls (system / posix_spawn_wait / sleep_ms) —
+  # see `mir_init_suspendable_leaves` for the leaf list and rationale.
+  # Eagerly pre-polling a goroutine that blocks in a syscall serializes all
+  # sibling `go fn()` spawns on the calling thread.
+  #
+  # Phase 4D.5c.3: async generators are ALWAYS suspendable — they yield, so
+  # the first poll consumes the first yield. Eager pre-polling them eats
+  # the first value before the consumer can read it. The async-target
+  # registry's suspendability bit is correct for non-spec gens, but for
+  # spec names (e.g. `doubled$1$implAsyncIterator$Int`) the registry has
+  # no entry and `mir_is_suspendable` returns false — leading to a wrong
+  # pre-poll. Skip pre-poll for any function whose return-type annotation
+  # marks it as an async generator.
+  var ret_ann_for_prepoll = ast::ast_get_str2(s, node)
+  var is_async_gen = mir::mir_func_annotation_is_async_generator(ret_ann_for_prepoll)
+  if not is_async_gen and not mir_lower_async_registry::mir_is_suspendable(name)
+    # Set @__qz_current_frame so task_id()/task_local work during pre-poll
+    var set_args = vec_new()
+    set_args.push(frame_ptr)
+    ctx.mir_emit_intrinsic("set_current_frame", set_args)
+    var poll_args = vec_new()
+    poll_args.push(frame_ptr)
+    ctx.mir_emit_call(poll_fn_name, poll_args)
+    # Restore @__qz_current_frame to 0 (no active frame on main thread)
+    var clear_args = vec_new()
+    clear_args.push(ctx.mir_emit_const_int(0))
+    ctx.mir_emit_intrinsic("set_current_frame", clear_args)
+  end
+  # Return frame pointer
+  var block = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(block, mir::TERM_RETURN, frame_ptr)
+end
+
+## Generate async $poll state machine for a function.
+## Emits __Future_name$poll(self) which drives the function body as a state machine.
+## Must be called AFTER PASS 1 when full MIR lowering infrastructure is available.
+def mir_lower_async_poll(ctx: MirContext, s: ast::AstStorage, node: AstNodeId, name: String): Void
+  # Collect params and locals for frame layout (same as constructor)
+  var params = ast::ast_get_left(s, node)
+  var body = ast::ast_get_right(s, node)
+  var param_names = vec_new<String>()
+  if params >= 0
+    for i in 0..vec_size(params)
+      var p = params[i]
+      param_names.push(ast::ast_get_str1(s, p))
+    end
+  end
+  var local_names = vec_new<String>()
+  if body >= 0
+    local_names = mir_collect_generator_locals(s, body)
+  end
+
+  var PARAM_BASE = 6  # [state@0, result@1, poll_fn@2, cancel_token@3, task_id@4, park_state@5, params@6+]
+
+  # Build offset maps
+  var all_names = vec_new<String>()
+  var all_offsets = vec_new()
+  for i in 0..param_names.size
+    all_names.push(param_names[i])
+    all_offsets.push(PARAM_BASE + i)
+  end
+  for i in 0..local_names.size
+    all_names.push(local_names[i])
+    all_offsets.push(PARAM_BASE + param_names.size + i)
+  end
+
+  # --- Emit __Future_name$poll step function ---
+  ctx.reset_droppables()
+  ctx.reset_defers()
+  ctx.reset_string_vars()
+  ctx.reset_float_vars()
+  ctx.reset_vec_elem_types()
+  ctx.reset_map_key_types()
+  ctx.mir_ctx_clear_iterator_bound_params()
+  ctx.bindings = vec_new()
+
+  var prog = ctx.mir_ctx_get_program()
+  var poll_name = "__Future_#{name}$poll"
+  var poll_func = mir_new_function(poll_name, mir::MIR_TYPE_INT)
+  mir::mir_func_set_origin_module(poll_func, dep_graph::depgraph_name_for_ast_store(s))
+  mir_get_functions(prog).push(poll_func)
+  ctx.mir_ctx_set_func(poll_func)
+
+  # $poll takes one param: self (the frame pointer)
+  mir_func_add_param(poll_func, "self", mir::MIR_TYPE_INT)
+  var self_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var("self", self_slot)
+
+  # Bind all params and locals as variables (they'll be loaded/stored from frame)
+  for i in 0..all_names.size
+    var var_slot = ctx.mir_ctx_alloc_slot()
+    ctx.mir_ctx_bind_var(all_names[i], var_slot)
+  end
+
+  # Set generator state for await/yield handler — async mode (_gen_active=2)
+  _gen_active = 2
+  _gen_async_func_name = name
+  _gen_frame_var = "self"
+  _gen_local_names = all_names
+  _gen_local_offsets = all_offsets
+  _gen_yield_counter = 0
+  _gen_resume_blocks = vec_new()
+  _gen_next_offset = PARAM_BASE + param_names.size + local_names.size
+  _gen_known_locals = map_new<String, Int>()
+  for i in 0..all_names.size
+    map_set(_gen_known_locals, all_names[i], all_offsets[i])
+  end
+
+  # Entry block: load state from frame[0]
+  var poll_entry = ctx.mir_create_block("poll_entry")
+  ctx.mir_switch_to_block(poll_entry)
+
+  var self_val = ctx.mir_emit_load_var("self")
+  var state_val = ctx.mir_emit_load_offset(self_val, 0)
+
+  # Create the done block (state = -1, return POLL_READY=1)
+  var done_block = ctx.mir_create_block("poll_done")
+
+  # Create the start block (state 0 — first poll)
+  var start_block = ctx.mir_create_block("poll_start")
+  _gen_resume_blocks.push(start_block)
+
+  # Start block: restore params/locals from frame, then lower the body
+  ctx.mir_switch_to_block(start_block)
+  var self_start = ctx.mir_emit_load_var("self")
+  for i in 0..all_names.size
+    var loaded = ctx.mir_emit_load_offset(self_start, all_offsets[i])
+    ctx.mir_emit_store_var(all_names[i], loaded)
+  end
+
+  # Mark parameters with impl AsyncIterator<T> type for indirect poll in for-await.
+  # Handle both literal `impl AsyncIterator<T>` annotations and synthetic
+  # `_impl_N` names desugared by resolve_desugar_impl_trait_args — for the
+  # latter, reconstruct the opaque marker from the function's bounds table.
+  if params >= 0
+    var agen_func_bounds = ast::ast_func_type_param_bounds(s, node)
+    for pi in 0..vec_size(params)
+      var p = params[pi]
+      var ptype = ast::ast_get_str2(s, p)
+      if str_byte_len(ptype) >= 19
+        if ptype.starts_with("impl AsyncIterator<")
+          ctx.mir_ctx_mark_struct_var(param_names[pi], ptype)
+        end
+      end
+      if str_byte_len(ptype) >= 6
+        if ptype.starts_with("_impl_")
+          var agen_trait = _mlg_bound_trait_for(agen_func_bounds, ptype)
+          if str_byte_len(agen_trait) > 0
+            ctx.mir_ctx_mark_struct_var(param_names[pi], "impl #{agen_trait}")
+          end
+        end
+      end
+    end
+  end
+
+  # Lower the async function body — NODE_AWAIT will create suspend/resume blocks
+  if body >= 0
+    mir_lower::mir_lower_stmt(ctx, s, body)
+  end
+
+  # After body: if not terminated, store result and go to done (function completed)
+  var body_end = ctx.mir_ctx_get_block()
+  if mir_block_get_term_kind(body_end) < 0
+    # For void functions or implicit return — store 0 as result
+    var self_end = ctx.mir_emit_load_var("self")
+    ctx.mir_emit_store_offset(self_end, 1, ctx.mir_emit_const_int(0))
+    ctx.mir_emit_store_offset(self_end, 0, ctx.mir_emit_const_int(-1))
+    mir_block_set_terminator(body_end, mir::TERM_RETURN, ctx.mir_emit_const_int(1))
+  end
+
+  # Done block: return POLL_READY (1)
+  ctx.mir_switch_to_block(done_block)
+  var done_cur = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(done_cur, mir::TERM_RETURN, ctx.mir_emit_const_int(1))
+
+  # Build O(1) switch dispatch in entry block
+  ctx.mir_switch_to_block(poll_entry)
+  var is_done = ctx.mir_emit_binary(op_constants::OP_LT, state_val, ctx.mir_emit_const_int(0))
+
+  if _gen_resume_blocks.size == 1
+    var entry_block = ctx.mir_ctx_get_block()
+    mir_block_set_branch(entry_block, is_done, done_block, start_block)
+  else
+    var switch_block = ctx.mir_create_block("poll_switch")
+    var entry_block = ctx.mir_ctx_get_block()
+    mir_block_set_branch(entry_block, is_done, done_block, switch_block)
+    var case_vals = vec_new()
+    var case_targets = vec_new()
+    for ri in 0.._gen_resume_blocks.size
+      case_vals.push(ri)
+      case_targets.push(_gen_resume_blocks[ri])
+    end
+    mir_block_set_switch(switch_block, state_val, case_vals, case_targets, done_block)
+  end
+
+  # Clear generator/async state (_gen_clear already sets _gen_active = 0)
+  _gen_clear()
+end
+
+## Go-lambda async constructor: creates frame with captures as parameters.
+## Captures (not AST params) are stored in the frame at offset [6, 7, ...].
+## Frame layout: [state@0, result@1, poll_fn@2, cancel_token@3, task_id@4, park_state@5, captures@6+, locals@6+C+, padding]
+def mir_lower_go_lambda_constructor(ctx: MirContext, s: ast::AstStorage, body: AstNodeId, name: String, capture_names: Vec<String>): Void
+  var local_names = vec_new<String>()
+  if body >= 0
+    local_names = mir_collect_generator_locals(s, body)
+  end
+
+  var PARAM_BASE = 6
+  var frame_size = PARAM_BASE + capture_names.size + local_names.size + GEN_FRAME_PADDING
+
+  ctx.reset_droppables()
+  ctx.reset_defers()
+  ctx.reset_string_vars()
+  ctx.reset_float_vars()
+  ctx.reset_vec_elem_types()
+  ctx.reset_map_key_types()
+  ctx.mir_ctx_clear_iterator_bound_params()
+  ctx.bindings = vec_new()
+
+  var prog = ctx.mir_ctx_get_program()
+  var ctor_name = "__Future_#{name}$new"
+  var ctor_func = mir_new_function(ctor_name, mir::MIR_TYPE_INT)
+  mir::mir_func_set_origin_module(ctor_func, dep_graph::depgraph_name_for_ast_store(s))
+  mir_get_functions(prog).push(ctor_func)
+  ctx.mir_ctx_set_func(ctor_func)
+
+  # Add captures as constructor parameters
+  for i in 0..capture_names.size
+    mir_func_add_param(ctor_func, capture_names[i], mir::MIR_TYPE_INT)
+    var slot = ctx.mir_ctx_alloc_slot()
+    ctx.mir_ctx_bind_var(capture_names[i], slot)
+  end
+
+  var ctor_entry = ctx.mir_create_block("entry")
+  ctx.mir_switch_to_block(ctor_entry)
+
+  var frame_ptr = ctx.mir_emit_alloc(frame_size)
+  ctx.mir_emit_store_offset(frame_ptr, 0, ctx.mir_emit_const_int(0))
+  ctx.mir_emit_store_offset(frame_ptr, 1, ctx.mir_emit_const_int(0))
+  var poll_fn_name = "__Future_#{name}$poll"
+  var poll_fn_ref = ctx.mir_emit_func_ref(poll_fn_name)
+  ctx.mir_emit_store_offset(frame_ptr, 2, poll_fn_ref)
+  ctx.mir_emit_store_offset(frame_ptr, 3, ctx.mir_emit_const_int(0))
+  var tid_args = vec_new()
+  var tid_val = ctx.mir_emit_intrinsic("task_id_next", tid_args)
+  ctx.mir_emit_store_offset(frame_ptr, 4, tid_val)
+  # Park state = 0 (RUNNING)
+  ctx.mir_emit_store_offset(frame_ptr, 5, ctx.mir_emit_const_int(0))
+
+  # Store captures into frame
+  for i in 0..capture_names.size
+    var cap_val = ctx.mir_emit_load_var(capture_names[i])
+    ctx.mir_emit_store_offset(frame_ptr, PARAM_BASE + i, cap_val)
+  end
+
+  var block = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(block, mir::TERM_RETURN, frame_ptr)
+end
+
+## Go-lambda async poll: state machine for lambda body with captures.
+## Captures are restored from frame on each poll, same as params in regular async.
+def mir_lower_go_lambda_poll(ctx: MirContext, s: ast::AstStorage, body: AstNodeId, name: String, capture_names: Vec<String>): Void
+  var local_names = vec_new<String>()
+  if body >= 0
+    local_names = mir_collect_generator_locals(s, body)
+  end
+
+  var PARAM_BASE = 6
+
+  # Build offset maps for all names (captures + locals)
+  var all_names = vec_new<String>()
+  var all_offsets = vec_new()
+  for i in 0..capture_names.size
+    all_names.push(capture_names[i])
+    all_offsets.push(PARAM_BASE + i)
+  end
+  for i in 0..local_names.size
+    all_names.push(local_names[i])
+    all_offsets.push(PARAM_BASE + capture_names.size + i)
+  end
+
+  ctx.reset_droppables()
+  ctx.reset_defers()
+  ctx.reset_string_vars()
+  ctx.reset_float_vars()
+  ctx.reset_vec_elem_types()
+  ctx.reset_map_key_types()
+  ctx.mir_ctx_clear_iterator_bound_params()
+  ctx.bindings = vec_new()
+
+  var prog = ctx.mir_ctx_get_program()
+  var poll_name = "__Future_#{name}$poll"
+  var poll_func = mir_new_function(poll_name, mir::MIR_TYPE_INT)
+  mir::mir_func_set_origin_module(poll_func, dep_graph::depgraph_name_for_ast_store(s))
+  mir_get_functions(prog).push(poll_func)
+  ctx.mir_ctx_set_func(poll_func)
+
+  mir_func_add_param(poll_func, "self", mir::MIR_TYPE_INT)
+  var self_slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var("self", self_slot)
+
+  for i in 0..all_names.size
+    var var_slot = ctx.mir_ctx_alloc_slot()
+    ctx.mir_ctx_bind_var(all_names[i], var_slot)
+  end
+
+  # Set generator state for async mode
+  _gen_active = 2
+  _gen_async_func_name = name
+  _gen_frame_var = "self"
+  _gen_local_names = all_names
+  _gen_local_offsets = all_offsets
+  _gen_yield_counter = 0
+  _gen_resume_blocks = vec_new()
+  _gen_next_offset = PARAM_BASE + capture_names.size + local_names.size
+  _gen_known_locals = map_new<String, Int>()
+  for i in 0..all_names.size
+    map_set(_gen_known_locals, all_names[i], all_offsets[i])
+  end
+
+  # Entry: load state, dispatch
+  var poll_entry = ctx.mir_create_block("poll_entry")
+  ctx.mir_switch_to_block(poll_entry)
+
+  var self_val = ctx.mir_emit_load_var("self")
+  var state_val = ctx.mir_emit_load_offset(self_val, 0)
+
+  var done_block = ctx.mir_create_block("poll_done")
+  var start_block = ctx.mir_create_block("poll_start")
+  _gen_resume_blocks.push(start_block)
+
+  # Start: restore captures and locals from frame, then lower body
+  ctx.mir_switch_to_block(start_block)
+  var self_start = ctx.mir_emit_load_var("self")
+  for i in 0..all_names.size
+    var loaded = ctx.mir_emit_load_offset(self_start, all_offsets[i])
+    ctx.mir_emit_store_var(all_names[i], loaded)
+  end
+
+  # Propagate string var info from enclosing context for captured strings
+  # (The enclosing scope's string_vars state is in the caller's ctx —
+  #  we don't have it here, but string operations on captured vars
+  #  will work because codegen emits string intrinsics based on MIR ops)
+
+  # Lambda body may be a statement block (`-> { stmts }`) whose explicit
+  # returns flow through NODE_RETURN into frame[1], or a bare expression
+  # (`-> 42`) whose value should be stored as the result.
+  var body_result_val = -1
+  if body >= 0
+    var body_kind = ast::ast_get_kind(s, body)
+    if body_kind == node_constants::NODE_BLOCK
+      mir_lower::mir_lower_stmt(ctx, s, body)
+    else
+      body_result_val = ctx.mir_lower_expr(s, body)
+    end
+  end
+
+  # After body: store the body's value (or 0 if void) as the task result
+  # at frame[1], mark done (state=-1), return POLL_READY(1).
+  var body_end = ctx.mir_ctx_get_block()
+  if mir_block_get_term_kind(body_end) < 0
+    var self_end = ctx.mir_emit_load_var("self")
+    var result_to_store = ctx.mir_emit_const_int(0)
+    if body_result_val >= 0
+      result_to_store = body_result_val
+    end
+    ctx.mir_emit_store_offset(self_end, 1, result_to_store)
+    ctx.mir_emit_store_offset(self_end, 0, ctx.mir_emit_const_int(-1))
+    mir_block_set_terminator(body_end, mir::TERM_RETURN, ctx.mir_emit_const_int(1))
+  end
+
+  # Done block
+  ctx.mir_switch_to_block(done_block)
+  var done_cur = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(done_cur, mir::TERM_RETURN, ctx.mir_emit_const_int(1))
+
+  # Build O(1) switch dispatch
+  ctx.mir_switch_to_block(poll_entry)
+  var is_done = ctx.mir_emit_binary(op_constants::OP_LT, state_val, ctx.mir_emit_const_int(0))
+
+  if _gen_resume_blocks.size == 1
+    var entry_block = ctx.mir_ctx_get_block()
+    mir_block_set_branch(entry_block, is_done, done_block, start_block)
+  else
+    var switch_block = ctx.mir_create_block("poll_switch")
+    var entry_block = ctx.mir_ctx_get_block()
+    mir_block_set_branch(entry_block, is_done, done_block, switch_block)
+    var case_vals = vec_new()
+    var case_targets = vec_new()
+    for ri in 0.._gen_resume_blocks.size
+      case_vals.push(ri)
+      case_targets.push(_gen_resume_blocks[ri])
+    end
+    mir_block_set_switch(switch_block, state_val, case_vals, case_targets, done_block)
+  end
+
+  _gen_clear()
+end
+
+# Handle yield statement. Two live routes post-4.B.7.b:
+#   `_gen_active == 0` — PASS 1 lowering of a `can Yield` helper. Emit a
+#     plain MIR_PERFORM_OP and mark the enclosing function suspendable so
+#     PASS 1.2b propagates it + (once `go my_helper()` or similar registers
+#     it) PASS 1.2a regenerates `$poll`.
+#   `_gen_active == 2` — $poll rebuild for both `impl Iterator<T>` and
+#     `impl AsyncIterator<T>` (yield routing unified in 4.B.7.b; ctor
+#     lowering folded into `mir_lower_generator_effect` in 4D.5c.5).
+#     Route to the kind=3 perform-suspend emitter so consumer-installed
+#     Yield handlers (`Stream.next()` for sync, `lower_stream_async_iteration`
+#     for async) observe each yield via the stashed-value convention.
+def mir_lower_stmt_yield(ctx: MirContext, s: ast::AstStorage, node: AstNodeId): Void
+  var value_node = ast::ast_get_left(s, node)
+  var yield_val = ctx.mir_emit_const_int(0)
+  if value_node >= 0
+    yield_val = mir_lower::mir_lower_expr(ctx, s, value_node)
+  end
+
+  if _gen_active == 0
+    # PASS 1 lowering of a `can Yield` helper (`def emit(v): Void can
+    # Yield<Int> { yield v }`). Record the enclosing helper TWO ways so
+    # downstream passes lift it correctly into the colorless-dispatch
+    # path:
+    #
+    # (1) `mir_record_suspendable_leaf` — feeds `mir_mark_suspendable`'s
+    #     PASS 1.2b fixed-point. Callers transitively reach a suspendable
+    #     leaf, which in turn skips eager pre-poll in PASS 1.3c's
+    #     constructor synthesis.
+    #
+    # (2) `mir_record_effect_leaf(name, 2)` (EFFECT_SUSPEND) — feeds
+    #     `mir_propagate_effects` (PASS 1.2b'). PASS 1.3 then auto-
+    #     registers the helper as an async target → PASS 1.3a synthesizes
+    #     `__Future_<helper>$poll` (yield-aware state machine via
+    #     `_gen_active==2`) → PASS 1.3c synthesizes `__Future_<helper>$new`
+    #     (constructor with pre-poll skipped). PASS 1.3b then re-runs
+    #     mark_suspendable so the helper's $poll counts as suspendable.
+    #
+    # With both registrations in place, my_gen$poll's call to the helper
+    # falls through `mir_lower_call`'s colorless-dispatch gate
+    # (mir_lower_expr_handlers.qz:2789): inside a $poll body
+    # (`_gen_active>=2`), if the callee has EFFECT_SUSPEND AND is an
+    # async target, route via `mir_emit_colorless_call`. That's the
+    # await-the-helper-frame pattern: allocate helper frame; poll;
+    # POLL_SUSPENDED → save outer state and return POLL_SUSPENDED to
+    # outer caller (cooperative — relies on 4.B.8.a's kind=3 dispatch
+    # not longjmping); POLL_READY → continue. The kind=3 perform inside
+    # the helper's $poll uses `mir_emit_kind3_perform_suspend` which
+    # sets the helper's frame state before perform — preserved across
+    # the cooperative suspend. Result: modular `can Yield` helpers
+    # compose with generators end-to-end.
+    var _p4b_func = ctx.mir_ctx_get_func()
+    if _p4b_func != 0
+      var _p4b_name = mir::mir_func_get_name(_p4b_func)
+      if str_byte_len(_p4b_name) > 0
+        mir_lower_async_registry::mir_record_suspendable_leaf(_p4b_name)
+        mir_lower_async_registry::mir_record_effect_leaf(_p4b_name, 2)
+        # Register as async target SYNCHRONOUSLY (during PASS 1) so PASS
+        # 1.2a's `$poll` synthesis loop, which captures `_afn_count` at
+        # entry, sees the helper. Without this, mir_lower_call's
+        # colorless-dispatch gate (mir_lower_expr_handlers.qz:2789)
+        # checks `mir_is_async_target(helper)` while lowering the
+        # generator's $poll body and gets `false` because the auto-
+        # registration step doesn't run until PASS 1.3 — emits a plain
+        # `call @emit_pair` that ignores the lifted $poll variant
+        # entirely. Registering here mirrors what
+        # `mir_lower_generator_effect` already does for `impl Iterator`
+        # functions: we know the helper needs a $poll the moment we see
+        # `yield` in its body, so we don't wait for the effect-
+        # propagation pass to figure it out.
+        if not mir_lower_async_registry::mir_is_async_target(_p4b_name)
+          mir_lower_async_registry::mir_record_async_target(_p4b_name, s)
+        end
+      end
+    end
+    var _p4b_args = vec_new<Int>()
+    _p4b_args.push(yield_val)
+    ctx.mir_emit_perform_op("yield", "Yield", 3, _p4b_args)
+    return
+  end
+  var _p4b_args2 = vec_new<Int>()
+  _p4b_args2.push(yield_val)
+  mir_emit_kind3_perform_suspend(ctx, "yield", "Yield", _p4b_args2)
+end

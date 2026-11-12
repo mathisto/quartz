@@ -1,0 +1,591 @@
+##! # Diagnostic Formatter
+##!
+##! Produces Rust/Elm-style diagnostic output with color, source context,
+##! error codes, and underline carets. Self-contained ANSI color support
+##! (does not depend on `std/colors.qz`) so the module has zero stdlib
+##! deps beyond the runtime — usable from bootstrap-tier programs and
+##! from anything that needs structured error rendering: LSPs, build
+##! tools, linters, custom CLIs, qspec source-location tracking.
+##!
+##! Lifted from `self-hosted/middle/diagnostic.qz` (A.16 Phase 1, May
+##! 2026). The macro-expansion-provenance walker that the compiler used
+##! lives in a compiler-side extension because it depends on the AST
+##! module — the `expansion_idx` field is preserved on the `Diagnostic`
+##! struct as a hint slot, but this file's formatters ignore non-zero
+##! values. Compiler producers that want expansion notes use the
+##! extension's wrapped formatters.
+##!
+##! ## Output Format
+##!
+##! ```
+##! error[QZ0301]: Unknown struct: PointXY
+##!   --> hello.qz:12:7
+##!    |
+##! 12 |   p = PointXY { x: 1, y: 2 }
+##!    |       ^^^^^^^ Did you mean 'Point'?
+##!    |
+##! ```
+
+# Severity constants
+const DIAG_ERROR = 0
+const DIAG_WARNING = 1
+const DIAG_NOTE = 2
+const DIAG_HELP = 3
+
+# ============================================================================
+# Minimal ANSI Color Support (self-contained for bootstrap compatibility)
+# ============================================================================
+
+var _diag_color_enabled = vec_new()
+
+def _diag_init_color(): Void
+  if _diag_color_enabled.size == 0
+    # Auto-detect: disable if NO_COLOR is set
+    var no_color = getenv("NO_COLOR")
+    if str_byte_len(no_color) > 0
+      _diag_color_enabled.push(0)
+    else
+      _diag_color_enabled.push(1)
+    end
+  end
+end
+
+def _diag_esc(): String = str_concat(str_from_char(27), "[")
+
+def _diag_sgr(code: Int): String = str_concat(str_concat(_diag_esc(), code.to_s()), "m")
+
+def _diag_sgr2(code1: Int, code2: Int): String = str_concat(str_concat(str_concat(str_concat(_diag_esc(), code1.to_s()), ";"), code2.to_s()), "m")
+
+def _diag_reset(): String = _diag_sgr(0)
+
+def _diag_wrap(s: String, code: Int): String
+  _diag_init_color()
+  if _diag_color_enabled[0] == 0
+    return s
+  end
+  return str_concat(str_concat(_diag_sgr(code), s), _diag_reset())
+end
+
+def _diag_wrap2(s: String, code1: Int, code2: Int): String
+  _diag_init_color()
+  if _diag_color_enabled[0] == 0
+    return s
+  end
+  return str_concat(str_concat(_diag_sgr2(code1, code2), s), _diag_reset())
+end
+
+# Style helpers
+def _diag_bold(s: String): String = _diag_wrap(s, 1)
+def _diag_bold_red(s: String): String = _diag_wrap2(s, 1, 91)
+def _diag_bold_yellow(s: String): String = _diag_wrap2(s, 1, 93)
+def _diag_bold_cyan(s: String): String = _diag_wrap2(s, 1, 96)
+def _diag_bold_blue(s: String): String = _diag_wrap2(s, 1, 34)
+
+# ============================================================================
+# Diagnostic Struct
+# ============================================================================
+
+struct Diagnostic
+  severity: Int
+  code: String
+  message: String
+  filename: String
+  line: Int
+  col: Int
+  span_len: Int
+  suggestion: String
+  source_lines: Vec<String>
+  notes: Vec<String>
+  ## Macro-expansion provenance hint (0 = none, non-zero = a 1-based index
+  ## into the producer's expansion-record store). The std formatters in
+  ## this file ignore non-zero values; the compiler-side
+  ## `diagnostic_expansion.qz` extension reads it and renders an
+  ## `in expansion of macro $X` chain. Field is preserved here so producers
+  ## (compiler diagnostics, future macro-aware tooling) populate it without
+  ## branching on which formatter will consume the diagnostic.
+  expansion_idx: Int
+end
+
+## Create a new diagnostic.
+def diag_new(severity: Int, code: String, message: String, filename: String, line: Int, col: Int): Diagnostic
+  return Diagnostic {
+    severity: severity,
+    code: code,
+    message: message,
+    filename: filename,
+    line: line,
+    col: col,
+    span_len: 1,
+    suggestion: "",
+    source_lines: vec_new<String>(),
+    notes: vec_new<String>(),
+    expansion_idx: 0
+  }
+end
+
+## Create a new diagnostic without source location.
+## Used for errors that don't map to a specific line/col (e.g., module not found).
+def diag_new_simple(severity: Int, code: String, message: String): Diagnostic
+  return Diagnostic {
+    severity: severity,
+    code: code,
+    message: message,
+    filename: "",
+    line: 0,
+    col: 0,
+    span_len: 1,
+    suggestion: "",
+    source_lines: vec_new<String>(),
+    notes: vec_new<String>(),
+    expansion_idx: 0
+  }
+end
+
+## Attach a macro-expansion-provenance index to a diagnostic. Walk happens
+## later at render time (`diag_format_*`) so the renderer can pick the
+## format appropriate to its output channel.
+def diag_set_expansion(d: Diagnostic, idx: Int): Void
+  d.expansion_idx = idx
+end
+
+## Add a note or help line to the diagnostic.
+## Displayed as "   = note: ..." or "   = help: ..." after the caret line.
+def diag_add_note(d: Diagnostic, note: String): Void
+  d.notes.push(note)
+end
+
+## Set the underline span length.
+def diag_set_span(d: Diagnostic, len: Int): Void
+  d.span_len = len
+end
+
+## Set the suggestion text (e.g., "Did you mean 'Point'?").
+def diag_set_suggestion(d: Diagnostic, s: String): Void
+  d.suggestion = s
+end
+
+## Set source lines for context display.
+def diag_set_source(d: Diagnostic, lines: Vec<String>): Void
+  d.source_lines = lines
+end
+
+## Split source text into lines.
+def diag_split_source(source: String): Vec<String>
+  var lines = vec_new<String>()
+  var buf = sb_new()
+  defer sb_free(buf)
+  var i = 0
+  var len = str_byte_len(source)
+  while i < len
+    var c = str_byte_at(source, i)
+    if c == '\n'
+      lines.push(buf.to_string())
+      sb_free(buf)
+      buf = sb_new()
+    else
+      sb_append_char(buf, c)
+    end
+    i += 1
+  end
+  # Final line (may not end with newline)
+  var last = buf.to_string()
+  if str_byte_len(last) > 0
+    lines.push(last)
+  end
+  return lines
+end
+
+## Build a string of N copies of a character.
+def _diag_repeat(ch: String, n: Int): String
+  var buf = sb_new()
+  defer sb_free(buf)
+  for i in 0..n
+    buf.append(ch)
+  end
+  return buf.to_string()
+end
+
+## Return the severity label string.
+def diag_severity_label(severity: Int): String
+  if severity == DIAG_ERROR
+    return "error"
+  end
+  if severity == DIAG_WARNING
+    return "warning"
+  end
+  if severity == DIAG_NOTE
+    return "note"
+  end
+  if severity == DIAG_HELP
+    return "help"
+  end
+  return "error"
+end
+
+## Colorize the severity label + brackets.
+def _diag_severity_styled(label: String, severity: Int): String
+  if severity == DIAG_ERROR
+    return _diag_bold_red(label)
+  end
+  if severity == DIAG_WARNING
+    return _diag_bold_yellow(label)
+  end
+  return _diag_bold_cyan(label)
+end
+
+## Colorize the underline carets.
+def _diag_caret_styled(carets: String, severity: Int): String
+  if severity == DIAG_ERROR
+    return _diag_bold_red(carets)
+  end
+  if severity == DIAG_WARNING
+    return _diag_bold_yellow(carets)
+  end
+  return _diag_bold_cyan(carets)
+end
+
+## Calculate the column width needed for line numbers.
+def _diag_gutter_width(line: Int): Int
+  var w = 0
+  var n = line
+  if n == 0
+    return 1
+  end
+  while n > 0
+    w += 1
+    n /= 10
+  end
+  return w
+end
+
+## Right-align a number within a given width.
+def _diag_pad_num(num: Int, width: Int): String
+  var s = num.to_s()
+  var pad = width - str_byte_len(s)
+  if pad <= 0
+    return s
+  end
+  return _diag_repeat(" ", pad).concat(s)
+end
+
+## Format a diagnostic as a colored string for terminal output.
+def diag_format_color(d: Diagnostic): String
+  var sb = sb_new()
+  defer sb_free(sb)
+
+  # Line 1: severity[code]: message
+  var label = diag_severity_label(d.severity)
+  if str_byte_len(d.code) > 0
+    sb.append(_diag_severity_styled(label.concat("[").concat(d.code).concat("]"), d.severity))
+  else
+    sb.append(_diag_severity_styled(label, d.severity))
+  end
+  sb.append(_diag_bold(": "))
+  sb.append(_diag_bold(d.message))
+  sb.append("\n")
+
+  # Line 2: --> filename:line:col (skip for location-less diagnostics)
+  var gutter_w = _diag_gutter_width(d.line)
+  var gutter_pad = _diag_repeat(" ", gutter_w)
+
+  if d.line > 0 or d.col > 0
+    sb.append(gutter_pad)
+    sb.append(_diag_bold_blue(" --> "))
+    sb.append(d.filename)
+    sb.append(":")
+    sb.append(d.line.to_s())
+    sb.append(":")
+    sb.append(d.col.to_s())
+    sb.append("\n")
+  end
+
+  # Line 3: gutter separator
+  sb.append(gutter_pad)
+  sb.append(_diag_bold_blue(" | "))
+  sb.append("\n")
+
+  # Line 4: source context (if source lines available and line is valid)
+  var src_lines = d.source_lines
+  if src_lines.size > 0 and d.line > 0 and d.line <= src_lines.size
+    var src_line = src_lines[d.line - 1]
+
+    # Source line
+    sb.append(_diag_bold_blue(_diag_pad_num(d.line, gutter_w)))
+    sb.append(_diag_bold_blue(" | "))
+    sb.append(src_line)
+    sb.append("\n")
+
+    # Caret line
+    sb.append(gutter_pad)
+    sb.append(_diag_bold_blue(" | "))
+
+    # Spaces up to the caret position
+    var col_offset = d.col - 1
+    if col_offset < 0
+      col_offset = 0
+    end
+    sb.append(_diag_repeat(" ", col_offset))
+
+    # Carets
+    var span = d.span_len
+    if span < 1
+      span = 1
+    end
+    sb.append(_diag_caret_styled(_diag_repeat("^", span), d.severity))
+
+    # Suggestion
+    if str_byte_len(d.suggestion) > 0
+      sb.append(" ")
+      sb.append(_diag_bold(d.suggestion))
+    end
+    sb.append("\n")
+  end
+
+  # Notes/help lines
+  var note_count = d.notes.size
+  if note_count > 0
+    for ni in 0..note_count
+      sb.append(gutter_pad)
+      sb.append(_diag_bold_blue(" | "))
+      sb.append("\n")
+      sb.append(gutter_pad)
+      sb.append("   ")
+      sb.append(_diag_bold_cyan("= "))
+      sb.append(_diag_bold(d.notes[ni]))
+      sb.append("\n")
+    end
+  end
+
+  # Macro expansion chain rendering lives in the compiler-side extension
+  # (`self-hosted/middle/diagnostic_expansion.qz`); std-tier consumers
+  # that set expansion_idx see no expansion notes here.
+
+  # Final gutter separator
+  sb.append(gutter_pad)
+  sb.append(_diag_bold_blue(" | "))
+  sb.append("\n")
+
+  return sb.to_string()
+end
+
+## Format a diagnostic as plain text (no ANSI codes).
+def diag_format_plain(d: Diagnostic): String
+  var sb = sb_new()
+  defer sb_free(sb)
+
+  # Line 1: severity[code]: message
+  var label = diag_severity_label(d.severity)
+  sb.append(label)
+  if str_byte_len(d.code) > 0
+    sb.append("[")
+    sb.append(d.code)
+    sb.append("]")
+  end
+  sb.append(": ")
+  sb.append(d.message)
+  sb.append("\n")
+
+  # Line 2: --> filename:line:col (skip for location-less diagnostics)
+  var gutter_w = _diag_gutter_width(d.line)
+  var gutter_pad = _diag_repeat(" ", gutter_w)
+
+  if d.line > 0 or d.col > 0
+    sb.append(gutter_pad)
+    sb.append(" --> ")
+    sb.append(d.filename)
+    sb.append(":")
+    sb.append(d.line.to_s())
+    sb.append(":")
+    sb.append(d.col.to_s())
+    sb.append("\n")
+  end
+
+  # Line 3: gutter separator
+  sb.append(gutter_pad)
+  sb.append(" | ")
+  sb.append("\n")
+
+  # Line 4: source context
+  var src_lines = d.source_lines
+  if src_lines.size > 0 and d.line > 0 and d.line <= src_lines.size
+    var src_line = src_lines[d.line - 1]
+
+    sb.append(_diag_pad_num(d.line, gutter_w))
+    sb.append(" | ")
+    sb.append(src_line)
+    sb.append("\n")
+
+    sb.append(gutter_pad)
+    sb.append(" | ")
+    var col_offset = d.col - 1
+    if col_offset < 0
+      col_offset = 0
+    end
+    sb.append(_diag_repeat(" ", col_offset))
+    var span = d.span_len
+    if span < 1
+      span = 1
+    end
+    sb.append(_diag_repeat("^", span))
+    if str_byte_len(d.suggestion) > 0
+      sb.append(" ")
+      sb.append(d.suggestion)
+    end
+    sb.append("\n")
+  end
+
+  # Notes/help lines
+  var note_count = d.notes.size
+  if note_count > 0
+    for ni in 0..note_count
+      sb.append(gutter_pad)
+      sb.append(" | ")
+      sb.append("\n")
+      sb.append(gutter_pad)
+      sb.append("   = ")
+      sb.append(d.notes[ni])
+      sb.append("\n")
+    end
+  end
+
+  # Macro expansion chain rendering lives in the compiler-side extension.
+
+  sb.append(gutter_pad)
+  sb.append(" | ")
+  sb.append("\n")
+
+  return sb.to_string()
+end
+
+## Escape a string for JSON output: backslash, quote, newline, tab.
+def _json_escape(s: String): String
+  var sb = sb_new()
+  defer sb_free(sb)
+  var i = 0
+  var len = str_byte_len(s)
+  while i < len
+    var c = str_byte_at(s, i)
+    if c == '\\'
+      sb.append("\\\\")
+    elsif c == '"'
+      sb.append("\\\"")
+    elsif c == '\n'
+      sb.append("\\n")
+    elsif c == '\r'
+      sb.append("\\r")
+    elsif c == '\t'
+      sb.append("\\t")
+    else
+      sb_append_char(sb, c)
+    end
+    i += 1
+  end
+  return sb.to_string()
+end
+
+## Format a diagnostic as JSON Lines (one object per diagnostic).
+def diag_format_json(d: Diagnostic): String
+  var sb = sb_new()
+  defer sb_free(sb)
+  sb.append("{\"severity\":\"")
+  sb.append(diag_severity_label(d.severity))
+  sb.append("\",\"code\":\"")
+  sb.append(_json_escape(d.code))
+  sb.append("\",\"message\":\"")
+  sb.append(_json_escape(d.message))
+  sb.append("\",\"file\":\"")
+  sb.append(_json_escape(d.filename))
+  sb.append("\",\"line\":")
+  sb.append(d.line.to_s())
+  sb.append(",\"col\":")
+  sb.append(d.col.to_s())
+  sb.append(",\"span\":")
+  sb.append(d.span_len.to_s())
+  if str_byte_len(d.suggestion) > 0
+    sb.append(",\"suggestion\":\"")
+    sb.append(_json_escape(d.suggestion))
+    sb.append("\"")
+  end
+  if d.notes.size > 0
+    sb.append(",\"notes\":[")
+    for ni in 0..d.notes.size
+      if ni > 0
+        sb.append(",")
+      end
+      sb.append("\"")
+      sb.append(_json_escape(d.notes[ni]))
+      sb.append("\"")
+    end
+    sb.append("]")
+  end
+  # The expansion_chain JSON field is populated by the compiler-side
+  # extension's diag_format_json wrapper; std-tier callers see no chain.
+  sb.append("}\n")
+  return sb.to_string()
+end
+
+# Module-level error format mode: 0 = text (default), 1 = json
+var _diag_format_mode = vec_new()
+
+## Set the output format mode: 0 = text, 1 = json.
+def diag_set_format(mode: Int): Void
+  if _diag_format_mode.size == 0
+    _diag_format_mode.push(mode)
+  else
+    _diag_format_mode[0] = mode
+  end
+end
+
+## Get the current output format mode.
+def _diag_get_format(): Int
+  if _diag_format_mode.size == 0
+    return 0
+  end
+  return _diag_format_mode[0]
+end
+
+# Module-level error counter — incremented by diag_emit on DIAG_ERROR.
+# Exists so callers that lack a phase-specific had_error flag
+# (macro expansion, resolver, etc.) can still fail the build. Without this,
+# `eputs` printed the diagnostic but the driver saw exit 0 and produced
+# a wrong binary — e.g., an unknown `$macro` silently became `0`.
+var _diag_err_count = vec_new()
+
+def _diag_err_count_ensure(): Void
+  if _diag_err_count.size == 0
+    _diag_err_count.push(0)
+  end
+end
+
+## Number of DIAG_ERROR diagnostics emitted since startup (or reset).
+def diag_error_count(): Int
+  if _diag_err_count.size == 0
+    return 0
+  end
+  return _diag_err_count[0]
+end
+
+## Reset the error counter — used by multi-invocation drivers (LSP, tests).
+def diag_reset_error_count(): Void
+  _diag_err_count_ensure()
+  _diag_err_count[0] = 0
+end
+
+## Emit a diagnostic to stderr with automatic color/format detection.
+## Respects NO_COLOR environment variable and --error-format setting.
+def diag_emit(d: Diagnostic): Void
+  if d.severity == DIAG_ERROR
+    _diag_err_count_ensure()
+    _diag_err_count[0] = _diag_err_count[0] + 1
+  end
+  if _diag_get_format() == 1
+    eputs(diag_format_json(d))
+    return
+  end
+  _diag_init_color()
+  if _diag_color_enabled[0] == 1
+    eputs(diag_format_color(d))
+  else
+    eputs(diag_format_plain(d))
+  end
+end

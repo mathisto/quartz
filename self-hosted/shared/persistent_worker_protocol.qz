@@ -1,0 +1,296 @@
+##! Persistent Worker Protocol — wire format for `quartz --persistent-worker`
+##!
+##! Bazel-style request/response framing for the qspec compile daemon
+##! (see `docs/design/QUARTZD.md`). Each frame on a pipe / socket is:
+##!
+##!     [uint32 LE length] [JSON body]
+##!
+##! The runner ships requests over a worker's stdin pipe; the worker
+##! ships responses back over stdout. `request_id` is monotonic per
+##! client and threaded through both directions so cancellation can
+##! match an in-flight request to its worker without ambiguity.
+##!
+##! This module is pure: encoders return a String (the bytes to write),
+##! decoders take a String (the bytes already read) and return a tagged
+##! result. All pipe / socket I/O happens at the call site (Quakefile.qz
+##! for the runner, self-hosted/quartz.qz for the worker stdin loop) so
+##! this module stays trivially testable in qspec.
+
+import * from json
+
+# ============================================================================
+# Request / Response data shapes
+# ============================================================================
+
+## Request kinds. String-typed in the protocol; constants here for
+## call-site readability and to avoid typos on the wire.
+def REQ_COMPILE(): String  = "compile"
+def REQ_CANCEL(): String   = "cancel"
+def REQ_PING(): String     = "ping"
+def REQ_SHUTDOWN(): String = "shutdown"
+
+## Response statuses. Same string-on-the-wire model as request kinds.
+def RESP_OK(): String        = "ok"
+def RESP_ERROR(): String     = "error"
+def RESP_CANCELLED(): String = "cancelled"
+
+## A single compile (or control) request. `request_id` is monotonic
+## per-client; "0" is reserved for fire-and-forget control messages
+## that don't need a reply (currently unused — every request gets a
+## response in v0).
+##
+## For `kind == REQ_COMPILE`, `argv` is the full command line as the
+## worker should see it (e.g. `["spec/foo.qz", "-I", "std", ...]`).
+## `cwd` is the working dir the worker should chdir into (so relative
+## include paths resolve correctly). `path_env` is the PATH to install
+## (everything else from the runner's env is intentionally NOT
+## propagated — explicit > implicit per Turborepo's strict-env lesson).
+##
+## `stderr_path` (Phase 5.0c, optional — empty string disables) names a
+## path on the worker-visible filesystem that the worker should redirect
+## its stderr to for the duration of this single request. The runner
+## reads this path on a compile failure to surface diagnostics back to
+## the user; truncate-before-send is unnecessary because the worker
+## opens the file with O_TRUNC each request.
+##
+## For `kind == REQ_CANCEL`, only `request_id` is meaningful — it
+## names the in-flight compile to cancel. `argv`, `cwd`, `path_env`,
+## `stderr_path` should be empty.
+##
+## For `kind == REQ_PING` / `REQ_SHUTDOWN`, only `request_id` is used.
+struct WorkRequest
+  request_id: Int
+  kind: String
+  argv: Vec<String>
+  cwd: String
+  path_env: String
+  stderr_path: String
+end
+
+## A response to one WorkRequest. `status` is the high-level outcome;
+## `exit_code` mirrors the compile process's exit code (0 on success,
+## non-zero on compile error). `stdout` / `stderr` carry the captured
+## output inline — large outputs land in `stderr_path` instead and the
+## inline String stays empty. `ir_path` is the path to the emitted
+## LLVM IR file (empty if the request didn't produce IR — e.g. ping,
+## or compile that aborted before codegen).
+##
+## `duration_ms` is wall time the worker spent on this request.
+struct WorkResponse
+  request_id: Int
+  status: String
+  exit_code: Int
+  stdout: String
+  stderr: String
+  stderr_path: String
+  ir_path: String
+  duration_ms: Int
+end
+
+## Tagged result for decoders. Sentinel: `kind == ""` means the body
+## couldn't be parsed; `error_msg` is populated.
+struct DecodeResult
+  ok: Bool
+  request: WorkRequest
+  response: WorkResponse
+  error_msg: String
+end
+
+# ============================================================================
+# Length-prefix framing
+# ============================================================================
+
+## Pack a 4-byte little-endian length prefix in front of `body`.
+## Caller writes the returned String verbatim to the pipe/socket.
+def _length_prefix(body: String): String
+  var len = str_byte_len(body)
+  var sb = sb_new()
+  sb_append_byte(sb, len & 0xFF)
+  sb_append_byte(sb, (len >> 8) & 0xFF)
+  sb_append_byte(sb, (len >> 16) & 0xFF)
+  sb_append_byte(sb, (len >> 24) & 0xFF)
+  sb_append(sb, body)
+  return sb_to_string(sb)
+end
+
+## Read the 4-byte little-endian length from offset 0 of `buf`.
+## Returns -1 if buf is too short to even contain a length prefix.
+def read_frame_length(buf: String): Int
+  if str_byte_len(buf) < 4
+    return -1
+  end
+  var b0 = str_byte_at(buf, 0)
+  var b1 = str_byte_at(buf, 1)
+  var b2 = str_byte_at(buf, 2)
+  var b3 = str_byte_at(buf, 3)
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+end
+
+## Length of a complete frame given a body byte-length (= 4 + body_len).
+## Useful for callers sizing read buffers.
+def frame_total_length(body_length: Int): Int = 4 + body_length
+
+# ============================================================================
+# Encoders — struct → length-prefixed bytes
+# ============================================================================
+
+## Encode a WorkRequest into a length-prefixed JSON frame ready to
+## write to a pipe / socket.
+def encode_request(req: WorkRequest): String
+  var obj = json_object()
+  json_object_set(obj, "request_id", json_number(req.request_id))
+  json_object_set(obj, "kind", json_string(req.kind))
+  var arr = json_array()
+  for i in 0..req.argv.size
+    json_array_push(arr, json_string(req.argv[i]))
+  end
+  json_object_set(obj, "argv", arr)
+  json_object_set(obj, "cwd", json_string(req.cwd))
+  json_object_set(obj, "path_env", json_string(req.path_env))
+  json_object_set(obj, "stderr_path", json_string(req.stderr_path))
+  return _length_prefix(json_stringify(obj))
+end
+
+## Encode a WorkResponse into a length-prefixed JSON frame.
+def encode_response(resp: WorkResponse): String
+  var obj = json_object()
+  json_object_set(obj, "request_id", json_number(resp.request_id))
+  json_object_set(obj, "status", json_string(resp.status))
+  json_object_set(obj, "exit_code", json_number(resp.exit_code))
+  json_object_set(obj, "stdout", json_string(resp.stdout))
+  json_object_set(obj, "stderr", json_string(resp.stderr))
+  json_object_set(obj, "stderr_path", json_string(resp.stderr_path))
+  json_object_set(obj, "ir_path", json_string(resp.ir_path))
+  json_object_set(obj, "duration_ms", json_number(resp.duration_ms))
+  return _length_prefix(json_stringify(obj))
+end
+
+# ============================================================================
+# Decoders — length-prefixed bytes → struct
+# ============================================================================
+
+## Empty WorkRequest used as the value field when decode fails.
+## Keeps return types non-nullable; callers check `result.ok`.
+def _empty_request(): WorkRequest
+  return WorkRequest {
+    request_id: 0,
+    kind: "",
+    argv: vec_new<String>(),
+    cwd: "",
+    path_env: "",
+    stderr_path: "",
+  }
+end
+
+def _empty_response(): WorkResponse
+  return WorkResponse {
+    request_id: 0,
+    status: "",
+    exit_code: 0,
+    stdout: "",
+    stderr: "",
+    stderr_path: "",
+    ir_path: "",
+    duration_ms: 0,
+  }
+end
+
+def _decode_err(msg: String): DecodeResult
+  return DecodeResult {
+    ok: false,
+    request: _empty_request(),
+    response: _empty_response(),
+    error_msg: msg,
+  }
+end
+
+## Decode one length-prefixed WorkRequest frame from `buf`. Caller is
+## responsible for passing a buffer that begins at frame boundary and
+## contains at least one complete frame.
+def decode_request(buf: String): DecodeResult
+  var declared_len = read_frame_length(buf)
+  if declared_len < 0
+    return _decode_err("truncated length prefix (got #{str_byte_len(buf)} bytes, need 4)")
+  end
+  if str_byte_len(buf) < 4 + declared_len
+    return _decode_err("truncated body (need #{declared_len} bytes after prefix, have #{str_byte_len(buf) - 4})")
+  end
+  var body = str_substr(buf, 4, declared_len)
+  var parsed = json_parse(body)
+  if parsed is Err
+    return _decode_err("malformed JSON body")
+  end
+  var v = try parsed
+  if not json_is_object(v)
+    return _decode_err("body is not a JSON object")
+  end
+  var req = WorkRequest {
+    request_id: json_as_number(json_object_get(v, "request_id")),
+    kind: json_as_string(json_object_get(v, "kind")),
+    argv: _decode_string_array(json_object_get(v, "argv")),
+    cwd: json_as_string(json_object_get(v, "cwd")),
+    path_env: json_as_string(json_object_get(v, "path_env")),
+    stderr_path: json_as_string(json_object_get(v, "stderr_path")),
+  }
+  return DecodeResult {
+    ok: true,
+    request: req,
+    response: _empty_response(),
+    error_msg: "",
+  }
+end
+
+## Decode one length-prefixed WorkResponse frame from `buf`.
+def decode_response(buf: String): DecodeResult
+  var declared_len = read_frame_length(buf)
+  if declared_len < 0
+    return _decode_err("truncated length prefix")
+  end
+  if str_byte_len(buf) < 4 + declared_len
+    return _decode_err("truncated body")
+  end
+  var body = str_substr(buf, 4, declared_len)
+  var parsed = json_parse(body)
+  if parsed is Err
+    return _decode_err("malformed JSON body")
+  end
+  var v = try parsed
+  if not json_is_object(v)
+    return _decode_err("body is not a JSON object")
+  end
+  var resp = WorkResponse {
+    request_id: json_as_number(json_object_get(v, "request_id")),
+    status: json_as_string(json_object_get(v, "status")),
+    exit_code: json_as_number(json_object_get(v, "exit_code")),
+    stdout: json_as_string(json_object_get(v, "stdout")),
+    stderr: json_as_string(json_object_get(v, "stderr")),
+    stderr_path: json_as_string(json_object_get(v, "stderr_path")),
+    ir_path: json_as_string(json_object_get(v, "ir_path")),
+    duration_ms: json_as_number(json_object_get(v, "duration_ms")),
+  }
+  return DecodeResult {
+    ok: true,
+    request: _empty_request(),
+    response: resp,
+    error_msg: "",
+  }
+end
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+def _decode_string_array(v: JsonValue): Vec<String>
+  var out = vec_new<String>()
+  if not json_is_array(v)
+    return out
+  end
+  var sz = json_array_size(v)
+  for i in 0..sz
+    var elem = json_array_get(v, i)
+    if json_is_string(elem)
+      out.push(json_as_string(elem))
+    end
+  end
+  return out
+end

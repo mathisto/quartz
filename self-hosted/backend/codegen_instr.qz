@@ -1,0 +1,4023 @@
+##! # LLVM IR Instruction Emission
+##!
+##! Emits LLVM IR for individual MIR instructions.
+##! Contains the main instruction dispatcher and specialized handlers
+##! for binary ops, calls, memory, indexing, and terminators.
+##!
+##! @see codegen Main code generation orchestrator
+##! @see codegen_util Shared codegen utilities
+
+import mir
+import * from mir
+import elem_width
+import codegen
+import codegen_util
+import codegen_intrinsics
+import codegen_runtime
+import cg_intrinsic_binary
+import op_constants
+import * from str_compat
+
+## Vec @value index-op inline-storage gating (B.10 value-types) — mirror of the
+## cg_intrinsic_vec.qz helpers, applied to the `[]` index operator which lowers
+## here (separately from the vec_get/vec_set intrinsics). See those helpers for
+## the GC-firewall and narrow-pack rationale.
+
+## Field count for an @value struct that is firewall-safe (homogeneous slots). 0
+## for mixed scalar+pointer structs → they fall to the BOXED index path.
+def cg_idx_inline_field_count(prog: MirProgram, elem_type: String): Int
+  if str_byte_len(elem_type) == 0
+    return 0
+  end
+  # item 47 — resolve bare cross-module element name → qualified struct_defs key
+  # ONCE here, mirroring cg_vec_inline_field_count, so the `[]` READ stride keys off
+  # the SAME struct as the push STORE (else cross-module @value packs at push but
+  # reads back boxed ⇒ layout-mismatch segfault). In-module names resolve to self ⇒
+  # byte-identical.
+  elem_type = mir_prog_resolve_struct_name(prog, elem_type)
+  # F4-PRE-1 — route through the SINGLE value-layout key (must agree with
+  # cg_vec_inline_field_count so the `[]` READ and the push STORE classify the same
+  # struct identically — else a flipped plain struct packs at push (stride N) but
+  # reads back boxed (stride 1), a layout mismatch that segfaults). Widens (does NOT
+  # replace) the is_value-only count: gate-0 plain ⇒ 0 ⇒ byte-identical; @value ⇒
+  # same count.
+  var fc = mir::mir_prog_get_value_layout_field_count(prog, elem_type)
+  if fc < 1
+    return 0
+  end
+  # B.10 §14.12.8 (C3.5/h2) — cow-layout elements are stored as a buffer POINTER
+  # (1+N refcount buffer); the `[]` inline-index path would read N FLAT words,
+  # mismatching the buffer. Return 0 ⇒ boxed index path (single pointer slot),
+  # mirroring cg_vec_inline_field_count. INERT at gate 0 (predicate false).
+  if mir::mir_prog_struct_is_cow_layout(prog, elem_type) == 1
+    return 0
+  end
+  # F4-PRE-1 — value-layout firewall gate (widened, mirrors cg_vec_inline_field_count).
+  if mir::mir_prog_struct_value_firewall_safe(prog, elem_type) == 0
+    return 0
+  end
+  return fc
+end
+
+## 1 if an index-inline-eligible @value struct has narrow fields → pack to
+## sizeof(%struct.Name) (typed-GEP element base). All-wide structs return 0 and
+## stay on the byte-identical i64-slot stride.
+def cg_idx_pack_narrow(prog: MirProgram, elem_type: String): Int
+  if cg_idx_inline_field_count(prog, elem_type) == 0
+    return 0
+  end
+  return mir::mir_prog_struct_has_narrow_fields(prog, elem_type)
+end
+
+## Emit binary operations (arithmetic, comparisons, overflow checking).
+def cg_emit_binary(state: CodegenState, out: Int, prog: MirProgram, instr: MirInstr): Void
+  var dest = instr.mir_instr_get_dest_id()
+  var op = instr.mir_instr_get_op()
+  var left = instr.mir_instr_get_operand1()
+  var right = instr.mir_instr_get_operand2()
+  var dest_type = instr.mir_instr_get_dest_type()
+
+  # String concatenation: String + String -> call str_concat
+  if op == op_constants::OP_ADD
+    if dest_type == mir::MIR_TYPE_STRING
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = call i64 @str_concat(i64 %v")
+      codegen_util::cg_emit_int(out, left)
+      codegen_util::cg_emit(out, ", i64 %v")
+      codegen_util::cg_emit_int(out, right)
+      codegen_util::cg_emit_line(out, ")")
+      return
+    end
+  end
+
+  if dest_type == mir::MIR_TYPE_F64
+    # Bitcast both operands from i64 to double
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".lf = bitcast i64 %v")
+    codegen_util::cg_emit_int(out, left)
+    codegen_util::cg_emit_line(out, " to double")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".rf = bitcast i64 %v")
+    codegen_util::cg_emit_int(out, right)
+    codegen_util::cg_emit_line(out, " to double")
+    if codegen_util::is_comparison(op)
+      # Float comparison: fcmp -> zext to i64
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".cmp = fcmp ")
+      codegen_util::cg_emit(out, codegen_util::float_cmp_to_llvm(op))
+      codegen_util::cg_emit(out, " double %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".lf, %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ".rf")
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = zext i1 %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ".cmp to i64")
+    else
+      # Float arithmetic: fadd/fsub/fmul/fdiv/frem -> bitcast back to i64
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".res = ")
+      codegen_util::cg_emit(out, codegen_util::float_op_to_llvm(op))
+      codegen_util::cg_emit(out, " double %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".lf, %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ".rf")
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = bitcast double %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ".res to i64")
+    end
+    return
+  end
+
+  if codegen_util::is_comparison(op)
+    # Comparison returns i1, need to zext to i64 for uniform value type
+    var is_unsigned = instr.mir_instr_get_slot1()
+    codegen_util::cg_emit(out, "  %cmp_tmp")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = icmp ")
+    if is_unsigned == 1
+      codegen_util::cg_emit(out, codegen_util::cmp_to_llvm_unsigned(op))
+    else
+      codegen_util::cg_emit(out, codegen_util::cmp_to_llvm(op))
+    end
+    codegen_util::cg_emit(out, " i64 %v")
+    codegen_util::cg_emit_int(out, left)
+    codegen_util::cg_emit(out, ", %v")
+    codegen_util::cg_emit_line(out, right.to_s())
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = zext i1 %cmp_tmp")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, " to i64")
+  elsif state.overflow_check == 1 and (op == op_constants::OP_ADD or op == op_constants::OP_SUB or op == op_constants::OP_MUL)
+    var intrinsic = ""
+    if op == op_constants::OP_ADD
+      intrinsic = "llvm.sadd.with.overflow.i64"
+    elsif op == op_constants::OP_SUB
+      intrinsic = "llvm.ssub.with.overflow.i64"
+    else
+      intrinsic = "llvm.smul.with.overflow.i64"
+    end
+    var lbl = state.overflow_label_counter
+    state.overflow_label_counter = lbl + 1
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".ov = call {i64, i1} @")
+    codegen_util::cg_emit(out, intrinsic)
+    codegen_util::cg_emit(out, "(i64 %v")
+    codegen_util::cg_emit_int(out, left)
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_int(out, right)
+    codegen_util::cg_emit_line(out, ")")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = extractvalue {i64, i1} %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ".ov, 0")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".flag = extractvalue {i64, i1} %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ".ov, 1")
+    codegen_util::cg_emit(out, "  br i1 %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".flag, label %overflow_panic_")
+    codegen_util::cg_emit_int(out, lbl)
+    codegen_util::cg_emit(out, ", label %overflow_ok_")
+    codegen_util::cg_emit_int(out, lbl)
+    codegen_util::cg_emit_line(out, "")
+    codegen_util::cg_emit(out, "overflow_panic_")
+    codegen_util::cg_emit_int(out, lbl)
+    codegen_util::cg_emit_line(out, ":")
+    codegen_util::cg_emit_line(out, "  call void @qz_overflow_panic()")
+    codegen_util::cg_emit_line(out, "  unreachable")
+    codegen_util::cg_emit(out, "overflow_ok_")
+    codegen_util::cg_emit_int(out, lbl)
+    codegen_util::cg_emit_line(out, ":")
+  else
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = ")
+    codegen_util::cg_emit(out, codegen_util::op_to_llvm(op))
+    codegen_util::cg_emit(out, " i64 %v")
+    codegen_util::cg_emit_int(out, left)
+    codegen_util::cg_emit(out, ", %v")
+    codegen_util::cg_emit_line(out, right.to_s())
+  end
+end
+
+## Emit call operations (direct calls, indirect calls, function references).
+def cg_emit_call_ops(state: CodegenState, out: Int, prog: MirProgram, instr: MirInstr): Void
+  var kind = instr.mir_instr_get_kind()
+  var dest = instr.mir_instr_get_dest_id()
+
+  if kind == mir::MIR_CALL
+    var func_name = instr.mir_instr_get_func_name()
+    var args = instr.mir_instr_get_args()
+    var arg_count = args.size
+
+    # Look up callee for narrow type handling. B.15d/N3.1: cg_find_function
+    # returns Option<MirFunc> (absence = not-found / no-program). Destructure
+    # once into a MirFunc-typed `callee` (typed-null when absent) + a found
+    # flag, so the existing `callee_found` guards keep the control flow intact
+    # while `callee.mir_func_*()` uses are now properly MirFunc-typed.
+    var callee_opt = codegen_util::cg_find_function(state, func_name)
+    var callee_found = callee_opt.is_some()
+    var callee = as_type<mir::MirFunc>(0)
+    if callee_found
+      callee = callee_opt.unwrap()
+    end
+    var callee_has_narrow_ret = 0
+    if callee_found
+      var callee_ret_name = callee.mir_func_get_return_type_name()
+      if callee_ret_name.mir_is_narrow_fixed_width()
+        callee_has_narrow_ret = 1
+      end
+    end
+
+    # B.10 P2.1 — does the callee use the by-value aggregate return ABI?
+    # When set, the call yields `{i64 x N}` and the site reconstructs a struct
+    # pointer from it (into a hoisted stack buffer, or heap if the result escapes).
+    var callee_byval = 0
+    if callee_found
+      callee_byval = codegen::cg_func_returns_byval(state, callee, prog)
+    end
+
+    # Check if this is a variadic extern function (arm64 ABI fix)
+    var var_idx = codegen_util::cg_extern_var_index(state, func_name)
+    if var_idx >= 0
+      var ext_ret = state.extern_var_rtypes[var_idx]
+      var ext_pcount = state.extern_var_pcounts[var_idx]
+      var needs_extend = 0
+      if ext_ret == "i32" or ext_ret == "i16" or ext_ret == "i8" or ext_ret == "ptr"
+        needs_extend = 1
+      end
+      # HB-DOG.14 — an extern returning a C `double`/`float` hands the
+      # result back in an FP register. The call must be typed `double`/
+      # `float` (so LLVM reads xmm0), then the result bitcast into the
+      # uniform i64 slot the rest of codegen expects. F32 is kept as
+      # double-bits-in-i64 to match Quartz's slot representation.
+      var needs_float_ret = 0
+      if ext_ret == "double" or ext_ret == "float"
+        needs_float_ret = 1
+      end
+      # B.10 P3.1c — Quartz->C call site. A C extern taking/returning a small
+      # (≤16B) all-8-byte-field struct BY VALUE crosses the boundary as the
+      # target's register-coerced aggregate (the classifier's coerce type), NOT
+      # Quartz's opaque i64 pointer. `ret_struct_coerce` is "" for a non-struct /
+      # non-eligible return (the legacy i64/float/void paths handle it). When set,
+      # the call is typed `<coerce>` and the result reconstructed into a fresh
+      # heap struct so downstream codegen sees the usual i64 pointer.
+      var ret_qtype = state.extern_var_ret_qtypes[var_idx]
+      var ret_struct_coerce = codegen::cg_c_abi_return_coerce(prog, state.target_triple, ret_qtype)
+      var ret_struct_fc = 0
+      if ret_struct_coerce != ""
+        ret_struct_fc = prog.mir_prog_get_struct_field_count(ret_qtype)
+      end
+      # B.10 P3.3 — Quartz->C call site, indirect (>16B) struct return. The C
+      # function returns through a hidden `ptr sret([N x i64])` first argument; the
+      # caller allocates the slot (heap, so it survives escape — mirrors the coerce
+      # rebuild) and reads %v<dest> back as the slot pointer after the call. Only
+      # one of ret_struct_coerce / ret_struct_sret is ever non-"".
+      var ret_struct_sret = ""
+      if ret_struct_coerce == ""
+        ret_struct_sret = codegen::cg_c_abi_return_indirect(prog, state.target_triple, ret_qtype)
+      end
+      var ret_sret_fc = 0
+      if ret_struct_sret != ""
+        ret_sret_fc = prog.mir_prog_get_struct_field_count(ret_qtype)
+      end
+
+      # Pre-pass: emit type casts for declared params
+      for i in 0..arg_count
+        if i < ext_pcount
+          var pt = codegen_util::cg_extern_var_param_type(state, var_idx, i)
+          var arg = args[i]
+          # B.10 P3.1c — struct-by-value arg: load the target's coerce aggregate
+          # out of the Quartz struct's [N x i64] memory (byte-identical to the C
+          # layout for the all-8-byte-field subset), then pass it by value.
+          var pq = codegen_util::cg_extern_var_pqtype(state, var_idx, i)
+          var pco = codegen::cg_c_abi_param_coerce(prog, state.target_triple, pq)
+          var pbv = ""
+          if pco == ""
+            pbv = codegen::cg_c_abi_param_indirect(prog, state.target_triple, pq)
+          end
+          if pco != "" and codegen::cg_c_abi_struct_has_f32(prog, pq) == 1
+            # B.10 P3.4b — F32 struct arg: boundary-repack the Quartz internal struct
+            # into the C-packed coerce value (fptrunc each F32 8→4 bytes). Defines
+            # %v<dest>.scl<i> (same name the all-wide path produces) for the arg emit.
+            var f32tag = "v" + dest.to_s() + ".scp" + i.to_s()
+            var f32res = "v" + dest.to_s() + ".scl" + i.to_s()
+            codegen::cg_c_abi_emit_pack(out, prog, pq, pco, "v" + arg.to_s(), 1, f32tag, f32res)
+          elsif pco != ""
+            codegen_util::cg_emit(out, "  %v")
+            codegen_util::cg_emit_int(out, dest)
+            codegen_util::cg_emit(out, ".scp")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit(out, " = inttoptr i64 %v")
+            codegen_util::cg_emit_int(out, arg)
+            codegen_util::cg_emit_line(out, " to ptr")
+            codegen_util::cg_emit(out, "  %v")
+            codegen_util::cg_emit_int(out, dest)
+            codegen_util::cg_emit(out, ".scl")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit(out, " = load ")
+            codegen_util::cg_emit(out, pco)
+            codegen_util::cg_emit(out, ", ptr %v")
+            codegen_util::cg_emit_int(out, dest)
+            codegen_util::cg_emit(out, ".scp")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit_line(out, ", align 8")
+          elsif pbv != "" and codegen::cg_c_abi_struct_has_f32(prog, pq) == 1
+            # B.10 P3.4-ii-b — F32 indirect arg: the Quartz internal struct is not
+            # the C layout, so repack it (fptrunc each F32) into a fresh C-packed
+            # %struct.Name.cabi buffer; pass THAT pointer (byval on SysV, plain ptr
+            # on AArch64 — both via the .fcb buffer). Heap so a call in a loop can't
+            # grow the stack.
+            var f32fc = prog.mir_prog_get_struct_field_count(pq)
+            codegen_util::cg_emit_line(out, "  %v#{dest.to_s()}.fqp#{i.to_s()} = inttoptr i64 %v#{arg.to_s()} to %struct.#{pq}*")
+            codegen_util::cg_emit_line(out, "  %v#{dest.to_s()}.fcb#{i.to_s()} = call noalias ptr @__qz_alloc(i64 #{f32fc * 8})")
+            codegen::cg_c_abi_emit_qz_to_c_buf(out, prog, pq, "v#{dest.to_s()}.fqp#{i.to_s()}", "v#{dest.to_s()}.fcb#{i.to_s()}", "v#{dest.to_s()}.fcr#{i.to_s()}")
+          elsif pbv != ""
+            # B.10 P3.3 — indirect (>16B) struct arg. The Quartz value is an i64
+            # pointer to the struct's [N x i64] memory.
+            codegen_util::cg_emit(out, "  %v")
+            codegen_util::cg_emit_int(out, dest)
+            codegen_util::cg_emit(out, ".bvp")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit(out, " = inttoptr i64 %v")
+            codegen_util::cg_emit_int(out, arg)
+            codegen_util::cg_emit_line(out, " to ptr")
+            # SysV: pass the pointer with `byval` (the backend copies into the stack
+            # arg area). AArch64: the indirect convention passes a pointer to a
+            # PRIVATE copy the callee may mutate — clone the N words into a fresh
+            # heap block (not alloca: a byval call in a loop must not grow the
+            # stack), then pass that pointer.
+            if codegen::cg_c_abi_indirect_param_is_pointer(state.target_triple) == 1
+              codegen_util::cg_emit(out, "  %v")
+              codegen_util::cg_emit_int(out, dest)
+              codegen_util::cg_emit(out, ".bvc")
+              codegen_util::cg_emit_int(out, i)
+              codegen_util::cg_emit(out, " = call noalias ptr @__qz_alloc(i64 ")
+              codegen_util::cg_emit_int(out, prog.mir_prog_get_struct_field_count(pq) * 8)
+              codegen_util::cg_emit_line(out, ")")
+              codegen_util::cg_emit(out, "  %v")
+              codegen_util::cg_emit_int(out, dest)
+              codegen_util::cg_emit(out, ".bvl")
+              codegen_util::cg_emit_int(out, i)
+              codegen_util::cg_emit(out, " = load ")
+              codegen_util::cg_emit(out, pbv)
+              codegen_util::cg_emit(out, ", ptr %v")
+              codegen_util::cg_emit_int(out, dest)
+              codegen_util::cg_emit(out, ".bvp")
+              codegen_util::cg_emit_int(out, i)
+              codegen_util::cg_emit_line(out, ", align 8")
+              codegen_util::cg_emit(out, "  store ")
+              codegen_util::cg_emit(out, pbv)
+              codegen_util::cg_emit(out, " %v")
+              codegen_util::cg_emit_int(out, dest)
+              codegen_util::cg_emit(out, ".bvl")
+              codegen_util::cg_emit_int(out, i)
+              codegen_util::cg_emit(out, ", ptr %v")
+              codegen_util::cg_emit_int(out, dest)
+              codegen_util::cg_emit(out, ".bvc")
+              codegen_util::cg_emit_int(out, i)
+              codegen_util::cg_emit_line(out, ", align 8")
+            end
+          elsif pt == "ptr"
+            codegen_util::cg_emit(out, "  %v")
+            codegen_util::cg_emit_int(out, dest)
+            codegen_util::cg_emit(out, ".ptr")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit(out, " = inttoptr i64 %v")
+            codegen_util::cg_emit_int(out, arg)
+            codegen_util::cg_emit_line(out, " to ptr")
+          else
+            if pt == "i32" or pt == "i16" or pt == "i8"
+              codegen_util::cg_emit(out, "  %v")
+              codegen_util::cg_emit_int(out, dest)
+              codegen_util::cg_emit(out, ".arg")
+              codegen_util::cg_emit_int(out, i)
+              codegen_util::cg_emit(out, " = trunc i64 %v")
+              codegen_util::cg_emit_int(out, arg)
+              codegen_util::cg_emit(out, " to ")
+              codegen_util::cg_emit_line(out, pt)
+            else
+              # HB-DOG.14 — a `double` arg is the i64 slot's bits reinterpreted
+              # as a double; a `float` arg additionally truncates the slot's
+              # double value down to single precision.
+              if pt == "double"
+                codegen_util::cg_emit(out, "  %v")
+                codegen_util::cg_emit_int(out, dest)
+                codegen_util::cg_emit(out, ".darg")
+                codegen_util::cg_emit_int(out, i)
+                codegen_util::cg_emit(out, " = bitcast i64 %v")
+                codegen_util::cg_emit_int(out, arg)
+                codegen_util::cg_emit_line(out, " to double")
+              else
+                if pt == "float"
+                  codegen_util::cg_emit(out, "  %v")
+                  codegen_util::cg_emit_int(out, dest)
+                  codegen_util::cg_emit(out, ".fbc")
+                  codegen_util::cg_emit_int(out, i)
+                  codegen_util::cg_emit(out, " = bitcast i64 %v")
+                  codegen_util::cg_emit_int(out, arg)
+                  codegen_util::cg_emit_line(out, " to double")
+                  codegen_util::cg_emit(out, "  %v")
+                  codegen_util::cg_emit_int(out, dest)
+                  codegen_util::cg_emit(out, ".farg")
+                  codegen_util::cg_emit_int(out, i)
+                  codegen_util::cg_emit(out, " = fptrunc double %v")
+                  codegen_util::cg_emit_int(out, dest)
+                  codegen_util::cg_emit(out, ".fbc")
+                  codegen_util::cg_emit_int(out, i)
+                  codegen_util::cg_emit_line(out, " to float")
+                end
+              end
+            end
+          end
+        end
+      end
+
+      # B.10 P3.3 — allocate the sret slot (heap, survives escape) before the call.
+      if ret_struct_sret != ""
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".sretbuf = call noalias ptr @__qz_alloc(i64 ")
+        codegen_util::cg_emit_int(out, ret_sret_fc * 8)
+        codegen_util::cg_emit_line(out, ")")
+      end
+      # Emit call with explicit function type: call ret (ptypes, ...) @name(args)
+      if ret_struct_sret != ""
+        # B.10 P3.3 — indirect struct return: the call is `void`, result delivered
+        # through the prepended sret pointer arg (emitted below).
+        codegen_util::cg_emit(out, "  call void (")
+      elsif ret_struct_coerce != ""
+        # B.10 P3.1c — struct-by-value return: type the call as the coerce
+        # aggregate; reconstruct into a heap struct after the call (below).
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".cret = call ")
+        codegen_util::cg_emit(out, ret_struct_coerce)
+        codegen_util::cg_emit(out, " (")
+      elsif ext_ret == "void"
+        codegen_util::cg_emit(out, "  call void (")
+      else
+        if needs_extend == 1
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".tmp = call ")
+          codegen_util::cg_emit(out, ext_ret)
+          codegen_util::cg_emit(out, " (")
+        else
+          if needs_float_ret == 1
+            codegen_util::cg_emit(out, "  %v")
+            codegen_util::cg_emit_int(out, dest)
+            codegen_util::cg_emit(out, ".fp = call ")
+            codegen_util::cg_emit(out, ext_ret)
+            codegen_util::cg_emit(out, " (")
+          else
+            codegen_util::cg_emit(out, "  %v")
+            codegen_util::cg_emit_int(out, dest)
+            codegen_util::cg_emit(out, " = call ")
+            codegen_util::cg_emit(out, ext_ret)
+            codegen_util::cg_emit(out, " (")
+          end
+        end
+      end
+
+      # Emit declared param types in function type signature
+      var sig_comma = 0
+      # B.10 P3.3 — sret pointer leads the signature when the return is indirect.
+      if ret_struct_sret != ""
+        codegen_util::cg_emit(out, "ptr")
+        sig_comma = 1
+      end
+      for i in 0..ext_pcount
+        if sig_comma == 1
+          codegen_util::cg_emit(out, ", ")
+        end
+        sig_comma = 1
+        # B.10 P3.1c — struct-by-value param uses the coerce aggregate type;
+        # P3.3 — a >16B byval param is `ptr` in the signature (byval is an arg attr).
+        var sig_pq = codegen_util::cg_extern_var_pqtype(state, var_idx, i)
+        var sig_pco = codegen::cg_c_abi_param_coerce(prog, state.target_triple, sig_pq)
+        var sig_pbv = ""
+        if sig_pco == ""
+          sig_pbv = codegen::cg_c_abi_param_indirect(prog, state.target_triple, sig_pq)
+        end
+        if sig_pco != ""
+          codegen_util::cg_emit(out, sig_pco)
+        elsif sig_pbv != ""
+          codegen_util::cg_emit(out, "ptr")
+        else
+          codegen_util::cg_emit(out, codegen_util::cg_extern_var_param_type(state, var_idx, i))
+        end
+      end
+      var is_var = codegen_util::cg_extern_is_variadic(state, var_idx)
+      if is_var == 1
+        if ext_pcount > 0
+          codegen_util::cg_emit(out, ", ")
+        end
+        codegen_util::cg_emit(out, "...) @")
+      else
+        codegen_util::cg_emit(out, ") @")
+      end
+      codegen_util::cg_emit(out, codegen_util::cg_sanitize_llvm_name(state.extern_var_c_names[var_idx]))
+      codegen_util::cg_emit(out, "(")
+
+      # Emit arguments with proper types
+      var arg_comma = 0
+      # B.10 P3.3 — the sret slot pointer is the first actual argument.
+      if ret_struct_sret != ""
+        codegen_util::cg_emit(out, "ptr sret(")
+        codegen_util::cg_emit(out, ret_struct_sret)
+        codegen_util::cg_emit(out, ") %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".sretbuf")
+        arg_comma = 1
+      end
+      for i in 0..arg_count
+        if arg_comma == 1
+          codegen_util::cg_emit(out, ", ")
+        end
+        arg_comma = 1
+        var arg = args[i]
+        if i < ext_pcount
+          var pt = codegen_util::cg_extern_var_param_type(state, var_idx, i)
+          # B.10 P3.1c — struct-by-value arg: pass the loaded coerce aggregate;
+          # P3.3 — a >16B byval arg passes the struct pointer with the byval attr.
+          var arg_pq = codegen_util::cg_extern_var_pqtype(state, var_idx, i)
+          var arg_pco = codegen::cg_c_abi_param_coerce(prog, state.target_triple, arg_pq)
+          var arg_pbv = ""
+          if arg_pco == ""
+            arg_pbv = codegen::cg_c_abi_param_indirect(prog, state.target_triple, arg_pq)
+          end
+          if arg_pco != ""
+            codegen_util::cg_emit(out, arg_pco)
+            codegen_util::cg_emit(out, " %v")
+            codegen_util::cg_emit_int(out, dest)
+            codegen_util::cg_emit(out, ".scl")
+            codegen_util::cg_emit_int(out, i)
+          elsif arg_pbv != "" and codegen::cg_c_abi_struct_has_f32(prog, arg_pq) == 1
+            # B.10 P3.4-ii-b — F32 indirect arg: pass the C-packed .fcb buffer built
+            # in the pre-pass (byval on SysV, plain ptr on AArch64).
+            if codegen::cg_c_abi_indirect_param_is_pointer(state.target_triple) == 1
+              codegen_util::cg_emit(out, "ptr %v#{dest.to_s()}.fcb#{i.to_s()}")
+            else
+              codegen_util::cg_emit(out, "ptr byval(#{arg_pbv}) %v#{dest.to_s()}.fcb#{i.to_s()}")
+            end
+          elsif arg_pbv != ""
+            # B.10 P3.3 — AArch64: plain pointer to the private copy made in the
+            # pre-pass. SysV: `byval` pointer to the original (the backend copies).
+            if codegen::cg_c_abi_indirect_param_is_pointer(state.target_triple) == 1
+              codegen_util::cg_emit(out, "ptr %v")
+              codegen_util::cg_emit_int(out, dest)
+              codegen_util::cg_emit(out, ".bvc")
+              codegen_util::cg_emit_int(out, i)
+            else
+              codegen_util::cg_emit(out, "ptr byval(")
+              codegen_util::cg_emit(out, arg_pbv)
+              codegen_util::cg_emit(out, ") %v")
+              codegen_util::cg_emit_int(out, dest)
+              codegen_util::cg_emit(out, ".bvp")
+              codegen_util::cg_emit_int(out, i)
+            end
+          elsif pt == "ptr"
+            codegen_util::cg_emit(out, "ptr %v")
+            codegen_util::cg_emit_int(out, dest)
+            codegen_util::cg_emit(out, ".ptr")
+            codegen_util::cg_emit_int(out, i)
+          else
+            if pt == "i32" or pt == "i16" or pt == "i8"
+              codegen_util::cg_emit(out, pt)
+              codegen_util::cg_emit(out, " %v")
+              codegen_util::cg_emit_int(out, dest)
+              codegen_util::cg_emit(out, ".arg")
+              codegen_util::cg_emit_int(out, i)
+            else
+              if pt == "double"
+                codegen_util::cg_emit(out, "double %v")
+                codegen_util::cg_emit_int(out, dest)
+                codegen_util::cg_emit(out, ".darg")
+                codegen_util::cg_emit_int(out, i)
+              else
+                if pt == "float"
+                  codegen_util::cg_emit(out, "float %v")
+                  codegen_util::cg_emit_int(out, dest)
+                  codegen_util::cg_emit(out, ".farg")
+                  codegen_util::cg_emit_int(out, i)
+                else
+                  codegen_util::cg_emit(out, pt)
+                  codegen_util::cg_emit(out, " %v")
+                  codegen_util::cg_emit_int(out, arg)
+                end
+              end
+            end
+          end
+        else
+          codegen_util::cg_emit(out, "i64 %v")
+          codegen_util::cg_emit_int(out, arg)
+        end
+      end
+
+      codegen_util::cg_emit_line(out, ")")
+
+      # Extend narrow return to i64
+      if needs_extend == 1
+        if ext_ret == "ptr"
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, " = ptrtoint ptr %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit_line(out, ".tmp to i64")
+        else
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, " = sext ")
+          codegen_util::cg_emit(out, ext_ret)
+          codegen_util::cg_emit(out, " %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit_line(out, ".tmp to i64")
+        end
+      end
+      # HB-DOG.14 — convert the FP-register result into the uniform i64
+      # slot. A `double` is reinterpreted directly; a `float` is first
+      # promoted to double so F32 values keep Quartz's double-bits-in-i64
+      # slot representation.
+      if needs_float_ret == 1
+        if ext_ret == "float"
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".fp64 = fpext float %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit_line(out, ".fp to double")
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, " = bitcast double %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit_line(out, ".fp64 to i64")
+        else
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, " = bitcast double %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit_line(out, ".fp to i64")
+        end
+      end
+      # B.10 P3.1c — reconstruct a Quartz struct pointer from the coerce
+      # aggregate the C function returned. The aggregate's bytes are
+      # byte-identical to the struct's [N x i64] memory (all-8-byte-field
+      # subset), so a single whole-aggregate store into a fresh heap block
+      # rebuilds the value; %v<dest> becomes the usual i64 pointer downstream.
+      # Heap (not stack) so the value stays valid if it escapes the caller.
+      if ret_struct_coerce != "" and codegen::cg_c_abi_struct_has_f32(prog, ret_qtype) == 1
+        # B.10 P3.4b — F32 struct return value: boundary-repack the C-packed coerce
+        # aggregate (fpext each F32 4→8 bytes) into a fresh heap struct; %v<dest>
+        # becomes the usual i64 Quartz pointer. Heap so it survives escape.
+        codegen::cg_c_abi_emit_unpack(out, prog, ret_qtype, ret_struct_coerce, "v" + dest.to_s() + ".cret", 1, "v" + dest.to_s() + ".rup", "v" + dest.to_s())
+      elsif ret_struct_coerce != ""
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".rbuf = call noalias ptr @__qz_alloc(i64 ")
+        codegen_util::cg_emit_int(out, ret_struct_fc * 8)
+        codegen_util::cg_emit_line(out, ")")
+        codegen_util::cg_emit(out, "  store ")
+        codegen_util::cg_emit(out, ret_struct_coerce)
+        codegen_util::cg_emit(out, " %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".cret, ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".rbuf, align 8")
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, " = ptrtoint ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".rbuf to i64")
+      end
+      # B.10 P3.4-ii-b — F32 indirect return: the C callee filled %sretbuf in the
+      # C layout (%struct.Name.cabi, packed floats). Reconstruct the Quartz internal
+      # struct (fpext each F32) into a fresh heap buffer; %v<dest> is its i64 ptr.
+      if ret_struct_sret != "" and codegen::cg_c_abi_struct_has_f32(prog, ret_qtype) == 1
+        codegen_util::cg_emit_line(out, "  %v#{dest.to_s()}.riqb = call noalias ptr @__qz_alloc(i64 #{ret_sret_fc * 8})")
+        codegen_util::cg_emit_line(out, "  %v#{dest.to_s()} = ptrtoint ptr %v#{dest.to_s()}.riqb to i64")
+        codegen_util::cg_emit_line(out, "  %v#{dest.to_s()}.riqp = inttoptr i64 %v#{dest.to_s()} to %struct.#{ret_qtype}*")
+        codegen::cg_c_abi_emit_c_to_qz_buf(out, prog, ret_qtype, "v#{dest.to_s()}.sretbuf", "v#{dest.to_s()}.riqp", "v#{dest.to_s()}.riqr")
+      elsif ret_struct_sret != ""
+        # B.10 P3.3 — indirect return: %v<dest> is the sret slot pointer the callee
+        # filled in place; expose it as the usual i64 struct pointer downstream.
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, " = ptrtoint ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".sretbuf to i64")
+      end
+      if ext_ret == "void"
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, " = add i64 0, 0")
+      end
+      return
+    end
+
+    # Pre-pass: emit trunc instructions for narrow param types
+    if callee_found
+      for i in 0..arg_count
+        var p_type_name = callee.mir_func_get_param_type_name(i)
+        if p_type_name.mir_is_narrow_fixed_width()
+          var narrow_t = p_type_name.mir_type_name_to_llvm()
+          var arg = args[i]
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".narg")
+          codegen_util::cg_emit_int(out, i)
+          codegen_util::cg_emit(out, " = trunc i64 %v")
+          codegen_util::cg_emit_int(out, arg)
+          codegen_util::cg_emit(out, " to ")
+          codegen_util::cg_emit_line(out, narrow_t)
+        end
+      end
+    end
+
+    # Pre-pass: decompose @value struct args into individual field loads
+    var callee_decompose = 0
+    if callee_found
+      callee_decompose = codegen::cg_func_should_decompose(state, callee, prog)
+      if callee_decompose == 1
+        for i in 0..arg_count
+          if callee.mir_func_param_is_decomposed(prog, i)
+            var arg = args[i]
+            var p_type_name = callee.mir_func_get_param_type_name(i)
+            var fcount = prog.mir_prog_get_struct_field_count(p_type_name)
+            codegen_util::cg_emit(out, "  %v")
+            codegen_util::cg_emit_int(out, dest)
+            codegen_util::cg_emit(out, ".sptr")
+            codegen_util::cg_emit_int(out, i)
+            codegen_util::cg_emit(out, " = inttoptr i64 %v")
+            codegen_util::cg_emit_int(out, arg)
+            codegen_util::cg_emit_line(out, " to ptr")
+            for fi in 0..fcount
+              codegen_util::cg_emit(out, "  %v")
+              codegen_util::cg_emit_int(out, dest)
+              codegen_util::cg_emit(out, ".sf")
+              codegen_util::cg_emit_int(out, i)
+              codegen_util::cg_emit(out, ".")
+              codegen_util::cg_emit_int(out, fi)
+              codegen_util::cg_emit(out, " = getelementptr inbounds i64, ptr %v")
+              codegen_util::cg_emit_int(out, dest)
+              codegen_util::cg_emit(out, ".sptr")
+              codegen_util::cg_emit_int(out, i)
+              codegen_util::cg_emit(out, ", i64 ")
+              codegen_util::cg_emit_int(out, fi)
+              codegen_util::cg_emit_line(out, "")
+              codegen_util::cg_emit(out, "  %v")
+              codegen_util::cg_emit_int(out, dest)
+              codegen_util::cg_emit(out, ".sf")
+              codegen_util::cg_emit_int(out, i)
+              codegen_util::cg_emit(out, ".")
+              codegen_util::cg_emit_int(out, fi)
+              codegen_util::cg_emit(out, ".val = load i64, ptr %v")
+              codegen_util::cg_emit_int(out, dest)
+              codegen_util::cg_emit(out, ".sf")
+              codegen_util::cg_emit_int(out, i)
+              codegen_util::cg_emit(out, ".")
+              codegen_util::cg_emit_int(out, fi)
+              codegen_util::cg_emit_line(out, ", align 8")
+            end
+          end
+        end
+      end
+    end
+
+    # Determine call return type
+    var call_ret_type = "i64"
+    if callee_has_narrow_ret == 1
+      call_ret_type = callee.mir_func_get_return_type_name().mir_type_name_to_llvm()
+    end
+
+    # Tail call detection: call result is block's return value
+    var is_tail = 0
+    if var_idx < 0 and callee_has_narrow_ret == 0
+      var blk = state.current_block.unwrap()
+      var term_kind = blk.mir_block_get_term_kind()
+      if term_kind == mir::TERM_RETURN
+        var ret_val = blk.mir_block_get_term_data()
+        if ret_val == dest
+          is_tail = 1
+        end
+      end
+    end
+
+    # Disable tail call for decomposed calls (arg count mismatch after expansion)
+    if callee_decompose == 1
+      is_tail = 0
+    end
+
+    # Disable tail call for by-value-return calls: the result is reconstructed
+    # into a caller-frame buffer after the call returns, so the call is not in
+    # tail position.
+    if callee_byval == 1
+      is_tail = 0
+    end
+
+    # Veto tail call if any argument is (or derives from) a caller-local
+    # stack alloca. LLVM's `tail` marker asserts the call does not access
+    # allocas from the caller; violating that is undefined behavior and
+    # causes the caller frame to be deallocated before the callee reads it.
+    # This was the root cause of the Apr 12 2026 class of miscompiled
+    # Result.unwrap() / never-type / small-stack-type tail calls where a
+    # @value type's payload pointer reached a library function through a
+    # tail call and the callee read freed stack memory.
+    if is_tail == 1
+      var origins = state.reg_origins
+      var origins_len = origins.size
+      for _ti in 0..arg_count
+        var _targ = args[_ti]
+        if _targ >= 0 and _targ < origins_len
+          if origins[_targ] > 0
+            is_tail = 0
+            break
+          end
+        end
+      end
+    end
+
+    # Emit call — use .tmp dest if narrow return (need to extend after)
+    if callee_byval == 1
+      # By-value @value return: result is a `{i64 x N}` aggregate (reconstructed
+      # into a struct pointer after the call).
+      var bc_ty0 = codegen::cg_byval_ret_type_str(prog.mir_prog_get_struct_field_count(callee.mir_func_get_return_type_name()))
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".agg = call ")
+      codegen_util::cg_emit(out, bc_ty0)
+      codegen_util::cg_emit(out, " @")
+    elsif callee_has_narrow_ret == 1
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".tmp = call ")
+      codegen_util::cg_emit(out, call_ret_type)
+      codegen_util::cg_emit(out, " @")
+    else
+      if is_tail == 1
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, " = tail call i64 @")
+      else
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, " = call i64 @")
+      end
+    end
+    codegen_util::cg_emit(out, codegen_util::cg_sanitize_llvm_name(func_name))
+    codegen_util::cg_emit(out, "(")
+
+    var call_comma = 0
+    for i in 0..arg_count
+      var arg = args[i]
+      # Decomposed @value struct arg: emit N field args
+      if callee_decompose == 1 and callee_found and callee.mir_func_param_is_decomposed(prog, i)
+        var p_type_name = callee.mir_func_get_param_type_name(i)
+        var fcount = prog.mir_prog_get_struct_field_count(p_type_name)
+        for fi in 0..fcount
+          if call_comma == 1
+            codegen_util::cg_emit(out, ", ")
+          end
+          codegen_util::cg_emit(out, "i64 %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".sf")
+          codegen_util::cg_emit_int(out, i)
+          codegen_util::cg_emit(out, ".")
+          codegen_util::cg_emit_int(out, fi)
+          codegen_util::cg_emit(out, ".val")
+          call_comma = 1
+        end
+      else
+        if call_comma == 1
+          codegen_util::cg_emit(out, ", ")
+        end
+        # Use narrow arg if callee expects narrow param
+        if callee_found
+          var p_type_name = callee.mir_func_get_param_type_name(i)
+          if p_type_name.mir_is_narrow_fixed_width()
+            var narrow_t = p_type_name.mir_type_name_to_llvm()
+            codegen_util::cg_emit(out, narrow_t)
+            codegen_util::cg_emit(out, " %v")
+            codegen_util::cg_emit_int(out, dest)
+            codegen_util::cg_emit(out, ".narg")
+            codegen_util::cg_emit_int(out, i)
+          else
+            codegen_util::cg_emit(out, "i64 %v")
+            codegen_util::cg_emit_int(out, arg)
+          end
+        else
+          codegen_util::cg_emit(out, "i64 %v")
+          codegen_util::cg_emit_int(out, arg)
+        end
+        call_comma = 1
+      end
+    end
+
+    codegen_util::cg_emit_line(out, ")")
+
+    # B.10 P2.1 — reconstruct a struct pointer from the `{i64 x N}` aggregate.
+    # Extract each field, store into a buffer, and ptrtoint the buffer to %v<dest>
+    # so all downstream codegen (field access, Vec push, decomposed re-pass) sees
+    # the usual i64 pointer. The buffer is the fn_entry-hoisted %vret_<dest> stack
+    # alloca when the result does not escape, or a fresh heap block when it does
+    # (escape analysis flagged dest — see mir_compute_escaped_regs).
+    if callee_byval == 1
+      var bc_rt = callee.mir_func_get_return_type_name()
+      var bc_fc = prog.mir_prog_get_struct_field_count(bc_rt)
+      var bc_ty = codegen::cg_byval_ret_type_str(bc_fc)
+      var ds = dest.to_s()
+      # Extract the N fields out of the aggregate.
+      for rfi in 0..bc_fc
+        var rfis = rfi.to_s()
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, ds)
+        codegen_util::cg_emit(out, ".rf")
+        codegen_util::cg_emit(out, rfis)
+        codegen_util::cg_emit(out, " = extractvalue ")
+        codegen_util::cg_emit(out, bc_ty)
+        codegen_util::cg_emit(out, " %v")
+        codegen_util::cg_emit(out, ds)
+        codegen_util::cg_emit(out, ".agg, ")
+        codegen_util::cg_emit_line(out, rfis)
+      end
+      # Choose the buffer: heap if the result escapes, else the hoisted alloca.
+      var resc = 0
+      if dest < state.escaped_regs.size
+        resc = state.escaped_regs[dest]
+      end
+      var bufname = "%vret_" + ds
+      if resc == 1
+        bufname = "%v" + ds + ".rbuf"
+        codegen_util::cg_emit(out, "  ")
+        codegen_util::cg_emit(out, bufname)
+        codegen_util::cg_emit(out, " = call noalias ptr @__qz_alloc(i64 ")
+        codegen_util::cg_emit_int(out, bc_fc * 8)
+        codegen_util::cg_emit_line(out, ")")
+      end
+      # Store each field into the buffer. For narrow-layout structs the buffer is
+      # reinterpreted as `%struct.Name` so fields land at their real byte offsets;
+      # narrow fields are trunc'd from the widened i64 aggregate slot back to iN.
+      var bc_narrow = prog.mir_prog_struct_has_narrow_fields(bc_rt)
+      for sfi in 0..bc_fc
+        var sfis = sfi.to_s()
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, ds)
+        codegen_util::cg_emit(out, ".rg")
+        codegen_util::cg_emit(out, sfis)
+        if bc_narrow == 1
+          codegen_util::cg_emit(out, " = getelementptr inbounds %struct.")
+          codegen_util::cg_emit(out, bc_rt)
+          codegen_util::cg_emit(out, ", ptr ")
+          codegen_util::cg_emit(out, bufname)
+          codegen_util::cg_emit(out, ", i32 0, i32 ")
+          codegen_util::cg_emit_line(out, sfis)
+          var bc_ft = prog.mir_prog_get_struct_field_type(bc_rt, sfi)
+          if bc_ft.mir_is_narrow_fixed_width()
+            var bc_llvm = bc_ft.mir_type_name_to_llvm()
+            codegen_util::cg_emit(out, "  %v")
+            codegen_util::cg_emit(out, ds)
+            codegen_util::cg_emit(out, ".rt")
+            codegen_util::cg_emit(out, sfis)
+            codegen_util::cg_emit(out, " = trunc i64 %v")
+            codegen_util::cg_emit(out, ds)
+            codegen_util::cg_emit(out, ".rf")
+            codegen_util::cg_emit(out, sfis)
+            codegen_util::cg_emit(out, " to ")
+            codegen_util::cg_emit_line(out, bc_llvm)
+            codegen_util::cg_emit(out, "  store ")
+            codegen_util::cg_emit(out, bc_llvm)
+            codegen_util::cg_emit(out, " %v")
+            codegen_util::cg_emit(out, ds)
+            codegen_util::cg_emit(out, ".rt")
+            codegen_util::cg_emit(out, sfis)
+            codegen_util::cg_emit(out, ", ptr %v")
+            codegen_util::cg_emit(out, ds)
+            codegen_util::cg_emit(out, ".rg")
+            codegen_util::cg_emit(out, sfis)
+            codegen_util::cg_emit_line(out, "")
+          else
+            codegen_util::cg_emit(out, "  store i64 %v")
+            codegen_util::cg_emit(out, ds)
+            codegen_util::cg_emit(out, ".rf")
+            codegen_util::cg_emit(out, sfis)
+            codegen_util::cg_emit(out, ", ptr %v")
+            codegen_util::cg_emit(out, ds)
+            codegen_util::cg_emit(out, ".rg")
+            codegen_util::cg_emit(out, sfis)
+            codegen_util::cg_emit_line(out, ", align 8")
+          end
+        else
+          codegen_util::cg_emit(out, " = getelementptr inbounds i64, ptr ")
+          codegen_util::cg_emit(out, bufname)
+          codegen_util::cg_emit(out, ", i64 ")
+          codegen_util::cg_emit_line(out, sfis)
+          codegen_util::cg_emit(out, "  store i64 %v")
+          codegen_util::cg_emit(out, ds)
+          codegen_util::cg_emit(out, ".rf")
+          codegen_util::cg_emit(out, sfis)
+          codegen_util::cg_emit(out, ", ptr %v")
+          codegen_util::cg_emit(out, ds)
+          codegen_util::cg_emit(out, ".rg")
+          codegen_util::cg_emit(out, sfis)
+          codegen_util::cg_emit_line(out, ", align 8")
+        end
+      end
+      # Result is the buffer pointer as an i64.
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit(out, ds)
+      codegen_util::cg_emit(out, " = ptrtoint ptr ")
+      codegen_util::cg_emit(out, bufname)
+      codegen_util::cg_emit_line(out, " to i64")
+      return
+    end
+
+    # Extend narrow return to i64
+    if callee_has_narrow_ret == 1
+      var callee_ret_name = callee.mir_func_get_return_type_name()
+      var ext_op = "sext"
+      if callee_ret_name.mir_is_unsigned_type()
+        ext_op = "zext"
+      end
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = ")
+      codegen_util::cg_emit(out, ext_op)
+      codegen_util::cg_emit(out, " ")
+      codegen_util::cg_emit(out, call_ret_type)
+      codegen_util::cg_emit(out, " %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ".tmp to i64")
+    end
+    return
+  end
+
+  if kind == mir::MIR_FUNC_REF
+    var func_name = instr.mir_instr_get_func_name()
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = ptrtoint i64 (i64)* @")
+    codegen_util::cg_emit(out, codegen_util::cg_sanitize_llvm_name(func_name))
+    codegen_util::cg_emit_line(out, " to i64")
+    return
+  end
+
+  if kind == mir::MIR_CALL_INDIRECT
+    var fn_ptr = instr.mir_instr_get_operand1()
+    var args = instr.mir_instr_get_args()
+    var arg_count = args.size
+    var d = dest.to_s()
+    var p = fn_ptr.to_s()
+
+    # Check closure tag (low bit = 1 means closure)
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".tag = and i64 %v")
+    codegen_util::cg_emit(out, p)
+    codegen_util::cg_emit_line(out, ", 1")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".is_closure = icmp eq i64 %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".tag, 1")
+    codegen_util::cg_emit(out, "  br i1 %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".is_closure, label %call")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".closure, label %call")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".plain")
+
+    # Closure path: extract fn ptr and env, call with env as first arg
+    codegen_util::cg_emit(out, "call")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".closure:")
+    codegen_util::cg_emit_line(out, "")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".env = and i64 %v")
+    codegen_util::cg_emit(out, p)
+    codegen_util::cg_emit_line(out, ", -2")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".envptr = inttoptr i64 %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".env to ptr")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".cfn.raw = load i64, ptr %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".envptr")
+
+    # Build closure function type: i64 (i64, ...args)
+    var ctype = "i64 (i64"
+    for i in 0..arg_count
+      ctype += ", i64"
+    end
+    ctype += ")*"
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".cfn = inttoptr i64 %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".cfn.raw to ")
+    codegen_util::cg_emit_line(out, ctype)
+
+    # Build closure call: call with env as first arg
+    var ccall = "  %v#{d}.cres = call i64 %v#{d}.cfn(i64 %v#{d}.env"
+    for i in 0..arg_count
+      var arg = args[i]
+      ccall += ", i64 %v#{arg.to_s()}"
+    end
+    ccall += ")"
+    codegen_util::cg_emit_line(out, ccall)
+    codegen_util::cg_emit(out, "  br label %call")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".end")
+
+    # Plain function path
+    codegen_util::cg_emit(out, "call")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".plain:")
+    codegen_util::cg_emit_line(out, "")
+
+    # Build plain function type: i64 (...args)
+    var ptype = "i64 ("
+    for i in 0..arg_count
+      if i > 0
+        ptype += ", "
+      end
+      ptype += "i64"
+    end
+    ptype += ")*"
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".pfn = inttoptr i64 %v")
+    codegen_util::cg_emit(out, p)
+    codegen_util::cg_emit(out, " to ")
+    codegen_util::cg_emit_line(out, ptype)
+
+    # Build plain call
+    var pcall = "  %v#{d}.pres = call i64 %v#{d}.pfn("
+    for i in 0..arg_count
+      if i > 0
+        pcall += ", "
+      end
+      var arg = args[i]
+      pcall += "i64 %v#{arg.to_s()}"
+    end
+    pcall += ")"
+    codegen_util::cg_emit_line(out, pcall)
+    codegen_util::cg_emit(out, "  br label %call")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".end")
+
+    # Merge
+    codegen_util::cg_emit(out, "call")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".end:")
+    codegen_util::cg_emit_line(out, "")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, " = phi i64 [ %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".cres, %call")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".closure ], [ %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".pres, %call")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".plain ]")
+    return
+  end
+end
+
+## Handle memory allocation and load/store instructions.
+def cg_emit_memory_ops(state: CodegenState, out: Int, prog: MirProgram, instr: MirInstr): Void
+  var kind = instr.mir_instr_get_kind()
+  var dest = instr.mir_instr_get_dest_id()
+
+  if kind == mir::MIR_ALLOC
+    var words = instr.mir_instr_get_slot1()
+    var struct_name_int = instr.mir_instr_get_operand1()
+    if struct_name_int != 0
+      # Typed struct allocation: sizeof via GEP-null trick
+      var sname = as_string(struct_name_int)
+      codegen_util::cg_emit(out, "  %alloc_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".size = ptrtoint %struct.")
+      codegen_util::cg_emit(out, sname)
+      codegen_util::cg_emit(out, "* getelementptr (%struct.")
+      codegen_util::cg_emit(out, sname)
+      codegen_util::cg_emit(out, ", %struct.")
+      codegen_util::cg_emit(out, sname)
+      codegen_util::cg_emit_line(out, "* null, i32 1) to i64")
+      codegen_util::cg_emit(out, "  %alloc_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = call noalias ptr @__qz_alloc(i64 %alloc_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ".size)")
+    else
+      var bytes = words * 8
+      codegen_util::cg_emit(out, "  %alloc_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = call noalias ptr @__qz_alloc(i64 ")
+      codegen_util::cg_emit_int(out, bytes)
+      codegen_util::cg_emit_line(out, ")")
+    end
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = ptrtoint ptr %alloc_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, " to i64")
+    return
+  end
+
+  # Stack allocation for @value structs (alloca or heap-promoted malloc)
+  if kind == mir::MIR_ALLOC_STACK
+    var words = instr.mir_instr_get_slot1()
+    var is_escaped = 0
+    var esc = state.escaped_regs
+    if dest < esc.size
+      is_escaped = esc[dest]
+    end
+    if is_escaped == 1
+      # Heap-promote: escaped @value struct needs to outlive its stack frame
+      var bytes = words * 8
+      codegen_util::cg_emit(out, "  %alloc_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = call noalias ptr @__qz_alloc(i64 ")
+      codegen_util::cg_emit_int(out, bytes)
+      codegen_util::cg_emit_line(out, ")")
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = ptrtoint ptr %alloc_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, " to i64")
+    else
+      # Stack: alloca was hoisted to fn_entry block (static alloca for LLVM inliner)
+      # Just emit the ptrtoint — alloca + bitcast already in fn_entry
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = ptrtoint ptr %alloc_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, " to i64")
+    end
+    return
+  end
+
+  if kind == mir::MIR_LOAD
+    var ptr = instr.mir_instr_get_operand1()
+    var offset = instr.mir_instr_get_operand2()
+    codegen_util::cg_emit(out, "  %ptr_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = inttoptr i64 %v")
+    codegen_util::cg_emit_int(out, ptr)
+    codegen_util::cg_emit_line(out, " to ptr")
+    if offset > 0
+      codegen_util::cg_emit(out, "  %gep_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = getelementptr inbounds i64, ptr %ptr_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ", i64 ")
+      codegen_util::cg_emit_line(out, offset.to_s())
+      # Race detector: instrument read before load
+      if state.race_mode == 1
+        codegen_util::cg_emit(out, "  call void @__qz_race_read8(ptr %gep_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ")")
+      end
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = load i64, ptr %gep_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ", align 8")
+    else
+      # Race detector: instrument read before load
+      if state.race_mode == 1
+        codegen_util::cg_emit(out, "  call void @__qz_race_read8(ptr %ptr_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ")")
+      end
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = load i64, ptr %ptr_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ", align 8")
+    end
+    return
+  end
+
+  if kind == mir::MIR_STORE
+    var ptr = instr.mir_instr_get_operand1()
+    var val = instr.mir_instr_get_operand2()
+    var offset = instr.mir_instr_get_slot1()
+    var struct_name_int = instr.mir_instr_get_slot2()
+    if struct_name_int != 0
+      # Typed struct field store via GEP
+      var sname = as_string(struct_name_int)
+      var ftype_int = instr.mir_instr_get_op()
+      var ftype = ""
+      if ftype_int != 0
+        ftype = as_string(ftype_int)
+      end
+      var llvm_ft = ftype.mir_type_name_to_llvm()
+      codegen_util::cg_emit(out, "  %sptr_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = inttoptr i64 %v")
+      codegen_util::cg_emit_int(out, ptr)
+      codegen_util::cg_emit(out, " to %struct.")
+      codegen_util::cg_emit(out, sname)
+      codegen_util::cg_emit_line(out, "*")
+      codegen_util::cg_emit(out, "  %sgep_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = getelementptr inbounds %struct.")
+      codegen_util::cg_emit(out, sname)
+      codegen_util::cg_emit(out, ", %struct.")
+      codegen_util::cg_emit(out, sname)
+      codegen_util::cg_emit(out, "* %sptr_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ", i32 0, i32 ")
+      codegen_util::cg_emit_line(out, offset.to_s())
+      # Race detector: instrument write before typed struct store
+      if state.race_mode == 1
+        codegen_util::cg_emit(out, "  call void @__qz_race_write8(ptr %sgep_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ")")
+      end
+      if ftype.mir_is_narrow_fixed_width()
+        codegen_util::cg_emit(out, "  %sval_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, " = trunc i64 %v")
+        codegen_util::cg_emit_int(out, val)
+        codegen_util::cg_emit(out, " to ")
+        codegen_util::cg_emit_line(out, llvm_ft)
+        codegen_util::cg_emit(out, "  store ")
+        codegen_util::cg_emit(out, llvm_ft)
+        codegen_util::cg_emit(out, " %sval_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ", ")
+        codegen_util::cg_emit(out, llvm_ft)
+        codegen_util::cg_emit(out, "* %sgep_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, "")
+      else
+        codegen_util::cg_emit(out, "  store ")
+        codegen_util::cg_emit(out, llvm_ft)
+        codegen_util::cg_emit(out, " %v")
+        codegen_util::cg_emit_int(out, val)
+        codegen_util::cg_emit(out, ", ")
+        codegen_util::cg_emit(out, llvm_ft)
+        codegen_util::cg_emit(out, "* %sgep_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, "")
+      end
+    else
+      # Legacy untyped store
+      codegen_util::cg_emit(out, "  %sptr_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = inttoptr i64 %v")
+      codegen_util::cg_emit_int(out, ptr)
+      codegen_util::cg_emit_line(out, " to ptr")
+      if offset > 0
+        codegen_util::cg_emit(out, "  %sgep_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, " = getelementptr inbounds i64, ptr %sptr_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ", i64 ")
+        codegen_util::cg_emit_line(out, offset.to_s())
+        # Race detector: instrument write before untyped store (with offset)
+        if state.race_mode == 1
+          codegen_util::cg_emit(out, "  call void @__qz_race_write8(ptr %sgep_")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit_line(out, ")")
+        end
+        codegen_util::cg_emit(out, "  store i64 %v")
+        codegen_util::cg_emit_int(out, val)
+        codegen_util::cg_emit(out, ", ptr %sgep_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ", align 8")
+      else
+        # Race detector: instrument write before untyped store (no offset)
+        if state.race_mode == 1
+          codegen_util::cg_emit(out, "  call void @__qz_race_write8(ptr %sptr_")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit_line(out, ")")
+        end
+        codegen_util::cg_emit(out, "  store i64 %v")
+        codegen_util::cg_emit_int(out, val)
+        codegen_util::cg_emit(out, ", ptr %sptr_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ", align 8")
+      end
+    end
+    return
+  end
+
+  if kind == mir::MIR_LOAD_OFFSET
+    var base = instr.mir_instr_get_slot1()
+    var offset = instr.mir_instr_get_slot2()
+    var struct_name_int = instr.mir_instr_get_operand1()
+    if struct_name_int != 0
+      # Typed struct field load via GEP
+      var sname = as_string(struct_name_int)
+      var ftype_int = instr.mir_instr_get_operand2()
+      var ftype = ""
+      if ftype_int != 0
+        ftype = as_string(ftype_int)
+      end
+      var llvm_ft = ftype.mir_type_name_to_llvm()
+      codegen_util::cg_emit(out, "  %loptr_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = inttoptr i64 %v")
+      codegen_util::cg_emit_int(out, base)
+      codegen_util::cg_emit(out, " to %struct.")
+      codegen_util::cg_emit(out, sname)
+      codegen_util::cg_emit_line(out, "*")
+      codegen_util::cg_emit(out, "  %logep_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = getelementptr inbounds %struct.")
+      codegen_util::cg_emit(out, sname)
+      codegen_util::cg_emit(out, ", %struct.")
+      codegen_util::cg_emit(out, sname)
+      codegen_util::cg_emit(out, "* %loptr_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ", i32 0, i32 ")
+      codegen_util::cg_emit_line(out, offset.to_s())
+      # Race detector: instrument read before typed struct load
+      if state.race_mode == 1
+        codegen_util::cg_emit(out, "  call void @__qz_race_read8(ptr %logep_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ")")
+      end
+      if ftype.mir_is_narrow_fixed_width()
+        var ext_op = "sext"
+        if ftype.mir_is_unsigned_type()
+          ext_op = "zext"
+        end
+        codegen_util::cg_emit(out, "  %loval_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, " = load ")
+        codegen_util::cg_emit(out, llvm_ft)
+        codegen_util::cg_emit(out, ", ")
+        codegen_util::cg_emit(out, llvm_ft)
+        codegen_util::cg_emit(out, "* %logep_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, "")
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, " = ")
+        codegen_util::cg_emit(out, ext_op)
+        codegen_util::cg_emit(out, " ")
+        codegen_util::cg_emit(out, llvm_ft)
+        codegen_util::cg_emit(out, " %loval_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, " to i64")
+      else
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, " = load ")
+        codegen_util::cg_emit(out, llvm_ft)
+        codegen_util::cg_emit(out, ", ")
+        codegen_util::cg_emit(out, llvm_ft)
+        codegen_util::cg_emit(out, "* %logep_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, "")
+      end
+    else
+      # Legacy untyped load
+      codegen_util::cg_emit(out, "  %loptr_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = inttoptr i64 %v")
+      codegen_util::cg_emit_int(out, base)
+      codegen_util::cg_emit_line(out, " to ptr")
+      codegen_util::cg_emit(out, "  %logep_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = getelementptr inbounds i64, ptr %loptr_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ", i64 ")
+      codegen_util::cg_emit_line(out, offset.to_s())
+      # Race detector: instrument read before untyped load offset
+      if state.race_mode == 1
+        codegen_util::cg_emit(out, "  call void @__qz_race_read8(ptr %logep_")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ")")
+      end
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = load i64, ptr %logep_")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ", align 8")
+    end
+    return
+  end
+
+  # B.10 §12.9 — typed interior field address (GEP, no load). Yields the
+  # address of field `field_idx` inside `%struct.Name` as an i64. Used to embed
+  # and read a @value struct field inline inside a generic-over-@value struct.
+  if kind == mir::MIR_FIELD_ADDR
+    var fa_base = instr.mir_instr_get_slot1()
+    var fa_idx = instr.mir_instr_get_slot2()
+    var fa_sname = as_string(instr.mir_instr_get_operand1())
+    codegen_util::cg_emit(out, "  %faptr_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = inttoptr i64 %v")
+    codegen_util::cg_emit_int(out, fa_base)
+    codegen_util::cg_emit(out, " to %struct.")
+    codegen_util::cg_emit(out, fa_sname)
+    codegen_util::cg_emit_line(out, "*")
+    codegen_util::cg_emit(out, "  %fagep_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = getelementptr inbounds %struct.")
+    codegen_util::cg_emit(out, fa_sname)
+    codegen_util::cg_emit(out, ", %struct.")
+    codegen_util::cg_emit(out, fa_sname)
+    codegen_util::cg_emit(out, "* %faptr_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ", i32 0, i32 ")
+    codegen_util::cg_emit_line(out, fa_idx.to_s())
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = ptrtoint ptr %fagep_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, " to i64")
+    return
+  end
+end
+
+## Handle vector/array index and index-store instructions.
+def cg_emit_index_ops(state: CodegenState, out: Int, prog: MirProgram, instr: MirInstr): Void can Emit
+  var kind = instr.mir_instr_get_kind()
+  var dest = instr.mir_instr_get_dest_id()
+
+  if kind == mir::MIR_INDEX
+    var arr = instr.mir_instr_get_operand1()
+    var idx = instr.mir_instr_get_operand2()
+    var lbl = codegen_util::cg_next_label(state).to_s()
+    var d = dest.to_s()
+    var i_s = idx.to_s()
+    # Read element type from slot2 (set by MIR lowering from type checker annotation)
+    var _ew_slot = instr.mir_instr_get_slot2()
+    var _ew_type = ""
+    if _ew_slot != 0
+      _ew_type = as_string(_ew_slot)
+    end
+    var is_narrow = elem_width::elem_is_narrow(_ew_type)
+    var elt = elem_width::elem_llvm_type(_ew_type)
+    var is_signed = elem_width::elem_is_signed(_ew_type)
+    var is_float = elem_width::elem_is_float(_ew_type)
+    # Vec layout: header[0]=capacity, header[1]=size, header[2]=data ptr, header[3]=elem_width
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".hdr = inttoptr i64 %v")
+    codegen_util::cg_emit_int(out, arr)
+    codegen_util::cg_emit_line(out, " to ptr")
+    # Load size for bounds check
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".size.ptr = getelementptr inbounds i64, ptr %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".hdr, i64 1")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".size = load i64, ptr %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".size.ptr, align 8")
+    # Bounds check: idx < size AND idx >= 0
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".inbounds = icmp slt i64 %v")
+    codegen_util::cg_emit(out, i_s)
+    codegen_util::cg_emit(out, ", %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".size")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".ge0 = icmp sge i64 %v")
+    codegen_util::cg_emit(out, i_s)
+    codegen_util::cg_emit_line(out, ", 0")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".valid = and i1 %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".inbounds, %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".ge0")
+    codegen_util::cg_emit(out, "  br i1 %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".valid, label %vec_get_ok_")
+    codegen_util::cg_emit(out, lbl)
+    codegen_util::cg_emit(out, ", label %vec_get_oob_")
+    codegen_util::cg_emit_line(out, lbl)
+    # OK path: load element
+    codegen_util::cg_emit(out, "vec_get_ok_")
+    codegen_util::cg_emit(out, lbl)
+    codegen_util::cg_emit_line(out, ":")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".data.ptr = getelementptr inbounds i64, ptr %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".hdr, i64 2")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".data.i = load i64, ptr %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".data.ptr, align 8")
+    if is_narrow == 1
+      # Narrow path: cast to iN*, GEP by iN, load iN, widen to i64
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit(out, d)
+      codegen_util::cg_emit(out, ".data.n = inttoptr i64 %v")
+      codegen_util::cg_emit(out, d)
+      codegen_util::cg_emit(out, ".data.i to ")
+      codegen_util::cg_emit(out, elt)
+      codegen_util::cg_emit_line(out, "*")
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit(out, d)
+      codegen_util::cg_emit(out, ".elem.ptr = getelementptr inbounds ")
+      codegen_util::cg_emit(out, elt)
+      codegen_util::cg_emit(out, ", ")
+      codegen_util::cg_emit(out, elt)
+      codegen_util::cg_emit(out, "* %v")
+      codegen_util::cg_emit(out, d)
+      codegen_util::cg_emit(out, ".data.n, i64 %v")
+      codegen_util::cg_emit_line(out, i_s)
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit(out, d)
+      codegen_util::cg_emit(out, ".narrow = load ")
+      codegen_util::cg_emit(out, elt)
+      codegen_util::cg_emit(out, ", ")
+      codegen_util::cg_emit(out, elt)
+      codegen_util::cg_emit(out, "* %v")
+      codegen_util::cg_emit(out, d)
+      codegen_util::cg_emit_line(out, ".elem.ptr")
+      if is_float == 1
+        # Float path: fpext narrow to double, bitcast double to i64.
+        # Must NOT use zext — LLVM rejects float→integer zext.
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".dbl = fpext ")
+        codegen_util::cg_emit(out, elt)
+        codegen_util::cg_emit(out, " %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit_line(out, ".narrow to double")
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".val = bitcast double %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit_line(out, ".dbl to i64")
+      elsif is_signed == 1
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".val = sext ")
+        codegen_util::cg_emit(out, elt)
+        codegen_util::cg_emit(out, " %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit_line(out, ".narrow to i64")
+      else
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".val = zext ")
+        codegen_util::cg_emit(out, elt)
+        codegen_util::cg_emit(out, " %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit_line(out, ".narrow to i64")
+      end
+    else
+      # Wide path: i64 load (original behavior)
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit(out, d)
+      codegen_util::cg_emit(out, ".data = inttoptr i64 %v")
+      codegen_util::cg_emit(out, d)
+      codegen_util::cg_emit_line(out, ".data.i to ptr")
+      var _idx_fc = cg_idx_inline_field_count(prog, _ew_type)
+      var _idx_pack = cg_idx_pack_narrow(prog, _ew_type)
+      if _idx_fc >= 1
+        # Inline struct read: return direct pointer into Vec data (no copy)
+        if _idx_pack == 1
+          # Packed narrow @value: typed-GEP element base (LLVM scales by sizeof).
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit(out, d)
+          codegen_util::cg_emit(out, ".elem.base = getelementptr inbounds %struct.")
+          codegen_util::cg_emit(out, _ew_type)
+          codegen_util::cg_emit(out, ", ptr %v")
+          codegen_util::cg_emit(out, d)
+          codegen_util::cg_emit(out, ".data, i64 %v")
+          codegen_util::cg_emit_line(out, i_s)
+        else
+          var fc_s_idx = _idx_fc.to_s()
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit(out, d)
+          codegen_util::cg_emit(out, ".ioff = mul i64 %v")
+          codegen_util::cg_emit(out, i_s)
+          codegen_util::cg_emit(out, ", ")
+          codegen_util::cg_emit_line(out, fc_s_idx)
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit(out, d)
+          codegen_util::cg_emit(out, ".elem.base = getelementptr inbounds i64, ptr %v")
+          codegen_util::cg_emit(out, d)
+          codegen_util::cg_emit(out, ".data, i64 %v")
+          codegen_util::cg_emit(out, d)
+          codegen_util::cg_emit_line(out, ".ioff")
+        end
+        codegen_util::cg_emit_ptrtoint("#{d}.val", "#{d}.elem.base", "ptr")
+      else
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".elem.ptr = getelementptr inbounds i64, ptr %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".data, i64 %v")
+        codegen_util::cg_emit_line(out, i_s)
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".val = load i64, ptr %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit_line(out, ".elem.ptr, align 8")
+      end
+    end
+    codegen_util::cg_emit(out, "  br label %vec_get_done_")
+    codegen_util::cg_emit_line(out, lbl)
+    # OOB path: panic with index and size
+    codegen_util::cg_emit(out, "vec_get_oob_")
+    codegen_util::cg_emit(out, lbl)
+    codegen_util::cg_emit_line(out, ":")
+    codegen_util::cg_emit(out, "  call void @qz_bounds_panic(i64 %v")
+    codegen_util::cg_emit(out, i_s)
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".size)")
+    codegen_util::cg_emit_line(out, "  unreachable")
+    # Done (only reachable from OK path)
+    codegen_util::cg_emit(out, "vec_get_done_")
+    codegen_util::cg_emit(out, lbl)
+    codegen_util::cg_emit_line(out, ":")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, " = add i64 %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".val, 0")
+    return
+  end
+
+  if kind == mir::MIR_INDEX_STORE
+    var arr = instr.mir_instr_get_operand1()
+    var idx = instr.mir_instr_get_operand2()
+    var args = instr.mir_instr_get_args()
+    var val = args[0]
+    var lbl = codegen_util::cg_next_label(state)
+    # Read element type from slot2
+    var _is_slot = instr.mir_instr_get_slot2()
+    var _is_type = ""
+    if _is_slot != 0
+      _is_type = as_string(_is_slot)
+    end
+    var is_narrow = elem_width::elem_is_narrow(_is_type)
+    var elt = elem_width::elem_llvm_type(_is_type)
+    var is_float = elem_width::elem_is_float(_is_type)
+    # Vec layout: header[0]=capacity, header[1]=size, header[2]=data ptr, header[3]=elem_width
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".hdr = inttoptr i64 %v")
+    codegen_util::cg_emit_int(out, arr)
+    codegen_util::cg_emit_line(out, " to ptr")
+    # Load size for bounds check
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".size.ptr = getelementptr inbounds i64, ptr %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ".hdr, i64 1")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".size = load i64, ptr %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ".size.ptr, align 8")
+    # Bounds check: idx < size AND idx >= 0
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".inbounds = icmp slt i64 %v")
+    codegen_util::cg_emit_int(out, idx)
+    codegen_util::cg_emit(out, ", %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ".size")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".ge0 = icmp sge i64 %v")
+    codegen_util::cg_emit_int(out, idx)
+    codegen_util::cg_emit_line(out, ", 0")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".valid = and i1 %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".inbounds, %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ".ge0")
+    codegen_util::cg_emit(out, "  br i1 %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".valid, label %vec_set_ok_")
+    codegen_util::cg_emit_int(out, lbl)
+    codegen_util::cg_emit(out, ", label %vec_set_oob_")
+    codegen_util::cg_emit_int(out, lbl)
+    codegen_util::cg_emit_line(out, "")
+    # OOB path: panic with index and size
+    codegen_util::cg_emit(out, "vec_set_oob_")
+    codegen_util::cg_emit_int(out, lbl)
+    codegen_util::cg_emit_line(out, ":")
+    codegen_util::cg_emit(out, "  call void @qz_bounds_panic(i64 %v")
+    codegen_util::cg_emit_int(out, idx)
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ".size)")
+    codegen_util::cg_emit_line(out, "  unreachable")
+    # OK path: store element
+    codegen_util::cg_emit(out, "vec_set_ok_")
+    codegen_util::cg_emit_int(out, lbl)
+    codegen_util::cg_emit_line(out, ":")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".data.ptr = getelementptr inbounds i64, ptr %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ".hdr, i64 2")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".data.i = load i64, ptr %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ".data.ptr, align 8")
+    if is_narrow == 1
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".data.n = inttoptr i64 %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".data.i to ")
+      codegen_util::cg_emit(out, elt)
+      codegen_util::cg_emit_line(out, "*")
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".elem.ptr = getelementptr inbounds ")
+      codegen_util::cg_emit(out, elt)
+      codegen_util::cg_emit(out, ", ")
+      codegen_util::cg_emit(out, elt)
+      codegen_util::cg_emit(out, "* %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".data.n, i64 %v")
+      codegen_util::cg_emit_int(out, idx)
+      codegen_util::cg_emit_line(out, "")
+      if is_float == 1
+        # Float path: i64 → bitcast to double → fptrunc to narrow float type.
+        # Cannot use `trunc i64 to float` — LLVM rejects that.
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".dbl = bitcast i64 %v")
+        codegen_util::cg_emit_int(out, val)
+        codegen_util::cg_emit_line(out, " to double")
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".flt = fptrunc double %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".dbl to ")
+        codegen_util::cg_emit_line(out, elt)
+        codegen_util::cg_emit(out, "  store ")
+        codegen_util::cg_emit(out, elt)
+        codegen_util::cg_emit(out, " %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".flt, ")
+        codegen_util::cg_emit(out, elt)
+        codegen_util::cg_emit(out, "* %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".elem.ptr")
+      else
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".trunc = trunc i64 %v")
+        codegen_util::cg_emit_int(out, val)
+        codegen_util::cg_emit(out, " to ")
+        codegen_util::cg_emit_line(out, elt)
+        codegen_util::cg_emit(out, "  store ")
+        codegen_util::cg_emit(out, elt)
+        codegen_util::cg_emit(out, " %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".trunc, ")
+        codegen_util::cg_emit(out, elt)
+        codegen_util::cg_emit(out, "* %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".elem.ptr")
+      end
+    else
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".data = inttoptr i64 %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ".data.i to ptr")
+      var _is_fc = cg_idx_inline_field_count(prog, _is_type)
+      var _is_pack = cg_idx_pack_narrow(prog, _is_type)
+      if _is_fc >= 1
+        # Inline struct write: memcpy fields into data array
+        if _is_pack == 1
+          # Packed narrow @value: typed-GEP element base (LLVM scales by sizeof).
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".elem.base = getelementptr inbounds %struct.")
+          codegen_util::cg_emit(out, _is_type)
+          codegen_util::cg_emit(out, ", ptr %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".data, i64 %v")
+          codegen_util::cg_emit_int(out, idx)
+          codegen_util::cg_emit_line(out, "")
+        else
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".ioff = mul i64 %v")
+          codegen_util::cg_emit_int(out, idx)
+          codegen_util::cg_emit(out, ", ")
+          codegen_util::cg_emit_int(out, _is_fc)
+          codegen_util::cg_emit_line(out, "")
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".elem.base = getelementptr inbounds i64, ptr %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".data, i64 %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit_line(out, ".ioff")
+        end
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".dst = bitcast ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".elem.base to ptr")
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".src = inttoptr i64 %v")
+        codegen_util::cg_emit_int(out, val)
+        codegen_util::cg_emit_line(out, " to ptr")
+        codegen_util::cg_emit(out, "  call void @llvm.memcpy.p0i8.p0i8.i64(ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".dst, ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        if _is_pack == 1
+          codegen_util::cg_emit(out, ".src, i64 ")
+          codegen_util::cg_emit(out, codegen_util::cg_struct_sizeof_const(_is_type))
+          codegen_util::cg_emit_line(out, ", i1 false)")
+        else
+          codegen_util::cg_emit(out, ".src, i64 ")
+          codegen_util::cg_emit_int(out, _is_fc * 8)
+          codegen_util::cg_emit_line(out, ", i1 false)")
+        end
+      else
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".elem.ptr = getelementptr inbounds i64, ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".data, i64 %v")
+        codegen_util::cg_emit_int(out, idx)
+        codegen_util::cg_emit_line(out, "")
+        codegen_util::cg_emit(out, "  store i64 %v")
+        codegen_util::cg_emit_int(out, val)
+        codegen_util::cg_emit(out, ", ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".elem.ptr, align 8")
+      end
+    end
+    codegen_util::cg_emit(out, "  br label %vec_set_done_")
+    codegen_util::cg_emit_int(out, lbl)
+    codegen_util::cg_emit_line(out, "")
+    # Done label (merge point)
+    codegen_util::cg_emit(out, "vec_set_done_")
+    codegen_util::cg_emit_int(out, lbl)
+    codegen_util::cg_emit_line(out, ":")
+    # Return the stored value for chained assignment
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = add i64 %v")
+    codegen_util::cg_emit_int(out, val)
+    codegen_util::cg_emit_line(out, ", 0")
+    return
+  end
+
+  # mir::MIR_VEC_DATA_PTR: extract raw data pointer from Vec handle.
+  # Emits: inttoptr vec → i64*, GEP to header[2], load data ptr.
+  # Result is the raw data pointer as i64.
+  if kind == mir::MIR_VEC_DATA_PTR
+    var vec = instr.mir_instr_get_operand1()
+    # Read element type
+    var _ew_slot = instr.mir_instr_get_slot2()
+    var _ew_type = ""
+    if _ew_slot != 0
+      _ew_type = as_string(_ew_slot)
+    end
+    var is_narrow = elem_width::elem_is_narrow(_ew_type)
+    var elt = elem_width::elem_llvm_type(_ew_type)
+    # Extract data pointer from Vec header[2]
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".hdr = inttoptr i64 %v")
+    codegen_util::cg_emit_int(out, vec)
+    codegen_util::cg_emit_line(out, " to ptr")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".dp.ptr = getelementptr inbounds i64, ptr %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ".hdr, i64 2")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = load i64, ptr %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ".dp.ptr, align 8")
+    return
+  end
+
+  # mir::MIR_INDEX_RAW: load element from Vec without bounds checking.
+  # Same as mir::MIR_INDEX but without icmp/branch/phi — straight-line code.
+  # operand1 = Vec handle (i64), operand2 = index, slot2 = elem type
+  if kind == mir::MIR_INDEX_RAW
+    var arr = instr.mir_instr_get_operand1()
+    var idx = instr.mir_instr_get_operand2()
+    var d = dest.to_s()
+    var i_s = idx.to_s()
+    var _ew_slot = instr.mir_instr_get_slot2()
+    var _ew_type = ""
+    if _ew_slot != 0
+      _ew_type = as_string(_ew_slot)
+    end
+    var is_narrow = elem_width::elem_is_narrow(_ew_type)
+    var elt = elem_width::elem_llvm_type(_ew_type)
+    var is_signed = elem_width::elem_is_signed(_ew_type)
+    var is_float = elem_width::elem_is_float(_ew_type)
+    # Vec layout: header[0]=capacity, header[1]=size, header[2]=data ptr
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".hdr = inttoptr i64 %v")
+    codegen_util::cg_emit_int(out, arr)
+    codegen_util::cg_emit_line(out, " to ptr")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".data.ptr = getelementptr inbounds i64, ptr %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".hdr, i64 2")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit(out, ".data.i = load i64, ptr %v")
+    codegen_util::cg_emit(out, d)
+    codegen_util::cg_emit_line(out, ".data.ptr, align 8")
+    if is_narrow == 1
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit(out, d)
+      codegen_util::cg_emit(out, ".data.n = inttoptr i64 %v")
+      codegen_util::cg_emit(out, d)
+      codegen_util::cg_emit(out, ".data.i to ")
+      codegen_util::cg_emit(out, elt)
+      codegen_util::cg_emit_line(out, "*")
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit(out, d)
+      codegen_util::cg_emit(out, ".elem.ptr = getelementptr inbounds ")
+      codegen_util::cg_emit(out, elt)
+      codegen_util::cg_emit(out, ", ")
+      codegen_util::cg_emit(out, elt)
+      codegen_util::cg_emit(out, "* %v")
+      codegen_util::cg_emit(out, d)
+      codegen_util::cg_emit(out, ".data.n, i64 %v")
+      codegen_util::cg_emit_line(out, i_s)
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit(out, d)
+      codegen_util::cg_emit(out, ".narrow = load ")
+      codegen_util::cg_emit(out, elt)
+      codegen_util::cg_emit(out, ", ")
+      codegen_util::cg_emit(out, elt)
+      codegen_util::cg_emit(out, "* %v")
+      codegen_util::cg_emit(out, d)
+      codegen_util::cg_emit_line(out, ".elem.ptr")
+      if is_float == 1
+        # Float path: fpext narrow to double, bitcast double to i64.
+        # Must NOT use zext — LLVM rejects float→integer zext.
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".dbl = fpext ")
+        codegen_util::cg_emit(out, elt)
+        codegen_util::cg_emit(out, " %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit_line(out, ".narrow to double")
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, " = bitcast double %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit_line(out, ".dbl to i64")
+      elsif is_signed == 1
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, " = sext ")
+        codegen_util::cg_emit(out, elt)
+        codegen_util::cg_emit(out, " %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit_line(out, ".narrow to i64")
+      else
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, " = zext ")
+        codegen_util::cg_emit(out, elt)
+        codegen_util::cg_emit(out, " %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit_line(out, ".narrow to i64")
+      end
+    else
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit(out, d)
+      codegen_util::cg_emit(out, ".data = inttoptr i64 %v")
+      codegen_util::cg_emit(out, d)
+      codegen_util::cg_emit_line(out, ".data.i to ptr")
+      var _idxr_fc = cg_idx_inline_field_count(prog, _ew_type)
+      var _idxr_pack = cg_idx_pack_narrow(prog, _ew_type)
+      if _idxr_fc >= 1
+        # Inline struct read: return direct pointer into Vec data (no copy)
+        if _idxr_pack == 1
+          # Packed narrow @value: typed-GEP element base (LLVM scales by sizeof).
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit(out, d)
+          codegen_util::cg_emit(out, ".elem.base = getelementptr inbounds %struct.")
+          codegen_util::cg_emit(out, _ew_type)
+          codegen_util::cg_emit(out, ", ptr %v")
+          codegen_util::cg_emit(out, d)
+          codegen_util::cg_emit(out, ".data, i64 %v")
+          codegen_util::cg_emit_line(out, i_s)
+        else
+          var fc_s_ir = _idxr_fc.to_s()
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit(out, d)
+          codegen_util::cg_emit(out, ".ioff = mul i64 %v")
+          codegen_util::cg_emit(out, i_s)
+          codegen_util::cg_emit(out, ", ")
+          codegen_util::cg_emit_line(out, fc_s_ir)
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit(out, d)
+          codegen_util::cg_emit(out, ".elem.base = getelementptr inbounds i64, ptr %v")
+          codegen_util::cg_emit(out, d)
+          codegen_util::cg_emit(out, ".data, i64 %v")
+          codegen_util::cg_emit(out, d)
+          codegen_util::cg_emit_line(out, ".ioff")
+        end
+        codegen_util::cg_emit_ptrtoint(d, "#{d}.elem.base", "ptr")
+      else
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".elem.ptr = getelementptr inbounds i64, ptr %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, ".data, i64 %v")
+        codegen_util::cg_emit_line(out, i_s)
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit(out, " = load i64, ptr %v")
+        codegen_util::cg_emit(out, d)
+        codegen_util::cg_emit_line(out, ".elem.ptr, align 8")
+      end
+    end
+    return
+  end
+
+  # mir::MIR_INDEX_STORE_RAW: store element to Vec without bounds checking.
+  # Same as mir::MIR_INDEX_STORE but without icmp/branch — straight-line code.
+  # operand1 = Vec handle, operand2 = index, args[0] = value, slot2 = elem type
+  if kind == mir::MIR_INDEX_STORE_RAW
+    var arr = instr.mir_instr_get_operand1()
+    var idx = instr.mir_instr_get_operand2()
+    var args = instr.mir_instr_get_args()
+    var val = args[0]
+    var _ew_slot = instr.mir_instr_get_slot2()
+    var _ew_type = ""
+    if _ew_slot != 0
+      _ew_type = as_string(_ew_slot)
+    end
+    var is_narrow = elem_width::elem_is_narrow(_ew_type)
+    var elt = elem_width::elem_llvm_type(_ew_type)
+    var is_float = elem_width::elem_is_float(_ew_type)
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".hdr = inttoptr i64 %v")
+    codegen_util::cg_emit_int(out, arr)
+    codegen_util::cg_emit_line(out, " to ptr")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".data.ptr = getelementptr inbounds i64, ptr %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ".hdr, i64 2")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".data.i = load i64, ptr %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ".data.ptr, align 8")
+    if is_narrow == 1
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".data.n = inttoptr i64 %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".data.i to ")
+      codegen_util::cg_emit(out, elt)
+      codegen_util::cg_emit_line(out, "*")
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".elem.ptr = getelementptr inbounds ")
+      codegen_util::cg_emit(out, elt)
+      codegen_util::cg_emit(out, ", ")
+      codegen_util::cg_emit(out, elt)
+      codegen_util::cg_emit(out, "* %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".data.n, i64 %v")
+      codegen_util::cg_emit_int(out, idx)
+      codegen_util::cg_emit_line(out, "")
+      if is_float == 1
+        # Float path: i64 → bitcast to double → fptrunc to narrow float type.
+        # Cannot use `trunc i64 to float` — LLVM rejects that.
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".dbl = bitcast i64 %v")
+        codegen_util::cg_emit_int(out, val)
+        codegen_util::cg_emit_line(out, " to double")
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".flt = fptrunc double %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".dbl to ")
+        codegen_util::cg_emit_line(out, elt)
+        codegen_util::cg_emit(out, "  store ")
+        codegen_util::cg_emit(out, elt)
+        codegen_util::cg_emit(out, " %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".flt, ")
+        codegen_util::cg_emit(out, elt)
+        codegen_util::cg_emit(out, "* %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".elem.ptr")
+      else
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".trunc = trunc i64 %v")
+        codegen_util::cg_emit_int(out, val)
+        codegen_util::cg_emit(out, " to ")
+        codegen_util::cg_emit_line(out, elt)
+        codegen_util::cg_emit(out, "  store ")
+        codegen_util::cg_emit(out, elt)
+        codegen_util::cg_emit(out, " %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".trunc, ")
+        codegen_util::cg_emit(out, elt)
+        codegen_util::cg_emit(out, "* %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".elem.ptr")
+      end
+    else
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".data = inttoptr i64 %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ".data.i to ptr")
+      var _isr_fc = cg_idx_inline_field_count(prog, _ew_type)
+      var _isr_pack = cg_idx_pack_narrow(prog, _ew_type)
+      if _isr_fc >= 1
+        # Inline struct write: memcpy fields into data array
+        if _isr_pack == 1
+          # Packed narrow @value: typed-GEP element base (LLVM scales by sizeof).
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".elem.base = getelementptr inbounds %struct.")
+          codegen_util::cg_emit(out, _ew_type)
+          codegen_util::cg_emit(out, ", ptr %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".data, i64 %v")
+          codegen_util::cg_emit_int(out, idx)
+          codegen_util::cg_emit_line(out, "")
+        else
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".ioff = mul i64 %v")
+          codegen_util::cg_emit_int(out, idx)
+          codegen_util::cg_emit(out, ", ")
+          codegen_util::cg_emit_int(out, _isr_fc)
+          codegen_util::cg_emit_line(out, "")
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".elem.base = getelementptr inbounds i64, ptr %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".data, i64 %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit_line(out, ".ioff")
+        end
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".dst = bitcast ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".elem.base to ptr")
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".src = inttoptr i64 %v")
+        codegen_util::cg_emit_int(out, val)
+        codegen_util::cg_emit_line(out, " to ptr")
+        codegen_util::cg_emit(out, "  call void @llvm.memcpy.p0i8.p0i8.i64(ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".dst, ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        if _isr_pack == 1
+          codegen_util::cg_emit(out, ".src, i64 ")
+          codegen_util::cg_emit(out, codegen_util::cg_struct_sizeof_const(_ew_type))
+          codegen_util::cg_emit_line(out, ", i1 false)")
+        else
+          codegen_util::cg_emit(out, ".src, i64 ")
+          codegen_util::cg_emit_int(out, _isr_fc * 8)
+          codegen_util::cg_emit_line(out, ", i1 false)")
+        end
+      else
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".elem.ptr = getelementptr inbounds i64, ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".data, i64 %v")
+        codegen_util::cg_emit_int(out, idx)
+        codegen_util::cg_emit_line(out, "")
+        codegen_util::cg_emit(out, "  store i64 %v")
+        codegen_util::cg_emit_int(out, val)
+        codegen_util::cg_emit(out, ", ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".elem.ptr, align 8")
+      end
+    end
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = add i64 %v")
+    codegen_util::cg_emit_int(out, val)
+    codegen_util::cg_emit_line(out, ", 0")
+    return
+  end
+end
+
+## Emit a single MIR instruction to LLVM IR.
+def cg_emit_instr(state: CodegenState, out: Int, prog: MirProgram, instr: MirInstr): Void can Emit
+  var kind = instr.mir_instr_get_kind()
+  var dest = instr.mir_instr_get_dest_id()
+
+  # Debug-location threading: emit one sentinel per MIR instruction. Every
+  # LLVM instruction this MIR node lowers to shares the sentinel's DILocation
+  # (Clang maps one source construct to many instructions the same way).
+  # cg_apply_debug_locations stamps `!dbg` from the sentinel post-codegen.
+  if state.debug_mode == 1
+    codegen_util::cg_emit_dbg_sentinel(out, codegen_util::cg_get_dilocation(state, instr.mir_instr_get_line(), codegen_util::cg_get_func_index(state)))
+  end
+
+  return if kind == mir::MIR_NOP
+
+  # Binary DSL real codegen (Phase 1.4 STEP 4). Dispatches to the emitters
+  # in cg_intrinsic_binary.qz — these walk the layout registry and emit
+  # straight-line shift/mask/load/store IR for each field.
+  if kind == mir::MIR_PACKED_BITCAST
+    var _pb_layout = instr.mir_instr_get_operand1()
+    var _pb_src = instr.mir_instr_get_operand2()
+    var _pb_dir = instr.mir_instr_get_slot1()
+    cg_intrinsic_binary::cg_emit_packed_bitcast(out, prog, dest, _pb_layout, _pb_src, _pb_dir)
+    return
+  end
+  if kind == mir::MIR_BINARY_PACK
+    var _bp_layout = instr.mir_instr_get_operand1()
+    var _bp_args = instr.mir_instr_get_args()
+    var _bp_self = 0
+    if _bp_args != 0 and _bp_args.size >= 1
+      _bp_self = _bp_args[0]
+    end
+    cg_intrinsic_binary::cg_emit_binary_pack(out, prog, dest, _bp_layout, _bp_self)
+    return
+  end
+  if kind == mir::MIR_BINARY_UNPACK
+    var _bu_layout = instr.mir_instr_get_operand1()
+    var _bu_src = instr.mir_instr_get_operand2()
+    cg_intrinsic_binary::cg_emit_binary_unpack(out, prog, dest, _bu_layout, _bu_src)
+    return
+  end
+
+  # Effects-runtime Milestones D.1/D.2/D.3 codegen.
+  # MIR_PERFORM_OP lowers to a call into the effect dispatch runtime
+  # (`@__qz_effect_perform`) with string-pool-backed null-terminated
+  # pointers for the effect + op names; args passing lands in D.5.
+  # Handler install/uninstall lower to calls that push/pop the global
+  # handler stack. Empty effect-name shapes (C.4 convention for non-
+  # PascalCase handler expressions) fall back to comment-only stubs so
+  # codegen stays safe when mir_lower's NODE_WITH branch saw a handler
+  # it couldn't classify. The IR `; effect: ...` comment breadcrumb
+  # stays on every emission — it's cheap and makes LLVM IR dumps
+  # readable.
+  if kind == mir::MIR_PERFORM_OP
+    var _po_op = instr.mir_instr_get_func_name()
+    var _po_eff_slot = instr.mir_instr_get_slot2()
+    var _po_eff = ""
+    if _po_eff_slot != 0
+      _po_eff = as_string(_po_eff_slot)
+    end
+    var _po_kind = instr.mir_instr_get_slot1()
+    var _po_args = instr.mir_instr_get_args()
+    var _po_argc = _po_args.size
+    # Effects G.2 / G-extended: operand1 carries the lexically-resolved
+    # handler fn name as-int (MIR G.1). The `op` field carries the
+    # matching install's dest register (G-extended — operand2 was
+    # taken by func_name for the op string, so we reuse `op` which is
+    # unused for MIR_PERFORM_OP). Used for %wb.jmpbuf + pretop threading
+    # on the kind=2 unwind fast path.
+    #
+    # When operand1 != 0, pick the static path. kind<2 (function-kind)
+    # goes through the _po_static branch (direct handler call, no unwind);
+    # kind==2 (operation-kind) goes through _po_static_unwind (direct
+    # handler call + inline longjmp to the with-block's jmpbuf). kind=2
+    # without a lexical match keeps the dynamic @__qz_effect_perform path
+    # (that's the "perform crosses a function boundary" case — the handler
+    # stack discipline lives in a different call frame, so only the
+    # runtime scan can find it).
+    var _po_static_handler = instr.mir_instr_get_operand1()
+    var _po_static_install_dest = instr.mir_instr_get_op()
+    var _po_static = 0
+    var _po_static_unwind = 0
+    if _po_static_handler != 0
+      if _po_kind < 2
+        _po_static = 1
+      else
+        _po_static_unwind = 1
+      end
+    end
+    codegen_util::cg_emit(out, "  ; effect: perform_op effect=")
+    codegen_util::cg_emit(out, _po_eff)
+    codegen_util::cg_emit(out, " op=")
+    codegen_util::cg_emit(out, _po_op)
+    codegen_util::cg_emit(out, " argc=")
+    codegen_util::cg_emit_int(out, _po_argc)
+    codegen_util::cg_emit(out, " kind=")
+    codegen_util::cg_emit_int(out, _po_kind)
+    if _po_static == 1
+      codegen_util::cg_emit(out, " [static:")
+      codegen_util::cg_emit(out, as_string(_po_static_handler))
+      codegen_util::cg_emit(out, "]")
+    end
+    if _po_static_unwind == 1
+      codegen_util::cg_emit(out, " [static-unwind:")
+      codegen_util::cg_emit(out, as_string(_po_static_handler))
+      codegen_util::cg_emit(out, " via install_dest=")
+      codegen_util::cg_emit_int(out, _po_static_install_dest)
+      codegen_util::cg_emit(out, "]")
+    end
+    codegen_util::cg_emit_line(out, "")
+    if str_byte_len(_po_eff) > 0
+      var _po_op_idx = codegen_util::cg_add_string(state, _po_op)
+      var _po_op_len = str_byte_len(_po_op) + 1
+      # On the dynamic path, emit eff_name_ptr first (the runtime scan
+      # needs it). The static fast paths (both _po_static and
+      # _po_static_unwind) skip eff name entirely — they resolve handler
+      # identity at emit time.
+      if _po_static == 0 and _po_static_unwind == 0
+        var _po_eff_idx = codegen_util::cg_add_string(state, _po_eff)
+        var _po_eff_len = str_byte_len(_po_eff) + 1
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".eff.p = getelementptr inbounds <{ i64, [")
+        codegen_util::cg_emit_int(out, _po_eff_len)
+        codegen_util::cg_emit(out, " x i8] }>, <{ i64, [")
+        codegen_util::cg_emit_int(out, _po_eff_len)
+        codegen_util::cg_emit(out, " x i8] }>* @.str.")
+        codegen_util::cg_emit_int(out, _po_eff_idx)
+        codegen_util::cg_emit_line(out, ", i64 0, i32 1, i64 0")
+      end
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ".op.p = getelementptr inbounds <{ i64, [")
+      codegen_util::cg_emit_int(out, _po_op_len)
+      codegen_util::cg_emit(out, " x i8] }>, <{ i64, [")
+      codegen_util::cg_emit_int(out, _po_op_len)
+      codegen_util::cg_emit(out, " x i8] }>* @.str.")
+      codegen_util::cg_emit_int(out, _po_op_idx)
+      codegen_util::cg_emit_line(out, ", i64 0, i32 1, i64 0")
+      # Milestone E(post): thread full argc/argv. Stack-alloca a fresh
+      # `[argc x i64]` per perform call (not hoisted to fn entry — each
+      # perform captures its own args). Store each Quartz arg register
+      # into the slot, then pass (argc, argv_ptr) to __qz_effect_perform.
+      # Zero-arg ops pass argc=0 + argv=null to avoid a useless alloca.
+      # F.3b: kind argument selects tail-return (0/1) vs unwind (>=2).
+      if _po_argc > 0
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".argv = alloca i64, i64 ")
+        codegen_util::cg_emit_int(out, _po_argc)
+        codegen_util::cg_emit_line(out, ", align 8")
+        var _po_ai = 0
+        while _po_ai < _po_argc
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".argv.")
+          codegen_util::cg_emit_int(out, _po_ai)
+          codegen_util::cg_emit(out, " = getelementptr inbounds i64, ptr %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".argv, i64 ")
+          codegen_util::cg_emit_int(out, _po_ai)
+          codegen_util::cg_emit_line(out, "")
+          codegen_util::cg_emit(out, "  store i64 %v")
+          codegen_util::cg_emit_int(out, _po_args[_po_ai])
+          codegen_util::cg_emit(out, ", ptr %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".argv.")
+          codegen_util::cg_emit_int(out, _po_ai)
+          codegen_util::cg_emit_line(out, ", align 8")
+          _po_ai += 1
+        end
+      end
+      if _po_static == 1
+        # G.2 fast path: direct call to the lexically-resolved handler.
+        # ABI matches the runtime: i64 (ptr op_name, i64 argc, ptr argv).
+        # No stack walk, no cstr_eq. kind<2 only (G.2 scope); kind=2
+        # continues through the static-unwind or dynamic path below.
+        #
+        # Phase 2 P2.a: set @__qz_effect_current_install_idx before the
+        # direct call so stateful-effect handlers (State<S>'s default
+        # reads slots[current_install_idx]) resolve to the correct slot.
+        # The runtime `__qz_effect_perform` does this store for the
+        # dynamic path (codegen_runtime.qz ~line 492); the fast path
+        # bypasses perform entirely, so we replicate the store here.
+        # pretop.<install_dest> equals the runtime stack index of this
+        # install (install pushed one entry; pretop was captured just
+        # before, so pretop is its index).
+        # POLL_BODY_WB_PRETOP_DOMINANCE: reload the install index from the
+        # fn_entry-hoisted slot rather than referencing %wb.pretop.<install>
+        # directly — that SSA lives in the install block, which a poll-resume
+        # block doesn't dominate. The slot reload dominates unconditionally.
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".pretop_rl = load i64, ptr %wb.pretop_slot.")
+        codegen_util::cg_emit_int(out, _po_static_install_dest)
+        codegen_util::cg_emit_line(out, ", align 8")
+        codegen_util::cg_emit(out, "  store i64 %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".pretop_rl, ptr @__qz_effect_current_install_idx, align 8")
+        # Phase A.6: replicate __qz_effect_perform's bypass-flag set
+        # around the Alloc handler call (codegen_runtime.qz line ~839-850).
+        # Without this, an Alloc handler that internally allocates (Vec
+        # push, str_concat, deeper helper chains) re-enters the wrapper's
+        # via_eff path because @__qz_alloc_in_handler is still 0 — the
+        # wrapper then picks up the same handler via perform, infinite-
+        # recursing. The static fast-path missed this when A.4 introduced
+        # it; surfaced by A.6 recursion-bypass spec coverage. Gated on
+        # _po_eff == "Alloc" — non-Alloc effects' handler bodies don't
+        # consult in_h, so no save/restore needed.
+        if _po_eff == "Alloc"
+          codegen_util::cg_emit(out, "  %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit_line(out, ".in_h_save = load i64, ptr @__qz_alloc_in_handler, align 8")
+          codegen_util::cg_emit_line(out, "  store i64 1, ptr @__qz_alloc_in_handler, align 8")
+        end
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, " = call i64 @")
+        codegen_util::cg_emit(out, as_string(_po_static_handler))
+        codegen_util::cg_emit(out, "(ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".op.p, i64 ")
+        codegen_util::cg_emit_int(out, _po_argc)
+        codegen_util::cg_emit(out, ", ptr ")
+        if _po_argc > 0
+          codegen_util::cg_emit(out, "%v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".argv")
+        else
+          codegen_util::cg_emit(out, "null")
+        end
+        codegen_util::cg_emit_line(out, ")")
+        if _po_eff == "Alloc"
+          codegen_util::cg_emit(out, "  store i64 %v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit_line(out, ".in_h_save, ptr @__qz_alloc_in_handler, align 8")
+        end
+      elsif _po_static_unwind == 1
+        # G-extended fast path: direct call to handler + inline unwind.
+        # Same handler ABI (ptr op, i64 argc, ptr argv) → i64. After the
+        # handler returns, write its value into the with-block's first
+        # stack_results slot (all N slots were zero-initialized at
+        # install; UNINSTALL's catch OR-folds across them, so writing
+        # any one suffices). Then longjmp to %wb.jmpbuf.<install_dest>
+        # which the with-block's setjmp captured. Unlike the dynamic
+        # path (which calls __qz_effect_perform, which internally calls
+        # longjmp), we inline the unwind here — saving the stack scan
+        # + cstr_eq + indirect dispatch. Downstream IR after the longjmp
+        # call is semantically dead (longjmp never returns) but is
+        # emitted as regular fall-through so %v<dest> retains SSA
+        # validity for any following instructions that reference it.
+        #
+        # Phase 2 P2.a: also set @__qz_effect_current_install_idx for
+        # stateful handlers. Same rationale as the G.2 branch above.
+        # POLL_BODY_WB_PRETOP_DOMINANCE: reload pretop from the hoisted slot
+        # (dominates this poll-resume-reachable block) and reuse it for both
+        # the install-idx store and the uw_slot GEP below.
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".pretop_rl = load i64, ptr %wb.pretop_slot.")
+        codegen_util::cg_emit_int(out, _po_static_install_dest)
+        codegen_util::cg_emit_line(out, ", align 8")
+        codegen_util::cg_emit(out, "  store i64 %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".pretop_rl, ptr @__qz_effect_current_install_idx, align 8")
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, " = call i64 @")
+        codegen_util::cg_emit(out, as_string(_po_static_handler))
+        codegen_util::cg_emit(out, "(ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".op.p, i64 ")
+        codegen_util::cg_emit_int(out, _po_argc)
+        codegen_util::cg_emit(out, ", ptr ")
+        if _po_argc > 0
+          codegen_util::cg_emit(out, "%v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".argv")
+        else
+          codegen_util::cg_emit(out, "null")
+        end
+        codegen_util::cg_emit_line(out, ")")
+        # Store handler's return value into stack_results[pretop] — the
+        # with-block's catch block loads from pretop..pretop+N-1 and
+        # OR-folds; writing slot 0 (zero-initialized alongside the rest)
+        # is sufficient to thread the value through.
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".uw_slot = getelementptr inbounds [256 x i64], ptr @__qz_effect_stack_results, i64 0, i64 %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".pretop_rl")
+        codegen_util::cg_emit(out, "  store i64 %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ", ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".uw_slot, align 8")
+        # Transfer control back to the with-block. The jmpbuf was
+        # captured by setjmp at install; catch block picks up execution
+        # with the loaded result.
+        codegen_util::cg_emit(out, "  call void @longjmp(ptr %wb.jmpbuf.")
+        codegen_util::cg_emit_int(out, _po_static_install_dest)
+        codegen_util::cg_emit_line(out, ", i32 1)")
+      else
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, " = call i64 @__qz_effect_perform(ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".eff.p, ptr %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".op.p, i64 ")
+        codegen_util::cg_emit_int(out, _po_argc)
+        codegen_util::cg_emit(out, ", ptr ")
+        if _po_argc > 0
+          codegen_util::cg_emit(out, "%v")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".argv")
+        else
+          codegen_util::cg_emit(out, "null")
+        end
+        codegen_util::cg_emit(out, ", i64 ")
+        codegen_util::cg_emit_int(out, _po_kind)
+        codegen_util::cg_emit_line(out, ")")
+      end
+    else
+      # Empty effect-name — fall back to zero constant so dest is a
+      # materialized SSA def. Shouldn't occur in practice (the tc
+      # annotation always carries a non-empty effect name) but kept
+      # for defense-in-depth.
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, " = add i64 0, 0")
+    end
+    return
+  end
+  if kind == mir::MIR_HANDLE_INSTALL
+    var _hi_eff = instr.mir_instr_get_func_name()
+    var _hi_entries = instr.mir_instr_get_args()
+    var _hi_entry_count = _hi_entries.size / 2
+    codegen_util::cg_emit(out, "  ; effect: handle_install effect=")
+    codegen_util::cg_emit(out, _hi_eff)
+    codegen_util::cg_emit(out, " entries=")
+    codegen_util::cg_emit_int(out, _hi_entry_count)
+    codegen_util::cg_emit_line(out, "")
+    if str_byte_len(_hi_eff) > 0 and _hi_entry_count > 0
+      var _hi_idx = codegen_util::cg_add_string(state, _hi_eff)
+      var _hi_len = str_byte_len(_hi_eff) + 1
+      codegen_util::cg_emit(out, "  %hi.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = getelementptr inbounds <{ i64, [")
+      codegen_util::cg_emit_int(out, _hi_len)
+      codegen_util::cg_emit(out, " x i8] }>, <{ i64, [")
+      codegen_util::cg_emit_int(out, _hi_len)
+      codegen_util::cg_emit(out, " x i8] }>* @.str.")
+      codegen_util::cg_emit_int(out, _hi_idx)
+      codegen_util::cg_emit_line(out, ", i64 0, i32 1, i64 0")
+      # F.3b: jmp_buf + result_slot allocas are HOISTED to fn_entry
+      # (see codegen.qz alongside the MIR_CONST_INT / MIR_ALLOC_STACK
+      # hoists). fn_entry dominates every block, including async-resume
+      # re-entry paths via poll_switch that bypass the block this
+      # handle_install instruction would otherwise emit into. Inline
+      # emission lived here pre-fix and produced SSA dominance violations
+      # for two-sequential-with-blocks-inside-$poll patterns. See
+      # docs/bugs/POLL_BODY_WB_RESULT_SLOT_DOMINANCE.md.
+      codegen_util::cg_emit(out, "  %wb.bufi.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = ptrtoint ptr %wb.jmpbuf.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, " to i64")
+      # Capture pretop BEFORE the first install so the catch block can
+      # index into @__qz_effect_stack_results at the first entry's slot.
+      # All N entries of this with-block write their unwind result to
+      # their own slot — but since they share a jmpbuf, only one of
+      # them fires per longjmp, and the catch reads that specific slot.
+      codegen_util::cg_emit(out, "  %wb.pretop.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, " = load i64, ptr @__qz_effect_stack_top, align 8")
+      # POLL_BODY_WB_PRETOP_DOMINANCE: spill pretop into the fn_entry-hoisted
+      # slot so a perform static fast path landing in a poll-resume block
+      # (which bypasses this install block) can reload the install index
+      # rather than referencing this block-local SSA. Same-block uses below
+      # (zero-init / state-slot / catch OR-fold) keep using the SSA directly,
+      # since the install block dominates them. See codegen.qz hoist + the
+      # perform fast-path reloads in this file.
+      codegen_util::cg_emit(out, "  store i64 %wb.pretop.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ", ptr %wb.pretop_slot.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ", align 8")
+      # H-delegate: zero-init the N stack_results slots before install so
+      # the catch block can scan-OR N entries safely. @__qz_effect_stack_results
+      # is a process-global array; slots carry stale data from prior
+      # longjmps. Perform writes only one slot per unwind (the matched
+      # entry's). OR-folding with zeros gives us the single real value.
+      var _hi_zi = 0
+      while _hi_zi < _hi_entry_count
+        codegen_util::cg_emit(out, "  %wb.zero_idx.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".")
+        codegen_util::cg_emit_int(out, _hi_zi)
+        codegen_util::cg_emit(out, " = add i64 %wb.pretop.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ", ")
+        codegen_util::cg_emit_int(out, _hi_zi)
+        codegen_util::cg_emit_line(out, "")
+        codegen_util::cg_emit(out, "  %wb.zero_gep.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".")
+        codegen_util::cg_emit_int(out, _hi_zi)
+        codegen_util::cg_emit(out, " = getelementptr inbounds [256 x i64], ptr @__qz_effect_stack_results, i64 0, i64 %wb.zero_idx.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".")
+        codegen_util::cg_emit_int(out, _hi_zi)
+        codegen_util::cg_emit_line(out, "")
+        codegen_util::cg_emit(out, "  store i64 0, ptr %wb.zero_gep.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".")
+        codegen_util::cg_emit_int(out, _hi_zi)
+        codegen_util::cg_emit_line(out, ", align 8")
+        _hi_zi += 1
+      end
+      # Emit N runtime install calls, one per entry. The FIRST install's
+      # slot is at pretop+0, the Kth at pretop+K.
+      var _hi_ei = 0
+      while _hi_ei < _hi_entry_count
+        var _hi_filter_int = _hi_entries[2 * _hi_ei]
+        var _hi_handler_int = _hi_entries[2 * _hi_ei + 1]
+        var _hi_filter_s = ""
+        var _hi_handler_s = ""
+        if _hi_filter_int != 0
+          _hi_filter_s = as_string(_hi_filter_int)
+        end
+        if _hi_handler_int != 0
+          _hi_handler_s = as_string(_hi_handler_int)
+        end
+        # Handler ptrtoint (or i64 0 if null handler)
+        if str_byte_len(_hi_handler_s) > 0
+          codegen_util::cg_emit(out, "  %hi.")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".fn.")
+          codegen_util::cg_emit_int(out, _hi_ei)
+          codegen_util::cg_emit(out, " = ptrtoint ptr @")
+          codegen_util::cg_emit(out, _hi_handler_s)
+          codegen_util::cg_emit_line(out, " to i64")
+        end
+        # op_filter pointer: null when filter_s is empty; otherwise GEP
+        # into the string pool at the interned op name.
+        var _hi_filter_ptr_expr = "null"
+        if str_byte_len(_hi_filter_s) > 0
+          var _hi_f_idx = codegen_util::cg_add_string(state, _hi_filter_s)
+          var _hi_f_len = str_byte_len(_hi_filter_s) + 1
+          codegen_util::cg_emit(out, "  %hi.")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".flt.")
+          codegen_util::cg_emit_int(out, _hi_ei)
+          codegen_util::cg_emit(out, " = getelementptr inbounds <{ i64, [")
+          codegen_util::cg_emit_int(out, _hi_f_len)
+          codegen_util::cg_emit(out, " x i8] }>, <{ i64, [")
+          codegen_util::cg_emit_int(out, _hi_f_len)
+          codegen_util::cg_emit(out, " x i8] }>* @.str.")
+          codegen_util::cg_emit_int(out, _hi_f_idx)
+          codegen_util::cg_emit_line(out, ", i64 0, i32 1, i64 0")
+        end
+        # Emit the runtime install call.
+        codegen_util::cg_emit(out, "  call void @__qz_effect_handle_install(ptr %hi.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ", i64 ")
+        if str_byte_len(_hi_handler_s) > 0
+          codegen_util::cg_emit(out, "%hi.")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".fn.")
+          codegen_util::cg_emit_int(out, _hi_ei)
+        else
+          codegen_util::cg_emit(out, "0")
+        end
+        codegen_util::cg_emit(out, ", i64 %wb.bufi.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ", ptr ")
+        if str_byte_len(_hi_filter_s) > 0
+          codegen_util::cg_emit(out, "%hi.")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".flt.")
+          codegen_util::cg_emit_int(out, _hi_ei)
+        else
+          codegen_util::cg_emit(out, "null")
+        end
+        codegen_util::cg_emit_line(out, ")")
+        _hi_ei += 1
+      end
+      # Phase 2 P2.a: evidence-slot initialization for stateful effects
+      # (State<S>, Reader<R>, etc). When the MIR install instruction has
+      # operand1==1, slot1 holds the MIR register carrying the initial
+      # state value. We materialize the slot pointer as
+      # state_slots[pretop+i] for i in 0..N and store %v<slot1> into
+      # each. The fan-out makes every entry of a multi-entry call-form
+      # install (B.0c — `with Alloc.in_arena(arena) do ... end` installs
+      # one entry per op) read the SAME env via
+      # `__qz_effect_state_get()`, which reads
+      # `state_slots[current_install_idx]`. Single-entry call-forms
+      # (State(v), Reader(v)) collapse to writing slot[pretop+0] only —
+      # same behavior as before B.0c.
+      var _hi_has_init = mir::mir_instr_get_operand1(instr)
+      if _hi_has_init == 1
+        var _hi_init_reg = mir::mir_instr_get_slot1(instr)
+        var _hi_si = 0
+        while _hi_si < _hi_entry_count
+          codegen_util::cg_emit(out, "  %wb.state_idx.")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".")
+          codegen_util::cg_emit_int(out, _hi_si)
+          codegen_util::cg_emit(out, " = add i64 %wb.pretop.")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ", ")
+          codegen_util::cg_emit_int(out, _hi_si)
+          codegen_util::cg_emit_line(out, "")
+          codegen_util::cg_emit(out, "  %wb.state_gep.")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".")
+          codegen_util::cg_emit_int(out, _hi_si)
+          codegen_util::cg_emit(out, " = getelementptr inbounds [256 x i64], ptr @__qz_effect_stack_state_slots, i64 0, i64 %wb.state_idx.")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".")
+          codegen_util::cg_emit_int(out, _hi_si)
+          codegen_util::cg_emit_line(out, "")
+          codegen_util::cg_emit(out, "  store i64 %v")
+          codegen_util::cg_emit_int(out, _hi_init_reg)
+          codegen_util::cg_emit(out, ", ptr %wb.state_gep.")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".")
+          codegen_util::cg_emit_int(out, _hi_si)
+          codegen_util::cg_emit_line(out, ", align 8")
+          _hi_si += 1
+        end
+      end
+      # B.0a: snapshot the bypass-during-handler flag (@__qz_alloc_in_handler)
+      # so the catch path can restore it. Without this, a handler that
+      # throws (longjmps out via Throws) leaves in_h at 1 — subsequent
+      # allocations after the catch then bypass perform and route direct
+      # to malloc, skipping any still-active outer Alloc handler. Save
+      # before setjmp so the SSA value dominates both wb.body and wb.catch.
+      # Restored only on the catch path; body path's perform invocations
+      # already restore in_h locally per __qz_effect_perform's do_call:
+      # block.
+      codegen_util::cg_emit(out, "  %wb.in_h_save.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, " = load i64, ptr @__qz_alloc_in_handler, align 8")
+      # setjmp + branch: rc==0 → body, rc!=0 → catch (longjmp landed here)
+      codegen_util::cg_emit(out, "  %wb.rc.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = call i32 @setjmp(ptr %wb.jmpbuf.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ")")
+      codegen_util::cg_emit(out, "  %wb.unwound.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = icmp ne i32 %wb.rc.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ", 0")
+      codegen_util::cg_emit(out, "  br i1 %wb.unwound.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ", label %wb.catch.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, ", label %wb.body.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, "")
+      # Catch block: perform's kind=2 unwind stashed the return at
+      # stack_results[matched_iprev]. That index is pretop + K for
+      # some K ∈ [0, N). We don't statically know K, so scan the N
+      # slots and OR together (only one can be non-zero per unwind,
+      # since the longjmp target is shared and scan is single-shot).
+      # For the common N=1 case this collapses to a single load.
+      codegen_util::cg_emit(out, "wb.catch.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ":")
+      # B.0a: restore @__qz_alloc_in_handler to its pre-with-block value.
+      # Covers the case where a handler longjmped out from within
+      # __qz_effect_perform's do_call: block, skipping perform's local
+      # restore. Restoring to the saved snapshot (rather than 0)
+      # preserves the invariant when this with-block is nested inside an
+      # outer handler body (in_h was already 1 going in; should still be
+      # 1 going out).
+      codegen_util::cg_emit(out, "  store i64 %wb.in_h_save.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ", ptr @__qz_alloc_in_handler, align 8")
+      # Build the catch value by OR-folding stack_results[pretop..pretop+N].
+      # Only the matched entry's slot is non-zero (we zero-initialized all
+      # N before install; perform writes exactly one slot per unwind).
+      # OR-fold == that value.
+      var _hi_cj = 0
+      while _hi_cj < _hi_entry_count
+        # Compute index = pretop + K. For K=0 the `add` simplifies to a
+        # no-op in LLVM's optimizer but stays legal SSA.
+        codegen_util::cg_emit(out, "  %wb.rgep_idx.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".")
+        codegen_util::cg_emit_int(out, _hi_cj)
+        codegen_util::cg_emit(out, " = add i64 %wb.pretop.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ", ")
+        codegen_util::cg_emit_int(out, _hi_cj)
+        codegen_util::cg_emit_line(out, "")
+        codegen_util::cg_emit(out, "  %wb.rgep.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".")
+        codegen_util::cg_emit_int(out, _hi_cj)
+        codegen_util::cg_emit(out, " = getelementptr inbounds [256 x i64], ptr @__qz_effect_stack_results, i64 0, i64 %wb.rgep_idx.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".")
+        codegen_util::cg_emit_int(out, _hi_cj)
+        codegen_util::cg_emit_line(out, "")
+        codegen_util::cg_emit(out, "  %wb.rval.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".")
+        codegen_util::cg_emit_int(out, _hi_cj)
+        codegen_util::cg_emit(out, " = load i64, ptr %wb.rgep.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".")
+        codegen_util::cg_emit_int(out, _hi_cj)
+        codegen_util::cg_emit_line(out, ", align 8")
+        _hi_cj += 1
+      end
+      # Accumulator: start at rval.0, OR in rval.1..rval.N-1.
+      if _hi_entry_count == 1
+        codegen_util::cg_emit(out, "  store i64 %wb.rval.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".0, ptr %wb.result_slot.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ", align 8")
+      else
+        # Fold-or: accN = acc(N-1) | rval.N (two-operand OR cascade).
+        codegen_util::cg_emit(out, "  %wb.racc.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".0 = or i64 %wb.rval.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".0, %wb.rval.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".1")
+        var _hi_ck = 2
+        while _hi_ck < _hi_entry_count
+          codegen_util::cg_emit(out, "  %wb.racc.")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".")
+          codegen_util::cg_emit_int(out, _hi_ck - 1)
+          codegen_util::cg_emit(out, " = or i64 %wb.racc.")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".")
+          codegen_util::cg_emit_int(out, _hi_ck - 2)
+          codegen_util::cg_emit(out, ", %wb.rval.")
+          codegen_util::cg_emit_int(out, dest)
+          codegen_util::cg_emit(out, ".")
+          codegen_util::cg_emit_int(out, _hi_ck)
+          codegen_util::cg_emit_line(out, "")
+          _hi_ck += 1
+        end
+        codegen_util::cg_emit(out, "  store i64 %wb.racc.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".")
+        codegen_util::cg_emit_int(out, _hi_entry_count - 2)
+        codegen_util::cg_emit(out, ", ptr %wb.result_slot.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ", align 8")
+      end
+      codegen_util::cg_emit(out, "  br label %wb.done.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, "")
+      # Body label — subsequent MIR instructions emit here, forming the
+      # normal-path body of the with-block.
+      codegen_util::cg_emit(out, "wb.body.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ":")
+    end
+    return
+  end
+  # Diag-leak fix (DIAG_WRAP_BLOCK_LEAK_248_ENTRIES_AT_PEAK): emits N raw
+  # runtime pop calls — no result-slot, no merge block — for early-return
+  # cleanup of the effect-stack. Mirrors the GEP+call sequence at the tail
+  # of MIR_HANDLE_UNINSTALL but does not introduce any new labels.
+  if kind == mir::MIR_EFFECT_POP_N
+    var _epn_eff = instr.mir_instr_get_func_name()
+    var _epn_pop_count = instr.mir_instr_get_int_val()
+    if str_byte_len(_epn_eff) == 0 or _epn_pop_count <= 0
+      return
+    end
+    var _epn_idx = codegen_util::cg_add_string(state, _epn_eff)
+    var _epn_len = str_byte_len(_epn_eff) + 1
+    codegen_util::cg_emit(out, "  ; effect: pop_n effect=")
+    codegen_util::cg_emit(out, _epn_eff)
+    codegen_util::cg_emit(out, " pop=")
+    codegen_util::cg_emit_int(out, _epn_pop_count)
+    codegen_util::cg_emit_line(out, "")
+    codegen_util::cg_emit(out, "  %epn.")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = getelementptr inbounds <{ i64, [")
+    codegen_util::cg_emit_int(out, _epn_len)
+    codegen_util::cg_emit(out, " x i8] }>, <{ i64, [")
+    codegen_util::cg_emit_int(out, _epn_len)
+    codegen_util::cg_emit(out, " x i8] }>* @.str.")
+    codegen_util::cg_emit_int(out, _epn_idx)
+    codegen_util::cg_emit_line(out, ", i64 0, i32 1, i64 0")
+    var _epn_pi = 0
+    while _epn_pi < _epn_pop_count
+      codegen_util::cg_emit(out, "  call void @__qz_effect_handle_uninstall(ptr %epn.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ")")
+      _epn_pi += 1
+    end
+    return
+  end
+  if kind == mir::MIR_HANDLE_UNINSTALL
+    var _hu_eff = instr.mir_instr_get_func_name()
+    var _hu_body_val = instr.mir_instr_get_slot1()
+    var _hu_install_dest = instr.mir_instr_get_slot2()
+    var _hu_pop_count = instr.mir_instr_get_int_val()
+    codegen_util::cg_emit(out, "  ; effect: handle_uninstall effect=")
+    codegen_util::cg_emit(out, _hu_eff)
+    codegen_util::cg_emit(out, " pop=")
+    codegen_util::cg_emit_int(out, _hu_pop_count)
+    codegen_util::cg_emit_line(out, "")
+    if str_byte_len(_hu_eff) == 0
+      # Empty-eff fallback: matching INSTALL emitted nothing for an
+      # unrecognized handler shape, so no setjmp frame exists. Just
+      # alias the uninstall's dest to body_val (identity add) and bail —
+      # keeps the IR well-formed without a with-block's catch machinery.
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = add i64 %v")
+      codegen_util::cg_emit_int(out, _hu_body_val)
+      codegen_util::cg_emit_line(out, ", 0")
+      return
+    end
+    if str_byte_len(_hu_eff) > 0
+      var _hu_idx = codegen_util::cg_add_string(state, _hu_eff)
+      var _hu_len = str_byte_len(_hu_eff) + 1
+      # F.3b: normal path — still in body's last block. Store body_val
+      # into the result slot established at INSTALL, then jump to done.
+      codegen_util::cg_emit(out, "  store i64 %v")
+      codegen_util::cg_emit_int(out, _hu_body_val)
+      codegen_util::cg_emit(out, ", ptr %wb.result_slot.")
+      codegen_util::cg_emit_int(out, _hu_install_dest)
+      codegen_util::cg_emit_line(out, ", align 8")
+      codegen_util::cg_emit(out, "  br label %wb.done.")
+      codegen_util::cg_emit_int(out, _hu_install_dest)
+      codegen_util::cg_emit_line(out, "")
+      # Done (merge) block: body and catch both jump here.
+      codegen_util::cg_emit(out, "wb.done.")
+      codegen_util::cg_emit_int(out, _hu_install_dest)
+      codegen_util::cg_emit_line(out, ":")
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = load i64, ptr %wb.result_slot.")
+      codegen_util::cg_emit_int(out, _hu_install_dest)
+      codegen_util::cg_emit_line(out, ", align 8")
+      # H-delegate: uninstall N stack entries via N runtime pop calls.
+      # Each call decrements @__qz_effect_stack_top by 1. Zero is
+      # defended inside the runtime (no-op on empty stack). The
+      # effect-name ptr arg is currently unused by the runtime but
+      # preserved for future push/pop-verification.
+      codegen_util::cg_emit(out, "  %hu.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = getelementptr inbounds <{ i64, [")
+      codegen_util::cg_emit_int(out, _hu_len)
+      codegen_util::cg_emit(out, " x i8] }>, <{ i64, [")
+      codegen_util::cg_emit_int(out, _hu_len)
+      codegen_util::cg_emit(out, " x i8] }>* @.str.")
+      codegen_util::cg_emit_int(out, _hu_idx)
+      codegen_util::cg_emit_line(out, ", i64 0, i32 1, i64 0")
+      var _hu_pi = 0
+      while _hu_pi < _hu_pop_count
+        codegen_util::cg_emit(out, "  call void @__qz_effect_handle_uninstall(ptr %hu.")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ")")
+        _hu_pi += 1
+      end
+    end
+    return
+  end
+  # Done-label-only HANDLE_UNINSTALL: emits ONLY the `wb.done.NN:` block (load
+  # + uninstall × pop_count). No body fall-through prefix (no store + br).
+  # Used at NODE_WITH lowering when the body's last block already has a
+  # terminator (early return / break / continue inside body) — the early-exit
+  # path already drained the runtime effect-stack via MIR_EFFECT_POP_N, but
+  # `wb.catch.NN`'s `br label %wb.done.NN` (emitted by MIR_HANDLE_INSTALL)
+  # still requires `wb.done.NN` to be defined for valid IR. The longjmp-
+  # resume path is the only edge into wb.done.NN in this case.
+  if kind == mir::MIR_HANDLE_UNINSTALL_DONE_ONLY
+    var _hud_eff = instr.mir_instr_get_func_name()
+    var _hud_install_dest = instr.mir_instr_get_slot2()
+    var _hud_pop_count = instr.mir_instr_get_int_val()
+    if str_byte_len(_hud_eff) == 0
+      return
+    end
+    var _hud_idx = codegen_util::cg_add_string(state, _hud_eff)
+    var _hud_len = str_byte_len(_hud_eff) + 1
+    codegen_util::cg_emit(out, "  ; effect: handle_uninstall_done_only effect=")
+    codegen_util::cg_emit(out, _hud_eff)
+    codegen_util::cg_emit(out, " pop=")
+    codegen_util::cg_emit_int(out, _hud_pop_count)
+    codegen_util::cg_emit_line(out, "")
+    # Bridge: terminate the host MIR block (which emitted its blockN_start:
+    # label before this opcode) with a `br` to wb.done.NN. Required because
+    # two consecutive labels with no terminator between them is invalid IR.
+    # If the host MIR block had no predecessors (the post-body-terminated
+    # case), this bridge is dead code; if it did (defensive use), wb.done.NN
+    # has two predecessors (the bridge + wb.catch.NN) — both well-formed.
+    codegen_util::cg_emit(out, "  br label %wb.done.")
+    codegen_util::cg_emit_int(out, _hud_install_dest)
+    codegen_util::cg_emit_line(out, "")
+    codegen_util::cg_emit(out, "wb.done.")
+    codegen_util::cg_emit_int(out, _hud_install_dest)
+    codegen_util::cg_emit_line(out, ":")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = load i64, ptr %wb.result_slot.")
+    codegen_util::cg_emit_int(out, _hud_install_dest)
+    codegen_util::cg_emit_line(out, ", align 8")
+    codegen_util::cg_emit(out, "  %hu.")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = getelementptr inbounds <{ i64, [")
+    codegen_util::cg_emit_int(out, _hud_len)
+    codegen_util::cg_emit(out, " x i8] }>, <{ i64, [")
+    codegen_util::cg_emit_int(out, _hud_len)
+    codegen_util::cg_emit(out, " x i8] }>* @.str.")
+    codegen_util::cg_emit_int(out, _hud_idx)
+    codegen_util::cg_emit_line(out, ", i64 0, i32 1, i64 0")
+    var _hud_pi = 0
+    while _hud_pi < _hud_pop_count
+      codegen_util::cg_emit(out, "  call void @__qz_effect_handle_uninstall(ptr %hu.")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit_line(out, ")")
+      _hud_pi += 1
+    end
+    return
+  end
+
+  ## mir::MIR_CONST_INT and mir::MIR_CONST_BOOL are hoisted to fn_entry block
+  ## in cg_emit_function to ensure LLVM SSA dominance.
+  if kind == mir::MIR_CONST_INT
+    return
+  end
+  if kind == mir::MIR_CONST_BOOL
+    return
+  end
+  
+  if kind == mir::MIR_CONST_STRING
+    # Get string value and add to pool
+    var str_val = instr.mir_instr_get_string_val()
+    var str_idx = codegen_util::cg_add_string(state, str_val)
+    var str_len = str_byte_len(str_val) + 1
+    # String constants - emit pointer to string pool (packed struct with length prefix), then convert to i64
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ".ptr = getelementptr inbounds <{ i64, [")
+    codegen_util::cg_emit_int(out, str_len)
+    codegen_util::cg_emit(out, " x i8] }>, <{ i64, [")
+    codegen_util::cg_emit_int(out, str_len)
+    codegen_util::cg_emit(out, " x i8] }>* @.str.")
+    codegen_util::cg_emit_int(out, str_idx)
+    codegen_util::cg_emit_line(out, ", i64 0, i32 1, i64 0")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = ptrtoint ptr %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ".ptr to i64")
+    return
+  end
+  
+  if kind == mir::MIR_CONST_FLOAT
+    var float_str = instr.mir_instr_get_string_val()
+    # LLVM requires a decimal point in double literals
+    # (e.g., 1e5 is invalid LLVM IR, but 1.0e5 is valid)
+    if not str_contains(float_str, ".")
+      var e_pos = __char_index(float_str, 'e')
+      if e_pos < 0
+        e_pos = __char_index(float_str, 'E')
+      end
+      if e_pos >= 0
+        var before = str_byte_slice(float_str, 0, e_pos)
+        var after = str_byte_slice(float_str, e_pos, str_byte_len(float_str))
+        float_str = str_concat(str_concat(before, ".0"), after)
+      else
+        float_str = str_concat(float_str, ".0")
+      end
+    end
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = bitcast double ")
+    codegen_util::cg_emit(out, float_str)
+    codegen_util::cg_emit_line(out, " to i64")
+    return
+  end
+  
+  if kind == mir::MIR_INLINE_C
+    # Get code string and args, emit as LLVM inline assembly
+    var code_str = instr.mir_instr_get_string_val()
+    var args = instr.mir_instr_get_args()  # Vector of MIR value IDs
+    var dquote = str_from_char('"')
+    var arg_count = 0
+    if args != 0
+      arg_count = args.size
+    end
+    
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = call i64 asm sideeffect ")
+    codegen_util::cg_emit(out, dquote)
+    codegen_util::cg_emit(out, code_str)
+    codegen_util::cg_emit(out, dquote)
+    codegen_util::cg_emit(out, ", ")
+    codegen_util::cg_emit(out, dquote)
+    # Build constraint string: "=r" for output, ",r" for each input
+    codegen_util::cg_emit(out, "=r")
+    var i = 0
+    while i < arg_count
+      codegen_util::cg_emit(out, ",r")
+      i += 1
+    end
+    codegen_util::cg_emit(out, dquote)
+    # Emit arguments
+    codegen_util::cg_emit(out, "(")
+    i = 0
+    while i < arg_count
+      if i > 0
+        codegen_util::cg_emit(out, ", ")
+      end
+      codegen_util::cg_emit(out, "i64 %v")
+      codegen_util::cg_emit_int(out, args[i])
+      i += 1
+    end
+    codegen_util::cg_emit_line(out, ")")
+    return
+  end
+  
+  if kind == mir::MIR_LOAD_VAR
+    var var_name = instr.mir_instr_get_var_name()
+    var is_global = instr.mir_instr_get_slot1()
+    var safe_name = var_name
+    if is_global == 0
+      safe_name = codegen_util::cg_sanitize_var_name(var_name)
+      var local_type = state.current_func.unwrap().mir_func_get_local_type(var_name)
+      if local_type.mir_is_narrow_fixed_width()
+        var llvm_type = local_type.mir_type_name_to_llvm()
+        var ext_op = "sext"
+        if local_type.mir_is_unsigned_type()
+          ext_op = "zext"
+        end
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, ".narrow = load ")
+        codegen_util::cg_emit(out, llvm_type)
+        codegen_util::cg_emit(out, ", ")
+        codegen_util::cg_emit(out, llvm_type)
+        codegen_util::cg_emit(out, "* %")
+        codegen_util::cg_emit_line(out, safe_name)
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit(out, " = ")
+        codegen_util::cg_emit(out, ext_op)
+        codegen_util::cg_emit(out, " ")
+        codegen_util::cg_emit(out, llvm_type)
+        codegen_util::cg_emit(out, " %v")
+        codegen_util::cg_emit_int(out, dest)
+        codegen_util::cg_emit_line(out, ".narrow to i64")
+        return
+      end
+    end
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    if is_global == 1
+      codegen_util::cg_emit(out, " = load i64, ptr @global_")
+      codegen_util::cg_emit(out, var_name)
+      codegen_util::cg_emit_line(out, ", align 8")
+    else
+      codegen_util::cg_emit(out, " = load i64, ptr %")
+      codegen_util::cg_emit(out, safe_name)
+      codegen_util::cg_emit_line(out, ", align 8")
+    end
+    return
+  end
+
+  if kind == mir::MIR_STORE_VAR
+    var var_name = instr.mir_instr_get_var_name()
+    var src = instr.mir_instr_get_operand2()
+    var is_global = instr.mir_instr_get_slot1()
+    var safe_name = var_name
+    if is_global == 0
+      safe_name = codegen_util::cg_sanitize_var_name(var_name)
+      var local_type = state.current_func.unwrap().mir_func_get_local_type(var_name)
+      if local_type.mir_is_narrow_fixed_width()
+        var llvm_type = local_type.mir_type_name_to_llvm()
+        codegen_util::cg_emit(out, "  %v")
+        codegen_util::cg_emit_int(out, src)
+        codegen_util::cg_emit(out, ".st = trunc i64 %v")
+        codegen_util::cg_emit_int(out, src)
+        codegen_util::cg_emit(out, " to ")
+        codegen_util::cg_emit_line(out, llvm_type)
+        codegen_util::cg_emit(out, "  store ")
+        codegen_util::cg_emit(out, llvm_type)
+        codegen_util::cg_emit(out, " %v")
+        codegen_util::cg_emit_int(out, src)
+        codegen_util::cg_emit(out, ".st, ")
+        codegen_util::cg_emit(out, llvm_type)
+        codegen_util::cg_emit(out, "* %")
+        codegen_util::cg_emit_line(out, safe_name)
+        return
+      end
+    end
+    codegen_util::cg_emit(out, "  store i64 %v")
+    codegen_util::cg_emit_int(out, src)
+    if is_global == 1
+      codegen_util::cg_emit(out, ", ptr @global_")
+      codegen_util::cg_emit(out, var_name)
+      codegen_util::cg_emit_line(out, ", align 8")
+    else
+      codegen_util::cg_emit(out, ", ptr %")
+      codegen_util::cg_emit(out, safe_name)
+      codegen_util::cg_emit_line(out, ", align 8")
+    end
+    return
+  end
+  
+  if kind == mir::MIR_ADDR_OF
+    var var_name = instr.mir_instr_get_var_name()
+    var safe_name = codegen_util::cg_sanitize_var_name(var_name)
+    var addr_local_type = state.current_func.unwrap().mir_func_get_local_type(var_name)
+    if addr_local_type.mir_is_narrow_fixed_width()
+      var llvm_type = addr_local_type.mir_type_name_to_llvm()
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = ptrtoint ")
+      codegen_util::cg_emit(out, llvm_type)
+      codegen_util::cg_emit(out, "* %")
+      codegen_util::cg_emit(out, safe_name)
+      codegen_util::cg_emit_line(out, " to i64")
+    else
+      codegen_util::cg_emit(out, "  %v")
+      codegen_util::cg_emit_int(out, dest)
+      codegen_util::cg_emit(out, " = ptrtoint ptr %")
+      codegen_util::cg_emit(out, safe_name)
+      codegen_util::cg_emit_line(out, " to i64")
+    end
+    return
+  end
+  
+  if kind == mir::MIR_BINARY
+    cg_emit_binary(state, out, prog, instr)
+    return
+  end
+
+  if kind == mir::MIR_CALL or kind == mir::MIR_CALL_INDIRECT or kind == mir::MIR_FUNC_REF
+    cg_emit_call_ops(state, out, prog, instr)
+    return
+  end
+
+  if kind == mir::MIR_INTRINSIC
+    codegen_intrinsics::cg_emit_intrinsic(state, out, prog, instr)
+    return
+  end
+  
+  if kind == mir::MIR_ALLOC or kind == mir::MIR_ALLOC_STACK or kind == mir::MIR_LOAD or kind == mir::MIR_STORE or kind == mir::MIR_LOAD_OFFSET or kind == mir::MIR_FIELD_ADDR
+    cg_emit_memory_ops(state, out, prog, instr)
+    return
+  end
+
+  if kind == mir::MIR_FIELD_ACCESS
+    var obj = instr.mir_instr_get_operand1()
+    var field_idx = instr.mir_instr_get_slot1()
+    codegen_util::cg_emit(out, "  %fptr_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = inttoptr i64 %v")
+    codegen_util::cg_emit_int(out, obj)
+    codegen_util::cg_emit_line(out, " to ptr")
+    codegen_util::cg_emit(out, "  %fgep_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = getelementptr inbounds i64, ptr %fptr_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ", i64 ")
+    codegen_util::cg_emit_line(out, field_idx.to_s())
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = load i64, ptr %fgep_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ", align 8")
+    return
+  end
+  
+  if kind == mir::MIR_INDEX or kind == mir::MIR_INDEX_STORE or kind == mir::MIR_VEC_DATA_PTR or kind == mir::MIR_INDEX_RAW or kind == mir::MIR_INDEX_STORE_RAW
+    cg_emit_index_ops(state, out, prog, instr)
+    return
+  end
+
+  if kind == mir::MIR_SELECT
+    var cond = instr.mir_instr_get_operand1()
+    var true_val = instr.mir_instr_get_operand2()
+    var false_val = instr.mir_instr_get_slot1()
+    # Convert condition to i1, then select
+    codegen_util::cg_emit(out, "  %cond_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = icmp ne i64 %v")
+    codegen_util::cg_emit_int(out, cond)
+    codegen_util::cg_emit_line(out, ", 0")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = select i1 %cond_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_int(out, true_val)
+    codegen_util::cg_emit(out, ", i64 %v")
+    codegen_util::cg_emit_line(out, false_val.to_s())
+    return
+  end
+  
+  # mir::MIR_UNION_WRAP: calloc(2, 8), store tag at [0], payload at [1], ptrtoint
+  if kind == mir::MIR_UNION_WRAP
+    var tag_val = instr.mir_instr_get_operand1()
+    var payload = instr.mir_instr_get_operand2()
+    codegen_util::cg_emit(out, "  %uw_ptr_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, " = call ptr @calloc(i64 2, i64 8)")
+    codegen_util::cg_emit(out, "  %uw_i64_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = bitcast ptr %uw_ptr_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, " to ptr")
+    codegen_util::cg_emit(out, "  store i64 %v")
+    codegen_util::cg_emit_int(out, tag_val)
+    codegen_util::cg_emit(out, ", ptr %uw_i64_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ", align 8")
+    codegen_util::cg_emit(out, "  %uw_gep_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = getelementptr inbounds i64, ptr %uw_i64_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ", i64 1")
+    codegen_util::cg_emit(out, "  store i64 %v")
+    codegen_util::cg_emit_int(out, payload)
+    codegen_util::cg_emit(out, ", ptr %uw_gep_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ", align 8")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = ptrtoint ptr %uw_i64_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, " to i64")
+    return
+  end
+
+  # mir::MIR_UNION_TAG: inttoptr + load from offset 0
+  if kind == mir::MIR_UNION_TAG
+    var src = instr.mir_instr_get_operand1()
+    codegen_util::cg_emit(out, "  %ut_ptr_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = inttoptr i64 %v")
+    codegen_util::cg_emit_int(out, src)
+    codegen_util::cg_emit_line(out, " to ptr")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = load i64, ptr %ut_ptr_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ", align 8")
+    return
+  end
+
+  # mir::MIR_UNION_UNWRAP: inttoptr + GEP offset 1 + load
+  if kind == mir::MIR_UNION_UNWRAP
+    var src = instr.mir_instr_get_operand1()
+    codegen_util::cg_emit(out, "  %uu_ptr_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = inttoptr i64 %v")
+    codegen_util::cg_emit_int(out, src)
+    codegen_util::cg_emit_line(out, " to ptr")
+    codegen_util::cg_emit(out, "  %uu_gep_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = getelementptr inbounds i64, ptr %uu_ptr_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ", i64 1")
+    codegen_util::cg_emit(out, "  %v")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit(out, " = load i64, ptr %uu_gep_")
+    codegen_util::cg_emit_int(out, dest)
+    codegen_util::cg_emit_line(out, ", align 8")
+    return
+  end
+
+  # Default: emit comment for unhandled
+  codegen_util::cg_emit(out, "  ; unhandled MIR kind: ")
+  codegen_util::cg_emit_line(out, kind.to_s())
+end
+
+# ============================================================================
+# Terminator Emission
+# ============================================================================
+
+def cg_emit_terminator(state: CodegenState, out: Int, block: MirBlock): Void
+  var kind = block.mir_block_get_term_kind()
+
+  if kind == mir::TERM_RETURN
+    var val = block.mir_block_get_term_data()
+    var func = state.current_func.unwrap()
+    var prog = state.current_prog.unwrap()
+    var func_name = func.mir_func_get_name()
+    var is_main = func_name == "main"
+    var ret_type_name = func.mir_func_get_return_type_name()
+    var is_cconv_c = func.mir_func_is_cconv_c()
+    var is_cconv_x86_intr = func.mir_func_is_cconv_x86_intr()
+
+    # B.10 P2.1 — by-value @value return: %v<val> is a pointer to the result
+    # struct's N i64 slots. Load each slot and build the `{i64 x N}` aggregate
+    # (no heap box). LLVM's SysV classifier lowers the aggregate to registers
+    # (small) or an sret memory slot (large). Block handle keys SSA names so
+    # multiple return paths don't collide.
+    if codegen::cg_func_returns_byval(state, func, prog) == 1
+      var bv_fc = prog.mir_prog_get_struct_field_count(ret_type_name)
+      var bv_ty = codegen::cg_byval_ret_type_str(bv_fc)
+      # Block handle as a unique SSA-name suffix. `block.to_s()` would resolve
+      # the UFCS `.to_s()` against a MirBlock receiver — which has no Int/F64/Bool
+      # mapping and silently lowers to a null String (segfaults cg_emit). The
+      # working terminator paths emit the handle via `cg_emit_int(out, block)`;
+      # str_from_int(block) is the String-typed equivalent of that same idiom.
+      var bn = str_from_int(block)
+      if val >= 0
+        # Narrow-layout structs ({i8,...,i64}) shift later fields' byte offsets,
+        # so every field must be addressed through typed `%struct.Name` GEP rather
+        # than a flat i64 index. Narrow fields load as iN then zext/sext to the
+        # widened i64 aggregate slot; wide fields load i64 directly.
+        var rb_narrow = prog.mir_prog_struct_has_narrow_fields(ret_type_name)
+        codegen_util::cg_emit(out, "  %ret.bp.")
+        codegen_util::cg_emit(out, bn)
+        codegen_util::cg_emit(out, " = inttoptr i64 %v")
+        codegen_util::cg_emit_int(out, val)
+        codegen_util::cg_emit_line(out, " to ptr")
+        for bvi in 0..bv_fc
+          var bvis = bvi.to_s()
+          codegen_util::cg_emit(out, "  %ret.bg")
+          codegen_util::cg_emit(out, bn)
+          codegen_util::cg_emit(out, "_")
+          codegen_util::cg_emit(out, bvis)
+          if rb_narrow == 1
+            codegen_util::cg_emit(out, " = getelementptr inbounds %struct.")
+            codegen_util::cg_emit(out, ret_type_name)
+            codegen_util::cg_emit(out, ", ptr %ret.bp.")
+            codegen_util::cg_emit(out, bn)
+            codegen_util::cg_emit(out, ", i32 0, i32 ")
+            codegen_util::cg_emit_line(out, bvis)
+            var rb_ft = prog.mir_prog_get_struct_field_type(ret_type_name, bvi)
+            if rb_ft.mir_is_narrow_fixed_width()
+              var rb_llvm = rb_ft.mir_type_name_to_llvm()
+              var rb_ext = "sext"
+              if rb_ft.mir_is_unsigned_type()
+                rb_ext = "zext"
+              end
+              codegen_util::cg_emit(out, "  %ret.bn")
+              codegen_util::cg_emit(out, bn)
+              codegen_util::cg_emit(out, "_")
+              codegen_util::cg_emit(out, bvis)
+              codegen_util::cg_emit(out, " = load ")
+              codegen_util::cg_emit(out, rb_llvm)
+              codegen_util::cg_emit(out, ", ptr %ret.bg")
+              codegen_util::cg_emit(out, bn)
+              codegen_util::cg_emit(out, "_")
+              codegen_util::cg_emit_line(out, bvis)
+              codegen_util::cg_emit(out, "  %ret.bl")
+              codegen_util::cg_emit(out, bn)
+              codegen_util::cg_emit(out, "_")
+              codegen_util::cg_emit(out, bvis)
+              codegen_util::cg_emit(out, " = ")
+              codegen_util::cg_emit(out, rb_ext)
+              codegen_util::cg_emit(out, " ")
+              codegen_util::cg_emit(out, rb_llvm)
+              codegen_util::cg_emit(out, " %ret.bn")
+              codegen_util::cg_emit(out, bn)
+              codegen_util::cg_emit(out, "_")
+              codegen_util::cg_emit(out, bvis)
+              codegen_util::cg_emit_line(out, " to i64")
+            else
+              codegen_util::cg_emit(out, "  %ret.bl")
+              codegen_util::cg_emit(out, bn)
+              codegen_util::cg_emit(out, "_")
+              codegen_util::cg_emit(out, bvis)
+              codegen_util::cg_emit(out, " = load i64, ptr %ret.bg")
+              codegen_util::cg_emit(out, bn)
+              codegen_util::cg_emit(out, "_")
+              codegen_util::cg_emit(out, bvis)
+              codegen_util::cg_emit_line(out, ", align 8")
+            end
+          else
+            codegen_util::cg_emit(out, " = getelementptr inbounds i64, ptr %ret.bp.")
+            codegen_util::cg_emit(out, bn)
+            codegen_util::cg_emit(out, ", i64 ")
+            codegen_util::cg_emit_line(out, bvis)
+            codegen_util::cg_emit(out, "  %ret.bl")
+            codegen_util::cg_emit(out, bn)
+            codegen_util::cg_emit(out, "_")
+            codegen_util::cg_emit(out, bvis)
+            codegen_util::cg_emit(out, " = load i64, ptr %ret.bg")
+            codegen_util::cg_emit(out, bn)
+            codegen_util::cg_emit(out, "_")
+            codegen_util::cg_emit(out, bvis)
+            codegen_util::cg_emit_line(out, ", align 8")
+          end
+        end
+        # insertvalue chain: undef → fill field 0..N-1
+        for bva in 0..bv_fc
+          var bvas = bva.to_s()
+          codegen_util::cg_emit(out, "  %ret.ba")
+          codegen_util::cg_emit(out, bn)
+          codegen_util::cg_emit(out, "_")
+          codegen_util::cg_emit(out, bvas)
+          codegen_util::cg_emit(out, " = insertvalue ")
+          codegen_util::cg_emit(out, bv_ty)
+          codegen_util::cg_emit(out, " ")
+          if bva == 0
+            codegen_util::cg_emit(out, "undef")
+          else
+            codegen_util::cg_emit(out, "%ret.ba")
+            codegen_util::cg_emit(out, bn)
+            codegen_util::cg_emit(out, "_")
+            codegen_util::cg_emit(out, (bva - 1).to_s())
+          end
+          codegen_util::cg_emit(out, ", i64 %ret.bl")
+          codegen_util::cg_emit(out, bn)
+          codegen_util::cg_emit(out, "_")
+          codegen_util::cg_emit(out, bvas)
+          codegen_util::cg_emit(out, ", ")
+          codegen_util::cg_emit_line(out, bvas)
+        end
+        codegen_util::cg_emit(out, "  ret ")
+        codegen_util::cg_emit(out, bv_ty)
+        codegen_util::cg_emit(out, " %ret.ba")
+        codegen_util::cg_emit(out, bn)
+        codegen_util::cg_emit(out, "_")
+        codegen_util::cg_emit_line(out, (bv_fc - 1).to_s())
+      else
+        codegen_util::cg_emit(out, "  ret ")
+        codegen_util::cg_emit(out, bv_ty)
+        codegen_util::cg_emit_line(out, " zeroinitializer")
+      end
+      return
+    end
+
+    # B.10 P3.1b — extern "C" struct return: %v<val> is an i64 pointer to the
+    # result struct's N i64 slots (all 8-byte fields). Reinterpret-load the
+    # target's coerce aggregate (i64 / {i64,i64} / {double,double} / [2 x double]
+    # …) and return it so the foreign caller reads the right registers/sret.
+    # The signature emit (codegen.qz) consults the same predicate, so the return
+    # type and this terminator always agree.
+    if is_cconv_c == 1 and is_main == 0
+      var c_ret_coerce = codegen::cg_c_abi_return_coerce(prog, state.target_triple, ret_type_name)
+      if c_ret_coerce != "" and codegen::cg_c_abi_struct_has_f32(prog, ret_type_name) == 1
+        # B.10 P3.4b — F32 struct return: boundary-repack the Quartz internal struct
+        # into the C-packed coerce value (fptrunc each F32 8→4 bytes), then return it.
+        var rfn = str_from_int(block)
+        if val >= 0
+          codegen::cg_c_abi_emit_pack(out, prog, ret_type_name, c_ret_coerce, "v" + val.to_s(), 0, "ret.fp." + rfn, "ret.fcv." + rfn)
+          codegen_util::cg_emit(out, "  ret ")
+          codegen_util::cg_emit(out, c_ret_coerce)
+          codegen_util::cg_emit(out, " %ret.fcv.")
+          codegen_util::cg_emit_line(out, rfn)
+        else
+          codegen_util::cg_emit(out, "  ret ")
+          codegen_util::cg_emit(out, c_ret_coerce)
+          codegen_util::cg_emit_line(out, " zeroinitializer")
+        end
+        return
+      end
+      if c_ret_coerce != ""
+        var rcn = str_from_int(block)
+        if val >= 0
+          codegen_util::cg_emit(out, "  %ret.cc.")
+          codegen_util::cg_emit(out, rcn)
+          codegen_util::cg_emit(out, " = inttoptr i64 %v")
+          codegen_util::cg_emit_int(out, val)
+          codegen_util::cg_emit_line(out, " to ptr")
+          codegen_util::cg_emit(out, "  %ret.ca.")
+          codegen_util::cg_emit(out, rcn)
+          codegen_util::cg_emit(out, " = load ")
+          codegen_util::cg_emit(out, c_ret_coerce)
+          codegen_util::cg_emit(out, ", ptr %ret.cc.")
+          codegen_util::cg_emit(out, rcn)
+          codegen_util::cg_emit_line(out, ", align 8")
+          codegen_util::cg_emit(out, "  ret ")
+          codegen_util::cg_emit(out, c_ret_coerce)
+          codegen_util::cg_emit(out, " %ret.ca.")
+          codegen_util::cg_emit_line(out, rcn)
+        else
+          codegen_util::cg_emit(out, "  ret ")
+          codegen_util::cg_emit(out, c_ret_coerce)
+          codegen_util::cg_emit_line(out, " zeroinitializer")
+        end
+        return
+      end
+      # B.10 P3.3 — extern "C" struct return >16B: the result is returned
+      # indirectly through the hidden `ptr sret([N x i64]) %sret` first parameter.
+      # %v<val> points to the result struct's N i64 slots; copy each word into the
+      # caller's sret slot, then `ret void`. Block handle keys SSA names so multiple
+      # return paths don't collide.
+      var c_ret_sret = codegen::cg_c_abi_return_indirect(prog, state.target_triple, ret_type_name)
+      if c_ret_sret != ""
+        var rsn = str_from_int(block)
+        # B.10 P3.4-ii-b — F32 result: the Quartz internal struct stores F32 as
+        # 8-byte double-bits, so repack field-by-field (fptrunc each F32) into the
+        # C-layout `%sret` (%struct.Name.cabi) buffer the caller allocated.
+        if val >= 0 and codegen::cg_c_abi_struct_has_f32(prog, ret_type_name) == 1
+          codegen_util::cg_emit_line(out, "  %ret.fqp.#{rsn} = inttoptr i64 %v#{val.to_s()} to %struct.#{ret_type_name}*")
+          codegen::cg_c_abi_emit_qz_to_c_buf(out, prog, ret_type_name, "ret.fqp.#{rsn}", "sret", "ret.fsr.#{rsn}")
+          codegen_util::cg_emit_line(out, "  ret void")
+          return
+        end
+        # B.10 P3.4-ii-a — narrow-packed result: the Quartz internal `%struct.Name`
+        # IS the C layout (packed iN at true offsets), so a single whole-struct
+        # load/store copies it into the C caller's `%sret` slot correctly. The
+        # i64-strided copy below would write at the wrong (8-byte) offsets.
+        if val >= 0 and codegen::cg_c_abi_struct_is_narrow_packed(prog, ret_type_name) == 1
+          codegen_util::cg_emit_line(out, "  %ret.spn.#{rsn} = inttoptr i64 %v#{val.to_s()} to %struct.#{ret_type_name}*")
+          codegen_util::cg_emit_line(out, "  %ret.swh.#{rsn} = load %struct.#{ret_type_name}, %struct.#{ret_type_name}* %ret.spn.#{rsn}")
+          codegen_util::cg_emit_line(out, "  store %struct.#{ret_type_name} %ret.swh.#{rsn}, ptr %sret")
+          codegen_util::cg_emit_line(out, "  ret void")
+          return
+        end
+        if val >= 0
+          var sret_fc = prog.mir_prog_get_struct_field_count(ret_type_name)
+          codegen_util::cg_emit(out, "  %ret.sp.")
+          codegen_util::cg_emit(out, rsn)
+          codegen_util::cg_emit(out, " = inttoptr i64 %v")
+          codegen_util::cg_emit_int(out, val)
+          codegen_util::cg_emit_line(out, " to ptr")
+          for sfi in 0..sret_fc
+            var sfis = sfi.to_s()
+            codegen_util::cg_emit(out, "  %ret.sg")
+            codegen_util::cg_emit(out, rsn)
+            codegen_util::cg_emit(out, "_")
+            codegen_util::cg_emit(out, sfis)
+            codegen_util::cg_emit(out, " = getelementptr inbounds i64, ptr %ret.sp.")
+            codegen_util::cg_emit(out, rsn)
+            codegen_util::cg_emit(out, ", i64 ")
+            codegen_util::cg_emit_line(out, sfis)
+            codegen_util::cg_emit(out, "  %ret.sl")
+            codegen_util::cg_emit(out, rsn)
+            codegen_util::cg_emit(out, "_")
+            codegen_util::cg_emit(out, sfis)
+            codegen_util::cg_emit(out, " = load i64, ptr %ret.sg")
+            codegen_util::cg_emit(out, rsn)
+            codegen_util::cg_emit(out, "_")
+            codegen_util::cg_emit(out, sfis)
+            codegen_util::cg_emit_line(out, ", align 8")
+            codegen_util::cg_emit(out, "  %ret.dg")
+            codegen_util::cg_emit(out, rsn)
+            codegen_util::cg_emit(out, "_")
+            codegen_util::cg_emit(out, sfis)
+            codegen_util::cg_emit(out, " = getelementptr inbounds i64, ptr %sret, i64 ")
+            codegen_util::cg_emit_line(out, sfis)
+            codegen_util::cg_emit(out, "  store i64 %ret.sl")
+            codegen_util::cg_emit(out, rsn)
+            codegen_util::cg_emit(out, "_")
+            codegen_util::cg_emit(out, sfis)
+            codegen_util::cg_emit(out, ", ptr %ret.dg")
+            codegen_util::cg_emit(out, rsn)
+            codegen_util::cg_emit(out, "_")
+            codegen_util::cg_emit(out, sfis)
+            codegen_util::cg_emit_line(out, ", align 8")
+          end
+        end
+        codegen_util::cg_emit_line(out, "  ret void")
+        return
+      end
+    end
+
+    var has_narrow_ret = 0
+    if is_main == 0
+      if ret_type_name.mir_is_narrow_fixed_width()
+        has_narrow_ret = 1
+      end
+    end
+    # C calling convention: CPtr/String return uses ptr type
+    var has_ptr_ret = 0
+    if is_cconv_c == 1 and is_main == 0
+      if ret_type_name == "CPtr" or ret_type_name == "String"
+        has_ptr_ret = 1
+      end
+    end
+    var has_void_ret = 0
+    if is_cconv_c == 1 and is_main == 0 and ret_type_name == "Void"
+      has_void_ret = 1
+    end
+    # x86_intrcc requires void return (parser enforces at source level);
+    # emit `ret void` so the IR is well-formed. Same for preserve_all/most
+    # when return type is Void.
+    if is_cconv_x86_intr == 1 and is_main == 0
+      has_void_ret = 1
+    end
+    # B.10 P3.1b — scalar F64 return: the value comes back in an FP register, so
+    # the type is `double`; %v<val> holds the i64 bit pattern → bitcast to double.
+    var has_f64_ret = 0
+    if is_cconv_c == 1 and is_main == 0 and ret_type_name == "F64"
+      has_f64_ret = 1
+    end
+    var ret_type = "i64"
+    if has_ptr_ret == 1
+      ret_type = "ptr"
+    elsif has_void_ret == 1
+      ret_type = "void"
+    elsif has_f64_ret == 1
+      ret_type = "double"
+    elsif has_narrow_ret == 1
+      ret_type = ret_type_name.mir_type_name_to_llvm()
+    end
+    # Void-returning functions ignore any trailing value and emit
+    # `ret void`. This matters for x86_intrcc (must be void) and for
+    # any cconv_c Void function that happens to have a live %v<N>
+    # reaching the terminator (e.g. trailing `@c(...)` inline asm that
+    # synthesizes an i64 output operand).
+    if has_void_ret == 1
+      codegen_util::cg_emit_line(out, "  ret void")
+      return
+    end
+    # val < 0 is sentinel for void/implicit return - emit ret <type> 0
+    if val >= 0
+      if has_ptr_ret == 1
+        # Convert i64 to ptr for C calling convention
+        codegen_util::cg_emit(out, "  %ret.ptr.")
+        codegen_util::cg_emit_int(out, block)
+        codegen_util::cg_emit(out, " = inttoptr i64 %v")
+        codegen_util::cg_emit_int(out, val)
+        codegen_util::cg_emit_line(out, " to ptr")
+        codegen_util::cg_emit(out, "  ret ptr %ret.ptr.")
+        codegen_util::cg_emit_int(out, block)
+        codegen_util::cg_emit_line(out, "")
+      elsif has_narrow_ret == 1
+        # Truncate i64 value to narrow type before returning
+        # Use block handle for unique SSA name (multiple return paths)
+        codegen_util::cg_emit(out, "  %ret.trunc.")
+        codegen_util::cg_emit_int(out, block)
+        codegen_util::cg_emit(out, " = trunc i64 %v")
+        codegen_util::cg_emit_int(out, val)
+        codegen_util::cg_emit(out, " to ")
+        codegen_util::cg_emit_line(out, ret_type)
+        codegen_util::cg_emit(out, "  ret ")
+        codegen_util::cg_emit(out, ret_type)
+        codegen_util::cg_emit(out, " %ret.trunc.")
+        codegen_util::cg_emit_int(out, block)
+        codegen_util::cg_emit_line(out, "")
+      elsif has_f64_ret == 1
+        # i64 bit pattern -> double for the FP-register return.
+        codegen_util::cg_emit(out, "  %ret.f64.")
+        codegen_util::cg_emit_int(out, block)
+        codegen_util::cg_emit(out, " = bitcast i64 %v")
+        codegen_util::cg_emit_int(out, val)
+        codegen_util::cg_emit_line(out, " to double")
+        codegen_util::cg_emit(out, "  ret double %ret.f64.")
+        codegen_util::cg_emit_int(out, block)
+        codegen_util::cg_emit_line(out, "")
+      else
+        codegen_util::cg_emit(out, "  ret i64 %v")
+        codegen_util::cg_emit_line(out, val.to_s())
+      end
+    else
+      if has_void_ret == 1
+        codegen_util::cg_emit_line(out, "  ret void")
+      elsif has_f64_ret == 1
+        codegen_util::cg_emit_line(out, "  ret double 0.000000e+00")
+      else
+        codegen_util::cg_emit(out, "  ret ")
+        codegen_util::cg_emit(out, ret_type)
+        codegen_util::cg_emit_line(out, " 0")
+      end
+    end
+    return
+  end
+  
+  if kind == mir::TERM_JUMP
+    # term_data is a polymorphic i64 (value-reg for RETURN); for JUMP it is the
+    # target MirBlock handle — bridge it back rather than re-typing the getter.
+    var target: mir::MirBlock = as_type<mir::MirBlock>(block.mir_block_get_term_data())
+    var label = target.mir_block_get_label()
+    # Phase S.3: Attach loop vectorization metadata on loop back-edges
+    var is_loop_back = 0
+    if str_byte_len(label) >= 8
+      if label.starts_with("for_cond")
+        is_loop_back = 1
+      end
+    end
+    if is_loop_back == 0
+      if str_byte_len(label) >= 10
+        if label.starts_with("while_cond")
+          is_loop_back = 1
+        end
+      end
+    end
+    if is_loop_back == 1
+      var md_id = state.metadata_counter
+      state.metadata_counter = state.metadata_counter + 2
+      state.loop_metadata_ids.push(md_id)
+      codegen_util::cg_emit(out, "  br label %")
+      codegen_util::cg_emit(out, label)
+      codegen_util::cg_emit(out, ", !llvm.loop !")
+      codegen_util::cg_emit_line(out, md_id.to_s())
+    else
+      codegen_util::cg_emit(out, "  br label %")
+      codegen_util::cg_emit_line(out, label)
+    end
+    return
+  end
+  
+  if kind == mir::TERM_BRANCH
+    var cond = block.mir_block_get_term_data()
+    var then_blk: mir::MirBlock = as_type<mir::MirBlock>(block.mir_block_get_branch_true())
+    var else_blk: mir::MirBlock = as_type<mir::MirBlock>(block.mir_block_get_branch_false())
+    var then_label = then_blk.mir_block_get_label()
+    var else_label = else_blk.mir_block_get_label()
+    
+    codegen_util::cg_emit(out, "  %cmp")
+    codegen_util::cg_emit_int(out, cond)
+    codegen_util::cg_emit(out, " = icmp ne i64 %v")
+    codegen_util::cg_emit_int(out, cond)
+    codegen_util::cg_emit_line(out, ", 0")
+    codegen_util::cg_emit(out, "  br i1 %cmp")
+    codegen_util::cg_emit_int(out, cond)
+    codegen_util::cg_emit(out, ", label %")
+    codegen_util::cg_emit(out, then_label)
+    codegen_util::cg_emit(out, ", label %")
+    codegen_util::cg_emit_line(out, else_label)
+    return
+  end
+  
+  if kind == mir::TERM_SWITCH
+    var switch_val = block.mir_block_get_term_data()
+    var default_target: mir::MirBlock = as_type<mir::MirBlock>(block.mir_block_get_branch_true())
+    var default_label = default_target.mir_block_get_label()
+    var case_values = block.mir_block_get_switch_values()
+    var case_targets = block.mir_block_get_switch_targets()
+    codegen_util::cg_emit(out, "  switch i64 %v")
+    codegen_util::cg_emit_int(out, switch_val)
+    codegen_util::cg_emit(out, ", label %")
+    codegen_util::cg_emit(out, default_label)
+    codegen_util::cg_emit_line(out, " [")
+    for ci in 0..case_values.size
+      var cv = case_values[ci]
+      var ct: mir::MirBlock = as_type<mir::MirBlock>(case_targets[ci])
+      var ct_label = ct.mir_block_get_label()
+      codegen_util::cg_emit(out, "    i64 ")
+      codegen_util::cg_emit_int(out, cv)
+      codegen_util::cg_emit(out, ", label %")
+      codegen_util::cg_emit_line(out, ct_label)
+    end
+    codegen_util::cg_emit_line(out, "  ]")
+    return
+  end
+
+  # mir::TERM_UNREACHABLE = 3
+  codegen_util::cg_emit_line(out, "  unreachable")
+end
+
+# ============================================================================
+# Block Emission
+# ============================================================================
+
+def cg_emit_block(state: CodegenState, out: Int, prog: MirProgram, block: MirBlock): Void can Emit
+  var label = block.mir_block_get_label()
+  codegen_util::cg_emit(out, label)
+  codegen_util::cg_emit_line(out, ":")
+
+  state.current_block = Option::Some(block)
+  var instrs = block.mir_block_get_instructions()
+  each(instrs, instr: MirInstr -> cg_emit_instr(state, out, prog, instr))
+
+  cg_emit_terminator(state, out, block)
+end

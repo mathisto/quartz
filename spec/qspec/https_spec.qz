@@ -1,0 +1,458 @@
+## HTTPS Client Spec — Tests for std/net/http
+##
+## Tests URL parsing, HTTP response parsing, and HTTP client network integration.
+## Network integration tests use local TCP/TLS servers with spawn+atomic port signaling.
+##
+## Contract:
+##   1. URL parsing for HTTPS.
+##   2. HTTP response parsing.
+##   3. HTTP client — network integration (GET, POST, redirects, TLS, timeout).
+
+import * from qspec
+import std/net/http
+import std/net/tcp
+import std/net/tls
+import std/time
+
+# =============================================================================
+# Helpers — URL parsing (pure string functions)
+# =============================================================================
+
+def print_url_host_https(): Void
+  puts(url_host("https://api.github.com/repos"))
+end
+
+def print_url_port_https(): Void
+  puts(str_from_int(url_port("https://api.github.com/repos")))
+end
+
+def print_url_port_http(): Void
+  puts(str_from_int(url_port("http://example.com/")))
+end
+
+def print_url_path_https(): Void
+  puts(url_path("https://api.github.com/repos/quartz/lang"))
+end
+
+def print_url_is_https_yes(): Void
+  if url_is_https("https://example.com")
+    puts("true")
+  else
+    puts("false")
+  end
+end
+
+def print_url_is_https_no(): Void
+  if url_is_https("http://example.com")
+    puts("true")
+  else
+    puts("false")
+  end
+end
+
+# =============================================================================
+# Helpers — HTTP response parsing (pure string functions)
+# =============================================================================
+
+def print_parse_status_200(): Void
+  puts(str_from_int(http_parse_status("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")))
+end
+
+def print_parse_status_404(): Void
+  puts(str_from_int(http_parse_status("HTTP/1.1 404 Not Found\r\n\r\n")))
+end
+
+def print_parse_status_text_ok(): Void
+  puts(http_parse_status_text("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"))
+end
+
+def print_parse_status_text_notfound(): Void
+  puts(http_parse_status_text("HTTP/1.1 404 Not Found\r\n\r\n"))
+end
+
+def print_parse_header_content_length(): Void
+  puts(http_parse_header("HTTP/1.1 200 OK\r\nContent-Length: 42\r\nContent-Type: text/html\r\n\r\nbody", "Content-Length"))
+end
+
+def print_parse_header_content_type(): Void
+  puts(http_parse_header("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/html\r\n\r\nhello", "Content-Type"))
+end
+
+def print_parse_header_missing(): Void
+  result = http_parse_header("HTTP/1.1 200 OK\r\n\r\nhello", "X-Custom")
+  if result.size == 0
+    puts("empty")
+  else
+    puts(result)
+  end
+end
+
+def print_is_ok_200(): Void
+  response = HttpResponse { status: 200, status_text: "OK", body: "hello", content_length: 5 }
+  if http_is_ok(response)
+    puts("true")
+  else
+    puts("false")
+  end
+end
+
+def print_is_redirect_301(): Void
+  response = HttpResponse { status: 301, status_text: "Moved", body: "", content_length: 0 }
+  if http_is_redirect(response)
+    puts("true")
+  else
+    puts("false")
+  end
+end
+
+# =============================================================================
+# Server infrastructure — spawn+atomic port signaling pattern
+# =============================================================================
+
+# Poll atomic until server signals its port
+def _http_wait_port(atom: Int): Int
+  var port = 0
+  while port == 0
+    sleep_ms(1)
+    port = atomic_load(atom)
+  end
+  return port
+end
+
+# TCP server: accept one connection, send a fixed HTTP response
+def _http_srv_static(atom: Int, status: Int, body: String): Int
+  match tcp_listen(0)
+    Ok(listener) => {
+      atomic_store(atom, listener.port)
+      match tcp_accept(listener)
+        Ok(conn) => {
+          match tcp_read(conn, 4096)
+            Ok(data) => {
+              var response = "HTTP/1.1 #{str_from_int(status)} OK\r\nContent-Length: #{str_from_int(str_byte_len(body))}\r\nConnection: close\r\n\r\n#{body}"
+              tcp_write_all(conn, response)
+              0
+            }
+            Err(e) => 0
+          end
+          tcp_close(conn)
+        }
+        Err(e) => 0
+      end
+      tcp_close_listener(listener)
+    }
+    Err(e) => 0
+  end
+  return 0
+end
+
+# TCP server: accept, read request, echo POST body back as response
+def _http_srv_echo_post(atom: Int): Int
+  match tcp_listen(0)
+    Ok(listener) => {
+      atomic_store(atom, listener.port)
+      match tcp_accept(listener)
+        Ok(conn) => {
+          match tcp_read(conn, 4096)
+            Ok(data) => {
+              var body = ""
+              match str_byte_find(data, "\r\n\r\n")
+                Some(pos) => {
+                  body = str_byte_slice(data, pos + 4, str_byte_len(data))
+                }
+                None => {}
+                _ => {}
+              end
+              var response = "HTTP/1.1 200 OK\r\nContent-Length: #{str_from_int(str_byte_len(body))}\r\nConnection: close\r\n\r\n#{body}"
+              tcp_write_all(conn, response)
+              0
+            }
+            Err(e) => 0
+          end
+          tcp_close(conn)
+        }
+        Err(e) => 0
+      end
+      tcp_close_listener(listener)
+    }
+    Err(e) => 0
+  end
+  return 0
+end
+
+# TCP server: accept, send 301 redirect to the given location
+def _http_srv_redirect(atom: Int, location: String): Int
+  match tcp_listen(0)
+    Ok(listener) => {
+      atomic_store(atom, listener.port)
+      match tcp_accept(listener)
+        Ok(conn) => {
+          match tcp_read(conn, 4096)
+            Ok(data) => {
+              var response = "HTTP/1.1 301 Moved\r\nLocation: #{location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+              tcp_write_all(conn, response)
+              0
+            }
+            Err(e) => 0
+          end
+          tcp_close(conn)
+        }
+        Err(e) => 0
+      end
+      tcp_close_listener(listener)
+    }
+    Err(e) => 0
+  end
+  return 0
+end
+
+# TCP server: accept but never respond (for timeout testing)
+def _http_srv_silent(atom: Int): Int
+  match tcp_listen(0)
+    Ok(listener) => {
+      atomic_store(atom, listener.port)
+      match tcp_accept(listener)
+        Ok(conn) => {
+          sleep_ms(3000)
+          tcp_close(conn)
+        }
+        Err(e) => 0
+      end
+      tcp_close_listener(listener)
+    }
+    Err(e) => 0
+  end
+  return 0
+end
+
+# TLS server: accept one TLS connection then close
+def _http_gen_certs(): Void
+  var _r = system("openssl req -x509 -newkey rsa:2048 -keyout /tmp/_qspec_http_key.pem -out /tmp/_qspec_http_cert.pem -days 1 -nodes -subj '/CN=localhost' 2>/dev/null")
+end
+
+def _http_srv_tls_accept(atom: Int, cert: String, key: String): Int
+  var ctx = tls_ctx_new_server()
+  tls_ctx_load_cert(ctx, cert)
+  tls_ctx_load_key(ctx, key)
+  match tcp_listen(0)
+    Ok(listener) => {
+      atomic_store(atom, listener.port)
+      match tcp_accept(listener)
+        Ok(conn) => {
+          match tls_accept(ctx, conn.fd)
+            Ok(stream) => {
+              tls_close(stream)
+              0
+            }
+            Err(e) => 0
+          end
+        }
+        Err(e) => 0
+      end
+      tcp_close_listener(listener)
+    }
+    Err(e) => 0
+  end
+  tls_ctx_free(ctx)
+  return 0
+end
+
+# =============================================================================
+# Helpers — network integration tests
+# =============================================================================
+
+def print_http_get_local(): Void
+  atom = atomic_new(0)
+  h = go _http_srv_static(atom, 200, "hello from quartz")
+  var port = _http_wait_port(atom)
+  var url = "http://127.0.0.1:#{str_from_int(port)}/"
+  match http_get(url)
+    Ok(response) => {
+      if response.status == 200 and str_contains(response.body, "hello from quartz")
+        puts("get_ok")
+      else
+        puts("get_fail_#{str_from_int(response.status)}")
+      end
+    }
+    Err(e) => puts("get_error: #{e.message}")
+  end
+  var _a = await h
+end
+
+def print_http_post_local(): Void
+  atom = atomic_new(0)
+  h = go _http_srv_echo_post(atom)
+  var port = _http_wait_port(atom)
+  var url = "http://127.0.0.1:#{str_from_int(port)}/"
+  match http_post(url, "test_body")
+    Ok(response) => {
+      if response.status == 200 and str_contains(response.body, "test_body")
+        puts("post_ok")
+      else
+        puts("post_fail_#{str_from_int(response.status)}")
+      end
+    }
+    Err(e) => puts("post_error: #{e.message}")
+  end
+  var _a = await h
+end
+
+def print_http_redirect_chain(): Void
+  # Spawn servers in reverse order (final first, so ports are known for redirect URLs)
+  atom3 = atomic_new(0)
+  h3 = go _http_srv_static(atom3, 200, "final")
+  var port3 = _http_wait_port(atom3)
+
+  atom2 = atomic_new(0)
+  var loc2 = "http://127.0.0.1:#{str_from_int(port3)}/step3"
+  h2 = go _http_srv_redirect(atom2, loc2)
+  var port2 = _http_wait_port(atom2)
+
+  atom1 = atomic_new(0)
+  var loc1 = "http://127.0.0.1:#{str_from_int(port2)}/step2"
+  h1 = go _http_srv_redirect(atom1, loc1)
+  var port1 = _http_wait_port(atom1)
+
+  var url = "http://127.0.0.1:#{str_from_int(port1)}/step1"
+  match http_get(url)
+    Ok(response) => {
+      if response.status == 200 and response.body.eq("final")
+        puts("redirect_ok")
+      else
+        puts("redirect_fail_#{str_from_int(response.status)}")
+      end
+    }
+    Err(e) => puts("redirect_error: #{e.message}")
+  end
+  var _a1 = await h1
+  var _a2 = await h2
+  var _a3 = await h3
+end
+
+def print_https_invalid_cert(): Void
+  _http_gen_certs()
+  cert = "/tmp/_qspec_http_cert.pem"
+  key = "/tmp/_qspec_http_key.pem"
+  atom = atomic_new(0)
+  h = go _http_srv_tls_accept(atom, cert, key)
+  var port = _http_wait_port(atom)
+  var url = "https://127.0.0.1:#{str_from_int(port)}/"
+  match http_get(url)
+    Ok(response) => puts("unexpected_success")
+    Err(e) => puts("cert_rejected")
+  end
+  var _a = await h
+end
+
+def print_http_timeout(): Void
+  atom = atomic_new(0)
+  h = go _http_srv_silent(atom)
+  var port = _http_wait_port(atom)
+  var url = "http://127.0.0.1:#{str_from_int(port)}/"
+  var start = time_epoch_ms()
+  match http_get_timeout(url, 1000)
+    Ok(response) => puts("unexpected_response")
+    Err(e) => {
+      var elapsed = time_epoch_ms() - start
+      if elapsed >= 800 and elapsed <= 5000
+        puts("timeout_ok")
+      else
+        puts("timeout_elapsed_#{str_from_int(elapsed)}")
+      end
+    }
+  end
+  var _a = await h
+end
+
+# =============================================================================
+# Tests
+# =============================================================================
+
+def main(): Int
+  describe("URL parsing for HTTPS") do ->
+    it("extracts host from https URL") do ->
+      assert_output("api.github.com\n", print_url_host_https)
+    end
+
+    it("returns port 443 for https URLs") do ->
+      assert_output("443\n", print_url_port_https)
+    end
+
+    it("returns port 80 for http URLs") do ->
+      assert_output("80\n", print_url_port_http)
+    end
+
+    it("extracts path from https URL") do ->
+      assert_output("/repos/quartz/lang\n", print_url_path_https)
+    end
+
+    it("detects https scheme") do ->
+      assert_output("true\n", print_url_is_https_yes)
+    end
+
+    it("detects non-https scheme") do ->
+      assert_output("false\n", print_url_is_https_no)
+    end
+  end
+
+  describe("HTTP response parsing") do ->
+    it("parses 200 status code") do ->
+      assert_output("200\n", print_parse_status_200)
+    end
+
+    it("parses 404 status code") do ->
+      assert_output("404\n", print_parse_status_404)
+    end
+
+    it("parses status text OK") do ->
+      assert_output("OK\n", print_parse_status_text_ok)
+    end
+
+    it("parses status text Not Found") do ->
+      assert_output("Not Found\n", print_parse_status_text_notfound)
+    end
+
+    it("parses Content-Length header") do ->
+      assert_output("42\n", print_parse_header_content_length)
+    end
+
+    it("parses Content-Type header") do ->
+      assert_output("text/html\n", print_parse_header_content_type)
+    end
+
+    it("returns empty for missing header") do ->
+      assert_output("empty\n", print_parse_header_missing)
+    end
+
+    it("http_is_ok returns true for 200") do ->
+      assert_output("true\n", print_is_ok_200)
+    end
+
+    it("http_is_redirect returns true for 301") do ->
+      assert_output("true\n", print_is_redirect_301)
+    end
+  end
+
+  describe("HTTP client — network integration") do ->
+    it("GET request to local TCP server") do ->
+      assert_output("get_ok\n", print_http_get_local)
+    end
+
+    it("POST request to local TCP server") do ->
+      assert_output("post_ok\n", print_http_post_local)
+    end
+
+    it("follows multiple redirects (3-hop chain)") do ->
+      assert_output("redirect_ok\n", print_http_redirect_chain)
+    end
+
+    it("rejects HTTPS with invalid certificate") do ->
+      assert_output("cert_rejected\n", print_https_invalid_cert)
+    end
+
+    it("times out on unresponsive server") do ->
+      assert_output("timeout_ok\n", print_http_timeout)
+    end
+  end
+
+  return qspec_main()
+end

@@ -1,0 +1,332 @@
+# std/net/buffered_net.qz - Buffered network I/O (Layer 2)
+#
+# Provides buffered reader/writer for network sockets (TCP and TLS).
+# Replaces byte-at-a-time recv() with efficient chunked reads.
+#
+# Example:
+#   import std/net/buffered_net
+#   import std/net/tcp
+#
+#   match tcp_connect("example.com", 80)
+#     TcpResult::Ok(conn) =>
+#       tcp_write(conn, "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+#       var reader = net_reader_new_tcp(conn.fd)
+#       var line = net_reader_read_line(reader)
+#       puts("Status: " + line)
+#       net_reader_close(reader)
+#     TcpResult::Err(e) => puts(e.message)
+#   end
+
+import std/ffi/socket
+import std/ffi/tls
+
+# =============================================================================
+# BufferedNetReader — reads from TCP or TLS in chunks
+# =============================================================================
+
+struct BufferedNetReader
+  fd: Int          # Socket file descriptor
+  ssl: Int         # SSL* (0 for plain TCP, non-zero for TLS)
+  buf: Int         # Buffer pointer (raw memory)
+  buf_pos: Int     # Current read position in buffer
+  buf_len: Int     # Number of valid bytes in buffer
+  buf_cap: Int     # Buffer capacity
+  eof: Int         # 1 if EOF reached
+end
+
+# Default buffer size
+def NET_BUF_SIZE(): Int = 8192
+
+# Create a buffered reader for a plain TCP socket.
+def net_reader_new_tcp(fd: Int): BufferedNetReader
+  var buf = mem_alloc(NET_BUF_SIZE())
+  return BufferedNetReader {
+    fd: fd,
+    ssl: 0,
+    buf: buf,
+    buf_pos: 0,
+    buf_len: 0,
+    buf_cap: NET_BUF_SIZE(),
+    eof: 0
+  }
+end
+
+# Create a buffered reader for a TLS stream.
+# ssl_ptr: The SSL* pointer from TlsStream.ssl
+# fd: The underlying socket fd
+def net_reader_new_tls(ssl_ptr: Int, fd: Int): BufferedNetReader
+  var buf = mem_alloc(NET_BUF_SIZE())
+  return BufferedNetReader {
+    fd: fd,
+    ssl: ssl_ptr,
+    buf: buf,
+    buf_pos: 0,
+    buf_len: 0,
+    buf_cap: NET_BUF_SIZE(),
+    eof: 0
+  }
+end
+
+# Create a buffered reader with custom buffer size.
+def net_reader_new_tcp_sized(fd: Int, size: Int): BufferedNetReader
+  var buf = mem_alloc(size)
+  return BufferedNetReader {
+    fd: fd,
+    ssl: 0,
+    buf: buf,
+    buf_pos: 0,
+    buf_len: 0,
+    buf_cap: size,
+    eof: 0
+  }
+end
+
+# Internal: Refill the buffer from the network.
+def _net_reader_refill(r: BufferedNetReader): Void
+  if r.eof
+    return
+  end
+
+  var n = 0
+  if r.ssl != 0
+    # TLS read
+    n = SSL_read(int_to_cptr(r.ssl), r.buf, r.buf_cap)
+  else
+    # Plain TCP read
+    n = socket_recv(r.fd, r.buf, r.buf_cap, 0)
+  end
+
+  if n <= 0
+    r.eof = 1
+    r.buf_pos = 0
+    r.buf_len = 0
+  else
+    r.buf_pos = 0
+    r.buf_len = n
+  end
+end
+
+# Read a single line (up to newline or EOF).
+# Returns the line content WITHOUT the trailing newline.
+# Returns "" at EOF.
+def net_reader_read_line(r: BufferedNetReader): String
+  var sb = sb_new()
+  var found = 0
+
+  while found == 0
+    # Refill if buffer exhausted
+    if r.buf_pos >= r.buf_len
+      _net_reader_refill(r)
+      if r.eof
+        return sb_to_string(sb)
+      end
+    end
+
+    # Scan for newline in current buffer
+    var i = r.buf_pos
+    while i < r.buf_len
+      var ch = ptr_read_byte(ptr_add(r.buf, i))
+      if ch == '\n'
+        # Found newline — append everything up to it
+        if i > r.buf_pos
+          var chunk = str_from_ptr(ptr_add(r.buf, r.buf_pos), i - r.buf_pos)
+          sb_append(sb, chunk)
+        end
+        r.buf_pos = i + 1
+        found = 1
+        i = r.buf_len
+      end
+      i += 1
+    end
+
+    if found == 0
+      # No newline found — append all remaining buffer data and refill
+      if r.buf_len > r.buf_pos
+        var chunk = str_from_ptr(ptr_add(r.buf, r.buf_pos), r.buf_len - r.buf_pos)
+        sb_append(sb, chunk)
+      end
+      r.buf_pos = r.buf_len
+    end
+  end
+
+  # Strip trailing \r if present (for \r\n line endings)
+  var result = sb_to_string(sb)
+  var rlen = str_byte_len(result)
+  if rlen > 0 and str_byte_at(result, rlen - 1) == '\r'
+    return str_byte_slice(result, 0, rlen - 1)
+  end
+  return result
+end
+
+# Read exactly n bytes (or fewer at EOF).
+def net_reader_read_n(r: BufferedNetReader, n: Int): String
+  var sb = sb_new()
+  var remaining = n
+
+  while remaining > 0
+    if r.buf_pos >= r.buf_len
+      _net_reader_refill(r)
+      if r.eof
+        return sb_to_string(sb)
+      end
+    end
+
+    var available = r.buf_len - r.buf_pos
+    if available > remaining
+      available = remaining
+    end
+
+    var chunk = str_from_ptr(ptr_add(r.buf, r.buf_pos), available)
+    sb_append(sb, chunk)
+    r.buf_pos += available
+    remaining -= available
+  end
+
+  return sb_to_string(sb)
+end
+
+# Read all data until EOF.
+def net_reader_read_all(r: BufferedNetReader): String
+  var sb = sb_new()
+
+  while r.eof == 0
+    if r.buf_pos >= r.buf_len
+      _net_reader_refill(r)
+      if r.eof
+        return sb_to_string(sb)
+      end
+    end
+
+    if r.buf_len > r.buf_pos
+      var chunk = str_from_ptr(ptr_add(r.buf, r.buf_pos), r.buf_len - r.buf_pos)
+      sb_append(sb, chunk)
+      r.buf_pos = r.buf_len
+    end
+  end
+
+  return sb_to_string(sb)
+end
+
+# Check if EOF has been reached and buffer is exhausted.
+def net_reader_is_eof(r: BufferedNetReader): Bool
+  if r.eof and r.buf_pos >= r.buf_len
+    return true
+  end
+  # Try a refill to see if there's more data
+  if r.buf_pos >= r.buf_len
+    _net_reader_refill(r)
+  end
+  return r.eof and r.buf_pos >= r.buf_len
+end
+
+# Close the buffered reader and free the buffer.
+# Does NOT close the underlying socket (caller is responsible).
+def net_reader_close(r: BufferedNetReader): Void
+  if r.buf != 0
+    qz_free(r.buf)
+  end
+end
+
+# =============================================================================
+# BufferedNetWriter — writes to TCP or TLS in chunks
+# =============================================================================
+
+# SSL_write imported via std/ffi/tls
+
+struct BufferedNetWriter
+  fd: Int          # Socket file descriptor
+  ssl: Int         # SSL* (0 for plain TCP)
+  buf: Int         # Buffer pointer (raw memory)
+  buf_len: Int     # Bytes currently in buffer
+  buf_cap: Int     # Buffer capacity
+end
+
+# Create a buffered writer for a plain TCP socket.
+def net_writer_new_tcp(fd: Int): BufferedNetWriter
+  var buf = mem_alloc(NET_BUF_SIZE())
+  return BufferedNetWriter {
+    fd: fd,
+    ssl: 0,
+    buf: buf,
+    buf_len: 0,
+    buf_cap: NET_BUF_SIZE()
+  }
+end
+
+# Create a buffered writer for a TLS stream.
+def net_writer_new_tls(ssl_ptr: Int, fd: Int): BufferedNetWriter
+  var buf = mem_alloc(NET_BUF_SIZE())
+  return BufferedNetWriter {
+    fd: fd,
+    ssl: ssl_ptr,
+    buf: buf,
+    buf_len: 0,
+    buf_cap: NET_BUF_SIZE()
+  }
+end
+
+# Internal: Flush the write buffer to the network.
+def _net_writer_do_flush(w: BufferedNetWriter): Int
+  if w.buf_len == 0
+    return 0
+  end
+
+  var total = 0
+  while total < w.buf_len
+    var n = 0
+    if w.ssl != 0
+      n = SSL_write(int_to_cptr(w.ssl), ptr_add(w.buf, total), w.buf_len - total)
+    else
+      n = socket_send(w.fd, ptr_add(w.buf, total), w.buf_len - total, 0)
+    end
+    if n <= 0
+      return -1
+    end
+    total += n
+  end
+
+  w.buf_len = 0
+  return 0
+end
+
+# Write data to the buffered writer. Flushes when buffer is full.
+def net_writer_write(w: BufferedNetWriter, data: String): Int
+  var ptr = str_to_ptr(data)
+  var len = str_byte_len(data)
+  var offset = 0
+
+  while offset < len
+    var space = w.buf_cap - w.buf_len
+    if space == 0
+      if _net_writer_do_flush(w) < 0
+        return -1
+      end
+      space = w.buf_cap
+    end
+
+    var to_copy = len - offset
+    if to_copy > space
+      to_copy = space
+    end
+
+    memcpy(ptr_add(w.buf, w.buf_len), ptr_add(ptr, offset), to_copy)
+    w.buf_len += to_copy
+    offset += to_copy
+  end
+
+  return len
+end
+
+# Flush the write buffer to the network.
+def net_writer_flush(w: BufferedNetWriter): Int
+  return _net_writer_do_flush(w)
+end
+
+# Flush and close the buffered writer. Frees the buffer.
+# Does NOT close the underlying socket.
+def net_writer_close(w: BufferedNetWriter): Void
+  _net_writer_do_flush(w)
+  if w.buf != 0
+    qz_free(w.buf)
+  end
+end

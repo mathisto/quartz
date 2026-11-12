@@ -1,0 +1,3358 @@
+##! # MIR Lower Statement Handlers
+##!
+##! Statement-specific lowering dispatched from mir_lower_stmt.
+##!
+##! @see mir_lower Main MIR lowering module
+
+import mir
+import * from mir
+import ast
+import op_constants
+import node_constants
+import type_constants
+import token_constants
+import diagnostic
+import mir_lower_gen
+import mir_lower_async_registry
+import mir_lower
+import mir_lower_expr_handlers
+import mir_lower_iter
+import * from str_compat
+import string_intern
+
+# enum-niche M2.3 — resolve the declared return type of the closure passed as the
+# 2nd combinator arg (`args[1]`). Named-fn ident ⇒ the registered function's declared
+# return (`str2` of its NODE_FUNCTION). NODE_LAMBDA ⇒ its (often-elided) return
+# annotation (`str1`). "" when unresolvable (elided lambda return) ⇒ caller skips the
+# refinement (no false niche verdict). Used by the cold-combinator var-init tracking.
+def mir_closure_arg_return_type(ctx: MirContext, s: ast::AstStorage, args: Vec<Int>): String
+  return "" if args == 0
+  return "" if args.size < 2
+  var f_node = args[1]
+  var f_kind = ast::ast_get_kind(s, f_node)
+  if f_kind == node_constants::NODE_LAMBDA
+    return ast::ast_get_str1(s, f_node)
+  end
+  if f_kind == node_constants::NODE_IDENT
+    var f_name = ast::ast_get_str1(s, f_node)
+    var f_resolved = ctx.mir_resolve_func_name(f_name)
+    var f_entry = ctx.mir_lookup_function(f_resolved)
+    if f_entry.is_some()
+      var f_e = f_entry.unwrap()
+      return ast::ast_get_str2(f_e.ast_store, f_e.node_id)
+    end
+  end
+  return ""
+end
+
+# NodeReturn = 22 (C-aligned)
+def mir_lower_stmt_return(ctx: MirContext, s: ast::AstStorage, node: AstNodeId): Void
+  var expr_node = ast::ast_get_left(s, node)
+  # Node handles start at 0, use >= 0 for valid nodes, -1 for absent
+  if expr_node >= 0
+    # B.10 §14 N1 — a `return`/expression-body in an `Option<…>`-returning fn is a
+    # value-flow boundary: supply the fn's declared return type as the niche
+    # construction's expected type (the only source for `return None`), so the
+    # returned Option matches the niche layout every caller reads.
+    # enum-niche M2 — a `Result<…>`-returning fn is the SAME value-flow boundary:
+    # supply the declared return type so the niche-multi Result construct recovers
+    # the concrete `Result<A,B>` the read side infers from the callee's annotation
+    # (§14.4 — construct/read agree). Inert at gate 0 (mir_result_type_is_niche_multi
+    # returns 0); `mir_option_payload_of_type` ignores a Result-typed slot, so the
+    # Option construct path is untouched.
+    var n_ret_ty = mir::mir_func_get_return_type_name(ctx.mir_ctx_get_func())
+    var n_ret_had = 0
+    if n_ret_ty.starts_with("Option<") or n_ret_ty.starts_with("Result<")
+      mir::mir_ctx_set_niche_expected(ctx, n_ret_ty)
+      n_ret_had = 1
+    end
+    var val = mir_lower::mir_lower_expr(ctx, s, expr_node)
+    if n_ret_had == 1
+      mir::mir_ctx_clear_niche_expected(ctx)
+    end
+    # R2.1 (B3) — union widening at RETURN: when the fn's declared return type is a
+    # union (`A | B`) and the returned expr is a bare arm (not already a union cell),
+    # wrap `val` into the union's tagged `{tag, payload}` cell so the caller's B2
+    # narrow (`if r is Int`) recovers the member. Reuses `n_ret_ty` read above. The
+    # arm type = mir_infer_expr_type on the returned expr; a src that already infers
+    # to a union (passthrough of a union var / union-returning call) short-circuits
+    # (no double-widen). Keyed on a union annotation, which the compiler's own
+    # sources do not use in RETURN position ⇒ gate-0-inert / byte-identical.
+    if mir_is_union_annotation(n_ret_ty)
+      var b3_ret_arm = ctx.mir_infer_expr_type(s, expr_node)
+      if mir_is_union_annotation(b3_ret_arm) == false
+        val = mir_lower::mir_emit_widen_to_union(ctx, val, n_ret_ty, b3_ret_arm)
+      end
+    end
+    # R2.2 (item 1) — union UN-WIDEN at RETURN: the inverse of B3's widen. When the
+    # fn's declared return type is a BARE ARM (non-union) but the returned expr infers
+    # to a UNION `A | B` (a union var / union-returning call flowing into a scalar-
+    # return slot), the value is the {tag, payload} CELL POINTER; recover the arm
+    # payload so the caller reads the member, not the pointer. Mutually exclusive with
+    # the B3 widen above (widen keys on a UNION n_ret_ty; un-widen keys on a NON-union
+    # n_ret_ty whose returned expr infers to a union), so ordering is safe. Mirrors
+    # mir_emit_reproject_return_to_record (C3) for records. GATE-0-INERT: keyed on
+    # mir_is_union_annotation(inferred), and the compiler/std carry ZERO union return
+    # types ⇒ inference never yields a top-level `|` in a scalar-return context ⇒
+    # byte-identical self-compile.
+    if mir_is_union_annotation(n_ret_ty) == false
+      # S2 fix — a returned `NODE_IDENT` stamped `int_val == 1` was ALREADY
+      # payload-extracted by the ident narrowed-read handler (mir_lower.qz:3312 →
+      # mir_emit_narrowed_read produced the bare arm scalar). Un-widening again here
+      # would dereference that scalar as a {tag,payload} cell pointer (double extract
+      # → SIGSEGV). Skip unwiden for the already-extracted ident; stamp 2 (raw cell,
+      # not extracted by ident) and stamp 0 / non-ident (union var / union CALL temp)
+      # STILL un-widen (single extract) — those paths are unchanged.
+      var b3u_ret_kind = ast::ast_get_kind(s, expr_node)
+      var b3u_already_extracted = b3u_ret_kind == node_constants::NODE_IDENT and ast::ast_get_int_val(s, expr_node) == 1
+      if b3u_already_extracted == false
+        var b3u_src = ctx.mir_infer_expr_type(s, expr_node)
+        if mir_is_union_annotation(b3u_src)
+          val = mir_lower::mir_emit_unwiden_from_union(ctx, val, b3u_src)
+        end
+      end
+    end
+    # R2 (C3/§3.3) — record RETURN reprojection. The return-type seam canonicalized a
+    # `{ x: Int }` return annotation to C1's registered `__rec$...$rec_` @value struct.
+    # When the returned expr is a WIDER nominal source struct (`Point3{...}` returned
+    # where `{ a, b, c }` is declared) the two physical layouts are not offset-
+    # compatible (COW header shift and/or field reordering), so the returned value must
+    # be reprojected into the record's flat canonical layout — exactly as the CALL-ARG
+    # coercion site does (mir_emit_reproject_to_record, commit 147bc97e). A passthrough
+    # `return r` where `r` already infers to the same record short-circuits. GATE-0-
+    # INERT: gated on a canonical `__rec` return-type-name, which self-compile never
+    # produces (zero record returns) ⇒ byte-identical.
+    if n_ret_ty.starts_with("__rec")
+      var c3_ret_arm = ctx.mir_infer_expr_type(s, expr_node)
+      var c3_src = mir::mir_resolve_struct_name(ctx, c3_ret_arm)
+      if str_byte_len(c3_ret_arm) > 0 and mir::mir_is_record_annotation(c3_ret_arm) == false and c3_src != n_ret_ty
+        val = mir_lower::mir_emit_reproject_return_to_record(ctx, val, c3_ret_arm, n_ret_ty)
+      end
+    end
+    # Get block AFTER evaluating expr - it may have changed (e.g., nil coalescing)
+    var block = ctx.mir_ctx_get_block()
+    # If returning a droppable variable, transfer ownership to caller (suppress drop)
+    var ret_kind = ast::ast_get_kind(s, expr_node)
+    if ret_kind == node_constants::NODE_IDENT
+      var ret_name = ast::ast_get_str1(s, expr_node)
+      ctx.mir_consume_droppable(ret_name)
+    end
+    # Emit deferred expressions in LIFO order before drops
+    ctx.emit_deferred()
+    # Emit drop calls for all droppables before returning
+    ctx.emit_drops_for_scope(0)
+    # Diag-leak fix: drain the runtime effect-stack for any active wrap-blocks
+    # the return path is escaping. Without this, returning from inside
+    # `with E {...} do -> body end` leaves E's install on the runtime stack.
+    ctx.mir_ctx_emit_active_wrap_pops()
+    # B.10 §14.12.8 (C4) — the cow_release destroy arm may split the block
+    # (conditional free), so re-fetch the CURRENT block before terminating. With
+    # no cow drops this is the same `block`. INERT at gate 0 (no split emitted).
+    block = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(block, mir::TERM_RETURN, val)
+  else
+    # Void return - use -1 as sentinel
+    var block = ctx.mir_ctx_get_block()
+    # Emit deferred expressions in LIFO order before drops
+    ctx.emit_deferred()
+    # Emit drop calls for all droppables before returning
+    ctx.emit_drops_for_scope(0)
+    ctx.mir_ctx_emit_active_wrap_pops()
+    # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+    block = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(block, mir::TERM_RETURN, -1)
+  end
+  return
+end
+
+# NodeLet = 25 (C-aligned)
+def mir_lower_stmt_let(ctx: MirContext, s: ast::AstStorage, node: AstNodeId): Void
+  var name = ast::ast_get_str1(s, node)
+
+  # B.10 §14.12.8 (C4 reassign-fix) — capture whether `name` is a REBIND of an
+  # already-bound local (a bare `e = …`, is_mutable==0, with an existing binding)
+  # BEFORE the alloc_slot/bind_var below shadows it. Only a rebind needs the
+  # old-cow-value release at the store site; a fresh bind must NOT (its alloca is
+  # uninitialized until the store). is_mutable==1 is always a fresh `var` decl.
+  var c4_is_local_rebind = 0
+  if ast::ast_get_int_val(s, node) == 0
+    if ctx.mir_ctx_lookup_var(name) >= 0
+      c4_is_local_rebind = 1
+    end
+  end
+
+  # Check if this is a reassignment of a module-level global variable.
+  # The parser produces NODE_LET for both new bindings (var x = ...) and
+  # bare reassignments (x = ...). For globals, is_mutable==0 (no `var`),
+  # and the bare name matches a prefixed global (e.g., "dep_graph$_state").
+  var is_mutable = ast::ast_get_int_val(s, node)
+  if is_mutable == 0
+    var global_name = ctx.mir_find_global_name(name)
+    if str_byte_len(global_name) > 0
+      var init_node = ast::ast_get_left(s, node)
+      # Preserve string/float metadata for codegen
+      if ctx.mir_is_string_expr(s, init_node)
+        ctx.mir_ctx_mark_string_var(global_name)
+      end
+      # Detect string container calls for global vars
+      var g_init_kind = ast::ast_get_kind(s, init_node)
+      if g_init_kind == node_constants::NODE_CALL
+        var g_callee = ast::ast_get_left(s, init_node)
+        if g_callee >= 0
+          if ast::ast_get_kind(s, g_callee) == node_constants::NODE_IDENT
+            var g_fn = ast::ast_get_str1(s, g_callee)
+            # str_split returns Vec<String> (element reads are String ptrs);
+            # str_chars returns Vec<Int> of codepoints, so its elements must NOT
+            # be marked as strings — see typecheck.qz str_chars registration.
+            if g_fn == "str_split"
+              ctx.mir_ctx_mark_string_var(global_name)
+            end
+          end
+        end
+      end
+      if ctx.mir_is_float_expr(s, init_node)
+        ctx.mir_ctx_mark_float_var(global_name)
+      end
+      var init_val = mir_lower::mir_lower_expr(ctx, s, init_node)
+      ctx.mir_emit_store_var(global_name, init_val)
+      return
+    end
+  end
+
+  var slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(name, slot)
+  var init_node = ast::ast_get_left(s, node)
+  # Mark variable as string if init expression is string-typed
+  if ctx.mir_is_string_expr(s, init_node)
+    ctx.mir_ctx_mark_string_var(name)
+  end
+  # Also check explicit type annotation for exact String type
+  # NOTE: Only mark exact "String" type, NOT containers like Vec<String>.
+  # Vec<String> vars are NOT strings — they are Vec handles (integer pointers).
+  # String container indexing (parts[i]) is detected via NODE_INDEX + str_split/str_chars tracking.
+  var let_type_ann = ast::ast_get_str2(s, node)
+  if let_type_ann == "String"
+    ctx.mir_ctx_mark_string_var(name)
+  end
+  # Detect string container calls (str_split returns Vec<String>) so index
+  # expressions like parts[i] read the element as a String ptr. str_chars is
+  # EXCLUDED: it returns Vec<Int> of codepoints, so `s.chars()[i]` is an Int,
+  # not a String — marking it string caused `cs[0]` to be read as a garbage
+  # pointer (SIGSEGV under content compare). See typecheck.qz str_chars reg.
+  var init_kind_for_sc = ast::ast_get_kind(s, init_node)
+  if init_kind_for_sc == node_constants::NODE_CALL
+    var sc_callee = ast::ast_get_left(s, init_node)
+    if sc_callee >= 0
+      if ast::ast_get_kind(s, sc_callee) == node_constants::NODE_IDENT
+        var sc_fn = ast::ast_get_str1(s, sc_callee)
+        if sc_fn == "str_split"
+          ctx.mir_ctx_mark_string_var(name)
+        end
+      end
+    end
+  end
+  # Mark variable as float if init expression is float-typed
+  if ctx.mir_is_float_expr(s, init_node)
+    ctx.mir_ctx_mark_float_var(name)
+  end
+  # Track Vec element types for width-aware vec ops (Vec<F32>, Vec<U8>, etc.)
+  # Use the BALANCED bracket extractor, not first-'>' : a nested element type
+  # like `Vec<Option<Point>>` would otherwise truncate to `Option<Point`
+  # (missing the inner closing '>'), which then poisons the niche read/construct
+  # of `Vec<Option<P>>` elements (payload type fails to parse → spill to tagged
+  # box, both `v[i] is Some` and `v.push(Some(..))` mis-lower). The depth-aware
+  # extractor yields the full `Option<Point>`. Inert for flat element types.
+  if let_type_ann.starts_with("Vec<")
+    var vec_elem = mir::mir_extract_generic_element_type(let_type_ann)
+    # R2 (C3) — a `var v: Vec<{ x: Int }>` LET binding's element annotation is raw
+    # record spelling. Canonicalize to C1's registered `__rec$...` @value struct name
+    # (register first) so the vec-elem registry — which the `v[i]` index read consults
+    # via mir_ctx_get_vec_elem_type to pick the inline value-layout stride — carries the
+    # SAME canonical name the `v.push(...)` intrinsic seam registered. Without this the
+    # store side (push, canonicalized) uses stride N while the read side (`v[i]`, raw
+    # record → fc=0) does a flat i64 load at stride 1 → layout mismatch → SIGSEGV on
+    # the field access. GATE-0-INERT: gated on mir_is_record_annotation ⇒ byte-identical.
+    if str_byte_len(vec_elem) > 0 and mir::mir_is_record_annotation(vec_elem) and mir::mir_record_is_intersection(vec_elem) == false
+      mir::mir_register_record_struct(ctx, vec_elem, s)
+      vec_elem = mir::mir_record_canonical_name(vec_elem)
+    end
+    if str_byte_len(vec_elem) > 0
+      ctx.mir_ctx_mark_vec_elem_type(name, vec_elem)
+    end
+  end
+  # F4 (item 9e) — a Vec built from an annotation-less array literal
+  # (`v = [S{..}, ..]`) never tracked its element type, so a later
+  # `v[i].field` read inferred `v[i]` as "" and fell to the generic untyped
+  # i64 field path — which, for a value-layout element, SKIPS the cow +1
+  # refcount-shift (cow structs) and the typed `%struct.Name` byte-packed GEP
+  # (narrow-@value structs), reading every field one word low / mis-packed.
+  # The `vec_new<T>()` + `.push` path tracks the elem type (above / line ~315),
+  # so its reads route correctly. Mirror that here: register the element type
+  # of an array-literal-built Vec from its first element. GATED on the element
+  # being value-layout (@value today) so reference-layout Vec literals — the
+  # only kind at gate 0 — are byte-for-byte UNCHANGED (the compiler has zero
+  # @value Vec literals ⇒ this arm is gate-0-dead).
+  var alit_kind = ast::ast_get_kind(s, init_node)
+  if alit_kind == node_constants::NODE_ARRAY
+    var alit_elems = ast::ast_get_children(s, init_node)
+    if alit_elems.size > 0
+      var alit_first = alit_elems[0]
+      if ast::ast_get_kind(s, alit_first) != node_constants::NODE_SPREAD
+        var alit_elem_ty = mir::mir_infer_expr_type(ctx, s, alit_first)
+        if str_byte_len(alit_elem_ty) > 0 and mir::mir_is_value_layout_type(ctx, alit_elem_ty) == 1
+          ctx.mir_ctx_mark_vec_elem_type(name, alit_elem_ty)
+        end
+      end
+    end
+  end
+  # Track Map key types so for-in over a Map dispatches to the correct
+  # key-type-specialized map_keys codegen (int vs string).
+  if let_type_ann.starts_with("Map<")
+    var map_lt = __char_index(let_type_ann, '<')
+    if map_lt > 0
+      var map_inner = str_byte_slice(let_type_ann, map_lt + 1, str_byte_len(let_type_ann))
+      var map_comma = __char_index(map_inner, ',')
+      if map_comma > 0
+        var map_key = str_byte_slice(map_inner, 0, map_comma)
+        while str_byte_len(map_key) > 0 and str_byte_at(map_key, str_byte_len(map_key) - 1) == ' '
+          map_key = str_byte_slice(map_key, 0, str_byte_len(map_key) - 1)
+        end
+        if str_byte_len(map_key) > 0
+          ctx.mir_ctx_mark_map_key_type(name, map_key)
+        end
+      end
+    end
+    # Track the Map VALUE type (V) too, so `m.set(k, None)` on a
+    # `Map<K, Option<V>>` can niche-construct the value (else a bare None spills
+    # to a tagged box the niche read misreads as Some — §14.4). Depth-aware so a
+    # nested `Option<Point>` value isn't truncated. Inert for non-Option values.
+    var map_val = mir::mir_extract_map_value_type(let_type_ann)
+    if str_byte_len(map_val) > 0
+      ctx.mir_ctx_mark_map_value_type(name, map_val)
+    end
+  end
+  # Track lazy async variables: `var f = async func(...)` or `var f = go func(...)` where func is a named function
+  var init_kind = ast::ast_get_kind(s, init_node)
+  if init_kind == node_constants::NODE_ASYNC_CALL or init_kind == node_constants::NODE_GO
+    var ac_inner = ast::ast_get_left(s, init_node)
+    if ac_inner >= 0
+      var ac_inner_kind = ast::ast_get_kind(s, ac_inner)
+      if ac_inner_kind == node_constants::NODE_CALL
+        var ac_callee = ast::ast_get_left(s, ac_inner)
+        if ac_callee >= 0 and ast::ast_get_kind(s, ac_callee) == node_constants::NODE_IDENT
+          var ac_fname = ast::ast_get_str1(s, ac_callee)
+          var ac_resolved = ctx.mir_resolve_func_name(ac_fname)
+          var ac_entry = ctx.mir_lookup_function(ac_resolved)
+          if ac_entry.is_some()
+            mir_lower_async_registry::mir_mark_lazy_async_var(name)
+            # Item 37 — record the future's payload (return) type so a later
+            # `var v = await name` can mark `v` with the payload struct type.
+            # Without this, a value-layout (>16B COW) struct returned through a
+            # future loses its struct-var registration ⇒ the field-read COW +1
+            # shift never fires ⇒ `v.field` reads the refcount header (word 0)
+            # instead of field 0 (word 1). Use the substituted return type so a
+            # generic future's concrete payload is tracked. INERT at gate 0
+            # (cow predicate false for plain structs ⇒ byte-identical).
+            var ac_e = ac_entry.unwrap()
+            var ac_ret = mir::mir_subst_return_type_for_call(ctx, s, ac_inner, ac_e.ast_store, ac_e.node_id)
+            if str_byte_len(ac_ret) > 0
+              mir_lower_async_registry::mir_mark_async_var_payload_type(name, ac_ret)
+            end
+          end
+        end
+      end
+    end
+  end
+  # Item 37 — `var v = await fut`: mark `v` with the future's payload (return)
+  # type so its field reads resolve through the payload's value-layout (a >16B
+  # COW value-layout struct returned through a future reads its fields at
+  # word f+1, skipping the refcount header). The awaited handle is an IDENT
+  # bound earlier by `var fut = go fn()`, whose payload type was recorded in
+  # the NODE_GO/NODE_ASYNC_CALL branch above. `mir_infer_expr_type` has no
+  # NODE_AWAIT branch and the NODE_CALL struct-var marking below is skipped for
+  # NODE_AWAIT, so without this `v` is never registered as a struct var.
+  # INERT at gate 0: the only consumer of this registration that changes
+  # behavior is the COW +1 field shift, keyed on mir_value_is_cow_layout, which
+  # is false for every non-@value struct ⇒ byte-identical self-compile.
+  if init_kind == node_constants::NODE_AWAIT
+    var aw_handle = ast::ast_get_left(s, init_node)
+    if aw_handle >= 0 and ast::ast_get_kind(s, aw_handle) == node_constants::NODE_IDENT
+      var aw_handle_name = ast::ast_get_str1(s, aw_handle)
+      var aw_payload = mir_lower_async_registry::mir_async_var_payload_type(aw_handle_name)
+      if str_byte_len(aw_payload) > 0
+        # Only register when the payload names a known struct (so scalar/String
+        # payloads keep their prior tracking and stay byte-identical).
+        var aw_base = aw_payload
+        var aw_lt = __char_index(aw_base, '<')
+        if aw_lt > 0
+          aw_base = str_byte_slice(aw_base, 0, aw_lt)
+        end
+        if ctx.mir_ctx_struct_field_count(mir::mir_resolve_struct_name(ctx, aw_base)) > 0
+          ctx.mir_ctx_mark_struct_var(name, aw_payload)
+        end
+      end
+    end
+  end
+  # Track struct variables for field access resolution
+  if init_kind == node_constants::NODE_STRUCT_INIT  # NodeStructInit
+    var struct_name = ast::ast_get_str1(s, init_node)
+    # A.36: for a generic struct with explicit type args
+    # (`var l = ITLift<ITBase> { .. }`), track the parameterized form so the
+    # extend-method monomorphization router can read the concrete args off `l`.
+    # Non-generic structs keep the bare name (zero behavioral change). Drop
+    # tracking always keys on the bare struct name.
+    var si_targs = ast::ast_get_str2(s, init_node)
+    var tracked_struct = struct_name
+    if str_byte_len(si_targs) > 0
+      if str_byte_len(mir::mir_get_struct_type_params(struct_name)) > 0
+        tracked_struct = "#{struct_name}<#{si_targs}>"
+      end
+    end
+    # Mark as struct variable so field access can look up field indices
+    ctx.mir_ctx_mark_struct_var(name, tracked_struct)
+    # Track droppable variables (struct inits with Drop trait or droppable fields)
+    # B.10 §14.12.8 (C4 reassign-fix) — a bare `e = Struct{…}` REBIND of a droppable
+    # binding routes through this SAME handler (a bare `name = e` statement lowers to
+    # a NODE_LET with is_mut==0, NOT NODE_ASSIGN). So an unconditional push would add a
+    # SECOND droppable entry for `e` ⇒ scope exit drops/frees the CURRENT value TWICE
+    # (double-free/SIGABRT for cow; double-drop for a user `Drop` struct — GAP-2). Skip
+    # the duplicate push on ANY rebind that already has an entry; the OLD value's
+    # release + entry-retarget is handled at the store site below
+    # (mir_cow_rebind_handle_old for cow, mir_rebind_drop_old_value for user Drop).
+    # GATE-0-INERT: the compiler's own reassignments are non-Drop ⇒ type_needs_drop is
+    # false here ⇒ this whole block is dead ⇒ byte-identical self-compile.
+    if ctx.type_needs_drop(struct_name)
+      if mir::mir_ctx_is_ref_var(ctx, name) == 1
+        # WS1b — `name` is a mutable-by-reference value-layout CAPTURE (a borrowed
+        # alias of the caller's slot). The CALLER owns the buffer and cow_releases it
+        # at ITS scope exit; pushing a droppable here would cow_release the SAME buffer
+        # at this lambda's scope exit ⇒ double-free (SIGABRT). A whole-var reassignment
+        # write-throughs the new handle into the caller's slot (mir_emit_store_var
+        # ref-var indirection); the caller's single scope-exit release covers the
+        # CURRENT buffer. The PRIOR (superseded) buffer for each loop iteration is NOT
+        # released — an accepted per-iteration leak (discipline (b), FILED); balancing
+        # it (discipline (a)) needs a release-old-without-scope-exit-release path for
+        # ref-vars that does not exist this increment. Memory-safe, not leak-free.
+        # GATE-0-INERT: ref_vars is empty for every compiler closure ⇒ never taken.
+      elsif c4_is_local_rebind == 1 and mir::mir_is_droppable_pushed(ctx, name) == 1
+        # rebind: existing entry already covers `e`; do NOT duplicate. The old value
+        # is released and the entry retargeted at the store site below.
+      else
+        ctx.push_droppable(name, struct_name)
+      end
+    end
+  end
+  # @heap StructInit or @arena StructInit: look through alloc wrapper
+  if init_kind == node_constants::NODE_ALLOC_EXPR
+    var alloc_inner = ast::ast_get_left(s, init_node)
+    var alloc_inner_kind = ast::ast_get_kind(s, alloc_inner)
+    if alloc_inner_kind == node_constants::NODE_STRUCT_INIT
+      var struct_name = ast::ast_get_str1(s, alloc_inner)
+      ctx.mir_ctx_mark_struct_var(name, struct_name)
+      if ctx.type_needs_drop(struct_name)
+        # WS1b — never push a scope-exit drop for a by-ref value-layout capture
+        # (borrowed alias of the caller's slot); the caller owns the release.
+        # Pushing here would double-free at this lambda's scope exit. Gate-0-inert
+        # (ref_vars empty for the compiler).
+        if mir::mir_ctx_is_ref_var(ctx, name) == 0
+          ctx.push_droppable(name, struct_name)
+        end
+      end
+      # F4c (R6) — a `@arena_name Struct {…}` binding is ARENA-OWNED: the struct
+      # lives in the arena (flat, no COW header), not a refcount buffer. Mark it so
+      # the COW copy / mutation / drop sites suppress cow ops on it (the ratified
+      # arena-non-COW carve-out). `@heap` is target "heap" and stays a normal heap
+      # binding. INERT at gate 0 (cow-layout false for plain structs pre-flip ⇒ the
+      # cow consumers that read this flag are never reached).
+      var alloc_target = ast::ast_get_str1(s, init_node)
+      if str_byte_len(alloc_target) > 0 and alloc_target.eq("heap") == false
+        mir::mir_ctx_mark_arena_owned(ctx, name)
+      end
+    end
+  end
+  # Track Vec element type from vec_new<T>() / vec_new_filled<T>() type_arg
+  if init_kind == node_constants::NODE_CALL
+    var vn_callee = ast::ast_get_left(s, init_node)
+    if vn_callee >= 0 and ast::ast_get_kind(s, vn_callee) == node_constants::NODE_IDENT
+      var vn_fn = ast::ast_get_str1(s, vn_callee)
+      if vn_fn == "vec_new" or vn_fn == "vec_new_filled"
+        var vn_type_arg = ast::ast_get_type_arg(s, init_node)
+        if str_byte_len(vn_type_arg) > 0
+          ctx.mir_ctx_mark_vec_elem_type(name, vn_type_arg)
+        end
+      end
+      if vn_fn == "map_new"
+        var mn_type_arg = ast::ast_get_type_arg(s, init_node)
+        # If the bare `map_new()` has no inline type_arg but the `let`
+        # statement has an explicit `Map<K, V>` annotation, back-stamp
+        # the init call's type_arg from the annotation so the codegen
+        # selects the correct memory layout (string-key vs int-key vs
+        # struct-key). Without this, fresh `var m: Map<Int, Int> = map_new()`
+        # allocates the string-key layout and a subsequent intmap_set
+        # crashes on layout mismatch.
+        if str_byte_len(mn_type_arg) == 0 and let_type_ann.starts_with("Map<")
+          var ann_lt = __char_index(let_type_ann, '<')
+          var ann_gt = __char_index(let_type_ann, '>')
+          if ann_lt > 0 and ann_gt > ann_lt
+            var ann_inner = str_byte_slice(let_type_ann, ann_lt + 1, ann_gt)
+            # Strip whitespace (annotations may have "Int, Int")
+            var ann_clean = str_replace(ann_inner, " ", "")
+            if str_byte_len(ann_clean) > 0
+              ast::ast_set_str2(s, init_node, ann_clean)
+              mn_type_arg = ann_clean
+            end
+          end
+        end
+        if str_byte_len(mn_type_arg) > 0
+          var mn_comma = __char_index(mn_type_arg, ',')
+          var mn_key = mn_type_arg
+          if mn_comma > 0
+            mn_key = str_byte_slice(mn_type_arg, 0, mn_comma)
+          end
+          while str_byte_len(mn_key) > 0 and str_byte_at(mn_key, str_byte_len(mn_key) - 1) == ' '
+            mn_key = str_byte_slice(mn_key, 0, str_byte_len(mn_key) - 1)
+          end
+          if str_byte_len(mn_key) > 0
+            ctx.mir_ctx_mark_map_key_type(name, mn_key)
+          end
+          # Track the VALUE type too (depth-aware via the Map<…> extractor) so a
+          # `Map<K, Option<V>>` built with `map_new()` + annotation niche-builds
+          # its `m.set(k, None)` value. mn_type_arg is the inner `K,V` form; wrap
+          # it so the extractor sees a top-level `<`.
+          var mn_val = mir::mir_extract_map_value_type("Map<#{mn_type_arg}>")
+          if str_byte_len(mn_val) > 0
+            ctx.mir_ctx_mark_map_value_type(name, mn_val)
+          end
+        end
+      end
+    end
+  end
+  # Mark struct variable when init is a function call returning a struct
+  if init_kind == node_constants::NODE_CALL
+    var call_callee = ast::ast_get_left(s, init_node)
+    var call_func_name = ast::ast_get_str1(s, call_callee)
+    # Special case: as_type<T>(val) — use type_arg as struct type
+    if call_func_name == "as_type"
+      var call_type_arg = ast::ast_get_type_arg(s, init_node)
+      if str_byte_len(call_type_arg) > 0
+        ctx.mir_ctx_mark_struct_var(name, call_type_arg)
+      end
+    else
+      # IMPL-TRAIT-RPITIT bounded-generic dispatch: try receiver-aware
+      # resolution first. Mirrors the A8 trait-rewriting logic in
+      # `mir_lower_expr_handlers.qz` so `var it = c.iter()` records `it`'s
+      # type via the SAME function the call dispatches to, rather than
+      # whichever `iter` happens to suffix-match first in `all_funcs`.
+      # Without this, a body like `def f<C: Iterable>(c: C); var it =
+      # c.iter(); it.next()` would emit the right call for `c.iter()` (A8)
+      # but track `it` against the wrong concrete return, and `it.next()`
+      # would dispatch to the wrong impl's $next.
+      var call_resolved = mir::mir_resolve_method_call_receiver_aware(ctx, s, init_node, call_func_name)
+      if str_byte_len(call_resolved) == 0
+        call_resolved = ctx.mir_resolve_func_name(call_func_name)
+      end
+      var call_entry = ctx.mir_lookup_function(call_resolved)
+      if call_entry.is_some()
+        var call_e = call_entry.unwrap()
+        var call_ast_store = call_e.ast_store
+        var call_func_handle = call_e.node_id
+        # NESTED-MONO-UFCS-TYPE-PARAM: substitute type parameters in the return
+        # type using the caller's inferred arg types. Without this, a call like
+        # `var d = map_doubler(r)` would track `d` as the raw declared return
+        # `MapDoubler<I>` instead of the concrete `MapDoubler<RangeSrc>`, which
+        # poisons downstream specialization + UFCS dispatch.
+        var call_ret_type = mir::mir_subst_return_type_for_call(ctx, s, init_node, call_ast_store, call_func_handle)
+        # item 42 (Part 3) — a value-layout Result/Option combinator's declared return
+        # erases `U` (it lives inside the `Fn(T):U` arg), so `mir_subst_return_type_for_call`
+        # yields `Result<U,E>`/`Option<U>` with U unbound ⇒ the bound name tracks an erased
+        # type and Part 2's inline-value unwrap_ok / field reads never recognize it.
+        # `mir_infer_expr_type` carries the Part-3 refinement (value-layout-gated) which
+        # recovers the concrete `U` from the mapping fn; prefer it when it resolves. GATED
+        # via that same value-layout predicate ⇒ for a non-value-layout combinator (every
+        # gate-0 case) the refinement is dead and this is byte-identical.
+        if mir::mir_combinator_op(call_func_name) > 0
+          var i42_refined = mir::mir_infer_expr_type(ctx, s, init_node)
+          if str_byte_len(i42_refined) > 0 and i42_refined != call_ret_type
+            call_ret_type = i42_refined
+          end
+        end
+        if str_byte_len(call_ret_type) > 0
+          ctx.mir_ctx_mark_struct_var(name, call_ret_type)
+        end
+      else
+        # CLOSURE-CALL-RETURN-TYPE fix (A.17): the callee is not a registered
+        # function — it may be a closure-valued local/param/global. Resolving
+        # its `Fn(P): Return` annotation lets `var resp = c(req)` track `resp`
+        # as `Return`, so a later `resp.field` access resolves against the
+        # right struct instead of the global field-name search fallback.
+        var intrinsic_ret = mir_intrinsic_return_type(call_func_name)
+        # A.45 ii (L1) — `var back = vec_get(v, i)` on a `Vec<SomeStruct>` must
+        # track `back` as the concrete ELEMENT struct, not the name-only "Int"
+        # that `mir_intrinsic_return_type` yields for vec_get/vec_get_unchecked.
+        # The element-aware `mir_infer_expr_type` (NODE_CALL branch) resolves the
+        # receiver's `Vec<T>→T`; prefer it when it names a REGISTERED STRUCT so a
+        # later `back.field` resolves against the right struct instead of falling
+        # to the GLOBAL field-name table (wrong offset on a cross-struct field
+        # collision ⇒ heap corruption). Guarded on a registered-struct match so
+        # the `Vec<Int>`/bare-Vec cases stay on the prior "Int" path
+        # (byte-identical). Only vec_get is rerouted; other intrinsics keep their
+        # exact prior behavior.
+        var vg_is_get = call_func_name == "vec_get" or call_func_name == "vec_get_unchecked" or str_ends_with(call_func_name, "$vec_get") == 1 or str_ends_with(call_func_name, "$vec_get_unchecked") == 1
+        var vg_elem_struct = ""
+        if vg_is_get == 1
+          var vg_inferred = ctx.mir_infer_expr_type(s, init_node)
+          if str_byte_len(vg_inferred) > 0
+            var vg_base = vg_inferred
+            var vg_lt = __char_index(vg_base, '<')
+            if vg_lt > 0
+              vg_base = str_byte_slice(vg_base, 0, vg_lt)
+            end
+            if ctx.mir_ctx_struct_field_count(mir::mir_resolve_struct_name(ctx, vg_base)) >= 0
+              vg_elem_struct = vg_inferred
+            end
+          end
+        end
+        if str_byte_len(vg_elem_struct) > 0
+          ctx.mir_ctx_mark_struct_var(name, vg_elem_struct)
+        elsif str_byte_len(intrinsic_ret) > 0
+          ctx.mir_ctx_mark_struct_var(name, intrinsic_ret)
+        else
+          var le_inferred = ctx.mir_infer_expr_type(s, init_node)
+          if str_byte_len(le_inferred) > 0
+            ctx.mir_ctx_mark_struct_var(name, le_inferred)
+          end
+        end
+      end
+    end
+  end
+  # EXPLICIT-LET-ANNOTATION refines tracked struct type (A.17): when a
+  # `var x: T = call(...)` binding carries an explicit type annotation `T`
+  # that names a registered struct, that annotation is authoritative for
+  # field-access resolution. The NODE_CALL inference above can produce a
+  # primitive/empty type — e.g. `call_fn` is a builtin intrinsic typed
+  # TYPE_INT, and a closure-call whose callee is unresolved infers "" —
+  # which leaves `x.field` to fall through to mir_find_field_globally (a
+  # name-only search across all registered structs) and pick the wrong
+  # struct when the field name is ambiguous. Pushing the annotation after
+  # the NODE_CALL block makes it win (mir_ctx_get_var_type reads the last
+  # entry). Guarded on an exact registered-struct match so a generic alias
+  # annotation (`MapDoubler<I>`) does NOT clobber a correct concrete
+  # inference (`MapDoubler<RangeSrc>`) — the unsubstituted alias won't
+  # exact-match the registry's base name and the guard fails.
+  if init_kind == node_constants::NODE_CALL
+    var let_ann_for_struct = ast::ast_get_str2(s, node)
+    if str_byte_len(let_ann_for_struct) > 0
+      if ctx.mir_ctx_struct_field_count(let_ann_for_struct) >= 0
+        ctx.mir_ctx_mark_struct_var(name, let_ann_for_struct)
+      end
+    end
+    # enum-niche M2.3 — a `var r: Result<A,B> = result_map(...)` (or any call whose
+    # generic return resolves to an erased `Result<U,E>`/`Option<P>`) needs its
+    # ANNOTATION to be authoritative for the niche verdict so downstream hot intercepts
+    # (`unwrap_ok(r)`, `r is Ok`, `?`) recognize `r` as niche-multi. The NODE_CALL
+    # inference above tracks the unsubstituted generic return (type vars ⇒ not niche),
+    # so without this the read side spill-decodes the packed word ⇒ SEGFAULT. Gated on
+    # the annotation being a niche Result/Option ⇒ INERT when the master flag is OFF
+    # (returns 0 ⇒ no refinement ⇒ byte-identical IR) and for spill types (no niche
+    # verdict ⇒ untouched). Placed after the struct-annotation override; this niche
+    # refinement wins (get_var_type reads the last entry) only when it actually niches.
+    if let_ann_for_struct.starts_with("Result<")
+      if mir::mir_result_type_is_niche_multi(ctx, let_ann_for_struct) == 1
+        ctx.mir_ctx_mark_struct_var(name, let_ann_for_struct)
+      end
+    elsif let_ann_for_struct.starts_with("Option<")
+      var le_opt_pt = mir::mir_option_payload_of_type(let_ann_for_struct)
+      if str_byte_len(le_opt_pt) > 0
+        if mir::mir_option_is_niche(ctx, le_opt_pt) == 1
+          ctx.mir_ctx_mark_struct_var(name, let_ann_for_struct)
+        end
+      end
+    end
+    # enum-niche M2.3 — un-annotated `var r = result_map(recv, f)` over a niche-multi
+    # Result. The generic combinator return (`Result<U,E>`/`Option<…>`) can't be
+    # resolved through the erased body, so the var tracks the bare head and the
+    # downstream read (`unwrap_ok(r)`) spill-decodes the niche word ⇒ SEGFAULT. Compute
+    # the CONCRETE result type from the combinator semantics + the receiver's inferred
+    # niche type (the closure return is the callee's declared return for a named fn) so
+    # `r` is tracked as the niche-multi type it actually carries. Mirrors the intercept
+    # in mir_lower_cold_result_intercept (mir_lower_expr_handlers.qz). Gated on the
+    # receiver being niche-multi ⇒ INERT off-gate (byte-identical IR).
+    var ler_callee = ast::ast_get_left(s, init_node)
+    if ast::ast_get_kind(s, ler_callee) == node_constants::NODE_IDENT
+      var ler_fn = ast::ast_get_str1(s, ler_callee)
+      var ler_op = 0
+      if ler_fn == "result_map" or str_ends_with(ler_fn, "$result_map") == 1
+        ler_op = 1
+      elsif ler_fn == "result_map_err" or str_ends_with(ler_fn, "$result_map_err") == 1
+        ler_op = 2
+      elsif ler_fn == "result_and_then" or str_ends_with(ler_fn, "$result_and_then") == 1
+        ler_op = 3
+      elsif ler_fn == "ok" or str_ends_with(ler_fn, "$ok") == 1
+        ler_op = 4
+      elsif ler_fn == "err" or str_ends_with(ler_fn, "$err") == 1
+        ler_op = 5
+      end
+      if ler_op > 0
+        var ler_args = ast::ast_get_children(s, init_node)
+        if ler_args != 0
+          if ler_args.size >= 1
+            if mir::mir_subject_is_niche_multi(ctx, s, ler_args[0]) == 1
+              var ler_rty = mir::mir_infer_expr_type(ctx, s, ler_args[0])
+              var ler_a = mir::mir_result_ok_type(ler_rty)
+              var ler_b = mir::mir_result_err_type(ler_rty)
+              var ler_concrete = ""
+              if ler_op == 1
+                # result_map: Result<U, B>; U = f's return type (named-fn closure).
+                var ler_u = mir_closure_arg_return_type(ctx, s, ler_args)
+                if str_byte_len(ler_u) > 0
+                  ler_concrete = "Result<#{ler_u}, #{ler_b}>"
+                end
+              elsif ler_op == 2
+                # result_map_err: Result<A, F>; F = f's return type.
+                var ler_f = mir_closure_arg_return_type(ctx, s, ler_args)
+                if str_byte_len(ler_f) > 0
+                  ler_concrete = "Result<#{ler_a}, #{ler_f}>"
+                end
+              elsif ler_op == 3
+                # result_and_then: f's return type IS the new Result<U,E>.
+                ler_concrete = mir_closure_arg_return_type(ctx, s, ler_args)
+              elsif ler_op == 4
+                # ok(): Option<A>.
+                if str_byte_len(ler_a) > 0
+                  ler_concrete = "Option<#{ler_a}>"
+                end
+              else
+                # err(): Option<B>.
+                if str_byte_len(ler_b) > 0
+                  ler_concrete = "Option<#{ler_b}>"
+                end
+              end
+              if str_byte_len(ler_concrete) > 0
+                ctx.mir_ctx_mark_struct_var(name, ler_concrete)
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  # B.10 §14 N3 6.3c — un-annotated local initialized from the BARE
+  # `option_some(x)` / `option_none()` INTRINSIC call form. The construction
+  # side (mir_lower_call, §14 N3 6.3b) niches via the SAME payload recovery, but
+  # the read side gates on `mir_infer_expr_type(u)`, which for a NODE_CALL init
+  # resolves the intrinsic's bare return type ("Option") — losing the concrete
+  # payload P. So `var u = option_some(User{..}); u?.age` would CONSTRUCT niche
+  # (identity pointer) yet READ spill (mis-decoding the pointer as a tagged box →
+  # 0/None). Recover `Option<P>` here, via the IDENTICAL `mir_option_intrinsic_
+  # payload` the construction side uses, so get_var_type(u) yields the concrete
+  # type and construct/read derive the same niche verdict for EVERY read position
+  # (`?.`, `$try`, `??`, `.unwrap`, `.some?`, match). Gated on
+  # `mir_option_is_niche` ⇒ INERT when the master flag is OFF (returns 0 ⇒ no
+  # refinement ⇒ byte-identical IR). Placed last so it wins over the generic
+  # NODE_CALL return-type mark above (get_var_type reads the last entry).
+  if init_kind == node_constants::NODE_CALL
+    var oc_callee = ast::ast_get_left(s, init_node)
+    var oc_func_name = ast::ast_get_str1(s, oc_callee)
+    if oc_func_name == "option_some" or oc_func_name == "option_none"
+      var oc_is_some = 0
+      if oc_func_name == "option_some"
+        oc_is_some = 1
+      end
+      var oc_arg = 0
+      if oc_is_some == 1
+        var oc_args = ast::ast_get_children(s, init_node)
+        if oc_args != 0
+          if oc_args.size >= 1
+            oc_arg = oc_args[0]
+          end
+        end
+      end
+      var oc_pt = mir::mir_option_intrinsic_payload(ctx, s, oc_is_some, oc_arg)
+      if str_byte_len(oc_pt) > 0
+        if mir::mir_option_is_niche(ctx, oc_pt) == 1
+          ctx.mir_ctx_mark_struct_var(name, "Option<#{oc_pt}>")
+        end
+      end
+    end
+  end
+  # Item 11 (enum-niche tail) — an un-annotated `var x = v.pop()` / `var x = m.get(k)`
+  # over a niche-eligible element/value type. The construction side (mir_lower_call)
+  # niches the result to the bare niche word (Some=ptr, None=0); mir_infer_expr_type
+  # now yields the concrete `Option<T>`. But the GENERAL var-type fallback below
+  # SKIPS NODE_CALL inits, so without this `x` would track no type ⇒ the read side
+  # (`x is Some`, `x is None`, `match x`, `x.unwrap()`) gates on
+  # mir_subject_is_niche_option(x) == 0 and SPILL-decodes the niche word as a tagged
+  # box (deref @0 for the tag) ⇒ wrong tag / SIGSEGV on the Some pointer. Mark `x`
+  # with the inferred concrete `Option<T>` (already niche-gated inside
+  # mir_infer_expr_type) so construct and read derive the same verdict for EVERY read
+  # position. Gated on the inferred type being a niche Option ⇒ INERT when the master
+  # flag is OFF (mir_infer_expr_type returns bare "Option" ⇒ no refinement ⇒
+  # byte-identical IR) and for non-niche elems (Vec<Int>, Vec<Option<W>>).
+  if init_kind == node_constants::NODE_CALL
+    var vpc_callee = ast::ast_get_left(s, init_node)
+    var vpc_fn = ast::ast_get_str1(s, vpc_callee)
+    var vpc_is_target = vpc_fn == "vec_pop" or str_ends_with(vpc_fn, "$vec_pop") == 1
+    vpc_is_target = vpc_is_target or vpc_fn == "map_get" or str_ends_with(vpc_fn, "$map_get") == 1
+    if vpc_is_target == 1
+      var vpc_ty = ctx.mir_infer_expr_type(s, init_node)
+      if vpc_ty.starts_with("Option<")
+        var vpc_pt = mir::mir_option_payload_of_type(vpc_ty)
+        if str_byte_len(vpc_pt) > 0 and mir::mir_option_is_niche(ctx, vpc_pt) == 1
+          ctx.mir_ctx_mark_struct_var(name, vpc_ty)
+        end
+      end
+    end
+  end
+  # Mark struct variable when init is an overloaded binary op (str2 has struct name)
+  if init_kind == node_constants::NODE_BINARY
+    var bin_struct = ast::ast_get_str2(s, init_node)
+    if as_int(bin_struct) != 0
+      if str_byte_len(bin_struct) > 0
+        ctx.mir_ctx_mark_struct_var(name, bin_struct)
+      end
+    end
+  end
+  # General fallback: use mir_infer_expr_type for any other init expression
+  # This handles field access (r.routes), index access (routes[i]),
+  # chained access (r.routes[i]), etc.
+  if init_kind != node_constants::NODE_STRUCT_INIT
+    if init_kind != node_constants::NODE_CALL
+      var inferred_type = ctx.mir_infer_expr_type(s, init_node)
+      # B.10 §12.10 — an Option/Result construction infers to the bare enum name
+      # ("Option"), losing the payload type a later `match` needs to de-box an
+      # inline @value payload. The construction carries it: Option::Some(P{}) → P.
+      # Refine to the concrete "Option<P>" so get_var_type(o) yields the arg.
+      # GATED to @value payloads ⇒ the compiler/std (zero @value enum payloads)
+      # keep the bare name ⇒ codegen byte-identical ⇒ fixpoint-safe.
+      if init_kind == node_constants::NODE_ENUM_ACCESS
+        var s1210_base = ast::ast_get_enum_name(s, init_node)
+        if s1210_base == "Option" or s1210_base == "Result"
+          var s1210_pl = ast::ast_get_payloads(s, init_node)
+          if s1210_pl != 0
+            if s1210_pl.size >= 1
+              var s1210_pt = ctx.mir_infer_expr_type(s, s1210_pl[0])
+              if str_byte_len(s1210_pt) > 0
+                var s1210_pres = mir::mir_resolve_struct_name(ctx, mir::mir_strip_generic_head(s1210_pt))
+                # item 36 — single layout key (flip-eligible plain OR @value); gate-0
+                # inert ⇒ byte-identical. resolved name re-resolves idempotently.
+                if mir::mir_is_value_layout_type(ctx, s1210_pres) == 1
+                  inferred_type = "#{s1210_base}<#{s1210_pt}>"
+                end
+                # B.10 §14 N3 6.3b — a niche-layout `Option<boxed P>` construction
+                # (e.g. `o = Option::Some(Point{..})`) infers to the bare enum head
+                # "Option", losing the concrete payload that the niche READ side
+                # (`o.unwrap()`, `o is Some`) needs to recover the same niche
+                # verdict. The construction node carries P; refine to the concrete
+                # "Option<P>" so get_var_type(o) yields it. Gated on
+                # mir_option_is_niche ⇒ INERT when the master flag is OFF (returns 0
+                # ⇒ no refinement ⇒ byte-identical IR), and only fires for the
+                # boxed-niche classes when ON. Mirrors the @value refinement above
+                # (kept separate: @value refines unconditionally for the inline-bind
+                # path; this one is niche-flag-gated). `Some` only — `None` carries
+                # no payload node, so its type comes from the lvalue annotation path.
+                if s1210_base == "Option"
+                  if mir::mir_option_is_niche(ctx, s1210_pt) == 1
+                    inferred_type = "Option<#{s1210_pt}>"
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+      # B.10 §14 N3 6.3d — a bare-`None` init infers to the payload-less bare
+      # "Option", which would SHADOW a richer "Option<P>" the 6.3d body pre-scan
+      # already recovered for this var (from a later `= Some(P{..})`). Downgrading
+      # to bare "Option" makes the None construction spill (no niche payload) while
+      # the field/var-typed READ niches → mismatch. Keep the richer tracking when
+      # the inferred type is exactly the payload-less head and a niche-eligible
+      # "Option<P>" is already tracked. Niche-gated ⇒ byte-identical IR flag-OFF.
+      if inferred_type == "Option" and mir::mir_boxed_niche_enabled() == 1
+        var n63d_prior = ctx.mir_ctx_get_var_type(name)
+        if n63d_prior.starts_with("Option<")
+          if mir::mir_option_is_niche(ctx, mir::mir_option_payload_of_type(n63d_prior)) == 1
+            inferred_type = n63d_prior
+          end
+        end
+      end
+      if str_byte_len(inferred_type) > 0
+        ctx.mir_ctx_mark_struct_var(name, inferred_type)
+        # Move semantics: if init is IDENT and source is droppable, transfer ownership
+        if init_kind == node_constants::NODE_IDENT
+          var src_name = ast::ast_get_str1(s, init_node)
+          if ctx.type_needs_drop(inferred_type)
+            # B.10 §14.12.8 (C4) — a cow-layout `var b = a` is a COPY (cow_rc_inc
+            # retains the shared buffer below), NOT a move: BOTH `a` and `b` must
+            # cow_release at scope exit (the second release frees at rc 0). So push
+            # `b` but do NOT transfer `a` away. Transferring (the move path) would
+            # drop `a` from the stack ⇒ only one release ⇒ rc never reaches 0 ⇒
+            # leak. INERT at gate 0 (predicate false ⇒ original move path).
+            if mir::mir_value_is_cow_layout(ctx, inferred_type) == 1
+              # B.10 §14.12.8 (C4 reassign-fix) — rebind-idempotent: a bare cow `e = a`
+              # REBIND must not add a second entry (scope-exit double-free); the old
+              # value's release + retarget is handled by mir_cow_rebind_handle_old at
+              # the store site. Fresh bind still pushes. Gate-0-dead predicate.
+              if c4_is_local_rebind == 1 and mir::mir_is_droppable_pushed(ctx, name) == 1
+                # cow rebind: existing entry covers `b`; do NOT duplicate.
+              else
+                ctx.push_droppable(name, inferred_type)
+              end
+            else
+              ctx.push_droppable(name, inferred_type)
+              ctx.mir_transfer_droppable(src_name, name)
+            end
+          end
+        end
+      end
+    end
+  end
+  # Track narrow local types for sized storage codegen
+  var let_type_ann = ast::ast_get_str2(s, node)
+  # Fallback: check if init is an integer literal with a type suffix (e.g., 42_u8)
+  if str_byte_len(let_type_ann) == 0
+    if init_kind == node_constants::NODE_INT_LIT
+      let_type_ann = ast::ast_get_str2(s, init_node)
+    end
+  end
+  if str_byte_len(let_type_ann) > 0
+    if mir_is_narrow_fixed_width(let_type_ann)
+      var cur_func = ctx.mir_ctx_get_func()
+      mir_func_set_local_type(cur_func, name, let_type_ann)
+    end
+    if let_type_ann == "F32" or let_type_ann == "F64"
+      ctx.mir_ctx_mark_float_var(name)
+    end
+  end
+  # B.10 §14 N1 — an `Option<…>`-annotated let supplies the niche construction
+  # its concrete type (the only source for `None`), and tracks the var's type so
+  # later reads (`match x` / `x.is_some()`) recover the same verdict. The set is
+  # scoped strictly around the init lowering and cleared after.
+  # enum-niche M2 — a `Result<…>`-annotated let is the SAME value-flow boundary as
+  # the Option case: supply the declared `Result<A,B>` so the niche-multi construct
+  # recovers the concrete type the read side infers from this var's tracked type
+  # (§14.4 — construct/read agree). Inert at gate 0; the Option construct path is
+  # untouched (`mir_option_payload_of_type` ignores a Result-typed slot).
+  var n_had_expected = 0
+  if let_type_ann.starts_with("Option<")
+    ctx.mir_ctx_mark_struct_var(name, let_type_ann)
+    mir::mir_ctx_set_niche_expected(ctx, let_type_ann)
+    n_had_expected = 1
+  elsif let_type_ann.starts_with("Result<")
+    # enum-niche M2 — a `Result<…>`-annotated let supplies the niche-multi construct
+    # the concrete `Result<A,B>` the read side infers from this var's annotation
+    # (§14.4 — construct/read agree). For a niche-multi Result we ALSO mark the var's
+    # type (mirroring the Option sibling above and the NODE_CALL niche mark ~505-507):
+    # the construct side niches to a bare payload ptr (no tag word), so the read side
+    # must track `r` as niche-multi to decode it correctly — otherwise `r is Ok` reads
+    # the bare ptr as a legacy 2-word tagged box and loads word[0] (the payload field)
+    # as the tag (item 17). Gated on the niche-multi predicate ⇒ INERT when the master
+    # flag is OFF for spill/legacy Result types (no niche verdict ⇒ var-type untouched).
+    if mir::mir_result_type_is_niche_multi(ctx, let_type_ann) == 1
+      ctx.mir_ctx_mark_struct_var(name, let_type_ann)
+    end
+    mir::mir_ctx_set_niche_expected(ctx, let_type_ann)
+    n_had_expected = 1
+  else
+    # Reassignment (the parser emits NODE_LET for bare `x = …` too) carries no
+    # annotation — fall back to the variable's already-tracked type so a
+    # reassigned `x = None` / `x = Result::Ok(..)` niches consistently with x's reads.
+    var n_var_ty = ctx.mir_ctx_get_var_type(name)
+    if n_var_ty.starts_with("Option<") or n_var_ty.starts_with("Result<")
+      mir::mir_ctx_set_niche_expected(ctx, n_var_ty)
+      n_had_expected = 1
+    end
+  end
+  var init_val = mir_lower::mir_lower_expr(ctx, s, init_node)
+  if n_had_expected == 1
+    mir::mir_ctx_clear_niche_expected(ctx)
+  end
+  # F32 truncation: wrap a float-typed init value in f64_to_f32() to truncate
+  # precision. Must use f64_to_f32 (fptrunc), NOT to_f32 (sitofp): the init
+  # value is already a float (double-bits-in-i64), so sitofp would reinterpret
+  # the bit pattern as a signed integer and produce garbage.
+  if let_type_ann == "F32"
+    if ctx.mir_is_float_expr(s, init_node)
+      var trunc_args = vec_new()
+      trunc_args.push(init_val)
+      init_val = ctx.mir_emit_intrinsic("f64_to_f32", trunc_args)
+    end
+  end
+  # Narrow integer truncation: wrap init value in to_X() for correct sign/zero extension
+  # This ensures the MIR value used downstream is already truncated, even if the
+  # optimizer forwards the value past the store/load (which would bypass codegen truncation)
+  if mir_is_narrow_fixed_width(let_type_ann)
+    var narrow_intrinsic = mir_narrow_to_intrinsic(let_type_ann)
+    if str_byte_len(narrow_intrinsic) > 0
+      var narrow_args = vec_new()
+      narrow_args.push(init_val)
+      init_val = ctx.mir_emit_intrinsic(narrow_intrinsic, narrow_args)
+    end
+  end
+  # R2.1 (B1) — union widening: when the declared type is a union (`A | B`) and the
+  # RHS is one arm, wrap init_val into the union's runtime tagged `{tag, payload}`
+  # cell (reusing the enum boxed shape) instead of erasing to the bare scalar. The
+  # arm type comes from mir_infer_expr_type on the RHS; the tag = hash(arm). The
+  # cell is a valid i64 handle so pass-through code is unaffected. Reading/narrowing
+  # is B2 — this only constructs + stores the tagged value. Also record the
+  # binding's union type (Step 4 forward-plumbing) so B2's read site can recover it
+  # via mir_ctx_get_var_type. Keyed on a union annotation, which the compiler's own
+  # sources do not use in LET position ⇒ gate-0-inert / byte-identical self-compile.
+  if mir_is_union_annotation(let_type_ann)
+    var arm = ctx.mir_infer_expr_type(s, init_node)
+    # Renarrow fix — when the RHS is ITSELF already a union value (e.g. `var y: Int
+    # | String = x` where `x: Int | String`), it is already a tagged `{tag, payload}`
+    # cell, NOT a bare arm. Re-widening would double-wrap it under a bogus tag
+    # (mir_union_arm_tag of the whole union spelling), so a later `y is Member` reads
+    # the wrong tag word → false → wrong value. Flow it through by IDENTITY, matching
+    # the B3 else-branch below (RHS-is-union, no widen). Only the genuine arm case
+    # (RHS infers to a single member type) constructs a fresh cell.
+    if mir_is_union_annotation(arm) == false
+      init_val = mir_lower::mir_emit_widen_to_union(ctx, init_val, let_type_ann, arm)
+    end
+    ctx.mir_ctx_mark_struct_var(name, let_type_ann)
+  end
+  # B3 — else-case: the RHS is already a union value (e.g. a call returning
+  # `Int | String`) but the binding carries NO explicit union annotation, so the
+  # B1 arm above never ran and the var's union type was never recorded — a later
+  # `if r is Int` then fails to narrow. Record the inferred union type here so the
+  # read site can recover it via mir_ctx_get_var_type. NO widen: the RHS is already
+  # a tagged union cell (the callee widened it on return), so init_val is untouched.
+  # Gated on the annotation NOT being a union (the B1 arm handles that) to avoid
+  # double-marking, and on the RHS inferring to a union ⇒ gate-0-inert.
+  if mir_is_union_annotation(let_type_ann) == false
+    var rhs_inferred = ctx.mir_infer_expr_type(s, init_node)
+    if mir_is_union_annotation(rhs_inferred)
+      ctx.mir_ctx_mark_struct_var(name, rhs_inferred)
+    end
+  end
+  # R2 (C1) — structural record LET `let p: { x: Int, y: Int } = Point{...}`.
+  # Register the sorted-canonical @value record struct (idempotent) and mark `p`
+  # with it, so `p.x` and passing `p` to a record-typed param resolve through the
+  # ordinary nominal flat-offset path. The RHS constructs via its own layout
+  # (a nominal `Point{...}` stores by Point's DECLARED field order, or an inferred
+  # anon record builds under the same canonical name); the canonical record layout
+  # matches when the constructor's field order equals sorted order (C1 scope —
+  # cross-order reprojection is C2). GATE-0-INERT: the compiler+stdlib carry ZERO
+  # record-typed LET annotations (verified), so this never fires for self-compile.
+  if mir::mir_is_record_annotation(let_type_ann)
+    mir::mir_register_record_struct(ctx, let_type_ann, s)
+    var lr_canon = mir::mir_record_canonical_name(let_type_ann)
+    ctx.mir_ctx_mark_struct_var(name, lr_canon)
+    # R2.2 (item 4 / GAP-reproject-let) — when the RHS is a WIDER >16B nominal
+    # source struct (a COW buffer: refcount header @word 0, field f @word f+1)
+    # narrowed into this record LET, its physical layout is NOT offset-compatible
+    # with the record's flat @value layout (field f @word f). Binding `p` to the
+    # raw source buffer then reads the record's field 0 off the COW header → garbage
+    # (same failure the CALL-ARG coercion site fixed in 147bc97e). Reproject the
+    # source into the record's flat canonical layout — reuse the COW-shift-aware
+    # helper `mir_emit_reproject_to_record` so `p` binds to a correct flat buffer.
+    # Gated on `mir_value_is_cow_layout(src) == 1` (the >16B COW probe): a ≤16B
+    # source has NO header, decomposes offset-compatibly, and is left UNTOUCHED
+    # (byte-identical to today). Also short-circuits a passthrough where the RHS
+    # already IS this canonical record. GATE-0-INERT: gated on a record LET
+    # annotation, which the compiler+stdlib never carry ⇒ byte-identical self-compile.
+    var lr_src_ty = ctx.mir_infer_expr_type(s, init_node)
+    if str_byte_len(lr_src_ty) > 0 and mir::mir_is_record_annotation(lr_src_ty) == false
+      var lr_src = mir::mir_resolve_struct_name(ctx, lr_src_ty)
+      if lr_src != lr_canon and mir::mir_value_is_cow_layout(ctx, lr_src) == 1
+        init_val = mir_lower::mir_emit_reproject_to_record(ctx, init_val, lr_src_ty, let_type_ann)
+      end
+    end
+  else
+    # R2.2 (item 4b / GAP-record-let-infer-from-call) — an UNANNOTATED record LET
+    # `var w = f()` where `f` returns a record `{ x: Int }` never runs the annotated
+    # block above (its guard is `let_type_ann` being a record annotation, but here
+    # `let_type_ann` is empty). So `w` is never marked with the canonical record
+    # struct name and `w.x` resolves the wrong flat offset (reads garbage). Derive an
+    # effective record annotation from the RHS inference and, when it IS a record,
+    # run the SAME register + canonical-name var-mark the annotated path performs, so
+    # `w.x` reads the flat canonical offset. The returned value is already flat (the
+    # record analogue of item-1's union-from-call recording) — NO reproject is needed
+    # here. Gated strictly on the INFERRED type being a record annotation: an Int /
+    # String / nominal-struct / union / Vec RHS never enters this branch, keeping its
+    # existing var-type recording exactly. GATE-0-INERT: the compiler+stdlib carry
+    # ZERO record-typed LETs (annotated or inferred), so this never fires for
+    # self-compile ⇒ byte-identical.
+    var lr_inf_ty = ctx.mir_infer_expr_type(s, init_node)
+    if str_byte_len(lr_inf_ty) > 0 and mir::mir_is_record_annotation(lr_inf_ty)
+      mir::mir_register_record_struct(ctx, lr_inf_ty, s)
+      var lr_inf_canon = mir::mir_record_canonical_name(lr_inf_ty)
+      ctx.mir_ctx_mark_struct_var(name, lr_inf_canon)
+    end
+  end
+  # B.10 §14.12 value semantics (V-track, INERT at gate 0): eager copy-on-assign
+  # for `@value` structs. When the init is a bare IDENT, init_val is a POINTER to
+  # the source region — binding it shares (reference semantics, the §14.11.8 bug).
+  # Emit an independent copy so `var b = a; b.x = 2` leaves `a` unchanged. Keyed on
+  # `@value` (the compiler uses zero) ⇒ fixpoint-trivial. v1 eager; COW later.
+  if mir::mir_value_semantics_live() == 1
+    if ast::ast_get_kind(s, init_node) == node_constants::NODE_IDENT
+      var vs_ty = ctx.mir_ctx_get_var_type(name)
+      if str_byte_len(vs_ty) > 0
+        # F4c (R6) — arena-owned source: a `var q = p` where p lives in an arena
+        # shares the arena buffer (no COW header). Do NOT value-copy/retain it
+        # (cow_rc_inc on a header-less arena buffer corrupts memory); propagate
+        # arena-ownership to q so its later mutation/drop also stays non-COW. INERT
+        # at gate 0 (is_arena_owned only set for arena structs, which are not
+        # cow-layout until the flip; the copy below is the only behavior that
+        # changes, and only for an arena value-layout binding at gate 1).
+        var vs_src_name = ast::ast_get_str1(s, init_node)
+        if str_byte_len(vs_src_name) > 0 and mir::mir_ctx_is_arena_owned(ctx, vs_src_name) == 1
+          mir::mir_ctx_mark_arena_owned(ctx, name)
+        # F4a: keyed on mir_is_value_layout_type (= is_value at gate-0, byte-
+        # identical; ⊇ eligible plain structs at F4-gate-1) so a flipped plain
+        # struct gets the SAME copy-on-assign (cow_retain >16B / eager ≤16B) — the
+        # construct uses a cow buffer + make-unique, so the assign MUST retain or
+        # the shared buffer aliases (the 999/999 miscompile). Single layout key.
+        elsif mir::mir_is_value_layout_type(ctx, vs_ty) == 1
+          init_val = mir::mir_emit_value_copy(ctx, init_val, vs_ty)
+        end
+      end
+    end
+  end
+  # item 23 — inline @value-payload Option unwrap bind: `var v = r.unwrap()` where
+  # `r: Option<P>` and `P` is an inline value-layout (`@value`) struct. The unwrap
+  # intercept (mir_lower_expr_handlers.qz) returned `&box[word1]` — the INTERIOR
+  # ADDRESS of the inlined payload, a FLAT header-less field block (construction
+  # strips the COW refcount header). So `v` must be ARENA-OWNED (exactly the match-arm
+  # `is_inline` bind, which marks its bound name arena-owned): its field reads stay
+  # offset+0 with NO COW +1 shift / make-unique, which a >16B value-layout `v` would
+  # otherwise apply (reading one word past each field → garbage / SEGV). The ≤16B case
+  # is offset+0 anyway, so the mark is a harmless no-op there. Track `v`'s concrete
+  # type so field access resolves. Keyed on `mir_option_subject_is_inline_value` ⇒
+  # INERT at gate 0 (no `@value` Option payload exists ⇒ never fires ⇒ byte-identical).
+  if mir::mir_option_subject_is_unwrap_call(s, init_node) == 1
+    var iv_subj = mir::mir_unwrap_call_subject(s, init_node)
+    # item 27 — exclude a value-layout COLLECTION READOUT (`m.get(k).unwrap()` /
+    # `v.get(i).unwrap()`): unwrap returns the BUFFER-POINTER HANDLE (load box[word1]),
+    # NOT the flat inlined-payload address. So `r` must NOT be arena-marked flat — it
+    # is the cow/value HANDLE, and the C4.5/h6 block below tracks it with the concrete
+    # cow type so field reads apply the +1 header-skip and the retain holds its own
+    # reference. Arena-marking it here would force offset+0 reads (refcount-as-field0).
+    if iv_subj != 0 and mir::mir_option_subject_is_inline_value(ctx, s, iv_subj) == 1 and mir::mir_option_subject_is_cow_handle_readout(ctx, s, iv_subj) == 0
+      var iv_pt = mir::mir_option_subject_payload(ctx, s, iv_subj)
+      mir::mir_ctx_mark_arena_owned(ctx, name)
+      if str_byte_len(iv_pt) > 0
+        ctx.mir_ctx_mark_struct_var(name, iv_pt)
+      end
+    end
+  end
+  # item 42 — an explicitly-annotated `var r: Result<P,E> = …` / `var o: Option<P> = …`
+  # whose payload `P` is value-layout (`@value`) must track that annotation so the
+  # downstream value-layout intercepts (Part 1/2 — `unwrap_ok(r)`, `result_map(r, f)`)
+  # recognize it. The NODE_CALL block above only tracks call inits; a literal enum init
+  # (`Result::Ok(P{..})`) is NODE_ENUM_ACCESS, so its annotation would otherwise be lost
+  # ⇒ the read side spill-decodes the inline payload ⇒ SIGSEGV (the pre-existing
+  # `Result::Ok(@value)` + `unwrap_ok` crash). Gated on the payload being value-layout ⇒
+  # INERT at gate 0 (no `@value` payload exists ⇒ never fires ⇒ byte-identical).
+  var i42_ann = ast::ast_get_str2(s, node)
+  if str_byte_len(i42_ann) > 0
+    var i42_pay = ""
+    if i42_ann.starts_with("Result<")
+      i42_pay = mir::mir_result_ok_type(i42_ann)
+    elsif i42_ann.starts_with("Option<")
+      i42_pay = mir::mir_option_payload_of_type(i42_ann)
+    end
+    if str_byte_len(i42_pay) > 0
+      var i42_pres = mir::mir_resolve_struct_name(ctx, mir::mir_strip_generic_head(i42_pay))
+      if mir::mir_is_value_layout_type(ctx, i42_pres) == 1
+        ctx.mir_ctx_mark_struct_var(name, i42_ann)
+      end
+    end
+  end
+  # item 42 (Part 2) — inline @value-payload `unwrap_ok`/`unwrap_err` bind:
+  # `var u = unwrap_ok(r)` where `r: Result<P, E>` and `P` is an inline value-layout
+  # (`@value`) struct. The Part-2 intercept (mir_lower_expr_handlers.qz) returned
+  # `&box[word1]` — the INTERIOR ADDRESS of the inlined payload, a FLAT header-less
+  # field block. So `u` must be ARENA-OWNED (exactly the item-23 Option unwrap bind):
+  # its field reads stay offset+0 with NO COW +1 shift, which a >16B value-layout `u`
+  # would otherwise apply (one word past each field → garbage / SEGV). The ≤16B case is
+  # offset+0 anyway, so the mark is a harmless no-op there. Track `u`'s concrete type so
+  # field access resolves. Keyed on `mir_result_subject_is_inline_value` ⇒ INERT at gate
+  # 0 (no `@value` Result payload exists ⇒ never fires ⇒ byte-identical).
+  if mir::mir_result_subject_is_unwrap_ok_call(s, init_node) == 1
+    var uo_subj = mir::mir_unwrap_ok_call_subject(s, init_node)
+    # item 42d — `var u = unwrap_err(r)` over a `Result<T, @value>`: the Part-2 intercept
+    # selected the Err-side predicate, so the bind site must MATCH it (the Ok-side
+    # predicate is blind to a value-layout Err payload, so a >16B Err `u` would skip the
+    # arena-mark, apply the COW +1 shift on its field reads → garbage / SEGV). Inspect the
+    # callee name to pick the side; mir_unwrap_ok_call_payload_type already returns the
+    # Err type for `unwrap_err`. GATE-0-INERT (both predicates false everywhere).
+    var uo_is_err = 0
+    if uo_subj != 0
+      var uo_callee = ast::ast_get_left(s, init_node)
+      if uo_callee != 0 and ast::ast_get_kind(s, uo_callee) == node_constants::NODE_IDENT
+        var uo_fname = ast::ast_get_str1(s, uo_callee)
+        if uo_fname == "unwrap_err" or str_ends_with(uo_fname, "$unwrap_err") == 1
+          uo_is_err = 1
+        end
+      end
+    end
+    var uo_inline = 0
+    if uo_subj != 0
+      if uo_is_err == 1
+        uo_inline = mir::mir_result_subject_err_is_inline_value(ctx, s, uo_subj)
+      else
+        uo_inline = mir::mir_result_subject_is_inline_value(ctx, s, uo_subj)
+      end
+    end
+    if uo_inline == 1
+      var uo_pt = mir::mir_unwrap_ok_call_payload_type(ctx, s, init_node)
+      mir::mir_ctx_mark_arena_owned(ctx, name)
+      if str_byte_len(uo_pt) > 0
+        ctx.mir_ctx_mark_struct_var(name, uo_pt)
+      end
+    end
+  end
+  # item 42b — inline @value-payload unwrap-with-fallback bind:
+  # `var u = unwrap_or_ok(r, fb)` / `result_or(r, fb)` / `unwrap_or(o, fb)` where the
+  # present-branch payload `P` is an inline value-layout (`@value`) struct. The item-42b
+  # intercept (mir_lower_expr_handlers.qz) `select`ed between the FLAT interior address
+  # (`box+8`) and the FLAT fallback, so `u` must be ARENA-OWNED — exactly the item-42
+  # unwrap_ok bind — so its field reads stay offset+0 with NO COW +1 shift (a >16B `u`
+  # would otherwise read one word past each field → garbage / SEGV). Track `u`'s concrete
+  # type so field access resolves. Keyed on the value-layout predicate ⇒ INERT at gate 0
+  # (no `@value` Result/Option payload exists ⇒ never fires ⇒ byte-identical).
+  if mir::mir_subject_is_unwrap_or_fallback_call(s, init_node) == 1
+    if mir::mir_unwrap_or_fallback_subject_is_inline_value(ctx, s, init_node) == 1
+      var uof_pt = mir::mir_unwrap_or_fallback_payload_type(ctx, s, init_node)
+      mir::mir_ctx_mark_arena_owned(ctx, name)
+      if str_byte_len(uof_pt) > 0
+        ctx.mir_ctx_mark_struct_var(name, uof_pt)
+      end
+    end
+  end
+  # item 42c — inline @value-payload `try`/`?` bind: `var inner = try r` where
+  # `r: Result<P,E>` / `Option<P>` and the present (Ok/Some) payload `P` is an inline
+  # value-layout (`@value`/flip-eligible) struct. The try intercept (mir_lower_expr_
+  # handlers.qz mir_lower_try) returned `&box[word1]` — the INTERIOR ADDRESS of the
+  # inlined payload, a FLAT header-less field block. So `inner` must be ARENA-OWNED
+  # (exactly the item-23/42 unwrap bind): its field reads stay offset+0 with NO COW +1
+  # shift, which a >16B value-layout `inner` would otherwise apply (one word past each
+  # field → garbage / SEGV — the gate-1 result_niche try_double crash). Track `inner`'s
+  # concrete type so field access resolves. Keyed on the value-layout predicate ⇒ INERT
+  # at gate 0 (no `@value` Result/Option payload exists ⇒ never fires ⇒ byte-identical).
+  if mir::mir_init_is_try_expr(s, init_node) == 1
+    if mir::mir_try_subject_present_is_inline_value(ctx, s, init_node) == 1
+      var try_pt = mir::mir_try_subject_present_payload_type(ctx, s, init_node)
+      mir::mir_ctx_mark_arena_owned(ctx, name)
+      if str_byte_len(try_pt) > 0
+        ctx.mir_ctx_mark_struct_var(name, try_pt)
+      end
+    end
+  end
+  # B.10 §14.12.8 (C4.5/h6) — retain-copy on a cow READ-OUT-of-collection bind.
+  # `r = v[0]` / `r = v.get(i)` returns the bare cow buffer POINTER from the Vec slot
+  # (C3.5 made these read paths return the handle, not a deep copy). Binding it WITHOUT
+  # a retain aliases the element: `r.a = 999` would make-unique only if rc>1, otherwise
+  # mutate v[0] in place (value-semantics violation), and dropping/clearing `v` would
+  # free the buffer under `r` (UAF). Emit cow_rc_inc so the new owner holds its own
+  # counted reference (exactly the `mir_emit_value_copy` retain for `var b = a`), and
+  # push `r` droppable so the symmetric cow_rc_dec fires at scope exit. This is the
+  # READ-OUT half; insert (push/extend) already MOVES/retains (C3.6/C4), and a transient
+  # field-access read (`v[0].x`) never reaches here (it is not a let-binding init).
+  # Keyed on mir_value_is_cow_layout(elem) ⇒ INERT at gate 0 (predicate false). NOTE:
+  # placed BEFORE the C4 NODE_CALL push so the droppable push is recorded once; the C4
+  # block is idempotent (mir_is_droppable_pushed guard) and only fires for a cow var
+  # type, which a vec_get readout does not track (untracked ⇒ skipped there).
+  if mir::mir_init_is_cow_collection_readout(ctx, s, init_node) == 1
+    var h6_elem_ty = mir::mir_cow_readout_elem_type(ctx, s, init_node)
+    if str_byte_len(h6_elem_ty) > 0
+      if mir::mir_value_is_cow_layout(ctx, h6_elem_ty) == 1
+        mir::mir_emit_cow_retain(ctx, init_val)
+        # Ensure `r`'s tracked type is the cow element so a later `r.a = …` / `r.a`
+        # routes through the +1 cow field access + make-unique (the `vec_get` CALL
+        # readout otherwise tracks "" ⇒ a flat offset-0 read would hit the refcount).
+        ctx.mir_ctx_mark_struct_var(name, h6_elem_ty)
+        if mir::mir_is_droppable_pushed(ctx, name) == 0
+          ctx.push_droppable(name, h6_elem_ty)
+        end
+      end
+    end
+  end
+  # B.10 §14.12.8 (C4) — make a `var r = make()` (call returning a cow-layout
+  # @value) droppable so the caller cow_releases the MOVED buffer it now owns.
+  # The struct-init and IDENT-copy branches above already push their (owned)
+  # cow values; the CALL branch only tracks the type, so without this the moved
+  # buffer would never reach rc 0 ⇒ leak. SCOPED to NODE_CALL init: index/field
+  # reads (`v[0]`, `s.f`) return a BORROW that C3.5 does not yet retain — pushing
+  # those would cow_rc_dec a reference the binding never acquired ⇒ refcount
+  # corruption (the inline_struct_vec `Triple` element case). Those reads are
+  # value-copied (retained) by a later C3.5 follow-up; until then they stay
+  # non-droppable, exactly as pre-C4. Idempotent. Keyed on the cow-layout
+  # predicate ⇒ INERT at gate 0.
+  if init_kind == node_constants::NODE_CALL
+    var c4_final_ty = ctx.mir_ctx_get_var_type(name)
+    if str_byte_len(c4_final_ty) > 0
+      if mir::mir_value_is_cow_layout(ctx, c4_final_ty) == 1
+        if mir::mir_is_droppable_pushed(ctx, name) == 0
+          ctx.push_droppable(name, c4_final_ty)
+        end
+      else
+        # GAP-4 (drop soundness) — a `var r = make()` whose call return is a
+        # NON-cow value with a user `Drop` impl (or droppable fields) is otherwise
+        # NEVER pushed onto the droppable stack ⇒ scope exit skips it ⇒ leak. The
+        # inline-construct sibling `var r = E{…}` IS pushed by the NODE_STRUCT_INIT
+        # branch above; the CALL branch only tracked the type. Register the binding
+        # droppable exactly as that branch does, keyed on the SAME type_needs_drop
+        # predicate (covers direct Drop + droppable fields). Push the BARE struct
+        # name (generics stripped) so emit_drops_for_scope mangles `<Base>$drop`
+        # and drops via the plain (non-cow) arm. WATCH double-free: this arm is the
+        # cow-layout `else`, so the cow branch never also fires; the
+        # mir_is_droppable_pushed guard keeps it to exactly ONE entry when an
+        # earlier type-tracking branch already pushed `r`. GATE-0-INERT for the
+        # compiler itself (its call-init bindings do not impl Drop).
+        var c4_base_ty = c4_final_ty
+        var c4_lt = __char_index(c4_base_ty, '<')
+        if c4_lt > 0
+          c4_base_ty = str_byte_slice(c4_base_ty, 0, c4_lt)
+        end
+        if ctx.type_needs_drop(c4_base_ty)
+          if mir::mir_ctx_is_ref_var(ctx, name) == 0
+            if mir::mir_is_droppable_pushed(ctx, name) == 0
+              ctx.push_droppable(name, c4_base_ty)
+            end
+          end
+        end
+      end
+    end
+  end
+  # B.10 §14.12.8 (C4 reassign-fix) — on a REBIND of a binding that already held a
+  # cow-layout @value (`e = …` where `e` was a >16B @value), release the OLD buffer
+  # NOW (its refcount is otherwise never decremented ⇒ leak) and retarget the single
+  # existing droppable entry to the new value's type (so scope exit cow_releases the
+  # CURRENT buffer exactly once, not the old one twice). The load reads `e`'s OLD
+  # value because the new value is stored just below. Must run AFTER the per-init-kind
+  # pushes above (which are now rebind-idempotent) and BEFORE the store. Keyed on
+  # mir_value_is_cow_layout via the helper ⇒ INERT at gate 0 (the compiler uses zero
+  # @value structs ⇒ predicate-dead ⇒ byte-identical self-compile).
+  # GAP-1 (Drop soundness) — SAME-SCOPE SHADOWING. A fresh `var x = D{…}; var x =
+  # D{…}` at the same depth is NOT a rebind (c4_is_local_rebind==0, is_mut==1), so the
+  # per-init-kind push above added a SECOND droppable entry sharing `x`'s single
+  # name-keyed slot with the first. Both scope-exit load-by-name reads resolve to the
+  # LATEST value ⇒ the first value is leaked, the second double-dropped. Spill the
+  # shadowed (older) binding's value into a fresh uniquely-named slot NOW (the shared
+  # slot still holds the old value; the new value is stored just below) and retarget
+  # the older entry to that slot, so scope exit drops each value exactly once. Only on
+  # a fresh (non-rebind) bind — a rebind never pushes a second entry, so this finds no
+  # prior entry there. GATE-0-INERT: the compiler has no same-scope Drop shadowing ⇒
+  # no second same-name droppable entry ⇒ this emits nothing ⇒ byte-identical.
+  if c4_is_local_rebind == 0
+    mir::mir_shadow_spill_prior_value(ctx, name)
+  end
+  if c4_is_local_rebind == 1
+    var rebind_new_ty = ctx.mir_ctx_get_var_type(name)
+    var rebind_cow_handled = mir::mir_cow_rebind_handle_old(ctx, name, rebind_new_ty)
+    # GAP-2 (Drop soundness) — non-cow user-`Drop` rebind: the cow handler above
+    # only fires for cow-layout @value entries. A plain `d = D{…}` / `d = make()`
+    # rebind of a user-Drop struct also routes here (bare reassignment lowers to a
+    # NODE_LET rebind, not NODE_ASSIGN), and without this its OLD value is never
+    # dropped (leak) while the retained single entry drops the NEW value once at
+    # scope exit. Emit the old-value drop NOW (slot still holds the old value; the
+    # new value is stored just below) and retarget the entry to the new type. Only
+    # runs when the cow handler did not claim the entry. GATE-0-INERT (compiler
+    # reassignments are non-Drop ⇒ no droppable entry ⇒ emits nothing).
+    if rebind_cow_handled == 0
+      mir::mir_rebind_drop_old_value(ctx, name, rebind_new_ty)
+    end
+  end
+  ctx.mir_emit_store_var(name, init_val)
+  return
+end
+
+# NodeAssign = 26 (C-aligned)
+def mir_lower_stmt_assign(ctx: MirContext, s: ast::AstStorage, node: AstNodeId): Void
+  var name = ast::ast_get_str1(s, node)
+  var expr_node = ast::ast_get_left(s, node)
+  # B.10 §14 N1 Phase 2 — `x = None` where x is a known `Option<…>` is a
+  # value-flow boundary identical to a reassigning let: supply x's tracked
+  # Option type as the niche construction's expected type (the only source for
+  # `None`) so the assigned Option niches consistently with x's reads. Set is
+  # scoped strictly around the RHS lowering and cleared after.
+  var n_asg_had = 0
+  var n_asg_ty = ctx.mir_ctx_get_var_type(name)
+  if n_asg_ty.starts_with("Option<") or n_asg_ty.starts_with("Result<")
+    mir::mir_ctx_set_niche_expected(ctx, n_asg_ty)
+    n_asg_had = 1
+  end
+  var val = mir_lower::mir_lower_expr(ctx, s, expr_node)
+  if n_asg_had == 1
+    mir::mir_ctx_clear_niche_expected(ctx)
+  end
+  # B.10 §14.12 value semantics (V2a, INERT at gate 0): eager copy-on-assign for
+  # `@value` structs at the plain reassignment site. Mirrors the NODE_LET-IDENT
+  # site above: when the RHS is a bare IDENT, `val` is a POINTER to the source
+  # region, so `b = a; b.x = 2` would mutate `a` (reference semantics, §14.11.8).
+  # Emit an independent copy keyed on the LHS var's tracked `@value` struct type.
+  # Compiler uses zero `@value` structs ⇒ gate-0-dead ⇒ fixpoint-trivial.
+  if mir::mir_value_semantics_live() == 1
+    if ast::ast_get_kind(s, expr_node) == node_constants::NODE_IDENT
+      var vs_asg_ty = ctx.mir_ctx_get_var_type(name)
+      if str_byte_len(vs_asg_ty) > 0
+        # F4a: see NODE_LET-IDENT site — single layout key, gate-0-inert.
+        if mir::mir_is_value_layout_type(ctx, vs_asg_ty) == 1
+          val = mir::mir_emit_value_copy(ctx, val, vs_asg_ty)
+        end
+      end
+    end
+  end
+  # Narrow integer truncation on assignment to narrow local
+  var assign_narrow = ctx.mir_get_narrow_type_of_ident(name)
+  if str_byte_len(assign_narrow) > 0
+    var assign_intrinsic = mir_narrow_to_intrinsic(assign_narrow)
+    if str_byte_len(assign_intrinsic) > 0
+      var assign_args = vec_new()
+      assign_args.push(val)
+      val = ctx.mir_emit_intrinsic(assign_intrinsic, assign_args)
+    end
+  end
+  # Drop old value on reassignment of droppable variable
+  var droppable_stack = ctx.mir_ctx_get_droppable_stack()
+  var di = droppable_stack.size - 1
+  while di >= 0
+    var dentry = droppable_stack[di]
+    if dentry.var_name == name
+      var old_type = dentry.type_name
+      var old_val = ctx.mir_emit_load_var(name)
+      if ctx.type_has_drop(old_type)
+        var drop_args = vec_new()
+        drop_args.push(old_val)
+        ctx.mir_emit_call(str_concat(old_type, "$drop"), drop_args)
+      end
+      ctx.emit_nested_drops(old_val, old_type)
+      di = -1
+    end
+    di -= 1
+  end
+  ctx.mir_emit_store_var(name, val)
+  return
+end
+
+# NodeIndexAssign = 27 (C-aligned): arr[idx] = value -> mir$MIR_INDEX_STORE
+# Supports negative indexing: a[-1] = val -> a[vec_size(a) - 1] = val
+def mir_lower_stmt_index_assign(ctx: MirContext, s: ast::AstStorage, node: AstNodeId): Void
+  var arr_node = ast::ast_get_left(s, node)
+  var idx_node = ast::ast_get_right(s, node)
+  var val_node = ast::ast_get_extra(s, node)
+
+  var arr_val = mir_lower::mir_lower_expr(ctx, s, arr_node)
+  # Async cross-suspend spill: if the value expression contains a suspend
+  # point (literal `await` or a colorless-dispatched call), the array SSA
+  # register defined here will not dominate the resume block where the
+  # index-store is finally emitted. Spill before lowering the value, reload
+  # after — mirrors the binary-op / call-arg spill sites.
+  var _ia_arr_spill = mir_lower_expr_handlers::mir_async_spill_if_await(ctx, s, val_node, arr_val)
+  # B.10 §14 N1 — index-assign value carries the collection element type as its
+  # niche-construction expected type, so `vec[i] = Option::None` on a niche-
+  # eligible `Vec<Option<P>>` constructs the niche None (0) rather than a TAGGED
+  # spill box that the niche read range-tests as Some. Element type from the str2
+  # width annotation, else inferred from the receiver's declared `Vec<…>` type
+  # (covers field/expr receivers the registry can't key). Inert for non-Option
+  # elements and flag-OFF (niche construction is gated on mir_option_is_niche).
+  var _ia_elem_ty = ast::ast_get_str2(s, node)
+  if _ia_elem_ty.starts_with("Option<") == false and _ia_elem_ty.starts_with("Result<") == false
+    var _ia_recv_ty = ctx.mir_infer_expr_type(s, arr_node)
+    if str_byte_len(_ia_recv_ty) > 0
+      _ia_elem_ty = mir::mir_extract_generic_element_type(_ia_recv_ty)
+    end
+  end
+  # enum-niche M2 — a niche-eligible `Vec<Result<A,B>>` element-assign supplies the
+  # element `Result<A,B>` so the construct niches consistently with the niche read
+  # (§14.4). Inert at gate 0; the Option element path is unaffected.
+  var _ia_niche_set = 0
+  if _ia_elem_ty.starts_with("Option<") or _ia_elem_ty.starts_with("Result<")
+    mir::mir_ctx_set_niche_expected(ctx, _ia_elem_ty)
+    _ia_niche_set = 1
+  end
+  var val_val = mir_lower::mir_lower_expr(ctx, s, val_node)
+  if _ia_niche_set == 1
+    mir::mir_ctx_clear_niche_expected(ctx)
+  end
+  # R2.1 (B3) — union widening at ELEMENT STORE: when the collection's element type
+  # is a union (`Vec<Int | String>` ⇒ `_ia_elem_ty` = "Int | String", preserved by
+  # mir_extract_generic_element_type which stops at a top-level '>'/','  not '|')
+  # and the RHS is a bare arm, wrap `val_val` into the union's tagged cell BEFORE the
+  # store-path fork (both the unchecked intrinsic and MIR_INDEX_STORE below see the
+  # widened value) so a later `if arr[i] is Int` (B2 narrow) recovers the member. Src
+  # already inferring to a union short-circuits (no double-widen). Keyed on a union
+  # element annotation, unused by the compiler's own sources ⇒ gate-0-inert.
+  if mir_is_union_annotation(_ia_elem_ty)
+    var b3_el_arm = ctx.mir_infer_expr_type(s, val_node)
+    if mir_is_union_annotation(b3_el_arm) == false
+      val_val = mir_lower::mir_emit_widen_to_union(ctx, val_val, _ia_elem_ty, b3_el_arm)
+    end
+  end
+  arr_val = mir_lower_expr_handlers::mir_async_reload_if_spilled(ctx, _ia_arr_spill, arr_val)
+
+  # Check for negative index: node_constants$NODE_UNARY with OpNeg
+  var idx_kind = ast::ast_get_kind(s, idx_node)
+  var idx_val = 0
+  if idx_kind == 7
+    if ast::ast_get_op(s, idx_node) == 14
+      var neg_val = mir_lower::mir_lower_expr(ctx, s, idx_node)
+      var la = vec_new()
+      la.push(arr_val)
+      var lv = ctx.mir_emit_intrinsic("vec_size", la)
+      idx_val = ctx.mir_emit_binary(op_constants::OP_ADD, lv, neg_val)
+    else
+      idx_val = mir_lower::mir_lower_expr(ctx, s, idx_node)
+    end
+  else
+    idx_val = mir_lower::mir_lower_expr(ctx, s, idx_node)
+  end
+
+  # ======== Loop Vec Optimization: use unchecked access if in a loop ========
+  var arr_base_kind = ast::ast_get_kind(s, arr_node)
+  if arr_base_kind == 6  # node_constants$NODE_IDENT — check if this Vec is in the unchecked set
+    var arr_base_name = ast::ast_get_str1(s, arr_node)
+    var hoisted = ctx.hoisted_vec_ptrs
+    for hpi in 0..hoisted.size
+      var h_name = as_string(hoisted[hpi])
+      if h_name == arr_base_name
+        # Found in unchecked set — use vec_set_unchecked intrinsic. Recover the
+        # concrete value-layout element type (item 44c) so the store goes INLINE
+        # matching push/read, not BOXED. Gate-0-inert.
+        var ia_elem_ann = mir_index_assign_value_elem(ctx, s, arr_node, ast::ast_get_str2(s, node))
+        var set_args = vec_new()
+        set_args.push(arr_val)
+        set_args.push(idx_val)
+        set_args.push(val_val)
+        var _discard = ctx.mir_emit_intrinsic_typed("vec_set_unchecked", set_args, ia_elem_ann)
+        return
+      end
+    end
+  end
+  # ============================================================================
+
+  # Create mir$MIR_INDEX_STORE instruction (kind 17)
+  var dest = ctx.mir_emit_value(mir::MIR_TYPE_INT)
+  var instr = mir_new_instr(mir::MIR_INDEX_STORE, dest, mir::MIR_TYPE_INT)
+  mir_instr_set_operand1(instr, arr_val)
+  mir_instr_set_operand2(instr, idx_val)
+  var args = vec_new()
+  args.push(val_val)
+  mir_instr_set_args(instr, args)
+  # Thread element type for width-aware codegen (mem-v2)
+  var ia_stmt_elem = mir_index_assign_value_elem(ctx, s, arr_node, ast::ast_get_str2(s, node))
+  if str_byte_len(ia_stmt_elem) > 0
+    mir_instr_set_slot2(instr, as_int(ia_stmt_elem))
+  end
+  ctx.mir_emit_instr(instr)
+  return
+end
+
+## F4 item-44c — recover the CONCRETE value-layout element type for `vec[i] = x`.
+## The typecheck index-WRITE annotation erases the element to the generic placeholder
+## "Struct" (and `mir_infer_expr_type` yields bare "Vec"), so a value-layout @value
+## element fell to the BOXED single-word store (store a pointer at stride-1), corrupting
+## the inline element stored at stride-fc by push/vec_get. When the str2 annotation is
+## not itself value-layout, recover the tracked element type (set by `vec_new<T>` /
+## `vec_new_filled<T>` via mir_ctx_mark_vec_elem_type) for an IDENT receiver and use it
+## iff value-layout. Gate-0-inert: at flip 0 no element is value-layout ⇒ the annotation
+## is returned unchanged ⇒ byte-identical (also never narrows a scalar element).
+def mir_index_assign_value_elem(ctx: MirContext, s: ast::AstStorage, arr_node: AstNodeId, str2_ann: String): String
+  return str2_ann if mir::mir_is_value_layout_type(ctx, str2_ann) == 1
+  return str2_ann if ast::ast_get_kind(s, arr_node) != node_constants::NODE_IDENT
+  var tracked = mir::mir_ctx_get_vec_elem_type(ctx, ast::ast_get_str1(s, arr_node))
+  return tracked if mir::mir_is_value_layout_type(ctx, tracked) == 1
+  return str2_ann
+end
+
+# NodeFieldAssign = 28 (C-aligned): obj.field = value -> store at field offset
+def mir_lower_stmt_field_assign(ctx: MirContext, s: ast::AstStorage, node: AstNodeId): Void
+  var obj_node = ast::ast_get_left(s, node)
+  var field_name = ast::ast_get_str1(s, node)
+  var val_node = ast::ast_get_extra(s, node)
+
+  var obj_val = mir_lower::mir_lower_expr(ctx, s, obj_node)
+  # B.10 §14 N1 — direct field assign `obj.field = Option::None` carries the
+  # field's declared Option type as niche-construction expected type, so the None
+  # niches (0) instead of constructing a TAGGED spill box the niche read would
+  # range-test as Some. Inert for non-Option fields and flag-OFF (niche
+  # construction is gated on mir_option_is_niche). Pre-infer the field type
+  # cheaply for the hint; the authoritative resolution below is unchanged.
+  var _fa_niche_set = 0
+  var _fa_obj_ty = ctx.mir_infer_expr_type(s, obj_node)
+  if str_byte_len(_fa_obj_ty) > 0
+    var _fa_lt = __char_index(_fa_obj_ty, '<')
+    if _fa_lt > 0
+      _fa_obj_ty = str_byte_slice(_fa_obj_ty, 0, _fa_lt)
+    end
+    var _fa_res = ctx.mir_resolve_struct_name(_fa_obj_ty)
+    var _fa_ft = ctx.mir_ctx_get_field_type(_fa_res, field_name)
+    if _fa_ft.starts_with("Option<") or _fa_ft.starts_with("Result<")
+      # enum-niche M2 — a niche-eligible `Result<A,B>`-typed field assign supplies the
+      # field type so the construct niches consistently with the niche read (§14.4).
+      # Inert at gate 0; the Option field path is unaffected.
+      mir::mir_ctx_set_niche_expected(ctx, _fa_ft)
+      _fa_niche_set = 1
+    end
+  end
+  var val_val = mir_lower::mir_lower_expr(ctx, s, val_node)
+  if _fa_niche_set == 1
+    mir::mir_ctx_clear_niche_expected(ctx)
+  end
+
+  # Look up field index from struct type using recursive type inference
+  var field_idx = -1
+  var resolved_type = ""
+  var struct_type = ctx.mir_infer_expr_type(s, obj_node)
+  if str_byte_len(struct_type) > 0
+    # Strip generic type args for struct registry lookup
+    var lt_pos = __char_index(struct_type, '<')
+    if lt_pos > 0
+      struct_type = str_byte_slice(struct_type, 0, lt_pos)
+    end
+    resolved_type = ctx.mir_resolve_struct_name(struct_type)
+    field_idx = ctx.mir_ctx_find_field_index(resolved_type, field_name)
+  end
+
+  # R2.1 (B3) — union widening at FIELD STORE: when the target field's declared
+  # type is a union (`A | B`) and the RHS is a bare arm (not already a union cell),
+  # wrap `val_val` into the union's tagged `{tag, payload}` cell so a later
+  # `if s.u is Int` (B2 narrow) recovers the member. A union field is a pointer-
+  # sized handle (not cow/not narrow) ⇒ the plain offset store below carries it.
+  # Src already inferring to a union short-circuits (no double-widen). Keyed on a
+  # union field annotation, unused by the compiler's own sources ⇒ gate-0-inert.
+  if field_idx >= 0 and str_byte_len(resolved_type) > 0
+    var b3_fld_ty = ctx.mir_ctx_get_field_type(resolved_type, field_name)
+    if mir_is_union_annotation(b3_fld_ty)
+      var b3_fa_arm = ctx.mir_infer_expr_type(s, val_node)
+      if mir_is_union_annotation(b3_fa_arm) == false
+        val_val = mir_lower::mir_emit_widen_to_union(ctx, val_val, b3_fld_ty, b3_fa_arm)
+      end
+    end
+  end
+
+  # If primary resolution found the field, use it
+  if field_idx >= 0
+    # B.10 §14.12.8 (C3) — COW mutation. Before storing into a cow-layout buffer
+    # that MIGHT be shared, run make-unique: if refcount > 1, deep-copy to a fresh
+    # buffer and rebind so the store hits OUR private copy (mutation-independence);
+    # if refcount == 1, no-op. Then store field f at buffer word f+1 (+1 shift). If
+    # the receiver is a plain ident var, rebind it to the (possibly new) buffer so
+    # later reads/writes see the fresh copy. Takes precedence over the narrow path
+    # (cow buffer is a flat i64 block). INERT at gate 0 (predicate false).
+    # F4c (R6) — arena-owned receiver: a `q.a = …` where q is an arena-placed
+    # value-layout struct must NOT make-unique or +1-shift — the arena buffer is
+    # flat offset+0 with no refcount header (make-unique reads a garbage refcount@0
+    # and the +1 store writes past the field). Fall through to the plain offset+0
+    # store (the ratified arena-non-COW carve-out). INERT at gate 0.
+    var _fwr_arena = mir_lower::mir_field_base_is_arena_owned(ctx, s, obj_node)
+    # item 20 P2 — borrowed mutating COW value-struct `self` receiver: a `self.f = …`
+    # inside a method whose `self` is a borrowed exclusive (caller-owned) COW buffer
+    # must mutate that buffer IN PLACE — do NOT make-unique. The caller passed its live
+    # buffer WITHOUT a retain (call-site copy elision) and registered no scope-exit
+    # release here, so rc==1 from the borrow's point of view; forking to a private copy
+    # would (a) lose the write back to the caller and (b) re-introduce the item-21
+    # iterator infinite-loop / mutation-loss. Store directly with the +1 shift (the
+    # buffer keeps its word-0 refcount header). Only fires when the receiver is the
+    # `self` IDENT and we are lowering such a method. Gate-0-inert (flag false ⇒ off).
+    var _fwr_borrowed_self = 0
+    if ast::ast_get_kind(s, obj_node) == node_constants::NODE_IDENT
+      if ast::ast_get_str1(s, obj_node).eq("self")
+        if mir::mir_ctx_get_borrowed_self_receiver(ctx) == 1
+          _fwr_borrowed_self = 1
+        end
+      end
+    end
+    if str_byte_len(resolved_type) > 0 and mir::mir_value_is_cow_layout(ctx, resolved_type) == 1 and _fwr_arena == 0 and _fwr_borrowed_self == 1
+      mir::mir_ctx_set_cow_field_shift(ctx, 1)
+      ctx.mir_emit_store_offset(obj_val, field_idx, val_val)
+      mir::mir_ctx_set_cow_field_shift(ctx, 0)
+      return
+    end
+    if str_byte_len(resolved_type) > 0 and mir::mir_value_is_cow_layout(ctx, resolved_type) == 1 and _fwr_arena == 0
+      var n_words = mir::mir_ctx_struct_field_count(ctx, resolved_type)
+      var eff_buf = mir::mir_emit_cow_make_unique(ctx, obj_val, n_words, resolved_type)
+      # Rebind the receiver var to the (possibly new) buffer for subsequent access.
+      if ast::ast_get_kind(s, obj_node) == node_constants::NODE_IDENT
+        var recv_name = ast::ast_get_str1(s, obj_node)
+        ctx.mir_emit_store_var(recv_name, eff_buf)
+      # item 24 — NESTED cow receiver (`o.q.a = …` where `q` is a >16B cow @value
+      # MEMBER of `o`). make-unique forked `q`'s buffer because the aggregate copy
+      # `var o2 = o` cow_rc_inc'd it (rc>1); the fresh fork must be written BACK into
+      # the parent's `q` field slot, else `o2.q` keeps pointing at the OLD buffer and
+      # the mutation is lost (the value-copy `o2.q.a` reads stale). Re-lower the parent
+      # base, find the member field index, and store the fork into that slot, routing
+      # through the parent's own +1 cow shift if the parent is itself cow-layout (it is
+      # NOT for a struct holding a @value member — flatness rail — so the plain offset
+      # store is the common case). The parent owns a private buffer here (it was eager-
+      # copied, OR is the original), so no parent make-unique is needed. INERT at gate 0
+      # (no @value member ⇒ no nested cow receiver ⇒ this branch is unreachable).
+      elsif ast::ast_get_kind(s, obj_node) == node_constants::NODE_FIELD_ACCESS
+        var par_node = ast::ast_get_left(s, obj_node)
+        var par_field = ast::ast_get_str1(s, obj_node)
+        var par_type = ctx.mir_infer_expr_type(s, par_node)
+        if str_byte_len(par_type) > 0
+          var par_lt = __char_index(par_type, '<')
+          if par_lt > 0
+            par_type = str_byte_slice(par_type, 0, par_lt)
+          end
+          var par_resolved = ctx.mir_resolve_struct_name(par_type)
+          var par_fidx = ctx.mir_ctx_find_field_index(par_resolved, par_field)
+          if par_fidx >= 0
+            var par_val = mir_lower::mir_lower_expr(ctx, s, par_node)
+            if mir::mir_value_is_cow_layout(ctx, par_resolved) == 1
+              mir::mir_ctx_set_cow_field_shift(ctx, 1)
+              ctx.mir_emit_store_offset(par_val, par_fidx, eff_buf)
+              mir::mir_ctx_set_cow_field_shift(ctx, 0)
+            else
+              ctx.mir_emit_store_offset(par_val, par_fidx, eff_buf)
+            end
+          end
+        end
+      end
+      mir::mir_ctx_set_cow_field_shift(ctx, 1)
+      ctx.mir_emit_store_offset(eff_buf, field_idx, val_val)
+      mir::mir_ctx_set_cow_field_shift(ctx, 0)
+      return
+    end
+    if str_byte_len(resolved_type) > 0
+      if ctx.mir_struct_has_narrow_fields(resolved_type)
+        var ft = ctx.mir_ctx_get_field_type(resolved_type, field_name)
+        ctx.mir_emit_store_field(obj_val, field_idx, val_val, resolved_type, ft)
+        return
+      end
+    end
+    ctx.mir_emit_store_offset(obj_val, field_idx, val_val)
+    return
+  end
+
+  # Fallback: search all registered structs for this field (matches field read path)
+  var global_result = ctx.mir_find_field_globally(field_name)
+  if global_result.size > 0
+    var gf_idx = global_result[1]
+    ctx.mir_emit_store_offset(obj_val, gf_idx, val_val)
+    return
+  end
+
+  ctx.mir_emit_store_offset(obj_val, 0, val_val)
+  return
+end
+
+# Emit pattern comparison for `if PATTERN = EXPR`. Sets up branch to
+# then_block/else_block and queues pending bind for enum payloads.
+# For irrefutable patterns (wildcard, struct, vec), jumps directly to then_block.
+def mir_lower_if_pattern(ctx: MirContext, s: ast::AstStorage, pattern_node: Int, subject_val: Int, subject_node: Int, then_block: MirBlock, else_block: MirBlock): Void
+  var pk = ast::ast_get_kind(s, pattern_node)
+
+  if pk == node_constants::NODE_ENUM_ACCESS
+    var base_enum_name = ast::ast_get_str1(s, pattern_node)
+    var variant_name = ast::ast_get_str2(s, pattern_node)
+    var enum_name = ""
+    if str_byte_len(base_enum_name) == 0
+      enum_name = ctx.mir_find_enum_by_variant(variant_name)
+    else
+      enum_name = ctx.mir_resolve_enum_name(base_enum_name)
+    end
+    var tag_val = ctx.mir_get_enum_tag_subj(s, subject_node, enum_name, subject_val)
+    var variant_idx = ctx.mir_find_variant_index_ctx(enum_name, variant_name)
+    var idx_val = ctx.mir_emit_const_int(variant_idx)
+    var cmp_val = ctx.mir_emit_binary(op_constants::OP_EQ, tag_val, idx_val)
+
+    # PATTERN_PARSER_REJECTS_QUALIFIED_VARIANT sub-bug (b) fix + enum-niche tail
+    # item 1: for `if PAT = EXPR` add nested tag checks for constructor sub-patterns.
+    # The inner payload load/deref is UNSAFE for a dataless outer variant (reads an
+    # uninitialized payload slot ⇒ SEGFAULT), so guard it behind the outer tag match:
+    # branch (outer_cmp ⇒ inner_check_block else else_block) and run the loads only
+    # in the outer-matched block. The inner read goes through the niche seam.
+    var sub_pats = ast::ast_get_children(s, pattern_node)
+    var has_ctor_sub = 0
+    if sub_pats > 0
+      var sub_count0 = vec_size(sub_pats)
+      for spi0 in 0..sub_count0
+        var sp0 = sub_pats[spi0]
+        if sp0 > 0 and ast::ast_get_kind(s, sp0) == node_constants::NODE_ENUM_ACCESS
+          has_ctor_sub = 1
+        end
+      end
+    end
+    if has_ctor_sub == 1
+      var inner_check_block = ctx.mir_create_block("if_pat_inner_check")
+      var outer_cur = ctx.mir_ctx_get_block()
+      mir_block_set_branch(outer_cur, cmp_val, inner_check_block, else_block)
+      ctx.mir_switch_to_block(inner_check_block)
+      cmp_val = ctx.mir_emit_const_int(1)
+      var sub_count = vec_size(sub_pats)
+      for spi in 0..sub_count
+        var sub_pat = sub_pats[spi]
+        if sub_pat > 0
+          var sub_kind = ast::ast_get_kind(s, sub_pat)
+          if sub_kind == node_constants::NODE_ENUM_ACCESS
+            var inner_payload_val = ctx.mir_emit_load_offset(subject_val, spi + 1)
+            var inner_base = ast::ast_get_str1(s, sub_pat)
+            var inner_variant = ast::ast_get_str2(s, sub_pat)
+            var inner_enum = ""
+            if str_byte_len(inner_base) == 0
+              inner_enum = ctx.mir_find_enum_by_variant(inner_variant)
+            else
+              inner_enum = ctx.mir_resolve_enum_name(inner_base)
+            end
+            var inner_static_ty = ""
+            var outer_field_types = mir::mir_ctx_lookup_variant_field_types(ctx, enum_name, variant_name)
+            if outer_field_types != 0 and spi < outer_field_types.size
+              inner_static_ty = as_string(outer_field_types[spi])
+            end
+            var inner_tag = mir::mir_get_enum_tag_nested(ctx, inner_enum, inner_static_ty, inner_payload_val)
+            var inner_vidx = ctx.mir_find_variant_index_ctx(inner_enum, inner_variant)
+            var inner_idx_val = ctx.mir_emit_const_int(inner_vidx)
+            var inner_cmp = ctx.mir_emit_binary(op_constants::OP_EQ, inner_tag, inner_idx_val)
+            cmp_val = ctx.mir_emit_binary(op_constants::OP_AND, cmp_val, inner_cmp)
+            # enum-niche tail item 6 — materialize nested inner-payload binds. The
+            # inner_check_block branches to then_block on match and dominates it,
+            # so the recovered reg is live there for apply_pending_bind. Same
+            # niche/spill classifier as the read above (§14.10.Q4 agreement).
+            var inner_bnames = ast::ast_get_bound_names(s, sub_pat)
+            if inner_bnames > 0 and inner_bnames.size > 0
+              for ibi in 0..inner_bnames.size
+                var inner_name = as_string(inner_bnames[ibi])
+                if inner_name != "_"
+                  var rec = mir::mir_bind_enum_payload_nested(ctx, inner_enum, inner_static_ty, inner_payload_val, inner_variant, ibi)
+                  var rec_ty = mir::mir_nested_bind_payload_type(ctx, inner_enum, inner_static_ty, inner_variant, ibi)
+                  var rec_inl = mir::mir_nested_bind_is_inline(ctx, inner_enum, inner_static_ty, inner_variant)
+                  mir::mir_ctx_push_nested_bind(ctx, inner_name, rec, rec_ty, rec_inl)
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+
+    var cur = ctx.mir_ctx_get_block()
+    mir_block_set_branch(cur, cmp_val, then_block, else_block)
+
+    # Queue payload binding for then_block
+    var bound_names = ast::ast_get_bound_names(s, pattern_node)
+    if bound_names > 0
+      if bound_names.size > 0
+        var names = vec_new<String>()
+        for bi in 0..bound_names.size
+          names.push(as_string(bound_names[bi]))
+        end
+        mir_mark_pattern_bindings_typed(ctx, s, subject_node, enum_name, variant_name, names)
+        ctx.mir_ctx_set_pending_bind(names, subject_val)
+        mir::mir_set_pending_inline_for_enum(ctx, s, subject_node, enum_name, variant_name, names)
+      end
+    end
+    return
+  end
+
+  if pk == node_constants::NODE_WILDCARD
+    # Irrefutable — always matches
+    var cur = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(cur, mir::TERM_JUMP, then_block)
+    return
+  end
+
+  if pk == node_constants::NODE_IDENT
+    # Bare ident: check if it's an enum variant name
+    var ident_name = ast::ast_get_str1(s, pattern_node)
+    var found_enum = ctx.mir_find_enum_by_variant(ident_name)
+    if str_byte_len(found_enum) > 0
+      var tag_val = ctx.mir_get_enum_tag_subj(s, subject_node, found_enum, subject_val)
+      var vidx = ctx.mir_find_variant_index_ctx(found_enum, ident_name)
+      var idx_val = ctx.mir_emit_const_int(vidx)
+      var cmp_val = ctx.mir_emit_binary(op_constants::OP_EQ, tag_val, idx_val)
+      var cur = ctx.mir_ctx_get_block()
+      mir_block_set_branch(cur, cmp_val, then_block, else_block)
+    else
+      # Regular value comparison
+      var pat_val = mir_lower::mir_lower_expr(ctx, s, pattern_node)
+      var cmp_val = ctx.mir_emit_binary(op_constants::OP_EQ, subject_val, pat_val)
+      var cur = ctx.mir_ctx_get_block()
+      mir_block_set_branch(cur, cmp_val, then_block, else_block)
+    end
+    return
+  end
+
+  if pk == node_constants::NODE_STRUCT_DESTRUCTURE
+    # Irrefutable — always matches, bind fields in then_block
+    var cur = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(cur, mir::TERM_JUMP, then_block)
+    return
+  end
+
+  if pk == node_constants::NODE_VEC_DESTRUCTURE
+    # Irrefutable — always matches, bind elements in then_block
+    var cur = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(cur, mir::TERM_JUMP, then_block)
+    return
+  end
+
+  if pk == node_constants::NODE_OR_PATTERN
+    # Or-pattern: comparison chain — any sub-pattern match → then_block
+    var or_pats = ast::ast_get_children(s, pattern_node)
+    var or_cnt = vec_size(or_pats)
+    for opi in 0..or_cnt
+      var sub_pat = or_pats[opi]
+      var sub_kind = ast::ast_get_kind(s, sub_pat)
+      var or_next = else_block
+      if opi < or_cnt - 1
+        or_next = ctx.mir_create_block("or_next")
+      end
+      if sub_kind == node_constants::NODE_ENUM_ACCESS
+        var or_base = ast::ast_get_str1(s, sub_pat)
+        var or_vname = ast::ast_get_str2(s, sub_pat)
+        var or_ename = ""
+        if str_byte_len(or_base) == 0
+          or_ename = ctx.mir_find_enum_by_variant(or_vname)
+        else
+          or_ename = ctx.mir_resolve_enum_name(or_base)
+        end
+        var or_tag = ctx.mir_get_enum_tag_subj(s, subject_node, or_ename, subject_val)
+        var or_vidx = ctx.mir_find_variant_index_ctx(or_ename, or_vname)
+        var or_idx_val = ctx.mir_emit_const_int(or_vidx)
+        var or_cmp = ctx.mir_emit_binary(op_constants::OP_EQ, or_tag, or_idx_val)
+        var or_cur = ctx.mir_ctx_get_block()
+        mir_block_set_branch(or_cur, or_cmp, then_block, or_next)
+        ctx.mir_switch_to_block(or_next)
+        if opi == 0
+          var or_bnames = ast::ast_get_bound_names(s, sub_pat)
+          if or_bnames > 0
+            if or_bnames.size > 0
+              var or_names = vec_new<String>()
+              for obi in 0..or_bnames.size
+                or_names.push(as_string(or_bnames[obi]))
+              end
+              mir_mark_pattern_bindings_typed(ctx, s, subject_node, or_ename, or_vname, or_names)
+              ctx.mir_ctx_set_pending_bind(or_names, subject_val)
+              mir::mir_set_pending_inline_for_enum(ctx, s, subject_node, or_ename, or_vname, or_names)
+            end
+          end
+        end
+      elsif sub_kind == node_constants::NODE_IDENT
+        var or_iname = ast::ast_get_str1(s, sub_pat)
+        var or_found_enum = ctx.mir_find_enum_by_variant(or_iname)
+        var or_cmp = 0
+        if str_byte_len(or_found_enum) > 0
+          var or_tag = ctx.mir_get_enum_tag_subj(s, subject_node, or_found_enum, subject_val)
+          var or_vidx = ctx.mir_find_variant_index_ctx(or_found_enum, or_iname)
+          var or_idx_val = ctx.mir_emit_const_int(or_vidx)
+          or_cmp = ctx.mir_emit_binary(op_constants::OP_EQ, or_tag, or_idx_val)
+        else
+          var or_pval = mir_lower::mir_lower_expr(ctx, s, sub_pat)
+          or_cmp = ctx.mir_emit_binary(op_constants::OP_EQ, subject_val, or_pval)
+        end
+        var or_cur = ctx.mir_ctx_get_block()
+        mir_block_set_branch(or_cur, or_cmp, then_block, or_next)
+        ctx.mir_switch_to_block(or_next)
+      elsif sub_kind == node_constants::NODE_WILDCARD
+        var or_cur = ctx.mir_ctx_get_block()
+        mir_block_set_terminator(or_cur, mir::TERM_JUMP, then_block)
+        ctx.mir_switch_to_block(or_next)
+      else
+        var or_pval = mir_lower::mir_lower_expr(ctx, s, sub_pat)
+        var or_cmp = ctx.mir_emit_binary(op_constants::OP_EQ, subject_val, or_pval)
+        var or_cur = ctx.mir_ctx_get_block()
+        mir_block_set_branch(or_cur, or_cmp, then_block, or_next)
+        ctx.mir_switch_to_block(or_next)
+      end
+    end
+    return
+  end
+
+  # Fallback: unconditional jump to then_block
+  var cur = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(cur, mir::TERM_JUMP, then_block)
+end
+
+# Bind struct/vec destructure fields in the then-block of a pattern binding if.
+def mir_lower_if_pattern_bind_fields(ctx: MirContext, s: ast::AstStorage, pattern_node: Int, subject_val: Int, subject_node: Int): Void
+  var pk = ast::ast_get_kind(s, pattern_node)
+
+  if pk == node_constants::NODE_STRUCT_DESTRUCTURE
+    var sd_type_name = ast::ast_get_str1(s, pattern_node)
+    var sd_field_specs = ast::ast_get_str2(s, pattern_node)
+    var sd_struct_name = sd_type_name
+    if str_byte_len(sd_struct_name) == 0
+      sd_struct_name = ctx.mir_infer_expr_type(s, subject_node)
+    end
+    var sd_specs = str_split(sd_field_specs, ",")
+    for sd_fi in 0..sd_specs.size
+      var sd_spec = sd_specs[sd_fi]
+      var sd_fname = sd_spec
+      var sd_bname = sd_spec
+      var sd_cp = __char_index(sd_spec, ':')
+      if sd_cp >= 0
+        sd_fname = str_byte_slice(sd_spec, 0, sd_cp)
+        sd_bname = str_byte_slice(sd_spec, sd_cp + 1, str_byte_len(sd_spec))
+      end
+      var sd_fidx = ctx.mir_ctx_find_field_index(sd_struct_name, sd_fname)
+      var sd_offset = sd_fi
+      if sd_fidx >= 0
+        sd_offset = sd_fidx
+      end
+      var sd_slot = ctx.mir_ctx_alloc_slot()
+      ctx.mir_ctx_bind_var(sd_bname, sd_slot)
+      # B.10 §14.12.8 (C3.5/h3) — COW pattern-bind field read: field f → buffer
+      # word f+1. Route through C3's cow_field_shift flag (same as dot-read /
+      # statement destructure). INERT at gate 0.
+      var _sdb_is_cow = mir::mir_value_is_cow_layout(ctx, sd_struct_name)
+      if _sdb_is_cow == 1
+        mir::mir_ctx_set_cow_field_shift(ctx, 1)
+      end
+      var sd_val = ctx.mir_emit_load_offset(subject_val, sd_offset)
+      if _sdb_is_cow == 1
+        mir::mir_ctx_set_cow_field_shift(ctx, 0)
+      end
+      ctx.mir_emit_store_var(sd_bname, sd_val)
+    end
+    return
+  end
+
+  if pk == node_constants::NODE_VEC_DESTRUCTURE
+    var vd_elems_str = ast::ast_get_str1(s, pattern_node)
+    var vd_rest = ast::ast_get_str2(s, pattern_node)
+    var vd_has_rest = ast::ast_get_op(s, pattern_node)
+    var vd_elems = str_split(vd_elems_str, ",")
+    for vd_ei in 0..vd_elems.size
+      var vd_ename = vd_elems[vd_ei]
+      if str_byte_len(vd_ename) > 0
+        var vd_slot = ctx.mir_ctx_alloc_slot()
+        ctx.mir_ctx_bind_var(vd_ename, vd_slot)
+        var vd_idx_val = ctx.mir_emit_const_int(vd_ei)
+        var vd_args = [subject_val, vd_idx_val]
+        var vd_val = ctx.mir_emit_intrinsic("vec_get", vd_args)
+        ctx.mir_emit_store_var(vd_ename, vd_val)
+      end
+    end
+    if vd_has_rest == 1 and str_byte_len(vd_rest) > 0
+      var vd_slot = ctx.mir_ctx_alloc_slot()
+      ctx.mir_ctx_bind_var(vd_rest, vd_slot)
+      var vd_start = ctx.mir_emit_const_int(vd_elems.size)
+      var vd_len_args = [subject_val]
+      var vd_len = ctx.mir_emit_intrinsic("vec_size", vd_len_args)
+      var vd_slice_args = [subject_val, vd_start, vd_len]
+      var vd_slice = ctx.mir_emit_intrinsic("vec_slice", vd_slice_args)
+      ctx.mir_emit_store_var(vd_rest, vd_slice)
+    end
+    return
+  end
+end
+
+# NodeIf = 23 (C-aligned)
+def mir_lower_stmt_if(ctx: MirContext, s: ast::AstStorage, node: AstNodeId): Void
+  var cond_node = ast::ast_get_left(s, node)
+  var then_node = ast::ast_get_right(s, node)
+  var else_node = ast::ast_get_extra(s, node)
+  var if_int_val = ast::ast_get_int_val(s, node)
+
+  if if_int_val == 1
+    # Pattern binding: `if PATTERN = EXPR`
+    var pb_pattern_node = ast::ast_get_op(s, node)
+    var pb_subject_val = mir_lower::mir_lower_expr(ctx, s, cond_node)
+
+    var pb_then_block = ctx.mir_create_block("pb_then")
+    var pb_else_block = ctx.mir_create_block("pb_else")
+    var pb_merge_block = ctx.mir_create_block("pb_merge")
+
+    mir_lower_if_pattern(ctx, s, pb_pattern_node, pb_subject_val, cond_node, pb_then_block, pb_else_block)
+
+    # Then block: apply pending bind (enum payloads) + struct/vec fields, lower body
+    var pb_saved_depth = ctx.mir_ctx_get_scope_depth()
+    var pb_body_scope = pb_saved_depth + 1
+    ctx.mir_ctx_set_scope_depth(pb_body_scope)
+
+    ctx.mir_switch_to_block(pb_then_block)
+    ctx.mir_ctx_apply_pending_bind()
+    mir_lower_if_pattern_bind_fields(ctx, s, pb_pattern_node, pb_subject_val, cond_node)
+    mir_lower::mir_lower_stmt(ctx, s, then_node)
+    var pb_then_cur = ctx.mir_ctx_get_block()
+    if mir_block_get_term_kind(pb_then_cur) < 0
+      ctx.emit_and_pop_drops_for_scope(pb_body_scope)
+      # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+      pb_then_cur = ctx.mir_ctx_get_block()
+      mir_block_set_terminator(pb_then_cur, mir::TERM_JUMP, pb_merge_block)
+    end
+
+    # Else block
+    ctx.mir_ctx_set_scope_depth(pb_body_scope)
+    ctx.mir_switch_to_block(pb_else_block)
+    if else_node >= 0
+      mir_lower::mir_lower_stmt(ctx, s, else_node)
+    end
+    var pb_else_cur = ctx.mir_ctx_get_block()
+    if mir_block_get_term_kind(pb_else_cur) < 0
+      ctx.emit_and_pop_drops_for_scope(pb_body_scope)
+      # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+      pb_else_cur = ctx.mir_ctx_get_block()
+      mir_block_set_terminator(pb_else_cur, mir::TERM_JUMP, pb_merge_block)
+    end
+
+    ctx.mir_ctx_set_scope_depth(pb_saved_depth)
+    ctx.mir_switch_to_block(pb_merge_block)
+    return
+  end
+
+  # Is-with-bindings statement: `if val is Some(x) ... end`
+  var isb_cond_kind = ast::ast_get_kind(s, cond_node)
+  var isb_bound = 0
+  if isb_cond_kind == node_constants::NODE_IS_CHECK
+    isb_bound = ast::ast_get_bound_names(s, cond_node)
+  end
+  if isb_bound > 0 and vec_size(isb_bound) > 0
+    var isb_subject_node = ast::ast_get_left(s, cond_node)
+    var isb_variant_name = ast::ast_get_str1(s, cond_node)
+    var isb_subject_val = mir_lower::mir_lower_expr(ctx, s, isb_subject_node)
+    # IS_PREDICATE_CROSS_ENUM_TAG_COLLISION: prefer subject's static type.
+    var isb_enum_name = mir::mir_resolve_is_enum(ctx, s, isb_subject_node, isb_variant_name)
+    var isb_tag_val = ctx.mir_get_enum_tag_subj(s, isb_subject_node, isb_enum_name, isb_subject_val)
+    var isb_variant_idx = ctx.mir_find_variant_index_ctx(isb_enum_name, isb_variant_name)
+    var isb_idx_val = ctx.mir_emit_const_int(isb_variant_idx)
+    var isb_cmp = ctx.mir_emit_binary(op_constants::OP_EQ, isb_tag_val, isb_idx_val)
+
+    var isb_then_block = ctx.mir_create_block("isb_then")
+    var isb_else_block = ctx.mir_create_block("isb_else")
+    var isb_merge_block = ctx.mir_create_block("isb_merge")
+
+    var isb_cur = ctx.mir_ctx_get_block()
+    mir_block_set_branch(isb_cur, isb_cmp, isb_then_block, isb_else_block)
+
+    # Flow-sensitive narrowing for is-with-bindings
+    var isb_narrow_saved = ctx.mir_ctx_get_narrowing_count()
+    var isb_narrow_var = ""
+    if ast::ast_get_kind(s, isb_subject_node) == node_constants::NODE_IDENT
+      isb_narrow_var = ast::ast_get_str1(s, isb_subject_node)
+    end
+
+    # Then block: extract payloads and bind, lower body
+    var isb_saved_depth = ctx.mir_ctx_get_scope_depth()
+    var isb_body_scope = isb_saved_depth + 1
+    ctx.mir_ctx_set_scope_depth(isb_body_scope)
+
+    # Push narrowing: subject is known to be the checked variant
+    if str_byte_len(isb_narrow_var) > 0
+      ctx.mir_ctx_push_narrowing(isb_narrow_var, isb_variant_name)
+    end
+
+    ctx.mir_switch_to_block(isb_then_block)
+    var isb_names = vec_new<String>()
+    for isb_i in 0..vec_size(isb_bound)
+      isb_names.push(as_string(isb_bound[isb_i]))
+    end
+    mir_mark_pattern_bindings_typed(ctx, s, isb_subject_node, isb_enum_name, isb_variant_name, isb_names)
+    ctx.mir_ctx_set_pending_bind(isb_names, isb_subject_val)
+    mir::mir_set_pending_inline_for_enum(ctx, s, isb_subject_node, isb_enum_name, isb_variant_name, isb_names)
+    ctx.mir_ctx_apply_pending_bind()
+    mir_lower::mir_lower_stmt(ctx, s, then_node)
+    var isb_then_cur = ctx.mir_ctx_get_block()
+    if mir_block_get_term_kind(isb_then_cur) < 0
+      ctx.emit_and_pop_drops_for_scope(isb_body_scope)
+      # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+      isb_then_cur = ctx.mir_ctx_get_block()
+      mir_block_set_terminator(isb_then_cur, mir::TERM_JUMP, isb_merge_block)
+    end
+
+    # Pop then narrowing, push else narrowing (opposite for 2-variant enums)
+    ctx.mir_ctx_pop_narrowing_to(isb_narrow_saved)
+
+    # Else block
+    ctx.mir_ctx_set_scope_depth(isb_body_scope)
+    if str_byte_len(isb_narrow_var) > 0
+      if isb_variant_name == "Some"
+        ctx.mir_ctx_push_narrowing(isb_narrow_var, "None")
+      elsif isb_variant_name == "None"
+        ctx.mir_ctx_push_narrowing(isb_narrow_var, "Some")
+      elsif isb_variant_name == "Ok"
+        ctx.mir_ctx_push_narrowing(isb_narrow_var, "Err")
+      elsif isb_variant_name == "Err"
+        ctx.mir_ctx_push_narrowing(isb_narrow_var, "Ok")
+      end
+    end
+    ctx.mir_switch_to_block(isb_else_block)
+    if else_node >= 0
+      mir_lower::mir_lower_stmt(ctx, s, else_node)
+    end
+    var isb_else_cur = ctx.mir_ctx_get_block()
+    if mir_block_get_term_kind(isb_else_cur) < 0
+      ctx.emit_and_pop_drops_for_scope(isb_body_scope)
+      # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+      isb_else_cur = ctx.mir_ctx_get_block()
+      mir_block_set_terminator(isb_else_cur, mir::TERM_JUMP, isb_merge_block)
+    end
+
+    ctx.mir_ctx_pop_narrowing_to(isb_narrow_saved)
+    ctx.mir_ctx_set_scope_depth(isb_saved_depth)
+    ctx.mir_switch_to_block(isb_merge_block)
+    return
+  end
+
+  var then_block = ctx.mir_create_block("then")
+  var else_block = ctx.mir_create_block("else")
+  var merge_block = ctx.mir_create_block("merge")
+
+  var cond_val = mir_lower::mir_lower_expr(ctx, s, cond_node)
+  var cur_block = ctx.mir_ctx_get_block()
+  mir_block_set_branch(cur_block, cond_val, then_block, else_block)
+
+  # Flow-sensitive narrowing: if condition is `x is Variant`, narrow x in then-block
+  var narrow_saved = ctx.mir_ctx_get_narrowing_count()
+  var narrow_var_name = ""
+  var narrow_variant_name = ""
+  var cond_kind = ast::ast_get_kind(s, cond_node)
+  if cond_kind == node_constants::NODE_IS_CHECK
+    var narrow_subject = ast::ast_get_left(s, cond_node)
+    if narrow_subject >= 0 and ast::ast_get_kind(s, narrow_subject) == node_constants::NODE_IDENT
+      narrow_var_name = ast::ast_get_str1(s, narrow_subject)
+      narrow_variant_name = ast::ast_get_str1(s, cond_node)
+    end
+  end
+
+  # Track scope depth for drop-on-exit in then body
+  var saved_depth = ctx.mir_ctx_get_scope_depth()
+  var if_body_scope = saved_depth + 1
+  ctx.mir_ctx_set_scope_depth(if_body_scope)
+
+  # Push narrowing for then-block: variable is known to be the checked variant
+  if str_byte_len(narrow_var_name) > 0
+    ctx.mir_ctx_push_narrowing(narrow_var_name, narrow_variant_name)
+  end
+
+  ctx.mir_switch_to_block(then_block)
+  mir_lower::mir_lower_stmt(ctx, s, then_node)
+  var then_cur = ctx.mir_ctx_get_block()
+  if mir_block_get_term_kind(then_cur) < 0
+    ctx.emit_and_pop_drops_for_scope(if_body_scope)
+    # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+    then_cur = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(then_cur, mir::TERM_JUMP, merge_block)
+  end
+
+  # Pop then-block narrowing, push else-block narrowing (opposite for 2-variant enums)
+  ctx.mir_ctx_pop_narrowing_to(narrow_saved)
+
+  # Restore and re-increment for else body
+  ctx.mir_ctx_set_scope_depth(if_body_scope)
+
+  # For else-block: if `x is Some` was the condition, narrow x to None (and vice versa)
+  if str_byte_len(narrow_var_name) > 0
+    if narrow_variant_name == "Some"
+      ctx.mir_ctx_push_narrowing(narrow_var_name, "None")
+    elsif narrow_variant_name == "None"
+      ctx.mir_ctx_push_narrowing(narrow_var_name, "Some")
+    elsif narrow_variant_name == "Ok"
+      ctx.mir_ctx_push_narrowing(narrow_var_name, "Err")
+    elsif narrow_variant_name == "Err"
+      ctx.mir_ctx_push_narrowing(narrow_var_name, "Ok")
+    end
+  end
+
+  ctx.mir_switch_to_block(else_block)
+  if else_node >= 0
+    mir_lower::mir_lower_stmt(ctx, s, else_node)
+  end
+  var else_cur = ctx.mir_ctx_get_block()
+  if mir_block_get_term_kind(else_cur) < 0
+    ctx.emit_and_pop_drops_for_scope(if_body_scope)
+    # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+    else_cur = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(else_cur, mir::TERM_JUMP, merge_block)
+  end
+
+  # Pop else-block narrowing
+  ctx.mir_ctx_pop_narrowing_to(narrow_saved)
+
+  # Restore original scope depth
+  ctx.mir_ctx_set_scope_depth(saved_depth)
+
+  ctx.mir_switch_to_block(merge_block)
+  return
+end
+
+# While statement - NodeWhile = 24 (C-aligned)
+def mir_lower_stmt_while(ctx: MirContext, s: ast::AstStorage, node: AstNodeId): Void
+  var cond_node = ast::ast_get_left(s, node)
+  var body_node = ast::ast_get_right(s, node)
+  var label = ast::ast_get_str1(s, node)
+
+  # ====================================================================
+  # Loop Vec Access Optimization: hoist data pointers (while-loop)
+  # ====================================================================
+  var saved_hoisted = ctx.hoisted_vec_ptrs
+  ctx.hoisted_vec_ptrs = vec_new()
+
+  # Scan body + condition for Vec accesses
+  var vec_names = vec_new<String>()
+  mir_lower_iter::mir_scan_vec_accesses(s, body_node, vec_names)
+  mir_lower_iter::mir_scan_vec_accesses(s, cond_node, vec_names)
+
+  # De-dup: register unique Vec names for unchecked access
+  for vi in 0..vec_names.size
+    var vn = vec_names[vi]
+    var already = false
+    for hi in 0..ctx.hoisted_vec_ptrs.size
+      if as_string(ctx.hoisted_vec_ptrs[hi]).eq(vn)
+        already = true
+      end
+    end
+    if already == false
+      var binding = ctx.mir_ctx_lookup_var(vn)
+      if binding >= 0
+        ctx.hoisted_vec_ptrs.push(as_int(vn))
+      end
+    end
+  end
+  # ====================================================================
+
+  var cond_block = ctx.mir_create_block("while_cond")
+  var body_block = ctx.mir_create_block("while_body")
+  var exit_block = ctx.mir_create_block("while_exit")
+
+  var cur_block = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(cur_block, mir::TERM_JUMP, cond_block)
+
+  ctx.mir_switch_to_block(cond_block)
+  var cond_val = mir_lower::mir_lower_expr(ctx, s, cond_node)
+  # After lowering, current block may differ from cond_block if the
+  # condition contains short-circuit and/or (which creates sub-blocks).
+  var after_cond = ctx.mir_ctx_get_block()
+  mir_block_set_branch(after_cond, cond_val, body_block, exit_block)
+
+  # Save old break/continue targets for nested loops
+  var saved_break = ctx.mir_ctx_get_break_target()
+  var saved_continue = ctx.mir_ctx_get_continue_target()
+  var saved_loop_scope = ctx.mir_ctx_get_loop_scope_depth()
+  var saved_loop_defer = ctx.mir_ctx_get_loop_defer_depth()
+  var saved_loop_wrap = ctx.mir_ctx_get_loop_wrap_depth()
+
+  # Set targets for this loop
+  ctx.mir_ctx_set_break_target(exit_block)
+  ctx.mir_ctx_set_continue_target(cond_block)
+
+  # Track the scope depth at loop entry (before incrementing for body)
+  var loop_scope = ctx.mir_ctx_get_scope_depth()
+  ctx.mir_ctx_set_loop_scope_depth(loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(ctx.drops.defer_stack.size)
+  var loop_wrap = ctx.wrap_stack_eff_names.size
+  ctx.mir_ctx_set_loop_wrap_depth(loop_wrap)
+
+  # Push labeled loop if there is a label
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_push_loop(label, exit_block, cond_block, loop_scope, loop_wrap)
+  end
+
+  # Increment scope depth for loop body
+  var body_scope = loop_scope + 1
+  ctx.mir_ctx_set_scope_depth(body_scope)
+
+  ctx.mir_switch_to_block(body_block)
+  mir_lower::mir_lower_stmt(ctx, s, body_node)
+  var body_cur = ctx.mir_ctx_get_block()
+  if mir_block_get_term_kind(body_cur) < 0
+    # Natural loop iteration exit - emit drops for body scope (no pop:
+    # MIR lowered once, IR runs each iteration, entries needed for drop emission)
+    ctx.emit_drops_for_scope(body_scope)
+    # Preemption check: every 64 iterations, yield to scheduler in async/async-gen context
+    if mir_lower_gen::mir_gen_is_active() >= 2
+      mir_lower_gen::mir_emit_preemption_check(ctx, cond_block)
+    else
+      # P21: fuel_check at loop back-edge (BEAM-style reduction counting)
+      mir_lower::mir_emit_fuel_check(ctx)
+      mir_block_set_terminator(ctx.mir_ctx_get_block(), mir::TERM_JUMP, cond_block)
+    end
+  end
+
+  # Restore scope depth
+  ctx.mir_ctx_set_scope_depth(loop_scope)
+
+  # Pop body-scope droppables so function-exit doesn't re-drop them.
+  # The drop IR was already emitted in the body block above.
+  ctx.pop_droppables_for_scope(body_scope)
+
+  # Pop labeled loop if there was a label
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_pop_loop()
+  end
+
+  # Restore old break/continue targets
+  ctx.mir_ctx_set_break_target(saved_break)
+  ctx.mir_ctx_set_continue_target(saved_continue)
+  ctx.mir_ctx_set_loop_scope_depth(saved_loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(saved_loop_defer)
+  ctx.mir_ctx_set_loop_wrap_depth(saved_loop_wrap)
+
+  # Restore hoisted vec ptrs
+  ctx.hoisted_vec_ptrs = saved_hoisted
+
+  ctx.mir_switch_to_block(exit_block)
+  return
+end
+
+# ============================================================================
+# Loop Vec Access Optimization: body scanner
+# ============================================================================
+# Scan a for-loop body AST for node_constants$NODE_INDEX/node_constants$NODE_INDEX_ASSIGN targeting
+# Vec variables (identifiers). Returns a Vec<String> of variable names
+# whose data pointers should be hoisted before the loop.
+# Only collects ident-based accesses (not complex expressions).
+
+# NodeFor = 44 (C-aligned): for var in range/collection
+def mir_lower_stmt_for(ctx: MirContext, s: ast::AstStorage, node: AstNodeId): Void
+  var var_name = ast::ast_get_str1(s, node)
+  var label = ast::ast_get_str2(s, node)
+  var iter_node = ast::ast_get_left(s, node)
+  var body_node = ast::ast_get_right(s, node)
+
+  # Phase 4D.4: F.3c MIR fast-path deleted. The fast path at this site
+  # short-circuited NODE_CALL-of-async-gen and NODE_IDENT-typed-
+  # `impl AsyncIterator<T>` BEFORE the range check, calling the async-
+  # iter helper (post-4D.5c.4: `lower_stream_async_iteration`). Both
+  # routes are duplicated at lines ~1286 (NODE_CALL async-gen) and
+  # ~1308 (IDENT `impl AsyncIterator<`) inside the collection-iteration
+  # branch.
+  # Falling through to those sites produces identical lowering — one
+  # extra range-check traversal, zero IR difference. The typecheck-
+  # side row widening for `impl AsyncIterator<` sources still lives at
+  # `typecheck_walk.qz:3411` (load-bearing until Stream<T, body_row>
+  # ptype synthesis lands; deferred from 4D.3 per kickoff memo).
+
+  # Check if iterator is a Range (NodeBinary with op 21)
+  var iter_kind = ast::ast_get_kind(s, iter_node)
+  var is_range = false
+  if iter_kind == node_constants::NODE_BINARY  # NodeBinary
+    var op = ast::ast_get_op(s, iter_node)
+    if op == op_constants::OP_RANGE or op == op_constants::OP_RANGE_INCLUSIVE  # op_constants$OP_RANGE (..) or op_constants$OP_RANGE_INCLUSIVE (...)
+      is_range = true
+    end
+  end
+
+  if is_range
+    # Range iteration: for x in start..end
+    var start_node = ast::ast_get_left(s, iter_node)
+    var end_node = ast::ast_get_right(s, iter_node)
+
+  # Lower start and end values
+  var start_val = mir_lower::mir_lower_expr(ctx, s, start_node)
+  var end_val = mir_lower::mir_lower_expr(ctx, s, end_node)
+
+  # Allocate slot for loop variable
+  var slot = ctx.mir_ctx_alloc_slot()
+  ctx.mir_ctx_bind_var(var_name, slot)
+
+  # Initialize loop variable to start
+  ctx.mir_emit_store_var(var_name, start_val)
+
+  # Generator/async: range end value must be saved/restored across yields/suspends.
+  # Store it in the pre-registered __gen_end_ variable (in the generator/async frame).
+  if mir_lower_gen::mir_gen_is_active() > 0
+    ctx.mir_emit_store_var("__gen_end_#{var_name}", end_val)
+  end
+
+  # ====================================================================
+  # Loop Vec Access Optimization: register Vec names for unchecked access
+  # ====================================================================
+  var saved_hoisted = ctx.hoisted_vec_ptrs
+  ctx.hoisted_vec_ptrs = vec_new()
+
+  # Scan body for Vec accesses
+  var vec_names = vec_new<String>()
+  mir_lower_iter::mir_scan_vec_accesses(s, body_node, vec_names)
+
+  # De-dup: register unique Vec names for unchecked access
+  for vi in 0..vec_names.size
+    var vn = vec_names[vi]
+    var already = false
+    for hi in 0..ctx.hoisted_vec_ptrs.size
+      if as_string(ctx.hoisted_vec_ptrs[hi]).eq(vn)
+        already = true
+      end
+    end
+    if already == false
+      var binding = ctx.mir_ctx_lookup_var(vn)
+      if binding >= 0
+        ctx.hoisted_vec_ptrs.push(as_int(vn))
+      end
+    end
+  end
+  # ====================================================================
+
+  # Create blocks (incr_block for proper continue handling)
+  var cond_block = ctx.mir_create_block("for_cond")
+  var body_block = ctx.mir_create_block("for_body")
+  var incr_block = ctx.mir_create_block("for_incr")
+  var exit_block = ctx.mir_create_block("for_exit")
+
+  # Jump to condition block
+  var cur_block = ctx.mir_ctx_get_block()
+  mir_block_set_terminator(cur_block, mir::TERM_JUMP, cond_block)
+
+  # Extract step expression
+  var step_node = ast::ast_get_int_val(s, node)
+  var step_val = 0
+  var step_is_const = false
+  var step_const_val = 1
+  if step_node > 0
+    step_val = mir_lower::mir_lower_expr(ctx, s, step_node)
+    step_is_const = mir_lower::mir_is_const_step(s, step_node)
+    if step_is_const
+      step_const_val = mir_get_const_step_val(s, step_node)
+    end
+  end
+
+  # Condition block: direction-aware comparison
+  ctx.mir_switch_to_block(cond_block)
+  var i_val = ctx.mir_emit_load_var(var_name)
+  # In generators/async, reload end_val from named variable (SSA value from init block
+  # is not available after resume — init block doesn't dominate cond via resume path)
+  if mir_lower_gen::mir_gen_is_active() > 0
+    end_val = ctx.mir_emit_load_var("__gen_end_#{var_name}")
+  end
+  var range_op = ast::ast_get_op(s, iter_node)
+  mir_lower::mir_emit_range_step_cond(ctx, s, i_val, end_val, range_op, step_node, step_val, step_is_const, step_const_val, body_block, exit_block, cond_block)
+
+  # Save old break/continue targets for nested loops
+  var saved_break = ctx.mir_ctx_get_break_target()
+  var saved_continue = ctx.mir_ctx_get_continue_target()
+  var saved_loop_scope = ctx.mir_ctx_get_loop_scope_depth()
+  var saved_loop_defer = ctx.mir_ctx_get_loop_defer_depth()
+  var saved_loop_wrap = ctx.mir_ctx_get_loop_wrap_depth()
+
+  # Set targets for this loop (continue goes to increment, not condition)
+  ctx.mir_ctx_set_break_target(exit_block)
+  ctx.mir_ctx_set_continue_target(incr_block)
+
+  # Track the scope depth at loop entry (before incrementing for body)
+  var loop_scope = ctx.mir_ctx_get_scope_depth()
+  ctx.mir_ctx_set_loop_scope_depth(loop_scope)
+  ctx.mir_ctx_set_loop_defer_depth(ctx.drops.defer_stack.size)
+  var loop_wrap = ctx.wrap_stack_eff_names.size
+  ctx.mir_ctx_set_loop_wrap_depth(loop_wrap)
+
+  # Push labeled loop if there is a label
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_push_loop(label, exit_block, incr_block, loop_scope, loop_wrap)
+  end
+
+  # Increment scope depth for loop body
+  var body_scope = loop_scope + 1
+  ctx.mir_ctx_set_scope_depth(body_scope)
+
+  # Body block
+  ctx.mir_switch_to_block(body_block)
+  mir_lower::mir_lower_stmt(ctx, s, body_node)
+
+  # Jump to increment block (if no other terminator)
+  var body_cur = ctx.mir_ctx_get_block()
+  if mir_block_get_term_kind(body_cur) < 0
+    # Natural loop iteration exit - emit drops for body scope (no pop:
+    # MIR lowered once, IR runs each iteration, entries needed for drop emission)
+    ctx.emit_drops_for_scope(body_scope)
+    # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+    body_cur = ctx.mir_ctx_get_block()
+    mir_block_set_terminator(body_cur, mir::TERM_JUMP, incr_block)
+  end
+
+  # Restore scope depth
+  ctx.mir_ctx_set_scope_depth(loop_scope)
+
+  # Pop body-scope droppables so function-exit doesn't re-drop them.
+  # The drop IR was already emitted in the body block above.
+  ctx.pop_droppables_for_scope(body_scope)
+
+  # Increment block: i += step (or 1 if no step)
+  ctx.mir_switch_to_block(incr_block)
+  var i_cur = ctx.mir_emit_load_var(var_name)
+  if step_node > 0
+    var i_next = ctx.mir_emit_binary(op_constants::OP_ADD, i_cur, step_val)
+    ctx.mir_emit_store_var(var_name, i_next)
+  else
+    var one = ctx.mir_emit_const_int(1)
+    var i_next = ctx.mir_emit_binary(op_constants::OP_ADD, i_cur, one)
+    ctx.mir_emit_store_var(var_name, i_next)
+  end
+  # Preemption check: every 64 iterations, yield to scheduler in async/async-gen context
+  if mir_lower_gen::mir_gen_is_active() >= 2
+    mir_lower_gen::mir_emit_preemption_check(ctx, cond_block)
+  else
+    # P21: fuel_check at loop back-edge (BEAM-style reduction counting)
+    mir_lower::mir_emit_fuel_check(ctx)
+    mir_block_set_terminator(ctx.mir_ctx_get_block(), mir::TERM_JUMP, cond_block)
+  end
+
+  # Pop labeled loop if there was a label
+  if str_byte_len(label) > 0
+    ctx.mir_ctx_pop_loop()
+  end
+
+  # Restore old break/continue targets
+  ctx.mir_ctx_set_break_target(saved_break)
+  ctx.mir_ctx_set_continue_target(saved_continue)
+  ctx.mir_ctx_set_loop_scope_depth(saved_loop_scope)
+ctx.mir_ctx_set_loop_defer_depth(saved_loop_defer)
+
+  # Restore hoisted vec ptrs (loop optimization scoping)
+  ctx.hoisted_vec_ptrs = saved_hoisted
+
+  ctx.mir_switch_to_block(exit_block)
+  else
+    # Collection iteration (Custom, Vec, or Channel)
+
+    # Check Iterator-bounded closure param FIRST
+    var is_closure_iter = 0
+    var iter_kind = ast::ast_get_kind(s, iter_node)
+    if iter_kind == node_constants::NODE_IDENT
+      var iter_ident_name = ast::ast_get_str1(s, iter_node)
+      if ctx.mir_ctx_is_iterator_bound_param(iter_ident_name)
+        is_closure_iter = 1
+      end
+    end
+    if is_closure_iter == 1
+      mir_lower_iter::lower_closure_iteration(ctx, s, var_name, label, iter_node, body_node)
+    else
+
+    # Check generator function calls: for x in gen_func()
+    # Phase 4D.5b: dispatch by return-type annotation instead of the
+    # `_generator_func_names` / `_async_gen_func_names` registries.
+    # `mir_infer_expr_type(s, iter_node)` returns the call's substituted
+    # return type; the prefix predicates `mir_func_annotation_is_*` check
+    # for `impl AsyncIterator<` / `impl Iterator<`. Same answer as the
+    # registries, no parallel cache.
+    if iter_kind == node_constants::NODE_CALL
+      var gen_callee = ast::ast_get_left(s, iter_node)
+      if gen_callee >= 0
+        var gen_callee_kind = ast::ast_get_kind(s, gen_callee)
+        if gen_callee_kind == node_constants::NODE_IDENT
+          var gen_func_name = ast::ast_get_str1(s, gen_callee)
+          var gen_iter_ann = ctx.mir_infer_expr_type(s, iter_node)
+          # Check async generators first (is_generator returns true for both forms)
+          if mir::mir_func_annotation_is_async_generator(gen_iter_ann)
+            # Drive via the INDIRECT path: the generator constructor returns a
+            # 2-word handle {frame@0, step@1} where step is the correctly-
+            # mangled `__Future_<resolved-name>$poll` pointer (see
+            # mir_lower_gen.qz). Rebuilding the name from the surface callee
+            # (`__Future_#{gen_func_name}$poll`) drops the module prefix and
+            # the monomorphization suffix, so for any generic or cross-module
+            # generator — e.g. std/streams' `stream_map` → defined as
+            # `__Future_streams$stream_map$2$implAsyncIterator$Int$poll` — the
+            # direct-by-name call referenced an undefined symbol (llc fail).
+            # Loading the pointer the constructor stored is correct by
+            # construction regardless of specialization/module. (A.44(2))
+            mir_lower_iter::lower_stream_async_iteration(ctx, s, var_name, label, iter_node, body_node, "", true)
+            return
+          end
+          if mir::mir_func_annotation_is_generator(gen_iter_ann)
+            # Generator constructor returns a Stream<T> handle
+            # (`{frame, step}` 2-word struct). Iterate via Stream$next:
+            # call Stream$next(iter_val), check option_is_some, extract
+            # via option_get, free, lower body, jump back.
+            mir_lower_iter::lower_custom_iteration(ctx, s, var_name, label, iter_node, body_node, "Stream$next")
+            return
+          end
+        end
+      end
+    end
+
+    # Check if iterating a variable holding an async iterator (indirect poll)
+    if iter_kind == node_constants::NODE_IDENT
+      var fa_ident = ast::ast_get_str1(s, iter_node)
+      var fa_var_type = ctx.mir_ctx_get_var_type(fa_ident)
+      if str_byte_len(fa_var_type) >= 19
+        if fa_var_type.starts_with("impl AsyncIterator<")
+          mir_lower_iter::lower_stream_async_iteration(ctx, s, var_name, label, iter_node, body_node, "", true)
+          return
+        end
+      end
+      # NODE_IDENT typed `impl Iterator<...>` — `var s = gen(); for x in s`.
+      # The var holds a Stream<T> handle (the constructor wrapped the frame
+      # in mir_lower_generator_effect). Drive via Stream$next, same loop
+      # shape as the NODE_CALL path above.
+      if str_byte_len(fa_var_type) >= 14
+        if fa_var_type.starts_with("impl Iterator<")
+          mir_lower_iter::lower_custom_iteration(ctx, s, var_name, label, iter_node, body_node, "Stream$next")
+          return
+        end
+      end
+    end
+
+    # Check custom iterator: look for StructName$next function.
+    # This must be checked before vec/channel to avoid type-constant
+    # numbering mismatches between typecheck and MIR modules.
+    var struct_name = ""
+    if iter_kind == node_constants::NODE_STRUCT_INIT
+      struct_name = ast::ast_get_str1(s, iter_node)
+    elsif iter_kind == node_constants::NODE_IDENT
+      var ident_name = ast::ast_get_str1(s, iter_node)
+      struct_name = ctx.mir_ctx_get_var_type(ident_name)
+    elsif iter_kind == node_constants::NODE_CALL
+      struct_name = ctx.mir_infer_expr_type(s, iter_node)
+    end
+
+    var next_func = ""
+    if str_byte_len(struct_name) > 0
+      var candidate = string_intern::mangle(struct_name, "next")
+      if ctx.mir_lookup_function(candidate).is_some()
+        next_func = candidate
+      else
+        var mangled = string_intern::mangle_int(candidate, 1)
+        if ctx.mir_lookup_function(mangled).is_some()
+          next_func = mangled
+        else
+          # Fallback: scan for module-prefixed $StructName$next
+          # e.g. iter$MapIter$next for MapIter defined in iter module
+          var suffix = "$#{candidate}"
+          var all_funcs = ctx.mir_ctx_get_all_funcs()
+          if all_funcs != 0
+            for __nfi in 0..all_funcs.size
+              var entry = all_funcs[__nfi]
+              var tag = entry.tag
+              if tag == 0 or tag == 10
+                var entry_name = entry.name
+                var pos = __str_index(entry_name, suffix)
+                if pos >= 0
+                  if pos + str_byte_len(suffix) == str_byte_len(entry_name)
+                    next_func = entry_name
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+
+    if str_byte_len(next_func) > 0
+      mir_lower_iter::lower_custom_iteration(ctx, s, var_name, label, iter_node, body_node, next_func)
+    else
+      # Get the iterator type from extra slot (set by typecheck)
+      var iter_type = ast::ast_get_extra(s, node)
+
+      if is_channel_type(iter_type)
+        # Channel iteration
+        mir_lower_iter::lower_channel_iteration(ctx, s, var_name, label, iter_node, body_node)
+      elsif iter_type == type_constants::TYPE_STRING
+        # String iteration: for c in "hello"
+        mir_lower_iter::lower_string_iteration(ctx, s, var_name, label, iter_node, body_node)
+      elsif iter_type == type_constants::TYPE_SLICE or iter_type == type_constants::TYPE_SLICE_MUT
+        # Slice<T>/SliceMut<T> iteration (Tier 4 #24 Phase 4)
+        mir_lower_iter::lower_slice_iteration(ctx, s, var_name, label, iter_node, body_node, false)
+      elsif iter_type == type_constants::TYPE_BYTE
+        # Tier 4 #24 Phase 4b §2.2: Slice<Byte> iteration uses byte-stride
+        # reads. Dispatch key set by typecheck_walk when elem is TYPE_BYTE.
+        mir_lower_iter::lower_slice_iteration(ctx, s, var_name, label, iter_node, body_node, true)
+      elsif iter_type == type_constants::TYPE_MAP
+        # Map iteration: for k in map
+        # Recover the map's key type from MIR-side tracking so the map_keys
+        # intrinsic dispatches to int-key or string-key codegen correctly.
+        var map_key_type = ""
+        if ast::ast_get_kind(s, iter_node) == node_constants::NODE_IDENT
+          var map_iter_name = ast::ast_get_str1(s, iter_node)
+          map_key_type = ctx.mir_ctx_get_map_key_type(map_iter_name)
+        end
+        mir_lower_iter::lower_map_iteration(ctx, s, var_name, label, iter_node, body_node, map_key_type)
+      else
+        # Default: Vec/Array iteration
+        # Extract @value struct elem type from struct destructure pattern in body.
+        # This is the dispatch hint (controls vec_get layout for @value structs).
+        var for_vec_elem_type = ""
+        var body_children = ast::ast_get_children(s, body_node)
+        if body_children != 0
+          if body_children.size > 0
+            var first_stmt = body_children[0]
+            if ast::ast_get_kind(s, first_stmt) == node_constants::NODE_STRUCT_DESTRUCTURE
+              for_vec_elem_type = ast::ast_get_str1(s, first_stmt)
+              if str_byte_len(for_vec_elem_type) > 0
+                for_vec_elem_type = ctx.mir_resolve_struct_name(for_vec_elem_type)
+              end
+            end
+          end
+        end
+        # PSQ-4: annotation-only hint for field-access resolution on the iter var.
+        # Without this, `for item in vec; item.field` falls back to
+        # mir_find_field_globally and silently picks the wrong struct when two
+        # structs share a field name. Unlike for_vec_elem_type, this does NOT
+        # affect the vec_get dispatch — it only marks the var's struct type
+        # so mir_infer_expr_type can resolve field access correctly.
+        #
+        # Two sources, in order:
+        #   1. If iter_node is an IDENT, look up the vec_elem_types registry
+        #      (populated from `var v: Vec<T>` annotations at let-statement time).
+        #   2. Otherwise, try mir_infer_expr_type for expressions that return
+        #      a generic type directly (e.g., function calls returning Vec<T>).
+        var for_vec_annotation = ""
+        if ast::ast_get_kind(s, iter_node) == node_constants::NODE_IDENT
+          var iter_ident = ast::ast_get_str1(s, iter_node)
+          for_vec_annotation = ctx.mir_ctx_get_vec_elem_type(iter_ident)
+        end
+        if str_byte_len(for_vec_annotation) == 0
+          var iter_type_ann = ctx.mir_infer_expr_type(s, iter_node)
+          if str_byte_len(iter_type_ann) > 0
+            for_vec_annotation = mir::mir_extract_generic_element_type(iter_type_ann)
+          end
+        end
+        if str_byte_len(for_vec_annotation) > 0
+          # Strip any inner generic args (e.g., "GBox<Int>" → "GBox") for struct lookup
+          var inner_lt = __char_index(for_vec_annotation, '<')
+          if inner_lt > 0
+            for_vec_annotation = str_byte_slice(for_vec_annotation, 0, inner_lt)
+          end
+          for_vec_annotation = ctx.mir_resolve_struct_name(for_vec_annotation)
+        end
+        mir_lower_iter::lower_vec_iteration(ctx, s, var_name, label, iter_node, body_node, for_vec_elem_type, for_vec_annotation)
+      end
+    end
+
+    end  # end is_closure_iter else branch
+  end
+  return
+end
+
+# Match statement - node_constants$NODE_MATCH = 40 (C-aligned) - desugar to if-else chain
+def mir_lower_stmt_match(ctx: MirContext, s: ast::AstStorage, node: AstNodeId): Void
+  var subject_node = ast::ast_get_left(s, node)
+  var arms = ast::ast_get_children(s, node)
+
+  # Lower subject once
+  var subject_val = mir_lower::mir_lower_expr(ctx, s, subject_node)
+
+  # Create end block for merge point
+  var end_block = ctx.mir_create_block("match_end")
+
+  # Hash pre-filter: count string arms; if >= 5, hash subject once
+  var num_arms = arms.size
+  var string_arm_count_s = 0
+  for i in 0..num_arms
+    var pat = ast::ast_get_left(s, arms[i])
+    if ast::ast_get_kind(s, pat) == node_constants::NODE_STRING_LIT
+      string_arm_count_s += 1
+    end
+  end
+  var use_hash_dispatch_s = 0
+  var subject_hash_s = 0
+  var subject_len_s = 0
+  if string_arm_count_s >= 5
+    use_hash_dispatch_s = 1
+    # Length-based pre-dispatch: str_byte_len is a single field load (cheapest discriminator)
+    var len_args = [subject_val]
+    subject_len_s = ctx.mir_emit_intrinsic("str_byte_len", len_args)
+    # Hash for within-length-group disambiguation
+    var hash_args = [subject_val]
+    subject_hash_s = ctx.mir_emit_intrinsic("str_hash", hash_args)
+  end
+
+  for i in 0..num_arms
+    var arm = arms[i]
+    var pattern_node = ast::ast_get_left(s, arm)
+    var body_node = ast::ast_get_right(s, arm)
+    var pattern_kind = ast::ast_get_kind(s, pattern_node)
+
+    # Create blocks for this arm
+    var arm_block = ctx.mir_create_block("match_arm")
+    var next_block = ctx.mir_create_block("match_next")
+
+    # Check if wildcard pattern (NodeWildcard = 42)
+    if pattern_kind == node_constants::NODE_WILDCARD
+      # Check for binding name and guard on this arm
+      var bind_name = ast::ast_get_str1(s, arm)
+      var guard_node = ast::ast_get_extra(s, arm)
+
+      # Jump from current block to arm_block
+      var prev_block = ctx.mir_ctx_get_block()
+      mir_block_set_terminator(prev_block, mir::TERM_JUMP, arm_block)
+      ctx.mir_switch_to_block(arm_block)
+
+      # Scope for match arm variables
+      var saved_depth = ctx.mir_ctx_get_scope_depth()
+      ctx.mir_ctx_set_scope_depth(saved_depth + 1)
+
+      # If there's a binding, store the subject value. Register the binding
+      # as a local FIRST (alloc_slot + bind_var) so the guard + arm body
+      # resolve `bind_name` via mir_ctx_lookup_var instead of falling through
+      # to a same-named free function/method — the match-statement form of
+      # the 30d37c96 wildcard-with-guard binding-shadow miscompile.
+      if str_byte_len(bind_name) > 0
+        var bind_slot = ctx.mir_ctx_alloc_slot()
+        ctx.mir_ctx_bind_var(bind_name, bind_slot)
+        ctx.mir_emit_store_var(bind_name, subject_val)
+      end
+
+      # If there's a guard, evaluate it and conditionally branch
+      if guard_node > 0
+        var guard_val = mir_lower::mir_lower_expr(ctx, s, guard_node)
+        var guard_body = ctx.mir_create_block("guard_body")
+        var cur_g = ctx.mir_ctx_get_block()
+        mir_block_set_branch(cur_g, guard_val, guard_body, next_block)
+        ctx.mir_switch_to_block(guard_body)
+      end
+
+      mir_lower::mir_lower_stmt(ctx, s, body_node)
+      var arm_cur = ctx.mir_ctx_get_block()
+      if mir_block_get_term_kind(arm_cur) < 0
+        ctx.emit_and_pop_drops_for_scope(saved_depth + 1)
+      else
+        ctx.mir_pop_drops_for_scope(saved_depth + 1)
+      end
+      ctx.mir_ctx_set_scope_depth(saved_depth)
+      # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split, so
+      # the terminator lands on the post-free continuation block, not the orphaned
+      # pre-split block (which cow_release already branch-terminated).
+      arm_cur = ctx.mir_ctx_get_block()
+      if mir_block_get_term_kind(arm_cur) < 0
+        mir_block_set_terminator(arm_cur, mir::TERM_JUMP, end_block)
+      end
+
+      # If no guard, wildcard is exhaustive — skip remaining arms
+      if guard_node <= 0
+        ctx.mir_switch_to_block(end_block)
+        return
+      end
+
+      # With guard, continue to next arm (guard might fail)
+      ctx.mir_switch_to_block(next_block)
+      continue
+    end
+
+    # Or-pattern: pat1 | pat2 | pat3 — comparison chain (stmt position)
+    if pattern_kind == node_constants::NODE_OR_PATTERN
+      var or_pats_s = ast::ast_get_children(s, pattern_node)
+      var or_cnt_s = vec_size(or_pats_s)
+
+      for opi in 0..or_cnt_s
+        var sub_pat = or_pats_s[opi]
+        var sub_kind = ast::ast_get_kind(s, sub_pat)
+        var or_next = next_block
+        if opi < or_cnt_s - 1
+          or_next = ctx.mir_create_block("or_next")
+        end
+
+        if sub_kind == node_constants::NODE_WILDCARD
+          var or_prev = ctx.mir_ctx_get_block()
+          mir_block_set_terminator(or_prev, mir::TERM_JUMP, arm_block)
+          ctx.mir_switch_to_block(or_next)
+        elsif sub_kind == node_constants::NODE_ENUM_ACCESS
+          var or_base = ast::ast_get_str1(s, sub_pat)
+          var or_vname = ast::ast_get_str2(s, sub_pat)
+          var or_ename = ""
+          if str_byte_len(or_base) == 0
+            or_ename = ctx.mir_find_enum_by_variant(or_vname)
+          else
+            or_ename = ctx.mir_resolve_enum_name(or_base)
+          end
+          var or_tag = ctx.mir_get_enum_tag_subj(s, subject_node, or_ename, subject_val)
+          var or_vidx = ctx.mir_find_variant_index_ctx(or_ename, or_vname)
+          var or_idx_val = ctx.mir_emit_const_int(or_vidx)
+          var or_cmp = ctx.mir_emit_binary(op_constants::OP_EQ, or_tag, or_idx_val)
+          var or_cur = ctx.mir_ctx_get_block()
+          mir_block_set_branch(or_cur, or_cmp, arm_block, or_next)
+          ctx.mir_switch_to_block(or_next)
+          if opi == 0
+            var or_bnames = ast::ast_get_bound_names(s, sub_pat)
+            if or_bnames > 0
+              if or_bnames.size > 0
+                var or_names = vec_new<String>()
+                for obi in 0..or_bnames.size
+                  or_names.push(as_string(or_bnames[obi]))
+                end
+                mir_mark_pattern_bindings_typed(ctx, s, subject_node, or_ename, or_vname, or_names)
+                ctx.mir_ctx_set_pending_bind(or_names, subject_val)
+                mir::mir_set_pending_inline_for_enum(ctx, s, subject_node, or_ename, or_vname, or_names)
+              end
+            end
+          end
+        elsif sub_kind == node_constants::NODE_IDENT
+          var or_iname = ast::ast_get_str1(s, sub_pat)
+          var or_found_enum = ctx.mir_find_enum_by_variant(or_iname)
+          var or_cmp = 0
+          if str_byte_len(or_found_enum) > 0
+            var or_tag = ctx.mir_get_enum_tag_subj(s, subject_node, or_found_enum, subject_val)
+            var or_vidx = ctx.mir_find_variant_index_ctx(or_found_enum, or_iname)
+            var or_idx_val = ctx.mir_emit_const_int(or_vidx)
+            or_cmp = ctx.mir_emit_binary(op_constants::OP_EQ, or_tag, or_idx_val)
+          else
+            var or_pval = mir_lower::mir_lower_expr(ctx, s, sub_pat)
+            or_cmp = ctx.mir_emit_binary(op_constants::OP_EQ, subject_val, or_pval)
+          end
+          var or_cur = ctx.mir_ctx_get_block()
+          mir_block_set_branch(or_cur, or_cmp, arm_block, or_next)
+          ctx.mir_switch_to_block(or_next)
+        elsif sub_kind == node_constants::NODE_STRING_LIT
+          var or_pval = mir_lower::mir_lower_expr(ctx, s, sub_pat)
+          var or_eq_args = [subject_val, or_pval]
+          var or_cmp = ctx.mir_emit_intrinsic("str_eq", or_eq_args)
+          var or_cur = ctx.mir_ctx_get_block()
+          mir_block_set_branch(or_cur, or_cmp, arm_block, or_next)
+          ctx.mir_switch_to_block(or_next)
+        else
+          var or_pval = mir_lower::mir_lower_expr(ctx, s, sub_pat)
+          var or_cmp = ctx.mir_emit_binary(op_constants::OP_EQ, subject_val, or_pval)
+          var or_cur = ctx.mir_ctx_get_block()
+          mir_block_set_branch(or_cur, or_cmp, arm_block, or_next)
+          ctx.mir_switch_to_block(or_next)
+        end
+      end
+
+      # Arm body (stmt position)
+      ctx.mir_switch_to_block(arm_block)
+      ctx.mir_ctx_apply_pending_bind()
+      var or_saved_depth = ctx.mir_ctx_get_scope_depth()
+      ctx.mir_ctx_set_scope_depth(or_saved_depth + 1)
+
+      var or_guard_node = ast::ast_get_extra(s, arm)
+      if or_guard_node > 0
+        var or_gval = mir_lower::mir_lower_expr(ctx, s, or_guard_node)
+        var or_gbody = ctx.mir_create_block("guard_body")
+        var or_gcur = ctx.mir_ctx_get_block()
+        mir_block_set_branch(or_gcur, or_gval, or_gbody, next_block)
+        ctx.mir_switch_to_block(or_gbody)
+      end
+
+      mir_lower::mir_lower_stmt(ctx, s, body_node)
+      var or_arm_cur = ctx.mir_ctx_get_block()
+      if mir_block_get_term_kind(or_arm_cur) < 0
+        ctx.emit_and_pop_drops_for_scope(or_saved_depth + 1)
+        # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+        or_arm_cur = ctx.mir_ctx_get_block()
+        mir_block_set_terminator(or_arm_cur, mir::TERM_JUMP, end_block)
+      else
+        ctx.mir_pop_drops_for_scope(or_saved_depth + 1)
+      end
+      ctx.mir_ctx_set_scope_depth(or_saved_depth)
+
+      ctx.mir_switch_to_block(next_block)
+      continue
+    end
+
+    # Check if enum pattern (NodeEnumAccess = 39) or bare ident matching variant
+    var cmp_val = 0
+    if pattern_kind == node_constants::NODE_ENUM_ACCESS
+      # Enum pattern: get tag from subject (handles simple vs payload enums)
+      var base_enum_name = ast::ast_get_str1(s, pattern_node)
+      var variant_name = ast::ast_get_str2(s, pattern_node)
+      # Resolve to qualified name; for unqualified patterns (empty name), find by variant
+      var enum_name = ""
+      if str_byte_len(base_enum_name) == 0
+        enum_name = ctx.mir_find_enum_by_variant(variant_name)
+      else
+        enum_name = ctx.mir_resolve_enum_name(base_enum_name)
+      end
+      var tag_val = ctx.mir_get_enum_tag_subj(s, subject_node, enum_name, subject_val)
+
+      # Get variant name, then compute index
+      var variant_idx = ctx.mir_find_variant_index_ctx(enum_name, variant_name)
+      var idx_val = ctx.mir_emit_const_int(variant_idx)
+
+      cmp_val = ctx.mir_emit_binary(op_constants::OP_EQ, tag_val, idx_val)
+
+      # PATTERN_PARSER_REJECTS_QUALIFIED_VARIANT sub-bug (b) fix + enum-niche tail
+      # item 1: emit nested tag comparisons for any sub-pattern child that is
+      # itself a constructor pattern (e.g. `Some(Focus::SaveList)`). The parser
+      # stores sub-pattern AstNodeIds in the children/payloads slot. Each
+      # NODE_ENUM_ACCESS child at payload position i adds a tag check on the payload
+      # at offset i+1 from subject_val. CRITICAL: the inner payload load + tag read
+      # DEREFERENCE the outer payload slot, which is UNINITIALIZED for a dataless
+      # outer variant (e.g. matching `Carry(Ok)` against `Empty` would read Empty's
+      # absent payload ⇒ SEGFAULT). So the inner check must be GUARDED behind the
+      # outer tag match: branch (outer_cmp ⇒ inner_check_block else next_block), and
+      # run the loads only in the outer-matched block. The inner read goes through
+      # the niche seam (mir_get_enum_tag_nested) so a niche inner reads correctly.
+      var sub_pats = ast::ast_get_children(s, pattern_node)
+      var has_ctor_sub = 0
+      if sub_pats > 0
+        var sub_count0 = vec_size(sub_pats)
+        for spi0 in 0..sub_count0
+          var sp0 = sub_pats[spi0]
+          if sp0 > 0 and ast::ast_get_kind(s, sp0) == node_constants::NODE_ENUM_ACCESS
+            has_ctor_sub = 1
+          end
+        end
+      end
+      if has_ctor_sub == 1
+        # Guard: only descend into the inner payload when the OUTER variant matched.
+        var inner_check_block = ctx.mir_create_block("match_inner_check")
+        var outer_cur = ctx.mir_ctx_get_block()
+        mir_block_set_branch(outer_cur, cmp_val, inner_check_block, next_block)
+        ctx.mir_switch_to_block(inner_check_block)
+        # Re-seed cmp_val to all-match; AND each inner constructor sub-pattern check.
+        cmp_val = ctx.mir_emit_const_int(1)
+        var sub_count = vec_size(sub_pats)
+        for spi in 0..sub_count
+          var sub_pat = sub_pats[spi]
+          if sub_pat > 0
+            var sub_kind = ast::ast_get_kind(s, sub_pat)
+            if sub_kind == node_constants::NODE_ENUM_ACCESS
+              var inner_payload_val = ctx.mir_emit_load_offset(subject_val, spi + 1)
+              var inner_base = ast::ast_get_str1(s, sub_pat)
+              var inner_variant = ast::ast_get_str2(s, sub_pat)
+              var inner_enum = ""
+              if str_byte_len(inner_base) == 0
+                inner_enum = ctx.mir_find_enum_by_variant(inner_variant)
+              else
+                inner_enum = ctx.mir_resolve_enum_name(inner_base)
+              end
+              var inner_static_ty = ""
+              var outer_field_types = mir::mir_ctx_lookup_variant_field_types(ctx, enum_name, variant_name)
+              if outer_field_types != 0 and spi < outer_field_types.size
+                inner_static_ty = as_string(outer_field_types[spi])
+              end
+              var inner_tag = mir::mir_get_enum_tag_nested(ctx, inner_enum, inner_static_ty, inner_payload_val)
+              var inner_vidx = ctx.mir_find_variant_index_ctx(inner_enum, inner_variant)
+              var inner_idx_val = ctx.mir_emit_const_int(inner_vidx)
+              var inner_cmp = ctx.mir_emit_binary(op_constants::OP_EQ, inner_tag, inner_idx_val)
+              cmp_val = ctx.mir_emit_binary(op_constants::OP_AND, cmp_val, inner_cmp)
+              # enum-niche tail item 6 — materialize nested inner-payload binds in
+              # the (outer-matched) inner_check_block. Same niche/spill classifier
+              # as the read above ⇒ recovered value matches construction (§14.10.Q4).
+              var inner_bnames = ast::ast_get_bound_names(s, sub_pat)
+              if inner_bnames > 0 and inner_bnames.size > 0
+                for ibi in 0..inner_bnames.size
+                  var inner_name = as_string(inner_bnames[ibi])
+                  if inner_name != "_"
+                    var rec = mir::mir_bind_enum_payload_nested(ctx, inner_enum, inner_static_ty, inner_payload_val, inner_variant, ibi)
+                    var rec_ty = mir::mir_nested_bind_payload_type(ctx, inner_enum, inner_static_ty, inner_variant, ibi)
+                    var rec_inl = mir::mir_nested_bind_is_inline(ctx, inner_enum, inner_static_ty, inner_variant)
+                    mir::mir_ctx_push_nested_bind(ctx, inner_name, rec, rec_ty, rec_inl)
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+
+      # If pattern has bound names, bind payloads in arm block (multi-field)
+      var bound_names = ast::ast_get_bound_names(s, pattern_node)
+      if bound_names > 0
+        if bound_names.size > 0
+          var names = vec_new<String>()
+          for bi in 0..bound_names.size
+            names.push(as_string(bound_names[bi]))
+          end
+          mir_mark_pattern_bindings_typed(ctx, s, subject_node, enum_name, variant_name, names)
+          ctx.mir_ctx_set_pending_bind(names, subject_val)
+          # B.10 §12.10 — flag inline @value payloads so apply_pending_bind binds
+          # an interior address instead of a boxed-pointer load.
+          mir::mir_set_pending_inline_for_enum(ctx, s, subject_node, enum_name, variant_name, names)
+        end
+      end
+    elsif pattern_kind == node_constants::NODE_STRUCT_DESTRUCTURE
+      # Struct pattern: irrefutable — always matches, bind fields
+      var sd_prev_block = ctx.mir_ctx_get_block()
+      mir_block_set_terminator(sd_prev_block, mir::TERM_JUMP, arm_block)
+      ctx.mir_switch_to_block(arm_block)
+
+      var sd_saved_depth = ctx.mir_ctx_get_scope_depth()
+      ctx.mir_ctx_set_scope_depth(sd_saved_depth + 1)
+
+      var sd_type_name = ast::ast_get_str1(s, pattern_node)
+      var sd_field_specs = ast::ast_get_str2(s, pattern_node)
+      var sd_struct_name = sd_type_name
+      if str_byte_len(sd_struct_name) == 0
+        sd_struct_name = ctx.mir_infer_expr_type(s, subject_node)
+      end
+      var sd_specs = str_split(sd_field_specs, ",")
+      for sd_fi in 0..sd_specs.size
+        var sd_spec = sd_specs[sd_fi]
+        var sd_fname = sd_spec
+        var sd_bname = sd_spec
+        var sd_cp = __char_index(sd_spec, ':')
+        if sd_cp >= 0
+          sd_fname = str_byte_slice(sd_spec, 0, sd_cp)
+          sd_bname = str_byte_slice(sd_spec, sd_cp + 1, str_byte_len(sd_spec))
+        end
+        var sd_fidx = ctx.mir_ctx_find_field_index(sd_struct_name, sd_fname)
+        var sd_offset = sd_fi
+        if sd_fidx >= 0
+          sd_offset = sd_fidx
+        end
+        var sd_slot = ctx.mir_ctx_alloc_slot()
+        ctx.mir_ctx_bind_var(sd_bname, sd_slot)
+        # B.10 §14.12.8 (C3.5/h3) — COW match-arm destructure field read: field f →
+        # buffer word f+1 via C3's cow_field_shift flag. INERT at gate 0.
+        var _sdm_is_cow = mir::mir_value_is_cow_layout(ctx, sd_struct_name)
+        if _sdm_is_cow == 1
+          mir::mir_ctx_set_cow_field_shift(ctx, 1)
+        end
+        var sd_val = ctx.mir_emit_load_offset(subject_val, sd_offset)
+        if _sdm_is_cow == 1
+          mir::mir_ctx_set_cow_field_shift(ctx, 0)
+        end
+        ctx.mir_emit_store_var(sd_bname, sd_val)
+      end
+
+      var sd_guard = ast::ast_get_extra(s, arm)
+      if sd_guard > 0
+        var sd_gval = mir_lower::mir_lower_expr(ctx, s, sd_guard)
+        var sd_gbody = ctx.mir_create_block("guard_body")
+        var sd_gcur = ctx.mir_ctx_get_block()
+        mir_block_set_branch(sd_gcur, sd_gval, sd_gbody, next_block)
+        ctx.mir_switch_to_block(sd_gbody)
+      end
+
+      mir_lower::mir_lower_stmt(ctx, s, body_node)
+      var sd_arm_cur = ctx.mir_ctx_get_block()
+      if mir_block_get_term_kind(sd_arm_cur) < 0
+        ctx.emit_and_pop_drops_for_scope(sd_saved_depth + 1)
+        # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+        sd_arm_cur = ctx.mir_ctx_get_block()
+        mir_block_set_terminator(sd_arm_cur, mir::TERM_JUMP, end_block)
+      else
+        ctx.mir_pop_drops_for_scope(sd_saved_depth + 1)
+      end
+      ctx.mir_ctx_set_scope_depth(sd_saved_depth)
+
+      if sd_guard <= 0
+        ctx.mir_switch_to_block(end_block)
+        return
+      end
+      ctx.mir_switch_to_block(next_block)
+      continue
+    elsif pattern_kind == node_constants::NODE_VEC_DESTRUCTURE
+      # Vec pattern: irrefutable — always matches, bind elements
+      var vd_prev_block = ctx.mir_ctx_get_block()
+      mir_block_set_terminator(vd_prev_block, mir::TERM_JUMP, arm_block)
+      ctx.mir_switch_to_block(arm_block)
+
+      var vd_saved_depth = ctx.mir_ctx_get_scope_depth()
+      ctx.mir_ctx_set_scope_depth(vd_saved_depth + 1)
+
+      var vd_elems_str = ast::ast_get_str1(s, pattern_node)
+      var vd_rest = ast::ast_get_str2(s, pattern_node)
+      var vd_has_rest = ast::ast_get_op(s, pattern_node)
+      var vd_elems = str_split(vd_elems_str, ",")
+      for vd_ei in 0..vd_elems.size
+        var vd_ename = vd_elems[vd_ei]
+        if str_byte_len(vd_ename) > 0
+          var vd_slot = ctx.mir_ctx_alloc_slot()
+          ctx.mir_ctx_bind_var(vd_ename, vd_slot)
+          var vd_idx = ctx.mir_emit_const_int(vd_ei)
+          var vd_val = ctx.mir_emit_intrinsic("vec_get", [subject_val, vd_idx])
+          ctx.mir_emit_store_var(vd_ename, vd_val)
+        end
+      end
+      if vd_has_rest == 1 and str_byte_len(vd_rest) > 0
+        var vd_rest_slot = ctx.mir_ctx_alloc_slot()
+        ctx.mir_ctx_bind_var(vd_rest, vd_rest_slot)
+        var vd_rest_vec = ctx.mir_emit_intrinsic("vec_new", [])
+        ctx.mir_emit_store_var(vd_rest, vd_rest_vec)
+      end
+
+      var vd_guard = ast::ast_get_extra(s, arm)
+      if vd_guard > 0
+        var vd_gval = mir_lower::mir_lower_expr(ctx, s, vd_guard)
+        var vd_gbody = ctx.mir_create_block("guard_body")
+        var vd_gcur = ctx.mir_ctx_get_block()
+        mir_block_set_branch(vd_gcur, vd_gval, vd_gbody, next_block)
+        ctx.mir_switch_to_block(vd_gbody)
+      end
+
+      mir_lower::mir_lower_stmt(ctx, s, body_node)
+      var vd_arm_cur = ctx.mir_ctx_get_block()
+      if mir_block_get_term_kind(vd_arm_cur) < 0
+        ctx.emit_and_pop_drops_for_scope(vd_saved_depth + 1)
+        # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+        vd_arm_cur = ctx.mir_ctx_get_block()
+        mir_block_set_terminator(vd_arm_cur, mir::TERM_JUMP, end_block)
+      else
+        ctx.mir_pop_drops_for_scope(vd_saved_depth + 1)
+      end
+      ctx.mir_ctx_set_scope_depth(vd_saved_depth)
+
+      if vd_guard <= 0
+        ctx.mir_switch_to_block(end_block)
+        return
+      end
+      ctx.mir_switch_to_block(next_block)
+      continue
+    elsif pattern_kind == node_constants::NODE_IDENT
+      # Bare ident pattern: check if it matches an enum variant name
+      var ident_name = ast::ast_get_str1(s, pattern_node)
+      var found_enum = ctx.mir_find_enum_by_variant(ident_name)
+      if str_byte_len(found_enum) > 0
+        # Resolve as enum variant: compare subject tag to variant index
+        var tag_val = ctx.mir_get_enum_tag_subj(s, subject_node, found_enum, subject_val)
+        var variant_idx = ctx.mir_find_variant_index_ctx(found_enum, ident_name)
+        var idx_val = ctx.mir_emit_const_int(variant_idx)
+        cmp_val = ctx.mir_emit_binary(op_constants::OP_EQ, tag_val, idx_val)
+      else
+        # Not an enum variant: compare as value (constant or binding)
+        var pattern_val = mir_lower::mir_lower_expr(ctx, s, pattern_node)
+        if string_arm_count_s > 0
+          # Subject is a string (other arms are string literals) — use str_eq
+          var eq_args = [subject_val, pattern_val]
+          cmp_val = ctx.mir_emit_intrinsic("str_eq", eq_args)
+        else
+          cmp_val = ctx.mir_emit_binary(op_constants::OP_EQ, subject_val, pattern_val)
+        end
+      end
+    else
+      # Non-enum pattern: compare subject to pattern value directly
+      var pattern_val = mir_lower::mir_lower_expr(ctx, s, pattern_node)
+
+      # String patterns (node_constants$NODE_STRING_LIT = 3) need str_eq comparison
+      if use_hash_dispatch_s == 1 and pattern_kind == node_constants::NODE_STRING_LIT
+        # Length + hash pre-filter: length check (cheapest) → hash check → str_eq verify
+        var pat_str = ast::ast_get_str1(s, pattern_node)
+        var pat_len = str_byte_len(pat_str)
+        var len_const = ctx.mir_emit_const_int(pat_len)
+        var len_cmp = ctx.mir_emit_binary(op_constants::OP_EQ, subject_len_s, len_const)
+        var hash_block = ctx.mir_create_block("match_len_ok")
+        var cur_l = ctx.mir_ctx_get_block()
+        mir_block_set_branch(cur_l, len_cmp, hash_block, next_block)
+        ctx.mir_switch_to_block(hash_block)
+        # Hash check within length group
+        var pat_hash = fnv1a_hash(pat_str)
+        var hash_const = ctx.mir_emit_const_int(pat_hash)
+        var hash_cmp = ctx.mir_emit_binary(op_constants::OP_EQ, subject_hash_s, hash_const)
+        var verify_block = ctx.mir_create_block("match_verify")
+        var cur_h = ctx.mir_ctx_get_block()
+        mir_block_set_branch(cur_h, hash_cmp, verify_block, next_block)
+        ctx.mir_switch_to_block(verify_block)
+        var eq_args = [subject_val, pattern_val]
+        cmp_val = ctx.mir_emit_intrinsic("str_eq", eq_args)
+      elsif pattern_kind == node_constants::NODE_STRING_LIT
+        var args = [subject_val, pattern_val]
+        cmp_val = ctx.mir_emit_intrinsic("str_eq", args)
+      else
+        cmp_val = ctx.mir_emit_binary(op_constants::OP_EQ, subject_val, pattern_val)
+      end
+    end
+
+    var cur = ctx.mir_ctx_get_block()
+    mir_block_set_branch(cur, cmp_val, arm_block, next_block)
+
+    # Arm block: apply pending binds, check guard, lower body, jump to end
+    ctx.mir_switch_to_block(arm_block)
+    ctx.mir_ctx_apply_pending_bind()
+    # Scope for match arm variables
+    var saved_depth = ctx.mir_ctx_get_scope_depth()
+    ctx.mir_ctx_set_scope_depth(saved_depth + 1)
+
+    # Check for guard expression on enum/value patterns
+    var arm_guard_node = ast::ast_get_extra(s, arm)
+    if arm_guard_node > 0
+      var guard_val = mir_lower::mir_lower_expr(ctx, s, arm_guard_node)
+      var guard_body = ctx.mir_create_block("guard_body")
+      var cur_g = ctx.mir_ctx_get_block()
+      mir_block_set_branch(cur_g, guard_val, guard_body, next_block)
+      ctx.mir_switch_to_block(guard_body)
+    end
+
+    mir_lower::mir_lower_stmt(ctx, s, body_node)
+    var arm_cur = ctx.mir_ctx_get_block()
+    if mir_block_get_term_kind(arm_cur) < 0
+      # Emit drops for arm-local variables before jump (and pop to prevent re-drop)
+      ctx.emit_and_pop_drops_for_scope(saved_depth + 1)
+      # B.10 §14.12.8 (C4) — re-fetch after a possible cow_release block split.
+      arm_cur = ctx.mir_ctx_get_block()
+      mir_block_set_terminator(arm_cur, mir::TERM_JUMP, end_block)
+    else
+      # Arm ended with return/break — drops were emitted by return handler,
+      # but we must still pop entries so subsequent arms don't re-drop them
+      ctx.mir_pop_drops_for_scope(saved_depth + 1)
+    end
+    ctx.mir_ctx_set_scope_depth(saved_depth)
+
+    # Continue with next arm
+    ctx.mir_switch_to_block(next_block)
+  end
+
+  # After all arms, jump to end
+  var final_cur = ctx.mir_ctx_get_block()
+  if mir_block_get_term_kind(final_cur) < 0
+    mir_block_set_terminator(final_cur, mir::TERM_JUMP, end_block)
+  end
+
+  ctx.mir_switch_to_block(end_block)
+  return
+end

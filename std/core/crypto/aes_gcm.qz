@@ -1,0 +1,513 @@
+## std/core/crypto/aes_gcm — Pure-Quartz constant-time AES-128/256-GCM (SP 800-38D)
+##
+## NET.5a.2 — the second half of the AES-GCM substrate gap called out in
+## `docs/design/TLS_1_3_DESIGN.md`. NET.5a.1 shipped bitsliced CT-AES; this
+## file composes it with a CT GHASH and the GCTR keystream into the
+## `TLS_AES_128_GCM_SHA256` (0x1301) and `TLS_AES_256_GCM_SHA384` (0x1302)
+## AEAD surfaces. NET.5a.3 added the dudect smoke (`aes_gcm_encrypt`
+## key-class + plaintext-class entries inside `dudect:smoke`); this file
+## ships the cipher proper.
+##
+## ## Why this GHASH (and not a tabulated one)
+##
+## The textbook GHASH multiplies in GF(2^128) by indexing a per-key
+## precomputed 16-entry (or 256-entry) table. Both leak under cache-timing
+## attacks (Käsper-Schwabe CHES 2009 §1.1 — the seminal cache-timing attack
+## on AES-GCM table impls). Modern portable CT GHASH uses bit-level
+## polynomial-multiply primitives. Two flavors:
+##
+##   - bit-by-bit shift-and-XOR — 128 iterations per block. Obviously CT,
+##     ~25 MB/s on a modern CPU.
+##   - Karatsuba over a fast scalar 64-bit polymul (BearSSL `bmul64`) — 6
+##     subproducts per block, ~500 MB/s. CT *iff* the underlying integer
+##     `*` is CT (LLVM emits IMUL/MADD; CT on every production CPU since
+##     ~2010).
+##
+## We ship the Karatsuba flavor. Same shape as BearSSL `ghash_ctmul64.c`
+## (Pornin, MIT, public-domain algorithm). The bmul64 splits each operand
+## by its bits-modulo-4 position into 4 masked subwords whose integer
+## product, masked back, equals the polynomial product. The high 64 bits
+## of the polynomial product are recovered via the bit-reversal identity
+## `polymul_hi(x, y) = rev64(polymul_lo(rev64(x), rev64(y))) >> 1`.
+##
+## ## Why TLS-1.3-only IV constraint
+##
+## RFC 8446 §5.3 fixes the per-record nonce length at 12 bytes
+## (record_iv_length = 12 for AES-GCM). NIST SP 800-38D §8.2 also requires
+## a deterministic 12-byte nonce path for the IETF AEAD profile. Non-12-byte
+## IVs need a special GHASH-based IV-to-J0 derivation (§7.1 step 2.b) that
+## adds attack surface (KAT corpus thinner, edge cases more numerous). We
+## ship the 12-byte path only; arbitrary-IV support is a NET.5/v2 follow-up.
+##
+## ## Public API (NET.5a.2)
+##
+##   def aes_gcm_encrypt(out: Int, tag: Int,
+##                       input: Int, input_len: Int,
+##                       aad: Int, aad_len: Int,
+##                       key: Secret<Int>, key_len: Int,
+##                       iv12: Int): Void
+##
+##   def aes_gcm_decrypt(out: Int,
+##                       input: Int, input_len: Int,
+##                       aad: Int, aad_len: Int,
+##                       key: Secret<Int>, key_len: Int,
+##                       iv12: Int, tag: Int): Int
+##
+## `key_len` is 16 (AES-128) or 32 (AES-256); other lengths are rejected.
+## `iv12` is exactly 12 bytes. The 16-byte tag is written to `tag` on encrypt;
+## on decrypt, the constant-time tag compare returns 0 on success, -1 on
+## tag mismatch. On mismatch the caller MUST treat `out` as undefined (per
+## NIST SP 800-38D §7.2 / RFC 5288 §3 receiver requirements).
+##
+## ## Validation
+##
+## `spec/qz/aes_gcm_smoke.qz` runs the McGrew-Viega "GCM Test Vectors"
+## corpus — Test Cases 1-4 (AES-128) and Test Cases 7-10 (AES-256). This
+## is the canonical KAT set that NIST CAVP, BoringSSL `aead_test`, Go
+## `crypto/cipher/gcm_test.go`, and Project Wycheproof all include. Plus
+## tag-mismatch rejection + AAD-mismatch rejection + invalid key length.
+## Driver task `quake aes_gcm:smoke`; NET.5a.3 extends `quake dudect:smoke`
+## with `aes_gcm_encrypt` key-class + plaintext-class entries (max|t| < 5).
+##
+## ## References
+##
+## - NIST SP 800-38D https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf
+## - McGrew, Viega. *The Galois/Counter Mode of Operation (GCM).*
+##   https://csrc.nist.gov/csrc/media/projects/block-cipher-techniques/documents/bcm/proposed-modes/gcm/gcm-spec.pdf
+## - Pornin. BearSSL `ghash_ctmul64`.
+##   https://www.bearssl.org/gitweb/?p=BearSSL;a=blob;f=src/hash/ghash_ctmul64.c
+## - Käsper, Schwabe. *Faster and Timing-Attack Resistant AES-GCM.*
+##   CHES 2009. https://cryptojedi.org/papers/aesbs-20090616.pdf
+## - docs/design/TLS_1_3_DESIGN.md "AES + AES-GCM"
+
+import * from ffi/socket               # malloc, free, memset, memcpy, ptr_read_byte, ptr_write_byte
+import * from std/core/crypto/secret   # Secret<Int>
+import std/core/crypto/subtle          # ct_eq_bytes
+import * from std/core/crypto/aes      # aes_round_keys_size, aes_keysched, aes_encrypt_block,
+                                        # _u64_lsr, _M55, _M33, _M0F, _M_00FF, _M_0000FFFF,
+                                        # _M_1111, _M_2222, _M_4444, _M_8888
+
+# =============================================================================
+# u64 helpers (logical shift, big-endian read/write)
+# =============================================================================
+#
+# `_u64_lsr` (logical right shift, n ∈ [1, 63]) and the mask constants
+# `_M55` / `_M33` / `_M0F` / `_M_00FF` / `_M_0000FFFF` / `_M_1111..8888` come
+# from aes.qz — re-imported here via the `import * from .../aes` at the
+# top of the file so we don't double-define and force the linker to pick
+# one (which surfaces as a `use of undefined value` after internalize+DCE).
+# Local additions: big-endian 64-bit codec and the GHASH-specific R_HI
+# reduction constant.
+
+def _be64_read(p: Int): Int
+  var b0 = ptr_read_byte(p)
+  var b1 = ptr_read_byte(p + 1)
+  var b2 = ptr_read_byte(p + 2)
+  var b3 = ptr_read_byte(p + 3)
+  var b4 = ptr_read_byte(p + 4)
+  var b5 = ptr_read_byte(p + 5)
+  var b6 = ptr_read_byte(p + 6)
+  var b7 = ptr_read_byte(p + 7)
+  return (b0 << 56) | (b1 << 48) | (b2 << 40) | (b3 << 32) | (b4 << 24) | (b5 << 16) | (b6 << 8) | b7
+end
+
+def _be64_write(p: Int, v: Int): Void
+  ptr_write_byte(p,     _u64_lsr(v, 56) & 255)
+  ptr_write_byte(p + 1, _u64_lsr(v, 48) & 255)
+  ptr_write_byte(p + 2, _u64_lsr(v, 40) & 255)
+  ptr_write_byte(p + 3, _u64_lsr(v, 32) & 255)
+  ptr_write_byte(p + 4, _u64_lsr(v, 24) & 255)
+  ptr_write_byte(p + 5, _u64_lsr(v, 16) & 255)
+  ptr_write_byte(p + 6, _u64_lsr(v, 8)  & 255)
+  ptr_write_byte(p + 7, v & 255)
+end
+
+# =============================================================================
+# 64-bit bit-reverse — `_rev64` (BearSSL `rev64`)
+# =============================================================================
+#
+# Five-stage SWAR bit-reverse: swap adjacent 1-bit pairs, then 2-bit, 4-bit,
+# 8-bit, 16-bit, then halves. Used to recover the high 64 bits of the
+# polynomial product via `polymul_hi(x, y) = rev64(bmul64(rev64(x), rev64(y))) >> 1`.
+
+def _rev64(x: Int): Int
+  var v = x
+  v = ((v & _M55()) << 1) | (_u64_lsr(v, 1) & _M55())
+  v = ((v & _M33()) << 2) | (_u64_lsr(v, 2) & _M33())
+  v = ((v & _M0F()) << 4) | (_u64_lsr(v, 4) & _M0F())
+  v = ((v & _M_00FF()) << 8) | (_u64_lsr(v, 8) & _M_00FF())
+  v = ((v & _M_0000FFFF()) << 16) | (_u64_lsr(v, 16) & _M_0000FFFF())
+  return (v << 32) | _u64_lsr(v, 32)
+end
+
+# =============================================================================
+# 64-bit polynomial multiply — `_bmul64` (BearSSL `bmul64`)
+# =============================================================================
+#
+# Multiplies two polynomials over GF(2) with degree < 64, returning the LOW
+# 64 bits of the product. The trick (Hassan-Schwabe ECNS 2008, isolated by
+# Pornin in BearSSL):
+#
+# Split each operand by bit-position mod 4 into 4 masked subwords. The
+# integer product of (x ∩ mask_i) × (y ∩ mask_j) puts polynomial bits at
+# positions ≡ (i+j) mod 4. Sum 4 such subproducts (with one fixed (i+j)
+# residue) and AND with the mask for that residue: the polynomial sum at
+# those positions is what survives; spurious integer carries between lanes
+# cancel modulo 2 by the linearity of the four-term combination.
+#
+# CT iff `*` on i64 is CT. LLVM emits IMUL/MADD; CT on every production
+# CPU since ~2010.
+def _bmul64(x: Int, y: Int): Int
+  var x0 = x & _M_1111()
+  var x1 = x & _M_2222()
+  var x2 = x & _M_4444()
+  var x3 = x & _M_8888()
+  var y0 = y & _M_1111()
+  var y1 = y & _M_2222()
+  var y2 = y & _M_4444()
+  var y3 = y & _M_8888()
+  # NOTE: single-line per MULTILINE_BINARY_OPERATOR_SILENTLY_DROPPED.
+  var z0 = (x0 * y0) ^ (x1 * y3) ^ (x2 * y2) ^ (x3 * y1)
+  var z1 = (x0 * y1) ^ (x1 * y0) ^ (x2 * y3) ^ (x3 * y2)
+  var z2 = (x0 * y2) ^ (x1 * y1) ^ (x2 * y0) ^ (x3 * y3)
+  var z3 = (x0 * y3) ^ (x1 * y2) ^ (x2 * y1) ^ (x3 * y0)
+  z0 = z0 & _M_1111()
+  z1 = z1 & _M_2222()
+  z2 = z2 & _M_4444()
+  z3 = z3 & _M_8888()
+  return z0 | z1 | z2 | z3
+end
+
+# =============================================================================
+# GHASH multiply — `_ghash_mul_inplace` (BearSSL `ghash_ctmul64`)
+# =============================================================================
+#
+# Computes Y ← Y × H in GF(2^128) modulo R(x) = 1 + x + x^2 + x^7 + x^128.
+# Y and H are each 16 bytes, big-endian; NIST SP 800-38D bit convention:
+# byte 0's MSB is the polynomial's x^0 coefficient.
+#
+# Decomposes Y, H into y0||y1 and h0||h1 (each i64, big-endian decode).
+# Computes the 128-bit polynomial product via 6 bmul64 calls (Karatsuba:
+# y0·h0, y1·h1, (y0^y1)·(h0^h1)) + 3 bit-reversed counterparts for the
+# high half. Then reduces modulo R(x) by substituting x^128 = x^7 + x^2 + x + 1.
+#
+# All `>>` on possibly-high-bit-set operands routed through `_u64_lsr`;
+# `<<` is wrap-modulo-2^64, which is exactly what we want for the
+# reduction's left-shifts.
+
+def _ghash_mul_inplace(y_16: Int, h_16: Int): Void
+  var y1 = _be64_read(y_16)         # bytes 0-7  (high)
+  var y0 = _be64_read(y_16 + 8)     # bytes 8-15 (low)
+  var h1 = _be64_read(h_16)
+  var h0 = _be64_read(h_16 + 8)
+  var h2 = h0 ^ h1
+  var h0r = _rev64(h0)
+  var h1r = _rev64(h1)
+  var h2r = h0r ^ h1r
+
+  var y0r = _rev64(y0)
+  var y1r = _rev64(y1)
+  var y2 = y0 ^ y1
+  var y2r = y0r ^ y1r
+
+  # 6 bmul64 calls — Karatsuba 3-way + bit-reversed counterparts.
+  var z0  = _bmul64(y0,  h0)
+  var z1  = _bmul64(y1,  h1)
+  var z2  = _bmul64(y2,  h2)
+  var z0h = _bmul64(y0r, h0r)
+  var z1h = _bmul64(y1r, h1r)
+  var z2h = _bmul64(y2r, h2r)
+
+  z2  = z2  ^ z0  ^ z1
+  z2h = z2h ^ z0h ^ z1h
+
+  z0h = _u64_lsr(_rev64(z0h), 1)
+  z1h = _u64_lsr(_rev64(z1h), 1)
+  z2h = _u64_lsr(_rev64(z2h), 1)
+
+  var v0 = z0
+  var v1 = z0h ^ z2
+  var v2 = z1 ^ z2h
+  var v3 = z1h
+
+  # The 4 limbs hold a 256-bit polynomial product with a one-bit shift
+  # quirk left by the rev64-based high-half recovery. Collapse it:
+  v3 = (v3 << 1) | _u64_lsr(v2, 63)
+  v2 = (v2 << 1) | _u64_lsr(v1, 63)
+  v1 = (v1 << 1) | _u64_lsr(v0, 63)
+  v0 = v0 << 1
+
+  # GF(2^128) reduction: x^128 ≡ x^7 + x^2 + x + 1.
+  # The "high" half of the polynomial product (v0, v1) gets folded into
+  # the "low" half (v2, v3) by substituting each high-half bit's
+  # contribution into the low-half coefficients.
+  # NOTE: single-line per MULTILINE_BINARY_OPERATOR_SILENTLY_DROPPED.
+  v2 = v2 ^ v0 ^ _u64_lsr(v0, 1) ^ _u64_lsr(v0, 2) ^ _u64_lsr(v0, 7)
+  v1 = v1 ^ (v0 << 63) ^ (v0 << 62) ^ (v0 << 57)
+  v3 = v3 ^ v1 ^ _u64_lsr(v1, 1) ^ _u64_lsr(v1, 2) ^ _u64_lsr(v1, 7)
+  v2 = v2 ^ (v1 << 63) ^ (v1 << 62) ^ (v1 << 57)
+
+  _be64_write(y_16,     v3)
+  _be64_write(y_16 + 8, v2)
+end
+
+# =============================================================================
+# GHASH stream update
+# =============================================================================
+#
+# Feed `data_len` bytes into Y (the running GHASH accumulator). Bytes are
+# consumed 16 at a time; if `data_len` is not a multiple of 16, the final
+# block is zero-padded (NIST SP 800-38D §6.4 GHASH-of-padded-AAD-and-C).
+#
+# Memory shape: 16-byte scratch block on the stack-ish path (malloc once,
+# reuse — minor optimization over per-block malloc).
+
+def _ghash_update(y_16: Int, h_16: Int, data: Int, data_len: Int): Void
+  if data_len == 0 then return end
+  var blk = malloc(16)
+  var i = 0
+  while i < data_len
+    memset(blk, 0, 16)
+    var chunk = if data_len - i >= 16 then 16 else data_len - i end
+    memcpy(blk, data + i, chunk)
+    # Y ^= blk
+    var j = 0
+    while j < 16
+      ptr_write_byte(y_16 + j, ptr_read_byte(y_16 + j) ^ ptr_read_byte(blk + j))
+      j = j + 1
+    end
+    # Y ← Y · H
+    _ghash_mul_inplace(y_16, h_16)
+    i = i + 16
+  end
+  free(blk)
+end
+
+# =============================================================================
+# GCTR (counter mode) — keystream XOR
+# =============================================================================
+#
+# Per NIST SP 800-38D §6.5, GCTR increments the LOW 32 BITS of the counter
+# block (big-endian, bytes 12..16). The high 12 bytes hold the IV. v1
+# generates the keystream one block at a time via `aes_encrypt_block`;
+# 5a.1's kernel processes 4 blocks per call with 3 padded, so per-block
+# CTR currently wastes 3/4 of the bitsliced kernel. A 4-way batched CTR
+# helper is filed forward for NET.5a.2-followup.
+
+def _aes_gcm_inc32(counter_16: Int): Void
+  var c = ptr_read_byte(counter_16 + 15) + 1
+  ptr_write_byte(counter_16 + 15, c & 255)
+  c = _u64_lsr(c, 8)
+  c = ptr_read_byte(counter_16 + 14) + c
+  ptr_write_byte(counter_16 + 14, c & 255)
+  c = _u64_lsr(c, 8)
+  c = ptr_read_byte(counter_16 + 13) + c
+  ptr_write_byte(counter_16 + 13, c & 255)
+  c = _u64_lsr(c, 8)
+  c = ptr_read_byte(counter_16 + 12) + c
+  ptr_write_byte(counter_16 + 12, c & 255)
+end
+
+# XOR `in_len` bytes from `in` to `out` with the AES-CTR keystream starting
+# at the value of `counter_16` (counter is updated as we go — caller may
+# re-use it for adjacent calls in a streaming flow, though TLS records are
+# always one-shot so this matters less here).
+def _aes_gcm_gctr(out: Int, input: Int, input_len: Int,
+                  num_rounds: Int, rk: Int, counter_16: Int): Void
+  if input_len == 0 then return end
+  var ks = malloc(16)
+  var i = 0
+  while i < input_len
+    aes_encrypt_block(num_rounds, rk, counter_16, ks)
+    var chunk = if input_len - i >= 16 then 16 else input_len - i end
+    var j = 0
+    while j < chunk
+      ptr_write_byte(out + i + j, ptr_read_byte(input + i + j) ^ ptr_read_byte(ks + j))
+      j = j + 1
+    end
+    _aes_gcm_inc32(counter_16)
+    i = i + 16
+  end
+  free(ks)
+end
+
+# =============================================================================
+# Public API
+# =============================================================================
+#
+# Standard GCM composition (NIST SP 800-38D §7.1):
+#   H   = AES_E(K, 0^128)
+#   J0  = IV || 0^31 || 1                          # 12-byte IV path
+#   C   = GCTR(inc32(J0), P)
+#   S   = GHASH(H, A || 0^v || C || 0^u || [len(A)*8 || len(C)*8])
+#   T   = AES_E(K, J0) XOR S
+#
+# Caller-owned buffers; `out` may not alias `in` (we don't promise in-place
+# for now — file forward if needed).
+
+## Encrypt `input_len` bytes from `input` to `out` and authenticate `aad_len`
+## bytes of additional data. Writes the 16-byte authentication tag to `tag`.
+## `key_len` is 16 (AES-128) or 32 (AES-256). `iv12` MUST be exactly 12 bytes.
+##
+## On unsupported `key_len`, writes zeros to `tag` and returns without
+## encrypting (caller-visible: tag mismatch on the receiver — fails closed).
+def aes_gcm_encrypt(
+  out: Int, tag: Int,
+  input: Int, input_len: Int,
+  aad: Int, aad_len: Int,
+  key: Secret<Int>, key_len: Int,
+  iv12: Int
+): Void
+  var rk_size = aes_round_keys_size(key_len)
+  if rk_size == 0
+    memset(tag, 0, 16)
+    return
+  end
+
+  var rk = malloc(rk_size)
+  var num_rounds = aes_keysched(rk, key, key_len)
+
+  # H = AES_E(K, 0^128)
+  var zero_block = malloc(16)
+  memset(zero_block, 0, 16)
+  var h = malloc(16)
+  aes_encrypt_block(num_rounds, rk, zero_block, h)
+
+  # J0 = IV || 0^31 || 1 (i.e., bytes 12-14 = 0, byte 15 = 1)
+  var j0 = malloc(16)
+  memcpy(j0, iv12, 12)
+  ptr_write_byte(j0 + 12, 0)
+  ptr_write_byte(j0 + 13, 0)
+  ptr_write_byte(j0 + 14, 0)
+  ptr_write_byte(j0 + 15, 1)
+
+  # ek_j0 = AES_E(K, J0) — used in the final tag step
+  var ek_j0 = malloc(16)
+  aes_encrypt_block(num_rounds, rk, j0, ek_j0)
+
+  # ciphertext = GCTR(inc32(J0), plaintext)
+  var counter = malloc(16)
+  memcpy(counter, j0, 16)
+  _aes_gcm_inc32(counter)
+  _aes_gcm_gctr(out, input, input_len, num_rounds, rk, counter)
+
+  # S = GHASH(H, A || 0^v || C || 0^u || [len(A)*8 || len(C)*8])
+  var s = malloc(16)
+  memset(s, 0, 16)
+  _ghash_update(s, h, aad, aad_len)
+  _ghash_update(s, h, out, input_len)
+
+  # Length suffix: two big-endian 64-bit lengths in BITS.
+  var len_block = malloc(16)
+  _be64_write(len_block,     aad_len * 8)
+  _be64_write(len_block + 8, input_len * 8)
+  _ghash_update(s, h, len_block, 16)
+
+  # T = ek_j0 XOR S
+  var i = 0
+  while i < 16
+    ptr_write_byte(tag + i, ptr_read_byte(ek_j0 + i) ^ ptr_read_byte(s + i))
+    i = i + 1
+  end
+
+  # Wipe scratch (H and ek_j0 are key-correlated).
+  memset(h, 0, 16)
+  memset(ek_j0, 0, 16)
+  memset(s, 0, 16)
+  memset(j0, 0, 16)
+  memset(counter, 0, 16)
+  memset(rk, 0, rk_size)
+
+  free(zero_block)
+  free(h)
+  free(j0)
+  free(ek_j0)
+  free(counter)
+  free(s)
+  free(len_block)
+  free(rk)
+end
+
+## Decrypt + verify. Returns 0 on success, -1 on tag mismatch (or unsupported
+## key length). On failure the caller MUST treat `out` as undefined.
+##
+## Tag is checked in constant time (`ct_eq_bytes`) AFTER plaintext is
+## computed; XOR is involutive so the same GCTR pass works for both
+## directions. Overall operation is constant-time over `in_len` and never
+## branches on key/plaintext bits.
+def aes_gcm_decrypt(
+  out: Int,
+  input: Int, input_len: Int,
+  aad: Int, aad_len: Int,
+  key: Secret<Int>, key_len: Int,
+  iv12: Int, tag: Int
+): Int
+  var rk_size = aes_round_keys_size(key_len)
+  if rk_size == 0 then return 0 - 1 end
+
+  var rk = malloc(rk_size)
+  var num_rounds = aes_keysched(rk, key, key_len)
+
+  var zero_block = malloc(16)
+  memset(zero_block, 0, 16)
+  var h = malloc(16)
+  aes_encrypt_block(num_rounds, rk, zero_block, h)
+
+  var j0 = malloc(16)
+  memcpy(j0, iv12, 12)
+  ptr_write_byte(j0 + 12, 0)
+  ptr_write_byte(j0 + 13, 0)
+  ptr_write_byte(j0 + 14, 0)
+  ptr_write_byte(j0 + 15, 1)
+
+  var ek_j0 = malloc(16)
+  aes_encrypt_block(num_rounds, rk, j0, ek_j0)
+
+  # Compute expected tag over the CIPHERTEXT (decrypt) before XORing.
+  var s = malloc(16)
+  memset(s, 0, 16)
+  _ghash_update(s, h, aad, aad_len)
+  _ghash_update(s, h, input, input_len)
+  var len_block = malloc(16)
+  _be64_write(len_block,     aad_len * 8)
+  _be64_write(len_block + 8, input_len * 8)
+  _ghash_update(s, h, len_block, 16)
+
+  var expected_tag = malloc(16)
+  var i = 0
+  while i < 16
+    ptr_write_byte(expected_tag + i, ptr_read_byte(ek_j0 + i) ^ ptr_read_byte(s + i))
+    i = i + 1
+  end
+
+  var ok = ct_eq_bytes(expected_tag, tag, 16)
+
+  # Decrypt regardless of tag verdict — XOR is involutive, same GCTR call.
+  # Caller contract says output is undefined on tag mismatch; we still
+  # compute it because branching on `ok` would leak the tag-compare bit.
+  var counter = malloc(16)
+  memcpy(counter, j0, 16)
+  _aes_gcm_inc32(counter)
+  _aes_gcm_gctr(out, input, input_len, num_rounds, rk, counter)
+
+  memset(h, 0, 16)
+  memset(ek_j0, 0, 16)
+  memset(s, 0, 16)
+  memset(expected_tag, 0, 16)
+  memset(j0, 0, 16)
+  memset(counter, 0, 16)
+  memset(rk, 0, rk_size)
+
+  free(zero_block)
+  free(h)
+  free(j0)
+  free(ek_j0)
+  free(counter)
+  free(s)
+  free(len_block)
+  free(expected_tag)
+  free(rk)
+
+  if ok == 1 then return 0 end
+  return 0 - 1
+end

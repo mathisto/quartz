@@ -1,0 +1,173 @@
+## Scoped resources — B.8 Phase 6.5: bound-param write-back semantics.
+##
+## Phase 4a/4b shipped Scoped with-block dispatch and throw-safety. The
+## bound `v` was a const binding, so `v = new_val` inside the body was
+## a typecheck error AND release(self, v) always saw the acquire-time
+## snapshot regardless. Phase 6.5 closes both gaps:
+##
+##   1. Bound `v` is implicitly `var` — body may reassign it.
+##   2. release(self, v) loads the current slot value at every exit
+##      site (natural fall-through, NODE_RETURN/break/continue drain
+##      via wrap_stack, and runtime throw handler via deref of the
+##      slot pointer pushed onto the Scoped-ctx TLS stack).
+##
+## This unblocks the Mutex<heap-pointer-as-int> stdlib pattern (e.g.
+## std/progress.qz's `_g_live_actives_mtx`, examples/concurrency.qz's
+## counter), where `var raw = mutex_lock(m); ... raw_new = mutate(raw);
+## mutex_unlock(m, raw_new)` becomes:
+##
+##   with m.lock do raw ->
+##     ...
+##     raw = mutate(raw)
+##   end
+##
+## Also: Scoped impls where v is a fixed handle (File, Channel, Tcp,
+## etc.) are unaffected — bodies that don't reassign v still see the
+## acquire value at release time.
+
+import * from qspec
+import * from std/sync/exclusion/mutex
+import * from std/throws
+
+# --- Test 1: Reassigning the bound param updates the protected value. ---
+
+def b65_reassign_bound_param(): Int
+  var m = mutex(7)
+  with m.lock do v ->
+    v = v + 100
+  end
+  # After release, the protected value should be 107.
+  with m.lock do v2 ->
+    return v2
+  end
+  return -1
+end
+
+# --- Test 2: Mid-body reassignment, multiple writes — last value wins. ---
+
+def b65_multiple_writes_last_wins(): Int
+  var m = mutex(0)
+  with m.lock do v ->
+    v = 1
+    v = 2
+    v = 3
+  end
+  with m.lock do v2 ->
+    return v2
+  end
+  return -1
+end
+
+# --- Test 3: Body that doesn't reassign — release sees acquire value. ---
+
+def b65_no_reassign_preserves_value(): Int
+  var m = mutex(42)
+  var read = 0
+  with m.lock do v ->
+    read = v
+    # No reassignment to v.
+  end
+  # Protected value unchanged.
+  with m.lock do v2 ->
+    return v2 + read
+  end
+  return -1
+end
+
+# --- Test 4: Early-return path — release sees the most-recent assignment. ---
+
+def b65_early_return_writeback(): Int
+  var m = mutex(10)
+  _b65_early_return_helper(m)
+  with m.lock do v ->
+    return v
+  end
+  return -1
+end
+
+def _b65_early_return_helper(m: Mutex): Void
+  with m.lock do v ->
+    v = v + 500
+    return  # early-return — wrap_stack drain fires release with v=510.
+  end
+end
+
+# --- Test 5: Throw-path write-back — release_on_throw sees the new v. ---
+#
+# The throw handler reads from `__qz_scoped_ctx_v[idx]` which Phase 6.5
+# stores as the slot ADDRESS, not the value, then derefs to read the
+# body's most-recent write.
+
+var g_b65_throw_msg_seen = ""
+
+def b65_capture(op_name: Int, argc: Int, argv: Int): Int
+  g_b65_throw_msg_seen = as_type<String>(load(argv, 0))
+  return 0
+end
+
+def b65_throw_path_writeback(): Int
+  var m = mutex(0)
+  g_b65_throw_msg_seen = ""
+  with Throws { throw: b65_capture } do ->
+    with m.lock do v ->
+      v = 999
+      throw("phase65")
+    end
+  end
+  # release_on_throw fired with v=999 — the protected slot now holds 999.
+  with m.lock do v2 ->
+    return v2
+  end
+  return -1
+end
+
+# --- Test 6: Nested with-blocks — each bound param is its own slot. ---
+
+def b65_nested_independent_slots(): Int
+  var ma = mutex(1)
+  var mb = mutex(10)
+  with ma.lock do a ->
+    with mb.lock do b ->
+      a = a + 100
+      b = b + 1000
+    end
+  end
+  var sum = 0
+  with ma.lock do a2 ->
+    sum = sum + a2
+  end
+  with mb.lock do b2 ->
+    sum = sum + b2
+  end
+  return sum
+end
+
+def main(): Int
+  describe("Scoped resources — B.8 Phase 6.5 (write-back semantics)") do ->
+    it("reassigning bound param flows through release on normal exit") do ->
+      assert_eq(b65_reassign_bound_param(), 107)
+    end
+
+    it("multiple body writes — release sees the last assignment") do ->
+      assert_eq(b65_multiple_writes_last_wins(), 3)
+    end
+
+    it("body that doesn't reassign — release preserves acquire value") do ->
+      assert_eq(b65_no_reassign_preserves_value(), 84)  # 42 (preserved) + 42 (read)
+    end
+
+    it("early-return path — wrap_stack drain releases current v") do ->
+      assert_eq(b65_early_return_writeback(), 510)
+    end
+
+    it("throw path — release_on_throw fires with most-recent v") do ->
+      assert_eq(b65_throw_path_writeback(), 999)
+    end
+
+    it("nested with-blocks have independent slots") do ->
+      # ma: 1+100 = 101, mb: 10+1000 = 1010, sum = 1111
+      assert_eq(b65_nested_independent_slots(), 1111)
+    end
+  end
+  return qspec_main()
+end

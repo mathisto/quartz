@@ -1,0 +1,890 @@
+# std/net/tls.qz - Ergonomic TLS networking (Layer 2 - The Quartz Way)
+#
+# Wraps std/ffi/tls with Quartz-idiomatic types and error handling.
+# For raw OpenSSL access, see std/ffi/tls.
+#
+# Example - HTTPS GET:
+#   import std/net/tls
+#
+#   def main(): Int
+#     var ctx = tls_ctx_new_client()
+#     match tls_connect(ctx, "example.com", 443)
+#       TlsResult::Ok(stream) =>
+#         tls_write(stream, "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+#         match tls_read(stream, 4096)
+#           TlsReadResult::Ok(data) => puts(data)
+#           TlsReadResult::Err(e) => puts(e.message)
+#         end
+#         tls_close(stream)
+#       TlsResult::Err(e) => puts("TLS error: " + e.message)
+#     end
+#     tls_ctx_free(ctx)
+#     return 0
+#   end
+
+import std/ffi/tls
+import std/ffi/socket
+import std/net/tcp
+
+# Internal: write i64 to raw memory (avoids cross-module struct codegen bug)
+def _tls_write_i32(ptr: Int, val: Int): Void
+  ptr_write_byte(ptr, val & 255)
+  ptr_write_byte(ptr_add(ptr, 1), (val >> 8) & 255)
+  ptr_write_byte(ptr_add(ptr, 2), (val >> 16) & 255)
+  ptr_write_byte(ptr_add(ptr, 3), (val >> 24) & 255)
+end
+
+def _tls_write_i64(ptr: Int, val: Int): Void
+  _tls_write_i32(ptr, val & 4294967295)
+  _tls_write_i32(ptr_add(ptr, 4), (val >> 32) & 4294967295)
+end
+
+# =============================================================================
+# Error Types
+# =============================================================================
+
+struct TlsError
+  message: String
+  code: Int
+end
+
+def tls_error(msg: String, code: Int): TlsError
+  return TlsError { message: msg, code: code }
+end
+
+# =============================================================================
+# Result Types
+# =============================================================================
+
+enum TlsResult
+  Ok(stream: TlsStream)
+  Err(error: TlsError)
+end
+
+enum TlsReadResult
+  Ok(data: String)
+  Err(error: TlsError)
+end
+
+enum TlsWriteResult
+  Ok(bytes: Int)
+  Err(error: TlsError)
+end
+
+# =============================================================================
+# TLS Context — shared configuration for multiple connections
+# =============================================================================
+
+struct TlsContext
+  ssl_ctx: Int    # SSL_CTX* (as Int for existential type model)
+  is_server: Int  # 1 for server, 0 for client
+end
+
+# Create a new TLS client context with sensible defaults:
+# - TLS 1.2 minimum
+# - Certificate verification enabled
+# - Default CA paths loaded
+def tls_ctx_new_client(): TlsContext
+  # Initialize OpenSSL (idempotent in 3.x)
+  OPENSSL_init_ssl(0, int_to_cptr(0))
+
+  var method = TLS_client_method()
+  var ctx = SSL_CTX_new(method)
+
+  if ptr_is_null(ctx)
+    return TlsContext { ssl_ctx: 0, is_server: 0 }
+  end
+
+  # Enable certificate verification
+  SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER(), int_to_cptr(0))
+
+  # Load default CA certificates
+  SSL_CTX_set_default_verify_paths(ctx)
+
+  # Set minimum TLS version to 1.2
+  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION())
+
+  return TlsContext { ssl_ctx: cptr_to_int(ctx), is_server: 0 }
+end
+
+# Create a new TLS server context
+# Caller must load cert and key with tls_ctx_load_cert/tls_ctx_load_key
+def tls_ctx_new_server(): TlsContext
+  OPENSSL_init_ssl(0, int_to_cptr(0))
+
+  var method = TLS_server_method()
+  var ctx = SSL_CTX_new(method)
+
+  if ptr_is_null(ctx)
+    return TlsContext { ssl_ctx: 0, is_server: 1 }
+  end
+
+  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION())
+
+  return TlsContext { ssl_ctx: cptr_to_int(ctx), is_server: 1 }
+end
+
+# Free a TLS context. Safe to call multiple times.
+def tls_ctx_free(ctx: TlsContext): Void
+  if ctx.ssl_ctx != 0
+    SSL_CTX_free(int_to_cptr(ctx.ssl_ctx))
+  end
+end
+
+# Load a certificate file into a server context
+# file: Path to PEM-format certificate file
+# Returns: 1 on success, 0 on failure
+def tls_ctx_load_cert(ctx: TlsContext, file: String): Int
+  if ctx.ssl_ctx == 0
+    return 0
+  end
+  var file_cstr = string_to_cstr(file)
+  return SSL_CTX_use_certificate_file(int_to_cptr(ctx.ssl_ctx), file_cstr, SSL_FILETYPE_PEM())
+end
+
+# Load a private key file into a server context
+# file: Path to PEM-format private key file
+# Returns: 1 on success, 0 on failure
+def tls_ctx_load_key(ctx: TlsContext, file: String): Int
+  if ctx.ssl_ctx == 0
+    return 0
+  end
+  var file_cstr = string_to_cstr(file)
+  return SSL_CTX_use_PrivateKey_file(int_to_cptr(ctx.ssl_ctx), file_cstr, SSL_FILETYPE_PEM())
+end
+
+# Verify that the loaded key matches the certificate
+# Returns: 1 if valid, 0 if mismatch
+def tls_ctx_check_key(ctx: TlsContext): Int
+  if ctx.ssl_ctx == 0
+    return 0
+  end
+  return SSL_CTX_check_private_key(int_to_cptr(ctx.ssl_ctx))
+end
+
+# Load a custom CA certificate file for verification.
+# Use this to trust self-signed or private CA certificates.
+# Returns: 1 on success, 0 on failure
+def tls_ctx_load_ca(ctx: TlsContext, ca_file: String): Int
+  if ctx.ssl_ctx == 0
+    return 0
+  end
+  var file_cstr = string_to_cstr(ca_file)
+  return SSL_CTX_load_verify_locations(int_to_cptr(ctx.ssl_ctx), file_cstr, int_to_cptr(0))
+end
+
+# Disable certificate verification on a client context.
+# Allows connecting to servers with self-signed certificates (testing only).
+def tls_ctx_disable_verify(ctx: TlsContext): Void
+  if ctx.ssl_ctx != 0
+    SSL_CTX_set_verify(int_to_cptr(ctx.ssl_ctx), SSL_VERIFY_NONE(), int_to_cptr(0))
+  end
+end
+
+# =============================================================================
+# TLS Stream — a connected TLS socket
+# =============================================================================
+
+struct TlsStream
+  ssl: Int     # SSL* (as Int)
+  fd: Int      # Underlying socket fd
+  host: String # Remote hostname
+  port: Int    # Remote port
+end
+
+# =============================================================================
+# TLS Client — connect to a remote host over TLS
+# =============================================================================
+
+# Connect to a remote host over TLS with certificate verification and SNI.
+def tls_connect(ctx: TlsContext, host: String, port: Int): TlsResult
+  if ctx.ssl_ctx == 0
+    return TlsResult::Err(tls_error("TLS context is not initialized", 0))
+  end
+
+  # Step 1: TCP connection
+  match tcp_connect(host, port)
+    Ok(tcp_stream) => {
+      # Step 2: Create SSL object
+      var ssl = SSL_new(int_to_cptr(ctx.ssl_ctx))
+      if ptr_is_null(ssl)
+        tcp_close(tcp_stream)
+        return TlsResult::Err(tls_error("Failed to create SSL object: #{ssl_drain_errors()}", 0))
+      end
+
+      # Step 3: Set SNI hostname (must be before handshake)
+      ssl_set_hostname(ssl, host)
+
+      # Step 3b: Set hostname verification (certificate CN/SAN must match)
+      ssl_set_verify_hostname(ssl, host)
+
+      # Step 4: Attach socket fd
+      SSL_set_fd(ssl, tcp_stream.fd)
+
+      # Step 5: Perform TLS handshake
+      ERR_clear_error()
+      var ret = SSL_connect(ssl)
+      if ret != 1
+        var err_code = SSL_get_error(ssl, ret)
+        var err_msg = ssl_drain_errors()
+        SSL_free(ssl)
+        tcp_close(tcp_stream)
+        return TlsResult::Err(tls_error("TLS handshake failed: #{err_msg}", err_code))
+      end
+
+      # Step 6: Verify certificate
+      var verify_result = SSL_get_verify_result(ssl)
+      if verify_result != X509_V_OK()
+        SSL_free(ssl)
+        tcp_close(tcp_stream)
+        return TlsResult::Err(tls_error("Certificate verification failed (code #{str_from_int(verify_result)})", verify_result))
+      end
+
+      TlsResult::Ok(TlsStream {
+        ssl: cptr_to_int(ssl),
+        fd: tcp_stream.fd,
+        host: host,
+        port: port
+      })
+    }
+    Err(e) => {
+      TlsResult::Err(tls_error("TCP connection failed: #{e.message}", e.code))
+    }
+  end
+end
+
+# Connect to a remote host over TLS without certificate verification.
+# Like tls_connect but skips the verify_result check (step 6).
+# Use with tls_ctx_disable_verify for self-signed cert servers (testing only).
+def tls_connect_noverify(ctx: TlsContext, host: String, port: Int): TlsResult
+  if ctx.ssl_ctx == 0
+    return TlsResult::Err(tls_error("TLS context is not initialized", 0))
+  end
+
+  match tcp_connect(host, port)
+    Ok(tcp_stream) => {
+      var ssl = SSL_new(int_to_cptr(ctx.ssl_ctx))
+      if ptr_is_null(ssl)
+        tcp_close(tcp_stream)
+        return TlsResult::Err(tls_error("Failed to create SSL object: #{ssl_drain_errors()}", 0))
+      end
+
+      ssl_set_hostname(ssl, host)
+      SSL_set_fd(ssl, tcp_stream.fd)
+
+      ERR_clear_error()
+      var ret = SSL_connect(ssl)
+      if ret != 1
+        var err_code = SSL_get_error(ssl, ret)
+        var err_msg = ssl_drain_errors()
+        SSL_free(ssl)
+        tcp_close(tcp_stream)
+        return TlsResult::Err(tls_error("TLS handshake failed: #{err_msg}", err_code))
+      end
+
+      # Skip certificate verification (unlike tls_connect)
+      TlsResult::Ok(TlsStream {
+        ssl: cptr_to_int(ssl),
+        fd: tcp_stream.fd,
+        host: host,
+        port: port
+      })
+    }
+    Err(e) => {
+      TlsResult::Err(tls_error("TCP connection failed: #{e.message}", e.code))
+    }
+  end
+end
+
+# Connect to a remote host over TLS with a timeout (milliseconds).
+def tls_connect_timeout(ctx: TlsContext, host: String, port: Int, timeout_ms: Int): TlsResult
+  if ctx.ssl_ctx == 0
+    return TlsResult::Err(tls_error("TLS context is not initialized", 0))
+  end
+
+  # Step 1: TCP connection with timeout
+  match tcp_connect_timeout(host, port, timeout_ms)
+    Ok(tcp_stream) => {
+      # Step 2: Create SSL object
+      var ssl = SSL_new(int_to_cptr(ctx.ssl_ctx))
+      if ptr_is_null(ssl)
+        tcp_close(tcp_stream)
+        return TlsResult::Err(tls_error("Failed to create SSL object: #{ssl_drain_errors()}", 0))
+      end
+
+      # Set SNI + hostname verification, attach fd
+      ssl_set_hostname(ssl, host)
+      ssl_set_verify_hostname(ssl, host)
+      SSL_set_fd(ssl, tcp_stream.fd)
+
+      # Set socket timeout for handshake
+      tcp_set_timeout(tcp_stream, timeout_ms)
+      tcp_set_send_timeout(tcp_stream, timeout_ms)
+
+      # TLS handshake
+      ERR_clear_error()
+      var ret = SSL_connect(ssl)
+      if ret != 1
+        var err_code = SSL_get_error(ssl, ret)
+        var err_msg = ssl_drain_errors()
+        SSL_free(ssl)
+        tcp_close(tcp_stream)
+        return TlsResult::Err(tls_error("TLS handshake failed: #{err_msg}", err_code))
+      end
+
+      # Verify certificate
+      var verify_result = SSL_get_verify_result(ssl)
+      if verify_result != X509_V_OK()
+        SSL_free(ssl)
+        tcp_close(tcp_stream)
+        return TlsResult::Err(tls_error("Certificate verification failed", verify_result))
+      end
+
+      TlsResult::Ok(TlsStream {
+        ssl: cptr_to_int(ssl),
+        fd: tcp_stream.fd,
+        host: host,
+        port: port
+      })
+    }
+    Err(e) => {
+      TlsResult::Err(tls_error("TCP connection failed: #{e.message}", e.code))
+    }
+  end
+end
+
+# =============================================================================
+# TLS Server — accept incoming TLS connections
+# =============================================================================
+
+# Wrap an accepted TCP client fd in a TLS connection (server side).
+# The context must have cert and key loaded.
+def tls_accept(ctx: TlsContext, client_fd: Int): TlsResult
+  if ctx.ssl_ctx == 0
+    return TlsResult::Err(tls_error("TLS context is not initialized", 0))
+  end
+
+  var ssl = SSL_new(int_to_cptr(ctx.ssl_ctx))
+  if ptr_is_null(ssl)
+    return TlsResult::Err(tls_error("Failed to create SSL object: #{ssl_drain_errors()}", 0))
+  end
+
+  SSL_set_fd(ssl, client_fd)
+
+  ERR_clear_error()
+  var ret = SSL_accept(ssl)
+  if ret != 1
+    var err_code = SSL_get_error(ssl, ret)
+    var err_msg = ssl_drain_errors()
+    SSL_free(ssl)
+    return TlsResult::Err(tls_error("TLS accept failed: #{err_msg}", err_code))
+  end
+
+  TlsResult::Ok(TlsStream {
+    ssl: cptr_to_int(ssl),
+    fd: client_fd,
+    host: "client",
+    port: 0
+  })
+end
+
+# =============================================================================
+# Stream I/O
+# =============================================================================
+
+# Read up to max_bytes of decrypted data from a TLS stream.
+def tls_read(stream: TlsStream, max_bytes: Int): TlsReadResult
+  if stream.ssl == 0
+    return TlsReadResult::Err(tls_error("TLS stream is closed", 0))
+  end
+
+  var buf = mem_alloc(max_bytes + 1)
+  ERR_clear_error()
+  var n = SSL_read(int_to_cptr(stream.ssl), buf, max_bytes)
+
+  # Sign-extend CInt return: if upper bit of i32 is set, it's negative
+  if n > 2147483647
+    n = n - 4294967296
+  end
+
+  if n > 0
+    # Successful read
+    ptr_write_byte(ptr_add(buf, n), 0)
+    var data = str_from_ptr(buf, n)
+    qz_free(buf)
+    return TlsReadResult::Ok(data)
+  end
+
+  if n == 0
+    # Clean shutdown (peer sent close_notify)
+    qz_free(buf)
+    return TlsReadResult::Ok("")
+  end
+
+  # Error (n < 0)
+  var err_code = SSL_get_error(int_to_cptr(stream.ssl), n)
+  qz_free(buf)
+
+  if err_code == SSL_ERROR_ZERO_RETURN()
+    return TlsReadResult::Ok("")
+  end
+
+  var err_msg = ssl_drain_errors()
+  TlsReadResult::Err(tls_error("TLS read failed: #{err_msg}", err_code))
+end
+
+# Write data to a TLS stream (will be encrypted).
+def tls_write(stream: TlsStream, data: String): TlsWriteResult
+  if stream.ssl == 0
+    return TlsWriteResult::Err(tls_error("TLS stream is closed", 0))
+  end
+
+  var ptr = str_to_ptr(data)
+  var len = str_byte_len(data)
+
+  ERR_clear_error()
+  var n = SSL_write(int_to_cptr(stream.ssl), ptr, len)
+  # Sign-extend CInt return
+  if n > 2147483647
+    n = n - 4294967296
+  end
+
+  if n > 0
+    return TlsWriteResult::Ok(n)
+  end
+
+  var err_code = SSL_get_error(int_to_cptr(stream.ssl), n)
+  var err_msg = ssl_drain_errors()
+  TlsWriteResult::Err(tls_error("TLS write failed: #{err_msg}", err_code))
+end
+
+# Write all data to a TLS stream, looping on partial writes.
+def tls_write_all(stream: TlsStream, data: String): TlsWriteResult
+  if stream.ssl == 0
+    return TlsWriteResult::Err(tls_error("TLS stream is closed", 0))
+  end
+
+  var ptr = str_to_ptr(data)
+  var total = str_byte_len(data)
+  var sent = 0
+
+  while sent < total
+    ERR_clear_error()
+    var n = SSL_write(int_to_cptr(stream.ssl), ptr_add(ptr, sent), total - sent)
+    # Sign-extend CInt return
+    if n > 2147483647
+      n = n - 4294967296
+    end
+    if n <= 0
+      var err_code = SSL_get_error(int_to_cptr(stream.ssl), n)
+      var err_msg = ssl_drain_errors()
+      return TlsWriteResult::Err(tls_error("TLS write failed: #{err_msg}", err_code))
+    end
+    sent += n
+  end
+
+  TlsWriteResult::Ok(sent)
+end
+
+# Close a TLS stream. Sends close_notify, frees SSL, closes socket.
+def tls_close(stream: TlsStream): Void
+  if stream.ssl != 0
+    # Send close_notify (ignore errors — peer may have already closed)
+    SSL_shutdown(int_to_cptr(stream.ssl))
+    SSL_free(int_to_cptr(stream.ssl))
+  end
+  if stream.fd >= 0
+    shutdown(stream.fd, SHUT_RDWR())
+    close(stream.fd)
+  end
+end
+
+# Set read/write timeout on the underlying socket (milliseconds).
+# Uses raw memory for timeval struct (avoids cross-module struct codegen issue)
+def tls_set_timeout(stream: TlsStream, timeout_ms: Int): Int
+  var tv = mem_alloc(16)
+  _tls_write_i64(tv, timeout_ms / 1000)
+  _tls_write_i64(ptr_add(tv, 8), (timeout_ms % 1000) * 1000)
+  setsockopt(stream.fd, SOL_SOCKET(), SO_RCVTIMEO(), tv, 16)
+  var result = setsockopt(stream.fd, SOL_SOCKET(), SO_SNDTIMEO(), tv, 16)
+  qz_free(tv)
+  return result
+end
+
+# =============================================================================
+# Async TLS — Non-blocking I/O with scheduler integration (P23)
+#
+# These functions use io_suspend(fd) to park the calling go-task when OpenSSL
+# returns WANT_READ or WANT_WRITE. The M:N scheduler registers the fd with
+# kqueue/epoll and resumes the task when the socket is ready. This is the
+# same mechanism used by _async_http_recv in http_server.qz.
+#
+# REQUIREMENT: The socket fd MUST be set to O_NONBLOCK before calling these.
+# The production server (https_serve_supervised) handles this automatically.
+# =============================================================================
+
+# Non-blocking TLS handshake (server side).
+# Performs SSL_accept in a loop, suspending the go-task on WANT_READ/WANT_WRITE.
+# The socket fd must already be non-blocking.
+# Returns TlsResult::Ok(stream) on success, TlsResult::Err on failure.
+def tls_accept_async(ctx: TlsContext, client_fd: Int): TlsResult
+  if ctx.ssl_ctx == 0
+    return TlsResult::Err(tls_error("TLS context is not initialized", 0))
+  end
+
+  var ssl = SSL_new(int_to_cptr(ctx.ssl_ctx))
+  if ptr_is_null(ssl)
+    return TlsResult::Err(tls_error("Failed to create SSL object: #{ssl_drain_errors()}", 0))
+  end
+
+  SSL_set_fd(ssl, client_fd)
+
+  while true
+    ERR_clear_error()
+    var ret = SSL_accept(ssl)
+    if ret == 1
+      # Handshake complete
+      return TlsResult::Ok(TlsStream {
+        ssl: cptr_to_int(ssl),
+        fd: client_fd,
+        host: "client",
+        port: 0
+      })
+    end
+    var err = SSL_get_error(ssl, ret)
+    if err == SSL_ERROR_WANT_READ() or err == SSL_ERROR_WANT_WRITE()
+      io_suspend(client_fd)
+    else
+      var err_msg = ssl_drain_errors()
+      SSL_free(ssl)
+      return TlsResult::Err(tls_error("TLS accept failed: #{err_msg}", err))
+    end
+  end
+  # Unreachable — the while-true loop always returns
+  SSL_free(ssl)
+  return TlsResult::Err(tls_error("TLS accept failed: unreachable", 0))
+end
+
+# Non-blocking TLS handshake with timeout (server side).
+# Returns TlsResult::Err with code -2 on timeout.
+def tls_accept_async_timeout(ctx: TlsContext, client_fd: Int, timeout_ms: Int): TlsResult
+  if timeout_ms <= 0
+    return tls_accept_async(ctx, client_fd)
+  end
+  if ctx.ssl_ctx == 0
+    return TlsResult::Err(tls_error("TLS context is not initialized", 0))
+  end
+
+  var ssl = SSL_new(int_to_cptr(ctx.ssl_ctx))
+  if ptr_is_null(ssl)
+    return TlsResult::Err(tls_error("Failed to create SSL object: #{ssl_drain_errors()}", 0))
+  end
+
+  SSL_set_fd(ssl, client_fd)
+  var deadline = time_mono_ns() / 1000000 + timeout_ms
+
+  while true
+    ERR_clear_error()
+    var ret = SSL_accept(ssl)
+    if ret == 1
+      return TlsResult::Ok(TlsStream {
+        ssl: cptr_to_int(ssl),
+        fd: client_fd,
+        host: "client",
+        port: 0
+      })
+    end
+    var err = SSL_get_error(ssl, ret)
+    if err == SSL_ERROR_WANT_READ() or err == SSL_ERROR_WANT_WRITE()
+      var remaining = deadline - time_mono_ns() / 1000000
+      if remaining <= 0
+        SSL_free(ssl)
+        return TlsResult::Err(tls_error("TLS accept timed out", -2))
+      end
+      io_suspend_timeout(client_fd, remaining, 1)
+      if time_mono_ns() / 1000000 >= deadline
+        SSL_free(ssl)
+        return TlsResult::Err(tls_error("TLS accept timed out", -2))
+      end
+    else
+      var err_msg = ssl_drain_errors()
+      SSL_free(ssl)
+      return TlsResult::Err(tls_error("TLS accept failed: #{err_msg}", err))
+    end
+  end
+  SSL_free(ssl)
+  return TlsResult::Err(tls_error("TLS accept failed: unreachable", 0))
+end
+
+# Non-blocking TLS read.
+# Reads up to max_bytes of decrypted data, suspending on WANT_READ/WANT_WRITE.
+# Returns TlsReadResult::Ok(data) on success (empty string on clean shutdown).
+def tls_read_async(stream: TlsStream, max_bytes: Int): TlsReadResult
+  if stream.ssl == 0
+    return TlsReadResult::Err(tls_error("TLS stream is closed", 0))
+  end
+
+  var buf = mem_alloc(max_bytes + 1)
+
+  while true
+    ERR_clear_error()
+    var n = SSL_read(int_to_cptr(stream.ssl), buf, max_bytes)
+    # Sign-extend CInt return: if upper bit of i32 is set, it's negative
+    if n > 2147483647
+      n = n - 4294967296
+    end
+
+    if n > 0
+      ptr_write_byte(ptr_add(buf, n), 0)
+      var data = str_from_ptr(buf, n)
+      qz_free(buf)
+      return TlsReadResult::Ok(data)
+    end
+
+    if n == 0
+      # Clean shutdown (peer sent close_notify)
+      qz_free(buf)
+      return TlsReadResult::Ok("")
+    end
+
+    # n < 0 — check error
+    var err = SSL_get_error(int_to_cptr(stream.ssl), n)
+    if err == SSL_ERROR_WANT_READ() or err == SSL_ERROR_WANT_WRITE()
+      io_suspend(stream.fd)
+    elsif err == SSL_ERROR_ZERO_RETURN()
+      qz_free(buf)
+      return TlsReadResult::Ok("")
+    else
+      var err_msg = ssl_drain_errors()
+      qz_free(buf)
+      return TlsReadResult::Err(tls_error("TLS read failed: #{err_msg}", err))
+    end
+  end
+  qz_free(buf)
+  return TlsReadResult::Err(tls_error("TLS read failed: unreachable", 0))
+end
+
+# Non-blocking TLS write.
+# Writes data (or partial), suspending on WANT_READ/WANT_WRITE.
+# Returns TlsWriteResult::Ok(bytes_written) on success.
+def tls_write_async(stream: TlsStream, data: String): TlsWriteResult
+  if stream.ssl == 0
+    return TlsWriteResult::Err(tls_error("TLS stream is closed", 0))
+  end
+
+  var ptr = str_to_ptr(data)
+  var len = str_byte_len(data)
+
+  while true
+    ERR_clear_error()
+    var n = SSL_write(int_to_cptr(stream.ssl), ptr, len)
+    # Sign-extend CInt return
+    if n > 2147483647
+      n = n - 4294967296
+    end
+
+    if n > 0
+      return TlsWriteResult::Ok(n)
+    end
+
+    var err = SSL_get_error(int_to_cptr(stream.ssl), n)
+    if err == SSL_ERROR_WANT_READ() or err == SSL_ERROR_WANT_WRITE()
+      io_suspend(stream.fd)
+    else
+      var err_msg = ssl_drain_errors()
+      return TlsWriteResult::Err(tls_error("TLS write failed: #{err_msg}", err))
+    end
+  end
+  return TlsWriteResult::Err(tls_error("TLS write failed: unreachable", 0))
+end
+
+# Non-blocking TLS write-all.
+# Writes ALL data, looping on partial writes and suspending on WANT_READ/WANT_WRITE.
+# Returns TlsWriteResult::Ok(total_bytes) on success.
+def tls_write_all_async(stream: TlsStream, data: String): TlsWriteResult
+  if stream.ssl == 0
+    return TlsWriteResult::Err(tls_error("TLS stream is closed", 0))
+  end
+
+  var ptr = str_to_ptr(data)
+  var total = str_byte_len(data)
+  var sent = 0
+
+  while sent < total
+    ERR_clear_error()
+    var n = SSL_write(int_to_cptr(stream.ssl), ptr_add(ptr, sent), total - sent)
+    # Sign-extend CInt return
+    if n > 2147483647
+      n = n - 4294967296
+    end
+
+    if n > 0
+      sent = sent + n
+    else
+      var err = SSL_get_error(int_to_cptr(stream.ssl), n)
+      if err == SSL_ERROR_WANT_READ() or err == SSL_ERROR_WANT_WRITE()
+        io_suspend(stream.fd)
+      else
+        var err_msg = ssl_drain_errors()
+        return TlsWriteResult::Err(tls_error("TLS write failed: #{err_msg}", err))
+      end
+    end
+  end
+
+  return TlsWriteResult::Ok(sent)
+end
+
+# Non-blocking TLS read with timeout.
+# Returns TlsReadResult::Err with code -2 on timeout.
+def tls_read_async_timeout(stream: TlsStream, max_bytes: Int, timeout_ms: Int): TlsReadResult
+  if timeout_ms <= 0
+    return tls_read_async(stream, max_bytes)
+  end
+  if stream.ssl == 0
+    return TlsReadResult::Err(tls_error("TLS stream is closed", 0))
+  end
+
+  var buf = mem_alloc(max_bytes + 1)
+  var deadline = time_mono_ns() / 1000000 + timeout_ms
+
+  while true
+    ERR_clear_error()
+    var n = SSL_read(int_to_cptr(stream.ssl), buf, max_bytes)
+    if n > 2147483647
+      n = n - 4294967296
+    end
+
+    if n > 0
+      ptr_write_byte(ptr_add(buf, n), 0)
+      var data = str_from_ptr(buf, n)
+      qz_free(buf)
+      return TlsReadResult::Ok(data)
+    end
+
+    if n == 0
+      qz_free(buf)
+      return TlsReadResult::Ok("")
+    end
+
+    var err = SSL_get_error(int_to_cptr(stream.ssl), n)
+    if err == SSL_ERROR_WANT_READ() or err == SSL_ERROR_WANT_WRITE()
+      var remaining = deadline - time_mono_ns() / 1000000
+      if remaining <= 0
+        qz_free(buf)
+        return TlsReadResult::Err(tls_error("TLS read timed out", -2))
+      end
+      io_suspend_timeout(stream.fd, remaining, 1)
+      if time_mono_ns() / 1000000 >= deadline
+        qz_free(buf)
+        return TlsReadResult::Err(tls_error("TLS read timed out", -2))
+      end
+    elsif err == SSL_ERROR_ZERO_RETURN()
+      qz_free(buf)
+      return TlsReadResult::Ok("")
+    else
+      var err_msg = ssl_drain_errors()
+      qz_free(buf)
+      return TlsReadResult::Err(tls_error("TLS read failed: #{err_msg}", err))
+    end
+  end
+  qz_free(buf)
+  return TlsReadResult::Err(tls_error("TLS read failed: unreachable", 0))
+end
+
+# Non-blocking TLS write-all with timeout.
+# Returns TlsWriteResult::Err with code -2 on timeout.
+def tls_write_all_async_timeout(stream: TlsStream, data: String, timeout_ms: Int): TlsWriteResult
+  if timeout_ms <= 0
+    return tls_write_all_async(stream, data)
+  end
+  if stream.ssl == 0
+    return TlsWriteResult::Err(tls_error("TLS stream is closed", 0))
+  end
+
+  var ptr = str_to_ptr(data)
+  var total = str_byte_len(data)
+  var sent = 0
+  var deadline = time_mono_ns() / 1000000 + timeout_ms
+
+  while sent < total
+    ERR_clear_error()
+    var n = SSL_write(int_to_cptr(stream.ssl), ptr_add(ptr, sent), total - sent)
+    if n > 2147483647
+      n = n - 4294967296
+    end
+
+    if n > 0
+      sent = sent + n
+    else
+      var err = SSL_get_error(int_to_cptr(stream.ssl), n)
+      if err == SSL_ERROR_WANT_READ() or err == SSL_ERROR_WANT_WRITE()
+        var remaining = deadline - time_mono_ns() / 1000000
+        if remaining <= 0
+          return TlsWriteResult::Err(tls_error("TLS write timed out", -2))
+        end
+        io_suspend_timeout(stream.fd, remaining, 4)
+        if time_mono_ns() / 1000000 >= deadline
+          return TlsWriteResult::Err(tls_error("TLS write timed out", -2))
+        end
+      else
+        var err_msg = ssl_drain_errors()
+        return TlsWriteResult::Err(tls_error("TLS write failed: #{err_msg}", err))
+      end
+    end
+  end
+
+  return TlsWriteResult::Ok(sent)
+end
+
+# Non-blocking TLS shutdown.
+# Sends close_notify, suspending on WANT_READ/WANT_WRITE.
+# Then frees the SSL object and closes the socket.
+def tls_close_async(stream: TlsStream): Void
+  if stream.ssl != 0
+    # SSL_shutdown returns 0 (sent, need second call), 1 (complete), <0 (error)
+    # First call sends close_notify; second call waits for peer's close_notify.
+    # We try twice, suspending if needed, then give up — peer may have already closed.
+    var attempts = 0
+    while attempts < 2
+      ERR_clear_error()
+      var ret = SSL_shutdown(int_to_cptr(stream.ssl))
+      # Sign-extend CInt return
+      if ret > 2147483647
+        ret = ret - 4294967296
+      end
+      if ret == 1
+        # Complete bidirectional shutdown
+        break
+      end
+      if ret == 0
+        # close_notify sent, need to call again for peer's response
+        attempts = attempts + 1
+        continue
+      end
+      # ret < 0 — check error
+      var err = SSL_get_error(int_to_cptr(stream.ssl), ret)
+      if err == SSL_ERROR_WANT_READ() or err == SSL_ERROR_WANT_WRITE()
+        io_suspend(stream.fd)
+        attempts = attempts + 1
+      else
+        # Fatal error during shutdown — just bail
+        break
+      end
+    end
+    SSL_free(int_to_cptr(stream.ssl))
+  end
+  if stream.fd >= 0
+    shutdown(stream.fd, SHUT_RDWR())
+    close(stream.fd)
+  end
+end
+
+# =============================================================================
+# Convenience
+# =============================================================================
+
+# Get the underlying file descriptor (for event loop integration)
+def tls_fd(stream: TlsStream): Int = stream.fd
+
+# Get the SSL pointer as Int (for advanced usage)
+def tls_ssl_ptr(stream: TlsStream): Int = stream.ssl

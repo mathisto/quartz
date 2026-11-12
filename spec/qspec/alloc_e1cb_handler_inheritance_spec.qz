@@ -1,0 +1,253 @@
+## QSpec coverage for Phase E.1.c.b — spawn-time effect-stack snapshot
+## for handler inheritance into goroutines.
+##
+## Phase E.1.c (2026-04-28) flipped all effect-stack arrays to TLS and
+## made each scheduler worker re-run `__qz_effect_install_defaults` at
+## entry, so per-task `with Alloc.in_arena(ar)` installs no longer race
+## across workers. The semantic shift: handlers installed on the parent
+## thread were no longer visible inside spawned goroutines, because the
+## parent's TLS effect stack didn't transfer to the worker.
+##
+## Phase E.1.c.b (this spec): at `go fn()` (default Async.spawn handler),
+## capture the parent's user-installed handlers above blessed_watermark
+## into a heap snapshot keyed by the task frame pointer. At each worker
+## $poll dispatch, save TLS top, apply the snapshot on top of the
+## worker's blessed defaults, call $poll, restore TLS top. At task
+## completion, take + free the snapshot. Net effect: handlers installed
+## via `with E { ... } do go fn() end` are visible inside the goroutine
+## body without users having to wrap `go fn()` in another with-block.
+##
+## What these tests prove:
+##
+##   E1cb.a — Alloc tracking handler installed on parent BEFORE go fn()
+##            observes the goroutine's allocations.
+##   E1cb.b — Multi-worker scheduler (sched_init(0)) — handler visibility
+##            persists across worker threads, not just the spawning one.
+##   E1cb.c — Sequential go fn() calls each inherit parent's handlers.
+##   E1cb.d — Goroutine without parent installs runs cleanly (snapshot
+##            machinery is no-op when nothing to inherit; regression
+##            check that the lookup-returns-null path doesn't break
+##            simple `go fn()` calls).
+##   E1cb.e — Snapshot lifetime — after task completes, the snapshot is
+##            freed; a NEW spawn after teardown re-snapshots fresh
+##            (simple round-trip; catches register-without-take leaks).
+
+import * from qspec
+import * from qspec/subprocess
+
+# -----------------------------------------------------------------------------
+# E1cb.a — basic inheritance: tracking handler on main observes goroutine allocs.
+# Single-worker (sched_init(1)) keeps tracking-handler counter increments
+# deterministic; multi-worker variant in E1cb.b exercises cross-thread visibility.
+# -----------------------------------------------------------------------------
+
+var _BASIC_INHERITANCE: String = """import std/sync/composition/go
+import std/alloc
+
+def heavy_alloc(): Int
+  var v = vec_new<Int>()
+  for i in 0..200
+    v.push(i)
+  end
+  return v[199]
+end
+
+def main(): Int
+  sched_init(1)
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    var t = go heavy_alloc()
+    var r = await t
+    0
+  end
+  var n = alloc_tracking_alloc_count()
+  # Handler must observe at least one alloc from inside the goroutine.
+  # Pre-E.1.c.b this would be 0 — handler not visible inside `go`.
+  if n > 0
+    puts(\"inherited\")
+  else
+    puts(\"missed:\" + str_from_int(n))
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E1cb.b — multi-worker scheduler: even when the goroutine runs on a worker
+# thread other than main, the tracking handler installed on main is still
+# visible inside the goroutine body. Tracking-handler increment is non-atomic
+# so we don't assert exact counts under multi-worker — just that the per-task
+# allocation reaches the handler at all.
+# -----------------------------------------------------------------------------
+
+var _MULTI_WORKER_INHERITANCE: String = """import std/sync/composition/go
+import std/alloc
+
+def task_body(): Int
+  var v = vec_new<Int>()
+  for i in 0..50
+    v.push(i)
+  end
+  return v[49]
+end
+
+def main(): Int
+  sched_init(0)
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    var t = go task_body()
+    var r = await t
+    0
+  end
+  var n = alloc_tracking_alloc_count()
+  if n > 0
+    puts(\"mw_ok\")
+  else
+    puts(\"mw_missed\")
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E1cb.c — sequential goroutines all inherit parent's handlers. Counter must
+# increment monotonically across spawns; install on main captured ONCE in the
+# parent's frame is reused across each go fn().
+# -----------------------------------------------------------------------------
+
+var _SEQUENTIAL_INHERITANCE: String = """import std/sync/composition/go
+import std/alloc
+
+def small_alloc(): Int
+  var v = vec_new<Int>()
+  v.push(1)
+  v.push(2)
+  v.push(3)
+  return v[2]
+end
+
+def main(): Int
+  sched_init(1)
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    for k in 0..5
+      var t = go small_alloc()
+      var r = await t
+    end
+    0
+  end
+  var n = alloc_tracking_alloc_count()
+  # 5 tasks each running small_alloc — handler should observe each task's
+  # vec_new + a few pushes. Count > 5 is the floor (vec hdr each).
+  if n >= 5
+    puts(\"seq_ok\")
+  else
+    puts(\"seq_missed:\" + str_from_int(n))
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E1cb.d — goroutine without any parent install: lookup short-circuits on
+# count==0; apply is no-op; run path matches pre-E.1.c.b behavior.
+# Regression guard against the common case getting broken.
+# -----------------------------------------------------------------------------
+
+var _NO_PARENT_INSTALL: String = """import std/sync/composition/go
+
+def calc(): Int
+  var v = vec_new<Int>()
+  for i in 0..30
+    v.push(i * 2)
+  end
+  return v[29]
+end
+
+def main(): Int
+  sched_init(0)
+  var t = go calc()
+  var r = await t
+  puts(str_from_int(r))
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E1cb.e — snapshot lifetime: spawn + await + spawn again. The first task's
+# snapshot must be taken+freed at task completion so the second spawn registers
+# fresh. If `take` failed (leaked entries in the side-table), repeat sequences
+# would either OOM-skip-register at cap=256 or carry stale frame mappings into
+# new tasks (lookup hits stale entry → wrong handler set applied).
+# -----------------------------------------------------------------------------
+
+var _SNAPSHOT_LIFETIME: String = """import std/sync/composition/go
+import std/alloc
+
+def alloc_one(): Int
+  var v = vec_new<Int>()
+  v.push(7)
+  return v[0]
+end
+
+def main(): Int
+  sched_init(1)
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    # Burn through 100 spawn+await pairs. If snapshot side-table leaks
+    # entries (take didn't free), we'd hit cap=256 well before this many
+    # outer iterations because the inner async-frame `var t = go calc()`
+    # is a fresh frame each iteration. Cap-skip drops new registers; the
+    # first 256 stale entries stay forever; lookup of new frames misses;
+    # tracking under-counts. We assert tracking still works at iter 100.
+    for i in 0..100
+      var t = go alloc_one()
+      var r = await t
+    end
+    0
+  end
+  var n = alloc_tracking_alloc_count()
+  if n >= 100
+    puts(\"lifetime_ok\")
+  else
+    puts(\"lifetime_short:\" + str_from_int(n))
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# =============================================================================
+# Spec entry point
+# =============================================================================
+
+def main(): Int
+  describe("Phase E.1.c.b — spawn-time effect-stack snapshot inherits parent handlers into goroutines") do ->
+
+    it("Alloc tracking handler installed on parent observes goroutine allocations (single-worker)") do ->
+      assert_run_stdout_eq(_BASIC_INHERITANCE, "inherited\n")
+    end
+
+    it("multi-worker — handler installed on main visible from worker-thread goroutines") do ->
+      assert_run_stdout_eq(_MULTI_WORKER_INHERITANCE, "mw_ok\n")
+    end
+
+    it("sequential goroutines all inherit parent handlers") do ->
+      assert_run_stdout_eq(_SEQUENTIAL_INHERITANCE, "seq_ok\n")
+    end
+
+    it("goroutine without parent install runs cleanly (regression — snapshot is no-op)") do ->
+      assert_run_stdout_eq(_NO_PARENT_INSTALL, "58\n")
+    end
+
+    it("snapshot is taken+freed at task completion (lifetime — 100 spawn+await pairs)") do ->
+      assert_run_stdout_eq(_SNAPSHOT_LIFETIME, "lifetime_ok\n")
+    end
+
+  end
+  return qspec_main()
+end

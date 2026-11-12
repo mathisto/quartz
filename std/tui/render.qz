@@ -1,0 +1,328 @@
+## std/tui/render.qz — damage / diff renderer (Phase 6.3 of v0.6).
+##
+## Every modern TUI framework converged on the same algorithm: render
+## to a back buffer, diff against the front buffer, emit only the
+## changed cells with cursor-move minimization. Ratatui, Bubble Tea
+## Cursed Renderer, Textual compositor — same shape, three
+## implementations. **No frame ever re-emits unchanged cells.**
+##
+## Quartz's v0.6 renderer holds two `Plane` buffers:
+##   - `front`: what the terminal is currently displaying.
+##   - `back`:  what the next frame should display.
+##
+## Each render cycle:
+##   1. App computes a new back plane (via `plane_putc` / `plane_blit` /
+##      `plane_merge_down_with` / etc) and installs it via
+##      `renderer_with_back(r, new_back)`.
+##   2. App calls `renderer_diff(r, sync)` to produce an ANSI escape
+##      string that emits only cells where back differs from front.
+##   3. App writes that string to stdout.
+##   4. App calls `renderer_swap(r)` to promote back to front.
+##
+## ## DEC 2026 synchronized output
+##
+## When `sync=true`, the diff string is wrapped in
+## `\x1b[?2026h ... \x1b[?2026l` markers. Modern terminals
+## (Ghostty / Kitty / WezTerm / Windows Terminal) batch the entire
+## frame and present it atomically — no tearing, no flicker. Older
+## terminals ignore the markers entirely; the wrapper is
+## fully backward-compatible.
+##
+## ## SGR state minimization
+##
+## The diff scanner maintains a (fg_color, bg_color, attrs) state
+## machine. SGR sequences are emitted only when the next cell's
+## styling differs from the currently-active state. Cursor moves
+## are emitted only when a diff lands at a non-adjacent position.
+## Both optimizations together drop typical frame output to a few
+## dozen bytes for steady-state UIs.
+##
+## ## Color emission — truecolor only in v0.6.3
+##
+## Phase 6.3 emits truecolor SGR sequences (`\x1b[38;2;R;G;Bm`) for
+## packed-truecolor cells; non-truecolor cells (-1 sentinel, ANSI 16,
+## 256-palette indices) fall back to a default-color reset
+## (`\x1b[39m` for fg, `\x1b[49m` for bg). Full color-depth
+## degradation is a v0.6.x polish task — std/style.qz already has
+## the math, just needs to be plumbed through.
+##
+## See `docs/design/TUI_V06_CELL_ENGINE.md` D7.
+##
+## @since 5.28.x
+
+import std/tui/cell as cl
+import std/tui/plane as pl
+
+# =============================================================================
+# Renderer struct
+# =============================================================================
+
+## Front + back buffer pair. Both planes have the same dimensions
+## (`w × h`).
+struct Renderer
+  w:     Int
+  h:     Int
+  front: pl::Plane
+  back:  pl::Plane
+end
+
+## Internal: build a fresh blank plane at `(w, h)`. Standalone helper
+## so `renderer_new` and `renderer_resize` share the same shape.
+def _render_blank_plane(w: Int, h: Int): pl::Plane
+  return pl::plane_create(w, h)
+end
+
+## Construct a renderer at `(w, h)`. Front and back are both blank,
+## so the first diff produced (against an unchanged blank back) is
+## empty — apps install their first frame via `renderer_with_back`
+## before calling `renderer_diff`.
+def renderer_new(w: Int, h: Int): Renderer
+  return Renderer {
+    w:     w,
+    h:     h,
+    front: _render_blank_plane(w, h),
+    back:  _render_blank_plane(w, h)
+  }
+end
+
+## Resize the renderer. Both buffers are reset to blank — callers must
+## re-render the full frame afterwards. v0.7 may add a resize-with-
+## carryover variant that preserves cells in the overlapping region.
+def renderer_resize(r: Renderer, w: Int, h: Int): Renderer
+  return Renderer {
+    w:     w,
+    h:     h,
+    front: _render_blank_plane(w, h),
+    back:  _render_blank_plane(w, h)
+  }
+end
+
+## Replace the back buffer with a new plane. Callers typically pass a
+## freshly-rendered scene Plane built via plane_blit / plane_putc /
+## plane_merge_down_with. The plane's dimensions should match the
+## renderer's; mismatched sizes produce undefined diff output.
+def renderer_with_back(r: Renderer, new_back: pl::Plane): Renderer
+  return Renderer {
+    w:     r.w,
+    h:     r.h,
+    front: r.front,
+    back:  new_back
+  }
+end
+
+## Promote back to front. Call this after the diff string has been
+## written to the terminal — the renderer's internal state now
+## reflects what's on screen. The new back equals the new front so
+## a subsequent `renderer_diff` (without an intervening
+## `renderer_with_back`) produces empty output.
+def renderer_swap(r: Renderer): Renderer
+  return Renderer {
+    w:     r.w,
+    h:     r.h,
+    front: r.back,
+    back:  r.back
+  }
+end
+
+# =============================================================================
+# Cell equality + ANSI emission helpers
+# =============================================================================
+
+## True iff two cells are visually identical (egc, fg, bg, attrs).
+def _cells_equal(a: cl::Cell, b: cl::Cell): Bool
+  if a.egc != b.egc
+    return false
+  end
+  if a.attrs != b.attrs
+    return false
+  end
+  var afg: cl::Channel = a.fg
+  var bfg: cl::Channel = b.fg
+  var abg: cl::Channel = a.bg
+  var bbg: cl::Channel = b.bg
+  if afg.color != bfg.color
+    return false
+  end
+  if abg.color != bbg.color
+    return false
+  end
+  return true
+end
+
+## Emit cursor-move escape: `\x1b[<row>;<col>H` (1-based).
+def _emit_move(sb: StringBuilder, row: Int, col: Int): Void
+  sb.append("\x1b[")
+  sb.append((row + 1).to_s())
+  sb.append(";")
+  sb.append((col + 1).to_s())
+  sb.append("H")
+end
+
+## Truecolor sentinel bit. Mirrors `style::_RGB_FLAG()`.
+def _RGB_FLAG(): Int = 0x1000000
+
+def _is_truecolor(c: Int): Bool = c >= _RGB_FLAG()
+
+def _rgb_r(c: Int): Int = (c >> 16) & 0xFF
+def _rgb_g(c: Int): Int = (c >> 8) & 0xFF
+def _rgb_b(c: Int): Int = c & 0xFF
+
+## Emit fg color SGR. Truecolor → `\x1b[38;2;R;G;Bm`. Non-truecolor
+## (sentinel / ANSI 16 / 256) → default-color reset `\x1b[39m`. Full
+## color-depth degradation lands in v0.6.x.
+def _emit_fg(sb: StringBuilder, color: Int): Void
+  if _is_truecolor(color)
+    sb.append("\x1b[38;2;")
+    sb.append(_rgb_r(color).to_s())
+    sb.append(";")
+    sb.append(_rgb_g(color).to_s())
+    sb.append(";")
+    sb.append(_rgb_b(color).to_s())
+    sb.append("m")
+  else
+    sb.append("\x1b[39m")
+  end
+end
+
+## Emit bg color SGR.
+def _emit_bg(sb: StringBuilder, color: Int): Void
+  if _is_truecolor(color)
+    sb.append("\x1b[48;2;")
+    sb.append(_rgb_r(color).to_s())
+    sb.append(";")
+    sb.append(_rgb_g(color).to_s())
+    sb.append(";")
+    sb.append(_rgb_b(color).to_s())
+    sb.append("m")
+  else
+    sb.append("\x1b[49m")
+  end
+end
+
+## Emit attribute SGR. Each set bit gets its own SGR code; absent bits
+## produce no output (the SGR reset before this call clears the slate).
+def _emit_attrs(sb: StringBuilder, attrs: Int): Void
+  if (attrs & cl::CELL_ATTR_BOLD()) != 0
+    sb.append("\x1b[1m")
+  end
+  if (attrs & cl::CELL_ATTR_DIM()) != 0
+    sb.append("\x1b[2m")
+  end
+  if (attrs & cl::CELL_ATTR_ITALIC()) != 0
+    sb.append("\x1b[3m")
+  end
+  if (attrs & cl::CELL_ATTR_UNDER()) != 0
+    sb.append("\x1b[4m")
+  end
+  if (attrs & cl::CELL_ATTR_BLINK()) != 0
+    sb.append("\x1b[5m")
+  end
+  if (attrs & cl::CELL_ATTR_REVERSE()) != 0
+    sb.append("\x1b[7m")
+  end
+  if (attrs & cl::CELL_ATTR_STRIKE()) != 0
+    sb.append("\x1b[9m")
+  end
+end
+
+# =============================================================================
+# Diff scanner
+# =============================================================================
+
+## Produce an ANSI escape string of cell-level differences from
+## `front` to `back`. When `sync=true`, the output is wrapped in
+## DEC 2026 begin/end markers for tear-free atomic frame
+## presentation on terminals that support them.
+##
+## The returned string is empty (or just the sync markers) when
+## front and back are visually identical — apps can compare its
+## length to skip writes when nothing changed.
+##
+## Output ends with `\x1b[0m` (SGR reset) when any cell was emitted,
+## so subsequent terminal output starts from a clean state.
+def renderer_diff(r: Renderer, sync: Bool): String
+  var sb = sb_new()
+
+  if sync
+    sb.append("\x1b[?2026h")
+  end
+
+  var front: pl::Plane = r.front
+  var back:  pl::Plane = r.back
+  var w = r.w
+  var h = r.h
+
+  # SGR state machine. -2 sentinel = "nothing emitted yet."
+  var cur_fg: Int = -2
+  var cur_bg: Int = -2
+  var cur_attrs: Int = -1
+  var any_emitted = false
+
+  # Cursor position tracking. After emitting a cell at (row, col), the
+  # cursor sits at (row, col+1). When the next diff lands somewhere
+  # other than (row, col+1), we emit a cursor move.
+  var last_row: Int = -1
+  var last_col: Int = -1
+
+  var y = 0
+  while y < h
+    var x = 0
+    while x < w
+      var fc = pl::plane_getc(front, x, y)
+      var bc = pl::plane_getc(back, x, y)
+      if not _cells_equal(fc, bc)
+        # Cursor move if we're not already at (y, x).
+        if last_row != y or last_col != x
+          _emit_move(sb, y, x)
+        end
+
+        var bc_fg: cl::Channel = bc.fg
+        var bc_bg: cl::Channel = bc.bg
+
+        # SGR delta: only emit changed slots.
+        if bc.attrs != cur_attrs
+          # Reset before applying new attrs (incremental SGR off-toggling
+          # would be more bytes than emitting the full new state).
+          sb.append("\x1b[0m")
+          _emit_attrs(sb, bc.attrs)
+          cur_attrs = bc.attrs
+          # The reset cleared fg/bg too — force re-emit below.
+          cur_fg = -2
+          cur_bg = -2
+        end
+        if bc_fg.color != cur_fg
+          _emit_fg(sb, bc_fg.color)
+          cur_fg = bc_fg.color
+        end
+        if bc_bg.color != cur_bg
+          _emit_bg(sb, bc_bg.color)
+          cur_bg = bc_bg.color
+        end
+
+        # Emit the egc.
+        sb.append(bc.egc)
+        any_emitted = true
+        last_row = y
+        last_col = x + 1
+      end
+      x += 1
+    end
+    y += 1
+  end
+
+  if any_emitted
+    sb.append("\x1b[0m")
+  end
+
+  if sync
+    sb.append("\x1b[?2026l")
+  end
+
+  return sb.to_string()
+end
+
+## Convenience: diff with `sync=true` (recommended default for
+## interactive frames).
+def renderer_diff_synced(r: Renderer): String
+  return renderer_diff(r, true)
+end

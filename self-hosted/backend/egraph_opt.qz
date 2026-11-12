@@ -1,0 +1,1711 @@
+##! # E-Graph MIR Optimizer
+##!
+##! Multi-pass MIR optimizer with equality saturation.
+##! Pass 1: Dominator-tree scoped GVN (constant fold, identity, annihilator,
+##!         strength reduction, CSE, copy propagation).
+##! Pass 1.5a: Lightweight equality saturation (reassociation, commutativity CSE).
+##! Pass 1.5b: Loop-invariant code motion (LICM).
+##! Pass 2: Forward map resolution.
+##! Pass 3: NOP forwarded instructions.
+##! Pass 4: Dead code elimination.
+##!
+##! The e-graph infrastructure (egraph.qz) provides union-find, hashcons,
+##! smart constructors, rewrite rules, and bounded saturation loop.
+
+import mir
+import mir_opt
+import egraph
+import domtree
+import op_constants
+import * from str_compat
+
+# ============================================================================
+# Forward map helpers (same pattern as mir_opt)
+# ============================================================================
+
+## Resolve a value ID through the forward map (path compression).
+def eg_resolve(fwd: Map<String, Int>, id: Int): Int
+  var current = id
+  var limit = 64
+  while limit > 0
+    var key = "#{current}"
+    if not fwd.has(key)
+      return current
+    end
+    var next = __map_get_raw(fwd, key)
+    if next == current
+      return current
+    end
+    current = next
+    limit -= 1
+  end
+  eputs("[egraph] WARNING: forward map cycle detected at id #{current.to_s()}")
+  return current
+end
+
+## Set a forward mapping (from_id -> to_id).
+def eg_fwd_set(fwd: Map<String, Int>, from_id: Int, to_id: Int): Void
+  fwd.set("#{from_id}", to_id)
+end
+
+def eg_fwd_has(fwd: Map<String, Int>, id: Int): Int = fwd.has("#{id}")
+
+# PF3-P1b: typed value map — was `Map<String, Int>` storing `as_int_generic(instr)`
+# (an erased struct handle); the typed `Map<String, MirInstr>` stores the handle
+# directly (no reinterpret, COW-safe at gate-1 per C4.5/C4.6).
+def eg_byid_set(by_id: Map<String, mir::MirInstr>, id: Int, instr: mir::MirInstr): Void
+  by_id.set("#{id}", instr)
+end
+
+# Callers guard with `eg_byid_has` first, so the key is always present here.
+# NB: the `var hit` split is load-bearing — see opt_byid_get in mir_opt.qz: the
+# chained `.get(k).unwrap()` form types the result as bare Int (QZ0215 wall).
+def eg_byid_get(by_id: Map<String, mir::MirInstr>, id: Int): mir::MirInstr
+  var hit = by_id.get("#{id}")
+  return hit.unwrap()
+end
+
+def eg_byid_has(by_id: Map<String, mir::MirInstr>, id: Int): Int = by_id.has("#{id}")
+
+
+
+# ============================================================================
+# Binary instruction optimization (constant fold, identity, annihilator,
+# strength reduction, CSE via hashcons)
+# ============================================================================
+
+## Optimize a binary instruction (fold, identity, strength reduction, CSE).
+def eg_opt_binary(instr: mir::MirInstr, did: Int, by_id: Map<String, mir::MirInstr>, fwd: Map<String, Int>, hashcons: Map<String, Int>, func: mir::MirFunc, instrs: Vec<mir::MirInstr>, idx: Int, overflow_check: Int): Void
+  var op = mir::mir_instr_get_op(instr)
+  var lid = eg_resolve(fwd, mir::mir_instr_get_operand1(instr))
+  var rid = eg_resolve(fwd, mir::mir_instr_get_operand2(instr))
+
+  # Update operands to resolved values
+  mir::mir_instr_set_operand1(instr, lid)
+  mir::mir_instr_set_operand2(instr, rid)
+
+  # Look up operand instructions
+  var lc = 0
+  var rc = 0
+  var lv = 0
+  var rv = 0
+  if eg_byid_has(by_id, lid)
+    var li = eg_byid_get(by_id, lid)
+    if mir::mir_instr_get_kind(li) == mir::MIR_CONST_INT
+      lc = 1
+      lv = mir::mir_instr_get_int_val(li)
+    end
+  end
+  if eg_byid_has(by_id, rid)
+    var ri = eg_byid_get(by_id, rid)
+    if mir::mir_instr_get_kind(ri) == mir::MIR_CONST_INT
+      rc = 1
+      rv = mir::mir_instr_get_int_val(ri)
+    end
+  end
+
+  # --- Constant folding ---
+  # Suppress folding of overflow-checked ops (ADD/SUB/MUL) under `--overflow-check`
+  # so the trapping llvm.s{add,sub,mul}.with.overflow survives to codegen (mirror
+  # of mir_opt.qz:203-219; overflow_spec "panics on addition overflow"). eg_fold is
+  # shared with non-trapping ops, so guard at this call site.
+  var is_ovf_op = op == op_constants::OP_ADD or op == op_constants::OP_SUB or op == op_constants::OP_MUL
+  if lc == 1 and rc == 1 and not (overflow_check == 1 and is_ovf_op)
+    var folded = eg_fold(op, lv, rv)
+    if folded != 0 - 9999999
+      mir::mir_instr_set_kind(instr, mir::MIR_CONST_INT)
+      mir::mir_instr_set_int_val(instr, folded)
+      return
+    end
+  end
+
+  # --- Algebraic identity + annihilator ---
+  var fwd_target = eg_identity(op, lid, rid, lc, rc, lv, rv)
+  if fwd_target >= 0
+    eg_fwd_set(fwd, did, fwd_target)
+    return
+  end
+  if fwd_target == 0 - 2
+    # Annihilator: result is 0
+    mir::mir_instr_set_kind(instr, mir::MIR_CONST_INT)
+    mir::mir_instr_set_int_val(instr, 0)
+    return
+  end
+
+  # --- Strength reduction: x * 2^n → x << n ---
+  # Strategy: insert const at idx, shift binary to idx+1.
+  # This keeps const before shl in block order for SSA dominance.
+  # Skip under --overflow-check: SHL is non-trapping, so this drops the checked-mul
+  # overflow trap (overflow_spec "panics on multiplication overflow").
+  if op == op_constants::OP_MUL and overflow_check == 0
+    if rc == 1
+      var shift = eg_log2(rv)
+      if shift >= 0
+        var new_id = mir::mir_func_next_value(func)
+        var new_instr = mir::mir_new_instr(mir::MIR_CONST_INT, new_id, 0)
+        mir::mir_instr_set_int_val(new_instr, shift)
+        eg_byid_set(by_id, new_id, new_instr)
+        # Insert const at idx: push dummy, shift right, place const
+        instrs.push(new_instr)
+        var j = instrs.size - 1
+        while j > idx
+          instrs.set_unchecked(j, instrs[j - 1])
+          j -= 1
+        end
+        instrs.set_unchecked(idx, new_instr)
+        # Binary is now at idx+1 — modify it to SHL
+        mir::mir_instr_set_op(instr, op_constants::OP_SHL)
+        mir::mir_instr_set_operand2(instr, new_id)
+        return
+      end
+    end
+    if lc == 1
+      var shift = eg_log2(lv)
+      if shift >= 0
+        var new_id = mir::mir_func_next_value(func)
+        var new_instr = mir::mir_new_instr(mir::MIR_CONST_INT, new_id, 0)
+        mir::mir_instr_set_int_val(new_instr, shift)
+        eg_byid_set(by_id, new_id, new_instr)
+        instrs.push(new_instr)
+        var j = instrs.size - 1
+        while j > idx
+          instrs.set_unchecked(j, instrs[j - 1])
+          j -= 1
+        end
+        instrs.set_unchecked(idx, new_instr)
+        mir::mir_instr_set_op(instr, op_constants::OP_SHL)
+        mir::mir_instr_set_operand1(instr, rid)
+        mir::mir_instr_set_operand2(instr, new_id)
+        return
+      end
+    end
+  end
+
+  # --- CSE via hashcons ---
+  var key = "B:#{op}:#{lid}:#{rid}"
+  if hashcons.has(key)
+    eg_fwd_set(fwd, did, __map_get_raw(hashcons, key))
+  else
+    hashcons.set(key, did)
+  end
+end
+
+# ============================================================================
+# Per-block optimization (same structure as mir_opt)
+# ============================================================================
+
+## Optimize a single block (local CSE and copy propagation).
+def eg_opt_block(block: mir::MirBlock, by_id: Map<String, mir::MirInstr>, fwd: Map<String, Int>, func: mir::MirFunc, hashcons: Map<String, Int>, overflow_check: Int): Void
+  var instrs = mir::mir_block_get_instructions(block)
+
+  # Per-block copy propagation: var_name -> dest_id
+  var var_map = map_new<String, Int>()
+
+  var i = 0
+  while i < instrs.size
+    var instr = instrs[i]
+    var kind = mir::mir_instr_get_kind(instr)
+    var did = mir::mir_instr_get_dest_id(instr)
+
+    # Register instruction in by_id lookup
+    if did >= 0
+      eg_byid_set(by_id, did, instr)
+    end
+
+    # --- BINARY: constant fold, algebraic simplify, strength reduction, CSE ---
+    if kind == mir::MIR_BINARY
+      var old_size = instrs.size
+      eg_opt_binary(instr, did, by_id, fwd, hashcons, func, instrs, i, overflow_check)
+      # If strength reduction inserted an instruction, skip past the new const
+      if instrs.size > old_size
+        i += 1
+      end
+
+    # --- UNARY: CSE ---
+    else
+      if kind == mir::MIR_UNARY
+        var op = mir::mir_instr_get_op(instr)
+        var oid = eg_resolve(fwd, mir::mir_instr_get_operand1(instr))
+        mir::mir_instr_set_operand1(instr, oid)
+        var key = "U:#{op}:#{oid}"
+        if hashcons.has(key)
+          eg_fwd_set(fwd, did, __map_get_raw(hashcons, key))
+        else
+          hashcons.set(key, did)
+        end
+
+      # --- STORE_VAR: update copy propagation map ---
+      else
+        if kind == mir::MIR_STORE_VAR
+          var val_id = eg_resolve(fwd, mir::mir_instr_get_operand2(instr))
+          mir::mir_instr_set_operand2(instr, val_id)
+          var is_global = mir::mir_instr_get_slot1(instr)
+          if is_global == 0
+            var name = mir::mir_instr_get_var_name(instr)
+            var_map.set(name, val_id)
+          end
+
+        # --- LOAD_VAR: copy propagation ---
+        else
+          if kind == mir::MIR_LOAD_VAR
+            var is_global = mir::mir_instr_get_slot1(instr)
+            if is_global == 0
+              var name = mir::mir_instr_get_var_name(instr)
+              if var_map.has(name)
+                eg_fwd_set(fwd, did, __map_get_raw(var_map, name))
+              end
+            end
+
+          # --- Side-effecting: clear copy propagation map ---
+          else
+            # Operand resolution is performed uniformly in pass-2
+            # (eg_resolve_block); pass-1 only invalidates copy-propagation.
+            # A.34 mirror: the five effect control-flow kinds lower to a
+            # multi-block setjmp/catch diamond in codegen, so a store->load
+            # forward across them references a value that does not dominate
+            # the load ("Instruction does not dominate all uses"). End the
+            # copy-prop dominance region on them, exactly as mir_opt.qz does.
+            if kind == mir::MIR_CALL or kind == mir::MIR_INTRINSIC or kind == mir::MIR_CALL_INDIRECT or kind == mir::MIR_STORE or kind == mir::MIR_INLINE_C or kind == mir::MIR_PERFORM_OP or kind == mir::MIR_HANDLE_INSTALL or kind == mir::MIR_HANDLE_UNINSTALL or kind == mir::MIR_EFFECT_POP_N or kind == mir::MIR_HANDLE_UNINSTALL_DONE_ONLY
+              var_map = map_new<String, Int>()
+            end
+          end
+        end
+      end
+    end
+    i += 1
+  end
+end
+
+# ============================================================================
+# Scoped hashcons helpers for cross-block GVN
+# ============================================================================
+
+# Lookup key in scoped hashcons stack (top-down = innermost first)
+## Lookup key in scoped hashcons stack (top-down, searching ancestor scopes).
+def eg_scoped_lookup(scope_stack: Vec<Int>, key: String): Int
+  var i = scope_stack.size - 1
+  while i >= 0
+    var hc = scope_stack[i]
+    if map_has(hc, key)
+      return __map_get_raw(hc, key)
+    end
+    i -= 1
+  end
+  return -1
+end
+
+# Insert into current (top) scope
+## Insert value into the current (top) hashcons scope.
+def eg_scoped_insert(scope_stack: Vec<Int>, key: String, val: Int): Void
+  if scope_stack.size > 0
+    var hc = scope_stack[scope_stack.size - 1]
+    map_set(hc, key, val)
+  end
+end
+
+# ============================================================================
+# Scoped block optimization (cross-block GVN)
+# ============================================================================
+
+## Optimize a block using scoped hashcons for Cross-Block GVN.
+def eg_opt_block_scoped(block: mir::MirBlock, by_id: Map<String, mir::MirInstr>, fwd: Map<String, Int>, func: mir::MirFunc, scope_stack: Vec<Int>, overflow_check: Int): Void
+  var instrs = mir::mir_block_get_instructions(block)
+
+  # Per-block copy propagation: var_name -> dest_id
+  var var_map = map_new<String, Int>()
+
+  var i = 0
+  while i < instrs.size
+    var instr = instrs[i]
+    var kind = mir::mir_instr_get_kind(instr)
+    var did = mir::mir_instr_get_dest_id(instr)
+
+    # Register instruction in by_id lookup
+    if did >= 0
+      eg_byid_set(by_id, did, instr)
+    end
+
+    # --- BINARY: constant fold, algebraic simplify, strength reduction, CSE ---
+    if kind == mir::MIR_BINARY
+      var old_size = instrs.size
+      eg_opt_binary_scoped(instr, did, by_id, fwd, scope_stack, func, instrs, i, overflow_check)
+      if instrs.size > old_size
+        i += 1
+      end
+
+    # --- UNARY: CSE ---
+    else
+      if kind == mir::MIR_UNARY
+        var op = mir::mir_instr_get_op(instr)
+        var oid = eg_resolve(fwd, mir::mir_instr_get_operand1(instr))
+        mir::mir_instr_set_operand1(instr, oid)
+        var key = "U:#{op}:#{oid}"
+        var existing = eg_scoped_lookup(scope_stack, key)
+        if existing >= 0
+          eg_fwd_set(fwd, did, existing)
+        else
+          eg_scoped_insert(scope_stack, key, did)
+        end
+
+      # --- STORE_VAR: update copy propagation map ---
+      else
+        if kind == mir::MIR_STORE_VAR
+          var val_id = eg_resolve(fwd, mir::mir_instr_get_operand2(instr))
+          mir::mir_instr_set_operand2(instr, val_id)
+          var is_global = mir::mir_instr_get_slot1(instr)
+          if is_global == 0
+            var name = mir::mir_instr_get_var_name(instr)
+            var_map.set(name, val_id)
+          end
+
+        # --- LOAD_VAR: copy propagation ---
+        else
+          if kind == mir::MIR_LOAD_VAR
+            var is_global = mir::mir_instr_get_slot1(instr)
+            if is_global == 0
+              var name = mir::mir_instr_get_var_name(instr)
+              if var_map.has(name)
+                eg_fwd_set(fwd, did, __map_get_raw(var_map, name))
+              end
+            end
+
+          # --- Side-effecting: clear copy propagation map ---
+          else
+            # Operand resolution is performed uniformly in pass-2
+            # (eg_resolve_block); pass-1 only invalidates copy-propagation.
+            # A.34 mirror: the five effect control-flow kinds lower to a
+            # multi-block setjmp/catch diamond in codegen, so a store->load
+            # forward across them references a value that does not dominate
+            # the load ("Instruction does not dominate all uses"). End the
+            # copy-prop dominance region on them, exactly as mir_opt.qz does.
+            if kind == mir::MIR_CALL or kind == mir::MIR_INTRINSIC or kind == mir::MIR_CALL_INDIRECT or kind == mir::MIR_STORE or kind == mir::MIR_INLINE_C or kind == mir::MIR_PERFORM_OP or kind == mir::MIR_HANDLE_INSTALL or kind == mir::MIR_HANDLE_UNINSTALL or kind == mir::MIR_EFFECT_POP_N or kind == mir::MIR_HANDLE_UNINSTALL_DONE_ONLY
+              var_map = map_new<String, Int>()
+            end
+          end
+        end
+      end
+    end
+    i += 1
+  end
+end
+
+# Binary optimization variant using scoped hashcons
+def eg_opt_binary_scoped(instr: mir::MirInstr, did: Int, by_id: Map<String, mir::MirInstr>, fwd: Map<String, Int>, scope_stack: Vec<Int>, func: mir::MirFunc, instrs: Vec<mir::MirInstr>, idx: Int, overflow_check: Int): Void
+  var op = mir::mir_instr_get_op(instr)
+  var lid = eg_resolve(fwd, mir::mir_instr_get_operand1(instr))
+  var rid = eg_resolve(fwd, mir::mir_instr_get_operand2(instr))
+
+  mir::mir_instr_set_operand1(instr, lid)
+  mir::mir_instr_set_operand2(instr, rid)
+
+  var lc = 0
+  var rc = 0
+  var lv = 0
+  var rv = 0
+  if eg_byid_has(by_id, lid)
+    var li = eg_byid_get(by_id, lid)
+    if mir::mir_instr_get_kind(li) == mir::MIR_CONST_INT
+      lc = 1
+      lv = mir::mir_instr_get_int_val(li)
+    end
+  end
+  if eg_byid_has(by_id, rid)
+    var ri = eg_byid_get(by_id, rid)
+    if mir::mir_instr_get_kind(ri) == mir::MIR_CONST_INT
+      rc = 1
+      rv = mir::mir_instr_get_int_val(ri)
+    end
+  end
+
+  # Constant fold
+  # Suppress folding of overflow-checked ops (ADD/SUB/MUL) under `--overflow-check`
+  # so the trapping llvm.s{add,sub,mul}.with.overflow survives to codegen (mirror
+  # of mir_opt.qz:203-219; overflow_spec "panics on addition overflow"). eg_fold is
+  # shared with non-trapping ops, so guard at this call site.
+  var is_ovf_op = op == op_constants::OP_ADD or op == op_constants::OP_SUB or op == op_constants::OP_MUL
+  if lc == 1 and rc == 1 and not (overflow_check == 1 and is_ovf_op)
+    var result = eg_fold(op, lv, rv)
+    if result != 0 - 9999999
+      mir::mir_instr_set_kind(instr, mir::MIR_CONST_INT)
+      mir::mir_instr_set_int_val(instr, result)
+      return
+    end
+  end
+
+  # Algebraic identity
+  if op == op_constants::OP_ADD and rc == 1 and rv == 0
+    eg_fwd_set(fwd, did, lid)
+    return
+  end
+  if op == op_constants::OP_ADD and lc == 1 and lv == 0
+    eg_fwd_set(fwd, did, rid)
+    return
+  end
+  if op == op_constants::OP_SUB and rc == 1 and rv == 0
+    eg_fwd_set(fwd, did, lid)
+    return
+  end
+  if op == op_constants::OP_MUL and rc == 1 and rv == 1
+    eg_fwd_set(fwd, did, lid)
+    return
+  end
+  if op == op_constants::OP_MUL and lc == 1 and lv == 1
+    eg_fwd_set(fwd, did, rid)
+    return
+  end
+
+  # Annihilator
+  if op == op_constants::OP_MUL and rc == 1 and rv == 0
+    mir::mir_instr_set_kind(instr, mir::MIR_CONST_INT)
+    mir::mir_instr_set_int_val(instr, 0)
+    return
+  end
+  if op == op_constants::OP_MUL and lc == 1 and lv == 0
+    mir::mir_instr_set_kind(instr, mir::MIR_CONST_INT)
+    mir::mir_instr_set_int_val(instr, 0)
+    return
+  end
+  if op == op_constants::OP_SUB and lid == rid
+    mir::mir_instr_set_kind(instr, mir::MIR_CONST_INT)
+    mir::mir_instr_set_int_val(instr, 0)
+    return
+  end
+
+  # Strength reduction: x * 2^n -> x << n
+  # Skip under --overflow-check: SHL is non-trapping, so this drops the checked-mul
+  # overflow trap (overflow_spec "panics on multiplication overflow").
+  if op == op_constants::OP_MUL and rc == 1 and overflow_check == 0
+    var shift = eg_log2(rv)
+    if shift >= 0
+      var new_id = mir::mir_func_next_value(func)
+      var new_instr = mir::mir_new_instr(mir::MIR_CONST_INT, new_id, 0)
+      mir::mir_instr_set_int_val(new_instr, shift)
+      eg_byid_set(by_id, new_id, new_instr)
+      instrs.push(new_instr)
+      var j = instrs.size - 1
+      while j > idx
+        instrs.set_unchecked(j, instrs[j - 1])
+        j -= 1
+      end
+      instrs.set_unchecked(idx, new_instr)
+      mir::mir_instr_set_op(instr, op_constants::OP_SHL)
+      mir::mir_instr_set_operand2(instr, new_id)
+      return
+    end
+  end
+  if op == op_constants::OP_MUL and lc == 1 and overflow_check == 0
+    var shift = eg_log2(lv)
+    if shift >= 0
+      var new_id = mir::mir_func_next_value(func)
+      var new_instr = mir::mir_new_instr(mir::MIR_CONST_INT, new_id, 0)
+      mir::mir_instr_set_int_val(new_instr, shift)
+      eg_byid_set(by_id, new_id, new_instr)
+      instrs.push(new_instr)
+      var j = instrs.size - 1
+      while j > idx
+        instrs.set_unchecked(j, instrs[j - 1])
+        j -= 1
+      end
+      instrs.set_unchecked(idx, new_instr)
+      mir::mir_instr_set_op(instr, op_constants::OP_SHL)
+      mir::mir_instr_set_operand1(instr, rid)
+      mir::mir_instr_set_operand2(instr, new_id)
+      return
+    end
+  end
+
+  # Cross-block CSE via scoped hashcons
+  var key = "B:#{op}:#{lid}:#{rid}"
+  var existing = eg_scoped_lookup(scope_stack, key)
+  if existing >= 0
+    eg_fwd_set(fwd, did, existing)
+  else
+    eg_scoped_insert(scope_stack, key, did)
+  end
+end
+
+# ============================================================================
+# Resolve operands for call/intrinsic/store instructions
+# ============================================================================
+
+# ============================================================================
+# Pass 2: Resolve all operands through forward map
+# ============================================================================
+#
+# A.30: operand resolution routes through the shared exhaustive walker
+# `mir_opt::opt_map_value_operands` — single source of truth for which slots
+# of each MIR kind carry SSA value IDs. The pre-A.30 hand-rolled dispatch
+# omitted MIR_PERFORM_OP, MIR_HANDLE_*, MIR_UNION_*, the raw-index and
+# binary-DSL families and TERM_SWITCH, leaving dangling SSA refs after pass-3.
+
+## Resolve all operands in a block using the final forward map.
+def eg_resolve_block(block: mir::MirBlock, fwd: Map<String, Int>): Void
+  var resolver: Fn(Int): Int = x: Int -> eg_resolve(fwd, x)
+  var instrs = mir::mir_block_get_instructions(block)
+  for i in 0..instrs.size
+    var instr = instrs[i]
+    mir_opt::opt_map_value_operands(instr, mir::mir_instr_get_kind(instr), resolver)
+  end
+  mir_opt::opt_map_term_value_operands(block, resolver)
+end
+
+# ============================================================================
+# Pass 3: NOP forwarded instructions
+# ============================================================================
+
+def eg_nop_forwarded(block: mir::MirBlock, fwd: Map<String, Int>): Void
+  var instrs = mir::mir_block_get_instructions(block)
+  for i in 0..instrs.size
+    var instr = instrs[i]
+    var did = mir::mir_instr_get_dest_id(instr)
+    if did >= 0 and eg_fwd_has(fwd, did)
+      var kind = mir::mir_instr_get_kind(instr)
+      if eg_is_side_effecting(kind) == 0
+        mir::mir_instr_set_kind(instr, mir::MIR_NOP)
+      end
+    end
+  end
+end
+
+# ============================================================================
+# Optimize one function
+# ============================================================================
+
+## Optimize a function: scoped GVN + equality saturation + LICM + DCE.
+def eg_opt_function(func: mir::MirFunc, overflow_check: Int): Void
+  var blocks = mir::mir_func_get_blocks(func)
+  var block_count = blocks.size
+  if block_count == 0
+    return
+  end
+
+  # Function-wide state
+  var by_id = map_new<String, mir::MirInstr>()
+  var fwd = map_new<String, Int>()
+
+  # Build dominator tree for cross-block GVN
+  var dt = domtree::domtree_build(func)
+
+  var child_list = vec_new()
+  var child_offsets = vec_new()
+  domtree::dt_build_children(dt, child_list, child_offsets)
+
+  var n = dt.block_count
+  var root = 0
+  for i in 0..n
+    if dt.idom[i] == i
+      root = i
+    end
+  end
+
+  # Scoped hashcons stack for cross-block GVN
+  var scope_stack = vec_new()
+
+  # Pass 1: Walk blocks in domtree preorder with scoped hashcons (original GVN).
+  var walk_idx = vec_new()
+  var walk_phase = vec_new()
+  walk_idx.push(root)
+  walk_phase.push(0)
+
+  while walk_idx.size > 0
+    var top = walk_idx.size - 1
+    var bi = walk_idx[top]
+    var ph = walk_phase[top]
+
+    if ph == 1
+      walk_idx.pop()
+      walk_phase.pop()
+      if scope_stack.size > 0
+        scope_stack.pop()
+      end
+    else
+      walk_phase.set_unchecked(top, 1)
+
+      var local_hc = map_new<String, Int>()
+      scope_stack.push(as_int_generic(local_hc))
+
+      var block_handle = dt.block_handles[bi]
+      eg_opt_block_scoped(block_handle, by_id, fwd, func, scope_stack, overflow_check)
+
+      var cstart = child_offsets[bi]
+      var cend = child_offsets[bi + 1]
+      var ci = cend - 1
+      while ci >= cstart
+        walk_idx.push(child_list[ci])
+        walk_phase.push(0)
+        ci -= 1
+      end
+    end
+  end
+
+  # Build id→block index map for dominance queries in e-graph extraction
+  var id_to_block_idx = eg_build_id_block_map(func, dt)
+
+  # Pass 1.5a: Equality saturation in domtree preorder (supplemental to GVN).
+  # R1: allocate ONE reusable EGraph for the whole function; eg_esat_block →
+  # eg_absorb_block clear-and-refill it per block instead of eg_new per block.
+  var shared_eg = eg_new()
+  # Propagate overflow-check into the saturation e-graph so eg_add_binary's
+  # smart-constructor fold (egraph.qz) skips ADD/SUB/MUL under --overflow-check.
+  shared_eg.overflow_check = overflow_check
+  var preorder = domtree::domtree_preorder_indices(dt)
+  for pi in 0..preorder.size
+    var bi = preorder[pi]
+    eg_esat_block(shared_eg, dt.block_handles[bi], by_id, fwd, func, id_to_block_idx, dt, bi)
+  end
+
+  # Pass 1.5b: LICM
+  var loops = domtree::detect_loops(dt, func)
+  for li_idx in 0..loops.size
+    eg_licm_loop(loops[li_idx], blocks, by_id, fwd, func)
+  end
+
+  # Pass 2: Resolve all operands through final forward map
+  for b in 0..block_count
+    eg_resolve_block(blocks[b], fwd)
+  end
+
+  # Pass 3: NOP instructions whose dest_id was forwarded
+  for b in 0..block_count
+    eg_nop_forwarded(blocks[b], fwd)
+  end
+end
+
+# ============================================================================
+# Pass 1.5a: Per-block equality saturation (supplemental to GVN)
+# ============================================================================
+
+# --- E-Graph extraction pipeline (Phases 2-4) ---
+
+## Build an e-graph from a block's already-GVN'd MIR instructions.
+## Returns the e-graph. Populates id_to_class (dest_id→class).
+## Cross-block operands get opaque leaf classes (Bug 6 fix).
+def eg_absorb_block(eg: EGraph, instrs: Vec<mir::MirInstr>, by_id: Map<String, mir::MirInstr>, fwd: Map<String, Int>, id_to_class: Map<String, Int>, all_dids: Vec<Int>): EGraph
+  # R1: reuse the caller-provided EGraph — clear it in place rather than
+  # allocating a fresh one per block. id_to_class / all_dids remain block-local
+  # (freshly created by eg_esat_block), so no cross-block state leaks.
+  eg_reset(eg)
+  for i in 0..instrs.size
+    var instr = instrs[i]
+    var kind = mir::mir_instr_get_kind(instr)
+    var did = mir::mir_instr_get_dest_id(instr)
+
+    # Skip impure / non-optimizable instructions
+    if kind == mir::MIR_NOP or eg_is_pure(kind) == 0
+      continue
+    end
+
+    var cls_id = -1
+    if kind == mir::MIR_CONST_INT
+      cls_id = eg_add_const_int(eg, mir::mir_instr_get_int_val(instr), mir::mir_instr_get_dest_type(instr))
+    else
+      if kind == mir::MIR_BINARY
+        var op = mir::mir_instr_get_op(instr)
+        var lid = eg_resolve(fwd, mir::mir_instr_get_operand1(instr))
+        var rid = eg_resolve(fwd, mir::mir_instr_get_operand2(instr))
+        # Ensure operands have e-classes (cross-block fix)
+        var lkey = "#{lid}"
+        if not id_to_class.has(lkey)
+          var leaf = eg_new_class(eg)
+          id_to_class.set(lkey, leaf)
+          all_dids.push(lid)
+        end
+        var rkey = "#{rid}"
+        if not id_to_class.has(rkey)
+          var leaf = eg_new_class(eg)
+          id_to_class.set(rkey, leaf)
+          all_dids.push(rid)
+        end
+        var lc = __map_get_raw(id_to_class, lkey)
+        var rc = __map_get_raw(id_to_class, rkey)
+        cls_id = eg_add_binary(eg, op, lc, rc, mir::mir_instr_get_dest_type(instr))
+      else
+        # For other pure kinds (LOAD_VAR, CONST_BOOL, etc.), create opaque leaf
+        cls_id = eg_new_class(eg)
+      end
+    end
+
+    if cls_id >= 0 and did >= 0
+      id_to_class.set("#{did}", cls_id)
+      all_dids.push(did)
+    end
+  end
+  return eg
+end
+
+## Apply lightweight equality saturation to a block's binary instructions.
+## Works directly on MIR instructions without e-graph data structures.
+## Catches multi-step constant folding via reassociation: (x + 3) + 5 → x + 8.
+def eg_esat_block(eg: EGraph, block: mir::MirBlock, by_id: Map<String, mir::MirInstr>, fwd: Map<String, Int>, func: mir::MirFunc, id_to_block_idx: Map<String, Int>, dt: DomTree, block_idx: Int): Void
+  var instrs = mir::mir_block_get_instructions(block)
+
+  # Quick check: skip blocks with fewer than 2 binary instructions
+  var binary_count = 0
+  for i in 0..instrs.size
+    var kind = mir::mir_instr_get_kind(instrs[i])
+    if kind == mir::MIR_BINARY
+      binary_count += 1
+    end
+  end
+  if binary_count < 2
+    return
+  end
+
+  # Bound allocation: skip very large blocks
+  if instrs.size > 200
+    return
+  end
+
+  # Lightweight passes (fast, correct)
+  eg_esat_reassociate(block, instrs, by_id, fwd, func, id_to_block_idx, block_idx, eg.overflow_check)
+  eg_esat_commutative_cse(instrs, by_id, fwd)
+
+  # Full e-graph pipeline with dominator-aware extraction
+  var id_to_class = map_new<String, Int>()
+  var all_dids = vec_new()
+  eg_absorb_block(eg, instrs, by_id, fwd, id_to_class, all_dids)
+  eg_saturate(eg, 3, 500)
+  eg_writeback_domaware(instrs, eg, id_to_class, by_id, fwd, all_dids, id_to_block_idx, dt, block_idx, func)
+end
+
+## Reassociate: (x ⊕ c1) ⊕ c2 → x ⊕ fold(c1, c2) for associative ops.
+def eg_esat_reassociate(block: mir::MirBlock, instrs: Vec<mir::MirInstr>, by_id: Map<String, mir::MirInstr>, fwd: Map<String, Int>, func: mir::MirFunc, id_to_block_idx: Map<String, Int>, block_idx: Int, overflow_check: Int): Void
+  var changed = 1
+  var pass = 0
+  while changed == 1 and pass < 4
+    pass += 1
+    changed = 0
+    var i = 0
+    while i < instrs.size
+      var instr = instrs[i]
+      var kind = mir::mir_instr_get_kind(instr)
+      if kind != mir::MIR_BINARY
+        i += 1
+        continue
+      end
+      var op = mir::mir_instr_get_op(instr)
+      if eg_is_associative(op) == 0
+        i += 1
+        continue
+      end
+      var did = mir::mir_instr_get_dest_id(instr)
+      var lid = eg_resolve(fwd, mir::mir_instr_get_operand1(instr))
+      var rid = eg_resolve(fwd, mir::mir_instr_get_operand2(instr))
+
+      # Check: outer right operand is constant
+      var rc = 0
+      var rv = 0
+      if eg_byid_has(by_id, rid)
+        var ri = eg_byid_get(by_id, rid)
+        if mir::mir_instr_get_kind(ri) == mir::MIR_CONST_INT
+          rc = 1
+          rv = mir::mir_instr_get_int_val(ri)
+        end
+      end
+      if rc == 0
+        i += 1
+        continue
+      end
+
+      # Check: left operand is same associative op with constant right
+      if eg_byid_has(by_id, lid) == 0
+        i += 1
+        continue
+      end
+      var li = eg_byid_get(by_id, lid)
+      if mir::mir_instr_get_kind(li) != mir::MIR_BINARY or mir::mir_instr_get_op(li) != op
+        i += 1
+        continue
+      end
+      var inner_lid = eg_resolve(fwd, mir::mir_instr_get_operand1(li))
+      var inner_rid = eg_resolve(fwd, mir::mir_instr_get_operand2(li))
+
+      var inner_rc = 0
+      var inner_rv = 0
+      if eg_byid_has(by_id, inner_rid)
+        var iri = eg_byid_get(by_id, inner_rid)
+        if mir::mir_instr_get_kind(iri) == mir::MIR_CONST_INT
+          inner_rc = 1
+          inner_rv = mir::mir_instr_get_int_val(iri)
+        end
+      end
+
+      # Suppress reassociation-fold of overflow-checked ops (ADD/SUB/MUL) under
+      # `--overflow-check`: fold(c1,c2) would silently wrap and drop the trap
+      # (mirror of mir_opt.qz:203-219; overflow_spec "panics on addition overflow").
+      # Only ADD/MUL are associative here, but guard all three for symmetry with
+      # the other fold sites; SUB simply never reaches this associative branch.
+      var is_ovf_op = op == op_constants::OP_ADD or op == op_constants::OP_SUB or op == op_constants::OP_MUL
+      if inner_rc == 1 and not (overflow_check == 1 and is_ovf_op)
+        # (x ⊕ c1) ⊕ c2 → x ⊕ fold(c1, c2)
+        var folded = eg_fold(op, inner_rv, rv)
+        if folded != 0 - 9999999
+          # Create new constant for the folded value
+          var new_id = mir::mir_func_next_value(func)
+          var new_instr = mir::mir_new_instr(mir::MIR_CONST_INT, new_id, 0)
+          mir::mir_instr_set_int_val(new_instr, folded)
+          eg_byid_set(by_id, new_id, new_instr)
+          id_to_block_idx.set("#{new_id}", block_idx)
+          # Insert const before this instruction
+          instrs.push(new_instr)
+          var j = instrs.size - 1
+          while j > i
+            instrs.set_unchecked(j, instrs[j - 1])
+            j -= 1
+          end
+          instrs.set_unchecked(i, new_instr)
+          i += 1
+          # Rewrite current instruction: x ⊕ folded_const
+          mir::mir_instr_set_operand1(instr, inner_lid)
+          mir::mir_instr_set_operand2(instr, new_id)
+          eg_byid_set(by_id, did, instr)
+          changed = 1
+        end
+      end
+      i += 1
+    end
+  end
+end
+
+## Commutativity CSE: if a+b exists, forward b+a to it.
+def eg_esat_commutative_cse(instrs: Vec<mir::MirInstr>, by_id: Map<String, mir::MirInstr>, fwd: Map<String, Int>): Void
+  var seen = map_new<String, Int>()
+  for i in 0..instrs.size
+    var instr = instrs[i]
+    var kind = mir::mir_instr_get_kind(instr)
+    if kind != mir::MIR_BINARY
+      continue
+    end
+    var op = mir::mir_instr_get_op(instr)
+    if eg_is_commutative(op) == 0
+      continue
+    end
+    var did = mir::mir_instr_get_dest_id(instr)
+    var lid = eg_resolve(fwd, mir::mir_instr_get_operand1(instr))
+    var rid = eg_resolve(fwd, mir::mir_instr_get_operand2(instr))
+
+    # Normal key
+    var key = "B:#{op}:#{lid}:#{rid}"
+    # Swapped key
+    var skey = "B:#{op}:#{rid}:#{lid}"
+
+    if seen.has(key)
+      eg_fwd_set(fwd, did, __map_get_raw(seen, key))
+    else
+      if seen.has(skey)
+        eg_fwd_set(fwd, did, __map_get_raw(seen, skey))
+      else
+        seen.set(key, did)
+      end
+    end
+  end
+end
+
+
+# ============================================================================
+# Phase 3: Dominator-Aware E-Graph Extraction
+# ============================================================================
+
+## Build a map from SSA dest_id → dense block index in the dominator tree.
+## Called once before Pass 1.5a to enable O(depth) dominance queries.
+def eg_build_id_block_map(func: mir::MirFunc, dt: DomTree): Map<String, Int>
+  var map = map_new<String, Int>()
+  var n = dt.block_count
+  for bi in 0..n
+    var block = dt.block_handles[bi]
+    var instrs = mir::mir_block_get_instructions(block)
+    for i in 0..instrs.size
+      var did = mir::mir_instr_get_dest_id(instrs[i])
+      if did >= 0
+        map.set("#{did}", bi)
+      end
+    end
+  end
+  return map
+end
+
+## Find a dominating equivalent: another dest_id in the same e-class that
+## dominates the current instruction. Returns the candidate dest_id or -1.
+## For same-block candidates, only accepts ones already processed (in seen).
+def eg_find_dominating_equivalent(eg: EGraph, my_did: Int, my_class: Int, all_dids: Vec<Int>, id_to_class: Map<String, Int>, fwd: Map<String, Int>, id_to_block_idx: Map<String, Int>, dt: DomTree, block_idx: Int, seen: Map<String, Int>): Int
+  for i in 0..all_dids.size
+    var cand = all_dids[i]
+    if cand == my_did
+      continue
+    end
+    if eg_fwd_has(fwd, cand)
+      continue
+    end
+    var ckey = "#{cand}"
+    if not id_to_class.has(ckey)
+      continue
+    end
+    var cand_class = eg_find(eg, __map_get_raw(id_to_class, ckey))
+    if cand_class != my_class
+      continue
+    end
+    if not id_to_block_idx.has(ckey)
+      continue
+    end
+    var cand_block = __map_get_raw(id_to_block_idx, ckey)
+    if cand_block == block_idx
+      # Same block: only accept if already processed (earlier in block)
+      if seen.has(ckey)
+        return cand
+      end
+    else
+      if domtree::domtree_dominates_idx(dt, cand_block, block_idx) == 1
+        return cand
+      end
+    end
+  end
+  return -1
+end
+
+## Find a MIR dest_id for an e-class that dominates the given block.
+## Used to resolve e-graph children back to MIR operands for operator swap.
+def eg_class_to_dominating_did(eg: EGraph, target_class: Int, all_dids: Vec<Int>, id_to_class: Map<String, Int>, fwd: Map<String, Int>, id_to_block_idx: Map<String, Int>, dt: DomTree, block_idx: Int, seen: Map<String, Int>): Int
+  for i in 0..all_dids.size
+    var cand = all_dids[i]
+    if eg_fwd_has(fwd, cand)
+      continue
+    end
+    var ckey = "#{cand}"
+    if not id_to_class.has(ckey)
+      continue
+    end
+    var cand_class = eg_find(eg, __map_get_raw(id_to_class, ckey))
+    if cand_class != target_class
+      continue
+    end
+    if not id_to_block_idx.has(ckey)
+      continue
+    end
+    var cand_block = __map_get_raw(id_to_block_idx, ckey)
+    if cand_block == block_idx
+      if seen.has(ckey)
+        return cand
+      end
+    else
+      if domtree::domtree_dominates_idx(dt, cand_block, block_idx) == 1
+        return cand
+      end
+    end
+  end
+  return -1
+end
+
+## Materialize a constant from an e-class as a new MIR CONST_INT instruction.
+## Inserts before insert_pos in instrs. Returns the new dest_id, or -1 if
+## the e-class does not contain a constant.
+def eg_materialize_const(eg: EGraph, cls: Int, func: mir::MirFunc, by_id: Map<String, mir::MirInstr>, id_to_block_idx: Map<String, Int>, block_idx: Int, instrs: Vec<mir::MirInstr>, insert_pos: Int): Int
+  if eg_class_is_const_int(eg, cls) == 0
+    return -1
+  end
+  var val = eg_class_const_int_val(eg, cls)
+  if val == 0 - 9999999
+    return -1
+  end
+  var new_id = mir::mir_func_next_value(func)
+  var new_instr = mir::mir_new_instr(mir::MIR_CONST_INT, new_id, 0)
+  mir::mir_instr_set_int_val(new_instr, val)
+  eg_byid_set(by_id, new_id, new_instr)
+  id_to_block_idx.set("#{new_id}", block_idx)
+  eg_insert_at(instrs, insert_pos, new_instr)
+  return new_id
+end
+
+## Dominator-aware extraction writeback: apply e-graph optimizations to MIR.
+## Three extraction types:
+##   1. Constant fold: BINARY → CONST_INT (existing, proven safe)
+##   2. CSE forwarding: forward to dominating equivalent (dominance-gated)
+##   3. Operator swap: rewrite op + materialize operands (dominance-gated)
+def eg_writeback_domaware(instrs: Vec<mir::MirInstr>, eg: EGraph, id_to_class: Map<String, Int>, by_id: Map<String, mir::MirInstr>, fwd: Map<String, Int>, all_dids: Vec<Int>, id_to_block_idx: Map<String, Int>, dt: DomTree, block_idx: Int, func: mir::MirFunc): Void
+  eg_extract(eg)
+
+  var seen = map_new<String, Int>()
+  var i = 0
+  while i < instrs.size
+    var instr = instrs[i]
+    var kind = mir::mir_instr_get_kind(instr)
+    var did = mir::mir_instr_get_dest_id(instr)
+
+    if kind != mir::MIR_BINARY or did < 0
+      if did >= 0
+        seen.set("#{did}", 1)
+      end
+      i += 1
+      continue
+    end
+    var dkey = "#{did}"
+    if not id_to_class.has(dkey)
+      seen.set(dkey, 1)
+      i += 1
+      continue
+    end
+
+    var cls = eg_find(eg, __map_get_raw(id_to_class, dkey))
+    var ecls = eg_get_class(eg, cls)
+    var best_idx = eg_class_get_best_node(ecls)
+    if best_idx < 0
+      seen.set(dkey, 1)
+      i += 1
+      continue
+    end
+    var best = eg_get_node(eg, best_idx)
+    var best_kind = eg_node_get_kind(best)
+
+    # TYPE 1: Constant fold (BINARY → CONST_INT)
+    if best_kind == mir::MIR_CONST_INT
+      mir::mir_instr_set_kind(instr, mir::MIR_CONST_INT)
+      mir::mir_instr_set_int_val(instr, eg_node_get_aux(best))
+      mir::mir_instr_set_op(instr, 0)
+      mir::mir_instr_set_operand2(instr, 0)
+      eg_byid_set(by_id, did, instr)
+      seen.set(dkey, 1)
+      i += 1
+      continue
+    end
+
+    # TYPE 2: CSE forwarding (dominance-gated)
+    if best_kind == mir::MIR_BINARY
+      var target = eg_find_dominating_equivalent(eg, did, cls, all_dids, id_to_class, fwd, id_to_block_idx, dt, block_idx, seen)
+      if target >= 0 and target != did
+        eg_fwd_set(fwd, did, target)
+        seen.set(dkey, 1)
+        i += 1
+        continue
+      end
+    end
+
+    # TYPE 3: Operator swap (dominance-gated + materialization)
+    if best_kind == mir::MIR_BINARY
+      var best_op = eg_node_get_op(best)
+      var cur_op = mir::mir_instr_get_op(instr)
+      if best_op != cur_op
+        var c1_class = eg_find(eg, eg_node_get_child1(best))
+        var c2_class = eg_find(eg, eg_node_get_child2(best))
+        var c1_did = eg_class_to_dominating_did(eg, c1_class, all_dids, id_to_class, fwd, id_to_block_idx, dt, block_idx, seen)
+        var c2_did = eg_class_to_dominating_did(eg, c2_class, all_dids, id_to_class, fwd, id_to_block_idx, dt, block_idx, seen)
+        var inserted = 0
+        # Materialize constants if needed
+        if c1_did < 0
+          c1_did = eg_materialize_const(eg, c1_class, func, by_id, id_to_block_idx, block_idx, instrs, i + inserted)
+          if c1_did >= 0
+            inserted += 1
+          end
+        end
+        if c2_did < 0
+          c2_did = eg_materialize_const(eg, c2_class, func, by_id, id_to_block_idx, block_idx, instrs, i + inserted)
+          if c2_did >= 0
+            inserted += 1
+          end
+        end
+        if c1_did >= 0 and c2_did >= 0
+          mir::mir_instr_set_op(instr, best_op)
+          mir::mir_instr_set_operand1(instr, c1_did)
+          mir::mir_instr_set_operand2(instr, c2_did)
+          i += inserted
+        end
+      end
+    end
+
+    seen.set(dkey, 1)
+    i += 1
+  end
+end
+
+# ============================================================================
+# LICM: Loop-Invariant Code Motion
+# ============================================================================
+
+def eg_is_side_effecting(kind: Int): Int
+  if kind == mir::MIR_CALL or kind == mir::MIR_INTRINSIC or kind == mir::MIR_CALL_INDIRECT
+    return 1
+  end
+  if kind == mir::MIR_STORE or kind == mir::MIR_INLINE_C
+    return 1
+  end
+  if kind == mir::MIR_INDEX_STORE or kind == mir::MIR_INDEX_STORE_RAW or kind == mir::MIR_STORE_VAR
+    return 1
+  end
+  # A.30: effect-system markers emit setjmp frames, with-block result-slot
+  # labels and runtime install/uninstall/perform calls. DCE'ing any of them
+  # drops a label or unbalances the runtime effect stack -> miscompile.
+  if kind == mir::MIR_PERFORM_OP or kind == mir::MIR_HANDLE_INSTALL or kind == mir::MIR_HANDLE_UNINSTALL
+    return 1
+  end
+  if kind == mir::MIR_HANDLE_UNINSTALL_DONE_ONLY or kind == mir::MIR_EFFECT_POP_N
+    return 1
+  end
+  return 0
+end
+
+# Check if a value (dest_id) is defined inside the loop
+def eg_defined_in_loop(did: Int, loop_defs: Map<String, Int>): Int = loop_defs.has("#{did}")
+
+# Hoist loop-invariant instructions to preheader for one loop.
+# Only hoists pure computations (constants, binary, unary) whose operands
+# are all defined outside the loop. Uses forward map to redirect uses.
+## Hoist loop-invariant instructions to the preheader (LICM).
+def eg_licm_loop(loop_info: domtree::LoopInfo, blocks: Vec<Int>, by_id: Map<String, mir::MirInstr>, fwd: Map<String, Int>, func: mir::MirFunc): Void
+  var li_header = domtree::li_get_header(loop_info)
+  var li_blocks = domtree::li_get_blocks(loop_info)
+  var li_preheader = domtree::li_get_preheader(loop_info)
+
+  # No preheader = can't hoist
+  if li_preheader < 0
+    return
+  end
+  if li_preheader >= blocks.size
+    return
+  end
+
+  # Build set of dest_ids defined inside the loop
+  var loop_defs = map_new<String, Int>()
+  for bi_idx in 0..li_blocks.size
+    var block_idx = li_blocks[bi_idx]
+    if block_idx >= 0 and block_idx < blocks.size
+      var block = blocks[block_idx]
+      var instrs = mir::mir_block_get_instructions(block)
+      for ii in 0..instrs.size
+        var instr = instrs[ii]
+        var did = mir::mir_instr_get_dest_id(instr)
+        if did >= 0
+          loop_defs.set("#{did}", 1)
+        end
+      end
+    end
+  end
+
+  # Find preheader block
+  var preheader_block = blocks[li_preheader]
+  var ph_instrs = mir::mir_block_get_instructions(preheader_block)
+
+  # Iterate loop blocks and find invariant instructions to hoist.
+  # Use repeated passes until no more changes (hoisted values may
+  # unlock further hoisting opportunities).
+  var changed = 1
+  var licm_pass = 0
+  while changed == 1 and licm_pass < 10
+    licm_pass += 1
+    changed = 0
+    for bi_idx in 0..li_blocks.size
+      var block_idx = li_blocks[bi_idx]
+      if block_idx >= 0 and block_idx < blocks.size
+        var block = blocks[block_idx]
+        var instrs = mir::mir_block_get_instructions(block)
+        for ii in 0..instrs.size
+          var instr = instrs[ii]
+          var kind = mir::mir_instr_get_kind(instr)
+          var did = mir::mir_instr_get_dest_id(instr)
+
+          # Only hoist pure computations with results
+          if kind != mir::MIR_NOP and kind != mir::MIR_PHI and eg_is_side_effecting(kind) == 0 and did >= 0
+            var invariant = eg_check_invariant(instr, kind, loop_defs, fwd)
+            if invariant == 1
+              # Clone instruction to preheader, keeping same dest_id.
+              # SSA dest_id is unique, and preheader dominates the loop.
+              var cloned = eg_clone_instr(instr, kind, did)
+              if cloned is Some
+                var new_instr = cloned.unwrap()
+                mir::mir_block_add_instr(preheader_block, new_instr)
+                eg_byid_set(by_id, did, new_instr)
+                mir::mir_instr_set_kind(instr, mir::MIR_NOP)
+                loop_defs.set("#{did}", 0)
+                changed = 1
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+# Clone an instruction with a new dest_id
+# PF3-P1b: returns `Option<MirInstr>` directly — the former `Int` return stored
+# `as_int_generic(new_instr)` (an erased COW value-struct handle) and used `-1`
+# as a failure sentinel. A typed Option de-erases both the success handle and
+# the sentinel.
+def eg_clone_instr(src: mir::MirInstr, kind: Int, new_id: Int): Option<mir::MirInstr>
+  var dest_type = mir::mir_instr_get_dest_type(src)
+  var new_instr = mir::mir_new_instr(kind, new_id, dest_type)
+
+  if kind == mir::MIR_CONST_INT
+    mir::mir_instr_set_int_val(new_instr, mir::mir_instr_get_int_val(src))
+    return Option::Some(new_instr)
+  end
+  if kind == mir::MIR_CONST_FLOAT
+    mir::mir_instr_set_string_val(new_instr, mir::mir_instr_get_string_val(src))
+    return Option::Some(new_instr)
+  end
+  if kind == mir::MIR_CONST_BOOL
+    mir::mir_instr_set_int_val(new_instr, mir::mir_instr_get_int_val(src))
+    return Option::Some(new_instr)
+  end
+  if kind == mir::MIR_BINARY
+    mir::mir_instr_set_op(new_instr, mir::mir_instr_get_op(src))
+    mir::mir_instr_set_operand1(new_instr, mir::mir_instr_get_operand1(src))
+    mir::mir_instr_set_operand2(new_instr, mir::mir_instr_get_operand2(src))
+    return Option::Some(new_instr)
+  end
+  if kind == mir::MIR_UNARY
+    mir::mir_instr_set_op(new_instr, mir::mir_instr_get_op(src))
+    mir::mir_instr_set_operand1(new_instr, mir::mir_instr_get_operand1(src))
+    return Option::Some(new_instr)
+  end
+  # Unsupported kind — don't clone
+  return Option::None
+end
+
+# Check if an instruction's operands are all loop-invariant
+def eg_check_invariant(instr: mir::MirInstr, kind: Int, loop_defs: Map<String, Int>, fwd: Map<String, Int>): Int
+  if kind == mir::MIR_CONST_INT or kind == mir::MIR_CONST_FLOAT or kind == mir::MIR_CONST_BOOL or kind == mir::MIR_CONST_STRING
+    return 1
+  end
+  if kind == mir::MIR_BINARY
+    var lid = eg_resolve(fwd, mir::mir_instr_get_operand1(instr))
+    var rid = eg_resolve(fwd, mir::mir_instr_get_operand2(instr))
+    if eg_defined_in_loop(lid, loop_defs)
+      return 0
+    end
+    if eg_defined_in_loop(rid, loop_defs)
+      return 0
+    end
+    return 1
+  end
+  if kind == mir::MIR_UNARY
+    var oid = eg_resolve(fwd, mir::mir_instr_get_operand1(instr))
+    if eg_defined_in_loop(oid, loop_defs)
+      return 0
+    end
+    return 1
+  end
+  if kind == mir::MIR_LOAD_VAR
+    # LOAD_VAR from globals or mutated locals is not safe to hoist
+    return 0
+  end
+  return 0
+end
+
+# ============================================================================
+# Pass 4: Dead Code Elimination
+# ============================================================================
+
+# Collect all dest_ids referenced as operands across a function.
+# A.30: operand enumeration routes through the shared exhaustive walker
+# `mir_opt::opt_map_value_operands` so DCE sees every use site (the pre-A.30
+# hand-rolled dispatch missed MIR_PERFORM_OP, MIR_HANDLE_*, MIR_UNION_*, the
+# raw-index/binary-DSL families and TERM_SWITCH, so DCE could NOP a still-live
+# value's defining instruction).
+def eg_collect_used(func: mir::MirFunc): Map<String, Int>
+  var used = map_new<String, Int>()
+  var marker: Fn(Int): Int = x: Int -> mir_opt::opt_note_used(used, x)
+  var blocks = mir::mir_func_get_blocks(func)
+  for b in 0..blocks.size
+    var block = blocks[b]
+    var instrs = mir::mir_block_get_instructions(block)
+    for i in 0..instrs.size
+      var instr = instrs[i]
+      mir_opt::opt_map_value_operands(instr, mir::mir_instr_get_kind(instr), marker)
+    end
+    mir_opt::opt_map_term_value_operands(block, marker)
+  end
+  return used
+end
+
+# Eliminate dead instructions in a function (iterative)
+## Eliminate dead code (unused instructions) in a function.
+def eg_dce(func: mir::MirFunc): Void
+  var changed = 1
+  var dce_pass = 0
+  while changed > 0 and dce_pass < 20
+    dce_pass += 1
+    changed = 0
+    var used = eg_collect_used(func)
+    var blocks = mir::mir_func_get_blocks(func)
+    for b in 0..blocks.size
+      var block = blocks[b]
+      var instrs = mir::mir_block_get_instructions(block)
+      for i in 0..instrs.size
+        var instr = instrs[i]
+        var kind = mir::mir_instr_get_kind(instr)
+        if kind == mir::MIR_NOP
+          continue
+        end
+        if eg_is_side_effecting(kind)
+          continue
+        end
+        var did = mir::mir_instr_get_dest_id(instr)
+        if did >= 0 and not used.has("#{did}")
+          mir::mir_instr_set_kind(instr, mir::MIR_NOP)
+          changed = 1
+        end
+      end
+    end
+  end
+end
+
+# ============================================================================
+# Pass 5: Tiny Function Inlining
+# ============================================================================
+
+# Check if a function is an inline candidate:
+# - Exactly 1 block (no control flow)
+# - ≤ 8 non-NOP instructions
+# - Not recursive (no calls to self)
+# - Not extern (has blocks)
+# Check if we can clone this instruction kind during inlining
+def eg_is_clonable_kind(kind: Int): Int
+  if kind == mir::MIR_NOP or kind == mir::MIR_CONST_INT or kind == mir::MIR_CONST_FLOAT
+    return 1
+  end
+  if kind == mir::MIR_CONST_BOOL or kind == mir::MIR_CONST_STRING
+    return 1
+  end
+  if kind == mir::MIR_LOAD_VAR or kind == mir::MIR_STORE_VAR
+    return 1
+  end
+  if kind == mir::MIR_BINARY or kind == mir::MIR_UNARY
+    return 1
+  end
+  if kind == mir::MIR_CALL or kind == mir::MIR_INTRINSIC
+    return 1
+  end
+  return 0
+end
+
+def eg_is_narrow_type(name: String): Int
+  if name == "U8" or name == "I8"
+    return 1
+  end
+  if name == "U16" or name == "I16"
+    return 1
+  end
+  if name == "U32" or name == "I32"
+    return 1
+  end
+  if name == "F32"
+    return 1
+  end
+  return 0
+end
+
+## Check if a function is a candidate for inlining (tiny, non-recursive).
+def eg_is_inline_candidate(func: mir::MirFunc): Int
+  var blocks = mir::mir_func_get_blocks(func)
+  if blocks.size != 1
+    return 0
+  end
+  # Skip functions with narrow return type (U8, I16, etc.)
+  var ret_name = mir::mir_func_get_return_type_name(func)
+  if eg_is_narrow_type(ret_name)
+    return 0
+  end
+  # Skip functions with narrow parameter types
+  var params = mir::mir_func_get_params(func)
+  for pi in 0..params.size
+    var ptn = mir::mir_func_get_param_type_name(func, pi)
+    if eg_is_narrow_type(ptn)
+      return 0
+    end
+  end
+  var block = blocks[0]
+  var instrs = mir::mir_block_get_instructions(block)
+  var real_count = 0
+  var fname = mir::mir_func_get_name(func)
+  for i in 0..instrs.size
+    var kind = mir::mir_instr_get_kind(instrs[i])
+    if kind == mir::MIR_NOP
+      continue
+    end
+    if eg_is_clonable_kind(kind) == 0
+      return 0
+    end
+    real_count += 1
+    # Check for self-recursion
+    if kind == mir::MIR_CALL
+      var callee = mir::mir_instr_get_func_name(instrs[i])
+      if callee == fname
+        return 0
+      end
+    end
+    # Don't inline functions that contain panic (diverging)
+    if kind == mir::MIR_INTRINSIC
+      var iname = mir::mir_instr_get_func_name(instrs[i])
+      if iname == "panic"
+        return 0
+      end
+    end
+  end
+  if real_count > 8
+    return 0
+  end
+  return 1
+end
+
+# Inline tiny functions at all call sites across the program
+## Inline tiny functions at all call sites across the program.
+def eg_inline_pass(prog: mir::MirProgram): Void
+  var funcs = mir::mir_get_functions(prog)
+
+  # Build candidate map: func_name -> func_handle
+  var candidates = map_new<String, mir::MirFunc>()
+  for i in 0..funcs.size
+    var func = funcs[i]
+    if eg_is_inline_candidate(func)
+      var name = mir::mir_func_get_name(func)
+      # Skip main — never inline it
+      if name != "main"
+        candidates.set(name, func)
+      end
+    end
+  end
+
+  # For each function, scan call sites and inline candidates (max 32 per function)
+  for fi in 0..funcs.size
+    var caller = funcs[fi]
+    var blocks = mir::mir_func_get_blocks(caller)
+    var inline_count = 0
+    for bi in 0..blocks.size
+      if inline_count >= 32
+        break
+      end
+      var block = blocks[bi]
+      var instrs = mir::mir_block_get_instructions(block)
+      var i = 0
+      while i < instrs.size and inline_count < 32
+        var instr = instrs[i]
+        var kind = mir::mir_instr_get_kind(instr)
+        if kind == mir::MIR_CALL
+          var callee_name = mir::mir_instr_get_func_name(instr)
+          if candidates.has(callee_name)
+            var callee_opt = candidates.get(callee_name)
+            var callee = callee_opt.unwrap()
+            var old_size = instrs.size
+            eg_inline_call(caller, block, i, callee)
+            # Advance past inserted instructions
+            i += instrs.size - old_size
+            inline_count += 1
+          end
+        end
+        i += 1
+      end
+    end
+  end
+end
+
+# Helper: insert an instruction at position pos in instrs Vec, shifting right
+def eg_insert_at(instrs: Vec<mir::MirInstr>, pos: Int, instr_handle: mir::MirInstr): Void
+  instrs.push(instr_handle)
+  var j = instrs.size - 1
+  while j > pos
+    instrs.set_unchecked(j, instrs[j - 1])
+    j -= 1
+  end
+  instrs.set_unchecked(pos, instr_handle)
+end
+
+# Inline a single call: clone callee body into caller at call site
+def eg_inline_call(caller: mir::MirFunc, block: mir::MirBlock, call_idx: Int, callee: mir::MirFunc): Void
+  var instrs = mir::mir_block_get_instructions(block)
+  var call_instr = instrs[call_idx]
+  var call_dest = mir::mir_instr_get_dest_id(call_instr)
+  # Save call args before any insertions shift the instrs Vec
+  var orig_args = mir::mir_instr_get_args(call_instr)
+  var call_args = vec_new()
+  for ai in 0..orig_args.size
+    call_args.push(orig_args[ai])
+  end
+
+  # Get callee info
+  var callee_blocks = mir::mir_func_get_blocks(callee)
+  var callee_block = callee_blocks[0]
+  var callee_instrs = mir::mir_block_get_instructions(callee_block)
+  var callee_params = mir::mir_func_get_params(callee)
+
+  # Generate unique prefix for this inline site
+  var site_id = mir::mir_func_next_value(caller)
+  var prefix = "__il#{site_id}_"
+
+  # Build param name set for quick lookup
+  var param_names = map_new<String, Int>()
+  for pi in 0..callee_params.size
+    param_names.set(callee_params[pi], pi)
+  end
+
+  # Find callee return value ID
+  var callee_term_kind = mir::mir_block_get_term_kind(callee_block)
+  var callee_ret_id = -1
+  if callee_term_kind == mir::TERM_RETURN
+    callee_ret_id = mir::mir_block_get_term_data(callee_block)
+  end
+
+  # Build ID remapping: callee dest_id -> fresh caller dest_id
+  var id_map = map_new<String, Int>()
+  for ci in 0..callee_instrs.size
+    var cinstr = callee_instrs[ci]
+    var ckind = mir::mir_instr_get_kind(cinstr)
+    if ckind == mir::MIR_NOP
+      continue
+    end
+    var old_id = mir::mir_instr_get_dest_id(cinstr)
+    if old_id >= 0
+      if old_id == callee_ret_id
+        id_map.set("#{old_id}", call_dest)
+      else
+        var new_id = mir::mir_func_next_value(caller)
+        id_map.set("#{old_id}", new_id)
+      end
+    end
+  end
+
+  var insert_pos = call_idx
+
+  # Emit STORE_VARs for parameter initialization with prefixed names
+  for pi in 0..callee_params.size
+    if pi < call_args.size
+      var store = mir::mir_new_instr(mir::MIR_STORE_VAR, mir::mir_func_next_value(caller), 0)
+      mir::mir_instr_set_var_name(store, str_concat(prefix, callee_params[pi]))
+      mir::mir_instr_set_operand2(store, call_args[pi])
+      eg_insert_at(instrs, insert_pos, store)
+      insert_pos += 1
+    end
+  end
+
+  # Clone callee instructions with remapped IDs and prefixed variable names
+  for ci in 0..callee_instrs.size
+    var cinstr = callee_instrs[ci]
+    var ckind = mir::mir_instr_get_kind(cinstr)
+    if ckind == mir::MIR_NOP
+      continue
+    end
+
+    # Remap dest_id
+    var old_dest = mir::mir_instr_get_dest_id(cinstr)
+    var new_dest = old_dest
+    if old_dest >= 0 and id_map.has("#{old_dest}")
+      new_dest = __map_get_raw(id_map, "#{old_dest}")
+    end
+    var new_instr = mir::mir_new_instr(ckind, new_dest, mir::mir_instr_get_dest_type(cinstr))
+
+    if ckind == mir::MIR_CONST_INT
+      mir::mir_instr_set_int_val(new_instr, mir::mir_instr_get_int_val(cinstr))
+    else
+      if ckind == mir::MIR_CONST_FLOAT
+        mir::mir_instr_set_string_val(new_instr, mir::mir_instr_get_string_val(cinstr))
+      else
+        if ckind == mir::MIR_CONST_BOOL
+          mir::mir_instr_set_int_val(new_instr, mir::mir_instr_get_int_val(cinstr))
+        else
+          if ckind == mir::MIR_CONST_STRING
+            mir::mir_instr_set_string_val(new_instr, mir::mir_instr_get_string_val(cinstr))
+          else
+            if ckind == mir::MIR_BINARY
+              mir::mir_instr_set_op(new_instr, mir::mir_instr_get_op(cinstr))
+              var lid = mir::mir_instr_get_operand1(cinstr)
+              if id_map.has("#{lid}")
+                lid = __map_get_raw(id_map, "#{lid}")
+              end
+              var rid = mir::mir_instr_get_operand2(cinstr)
+              if id_map.has("#{rid}")
+                rid = __map_get_raw(id_map, "#{rid}")
+              end
+              mir::mir_instr_set_operand1(new_instr, lid)
+              mir::mir_instr_set_operand2(new_instr, rid)
+            else
+              if ckind == mir::MIR_UNARY
+                mir::mir_instr_set_op(new_instr, mir::mir_instr_get_op(cinstr))
+                var oid = mir::mir_instr_get_operand1(cinstr)
+                if id_map.has("#{oid}")
+                  oid = __map_get_raw(id_map, "#{oid}")
+                end
+                mir::mir_instr_set_operand1(new_instr, oid)
+              else
+                if ckind == mir::MIR_CALL or ckind == mir::MIR_INTRINSIC
+                  mir::mir_instr_set_func_name(new_instr, mir::mir_instr_get_func_name(cinstr))
+                  var old_args = mir::mir_instr_get_args(cinstr)
+                  var new_args = vec_new()
+                  for ai in 0..old_args.size
+                    var aid = old_args[ai]
+                    if id_map.has("#{aid}")
+                      aid = __map_get_raw(id_map, "#{aid}")
+                    end
+                    new_args.push(aid)
+                  end
+                  mir::mir_instr_set_args(new_instr, new_args)
+                  # Preserve slot2 (elem_type annotation) — load-bearing for
+                  # cg_intrinsic_map dispatch on map_*/__map_get_raw and for
+                  # vec width-aware codegen on vec_*. Without this the inlined
+                  # call loses its key/element type and routes to the wrong
+                  # backend handler.
+                  mir::mir_instr_set_slot2(new_instr, mir::mir_instr_get_slot2(cinstr))
+                else
+                  if ckind == mir::MIR_LOAD_VAR
+                    # Prefix variable name (locals only, not globals)
+                    var vname = mir::mir_instr_get_var_name(cinstr)
+                    var is_global = mir::mir_instr_get_slot1(cinstr)
+                    if is_global == 0
+                      mir::mir_instr_set_var_name(new_instr, str_concat(prefix, vname))
+                    else
+                      mir::mir_instr_set_var_name(new_instr, vname)
+                    end
+                    mir::mir_instr_set_slot1(new_instr, is_global)
+                  else
+                    if ckind == mir::MIR_STORE_VAR
+                      var vname = mir::mir_instr_get_var_name(cinstr)
+                      var is_global = mir::mir_instr_get_slot1(cinstr)
+                      if is_global == 0
+                        mir::mir_instr_set_var_name(new_instr, str_concat(prefix, vname))
+                      else
+                        mir::mir_instr_set_var_name(new_instr, vname)
+                      end
+                      mir::mir_instr_set_slot1(new_instr, is_global)
+                      var sv = mir::mir_instr_get_operand2(cinstr)
+                      if id_map.has("#{sv}")
+                        sv = __map_get_raw(id_map, "#{sv}")
+                      end
+                      mir::mir_instr_set_operand2(new_instr, sv)
+                    else
+                      # Unsupported kind — bail
+                      return
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+
+    eg_insert_at(instrs, insert_pos, new_instr)
+    insert_pos += 1
+  end
+
+  # If callee is Void (no return value), define call_dest as 0
+  if callee_ret_id < 0 and call_dest >= 0
+    var zero_instr = mir::mir_new_instr(mir::MIR_CONST_INT, call_dest, mir::MIR_TYPE_INT)
+    mir::mir_instr_set_int_val(zero_instr, 0)
+    eg_insert_at(instrs, insert_pos, zero_instr)
+    insert_pos += 1
+  end
+
+  # NOP the original call (now at position insert_pos)
+  mir::mir_instr_set_kind(instrs[insert_pos], mir::MIR_NOP)
+end
+
+# ============================================================================
+# Entry point: optimize entire program
+# ============================================================================
+
+## Main entry point: Optimize the entire MIR program using e-graph techniques.
+def mir_egraph_optimize(prog: mir::MirProgram, overflow_check: Int): Void
+  eg_inline_pass(prog)
+  var funcs = mir::mir_get_functions(prog)
+  for i in 0..funcs.size
+    eg_opt_function(funcs[i], overflow_check)
+    eg_dce(funcs[i])
+  end
+end

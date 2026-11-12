@@ -1,0 +1,521 @@
+## std/crypto/dudect — Welch t-test timing-leak detector
+##
+## ## What this module is
+##
+## A pure-Quartz port of dudect (Reparaz, Balasch, Verbauwhede 2017 —
+## *Dude, is my code constant time?*, DATE 2017, eprint 2016/1123, ~300
+## LoC C reference at https://github.com/oreparaz/dudect). The harness
+## takes a sequence of `(timing_ns, class_label)` pairs from the caller
+## and reports the maximum Welch t-statistic across 102 parallel t-tests
+## (1 uncropped + 100 cropped at exponentially-spaced upper percentiles
+## + 1 second-order test on `(x - μ_uncropped)²`). The maximum |t| is
+## the leak score:
+##
+## | `max |t|` | interpretation                                        |
+## |-----------|-------------------------------------------------------|
+## | `< 5`     | no leak detected (Reparaz §4 practitioner cutoff)     |
+## | `5..10`   | possible leak, borderline                             |
+## | `10..100` | likely a leak                                         |
+## | `≥ 100`   | overwhelming evidence of a leak (Reparaz §4)          |
+##
+## ## Why a stats-only API (no fn-callback)
+##
+## The harness is a streaming statistics library. **The caller drives the
+## measurement loop** — fills the input buffer, calls the target, times
+## with `time_mono_ns()`, calls `dudect_push(ctx, ns, class)`. Two
+## upsides over Reparaz's fn-callback shape:
+##
+##   1. No cross-module `Fn` value passing — avoids HB-DOG.12-class
+##      compiler hazards.
+##   2. Maximally flexible — caller can shape inputs however needed
+##      (fixed-vs-random, all-zeros-vs-all-ones, scalar bit toggle, etc).
+##      The harness only needs the (timing, class) pairs.
+##
+## ## Two-class measurement protocol (the dudect convention)
+##
+## Class 0 = "fixed input" — the same byte pattern every call (typically
+## all-zeros, or a chosen edge case). Class 1 = "random input" — fresh
+## random bytes per call. Any timing dependence on input data shows up
+## as `μ_class_0 ≠ μ_class_1`. The Welch t-test detects this with no
+## distribution assumption on the timing noise (just that both classes
+## see the same OS preemption / cache-line / branch-predictor noise
+## floor, which they do because they're interleaved within one run).
+##
+## The caller is responsible for class labeling. The canonical pattern:
+##
+## ```quartz
+##   var ctx = dudect_new()
+##   var i = 0
+##   while i < N
+##     var class = i % 2
+##     fill_input(buf, class)        # caller's responsibility
+##     var t0 = time_mono_ns()
+##     target_under_test(buf)
+##     var t1 = time_mono_ns()
+##     dudect_push(ctx, t1 - t0, class)
+##     i = i + 1
+##   end
+##   dudect_assert_ct("target", ctx, DUDECT_T_THRESHOLD_LEAK)
+## ```
+##
+## ## Time source (v1 = `clock_gettime(CLOCK_MONOTONIC)`)
+##
+## `time_mono_ns()` resolves to nanoseconds via `clock_gettime` on macOS
+## and Linux. Syscall overhead is ~20-50 ns in practice; the canonical
+## dudect reference uses `__rdtsc` for ~0.3 ns/cycle resolution. We ship
+## v1 on `time_mono_ns()` because (a) the canary test produces a leak
+## signal large enough for clock_gettime to see, and (b) `rdtsc` would
+## need a new compiler intrinsic. If a real-primitive test needs finer
+## resolution than v1 provides, file `@rdtsc` (~30 LoC in
+## `codegen_runtime.qz` + 1 line in `intrinsic_registry.qz` per the
+## "Adding a New Builtin" 4-step recipe in CLAUDE.md). The design memo
+## (`docs/design/SECRET_T_AND_DUDECT_DESIGN.md` §Layer 2 "Implementation
+## outline") flags this as the v1→v2 trigger.
+##
+## ## Algorithm — the 102 parallel t-tests
+##
+## After collection of N raw measurements:
+##
+##   1. Drop the first 10 samples (first-call cold-cache noise; matches
+##      Reparaz's `DUDECT_DROP_FIRST_N`).
+##   2. Sort a copy of the timings ascending (quicksort, in-place on the
+##      copy — `Vec<Int>` of N items; N up to ~100K is fine).
+##   3. Compute 100 upper-tail percentile cutoffs by the exponential
+##      schedule `1 - 0.5^(i/10)` for `i ∈ 1..100`. This concentrates the
+##      crop thresholds near the upper tail (i=10 ≈ p50, i=50 ≈ p96.9,
+##      i=100 ≈ p99.9) — empirically Reparaz et al. found this multi-
+##      cutoff fanout finds leaks that any single percentile misses.
+##   4. Initialize 102 fresh Welford accumulators (`DudectTest`).
+##   5. Single pass over the N - 10 retained measurements:
+##      - test[0] = uncropped — push every measurement.
+##      - test[1..100] = cropped — push iff `measurement < cutoff[i-1]`.
+##      - test[101] = second-order — push `(x - μ_uncropped[class])²`,
+##        the running mean from test[0]. Catches variance leaks that
+##        the mean-difference tests miss.
+##   6. Compute Welch t for each of the 102 accumulators, return max |t|.
+##
+## Welch's t formula (two-sample, unequal-variance):
+##
+##   `t = (μ_a − μ_b) / sqrt(σ²_a / n_a + σ²_b / n_b)`
+##
+## Welford online variance (Knuth TAOCP vol 2 §4.2.2, also Welford 1962):
+##
+##   `n += 1; δ = x − μ; μ += δ/n; m2 += δ * (x − μ);  σ² = m2 / (n-1)`
+##
+## ## Recommended N
+##
+## - Canary test: 10K-30K samples. Leaky early-exit will hit |t|≥100
+##   in a few thousand samples; the canary's correctness signal is fast.
+## - Real-primitive validation: 30K-100K samples is the dudect-canonical
+##   "I'm done" point if max|t| stays under 5. Constant-time validation
+##   of e.g. dalek's curve25519 took millions; we don't need that for
+##   the v1 stdlib-correctness story.
+##
+## See `docs/design/SECRET_T_AND_DUDECT_DESIGN.md` §Layer 2 for the full
+## design. See `spec/qz/dudect_canary_smoke.qz` for the leaky-vs-honest
+## canary. See `spec/qz/dudect_smoke.qz` for real-primitive coverage.
+
+import * from ffi/socket  # malloc/free/memcpy/memset for buffer allocation
+
+# =============================================================================
+# Tunables
+# =============================================================================
+
+const DUDECT_NUMBER_PERCENTILES = 100
+const DUDECT_NUMBER_TESTS = 102            # 1 uncropped + 100 cropped + 1 2nd-order
+const DUDECT_DROP_FIRST_N = 10             # drop first-call cold-cache outliers
+
+## Welch |t| ≥ this fails `dudect_assert_ct`. Practitioner cutoff from
+## Reparaz et al. §4: "the threshold is set to 5 based on practical
+## experience." Cross-module-exportable as a def returning F64 because
+## module-level `var X: F64 = ...` does not currently propagate the
+## binding across the qzmod import boundary (callers see QZ0403).
+def dudect_t_threshold_leak(): F64 = 5.0
+
+## |t| ≥ this constitutes "overwhelming evidence of a leak" per Reparaz
+## et al. §4. The canary test (deliberately-leaky early-exit `ct_eq_bytes`)
+## must hit this to validate the harness itself.
+def dudect_t_threshold_overwhelming(): F64 = 100.0
+
+# =============================================================================
+# Per-test Welford accumulator
+# =============================================================================
+
+## One of 102 t-test slots. Holds streaming Welford state for both
+## classes — n, mean, and m2 (sum of squared deviations from the
+## running mean). σ² = m2 / (n - 1) is computed on demand at scoring
+## time.
+struct DudectTest
+  n0: Int          # samples seen for class 0
+  n1: Int          # samples seen for class 1
+  mean0: F64       # running mean for class 0
+  mean1: F64       # running mean for class 1
+  m2_0: F64        # Welford m2 for class 0
+  m2_1: F64        # Welford m2 for class 1
+end
+
+## Harness state. Raw timings + class labels are accumulated as the
+## caller drives the measurement loop; the 102 parallel t-tests are
+## computed at scoring time (`dudect_compute_max_t`).
+struct DudectCtx
+  timings: Vec<Int>    # raw measurements, ns
+  classes: Vec<Int>    # parallel; 0 = class A (fixed), 1 = class B (random)
+end
+
+## Allocate a fresh harness context. Caller drives the measurement loop
+## then calls `dudect_compute_max_t` (returns the score) or
+## `dudect_assert_ct` (returns the score AND fails on leak).
+def dudect_new(): DudectCtx
+  return DudectCtx {
+    timings: vec_new<Int>(),
+    classes: vec_new<Int>(),
+  }
+end
+
+## Record one measurement. `ns` is a duration in nanoseconds (typically
+## from `time_mono_ns()` deltas); `class` is 0 or 1 (the dudect-canonical
+## "fixed input" vs "random input" labeling).
+def dudect_push(ctx: DudectCtx, ns: Int, class: Int): Void
+  ctx.timings.push(ns)
+  ctx.classes.push(class)
+end
+
+## Total measurements pushed so far.
+def dudect_n(ctx: DudectCtx): Int = ctx.timings.size
+
+# =============================================================================
+# Sort — quicksort over Vec<Int>
+# =============================================================================
+
+# `bench.qz`'s insertion sort is O(N²) — fine for ≤30 samples, way too
+# slow for the 10K+ samples a real dudect run wants. Recursive 3-way
+# Lomuto-ish quicksort works at scale; pivot is the middle element to
+# avoid worst-case on already-sorted input. We don't move this to
+# `std/sort.qz` because no second consumer exists yet — premature
+# factoring trades a real follow-up for a speculative one.
+def _dudect_qs(a: Vec<Int>, lo: Int, hi: Int): Void
+  if lo >= hi
+    return
+  end
+  var pivot = a[(lo + hi) / 2]
+  var i = lo
+  var j = hi
+  while i <= j
+    while a[i] < pivot
+      i = i + 1
+    end
+    while a[j] > pivot
+      j = j - 1
+    end
+    if i <= j
+      var t = a[i]
+      a[i] = a[j]
+      a[j] = t
+      i = i + 1
+      j = j - 1
+    end
+  end
+  _dudect_qs(a, lo, j)
+  _dudect_qs(a, i, hi)
+end
+
+def _dudect_sort_copy(src: Vec<Int>): Vec<Int>
+  var copy = vec_new<Int>()
+  var i = 0
+  while i < src.size
+    copy.push(src[i])
+    i = i + 1
+  end
+  if copy.size > 1
+    _dudect_qs(copy, 0, copy.size - 1)
+  end
+  return copy
+end
+
+# =============================================================================
+# Percentile cutoffs — Reparaz exponential schedule
+# =============================================================================
+
+# 100 thresholds from the sorted timings, exponentially spaced toward the
+# upper tail: `cutoff[i] = sorted[floor((1 − 0.5^(i/10)) * n)]` for
+# `i ∈ 1..100`. Matches the C reference's
+# `percentile(exec_times, 1 − pow(0.5, 10*(i+1)/100), n)` literally.
+# Concentrates outlier-cropping near the tail where OS-preemption
+# samples land, leaving the bulk of the distribution intact for the
+# mean-difference test.
+def _dudect_percentiles(sorted: Vec<Int>): Vec<Int>
+  var out = vec_new<Int>()
+  var n = sorted.size
+  if n == 0
+    return out
+  end
+  var i = 1
+  while i <= DUDECT_NUMBER_PERCENTILES
+    # 1 - 0.5^(i/10). Note: i=10 → 0.5, i=50 → ~0.969, i=100 → ~0.999.
+    var frac: F64 = to_f64(i) / 10.0
+    var p: F64 = 1.0 - f64_pow(0.5, frac)
+    var idx = to_int(p * to_f64(n))
+    if idx >= n
+      idx = n - 1
+    end
+    if idx < 0
+      idx = 0
+    end
+    out.push(sorted[idx])
+    i = i + 1
+  end
+  return out
+end
+
+# =============================================================================
+# Welford update + t-statistic
+# =============================================================================
+
+# Streaming update of one DudectTest's per-class Welford state. Vec-of-
+# struct uses Quartz value semantics, so we read the slot, mutate the
+# local, write it back. Same shape as `_replace_peer` in wireguard's
+# device.qz.
+def _dudect_test_push(tests: Vec<DudectTest>, k: Int, x: F64, class: Int): Void
+  var t = tests[k]
+  if class == 0
+    t.n0 = t.n0 + 1
+    var delta = x - t.mean0
+    t.mean0 = t.mean0 + delta / to_f64(t.n0)
+    t.m2_0 = t.m2_0 + delta * (x - t.mean0)
+  end
+  if class != 0
+    t.n1 = t.n1 + 1
+    var delta = x - t.mean1
+    t.mean1 = t.mean1 + delta / to_f64(t.n1)
+    t.m2_1 = t.m2_1 + delta * (x - t.mean1)
+  end
+  tests[k] = t
+end
+
+# Welch's two-sample unequal-variance t-statistic. Both classes need
+# at least 2 samples for variance to be defined; otherwise return 0
+# (don't accuse the target of leaking when we just haven't collected
+# enough). Denominator-zero (constant-output edge case) also returns 0.
+def _dudect_t_value(t: DudectTest): F64
+  if t.n0 < 2
+    return 0.0
+  end
+  if t.n1 < 2
+    return 0.0
+  end
+  var var0: F64 = t.m2_0 / to_f64(t.n0 - 1)
+  var var1: F64 = t.m2_1 / to_f64(t.n1 - 1)
+  var num: F64 = t.mean0 - t.mean1
+  var denom: F64 = f64_sqrt(var0 / to_f64(t.n0) + var1 / to_f64(t.n1))
+  if denom == 0.0
+    return 0.0
+  end
+  return num / denom
+end
+
+def _dudect_abs(x: F64): F64
+  if x < 0.0
+    return 0.0 - x
+  end
+  return x
+end
+
+# =============================================================================
+# Public scoring API
+# =============================================================================
+
+## Score the harness — runs the 102 parallel t-tests over accumulated
+## measurements and returns `max |t|` across them. The leak score.
+##
+## Returns `0.0` if fewer than 100 samples accumulated (not enough for
+## the percentile machinery; caller's loop count is too small).
+##
+## Side-effect-free; safe to call repeatedly. Cost is O(N log N) sort
+## + O(N * 100) per-percentile gating + O(N) Welford updates. For
+## N=10K that's roughly 10ms in practice on modern hardware.
+def dudect_compute_max_t(ctx: DudectCtx): F64
+  var n = ctx.timings.size
+  if n < 100
+    return 0.0
+  end
+
+  # Step 1: sort a copy + compute 100 percentile cutoffs.
+  var sorted = _dudect_sort_copy(ctx.timings)
+  var pcts = _dudect_percentiles(sorted)
+
+  # Step 2: 102 fresh Welford accumulators.
+  var tests = vec_new<DudectTest>()
+  var k = 0
+  while k < DUDECT_NUMBER_TESTS
+    tests.push(DudectTest {
+      n0: 0,
+      n1: 0,
+      mean0: 0.0,
+      mean1: 0.0,
+      m2_0: 0.0,
+      m2_1: 0.0,
+    })
+    k = k + 1
+  end
+
+  # Step 3: single pass — push every measurement into 1 uncropped
+  # accumulator, 0..100 cropped accumulators (gated on percentile),
+  # and 1 second-order accumulator on (x - μ_uncropped[class])².
+  var i = DUDECT_DROP_FIRST_N
+  while i < n
+    var x: Int = ctx.timings[i]
+    var c: Int = ctx.classes[i]
+    var xf: F64 = to_f64(x)
+
+    # test[0] = uncropped.
+    _dudect_test_push(tests, 0, xf, c)
+
+    # test[1..100] = cropped at percentiles[0..99]. Slot 1+p uses
+    # cutoff p, so cutoff[0] is the i=1 (least-aggressive) crop and
+    # cutoff[99] is the i=100 (most-aggressive, ~p99.9) crop.
+    var p = 0
+    while p < DUDECT_NUMBER_PERCENTILES
+      if x < pcts[p]
+        _dudect_test_push(tests, 1 + p, xf, c)
+      end
+      p = p + 1
+    end
+
+    # test[101] = second-order on (x - μ_uncropped[class])². Uses the
+    # running mean from test[0] *as observed at this point in the pass*.
+    # Matches Reparaz's single-pass formulation; the small lag converges
+    # quickly and doesn't affect leak detection materially.
+    var mu_slot = tests[0]
+    var center: F64 = 0.0
+    if c == 0
+      center = mu_slot.mean0
+    end
+    if c != 0
+      center = mu_slot.mean1
+    end
+    var d: F64 = xf - center
+    _dudect_test_push(tests, DUDECT_NUMBER_TESTS - 1, d * d, c)
+
+    i = i + 1
+  end
+
+  # Step 4: scan, return max |t|.
+  var max_t: F64 = 0.0
+  var kk = 0
+  while kk < DUDECT_NUMBER_TESTS
+    var tv = _dudect_t_value(tests[kk])
+    var av = _dudect_abs(tv)
+    if av > max_t
+      max_t = av
+    end
+    kk = kk + 1
+  end
+  return max_t
+end
+
+## Assert constant-time. Computes `max |t|`, prints a one-line
+## PASS/FAIL summary, and returns 1 (true, "leak detected") if the
+## threshold is crossed, 0 otherwise.
+##
+## Doesn't `panic` — smoke-test drivers (canonical pattern in
+## `spec/qz/*_smoke.qz`) accumulate a pass/fail counter and `return 1`
+## from `main` on any failure. The returned Int composes with that.
+def dudect_assert_ct(name: String, ctx: DudectCtx, threshold: F64): Int
+  var max_t = dudect_compute_max_t(ctx)
+  var av = _dudect_abs(max_t)
+  var n = ctx.timings.size
+
+  if av >= threshold
+    puts("dudect FAIL [" + name + "]: max|t| = " + f64_to_str(av) +
+         "  threshold = " + f64_to_str(threshold) +
+         "  n = " + to_str(n))
+    return 1
+  end
+
+  puts("dudect PASS [" + name + "]: max|t| = " + f64_to_str(av) +
+       "  threshold = " + f64_to_str(threshold) +
+       "  n = " + to_str(n))
+  return 0
+end
+
+## The inverse — asserts the harness DETECTED a leak. Used by the
+## canary test to verify the harness itself is working. Returns 1 if
+## the expected leak was NOT detected (canary failure), 0 if the
+## expected leak WAS detected (canary passed).
+def dudect_assert_leak(name: String, ctx: DudectCtx, expected_threshold: F64): Int
+  var max_t = dudect_compute_max_t(ctx)
+  var av = _dudect_abs(max_t)
+  var n = ctx.timings.size
+
+  if av < expected_threshold
+    puts("dudect CANARY FAIL [" + name +
+         "]: expected max|t| >= " + f64_to_str(expected_threshold) +
+         "  got " + f64_to_str(av) +
+         "  n = " + to_str(n))
+    return 1
+  end
+
+  puts("dudect CANARY PASS [" + name +
+       "]: max|t| = " + f64_to_str(av) +
+       "  (>= " + f64_to_str(expected_threshold) + ")" +
+       "  n = " + to_str(n))
+  return 0
+end
+
+# =============================================================================
+# xorshift64 — tiny deterministic PRNG for harness-driven input generation
+# =============================================================================
+#
+# Crypto code in `std/crypto/rng.qz` uses HKDF-BLAKE2s-over-OS-entropy; that's
+# the right choice for production keys. For dudect-style timing experiments
+# we want deterministic input generation so canary results are reproducible
+# across runs. xorshift64 (Marsaglia 2003) is ~20 ns/call and good enough
+# entropy for "fill a buffer with bytes that aren't all the same."
+#
+# DO NOT USE for cryptographic randomness — that's `std/crypto/rng.qz`.
+
+struct DudectRng
+  state: Int
+end
+
+## Construct a deterministic PRNG. Pass a non-zero seed.
+def dudect_rng_new(seed: Int): DudectRng
+  var s = seed
+  if s == 0
+    s = 1   # xorshift64 dies at 0; remap to 1.
+  end
+  return DudectRng { state: s }
+end
+
+## Pull the next 64-bit sample from xorshift64. Marsaglia constants
+## (13, 7, 17) — the classic combination.
+def dudect_rng_next(r: DudectRng): Int
+  var x = r.state
+  x = x ^ (x << 13)
+  x = x ^ ((x >> 7) & 144115188075855871)   # 2^57 - 1 mask: simulate logical shift right by 7 on signed Int
+  x = x ^ (x << 17)
+  r.state = x
+  return x
+end
+
+## Fill `len` bytes at `buf` with pseudo-random data from `r`.
+def dudect_rng_fill(r: DudectRng, buf: Int, len: Int): Void
+  var i = 0
+  while i + 8 <= len
+    var v = dudect_rng_next(r)
+    var k = 0
+    while k < 8
+      ptr_write_byte(buf + i + k, (v >> (k * 8)) & 255)
+      k = k + 1
+    end
+    i = i + 8
+  end
+  if i < len
+    var v = dudect_rng_next(r)
+    var k = 0
+    while i + k < len
+      ptr_write_byte(buf + i + k, (v >> (k * 8)) & 255)
+      k = k + 1
+    end
+  end
+end

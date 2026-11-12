@@ -1,0 +1,236 @@
+# tools/fuzz.qz — Grammar-guided compiler fuzzer CLI
+#
+# Generates random valid Quartz programs and runs multi-level oracles
+# to detect compiler crashes, non-determinism, invalid IR, and regressions.
+#
+# Usage:
+#   quartz tools/fuzz.qz -- [options]
+#     --count N          Number of programs to generate (default: 100)
+#     --seed N           PRNG seed for reproducibility (default: time-based)
+#     --depth N          Max AST depth (default: 8)
+#     --differential BIN Compare against another compiler binary
+#     --save-crashes DIR Save crashing inputs to directory
+#     --shrink           Auto-minimize crash reproducers
+#     --verbose          Print each program before compiling
+
+import std/fuzz/gen
+import std/fuzz/oracle
+import time
+
+# =============================================================================
+# Argument Parsing
+# =============================================================================
+
+struct FuzzArgs
+  count: Int
+  seed: Int
+  depth: Int
+  differential: String
+  save_crashes: String
+  shrink: Int
+  verbose: Int
+end
+
+def parse_fuzz_args(): FuzzArgs
+  var args = FuzzArgs {
+    count: 100,
+    seed: 0,
+    depth: 8,
+    differential: "",
+    save_crashes: "",
+    shrink: 0,
+    verbose: 0
+  }
+
+  var argc = argc()
+  var i = 1
+  while i < argc
+    var arg = argv(i)
+    if arg == "--count" and i + 1 < argc
+      i += 1
+      args.count = str_to_int(argv(i))
+    elsif arg == "--seed" and i + 1 < argc
+      i += 1
+      args.seed = str_to_int(argv(i))
+    elsif arg == "--depth" and i + 1 < argc
+      i += 1
+      args.depth = str_to_int(argv(i))
+    elsif arg == "--differential" and i + 1 < argc
+      i += 1
+      args.differential = argv(i)
+    elsif arg == "--save-crashes" and i + 1 < argc
+      i += 1
+      args.save_crashes = argv(i)
+    elsif arg == "--shrink"
+      args.shrink = 1
+    elsif arg == "--verbose"
+      args.verbose = 1
+    end
+    i += 1
+  end
+
+  return args
+end
+
+# =============================================================================
+# Statistics
+# =============================================================================
+
+struct FuzzStats
+  total: Int
+  compiled: Int
+  compile_errors: Int
+  crashes: Int
+  determinism_fails: Int
+  ir_invalid: Int
+  differential_fails: Int
+end
+
+def stats_new(): FuzzStats
+  return FuzzStats {
+    total: 0,
+    compiled: 0,
+    compile_errors: 0,
+    crashes: 0,
+    determinism_fails: 0,
+    ir_invalid: 0,
+    differential_fails: 0
+  }
+end
+
+# =============================================================================
+# Main Fuzz Loop
+# =============================================================================
+
+def main(): Int
+  var args = parse_fuzz_args()
+
+  ## Seed PRNG
+  if args.seed == 0
+    args.seed = time_epoch_ms()
+  end
+  rand_seed_op(args.seed)
+
+  puts("Quartz Fuzzer")
+  puts("  Programs: " + str_from_int(args.count))
+  puts("  Seed: " + str_from_int(args.seed))
+  puts("  Depth: " + str_from_int(args.depth))
+  if str_byte_len(args.differential) > 0
+    puts("  Differential: " + args.differential)
+  end
+  if str_byte_len(args.save_crashes) > 0
+    puts("  Save crashes: " + args.save_crashes)
+    system("mkdir -p " + args.save_crashes)
+  end
+  puts("")
+
+  var config = FuzzConfig {
+    max_depth: args.depth,
+    max_funcs: 5,
+    max_stmts: 10,
+    max_params: 3
+  }
+
+  var stats = stats_new()
+  var start_time = time_epoch_ms()
+
+  var i = 0
+  while i < args.count
+    stats.total += 1
+
+    ## Generate a program with per-iteration seed bump
+    var source = fuzz_generate(config)
+
+    if args.verbose == 1
+      puts("--- Program " + str_from_int(i) + " ---")
+      puts(source)
+      puts("---")
+    end
+
+    ## Oracle 1: Crash detection
+    var crash_result = fuzz_check_crash(source)
+    if crash_result.ok == 0
+      stats.crashes += 1
+      eputs("CRASH [" + str_from_int(i) + "]: " + crash_result.message)
+
+      var crash_source = source
+      if args.shrink == 1
+        eputs("  Shrinking...")
+        crash_source = fuzz_shrink(source)
+        eputs("  Minimized to " + str_from_int(str_byte_len(crash_source)) + " chars")
+      end
+
+      if str_byte_len(args.save_crashes) > 0
+        var crash_path = args.save_crashes + "/crash_" + str_from_int(args.seed) + "_" + str_from_int(i) + ".qz"
+        var sb = sb_new()
+        sb_append(sb, "## Fuzz crash: seed=" + str_from_int(args.seed) + " index=" + str_from_int(i) + "\n")
+        sb_append(sb, "## " + crash_result.message + "\n\n")
+        sb_append(sb, crash_source)
+        write_file(crash_path, sb_to_string(sb))
+        eputs("  Saved: " + crash_path)
+      end
+    else
+      ## Check if it compiled successfully (not just no crash)
+      if str_contains(crash_result.message, "exit 0")
+        stats.compiled += 1
+
+        ## Oracle 2: Determinism
+        var det_result = fuzz_check_determinism(source)
+        if det_result.ok == 0
+          stats.determinism_fails += 1
+          eputs("NONDETERMINISTIC [" + str_from_int(i) + "]: " + det_result.message)
+        end
+
+        ## Oracle 3: IR validation
+        var ir_result = fuzz_check_ir_valid(source)
+        if ir_result.ok == 0
+          stats.ir_invalid += 1
+          eputs("INVALID IR [" + str_from_int(i) + "]: " + ir_result.message)
+        end
+
+        ## Oracle 4: Differential (if configured)
+        if str_byte_len(args.differential) > 0
+          var diff_result = fuzz_check_differential(source, args.differential)
+          if diff_result.ok == 0
+            stats.differential_fails += 1
+            eputs("DIFFERENTIAL [" + str_from_int(i) + "]: " + diff_result.message)
+          end
+        end
+      else
+        stats.compile_errors += 1
+      end
+    end
+
+    ## Progress indicator
+    if (i + 1) % 10 == 0
+      eprint(".")
+    end
+    if (i + 1) % 100 == 0
+      eputs(" " + str_from_int(i + 1))
+    end
+
+    i += 1
+  end
+
+  var elapsed = time_epoch_ms() - start_time
+  puts("")
+  puts("Results:")
+  puts("  Total: " + str_from_int(stats.total))
+  puts("  Compiled: " + str_from_int(stats.compiled))
+  puts("  Compile errors: " + str_from_int(stats.compile_errors))
+  puts("  Crashes: " + str_from_int(stats.crashes))
+  puts("  Determinism failures: " + str_from_int(stats.determinism_fails))
+  puts("  Invalid IR: " + str_from_int(stats.ir_invalid))
+  if str_byte_len(args.differential) > 0
+    puts("  Differential failures: " + str_from_int(stats.differential_fails))
+  end
+  puts("  Time: " + str_from_int(elapsed) + "ms")
+  if elapsed > 0
+    puts("  Rate: " + str_from_int(stats.total * 1000 / elapsed) + " programs/sec")
+  end
+
+  if stats.crashes > 0
+    return 1
+  end
+  return 0
+end

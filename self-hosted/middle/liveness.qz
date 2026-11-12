@@ -1,0 +1,695 @@
+##! # Liveness Analysis
+##!
+##! NLL-lite (Non-Lexical Lifetime) pre-pass for the Quartz borrow checker.
+##!
+##! Inserted between Resolver (Phase 3) and TypeCheck (Phase 4) in the
+##! compiler pipeline. Computes last-use line/col for each binding in each
+##! function, enabling the type checker to release borrows at last use
+##! rather than at scope exit.
+##!
+##! ## Algorithm
+##!
+##! Two-pass forward AST walk per function:
+##! 1. Collect bindings (NODE_LET, NODE_PARAM)
+##! 2. Track last NODE_IDENT reference to each binding
+##!
+##! For branches: take MAX (latest line) across all arms.
+##! For loops: any use inside extends liveness to loop end (conservative).
+##!
+##! @see typecheck Borrow release integration
+##! @since 5.13.0
+
+import ast
+import node_constants
+
+## Per-function liveness results.
+## Maps binding names to their last-use location in the source.
+struct LivenessInfo
+  ## Binding names tracked in this function
+  names: Vec<String>
+  ## Last-use line number for each binding (-1 if never used after definition)
+  last_lines: Vec<Int>
+  ## Last-use column number for each binding
+  last_cols: Vec<Int>
+end
+
+## Create a new empty LivenessInfo.
+def liveness_new(): LivenessInfo
+  return LivenessInfo {
+    names: vec_new<String>(),
+    last_lines: vec_new(),
+    last_cols: vec_new()
+  }
+end
+
+## Record a use of a binding, updating its last-use location if this
+## use is later than the previously recorded one.
+def liveness_record_use(info: LivenessInfo, name: String, line: Int, col: Int): Void
+  var count = info.names.size
+  for i in 0..count
+    if info.names[i] == name
+      # Update if this use is on a later line, or same line but later column
+      if line > info.last_lines[i]
+        info.last_lines[i] = line
+        info.last_cols[i] = col
+      elsif line == info.last_lines[i] and col > info.last_cols[i]
+        info.last_cols[i] = col
+      end
+      return
+    end
+  end
+  # First use of this binding — register it
+  info.names.push(name)
+  info.last_lines.push(line)
+  info.last_cols.push(col)
+end
+
+## Look up the last-use line for a binding. Returns -1 if unknown.
+def liveness_get_last_use_line(info: LivenessInfo, name: String): Int
+  var count = info.names.size
+  for i in 0..count
+    if info.names[i] == name
+      return info.last_lines[i]
+    end
+  end
+  return -1
+end
+
+## Look up the last-use column for a binding. Returns -1 if unknown.
+def liveness_get_last_use_col(info: LivenessInfo, name: String): Int
+  var count = info.names.size
+  for i in 0..count
+    if info.names[i] == name
+      return info.last_cols[i]
+    end
+  end
+  return -1
+end
+
+# ============================================================================
+# Global registry: function handle → LivenessInfo
+# ============================================================================
+
+## Function handles that have been analyzed
+var g_func_handles = vec_new()
+## Corresponding LivenessInfo for each function (typed value storage)
+var g_func_infos = vec_new<LivenessInfo>()
+
+## Current function's LivenessInfo (set before tc_function runs)
+var g_current_info = vec_new<LivenessInfo>()
+## Whether the current function was actually analyzed (1=yes, 0=no)
+var g_current_analyzed = vec_new()
+
+## Register liveness info for a function.
+def liveness_register(func_handle: Int, info: LivenessInfo): Void
+  g_func_handles.push(func_handle)
+  g_func_infos.push(info)
+end
+
+## Check if a function handle was analyzed.
+def liveness_was_analyzed(func_handle: Int): Int
+  var count = g_func_handles.size
+  for i in 0..count
+    if g_func_handles[i] == func_handle
+      return 1
+    end
+  end
+  return 0
+end
+
+## Look up liveness info for a function. Returns empty info if not found.
+def liveness_lookup(func_handle: Int): LivenessInfo
+  var count = g_func_handles.size
+  for i in 0..count
+    if g_func_handles[i] == func_handle
+      return g_func_infos[i]
+    end
+  end
+  return liveness_new()
+end
+
+## Set the current function context for liveness queries during typecheck.
+def liveness_set_current_function(func_handle: Int): Void
+  var analyzed = liveness_was_analyzed(func_handle)
+  if g_current_info.size == 0
+    g_current_info.push(liveness_lookup(func_handle))
+    g_current_analyzed.push(analyzed)
+  else
+    g_current_info[0] = liveness_lookup(func_handle)
+    g_current_analyzed[0] = analyzed
+  end
+end
+
+## Query whether a binding's last use is at the given location.
+## Returns true (1) if this is the last use, false (0) otherwise.
+## Returns false if liveness data is unavailable (conservative default).
+def liveness_is_last_use(binding_name: String, line: Int, col: Int): Int
+  if g_current_analyzed.size == 0
+    return 0
+  end
+  if g_current_analyzed[0] == 0
+    return 0
+  end
+  var info = g_current_info[0]
+  var last_line = liveness_get_last_use_line(info, binding_name)
+  if last_line < 0
+    return 0
+  end
+  var last_col = liveness_get_last_use_col(info, binding_name)
+  if last_line == line and last_col == col
+    return 1
+  end
+  return 0
+end
+
+## Query the last-use line for a binding in the current function.
+## Returns -1 if liveness data is unavailable or binding is unknown.
+def liveness_current_last_use_line(binding_name: String): Int
+  if g_current_analyzed.size == 0
+    return -1
+  end
+  if g_current_analyzed[0] == 0
+    return -1
+  end
+  var info = g_current_info[0]
+  return liveness_get_last_use_line(info, binding_name)
+end
+
+## Query whether a binding is never used after its definition.
+## Returns true (1) if never used, false (0) otherwise.
+## Returns false if liveness data is unavailable (conservative default).
+def liveness_is_never_used(binding_name: String): Int
+  if g_current_analyzed.size == 0
+    return 0
+  end
+  if g_current_analyzed[0] == 0
+    return 0
+  end
+  var info = g_current_info[0]
+  var last_line = liveness_get_last_use_line(info, binding_name)
+  if last_line < 0
+    return 1
+  end
+  return 0
+end
+
+# ============================================================================
+# AST Walking — Last-Use Analysis
+# ============================================================================
+
+## Analyze a single function body for binding last-uses.
+## Walks the AST to track last NODE_IDENT reference to each binding.
+def analyze_function(s: ast::AstStorage, func_node: Int): LivenessInfo
+  var info = liveness_new()
+  if func_node < 0
+    return info
+  end
+  var kind = ast::ast_get_kind(s, func_node)
+  if kind != node_constants::NODE_FUNCTION
+    return info
+  end
+  var body = ast::ast_get_right(s, func_node)
+  if body >= 0
+    liveness_walk(info, s, body)
+  end
+  return info
+end
+
+## Walk a single AST node, recording identifier uses.
+def liveness_walk(info: LivenessInfo, s: ast::AstStorage, node: Int): Void
+  if node < 0
+    return
+  end
+  # Bounds check: ensure node handle is within AST storage
+  if node >= ast::ast_node_count(s)
+    return
+  end
+  var kind = ast::ast_get_kind(s, node)
+  var line = ast::ast_get_line(s, node)
+  var col = ast::ast_get_col(s, node)
+
+  # Literals — no children to walk, return immediately
+  if kind == node_constants::NODE_INT_LIT
+    return
+  end
+  if kind == node_constants::NODE_BOOL_LIT
+    return
+  end
+  if kind == node_constants::NODE_NIL_LIT
+    return
+  end
+  if kind == node_constants::NODE_STRING_LIT
+    return
+  end
+  if kind == node_constants::NODE_SYMBOL_LIT
+    return
+  end
+  if kind == node_constants::NODE_FLOAT_LIT
+    return
+  end
+  if kind == node_constants::NODE_REGEX_LIT
+    return
+  end
+  if kind == node_constants::NODE_WILDCARD
+    return
+  end
+  if kind == node_constants::NODE_OR_PATTERN
+    var or_pats = ast::ast_get_children(s, node)
+    if or_pats != 0
+      var or_cnt = vec_size(or_pats)
+      for oi in 0..or_cnt
+        liveness_walk(info, s, or_pats[oi])
+      end
+    end
+    return
+  end
+
+  # Identifier — record use
+  if kind == node_constants::NODE_IDENT
+    var name = ast::ast_get_str1(s, node)
+    liveness_record_use(info, name, line, col)
+    return
+  end
+
+  # Let binding — walk init expression (the binding name itself is not a "use")
+  # NOTE: ast_let stores value in slot 7 (left), not slot 8 (right)
+  if kind == node_constants::NODE_LET
+    var init = ast::ast_get_left(s, node)
+    if init >= 0
+      liveness_walk(info, s, init)
+    end
+    return
+  end
+
+  # Let destructuring — walk init expression
+  if kind == node_constants::NODE_LET_DESTRUCTURE
+    var init = ast::ast_get_left(s, node)
+    if init >= 0
+      liveness_walk(info, s, init)
+    end
+    return
+  end
+
+  # Struct/Vec destructuring — walk init expression
+  if kind == node_constants::NODE_STRUCT_DESTRUCTURE or kind == node_constants::NODE_VEC_DESTRUCTURE
+    var init = ast::ast_get_left(s, node)
+    if init > 0
+      liveness_walk(info, s, init)
+    end
+    return
+  end
+
+  # Block — walk children sequentially
+  if kind == node_constants::NODE_BLOCK
+    var stmts = ast::ast_get_children(s, node)
+    if stmts != 0
+      var count = vec_size(stmts)
+      for i in 0..count
+        liveness_walk(info, s, stmts[i])
+      end
+    end
+    return
+  end
+
+  # With-block (Piezo C.1) — walk handler + body
+  if kind == node_constants::NODE_WITH
+    var w_handler = ast::ast_get_left(s, node)
+    var w_body = ast::ast_get_right(s, node)
+    if w_handler > 0
+      liveness_walk(info, s, w_handler)
+    end
+    if w_body > 0
+      liveness_walk(info, s, w_body)
+    end
+    return
+  end
+
+  # Program — walk children
+  if kind == node_constants::NODE_PROGRAM
+    var stmts = ast::ast_get_children(s, node)
+    if stmts != 0
+      var count = vec_size(stmts)
+      for i in 0..count
+        liveness_walk(info, s, stmts[i])
+      end
+    end
+    return
+  end
+
+  # If — walk condition, then-branch, else-branch
+  # For branches, we take the MAX last-use across branches.
+  # Since we're walking forward and liveness_record_use keeps the latest,
+  # we just walk all branches — the latest use wins automatically.
+  if kind == node_constants::NODE_IF
+    var cond = ast::ast_get_left(s, node)
+    var then_block = ast::ast_get_right(s, node)
+    var else_block = ast::ast_get_extra(s, node)
+    liveness_walk(info, s, cond)
+    liveness_walk(info, s, then_block)
+    if else_block > 0
+      liveness_walk(info, s, else_block)
+    end
+    return
+  end
+
+  # While — walk condition and body.
+  # Conservative: any binding used inside the loop body gets its liveness
+  # extended. We snapshot before walking and compare after to detect changes.
+  if kind == node_constants::NODE_WHILE
+    var cond = ast::ast_get_left(s, node)
+    var body = ast::ast_get_right(s, node)
+    # Snapshot last-use lines before walking the loop
+    var pre_count = info.names.size
+    var pre_lines = vec_new()
+    for pi in 0..pre_count
+      pre_lines.push(info.last_lines[pi])
+    end
+    liveness_walk(info, s, cond)
+    liveness_walk(info, s, body)
+    # Walk the body again to get a stable fixpoint — the body might use bindings
+    # that were first seen on the first pass. A second pass ensures we catch
+    # all uses in the loop.
+    liveness_walk(info, s, body)
+    # Any binding whose last-use CHANGED (or was newly added) was used in the loop.
+    # Don't extend — just leave the last use as the max from the body walk.
+    # The loop ensures these bindings are live until at LEAST the loop body's last use.
+    # This is already handled correctly by the forward walk recording max lines.
+    return
+  end
+
+  # For-in — walk range, step, and body
+  if kind == node_constants::NODE_FOR
+    var range_node = ast::ast_get_left(s, node)
+    var body = ast::ast_get_right(s, node)
+    var iter_name = ast::ast_get_str1(s, node)
+    # Record iterator as used through the loop
+    liveness_record_use(info, iter_name, line, col)
+    liveness_walk(info, s, range_node)
+    # Walk step expression if present
+    var for_step = ast::ast_get_int_val(s, node)
+    if for_step > 0
+      liveness_walk(info, s, for_step)
+    end
+    liveness_walk(info, s, body)
+    # Same as while — walk body twice for fixpoint
+    liveness_walk(info, s, body)
+    return
+  end
+
+  # For-await loop — walk channel expression and body
+  if kind == node_constants::NODE_FOR_AWAIT
+    var fa_ch = ast::ast_get_left(s, node)
+    var fa_body = ast::ast_get_right(s, node)
+    var fa_name = ast::ast_get_str1(s, node)
+    liveness_record_use(info, fa_name, line, col)
+    liveness_walk(info, s, fa_ch)
+    liveness_walk(info, s, fa_body)
+    liveness_walk(info, s, fa_body)
+    return
+  end
+
+  # Match — walk subject and all arm bodies
+  if kind == node_constants::NODE_MATCH
+    var subject = ast::ast_get_left(s, node)
+    var arms = ast::ast_get_children(s, node)
+    liveness_walk(info, s, subject)
+    if arms != 0
+      var arm_count = vec_size(arms)
+      for ai in 0..arm_count
+        var arm = arms[ai]
+        var arm_body = ast::ast_get_right(s, arm)
+        # Walk pattern for bound names
+        var arm_pattern = ast::ast_get_left(s, arm)
+        if arm_pattern >= 0
+          liveness_walk(info, s, arm_pattern)
+        end
+        if arm_body >= 0
+          liveness_walk(info, s, arm_body)
+        end
+      end
+    end
+    return
+  end
+
+  # Return — walk the return value
+  if kind == node_constants::NODE_RETURN
+    var val = ast::ast_get_left(s, node)
+    if val >= 0
+      liveness_walk(info, s, val)
+    end
+    return
+  end
+
+  # Call — walk callee and arguments
+  if kind == node_constants::NODE_CALL
+    var callee = ast::ast_get_left(s, node)
+    var args = ast::ast_get_children(s, node)
+    if callee >= 0
+      liveness_walk(info, s, callee)
+    end
+    if args != 0
+      var arg_count = vec_size(args)
+      for ai in 0..arg_count
+        liveness_walk(info, s, args[ai])
+      end
+    end
+    return
+  end
+
+  # Binary — walk left and right operands
+  if kind == node_constants::NODE_BINARY
+    var left = ast::ast_get_left(s, node)
+    var right = ast::ast_get_right(s, node)
+    if left >= 0
+      liveness_walk(info, s, left)
+    end
+    if right >= 0
+      liveness_walk(info, s, right)
+    end
+    return
+  end
+
+  # Unary — walk operand
+  if kind == node_constants::NODE_UNARY
+    var operand = ast::ast_get_left(s, node)
+    if operand >= 0
+      liveness_walk(info, s, operand)
+    end
+    return
+  end
+
+  # Field access — walk base expression
+  if kind == node_constants::NODE_FIELD_ACCESS or kind == node_constants::NODE_SAFE_FIELD_ACCESS
+    var base = ast::ast_get_left(s, node)
+    if base >= 0
+      liveness_walk(info, s, base)
+    end
+    return
+  end
+
+  # Index — walk base and index
+  if kind == node_constants::NODE_INDEX
+    var base = ast::ast_get_left(s, node)
+    var idx = ast::ast_get_right(s, node)
+    if base >= 0
+      liveness_walk(info, s, base)
+    end
+    if idx >= 0
+      liveness_walk(info, s, idx)
+    end
+    return
+  end
+
+  # Assignment — walk value (lvalue is mutation, not use for liveness)
+  if kind == node_constants::NODE_ASSIGN
+    var val = ast::ast_get_right(s, node)
+    if val >= 0
+      liveness_walk(info, s, val)
+    end
+    return
+  end
+
+  # Compound assignment — walk value and target (target IS used since it's read+written)
+  if kind == node_constants::NODE_COMPOUND_ASSIGN
+    var target = ast::ast_get_left(s, node)
+    var val = ast::ast_get_right(s, node)
+    if target >= 0
+      liveness_walk(info, s, target)
+    end
+    if val >= 0
+      liveness_walk(info, s, val)
+    end
+    return
+  end
+
+  # Index assignment — walk base, index, value
+  if kind == node_constants::NODE_INDEX_ASSIGN
+    var base = ast::ast_get_left(s, node)
+    var idx = ast::ast_get_right(s, node)
+    var val = ast::ast_get_extra(s, node)
+    if base >= 0
+      liveness_walk(info, s, base)
+    end
+    if idx >= 0
+      liveness_walk(info, s, idx)
+    end
+    if val >= 0
+      liveness_walk(info, s, val)
+    end
+    return
+  end
+
+  # Field assignment — walk value (and base if it's an expression)
+  if kind == node_constants::NODE_FIELD_ASSIGN
+    var base = ast::ast_get_left(s, node)
+    var val = ast::ast_get_extra(s, node)
+    if base >= 0
+      liveness_walk(info, s, base)
+    end
+    if val >= 0
+      liveness_walk(info, s, val)
+    end
+    return
+  end
+
+  # Expression statement — walk inner expression
+  if kind == node_constants::NODE_EXPR_STMT
+    var inner = ast::ast_get_left(s, node)
+    if inner >= 0
+      liveness_walk(info, s, inner)
+    end
+    return
+  end
+
+  # Struct init — walk field initializer values
+  if kind == node_constants::NODE_STRUCT_INIT
+    var fields = ast::ast_get_children(s, node)
+    if fields != 0
+      var fc = vec_size(fields)
+      for fi in 0..fc
+        liveness_walk(info, s, fields[fi])
+      end
+    end
+    # C.1 spread base lives in `lefts` until tc desugar.
+    var su_base = ast::ast_get_left(s, node)
+    if su_base > 0
+      liveness_walk(info, s, su_base)
+    end
+    return
+  end
+
+  # Spread operator — walk inner
+  if kind == node_constants::NODE_SPREAD
+    liveness_walk(info, s, ast::ast_get_left(s, node))
+    return
+  end
+
+  # Array literal — walk elements
+  if kind == node_constants::NODE_ARRAY or kind == node_constants::NODE_TUPLE_LITERAL
+    var elems = ast::ast_get_children(s, node)
+    if elems != 0
+      var ec = vec_size(elems)
+      for ei in 0..ec
+        liveness_walk(info, s, elems[ei])
+      end
+    end
+    return
+  end
+
+  # Interpolated string — walk parts
+  if kind == node_constants::NODE_INTERP_STRING
+    var parts = ast::ast_get_children(s, node)
+    if parts != 0
+      var pc = vec_size(parts)
+      for pi in 0..pc
+        liveness_walk(info, s, parts[pi])
+      end
+    end
+    return
+  end
+
+  # Lambda — walk body (params are new bindings, not uses)
+  if kind == node_constants::NODE_LAMBDA
+    var body = ast::ast_get_right(s, node)
+    if body >= 0
+      liveness_walk(info, s, body)
+    end
+    return
+  end
+
+  # Func ref (&name) — record as use of the referenced binding
+  if kind == node_constants::NODE_FUNC_REF
+    var ref_name = ast::ast_get_str1(s, node)
+    liveness_record_use(info, ref_name, line, col)
+    return
+  end
+
+  # Projected data-borrow (&mut p.f / &p.f / &mut a[i]) — WS4 Step 0. The
+  # operand is a full place-expression subtree (NODE_FIELD_ACCESS / NODE_INDEX);
+  # walking it records the use of the borrowed BASE binding (the field/index
+  # walk descends to the base NODE_IDENT). GATE-0-INERT: never constructed for
+  # the current corpus (no first-party `&mut p.f`).
+  if kind == node_constants::NODE_BORROW
+    var borrow_place = ast::ast_get_left(s, node)
+    if borrow_place >= 0
+      liveness_walk(info, s, borrow_place)
+    end
+    return
+  end
+
+  # Defer — walk body
+  if kind == node_constants::NODE_DEFER
+    var body = ast::ast_get_left(s, node)
+    if body >= 0
+      liveness_walk(info, s, body)
+    end
+    return
+  end
+
+  # Try expression — walk inner
+  if kind == node_constants::NODE_TRY_EXPR
+    var inner = ast::ast_get_left(s, node)
+    if inner >= 0
+      liveness_walk(info, s, inner)
+    end
+    return
+  end
+
+  # Function definition (nested) — skip (has its own scope)
+  if kind == node_constants::NODE_FUNCTION
+    return
+  end
+
+  # All other node types — skip (conservative: don't walk unknown structures)
+  # Unhandled nodes won't contribute to liveness, which is safe because
+  # NLL is strictly more permissive — unknown means "assume still live".
+end
+
+
+## Analyze all functions collected by the resolver plus main module functions.
+## Called from quartz.qz Phase 4.2.
+def analyze_all(all_funcs: Vec<ResolverEntry>, main_ast: ast::AstStorage, root: Int): Void
+  # Reset globals for fresh analysis
+  g_func_handles = vec_new()
+  g_func_infos = vec_new()
+  g_current_info = vec_new()
+  g_current_analyzed = vec_new()
+
+  # Analyze main module functions only.
+  # Imported library functions don't need NLL (their borrows are handled
+  # at call sites via ephemeral release, not by liveness analysis).
+  if root >= 0
+    var items = ast::ast_get_children(main_ast, root)
+    if items != 0
+      var ic = vec_size(items)
+      for j in 0..ic
+        var item = items[j]
+        var kind = ast::ast_get_kind(main_ast, item)
+        if kind == node_constants::NODE_FUNCTION
+          var info = analyze_function(main_ast, item)
+          liveness_register(item, info)
+        end
+      end
+    end
+  end
+end

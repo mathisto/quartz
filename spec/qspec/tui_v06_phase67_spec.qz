@@ -1,0 +1,340 @@
+## QSpec coverage for v0.6 Phase 6.7 — Tier A reimplemented on Tier B.
+##
+## Phase 6.7 collapses the pre-v0.6.7 `Style.render(text)` String pipeline
+## onto the v0.6 cell-engine emitters: a styled string becomes a
+## `Vec<Cell>` (built by `cl::style_to_cells`) which is then rendered to
+## an inline ANSI escape String by `cl::cells_render_inline`. This spec
+## proves:
+##
+##   - The Tier-B route produces byte-identical output to the pre-6.7
+##     `Style.render` (covered indirectly: `style_spec.qz`'s 35 tests
+##     stay green; covered directly here for representative inputs).
+##   - `cells_render_inline` collapses single-style runs to one combined
+##     SGR prefix + concatenated egcs + one reset (matches Style's
+##     pre-6.7 byte format).
+##   - `cells_render_inline` correctly emits SGR transitions for
+##     heterogeneous-style runs (reset + new prefix between styles).
+##   - `style_to_cells` builds correct cell sequences: one cell per
+##     input byte, all sharing the same (fg, bg, attrs).
+##   - `plane_render_inline` round-trips single-row planes through
+##     `cells_render_inline` and stitches multi-row planes with `\n`.
+##   - Every depth path (0 / 16 / 256 / 16777216) lands the right
+##     bytes via the new emitter.
+##   - Color encoding (RGB_FLAG, color_is_rgb, color_r/g/b, the three
+##     degradation helpers) round-trips correctly through cell.qz.
+##
+## See `docs/design/TUI_V06_CELL_ENGINE.md` Phase 6.7 for the
+## "Tier A on Tier B" rationale.
+
+import * from qspec
+import std/tui/cell as cl
+import std/tui/plane as pl
+import style
+
+def main(): Int
+
+  # ============================================================
+  # Tier-A round-trip — Style.render byte-identity through Cell
+  # ============================================================
+  describe("phase 6.7 — Tier A on Tier B byte-identity") do ->
+    it("empty Style passes text through unchanged at every depth") do ->
+      var s = Style.new()
+      assert_eq_str(s.render_at("hello", 0), "hello")
+      assert_eq_str(s.render_at("hello", 16), "hello")
+      assert_eq_str(s.render_at("hello", 256), "hello")
+      assert_eq_str(s.render_at("hello", 16777216), "hello")
+    end
+
+    it("bold + red at depth 16 → \\x1b[1;31mtext\\x1b[0m") do ->
+      var s = Style.new().bold().fg(Red())
+      assert_eq_str(s.render_at("x", 16), "\x1b[1;31mx\x1b[0m")
+    end
+
+    it("bold + italic + underline + green-fg + black-bg → 1;3;4;32;40") do ->
+      var s = Style.new().bold().italic().underline().fg(Green()).bg(Black())
+      assert_eq_str(s.render_at("x", 16), "\x1b[1;3;4;32;40mx\x1b[0m")
+    end
+
+    it("RGB orange truecolor → 38;2;255;128;0") do ->
+      var s = Style.new().fg(rgb_color(255, 128, 0))
+      assert_eq_str(s.render_at("x", 16777216), "\x1b[38;2;255;128;0mx\x1b[0m")
+    end
+
+    it("RGB orange degrades to 256 cube index 214 at depth 256") do ->
+      # (255, 128, 0) → ri=5, gi=3, bi=0 → 16 + 36*5 + 6*3 + 0 = 214 (Orange1)
+      var s = Style.new().fg(rgb_color(255, 128, 0))
+      assert_eq_str(s.render_at("x", 256), "\x1b[38;5;214mx\x1b[0m")
+    end
+
+    it("RGB orange degrades to bright yellow (93) at depth 16") do ->
+      # lum=151 (bright), max_c=255, dominant=red+green-strong → base 3 (yellow) + 8 = 11 → 93
+      var s = Style.new().fg(rgb_color(255, 128, 0))
+      assert_eq_str(s.render_at("x", 16), "\x1b[93mx\x1b[0m")
+    end
+
+    it("multi-byte text emits one combined SGR + concatenated egcs + one reset") do ->
+      var s = Style.new().bold().fg(Cyan())
+      assert_eq_str(s.render_at("hello", 16), "\x1b[1;36mhello\x1b[0m")
+    end
+
+    it("Style.heading() preset = bold + underline + cyan = 1;4;36") do ->
+      var s = Style.heading()
+      assert_eq_str(s.render_at("KEYS", 16), "\x1b[1;4;36mKEYS\x1b[0m")
+    end
+
+    it("depth 0 returns bare text even for fully-styled Style") do ->
+      var s = Style.new().bold().fg(Red()).bg(Yellow())
+      assert_eq_str(s.render_at("x", 0), "x")
+    end
+  end
+
+  # ============================================================
+  # cl::style_to_cells — Tier-A → Tier-B bridge
+  # ============================================================
+  describe("cl::style_to_cells") do ->
+    it("empty text → empty cell vec") do ->
+      var cells = cl::style_to_cells("", -1, -1, 0)
+      assert_eq(cells.size, 0)
+    end
+
+    it("'abc' with no style → 3 cells, each default fg/bg, attrs=0") do ->
+      var cells = cl::style_to_cells("abc", -1, -1, 0)
+      assert_eq(cells.size, 3)
+      var c0: cl::Cell = cells[0]
+      assert_eq_str(c0.egc, "a")
+      var fg0: cl::Channel = c0.fg
+      var bg0: cl::Channel = c0.bg
+      if fg0.default_color
+        assert_eq(1, 1)
+      else
+        assert_eq(0, 1)
+      end
+      if bg0.default_color
+        assert_eq(1, 1)
+      else
+        assert_eq(0, 1)
+      end
+      assert_eq(c0.attrs, 0)
+    end
+
+    it("all cells share the same (fg, bg, attrs)") do ->
+      var cells = cl::style_to_cells("xyz", Red(), Black(), cl::CELL_ATTR_BOLD())
+      assert_eq(cells.size, 3)
+      var c0: cl::Cell = cells[0]
+      var c2: cl::Cell = cells[2]
+      var c0fg: cl::Channel = c0.fg
+      var c2fg: cl::Channel = c2.fg
+      var c0bg: cl::Channel = c0.bg
+      var c2bg: cl::Channel = c2.bg
+      assert_eq(c0fg.color, c2fg.color)
+      assert_eq(c0bg.color, c2bg.color)
+      assert_eq(c0.attrs, c2.attrs)
+      assert_eq(c0.attrs, cl::CELL_ATTR_BOLD())
+    end
+  end
+
+  # ============================================================
+  # cl::cells_render_inline — direct emitter behavior
+  # ============================================================
+  describe("cl::cells_render_inline") do ->
+    it("empty cell vec → empty String") do ->
+      var cells = vec_new<cl::Cell>()
+      assert_eq_str(cl::cells_render_inline(cells, 16), "")
+    end
+
+    it("depth 0 → bare egcs concatenated") do ->
+      var cells = cl::style_to_cells("hi", Red(), -1, cl::CELL_ATTR_BOLD())
+      assert_eq_str(cl::cells_render_inline(cells, 0), "hi")
+    end
+
+    it("uniform-style run collapses to one SGR + content + reset") do ->
+      var cells = cl::style_to_cells("ok", Green(), -1, cl::CELL_ATTR_BOLD())
+      assert_eq_str(cl::cells_render_inline(cells, 16), "\x1b[1;32mok\x1b[0m")
+    end
+
+    it("default-color cell with no attrs emits no SGR") do ->
+      var cells = cl::style_to_cells("plain", -1, -1, 0)
+      assert_eq_str(cl::cells_render_inline(cells, 16), "plain")
+    end
+
+    it("heterogeneous style emits reset + new prefix between transitions") do ->
+      var cells = vec_new<cl::Cell>()
+      var c1 = cl::style_to_cells("a", Red(), -1, 0)
+      var c2 = cl::style_to_cells("b", Blue(), -1, 0)
+      cells.push(c1[0])
+      cells.push(c2[0])
+      # Expected: ESC[31m a ESC[0m ESC[34m b ESC[0m
+      assert_eq_str(cl::cells_render_inline(cells, 16), "\x1b[31ma\x1b[0m\x1b[34mb\x1b[0m")
+    end
+
+    it("background color emits 40-series codes at depth 16") do ->
+      var cells = cl::style_to_cells("x", -1, Yellow(), 0)
+      assert_eq_str(cl::cells_render_inline(cells, 16), "\x1b[43mx\x1b[0m")
+    end
+
+    it("RGB bg degraded to 256 cube emits 48;5;39 (sky-blue)") do ->
+      # (0, 128, 255) → ri=0, gi=3, bi=5 → 16 + 0 + 18 + 5 = 39 (DeepSkyBlue1)
+      var cells = cl::style_to_cells("x", -1, rgb_color(0, 128, 255), 0)
+      assert_eq_str(cl::cells_render_inline(cells, 256), "\x1b[48;5;39mx\x1b[0m")
+    end
+  end
+
+  # ============================================================
+  # cl::cell_render_inline — single-cell convenience
+  # ============================================================
+  describe("cl::cell_render_inline") do ->
+    it("single bold-red cell → matches uniform-run output") do ->
+      var cells = cl::style_to_cells("X", Red(), -1, cl::CELL_ATTR_BOLD())
+      var c0: cl::Cell = cells[0]
+      assert_eq_str(cl::cell_render_inline(c0, 16), "\x1b[1;31mX\x1b[0m")
+    end
+  end
+
+  # ============================================================
+  # pl::plane_render_inline — Plane → ANSI String
+  # ============================================================
+  describe("pl::plane_render_inline") do ->
+    it("blank single-row plane → spaces, no SGR") do ->
+      var p = pl::plane_create(3, 1)
+      assert_eq_str(pl::plane_render_inline(p, 16), "   ")
+    end
+
+    it("empty plane (h=0) → empty String") do ->
+      var p = pl::plane_create(5, 0)
+      assert_eq_str(pl::plane_render_inline(p, 16), "")
+    end
+
+    it("single-row styled plane round-trips to inline ANSI") do ->
+      var p = pl::plane_create(2, 1)
+      var c1 = cl::Cell {
+        egc:   "a",
+        fg:    cl::channel_rgb(Red()),
+        bg:    cl::channel_default(),
+        attrs: cl::CELL_ATTR_BOLD()
+      }
+      var c2 = cl::Cell {
+        egc:   "b",
+        fg:    cl::channel_rgb(Red()),
+        bg:    cl::channel_default(),
+        attrs: cl::CELL_ATTR_BOLD()
+      }
+      p = pl::plane_putc(p, 0, 0, c1)
+      p = pl::plane_putc(p, 1, 0, c2)
+      assert_eq_str(pl::plane_render_inline(p, 16), "\x1b[1;31mab\x1b[0m")
+    end
+
+    it("multi-row plane stitches rows with \\n; each row resets independently") do ->
+      var p = pl::plane_create(1, 2)
+      var ca = cl::Cell {
+        egc:   "A",
+        fg:    cl::channel_rgb(Red()),
+        bg:    cl::channel_default(),
+        attrs: 0
+      }
+      var cb = cl::Cell {
+        egc:   "B",
+        fg:    cl::channel_rgb(Blue()),
+        bg:    cl::channel_default(),
+        attrs: 0
+      }
+      p = pl::plane_putc(p, 0, 0, ca)
+      p = pl::plane_putc(p, 0, 1, cb)
+      # Expected: ESC[31m A ESC[0m \n ESC[34m B ESC[0m
+      assert_eq_str(pl::plane_render_inline(p, 16), "\x1b[31mA\x1b[0m\n\x1b[34mB\x1b[0m")
+    end
+
+    it("depth 0 → bare egcs + newlines only") do ->
+      var p = pl::plane_create(2, 2)
+      var ca = cl::Cell {
+        egc:   "A",
+        fg:    cl::channel_rgb(Red()),
+        bg:    cl::channel_default(),
+        attrs: cl::CELL_ATTR_BOLD()
+      }
+      p = pl::plane_putc(p, 0, 0, ca)
+      p = pl::plane_putc(p, 1, 0, ca)
+      p = pl::plane_putc(p, 0, 1, ca)
+      p = pl::plane_putc(p, 1, 1, ca)
+      assert_eq_str(pl::plane_render_inline(p, 0), "AA\nAA")
+    end
+  end
+
+  # ============================================================
+  # Color encoding helpers — RGB_FLAG / color_is_rgb / color_r/g/b
+  # ============================================================
+  describe("cl color encoding helpers") do ->
+    it("RGB_FLAG round-trip: rgb_color(255, 128, 0) is_rgb true") do ->
+      var c = rgb_color(255, 128, 0)
+      if cl::color_is_rgb(c)
+        assert_eq(1, 1)
+      else
+        assert_eq(0, 1)
+      end
+      assert_eq(cl::color_r(c), 255)
+      assert_eq(cl::color_g(c), 128)
+      assert_eq(cl::color_b(c), 0)
+    end
+
+    it("ANSI 16 indices are not is_rgb") do ->
+      if cl::color_is_rgb(Red())
+        assert_eq(0, 1)
+      else
+        assert_eq(1, 1)
+      end
+      if cl::color_is_rgb(15)
+        assert_eq(0, 1)
+      else
+        assert_eq(1, 1)
+      end
+    end
+
+    it("256-palette indices are not is_rgb") do ->
+      if cl::color_is_rgb(202)
+        assert_eq(0, 1)
+      else
+        assert_eq(1, 1)
+      end
+    end
+  end
+
+  # ============================================================
+  # Color degradation helpers — rgb_to_ansi256 / 16 / ansi256_to_16
+  # ============================================================
+  describe("cl color degradation") do ->
+    it("rgb_to_ansi256(255, 128, 0) → 214 (Orange1 in 6×6×6 cube)") do ->
+      # ri=5, gi=3, bi=0 → 16 + 36*5 + 6*3 + 0 = 214
+      assert_eq(cl::rgb_to_ansi256(255, 128, 0), 214)
+    end
+
+    it("rgb_to_ansi256(128, 128, 128) → grayscale ramp index") do ->
+      var idx = cl::rgb_to_ansi256(128, 128, 128)
+      # 128 → ((128-8)*24)/240 + 232 = 244
+      assert_eq(idx, 244)
+    end
+
+    it("rgb_to_ansi16(255, 0, 0) → bright red 9 (luminance + max-channel heuristic)") do ->
+      assert_eq(cl::rgb_to_ansi16(255, 0, 0), 9)
+    end
+
+    it("rgb_to_ansi16(0, 0, 0) → black 0") do ->
+      assert_eq(cl::rgb_to_ansi16(0, 0, 0), 0)
+    end
+
+    it("rgb_to_ansi16(255, 255, 255) → white 15") do ->
+      assert_eq(cl::rgb_to_ansi16(255, 255, 255), 15)
+    end
+
+    it("ansi256_to_ansi16: 0-15 round-trip identity") do ->
+      assert_eq(cl::ansi256_to_ansi16(0), 0)
+      assert_eq(cl::ansi256_to_ansi16(7), 7)
+      assert_eq(cl::ansi256_to_ansi16(15), 15)
+    end
+
+    it("ansi256_to_ansi16: 232-255 grayscale ramp lands on 0/8/7/15") do ->
+      assert_eq(cl::ansi256_to_ansi16(232), 0)
+      assert_eq(cl::ansi256_to_ansi16(255), 15)
+    end
+  end
+
+  return qspec_main()
+end

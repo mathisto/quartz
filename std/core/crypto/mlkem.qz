@@ -1,0 +1,1194 @@
+## std/core/crypto/mlkem — Pure-Quartz ML-KEM-768 (FIPS 203)
+##
+## NET.3b. Module-Lattice KEM at the production parameter set
+## (n=256, q=3329, k=3, η₁=η₂=2, d_u=10, d_v=4) — the same set deployed
+## by Cloudflare (X25519MLKEM768), Apple iMessage PQ3, Signal PQXDH,
+## and Go's `crypto/mlkem`.
+##
+## Implementation strategy:
+##
+##   - Field Z/3329 — signed `Int` (i64 in Quartz) coefficients held in
+##     canonical range [0, q-1] at function boundaries. Barrett constant
+##     v = floor(2²⁶ / q) = 20159; the inner mul is `prod*v >> 26`,
+##     `r = prod - t*q`, one conditional subtract.
+##
+##   - Polynomial — 256-element flat buffer. The FIPS 203 reference and the
+##     MLKEM_DESIGN.md memo describe an i32-packed layout (`malloc(256*4)`).
+##     We deviate to **i64-per-coefficient (`malloc(256*8)`, 2048B)** for
+##     v1 — same algorithmic surface, simpler get/set, no sign-extension
+##     dance on every read. Bit-packed serialisation (Compress / ByteEncode)
+##     still emits the canonical 12-bit-per-coefficient wire format. The
+##     i32-packed in-memory layout is a perf follow-up; for v1 the
+##     readability win is worth the 2× memory footprint on a buffer that's
+##     never more than a few KB total.
+##
+##   - PolyVec (R_q^k for k=3) — 3 × 2048 = 6144B flat. Row-major.
+##
+##   - Matrix Â (R_q^{k×k}) — 9 × 2048 = 18432B flat. Row-major.
+##
+##   - NTT — Cooley-Tukey forward, Gentleman-Sande inverse, with the
+##     precomputed table ζ_table[i] = 17^BitRev7(i) mod q for i in 0..128.
+##     Table built lazily at first use; 128 × 8 = 1024B.
+##
+##   - Samplers — SampleNTT (rejection from SHAKE128) and SampleCBD_η=2
+##     (centered binomial from SHAKE256). Both stream through the sponge
+##     context API in std/core/crypto/sha3 so we don't materialise the
+##     full XOF output.
+##
+## What this file ships at each NET.3b sub-phase:
+##
+##   3b.1 (THIS):  Field arith, polynomial type, zeta table, NTT/INTT,
+##                  base-case mul, samplers, polyvec ops. NTT round-trip
+##                  + sampler determinism are the validation gate.
+##   3b.2:         Compress/Decompress, ByteEncode/ByteDecode, K-PKE
+##                  KeyGen/Encrypt/Decrypt + a K-PKE round-trip smoke.
+##   3b.3:         ML-KEM internal + randomised top-level wrappers, 100×
+##                  round-trip + tampered-ciphertext rejection.
+##   3b.4:         ACVP KAT runner (`tmp/acvp-mlkem/`).
+##   3b.5:         C2SP/CCTV negative tests (modulus, unlucky, strcmp).
+##
+## CT discipline (preview — full CT pass lands with NET.4 dudect):
+##   - Field ops are by-inspection CT. Barrett's conditional subtract
+##     is a value-dependent branch in v1; rewritten to masked-select
+##     ahead of NET.4.
+##   - SampleNTT iteration count is data-dependent — fine: input is
+##     public (ρ, i, j) per FIPS 203 §7.4.
+##   - SampleCBD inner ops are CT in the byte-level operations; the
+##     CBD output is also derived from a public PRF stream until used
+##     for ŝ/ê/y in KeyGen/Encrypt.
+##
+## Quartz-specific notes:
+##   - `>>` is ashr. For Barrett's `(prod * v) >> 26`, prod can be in
+##     [-q², q²] = [-2²⁴, 2²⁴]; prod*v fits in i64 with room to spare.
+##     ashr's behaviour matches lsr on non-negatives and floors on
+##     negatives — both correct for Barrett. The lsr-via-mask workaround
+##     from `feedback_curve25519_ashr_carry_extraction.md` is NOT
+##     needed here.
+##   - Per `docs/bugs/MULTILINE_BINARY_OPERATOR_SILENTLY_DROPPED.md`:
+##     keep XOR / OR / AND folds on a single line. The parser silently
+##     drops `\n^ expr` continuations.
+##
+## See:
+##   - FIPS 203 https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.203.pdf
+##   - docs/design/MLKEM_DESIGN.md "ML-KEM-768 internals"
+
+import * from ffi/socket                # malloc/free/memcpy/memset, ptr_read/write_byte
+import * from std/core/crypto/sha3      # SHAKE128/256 streaming + SHA3-256/512
+import * from std/core/crypto/secret    # Secret<Int> + secret_unwrap (NET.4.1)
+import * from std/core/crypto/subtle    # ct_eq_byte / ct_select_byte for impl-reject
+import * from std/crypto/rng            # entropy_fill for top-level randomised wrappers
+
+# =============================================================================
+# Parameters — ML-KEM-768
+# =============================================================================
+
+def MLKEM_Q(): Int = 3329          # field modulus
+def MLKEM_N(): Int = 256           # poly degree
+def MLKEM_K(): Int = 3             # module rank (k=3 for ML-KEM-768)
+def MLKEM_ETA1(): Int = 2          # CBD parameter for s, e
+def MLKEM_ETA2(): Int = 2          # CBD parameter for e1, e2
+def MLKEM_DU(): Int = 10           # u-component compression bits
+def MLKEM_DV(): Int = 4            # v-component compression bits
+
+# Sizes (FIPS 203 §8 Table 3). Exposed for callers + audit.
+def MLKEM768_EK_BYTES(): Int = 1184       # 384*k + 32
+def MLKEM768_DK_BYTES(): Int = 2400       # 768*k + 96 (expanded form)
+def MLKEM768_DK_SEED_BYTES(): Int = 64    # 32 (d) + 32 (z) — Filippo-form
+def MLKEM768_CT_BYTES(): Int = 1088       # 32*(du*k + dv) = 32*(30 + 4)
+def MLKEM768_SS_BYTES(): Int = 32
+
+# Barrett reduction constant: floor(2^26 / 3329) = 20158.
+#
+# Inlined into _zq_mul to avoid function-call overhead in the NTT inner loop.
+# Most reference impls (Kyber pq-crystals, RustCrypto, CIRCL) carry v = 20159
+# but pair it with a ROUND-Barrett `t = (prod*v + (1<<25)) >> 26` and tolerate
+# a result in (-q, q] that gets canonicalised at specific call sites. We use
+# FLOOR-Barrett — simpler audit — so the constant is the true floor of
+# 2^26 / q, which is 20158. With v=20158 and prod ≤ (q-1)², t ≤ floor(prod/q),
+# so r = prod − t·q ∈ [0, 2q); one conditional subtract canonicalises.
+
+# =============================================================================
+# Z/3329 field arithmetic
+# =============================================================================
+#
+# All ops take inputs in canonical [0, q-1] and produce outputs in canonical
+# [0, q-1] unless otherwise noted. Internal callers can pass non-canonical
+# inputs only to _zq_reduce / _zq_mul; _zq_add / _zq_sub assume canonical.
+
+# Reduce a signed value of any magnitude (fitting in i64) to canonical [0, q-1].
+# Uses Quartz's `%` operator (C-style truncate-toward-zero on Int), then a
+# single conditional add. Faster paths for the canonical-input mul are below.
+def _zq_reduce(x: Int): Int
+  var r = x % 3329
+  if r < 0 then r = r + 3329 end
+  return r
+end
+
+# Canonical add: assumes a, b in [0, q-1]; result in [0, q-1].
+def _zq_add(a: Int, b: Int): Int
+  var r = a + b
+  if r >= 3329 then r = r - 3329 end
+  return r
+end
+
+# Canonical sub: assumes a, b in [0, q-1]; result in [0, q-1].
+def _zq_sub(a: Int, b: Int): Int
+  var r = a - b
+  if r < 0 then r = r + 3329 end
+  return r
+end
+
+# Canonical mul via floor-Barrett. Assumes a, b in [0, q-1]; result in [0, q-1].
+# With v=20158 and prod ≤ (q-1)², the Barrett t never over-estimates floor(prod/q)
+# so r = prod − t·q is in [0, 2q) and one conditional subtract canonicalises.
+def _zq_mul(a: Int, b: Int): Int
+  var prod = a * b                       # in [0, (q-1)²] ≈ 2²⁴
+  var t = (prod * 20158) >> 26           # ≤ floor(prod/q); ashr ≡ lsr for non-neg
+  var r = prod - t * 3329                # in [0, 2q)
+  if r >= 3329 then r = r - 3329 end
+  return r
+end
+
+# =============================================================================
+# Bit-reversal helper for ζ-table indexing
+# =============================================================================
+
+# Reverse the low 7 bits of x. Used to convert sequential indices to the
+# bit-reversed order ζ-table layout. FIPS 203 §A.4 BitRev_7.
+def _bitrev7(x: Int): Int
+  var r = 0
+  if (x & 1)  != 0 then r = r | 64 end
+  if (x & 2)  != 0 then r = r | 32 end
+  if (x & 4)  != 0 then r = r | 16 end
+  if (x & 8)  != 0 then r = r | 8  end
+  if (x & 16) != 0 then r = r | 4  end
+  if (x & 32) != 0 then r = r | 2  end
+  if (x & 64) != 0 then r = r | 1  end
+  return r
+end
+
+# =============================================================================
+# ζ table — 128 entries of 17^BitRev7(i) mod q
+# =============================================================================
+#
+# Built lazily on first use. Sanity-checked against FIPS 203 reference:
+# zeta_table[0..5] = [1, 1729, 2580, 3289, 2642, 630].
+
+var _zeta_table_ptr: Int = 0
+
+def _ensure_zeta_table(): Int
+  if _zeta_table_ptr != 0
+    return _zeta_table_ptr
+  end
+
+  # First build zpow[i] = 17^i mod q for i in 0..128.
+  var zpow = malloc(128 * 8)
+  ptr_write_byte(zpow, 1)                # zpow[0] = 1 in the low byte
+  var i = 1
+  while i < 128
+    # We treat each 8-byte slot as a little-endian i64. Since values are
+    # small (< 3329), we just read/write the slot as an Int via memcpy
+    # would work — but we're already in malloc territory; do it explicitly.
+    var prev_off = (i - 1) * 8
+    var prev = _slot_get_i64(zpow, prev_off)
+    var cur = (prev * 17) % 3329
+    _slot_set_i64(zpow, i * 8, cur)
+    i += 1
+  end
+
+  # Then zeta_table[i] = zpow[BitRev7(i)].
+  var t = malloc(128 * 8)
+  i = 0
+  while i < 128
+    var br = _bitrev7(i)
+    _slot_set_i64(t, i * 8, _slot_get_i64(zpow, br * 8))
+    i += 1
+  end
+  free(zpow)
+
+  _zeta_table_ptr = t
+  return t
+end
+
+# Read an Int from a malloc'd 8-byte slot (little-endian).
+def _slot_get_i64(base: Int, off: Int): Int
+  var p = base + off
+  var b0 = ptr_read_byte(p)
+  var b1 = ptr_read_byte(p + 1)
+  var b2 = ptr_read_byte(p + 2)
+  var b3 = ptr_read_byte(p + 3)
+  var b4 = ptr_read_byte(p + 4)
+  var b5 = ptr_read_byte(p + 5)
+  var b6 = ptr_read_byte(p + 6)
+  var b7 = ptr_read_byte(p + 7)
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+end
+
+# Write an Int to a malloc'd 8-byte slot (little-endian). Values fit in i64.
+def _slot_set_i64(base: Int, off: Int, v: Int): Void
+  var p = base + off
+  ptr_write_byte(p,     v & 255)
+  ptr_write_byte(p + 1, ((v >> 8)  & 255))
+  ptr_write_byte(p + 2, ((v >> 16) & 255))
+  ptr_write_byte(p + 3, ((v >> 24) & 255))
+  ptr_write_byte(p + 4, ((v >> 32) & 255))
+  ptr_write_byte(p + 5, ((v >> 40) & 255))
+  ptr_write_byte(p + 6, ((v >> 48) & 255))
+  ptr_write_byte(p + 7, ((v >> 56) & 255))
+end
+
+def _zeta(i: Int): Int
+  return _slot_get_i64(_ensure_zeta_table(), i * 8)
+end
+
+# =============================================================================
+# Polynomial type — 256 i64 coefficients (2048 bytes)
+# =============================================================================
+#
+# Coefficients held in canonical [0, q-1] at function boundaries. Storage is
+# malloc'd; ownership is caller's. Reuse buffers across calls to avoid heap
+# churn in the hot KEM path.
+
+def _POLY_BYTES(): Int = 2048   # 256 * 8
+
+def _poly_new(): Int
+  var p = malloc(2048)
+  memset(p, 0, 2048)
+  return p
+end
+
+def _poly_free(p: Int): Void = free(p)
+
+def _poly_get(p: Int, i: Int): Int = _slot_get_i64(p, i * 8)
+def _poly_set(p: Int, i: Int, v: Int): Void = _slot_set_i64(p, i * 8, v)
+
+def _poly_copy(dst: Int, src: Int): Void = memcpy(dst, src, 2048)
+
+def _poly_zero(p: Int): Void = memset(p, 0, 2048)
+
+# Canonicalise: bring every coefficient into [0, q-1]. Use after any series of
+# raw arithmetic where intermediates may have drifted out of canonical range.
+def _poly_canonicalise(p: Int): Void
+  var i = 0
+  while i < 256
+    _poly_set(p, i, _zq_reduce(_poly_get(p, i)))
+    i += 1
+  end
+end
+
+# Add two polynomials componentwise into `dst`. dst, a, b may alias.
+def _poly_add(dst: Int, a: Int, b: Int): Void
+  var i = 0
+  while i < 256
+    _poly_set(dst, i, _zq_add(_poly_get(a, i), _poly_get(b, i)))
+    i += 1
+  end
+end
+
+def _poly_sub(dst: Int, a: Int, b: Int): Void
+  var i = 0
+  while i < 256
+    _poly_set(dst, i, _zq_sub(_poly_get(a, i), _poly_get(b, i)))
+    i += 1
+  end
+end
+
+# =============================================================================
+# NTT — Cooley-Tukey forward (FIPS 203 Algorithm 9)
+# =============================================================================
+#
+# In-place over the polynomial buffer. Reads ζ values from the precomputed
+# table.
+
+def _poly_ntt(p: Int): Void
+  _ensure_zeta_table()
+  var k = 1
+  var len = 128
+  while len >= 2
+    var start = 0
+    while start < 256
+      var zeta = _zeta(k)
+      k = k + 1
+      var j = start
+      while j < start + len
+        var t = _zq_mul(zeta, _poly_get(p, j + len))
+        _poly_set(p, j + len, _zq_sub(_poly_get(p, j), t))
+        _poly_set(p, j,       _zq_add(_poly_get(p, j), t))
+        j = j + 1
+      end
+      start = start + 2 * len
+    end
+    len = len / 2
+  end
+end
+
+# =============================================================================
+# INTT — Gentleman-Sande inverse (FIPS 203 Algorithm 10)
+# =============================================================================
+#
+# In-place. k descends from 127 to 1. Final pass multiplies every coefficient
+# by 128^-1 mod q = 3303.
+
+def _poly_intt(p: Int): Void
+  _ensure_zeta_table()
+  var k = 127
+  var len = 2
+  while len <= 128
+    var start = 0
+    while start < 256
+      var zeta = _zeta(k)
+      k = k - 1
+      var j = start
+      while j < start + len
+        var t = _poly_get(p, j)
+        _poly_set(p, j,       _zq_add(t, _poly_get(p, j + len)))
+        _poly_set(p, j + len, _zq_mul(zeta, _zq_sub(_poly_get(p, j + len), t)))
+        j = j + 1
+      end
+      start = start + 2 * len
+    end
+    len = len * 2
+  end
+
+  # Scale by 128^-1 mod q = 3303.
+  var i = 0
+  while i < 256
+    _poly_set(p, i, _zq_mul(_poly_get(p, i), 3303))
+    i += 1
+  end
+end
+
+# =============================================================================
+# Base-case multiply in the NTT domain (FIPS 203 Algorithm 11 + 12)
+# =============================================================================
+#
+# In R_q under the NTT representation, multiplication is not pointwise — it's
+# a polynomial multiplication mod (X² - γ_i) for each of the 128 length-2
+# pairs (a_2i + a_{2i+1}·X)(b_2i + b_{2i+1}·X) mod (X² - γ_i), where
+# γ_i = ζ^(2·BitRev7(i) + 1).
+#
+# Algorithm 12 BaseCaseMultiply(a₀, a₁, b₀, b₁, γ):
+#   c₀ = a₀ b₀ + a₁ b₁ γ
+#   c₁ = a₀ b₁ + a₁ b₀
+
+# Pointwise-mul-in-NTT-domain: dst = a * b. dst, a, b may alias.
+#
+# Under the NTT representation a polynomial is a sequence of 128 length-2
+# pairs, each living in a quadratic extension Z_q[X]/(X² − γ_i) where
+# γ_i = ζ^(2·BitRev7(i) + 1). Multiplication is therefore not pointwise but
+# a pairwise mul-in-extension via FIPS 203 Algorithm 12.
+def _poly_basemul(dst: Int, a: Int, b: Int): Void
+  _ensure_gamma_table()
+  var i = 0
+  while i < 128
+    var a0 = _poly_get(a, 2 * i)
+    var a1 = _poly_get(a, 2 * i + 1)
+    var b0 = _poly_get(b, 2 * i)
+    var b1 = _poly_get(b, 2 * i + 1)
+    var gamma = _gamma(i)
+    var c0 = _zq_add(_zq_mul(a0, b0), _zq_mul(_zq_mul(a1, b1), gamma))
+    var c1 = _zq_add(_zq_mul(a0, b1), _zq_mul(a1, b0))
+    _poly_set(dst, 2 * i,     c0)
+    _poly_set(dst, 2 * i + 1, c1)
+    i += 1
+  end
+end
+
+# γ_i = ζ^(2·BitRev7(i) + 1) mod q. Lazy-init alongside ζ table.
+# Storage: 128 × 8 bytes.
+
+var _gamma_table_ptr: Int = 0
+
+def _ensure_gamma_table(): Int
+  if _gamma_table_ptr != 0
+    return _gamma_table_ptr
+  end
+  # Build zpow[0..256] of 17^i mod q (need exponents up to 2·127 + 1 = 255).
+  var zpow = malloc(256 * 8)
+  _slot_set_i64(zpow, 0, 1)
+  var i = 1
+  while i < 256
+    var cur = (_slot_get_i64(zpow, (i - 1) * 8) * 17) % 3329
+    _slot_set_i64(zpow, i * 8, cur)
+    i += 1
+  end
+  var t = malloc(128 * 8)
+  i = 0
+  while i < 128
+    var exp = 2 * _bitrev7(i) + 1
+    _slot_set_i64(t, i * 8, _slot_get_i64(zpow, exp * 8))
+    i += 1
+  end
+  free(zpow)
+  _gamma_table_ptr = t
+  return t
+end
+
+def _gamma(i: Int): Int = _slot_get_i64(_ensure_gamma_table(), i * 8)
+
+# =============================================================================
+# Polynomial-vector ops (R_q^k, k=3)
+# =============================================================================
+#
+# Stored as 3 contiguous polys = 6144 bytes. Index i selects the i-th poly's
+# 2048-byte sub-buffer.
+
+def _POLYVEC_BYTES(): Int = 6144   # 3 * 2048
+
+def _polyvec_new(): Int
+  var p = malloc(6144)
+  memset(p, 0, 6144)
+  return p
+end
+
+def _polyvec_free(v: Int): Void = free(v)
+
+# Pointer to the i-th poly of a polyvec.
+def _polyvec_at(v: Int, i: Int): Int = v + i * 2048
+
+def _polyvec_ntt(v: Int): Void
+  var i = 0
+  while i < 3
+    _poly_ntt(_polyvec_at(v, i))
+    i += 1
+  end
+end
+
+def _polyvec_intt(v: Int): Void
+  var i = 0
+  while i < 3
+    _poly_intt(_polyvec_at(v, i))
+    i += 1
+  end
+end
+
+def _polyvec_add(dst: Int, a: Int, b: Int): Void
+  var i = 0
+  while i < 3
+    _poly_add(_polyvec_at(dst, i), _polyvec_at(a, i), _polyvec_at(b, i))
+    i += 1
+  end
+end
+
+# Inner product in the NTT domain: dot = Σ a_i ⋆ b_i (using basemul).
+# `tmp` is a caller-provided scratch poly so we don't re-malloc per call.
+def _polyvec_basemul_acc(dst: Int, a: Int, b: Int, tmp: Int): Void
+  _poly_zero(dst)
+  var i = 0
+  while i < 3
+    _poly_basemul(tmp, _polyvec_at(a, i), _polyvec_at(b, i))
+    _poly_add(dst, dst, tmp)
+    i += 1
+  end
+end
+
+# =============================================================================
+# SampleNTT — rejection sampler from a SHAKE128 stream (FIPS 203 Algorithm 7)
+# =============================================================================
+#
+# Output is a polynomial in the NTT domain. Input is the SHAKE128 context
+# already initialised + absorbed + finalize_absorb'd — caller controls the
+# seed. We consume 3 bytes at a time and produce up to 2 candidates per
+# 3 bytes; accept those that are < q.
+
+def _sample_ntt(dst_poly: Int, shake128_ctx: Int): Void
+  var n_accepted = 0
+  var triple = malloc(3)
+  while n_accepted < 256
+    shake128_squeeze(shake128_ctx, triple, 3)
+    var b0 = ptr_read_byte(triple)
+    var b1 = ptr_read_byte(triple + 1)
+    var b2 = ptr_read_byte(triple + 2)
+    var d1 = b0 | ((b1 & 15) << 8)             # 0x0F
+    var d2 = (b1 >> 4) | (b2 << 4)
+    if d1 < 3329
+      _poly_set(dst_poly, n_accepted, d1)
+      n_accepted = n_accepted + 1
+    end
+    if n_accepted < 256 and d2 < 3329
+      _poly_set(dst_poly, n_accepted, d2)
+      n_accepted = n_accepted + 1
+    end
+  end
+  free(triple)
+end
+
+# Helper: build a SHAKE128 context, absorb (ρ || j || i) for the matrix-A
+# sampler, finalize, and call _sample_ntt. Caller owns dst_poly; we free
+# the context. j and i are the matrix indices as bytes.
+def _sample_ntt_for_matrix(dst_poly: Int, rho_32: Int, j: Int, i: Int): Void
+  var ctx = shake128_new()
+  shake128_absorb(ctx, rho_32, 32)
+  var jb = malloc(1)
+  ptr_write_byte(jb, j)
+  shake128_absorb(ctx, jb, 1)
+  ptr_write_byte(jb, i)
+  shake128_absorb(ctx, jb, 1)
+  shake128_finalize_absorb(ctx)
+  _sample_ntt(dst_poly, ctx)
+  shake128_free(ctx)
+  free(jb)
+end
+
+# =============================================================================
+# SampleCBD_η — centered binomial sampler (FIPS 203 Algorithm 8)
+# =============================================================================
+#
+# Input is 64·η bytes from a PRF (SHAKE256(σ || N) for ML-KEM-768). Output is
+# a polynomial with coefficients in {-η, ..., η}, then reduced mod q to
+# canonical form.
+#
+# For η = 2 (the only value used by ML-KEM-768): 128 bytes in → 256 coefficients out.
+# Each coefficient consumes 4 bits = (a₁ + a₂) - (b₁ + b₂) where bits are
+# bit[4i..4i+3] of the input stream.
+
+def _sample_cbd_eta2(dst_poly: Int, src_bytes: Int): Void
+  # We process 256 coefficients in groups of 2 (one byte = 4 bits/coeff × 2 coeffs).
+  var i = 0
+  while i < 64
+    # bytes [2i..2i+1] contribute 16 bits / 4 bits per coeff = 4 coefficients
+    var i0 = ptr_read_byte(src_bytes + 2 * i)
+    var i1 = ptr_read_byte(src_bytes + 2 * i + 1)
+    var packed = i0 | (i1 << 8)
+    var coeff_in_chunk = 0
+    while coeff_in_chunk < 4
+      var bit_off = coeff_in_chunk * 4
+      # Two bits for a, two bits for b.
+      var a = ((packed >> bit_off) & 1) + ((packed >> (bit_off + 1)) & 1)
+      var b = ((packed >> (bit_off + 2)) & 1) + ((packed >> (bit_off + 3)) & 1)
+      var c = a - b
+      # Canonical reduction: c ∈ {-2, -1, 0, 1, 2}.
+      if c < 0 then c = c + 3329 end
+      _poly_set(dst_poly, 4 * i + coeff_in_chunk, c)
+      coeff_in_chunk += 1
+    end
+    i += 1
+  end
+end
+
+# Helper: derive the PRF stream from (σ, N) and sample η=2 CBD into dst.
+# σ is 32 bytes; N is a single byte counter.
+def _sample_cbd_from_seed(dst_poly: Int, sigma_32: Int, n_byte: Int): Void
+  var stream = malloc(128)   # 64 * η = 64 * 2
+  var ctx = shake256_new()
+  shake256_absorb(ctx, sigma_32, 32)
+  var nb = malloc(1)
+  ptr_write_byte(nb, n_byte)
+  shake256_absorb(ctx, nb, 1)
+  shake256_finalize_absorb(ctx)
+  shake256_squeeze(ctx, stream, 128)
+  shake256_free(ctx)
+  _sample_cbd_eta2(dst_poly, stream)
+  free(nb)
+  free(stream)
+end
+
+# =============================================================================
+# Compress_d / Decompress_d (FIPS 203 §4.2.1, Eq. 4.7 + 4.8)
+# =============================================================================
+#
+#   Compress_d(x)   = ⌈(2^d / q) · x⌋ = ⌊(2·2^d·x + q) / (2q)⌋
+#   Decompress_d(y) = ⌈(q / 2^d) · y⌋ = ⌊(2·q·y + 2^d) / 2^(d+1)⌋
+#                                    = ⌊(q·y + 2^(d-1)) / 2^d⌋
+#
+# Both use round-half-up. Three d values: 1 (message bits), 4 (v ciphertext
+# component, d_v), 10 (u ciphertext component, d_u). d=12 is not used here —
+# 12-bit serialization is straight bit-packing with no compression.
+
+def _compress(x: Int, d: Int): Int
+  var two_d = 1 << d
+  # round((2^d/q) * x) = floor((2 * 2^d * x + q) / (2q))
+  var num = 2 * two_d * x + 3329
+  var den = 6658                  # 2 * q
+  return (num / den) & (two_d - 1)
+end
+
+def _decompress(y: Int, d: Int): Int
+  var two_d = 1 << d
+  # round((q/2^d) * y) = floor((q*y + 2^(d-1)) / 2^d)
+  return (3329 * y + (two_d >> 1)) >> d
+end
+
+# Apply Compress_d coefficientwise; dst, src may alias.
+def _poly_compress(dst: Int, src: Int, d: Int): Void
+  var i = 0
+  while i < 256
+    _poly_set(dst, i, _compress(_poly_get(src, i), d))
+    i += 1
+  end
+end
+
+# Apply Decompress_d coefficientwise; dst, src may alias.
+def _poly_decompress(dst: Int, src: Int, d: Int): Void
+  var i = 0
+  while i < 256
+    _poly_set(dst, i, _decompress(_poly_get(src, i), d))
+    i += 1
+  end
+end
+
+# PolyVec versions.
+def _polyvec_compress(dst: Int, src: Int, d: Int): Void
+  var i = 0
+  while i < 3
+    _poly_compress(_polyvec_at(dst, i), _polyvec_at(src, i), d)
+    i += 1
+  end
+end
+
+def _polyvec_decompress(dst: Int, src: Int, d: Int): Void
+  var i = 0
+  while i < 3
+    _poly_decompress(_polyvec_at(dst, i), _polyvec_at(src, i), d)
+    i += 1
+  end
+end
+
+# =============================================================================
+# ByteEncode_d / ByteDecode_d (FIPS 203 §4.2.2, Algorithms 5 + 6)
+# =============================================================================
+#
+# Pack 256 coefficients (each represented in d bits) into 32d output bytes,
+# bit i of byte k of the output comes from bit ((8k+i) mod d) of coefficient
+# ⌊(8k+i)/d⌋. Concretely: stream the coefficients lsb-first, accumulate into
+# a bit window, flush 8-bit blocks. 256·d is always a multiple of 8 for
+# d ∈ {1, 4, 10, 12} so no tail padding is needed.
+
+# Encode one polynomial. `d` must be in {1, 4, 10, 12}. Output is 32*d bytes
+# at `out`. Coefficients are read modulo 2^d (so d=12 inputs in [0, q-1] go
+# straight through; d=10 inputs from Compress_10 are in [0, 1023], etc.).
+def _byte_encode(out: Int, poly: Int, d: Int): Void
+  var bit_buf = 0
+  var n_bits = 0
+  var out_idx = 0
+  var mask = (1 << d) - 1
+  var i = 0
+  while i < 256
+    var c = _poly_get(poly, i) & mask
+    bit_buf = bit_buf | (c << n_bits)
+    n_bits = n_bits + d
+    while n_bits >= 8
+      ptr_write_byte(out + out_idx, bit_buf & 255)
+      bit_buf = bit_buf >> 8
+      n_bits = n_bits - 8
+      out_idx = out_idx + 1
+    end
+    i += 1
+  end
+end
+
+# Decode one polynomial. d must be in {1, 4, 10, 12}. Reads 32*d bytes from
+# `src` and writes 256 coefficients to `poly`.
+def _byte_decode(poly: Int, src: Int, d: Int): Void
+  var bit_buf = 0
+  var n_bits = 0
+  var src_idx = 0
+  var mask = (1 << d) - 1
+  var i = 0
+  while i < 256
+    while n_bits < d
+      bit_buf = bit_buf | (ptr_read_byte(src + src_idx) << n_bits)
+      n_bits = n_bits + 8
+      src_idx = src_idx + 1
+    end
+    _poly_set(poly, i, bit_buf & mask)
+    bit_buf = bit_buf >> d
+    n_bits = n_bits - d
+    i += 1
+  end
+end
+
+# PolyVec versions — encode/decode k=3 polys back-to-back, each consuming
+# 32*d bytes of buffer.
+def _polyvec_byte_encode(out: Int, v: Int, d: Int): Void
+  var stride = 32 * d
+  var i = 0
+  while i < 3
+    _byte_encode(out + i * stride, _polyvec_at(v, i), d)
+    i += 1
+  end
+end
+
+def _polyvec_byte_decode(v: Int, src: Int, d: Int): Void
+  var stride = 32 * d
+  var i = 0
+  while i < 3
+    _byte_decode(_polyvec_at(v, i), src + i * stride, d)
+    i += 1
+  end
+end
+
+# =============================================================================
+# Matrix Â ∈ R_q^{k×k} (k=3)
+# =============================================================================
+#
+# Stored as 9 polys flat = 18432 bytes. Row-major: Â[i,j] at offset
+# (3*i + j) * 2048.
+
+def _MATRIX_BYTES(): Int = 18432   # 9 * 2048
+
+def _matrix_new(): Int
+  var m = malloc(18432)
+  memset(m, 0, 18432)
+  return m
+end
+
+def _matrix_free(m: Int): Void = free(m)
+
+def _matrix_at(m: Int, i: Int, j: Int): Int = m + (3 * i + j) * 2048
+
+# Build Â from ρ via SampleNTT. `transpose` selects the byte order in the
+# SHAKE128 absorb: 0 → SHAKE128(ρ ∥ j ∥ i) (KeyGen order, FIPS 203 §5.1
+# Algorithm 13 step 4), 1 → SHAKE128(ρ ∥ i ∥ j) (Encrypt order, Algorithm 14
+# step 4 — gives Â^T).
+def _matrix_sample(m: Int, rho_32: Int, transpose: Int): Void
+  var i = 0
+  while i < 3
+    var j = 0
+    while j < 3
+      var a_byte = j
+      var b_byte = i
+      if transpose != 0
+        a_byte = i
+        b_byte = j
+      end
+      _sample_ntt_for_matrix(_matrix_at(m, i, j), rho_32, a_byte, b_byte)
+      j += 1
+    end
+    i += 1
+  end
+end
+
+# Matrix-vector product in NTT domain: dst[i] = Σ_j m[i,j] ⋆ src[j]. `tmp`
+# is a caller-provided scratch poly to avoid per-call mallocs.
+def _matrix_vec_mul(dst_vec: Int, m: Int, src_vec: Int, tmp: Int): Void
+  var i = 0
+  while i < 3
+    var dst_poly = _polyvec_at(dst_vec, i)
+    _poly_zero(dst_poly)
+    var j = 0
+    while j < 3
+      _poly_basemul(tmp, _matrix_at(m, i, j), _polyvec_at(src_vec, j))
+      _poly_add(dst_poly, dst_poly, tmp)
+      j += 1
+    end
+    i += 1
+  end
+end
+
+# =============================================================================
+# K-PKE — internal CPA-secure scheme underneath ML-KEM (FIPS 203 §5.2)
+# =============================================================================
+#
+# K-PKE.KeyGen(d_seed) → (ek_PKE, dk_PKE)
+#   1.  (ρ, σ)   ← SHA3-512(d_seed ∥ 0x03)        # 0x03 = k = 3
+#   2.  Â[i,j]   ← SampleNTT(SHAKE128(ρ ∥ j ∥ i)) # transpose=0 order
+#   3.  s,e      ← CBD_2(PRF(σ, N)) for N in 0..2k
+#   4.  ŝ ← NTT(s); ê ← NTT(e)
+#   5.  t̂        ← Â ∘ ŝ + ê
+#   6.  ek_PKE   ← ByteEncode_12(t̂) ∥ ρ
+#   7.  dk_PKE   ← ByteEncode_12(ŝ)
+
+# Output buffers caller-owned: ek_pke is 1184 bytes, dk_pke is 1152 bytes.
+def _k_pke_keygen(ek_pke: Int, dk_pke: Int, d_seed: Int): Void
+  # Step 1: G(d ∥ k_byte) → (ρ, σ), 64 bytes total.
+  var seed_in = malloc(33)
+  memcpy(seed_in, d_seed, 32)
+  ptr_write_byte(seed_in + 32, 3)
+  var g_out = malloc(64)
+  sha3_512(seed_in, 33, g_out)
+  var rho = g_out             # bytes 0..32
+  var sigma = g_out + 32      # bytes 32..64
+  free(seed_in)
+
+  # Step 2: Build Â.
+  var a_mat = _matrix_new()
+  _matrix_sample(a_mat, rho, 0)
+
+  # Step 3: Sample s, e via CBD with PRF counter.
+  var s_vec = _polyvec_new()
+  var e_vec = _polyvec_new()
+  var n = 0
+  var i = 0
+  while i < 3
+    _sample_cbd_from_seed(_polyvec_at(s_vec, i), sigma, n)
+    n = n + 1
+    i += 1
+  end
+  i = 0
+  while i < 3
+    _sample_cbd_from_seed(_polyvec_at(e_vec, i), sigma, n)
+    n = n + 1
+    i += 1
+  end
+
+  # Step 4: ŝ ← NTT(s); ê ← NTT(e).
+  _polyvec_ntt(s_vec)
+  _polyvec_ntt(e_vec)
+
+  # Step 5: t̂ ← Â ∘ ŝ + ê.
+  var t_vec = _polyvec_new()
+  var tmp = _poly_new()
+  _matrix_vec_mul(t_vec, a_mat, s_vec, tmp)
+  _polyvec_add(t_vec, t_vec, e_vec)
+
+  # Step 6: ek_PKE ← ByteEncode_12(t̂) ∥ ρ.
+  _polyvec_byte_encode(ek_pke, t_vec, 12)
+  memcpy(ek_pke + 1152, rho, 32)
+
+  # Step 7: dk_PKE ← ByteEncode_12(ŝ).
+  _polyvec_byte_encode(dk_pke, s_vec, 12)
+
+  _poly_free(tmp)
+  _polyvec_free(s_vec)
+  _polyvec_free(e_vec)
+  _polyvec_free(t_vec)
+  _matrix_free(a_mat)
+  free(g_out)
+end
+
+# K-PKE.Encrypt(ek_PKE, m: 32B, r_seed: 32B) → c: 1088B
+#   1.  Parse t̂ ← ByteDecode_12(ek_PKE[0..1152]); ρ ← ek_PKE[1152..1184].
+#   2.  Â[i,j] ← SampleNTT(SHAKE128(ρ ∥ i ∥ j))            # transpose=1
+#   3.  y     ← CBD_2(PRF(r_seed, N)) for N in 0..k
+#       e1    ← CBD_2(PRF(r_seed, N)) for N in k..2k
+#       e2    ← CBD_2(PRF(r_seed, 2k))                     # scalar in R_q
+#   4.  ŷ     ← NTT(y)
+#       u     ← NTT^-1(Â^T ∘ ŷ) + e1
+#       v     ← NTT^-1(t̂^T ∘ ŷ) + e2 + Decompress_1(m)
+#   5.  c1    ← ByteEncode_10(Compress_10(u))      # 960 bytes
+#       c2    ← ByteEncode_4 (Compress_4 (v))      #  128 bytes
+#   6.  c     ← c1 ∥ c2                            # 1088 bytes
+
+def _k_pke_encrypt(c_out: Int, ek_pke: Int, m_32: Int, r_seed_32: Int): Void
+  # Step 1: parse ek_PKE.
+  var t_vec = _polyvec_new()
+  _polyvec_byte_decode(t_vec, ek_pke, 12)
+  var rho = ek_pke + 1152
+
+  # Step 2: Â^T via transpose=1.
+  var a_mat = _matrix_new()
+  _matrix_sample(a_mat, rho, 1)
+
+  # Step 3: sample y, e1, e2 via PRF counter.
+  var y_vec = _polyvec_new()
+  var e1_vec = _polyvec_new()
+  var e2_poly = _poly_new()
+  var n = 0
+  var i = 0
+  while i < 3
+    _sample_cbd_from_seed(_polyvec_at(y_vec, i), r_seed_32, n)
+    n = n + 1
+    i += 1
+  end
+  i = 0
+  while i < 3
+    _sample_cbd_from_seed(_polyvec_at(e1_vec, i), r_seed_32, n)
+    n = n + 1
+    i += 1
+  end
+  _sample_cbd_from_seed(e2_poly, r_seed_32, n)
+
+  # Step 4: ŷ, u, v.
+  _polyvec_ntt(y_vec)
+  var u_vec = _polyvec_new()
+  var tmp = _poly_new()
+  _matrix_vec_mul(u_vec, a_mat, y_vec, tmp)
+  _polyvec_intt(u_vec)
+  _polyvec_add(u_vec, u_vec, e1_vec)
+
+  var v_poly = _poly_new()
+  # v = NTT^-1(t̂^T ∘ ŷ) — t̂^T ∘ ŷ as a scalar dot product. Use the polyvec
+  # basemul-acc helper directly (t̂^T is a row, ŷ is a column).
+  _polyvec_basemul_acc(v_poly, t_vec, y_vec, tmp)
+  _poly_intt(v_poly)
+  _poly_add(v_poly, v_poly, e2_poly)
+  # v += Decompress_1(m). Decompress_1 maps a 32-byte message into 256 coeffs.
+  var m_poly = _poly_new()
+  _byte_decode(m_poly, m_32, 1)
+  _poly_decompress(m_poly, m_poly, 1)
+  _poly_add(v_poly, v_poly, m_poly)
+
+  # Step 5: compress + byte-encode.
+  _polyvec_compress(u_vec, u_vec, 10)
+  _polyvec_byte_encode(c_out, u_vec, 10)             # bytes 0..960
+  _poly_compress(v_poly, v_poly, 4)
+  _byte_encode(c_out + 960, v_poly, 4)               # bytes 960..1088
+
+  _polyvec_free(t_vec)
+  _matrix_free(a_mat)
+  _polyvec_free(y_vec)
+  _polyvec_free(e1_vec)
+  _poly_free(e2_poly)
+  _polyvec_free(u_vec)
+  _poly_free(v_poly)
+  _poly_free(m_poly)
+  _poly_free(tmp)
+end
+
+# K-PKE.Decrypt(dk_PKE, c) → m: 32B
+#   1.  u' ← Decompress_10(ByteDecode_10(c[0..960]))
+#   2.  v' ← Decompress_4 (ByteDecode_4 (c[960..1088]))
+#   3.  ŝ ← ByteDecode_12(dk_PKE)
+#   4.  m ← ByteEncode_1(Compress_1(v' − NTT^-1(ŝ^T ∘ NTT(u'))))
+
+def _k_pke_decrypt(m_out: Int, dk_pke: Int, c_in: Int): Void
+  var u_vec = _polyvec_new()
+  _polyvec_byte_decode(u_vec, c_in, 10)
+  _polyvec_decompress(u_vec, u_vec, 10)
+
+  var v_poly = _poly_new()
+  _byte_decode(v_poly, c_in + 960, 4)
+  _poly_decompress(v_poly, v_poly, 4)
+
+  var s_vec = _polyvec_new()
+  _polyvec_byte_decode(s_vec, dk_pke, 12)
+
+  # m_poly ← v' − NTT^-1(ŝ^T ∘ NTT(u'))
+  _polyvec_ntt(u_vec)
+  var tmp = _poly_new()
+  var w_poly = _poly_new()
+  _polyvec_basemul_acc(w_poly, s_vec, u_vec, tmp)
+  _poly_intt(w_poly)
+  _poly_sub(v_poly, v_poly, w_poly)
+
+  # m ← ByteEncode_1(Compress_1(...))
+  _poly_compress(v_poly, v_poly, 1)
+  _byte_encode(m_out, v_poly, 1)
+
+  _polyvec_free(u_vec)
+  _poly_free(v_poly)
+  _polyvec_free(s_vec)
+  _poly_free(tmp)
+  _poly_free(w_poly)
+end
+
+# =============================================================================
+# ML-KEM (FIPS 203 §6 + §7) — FO-wrapped IND-CCA2 KEM over K-PKE
+# =============================================================================
+#
+# ML-KEM lifts K-PKE (IND-CPA) to IND-CCA2 via the Fujisaki–Okamoto transform.
+# The derandomised "_internal" form takes the seed inputs as parameters so
+# ACVP can pin them; the randomised top-level wrapper draws those inputs
+# from getentropy(3) (or rng_new_hw on the unikernel — see std/crypto/rng).
+#
+# Notation:
+#   G = SHA3-512          # 64-byte output, split into (K, r)
+#   H = SHA3-256          # 32-byte output
+#   J = SHAKE256(_, 32)   # 32-byte output (implicit-rejection key)
+
+# Compute H(ek_PKE) into 32 bytes at `out`. Used for the dk's bound hash and
+# for the Encaps G-input.
+def _mlkem_h(out_32: Int, ek_pke: Int): Void
+  sha3_256(ek_pke, 1184, out_32)
+end
+
+# Compute K̄ = J(z ∥ c, 32) into 32 bytes at `out`. Used for the implicit-
+# rejection key in Decaps.
+def _mlkem_j(out_32: Int, z_32: Int, c_1088: Int): Void
+  var ctx = shake256_new()
+  shake256_absorb(ctx, z_32, 32)
+  shake256_absorb(ctx, c_1088, 1088)
+  shake256_finalize_absorb(ctx)
+  shake256_squeeze(ctx, out_32, 32)
+  shake256_free(ctx)
+end
+
+# CT 1088-byte equality → 0xFF mask if equal, 0 otherwise.
+def _mlkem_ct_ct_eq(c1: Int, c2: Int): Int
+  var diff = 0
+  var i = 0
+  while i < 1088
+    diff = diff | (ptr_read_byte(c1 + i) ^ ptr_read_byte(c2 + i))
+    i += 1
+  end
+  # ct_eq_byte returns 0xFF iff (diff & 0xFF) == 0. Since diff is built
+  # by OR-ing single bytes, diff ∈ [0, 255] already.
+  return ct_eq_byte(diff, 0)
+end
+
+# CT byte-select over 32 bytes: out[i] = mask ? a[i] : b[i].
+def _mlkem_ct_select_32(out: Int, mask: Int, a: Int, b: Int): Void
+  var i = 0
+  while i < 32
+    ptr_write_byte(out + i, ct_select_byte(mask, ptr_read_byte(a + i), ptr_read_byte(b + i)))
+    i += 1
+  end
+end
+
+# Modulus check on a 1184-byte ek_PKE: every coefficient of t̂ must be < q.
+# Returns 1 if valid, 0 if any coefficient is in [q, 4095].
+# (FIPS 203 §7.2 "Encapsulation Key Check" — mandatory for ek received from
+# an untrusted party. Self-generated ek always passes by construction.)
+def _mlkem_ek_modulus_check(ek_pke: Int): Int
+  var t = _polyvec_new()
+  _polyvec_byte_decode(t, ek_pke, 12)
+  var ok = 1
+  var pi = 0
+  while pi < 3
+    var i = 0
+    while i < 256
+      if _poly_get(_polyvec_at(t, pi), i) >= 3329
+        ok = 0
+      end
+      i += 1
+    end
+    pi += 1
+  end
+  _polyvec_free(t)
+  return ok
+end
+
+# ---------------------------------------------------------------------------
+# ML-KEM.KeyGen_internal(d: 32B, z: 32B) → (ek: 1184B, dk: 2400B)
+#   1. (ek_PKE, dk_PKE) ← K-PKE.KeyGen(d)
+#   2. dk ← dk_PKE ∥ ek_PKE ∥ H(ek_PKE) ∥ z   (1152 + 1184 + 32 + 32 = 2400)
+#   3. ek ← ek_PKE
+# ---------------------------------------------------------------------------
+
+def _mlkem_keygen_internal(ek: Int, dk: Int, d_32: Int, z_32: Int): Void
+  # Step 1: K-PKE.KeyGen.
+  var ek_pke = ek                   # K-PKE ek is the ML-KEM ek; alias buffer.
+  var dk_pke_dest = dk              # First 1152 bytes of dk hold dk_PKE.
+  _k_pke_keygen(ek_pke, dk_pke_dest, d_32)
+
+  # Step 2: append ek_PKE, H(ek_PKE), z to dk.
+  memcpy(dk + 1152, ek_pke, 1184)         # ek_PKE @ offset 1152
+  _mlkem_h(dk + 1152 + 1184, ek_pke)      # H(ek_PKE) @ offset 2336
+  memcpy(dk + 1152 + 1184 + 32, z_32, 32) # z @ offset 2368
+end
+
+# ---------------------------------------------------------------------------
+# ML-KEM.Encaps_internal(ek, m: 32B) → (K: 32B, c: 1088B)
+#   1. (K, r) ← G(m ∥ H(ek))     # G = SHA3-512; K is bytes 0..32, r is 32..64
+#   2. c ← K-PKE.Encrypt(ek, m, r)
+#
+# Returns 1 on success, 0 if ek fails the modulus check.
+# ---------------------------------------------------------------------------
+
+def _mlkem_encaps_internal(ct: Int, ss: Int, ek: Int, m_32: Int): Int
+  if _mlkem_ek_modulus_check(ek) == 0
+    return 0
+  end
+
+  # Step 1: G(m ∥ H(ek)) → (K, r).
+  var h_ek = malloc(32)
+  _mlkem_h(h_ek, ek)
+  var g_in = malloc(64)
+  memcpy(g_in, m_32, 32)
+  memcpy(g_in + 32, h_ek, 32)
+  var g_out = malloc(64)
+  sha3_512(g_in, 64, g_out)
+  # K is the first 32B; r is the last 32B.
+  memcpy(ss, g_out, 32)
+
+  # Step 2: c ← K-PKE.Encrypt(ek, m, r).
+  _k_pke_encrypt(ct, ek, m_32, g_out + 32)
+
+  free(h_ek)
+  free(g_in)
+  free(g_out)
+  return 1
+end
+
+# ---------------------------------------------------------------------------
+# ML-KEM.Decaps_internal(dk, c) → K: 32B
+#   1. Parse dk → (dk_PKE, ek_PKE, h, z) with h = H(ek_PKE).
+#   2. m' ← K-PKE.Decrypt(dk_PKE, c).
+#   3. (K', r') ← G(m' ∥ h).
+#   4. K̄ ← J(z ∥ c).
+#   5. c' ← K-PKE.Encrypt(ek_PKE, m', r').
+#   6. return K' if c == c' (CT), else K̄. Both branches always execute.
+#
+# Always returns 1; failures are absorbed into the implicit-rejection key.
+# ---------------------------------------------------------------------------
+
+def _mlkem_decaps_internal(ss: Int, ct: Int, dk: Int): Int
+  # Parse dk slices.
+  var dk_pke = dk                  # 0..1152
+  var ek_pke = dk + 1152           # 1152..2336 (1184B)
+  var h      = dk + 1152 + 1184    # 2336..2368 (32B)
+  var z      = dk + 1152 + 1184 + 32   # 2368..2400 (32B)
+
+  # Step 2: m' = K-PKE.Decrypt.
+  var m_prime = malloc(32)
+  _k_pke_decrypt(m_prime, dk_pke, ct)
+
+  # Step 3: G(m' ∥ h) → (K', r').
+  var g_in = malloc(64)
+  memcpy(g_in, m_prime, 32)
+  memcpy(g_in + 32, h, 32)
+  var g_out = malloc(64)
+  sha3_512(g_in, 64, g_out)
+  var k_prime = g_out               # 32B
+  var r_prime = g_out + 32          # 32B
+
+  # Step 4: K̄ = J(z ∥ c, 32).
+  var k_bar = malloc(32)
+  _mlkem_j(k_bar, z, ct)
+
+  # Step 5: c' = K-PKE.Encrypt(ek_PKE, m', r').
+  var c_prime = malloc(1088)
+  _k_pke_encrypt(c_prime, ek_pke, m_prime, r_prime)
+
+  # Step 6: CT-select K' if c == c' else K̄.
+  var mask = _mlkem_ct_ct_eq(ct, c_prime)
+  _mlkem_ct_select_32(ss, mask, k_prime, k_bar)
+
+  free(m_prime)
+  free(g_in)
+  free(g_out)
+  free(k_bar)
+  free(c_prime)
+  return 1
+end
+
+# ===========================================================================
+# Randomised top-level API — draws m, d, z from getentropy(3) (via
+# std/crypto/rng's entropy_fill).
+# ===========================================================================
+
+# Generate a fresh ML-KEM-768 key pair. `out_dk` becomes secret material on
+# return; callers should `secret_wrap` it before threading downstream.
+def mlkem768_keygen(out_ek: Int, out_dk: Int): Void
+  var d_z = malloc(64)
+  entropy_fill(d_z, 64)
+  _mlkem_keygen_internal(out_ek, out_dk, d_z, d_z + 32)
+  free(d_z)
+end
+
+# Encapsulate to `ek`. Returns 1 on success, 0 if ek fails the modulus check.
+def mlkem768_encaps(out_ct: Int, out_ss: Int, ek: Int): Int
+  var m = malloc(32)
+  entropy_fill(m, 32)
+  var rc = _mlkem_encaps_internal(out_ct, out_ss, ek, m)
+  free(m)
+  return rc
+end
+
+# Decapsulate `ct` with `dk`. Always returns 1 (failures absorbed via
+# implicit rejection). NET.4.1 — `dk` is the secret decapsulation key;
+# carries the `Secret<Int>` discipline; unwrapped once at the internal
+# seam below.
+def mlkem768_decaps(out_ss: Int, ct: Int, dk: Secret<Int>): Int
+  return _mlkem_decaps_internal(out_ss, ct, secret_unwrap(dk))
+end
+
+# ===========================================================================
+# Derandomised internal API (ACVP-tested form)
+# ===========================================================================
+#
+# NET.4.1: seed inputs (d_32, z_32, m_32, dk) carry the `Secret<Int>` discipline.
+# Each call below unwraps once at the implementation seam.
+
+def mlkem768_keygen_internal(out_ek: Int, out_dk: Int, d_32: Secret<Int>, z_32: Secret<Int>): Void
+  _mlkem_keygen_internal(out_ek, out_dk, secret_unwrap(d_32), secret_unwrap(z_32))
+end
+
+def mlkem768_encaps_internal(out_ct: Int, out_ss: Int, ek: Int, m_32: Secret<Int>): Int
+  return _mlkem_encaps_internal(out_ct, out_ss, ek, secret_unwrap(m_32))
+end
+
+def mlkem768_decaps_internal(out_ss: Int, ct: Int, dk: Secret<Int>): Int
+  return _mlkem_decaps_internal(out_ss, ct, secret_unwrap(dk))
+end

@@ -1,0 +1,557 @@
+##! # Dominator Tree
+##!
+##! Cooper, Harvey, Kennedy (2001) "A Simple, Fast Dominance Algorithm"
+##! Iterative dataflow on reverse postorder. Converges in 2-3 passes for
+##! reducible CFGs (all Quartz programs). O(n^2) worst case.
+##!
+##! Also provides loop detection via back-edge analysis for LICM.
+
+import mir
+import * from str_compat
+
+# ============================================================================
+# Data structures
+# ============================================================================
+
+## Dominator Tree structure containing dominance information and RPO.
+struct DomTree
+  block_count: Int
+  idom: Vec<Int>               # idom[i] = immediate dominator index (-1 if none)
+  order: Vec<Int>              # Reverse postorder (dense indices)
+  rpo_number: Vec<Int>         # rpo_number[i] = position in RPO (-1 if unreachable)
+  block_index: Map<String, Int>  # block handle (str) -> dense index
+  block_handles: Vec<mir::MirBlock>      # dense index -> block handle
+  preds: Vec<Int>              # flattened predecessor list
+  pred_offsets: Vec<Int>       # CSR: pred_offsets[i]..pred_offsets[i+1]
+end
+
+## Loop information collected from back-edge analysis.
+struct LoopInfo
+  header: Int       # dense index of loop header
+  blocks: Vec<Int>  # all dense indices in loop body (including header)
+  preheader: Int    # dense index of preheader (-1 if none)
+end
+
+# ============================================================================
+# Successor enumeration helper
+# ============================================================================
+
+## Get successors of a block for CFG analysis.
+def dt_get_succs(block: mir::MirBlock, bindex: Map<String, Int>, out_succs: Vec<Int>): Void
+  var tk = mir::mir_block_get_term_kind(block)
+  if tk == mir::TERM_JUMP
+    var tgt = mir::mir_block_get_term_data(block)
+    var key = "#{tgt}"
+    if bindex.has(key)
+      out_succs.push(__map_get_raw(bindex, key))
+    end
+  end
+  if tk == mir::TERM_BRANCH
+    var bt = mir::mir_block_get_branch_true(block)
+    var kt = "#{bt}"
+    if bindex.has(kt)
+      out_succs.push(__map_get_raw(bindex, kt))
+    end
+    var bf = mir::mir_block_get_branch_false(block)
+    var kf = "#{bf}"
+    if bindex.has(kf)
+      out_succs.push(__map_get_raw(bindex, kf))
+    end
+  end
+end
+
+# ============================================================================
+# Build predecessor lists (CSR format)
+# ============================================================================
+
+## Build predecessor lists in Compressed Sparse Row (CSR) format.
+def dt_build_preds(blocks: Vec<mir::MirBlock>, n: Int, bindex: Map<String, Int>, out_preds: Vec<Int>, out_offsets: Vec<Int>): Void
+  # Count predecessors per block
+  var pred_count = vec_new()
+  for i in 0..n
+    pred_count.push(0)
+  end
+
+  var succs = vec_new()
+  for b in 0..n
+    succs = vec_new()
+    dt_get_succs(blocks[b], bindex, succs)
+    for s in 0..succs.size
+      var si = succs[s]
+      pred_count.set_unchecked(si, pred_count[si] + 1)
+    end
+  end
+
+  # Build CSR offsets
+  var total = 0
+  for i in 0..n
+    out_offsets.push(total)
+    total += pred_count[i]
+  end
+  out_offsets.push(total)
+
+  # Initialize preds array
+  for i in 0..total
+    out_preds.push(-1)
+  end
+
+  # Reset counts for filling
+  for i in 0..n
+    pred_count.set_unchecked(i, 0)
+  end
+
+  # Fill predecessor array
+  for b in 0..n
+    succs = vec_new()
+    dt_get_succs(blocks[b], bindex, succs)
+    for s in 0..succs.size
+      var si = succs[s]
+      var pos = out_offsets[si] + pred_count[si]
+      out_preds.set_unchecked(pos, b)
+      pred_count.set_unchecked(si, pred_count[si] + 1)
+    end
+  end
+end
+
+# ============================================================================
+# Reverse postorder via iterative DFS
+# ============================================================================
+
+## Compute Reverse Post-Order (RPO) traversal of the CFG.
+def dt_compute_rpo(blocks: Vec<mir::MirBlock>, n: Int, entry_idx: Int, bindex: Map<String, Int>): Vec<Int>
+  var visited = vec_new()
+  for i in 0..n
+    visited.push(0)
+  end
+
+  var finish_order = vec_new()
+
+  # Stack: (block_index, phase) where phase=0 means first visit, phase=1 means post-visit
+  var stack_idx = vec_new()
+  var stack_phase = vec_new()
+  stack_idx.push(entry_idx)
+  stack_phase.push(0)
+  visited.set_unchecked(entry_idx, 1)
+
+  while stack_idx.size > 0
+    var top = stack_idx.size - 1
+    var bi = stack_idx[top]
+    var ph = stack_phase[top]
+
+    if ph == 1
+      finish_order.push(bi)
+      stack_idx.pop()
+      stack_phase.pop()
+    else
+      stack_phase.set_unchecked(top, 1)
+      var block = blocks[bi]
+      var tk = mir::mir_block_get_term_kind(block)
+
+      # Push successors in reverse order so first is visited first
+      if tk == mir::TERM_BRANCH
+        var bf = mir::mir_block_get_branch_false(block)
+        var kf = "#{bf}"
+        if bindex.has(kf)
+          var fi = __map_get_raw(bindex, kf)
+          if visited[fi] == 0
+            visited.set_unchecked(fi, 1)
+            stack_idx.push(fi)
+            stack_phase.push(0)
+          end
+        end
+        var bt = mir::mir_block_get_branch_true(block)
+        var kt = "#{bt}"
+        if bindex.has(kt)
+          var ti = __map_get_raw(bindex, kt)
+          if visited[ti] == 0
+            visited.set_unchecked(ti, 1)
+            stack_idx.push(ti)
+            stack_phase.push(0)
+          end
+        end
+      end
+      if tk == mir::TERM_JUMP
+        var tgt = mir::mir_block_get_term_data(block)
+        var key = "#{tgt}"
+        if bindex.has(key)
+          var si = __map_get_raw(bindex, key)
+          if visited[si] == 0
+            visited.set_unchecked(si, 1)
+            stack_idx.push(si)
+            stack_phase.push(0)
+          end
+        end
+      end
+    end
+  end
+
+  # Reverse finish order = RPO
+  var rpo = vec_new()
+  var j = finish_order.size - 1
+  while j >= 0
+    rpo.push(finish_order[j])
+    j -= 1
+  end
+  return rpo
+end
+
+# ============================================================================
+# Intersect: common ancestor in dominator tree
+# ============================================================================
+
+## Find common ancestor in dominator tree (intersection of two nodes).
+def dt_intersect(idom: Vec<Int>, rpo_num: Vec<Int>, a: Int, b: Int): Int
+  var f1 = a
+  var f2 = b
+  while f1 != f2
+    while rpo_num[f1] > rpo_num[f2]
+      f1 = idom[f1]
+    end
+    while rpo_num[f2] > rpo_num[f1]
+      f2 = idom[f2]
+    end
+  end
+  return f1
+end
+
+# ============================================================================
+# Build dominator tree
+# ============================================================================
+
+## Build the dominator tree for a function using the Cooper-Harvey-Kennedy algorithm.
+def domtree_build(func: mir::MirFunc): DomTree
+  var blocks = mir::mir_func_get_blocks(func)
+  var n = blocks.size
+
+  # Map block handles to dense indices
+  var bindex = map_new<String, Int>()
+  var bhandles = vec_new()
+  var entry = mir::mir_func_get_entry(func)
+  var entry_idx = 0
+
+  for i in 0..n
+    var h = blocks[i]
+    bindex.set("#{h}", i)
+    bhandles.push(h)
+    if h == entry
+      entry_idx = i
+    end
+  end
+
+  # Build predecessor lists
+  var preds = vec_new()
+  var pred_offsets = vec_new()
+  dt_build_preds(blocks, n, bindex, preds, pred_offsets)
+
+  # Compute RPO
+  var rpo = dt_compute_rpo(blocks, n, entry_idx, bindex)
+
+  # RPO numbers
+  var rpo_number = vec_new()
+  for i in 0..n
+    rpo_number.push(-1)
+  end
+  for i in 0..rpo.size
+    rpo_number.set_unchecked(rpo[i], i)
+  end
+
+  # Initialize idom
+  var idom = vec_new()
+  for i in 0..n
+    idom.push(-1)
+  end
+  idom.set_unchecked(entry_idx, entry_idx)
+
+  # Iterative dominator computation
+  var changed = 1
+  while changed == 1
+    changed = 0
+    for r in 0..rpo.size
+      var b = rpo[r]
+      if b != entry_idx
+        var new_idom = -1
+        var pstart = pred_offsets[b]
+        var pend = pred_offsets[b + 1]
+        var p = pstart
+        while p < pend
+          var pred = preds[p]
+          if pred >= 0 and idom[pred] >= 0
+            if new_idom < 0
+              new_idom = pred
+            else
+              new_idom = dt_intersect(idom, rpo_number, new_idom, pred)
+            end
+          end
+          p += 1
+        end
+        if new_idom >= 0 and idom[b] != new_idom
+          idom.set_unchecked(b, new_idom)
+          changed = 1
+        end
+      end
+    end
+  end
+
+  var dt = DomTree {
+    block_count: n,
+    idom: idom,
+    order: rpo,
+    rpo_number: rpo_number,
+    block_index: bindex,
+    block_handles: bhandles,
+    preds: preds,
+    pred_offsets: pred_offsets
+  }
+  return dt
+end
+
+# ============================================================================
+# Dominance queries
+# ============================================================================
+
+## Check if block A dominates block B (using block handles).
+def domtree_dominates(dt: DomTree, a: Int, b: Int): Int
+  var ka = "#{a}"
+  var kb = "#{b}"
+  if not dt.block_index.has(ka) or not dt.block_index.has(kb)
+    return 0
+  end
+  return domtree_dominates_idx(dt, __map_get_raw(dt.block_index, ka), __map_get_raw(dt.block_index, kb))
+end
+
+## Check if block index AI dominates block index BI.
+def domtree_dominates_idx(dt: DomTree, ai: Int, bi: Int): Int
+  if ai == bi
+    return 1
+  end
+  var current = bi
+  var limit = dt.block_count + 1
+  while limit > 0
+    var parent = dt.idom[current]
+    if parent == current or parent < 0
+      return 0
+    end
+    if parent == ai
+      return 1
+    end
+    current = parent
+    limit -= 1
+  end
+  return 0
+end
+
+# ============================================================================
+# Dominator tree preorder
+# ============================================================================
+
+# Build children CSR from idom
+## Build list of children for each node in the dominator tree (CSR format).
+def dt_build_children(dt: DomTree, out_list: Vec<Int>, out_offsets: Vec<Int>): Void
+  var n = dt.block_count
+  var child_count = vec_new()
+  for i in 0..n
+    child_count.push(0)
+  end
+  for i in 0..n
+    var parent = dt.idom[i]
+    if parent >= 0 and parent != i
+      child_count.set_unchecked(parent, child_count[parent] + 1)
+    end
+  end
+
+  var total = 0
+  for i in 0..n
+    out_offsets.push(total)
+    total += child_count[i]
+  end
+  out_offsets.push(total)
+
+  for i in 0..total
+    out_list.push(0)
+  end
+  for i in 0..n
+    child_count.set_unchecked(i, 0)
+  end
+  for i in 0..n
+    var parent = dt.idom[i]
+    if parent >= 0 and parent != i
+      var pos = out_offsets[parent] + child_count[parent]
+      out_list.set_unchecked(pos, i)
+      child_count.set_unchecked(parent, child_count[parent] + 1)
+    end
+  end
+end
+
+# Returns block handles in domtree preorder
+## Return block handles in dominator tree pre-order.
+def domtree_preorder(dt: DomTree): Vec<mir::MirBlock>
+  var n = dt.block_count
+  if n == 0
+    return vec_new()
+  end
+  var child_list = vec_new()
+  var child_offsets = vec_new()
+  dt_build_children(dt, child_list, child_offsets)
+
+  # Find root
+  var root = 0
+  for i in 0..n
+    if dt.idom[i] == i
+      root = i
+    end
+  end
+
+  var result = vec_new()
+  var stack = vec_new()
+  stack.push(root)
+  while stack.size > 0
+    var cur = stack[stack.size - 1]
+    stack.pop()
+    result.push(dt.block_handles[cur])
+    # Push children in reverse so leftmost visited first
+    var ci = child_offsets[cur + 1] - 1
+    while ci >= child_offsets[cur]
+      stack.push(child_list[ci])
+      ci -= 1
+    end
+  end
+  return result
+end
+
+# Returns dense indices in domtree preorder (for GVN/LICM)
+## Return dense block indices in dominator tree pre-order.
+def domtree_preorder_indices(dt: DomTree): Vec<Int>
+  var n = dt.block_count
+  if n == 0
+    return vec_new()
+  end
+  var child_list = vec_new()
+  var child_offsets = vec_new()
+  dt_build_children(dt, child_list, child_offsets)
+
+  var root = 0
+  for i in 0..n
+    if dt.idom[i] == i
+      root = i
+    end
+  end
+
+  var result = vec_new()
+  var stack = vec_new()
+  stack.push(root)
+  while stack.size > 0
+    var cur = stack[stack.size - 1]
+    stack.pop()
+    result.push(cur)
+    var ci = child_offsets[cur + 1] - 1
+    while ci >= child_offsets[cur]
+      stack.push(child_list[ci])
+      ci -= 1
+    end
+  end
+  return result
+end
+
+# ============================================================================
+# Loop detection
+# ============================================================================
+
+## Detect natural loops via back-edge analysis.
+# PF3-P1: returns `Vec<LoopInfo>` directly — the former `Vec<Int>` stored
+# `as_int_generic(li)` (an erased COW value-struct pointer) and recovered it
+# by passing the int where a `LoopInfo` was expected. Storing the struct in a
+# typed vec de-erases it with no id needed.
+def detect_loops(dt: DomTree, func: mir::MirFunc): Vec<LoopInfo>
+  var blocks = mir::mir_func_get_blocks(func)
+  var n = dt.block_count
+  var loops = vec_new<LoopInfo>()
+  var succs = vec_new()
+
+  for src in 0..n
+    succs = vec_new()
+    dt_get_succs(blocks[src], dt.block_index, succs)
+    for s in 0..succs.size
+      var dst = succs[s]
+      if domtree_dominates_idx(dt, dst, src)
+        var li = dt_collect_loop(dt, blocks, n, dst, src)
+        loops.push(li)
+      end
+    end
+  end
+  return loops
+end
+
+## Collect loop body blocks given a back-edge (header, back_src).
+def dt_collect_loop(dt: DomTree, blocks: Vec<Int>, n: Int, header: Int, back_src: Int): LoopInfo
+  var body = vec_new()
+  var in_loop = vec_new()
+  for i in 0..n
+    in_loop.push(0)
+  end
+
+  in_loop.set_unchecked(header, 1)
+  body.push(header)
+
+  if back_src != header
+    in_loop.set_unchecked(back_src, 1)
+    body.push(back_src)
+
+    var worklist = vec_new()
+    worklist.push(back_src)
+
+    while worklist.size > 0
+      var cur = worklist[worklist.size - 1]
+      worklist.pop()
+      var pstart = dt.pred_offsets[cur]
+      var pend = dt.pred_offsets[cur + 1]
+      var p = pstart
+      while p < pend
+        var pred = dt.preds[p]
+        if pred >= 0 and in_loop[pred] == 0
+          in_loop.set_unchecked(pred, 1)
+          body.push(pred)
+          worklist.push(pred)
+        end
+        p += 1
+      end
+    end
+  end
+
+  # Preheader: unique predecessor of header not in loop
+  var preheader = -1
+  var non_loop_count = 0
+  var pstart = dt.pred_offsets[header]
+  var pend = dt.pred_offsets[header + 1]
+  var p = pstart
+  while p < pend
+    var pred = dt.preds[p]
+    if pred >= 0 and in_loop[pred] == 0
+      preheader = pred
+      non_loop_count += 1
+    end
+    p += 1
+  end
+  if non_loop_count != 1
+    preheader = -1
+  end
+
+  var li = LoopInfo {
+    header: header,
+    blocks: body,
+    preheader: preheader
+  }
+  return li
+end
+
+# ============================================================================
+# LoopInfo accessors (for cross-module access via as_int_generic)
+# ============================================================================
+
+## Get loop header block handle.
+def li_get_header(li: LoopInfo): Int = li.header
+
+## Get all blocks in the loop.
+def li_get_blocks(li: LoopInfo): Vec<Int> = li.blocks
+
+## Get loop preheader block handle (-1 if none).
+def li_get_preheader(li: LoopInfo): Int = li.preheader

@@ -1,0 +1,649 @@
+## QSpec Test Runner
+##
+## Core test execution engine with describe/it DSL, hooks,
+## focus/skip, and timing.
+##
+## Usage:
+##   import qspec/runner
+##   import qspec/matchers
+##
+##   describe("My Module") do ->
+##     it "does something" do
+##       expect(42).to_eq(42)
+##     end
+##   end
+
+import qspec/matchers
+import ffi/time
+import std/throws
+import * from std/scoped
+
+# =============================================================================
+# Test and Suite types
+#
+# Public wire API exposes Int handles via `qspec_test_*` / `qspec_suite_*`
+# accessors so external consumers (formatter, downstream tooling) keep
+# treating them as opaque IDs. Internal storage is typed structs, recovered
+# via `as_type<Test>(handle)` / `as_type<Suite>(handle)`.
+# =============================================================================
+
+_STATUS_NOT_RUN = 0
+_STATUS_PASS = 1
+_STATUS_FAIL = 2
+_STATUS_PENDING = 3
+_STATUS_SKIPPED = 4
+
+struct Test
+  name: String
+  body: Int            # as_int(Fn(): Void), or 0 for pending/skipped tests
+  focused: Int
+  status: Int          # _STATUS_*
+  duration_us: Int
+  failure: TestFailure   # meaningful only when status == _STATUS_FAIL; else an empty record
+  failures: Vec<TestFailure>
+end
+
+# Suite is `@repr(C)` to PIN it on the reference (Boxed) path under value-default
+# structs (F4). The suite tree is built by SHARED MUTATION through as_int handles:
+# `describe`/`it` reach a parent suite via `_current_suite()` (an Int handle stored
+# in `_suite_stack`/`_root_suites`) and push into its `.tests`/`.children`. Value-copy
+# semantics would copy the suite on read and drop those writes. `@repr(C)` is
+# positively known-Boxed (never flips to value-layout), so the existential-handle
+# architecture keeps working AND the QZ0221 erased-boundary wall positively excludes
+# it — exactly as `AstStorage` (an all-pointer @repr(C) struct used via as_int).
+@repr(C)
+struct Suite
+  name: String
+  tests: Vec<Int>      # Vec of as_int(Test) handles
+  children: Vec<Int>   # Vec of as_int(Suite) handles
+  entries: Vec<Int>    # Test/suite handles in declaration order
+  entry_kinds: Vec<Int> # Parallel kinds: 0 = test, 1 = child suite
+  before_hooks: Vec<Int>
+  after_hooks: Vec<Int>
+end
+
+def _test_new(name: String, body: Int, focused: Int): Int
+  return as_int(Test {
+    name: name,
+    body: body,
+    focused: focused,
+    status: _STATUS_NOT_RUN,
+    duration_us: 0,
+    failure: test_failure_simple(""),
+    failures: vec_new<TestFailure>(),
+  })
+end
+
+def _suite_new(name: String): Int
+  return as_int(Suite {
+    name: name,
+    tests: vec_new<Int>(),
+    children: vec_new<Int>(),
+    entries: vec_new<Int>(),
+    entry_kinds: vec_new<Int>(),
+    before_hooks: vec_new<Int>(),
+    after_hooks: vec_new<Int>(),
+  })
+end
+
+# =============================================================================
+# Global State
+# =============================================================================
+
+# Suite stack for nesting: vec of suite handles
+_suite_stack = vec_new()
+# Root suites: vec of top-level suite handles
+_root_suites = vec_new()
+# Runtime skip state: requested, reason, dynamic marker, runner-observed.
+_skip_flag = vec_new()
+# qspec_run is one-shot: later calls return the cached failure count.
+_run_state = vec_new()
+_skip_nonce = vec_new()
+_test_active = vec_new()
+_framework_failures = vec_new<String>()
+# Stats
+_stats = vec_new()
+
+def _init_stats(): Void
+  if vec_size(_stats) == 0
+    vec_push(_stats, 0) # [0] total
+    vec_push(_stats, 0) # [1] passed
+    vec_push(_stats, 0) # [2] failed
+    vec_push(_stats, 0) # [3] pending
+    vec_push(_stats, 0) # [4] skipped
+    vec_push(_stats, 0) # [5] total_duration_us
+    vec_push(_stats, 0) # [6] assertions
+  end
+end
+
+def _inc_stat(idx: Int): Void
+  var n = vec_get(_stats, idx)
+  vec_set(_stats, idx, n + 1)
+end
+
+def _add_duration(us: Int): Void
+  var n = vec_get(_stats, 5)
+  vec_set(_stats, 5, n + us)
+end
+
+def _add_assertions(count: Int): Void
+  var n = vec_get(_stats, 6)
+  vec_set(_stats, 6, n + count)
+end
+
+
+
+# Has any test been marked with fit/fdescribe?
+_has_focus = vec_new()
+
+def _init_focus(): Void
+  if vec_size(_has_focus) == 0
+    vec_push(_has_focus, 0)
+  end
+end
+
+def _set_has_focus(): Void
+  _init_focus()
+  vec_set(_has_focus, 0, 1)
+end
+
+def _is_focus_mode(): Bool
+  _init_focus()
+  return vec_get(_has_focus, 0) == 1
+end
+
+# =============================================================================
+# DSL Functions
+# =============================================================================
+
+## Get the current suite from the top of the suite stack.
+def _current_suite(): Int
+  return vec_get(_suite_stack, vec_size(_suite_stack) - 1)
+end
+
+struct _SuiteStackGuard
+  prior_depth: Int
+  suite: Int
+end
+
+extend _SuiteStackGuard with Scoped
+  def acquire(self): Int
+    vec_push(_suite_stack, @suite)
+    return 0
+  end
+
+  def release(self, value: Int): Void
+    vec_truncate(_suite_stack, @prior_depth)
+  end
+
+  def release_on_throw(self, value: Int, exc_msg: String): Void
+    vec_truncate(_suite_stack, @prior_depth)
+  end
+end
+
+priv def _reject_closed_declaration(kind: String): Bool
+  if vec_size(_run_state) == 0
+    return false
+  end
+  var msg = "QSpec #{kind} declaration is unsupported after qspec_run has started; declare tests and hooks before execution"
+  if vec_size(_test_active) > 0 and vec_get(_test_active, 0) == 1
+    _record_failure(msg)
+  else
+    vec_push(_framework_failures, msg)
+  end
+  return true
+end
+
+## Define a test suite. Nests when called inside another describe.
+def describe(name: String, block: Fn(): Void): Void
+  if _reject_closed_declaration("describe")
+    return
+  end
+  var suite = _suite_new(name)
+
+  # If we're inside a parent suite, add as child
+  if vec_size(_suite_stack) > 0
+    var parent = _current_suite()
+    vec_push(as_type<Suite>(parent).children, suite)
+    vec_push(as_type<Suite>(parent).entries, suite)
+    vec_push(as_type<Suite>(parent).entry_kinds, 1)
+  else
+    # Top-level suite
+    vec_push(_root_suites, suite)
+  end
+
+  var guard = _SuiteStackGuard { prior_depth: vec_size(_suite_stack), suite: suite }
+  with guard do _guard_value ->
+    block()
+  end
+end
+
+## Alias for describe — reads as "given this precondition"
+def context(name: String, block: Fn(): Void): Void
+  if _reject_closed_declaration("context")
+    return
+  end
+  describe(name, block)
+end
+
+## Define a test case for execution by qspec_run().
+def it(name: String, test_fn: Fn(): Void): Void
+  if _reject_closed_declaration("it")
+    return
+  end
+  var suite = _current_suite()
+  var tc = _test_new(name, as_int(test_fn), 0)
+  vec_push(as_type<Suite>(suite).tests, tc)
+  vec_push(as_type<Suite>(suite).entries, tc)
+  vec_push(as_type<Suite>(suite).entry_kinds, 0)
+end
+
+## Define a pending test (no block)
+def it_pending(name: String): Void
+  if _reject_closed_declaration("it_pending")
+    return
+  end
+  var suite = _current_suite()
+  var tc = _test_new(name, 0, 0)
+  as_type<Test>(tc).status = _STATUS_PENDING
+  vec_push(as_type<Suite>(suite).tests, tc)
+  vec_push(as_type<Suite>(suite).entries, tc)
+  vec_push(as_type<Suite>(suite).entry_kinds, 0)
+end
+
+## Focused test — only focused tests run when any exist
+def fit(name: String, test_fn: Fn(): Void): Void
+  if _reject_closed_declaration("fit")
+    return
+  end
+  _set_has_focus()
+  var suite = _current_suite()
+  var tc = _test_new(name, as_int(test_fn), 1)
+  vec_push(as_type<Suite>(suite).tests, tc)
+  vec_push(as_type<Suite>(suite).entries, tc)
+  vec_push(as_type<Suite>(suite).entry_kinds, 0)
+end
+
+## Skipped test
+def xit(name: String, test_fn: Fn(): Void): Void
+  if _reject_closed_declaration("xit")
+    return
+  end
+  var suite = _current_suite()
+  var tc = _test_new(name, 0, 0)
+  as_type<Test>(tc).status = _STATUS_SKIPPED
+  vec_push(as_type<Suite>(suite).tests, tc)
+  vec_push(as_type<Suite>(suite).entries, tc)
+  vec_push(as_type<Suite>(suite).entry_kinds, 0)
+end
+
+## Skip the current test at runtime if condition is false.
+## Call at the top of an `it` block:
+##   it "needs QEMU" do
+##     skip_unless(shell_ok("which qemu-system-aarch64"), "QEMU not installed")
+##     # ... rest of test only runs if QEMU is available
+##   end
+def skip_unless(condition: Int, reason: String): Void
+  if condition == 0
+    throw(_set_skip(reason))
+  end
+end
+
+## Skip the current test unconditionally with a reason.
+def skip(reason: String): Void
+  throw(_set_skip(reason))
+end
+
+priv def _init_skip(): Void
+  if vec_size(_skip_flag) == 0
+    vec_push(_skip_flag, 0)
+    vec_push(_skip_flag, as_int(""))
+    vec_push(_skip_flag, as_int(""))
+    vec_push(_skip_flag, 0)
+  end
+  if vec_size(_skip_nonce) == 0
+    vec_push(_skip_nonce, 0)
+  end
+end
+
+priv def _set_skip(reason: String): String
+  _init_skip()
+  var nonce = vec_get(_skip_nonce, 0) + 1
+  vec_set(_skip_nonce, 0, nonce)
+  var marker = "__qspec_skip_#{clock().to_s()}_#{nonce.to_s()}_#{as_int(reason).to_s()}"
+  vec_set(_skip_flag, 0, 1)
+  vec_set(_skip_flag, 1, as_int(reason))
+  vec_set(_skip_flag, 2, as_int(marker))
+  vec_set(_skip_flag, 3, 0)
+  return marker
+end
+
+priv def _clear_skip(): Void
+  _init_skip()
+  vec_set(_skip_flag, 0, 0)
+  vec_set(_skip_flag, 1, as_int(""))
+  vec_set(_skip_flag, 2, as_int(""))
+  vec_set(_skip_flag, 3, 0)
+end
+
+priv def _is_skipped(): Bool
+  _init_skip()
+  return vec_get(_skip_flag, 0) == 1
+end
+
+priv def _skip_marker(): String
+  _init_skip()
+  return as_string(vec_get(_skip_flag, 2))
+end
+
+priv def _skip_observed(): Bool
+  _init_skip()
+  return vec_get(_skip_flag, 3) == 1
+end
+
+priv def _mark_skip_observed(): Void
+  _init_skip()
+  vec_set(_skip_flag, 3, 1)
+end
+
+## Register a before hook for each test in this suite and its descendants.
+def before(hook: Fn(): Void): Void
+  if _reject_closed_declaration("before")
+    return
+  end
+  vec_push(as_type<Suite>(_current_suite()).before_hooks, as_int(hook))
+end
+
+## Register an after hook for each test in this suite and its descendants.
+def after(hook: Fn(): Void): Void
+  if _reject_closed_declaration("after")
+    return
+  end
+  vec_push(as_type<Suite>(_current_suite()).after_hooks, as_int(hook))
+end
+
+# =============================================================================
+# Flat-style DSL
+# =============================================================================
+
+## Flat test definition (creates an implicit top-level suite)
+def test(name: String, test_fn: Fn(): Void): Void
+  if _reject_closed_declaration("test")
+    return
+  end
+  # Auto-create a root suite if needed
+  if vec_size(_root_suites) == 0
+    var default_suite = _suite_new("Tests")
+    vec_push(_root_suites, default_suite)
+  end
+  # Push the default suite as current so _current_suite() works
+  var suite = vec_get(_root_suites, 0)
+  vec_push(_suite_stack, suite)
+  it(name, test_fn)
+  var _ignored = vec_pop(_suite_stack)
+end
+
+# =============================================================================
+# Public API
+# =============================================================================
+
+def _qspec_catch_throw(op_name: Int, argc_l: Int, argv_l: Int): Int
+  var msg = as_string(load(argv_l, 0))
+  if _is_skipped() and not _skip_observed() and msg == _skip_marker()
+    _mark_skip_observed()
+  else
+    _record_failure("Unhandled throw in test: " + msg)
+  end
+  return 0
+end
+
+def _copy_hooks(source: Vec<Int>, target: Vec<Int>): Void
+  var i = 0
+  while i < vec_size(source)
+    vec_push(target, vec_get(source, i))
+    i += 1
+  end
+end
+
+def _run_before_hooks(hooks: Vec<Int>): Void
+  var i = 0
+  while i < vec_size(hooks)
+    call_fn(vec_get(hooks, i))
+    i += 1
+  end
+end
+
+def _run_after_hook(hook: Int): Void
+  var _result = with Throws { throw: _qspec_catch_throw } do ->
+    call_fn(hook)
+    0
+  end
+end
+
+def _run_after_hooks(hooks: Vec<Int>): Void
+  var i = vec_size(hooks) - 1
+  while i >= 0
+    _run_after_hook(vec_get(hooks, i))
+    i -= 1
+  end
+end
+
+def _execute_test(tc: Int, before_hooks: Vec<Int>, after_hooks: Vec<Int>): Void
+  var t = as_type<Test>(tc)
+  _inc_stat(0)
+
+  if t.status == _STATUS_PENDING
+    _inc_stat(3)
+    return
+  end
+  if t.status == _STATUS_SKIPPED or (_is_focus_mode() and t.focused == 0)
+    t.status = _STATUS_SKIPPED
+    _inc_stat(4)
+    return
+  end
+
+  matcher_clear()
+  _clear_skip()
+  if vec_size(_test_active) == 0
+    vec_push(_test_active, 1)
+  else
+    vec_set(_test_active, 0, 1)
+  end
+  var start = clock()
+  var _body_result = with Throws { throw: _qspec_catch_throw } do ->
+    _run_before_hooks(before_hooks)
+    call_fn(t.body)
+    0
+  end
+  _run_after_hooks(after_hooks)
+  if _is_skipped() and not _skip_observed()
+    _record_failure("skip control flow was intercepted before reaching the QSpec runner")
+  end
+  var duration = clock() - start
+  t.duration_us = duration
+  _add_duration(duration)
+  _add_assertions(matcher_assertion_count())
+
+  if matcher_failure_count() > 0
+    t.status = _STATUS_FAIL
+    t.failure = matcher_get_failure_struct(0)
+    var failure_idx = 0
+    while failure_idx < matcher_failure_count()
+      vec_push(t.failures, matcher_get_failure_struct(failure_idx))
+      failure_idx += 1
+    end
+    _inc_stat(2)
+  elsif _is_skipped()
+    t.status = _STATUS_SKIPPED
+    _inc_stat(4)
+  else
+    t.status = _STATUS_PASS
+    _inc_stat(1)
+  end
+  vec_set(_test_active, 0, 0)
+end
+
+def _run_suite(suite_handle: Int, inherited_before: Vec<Int>, inherited_after: Vec<Int>): Void
+  var suite = as_type<Suite>(suite_handle)
+  var before_hooks = vec_new<Int>()
+  var after_hooks = vec_new<Int>()
+  _copy_hooks(inherited_before, before_hooks)
+  _copy_hooks(suite.before_hooks, before_hooks)
+  _copy_hooks(inherited_after, after_hooks)
+  _copy_hooks(suite.after_hooks, after_hooks)
+
+  var i = 0
+  while i < vec_size(suite.entries)
+    var entry = vec_get(suite.entries, i)
+    if vec_get(suite.entry_kinds, i) == 0
+      _execute_test(entry, before_hooks, after_hooks)
+    else
+      _run_suite(entry, before_hooks, after_hooks)
+    end
+    i += 1
+  end
+end
+
+## Execute all registered tests and return the failure count.
+def qspec_run(): Int
+  _init_stats()
+  if vec_size(_run_state) > 0
+    return qspec_failed()
+  end
+  vec_push(_run_state, 1)
+  var no_hooks = vec_new<Int>()
+  var i = 0
+  while i < vec_size(_root_suites)
+    _run_suite(vec_get(_root_suites, i), no_hooks, no_hooks)
+    i += 1
+  end
+  if qspec_total() == 0
+    vec_push(_framework_failures, "QSpec selected a file that executed zero test cases")
+  end
+  vec_set(_run_state, 0, 2)
+  return qspec_failed()
+end
+
+## Accessors for stats
+def qspec_total(): Int
+  _init_stats()
+  return vec_get(_stats, 0)
+end
+
+def qspec_passed(): Int
+  _init_stats()
+  return vec_get(_stats, 1)
+end
+
+def qspec_failed(): Int
+  _init_stats()
+  var lifecycle_failure = 0
+  if vec_size(_framework_failures) > 0
+    lifecycle_failure = 1
+  end
+  return vec_get(_stats, 2) + lifecycle_failure
+end
+
+def qspec_case_failed(): Int
+  _init_stats()
+  return vec_get(_stats, 2)
+end
+
+def qspec_framework_failure_count(): Int
+  return vec_size(_framework_failures)
+end
+
+def qspec_framework_failure_message(idx: Int): String
+  if idx < 0 or idx >= vec_size(_framework_failures)
+    return ""
+  end
+  return _framework_failures[idx]
+end
+
+def qspec_pending(): Int
+  _init_stats()
+  return vec_get(_stats, 3)
+end
+
+def qspec_skipped(): Int
+  _init_stats()
+  return vec_get(_stats, 4)
+end
+
+def qspec_duration_us(): Int
+  _init_stats()
+  return vec_get(_stats, 5)
+end
+
+def qspec_assertions(): Int
+  _init_stats()
+  return vec_get(_stats, 6)
+end
+
+## Get root suites for formatter access
+def qspec_root_suites(): Int
+  return _root_suites
+end
+
+## Get a suite's name
+def qspec_suite_name(suite: Int): String
+  return as_type<Suite>(suite).name
+end
+
+## Get a suite's tests vec
+def qspec_suite_tests(suite: Int): Int
+  return as_int(as_type<Suite>(suite).tests)
+end
+
+## Get a suite's children vec
+def qspec_suite_children(suite: Int): Int
+  return as_int(as_type<Suite>(suite).children)
+end
+
+## Get a suite's declaration-ordered entries.
+def qspec_suite_entries(suite: Int): Int
+  return as_int(as_type<Suite>(suite).entries)
+end
+
+def qspec_suite_entry_kinds(suite: Int): Int
+  return as_int(as_type<Suite>(suite).entry_kinds)
+end
+
+## Get test case accessors
+def qspec_test_name(tc: Int): String
+  return as_type<Test>(tc).name
+end
+
+def qspec_test_status(tc: Int): Int
+  return as_type<Test>(tc).status
+end
+
+def qspec_test_duration(tc: Int): Int
+  return as_type<Test>(tc).duration_us
+end
+
+## Get the failure message for a test. Returns "" when the test passed,
+## was skipped, or hasn't run. For structured access (matcher name,
+## expected/actual operands, notes) use `qspec_test_failure_struct`.
+def qspec_test_failure(tc: Int): String
+  return as_type<Test>(tc).failure.message
+end
+
+## Get the structured failure record for a test (matcher / expected / actual /
+## notes). Meaningful only when the test failed; passing tests carry an empty
+## record (message == ""). Use `qspec_test_status(tc) == 2` to gate.
+def qspec_test_failure_struct(tc: Int): TestFailure
+  return as_type<Test>(tc).failure
+end
+
+def qspec_test_failure_count(tc: Int): Int
+  return vec_size(as_type<Test>(tc).failures)
+end
+
+def qspec_test_failure_struct_at(tc: Int, idx: Int): TestFailure
+  var failures = as_type<Test>(tc).failures
+  if idx < 0 or idx >= vec_size(failures)
+    return test_failure_simple("")
+  end
+  return vec_get(failures, idx)
+end

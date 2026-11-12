@@ -1,0 +1,558 @@
+## std/bench coverage — Phase C.8 Phase 1.
+##
+## Covers:
+##   - statistics primitives (mean / median / percentile / stddev / iqr)
+##   - MAD-based outlier rejection
+##   - bench_run end-to-end (warmup, measure, stat compute)
+##   - JSON emission shape
+##   - Mann-Whitney U regression detection
+##   - bench_compare verdict logic
+##
+## Timing tests use deterministic workloads (busy loops with known
+## work, no sleeps) so iteration timings cluster tightly enough that
+## the stat assertions are stable across CI runs.
+
+import * from qspec
+import * from std/bench
+
+## ---- statistics primitives ----
+
+def t_mean(): Void
+  var v = vec_new<Int>()
+  v.push(10)
+  v.push(20)
+  v.push(30)
+  v.push(40)
+  v.push(50)
+  assert_eq(bench_mean(v), 30)
+end
+
+def t_mean_empty(): Void
+  var v = vec_new<Int>()
+  assert_eq(bench_mean(v), 0)
+end
+
+def t_median_odd(): Void
+  var v = vec_new<Int>()
+  v.push(5)
+  v.push(1)
+  v.push(3)
+  assert_eq(bench_median(v), 3)
+end
+
+def t_median_even(): Void
+  var v = vec_new<Int>()
+  v.push(2)
+  v.push(4)
+  v.push(6)
+  v.push(8)
+  assert_eq(bench_median(v), 5)
+end
+
+def t_percentile_p95(): Void
+  var v = vec_new<Int>()
+  for i in 0..100
+    v.push(i)
+  end
+  ## p95 of [0..99] should be ~94 (index 94 in zero-based, n-1=99 * 9500 / 10000 = 94)
+  assert_eq(bench_percentile(v, 9500), 94)
+end
+
+def t_percentile_p99(): Void
+  var v = vec_new<Int>()
+  for i in 0..100
+    v.push(i)
+  end
+  assert_eq(bench_percentile(v, 9900), 98)
+end
+
+def t_percentile_single(): Void
+  var v = vec_new<Int>()
+  v.push(42)
+  assert_eq(bench_percentile(v, 9500), 42)
+end
+
+def t_iqr(): Void
+  var v = vec_new<Int>()
+  for i in 0..100
+    v.push(i)
+  end
+  ## p25=24, p75=74, IQR=50
+  assert_eq(bench_iqr(v), 50)
+end
+
+def t_stddev_constant(): Void
+  ## All identical → stddev 0
+  var v = vec_new<Int>()
+  for i in 0..10
+    v.push(50)
+  end
+  assert_eq(bench_stddev_x100(v), 0)
+end
+
+def t_stddev_known(): Void
+  ## values: 2, 4, 4, 4, 5, 5, 7, 9 — population stddev = 2.0
+  ## bench_stddev_x100 should report 200 (±1 for Newton iteration)
+  var v = vec_new<Int>()
+  v.push(2)
+  v.push(4)
+  v.push(4)
+  v.push(4)
+  v.push(5)
+  v.push(5)
+  v.push(7)
+  v.push(9)
+  var s = bench_stddev_x100(v)
+  ## Allow ±2 for integer-rounding error in the variance + isqrt path.
+  var ok = 0
+  if s >= 198 and s <= 202
+    ok = 1
+  end
+  assert_eq(ok, 1)
+end
+
+## ---- MAD outlier rejection ----
+
+def t_outlier_filter_keeps_clean(): Void
+  ## Values clustered tight; MAD filter should drop nothing.
+  var v = vec_new<Int>()
+  v.push(100)
+  v.push(102)
+  v.push(101)
+  v.push(99)
+  v.push(103)
+  v.push(98)
+  v.push(101)
+  var kept = bench_filter_outliers_mad(v)
+  assert_eq(kept.size, 7)
+end
+
+def t_outlier_filter_drops_extreme(): Void
+  ## One huge outlier in an otherwise-tight cluster. MAD filter
+  ## should drop it.
+  var v = vec_new<Int>()
+  v.push(100)
+  v.push(102)
+  v.push(101)
+  v.push(99)
+  v.push(103)
+  v.push(98)
+  v.push(101)
+  v.push(10000)  # extreme outlier
+  var kept = bench_filter_outliers_mad(v)
+  assert_eq(kept.size, 7)
+end
+
+def t_outlier_filter_too_few(): Void
+  ## n < 3 → return unchanged.
+  var v = vec_new<Int>()
+  v.push(100)
+  v.push(99999)
+  var kept = bench_filter_outliers_mad(v)
+  assert_eq(kept.size, 2)
+end
+
+## ---- bench_run end-to-end ----
+
+## Lightweight workload — small busy loop. Returns a sentinel value so
+## the optimizer can't fully elide it.
+def workload_small(): Int
+  var sum = 0
+  for i in 0..100
+    sum = sum + i
+  end
+  return sum
+end
+
+## Heavier workload — guaranteed to clock above ns granularity. Used
+## for assertions that need a non-zero median (verifies the timing
+## machinery itself, not just the stat plumbing).
+def workload_heavy(): Int
+  var sum = 0
+  for i in 0..100000
+    sum = sum + i * i
+  end
+  return sum
+end
+
+def t_run_default(): Void
+  var cfg = bench_config_default("heavy")
+  var r = bench_run(cfg, workload_heavy)
+  ## Default is 10 measure iters; some may be filtered as outliers.
+  assert_eq(r.values.size > 0, true)
+  assert_eq(r.values.size <= 10, true)
+  assert_eq(r.n_iters_observed, 10)
+  assert_eq_str(r.name, "heavy")
+  assert_eq_str(r.unit, "ns_per_iter")
+  ## Median should be positive (non-zero work was done).
+  assert_eq(r.median > 0, true)
+  ## p95 ≥ median by definition.
+  assert_eq(r.p95 >= r.median, true)
+  ## p99 ≥ p95.
+  assert_eq(r.p99 >= r.p95, true)
+  ## min ≤ median ≤ max.
+  assert_eq(r.min <= r.median, true)
+  assert_eq(r.median <= r.max, true)
+end
+
+def t_run_quick(): Void
+  var cfg = bench_config_quick("quick")
+  var r = bench_run(cfg, workload_small)
+  assert_eq(r.n_iters_observed, 5)
+  assert_eq(r.values.size > 0, true)
+end
+
+def t_run_custom_iters(): Void
+  var cfg = bench_config_with_iters("custom", 2, 8)
+  var r = bench_run(cfg, workload_small)
+  assert_eq(r.n_iters_observed, 8)
+  assert_eq(r.values.size > 0, true)
+end
+
+## ---- Mann-Whitney U ----
+
+def t_mw_no_diff(): Void
+  ## Two identical samples → not significant.
+  var xs = vec_new<Int>()
+  var ys = vec_new<Int>()
+  for i in 0..10
+    xs.push(i)
+    ys.push(i)
+  end
+  assert_eq(bench_mann_whitney_u(xs, ys), 0)
+end
+
+def t_mw_xs_larger(): Void
+  ## xs all > ys → xs greater (returns 1).
+  var xs = vec_new<Int>()
+  var ys = vec_new<Int>()
+  for i in 0..10
+    xs.push(100 + i)
+    ys.push(i)
+  end
+  assert_eq(bench_mann_whitney_u(xs, ys), 1)
+end
+
+def t_mw_ys_larger(): Void
+  var xs = vec_new<Int>()
+  var ys = vec_new<Int>()
+  for i in 0..10
+    xs.push(i)
+    ys.push(100 + i)
+  end
+  assert_eq(bench_mann_whitney_u(xs, ys), -1)
+end
+
+def t_mw_too_few(): Void
+  ## n < 5 per side → 0.
+  var xs = vec_new<Int>()
+  var ys = vec_new<Int>()
+  xs.push(1)
+  xs.push(2)
+  ys.push(100)
+  ys.push(200)
+  assert_eq(bench_mann_whitney_u(xs, ys), 0)
+end
+
+## ---- bench_compare ----
+
+def _make_result(name: String, unit: String, vals: Vec<Int>): BenchResult
+  return BenchResult {
+    name: name,
+    unit: unit,
+    values: vals,
+    mean: bench_mean(vals),
+    median: bench_median(vals),
+    p95: bench_percentile(vals, 9500),
+    p99: bench_percentile(vals, 9900),
+    min: 0,
+    max: 0,
+    stddev_x100: bench_stddev_x100(vals),
+    iqr: bench_iqr(vals),
+    n_iters_observed: vals.size,
+    n_outliers_removed: 0
+  }
+end
+
+def t_compare_no_change(): Void
+  ## Identical distributions → verdict 0.
+  var vs = vec_new<Int>()
+  for i in 0..10
+    vs.push(100 + i)
+  end
+  var vs2 = vec_new<Int>()
+  for i in 0..10
+    vs2.push(100 + i)
+  end
+  var baseline = _make_result("x", "ns_per_iter", vs)
+  var current = _make_result("x", "ns_per_iter", vs2)
+  var c = bench_compare(baseline, current)
+  assert_eq(c.verdict, 0)
+end
+
+def t_compare_regression(): Void
+  ## Lower-is-better unit; current 50% slower than baseline.
+  var base_v = vec_new<Int>()
+  for i in 0..10
+    base_v.push(100 + i)
+  end
+  var cur_v = vec_new<Int>()
+  for i in 0..10
+    cur_v.push(150 + i)
+  end
+  var baseline = _make_result("x", "ns_per_iter", base_v)
+  var current = _make_result("x", "ns_per_iter", cur_v)
+  var c = bench_compare(baseline, current)
+  ## ~50% regression on a lower-is-better unit.
+  assert_eq(c.verdict, 1)
+  assert_eq(c.mw_significant, true)
+end
+
+def t_compare_improvement(): Void
+  ## Higher-is-better unit (ops_per_sec); current 30% faster.
+  var base_v = vec_new<Int>()
+  for i in 0..10
+    base_v.push(100 + i)
+  end
+  var cur_v = vec_new<Int>()
+  for i in 0..10
+    cur_v.push(140 + i)
+  end
+  var baseline = _make_result("x", "ops_per_sec", base_v)
+  var current = _make_result("x", "ops_per_sec", cur_v)
+  var c = bench_compare(baseline, current)
+  ## Going from ~105 ops/sec to ~145 ops/sec is improvement under
+  ## ops_per_sec (higher is better).
+  assert_eq(c.verdict, -1)
+end
+
+def t_compare_higher_better_regression(): Void
+  ## Higher-is-better unit; current 50% slower than baseline → regression.
+  var base_v = vec_new<Int>()
+  for i in 0..10
+    base_v.push(150 + i)
+  end
+  var cur_v = vec_new<Int>()
+  for i in 0..10
+    cur_v.push(100 + i)
+  end
+  var baseline = _make_result("x", "ops_per_sec", base_v)
+  var current = _make_result("x", "ops_per_sec", cur_v)
+  var c = bench_compare(baseline, current)
+  assert_eq(c.verdict, 1)
+end
+
+## ---- JSON round-trip ----
+
+def t_json_roundtrip(): Void
+  var vs = vec_new<Int>()
+  for i in 0..10
+    vs.push(100 + i * 7)
+  end
+  var original = _make_result("roundtrip", "ns_per_iter", vs)
+  ## Build the JSON line via bench_format_json.
+  var sb = sb_new()
+  bench_format_json(original, sb)
+  var line = sb_to_string(sb)
+  ## Parse it back.
+  var parsed = bench_parse_json_line(line)
+  assert_eq_str(parsed.name, "roundtrip")
+  assert_eq_str(parsed.unit, "ns_per_iter")
+  assert_eq(parsed.median, original.median)
+  assert_eq(parsed.p95, original.p95)
+  assert_eq(parsed.p99, original.p99)
+  assert_eq(parsed.values.size, 10)
+  assert_eq(parsed.values[0], 100)
+  assert_eq(parsed.values[9], 100 + 9 * 7)
+end
+
+def t_json_parse_unprefixed(): Void
+  ## Parser strips BENCHJSON: prefix; bare {"v":2,...} also works.
+  var line = "{\"v\":2,\"name\":\"bare\",\"unit\":\"ns\",\"iters\":3,\"outliers_removed\":0,\"values\":[1,2,3],\"mean\":2,\"median\":2,\"p25\":1,\"p75\":3,\"p95\":3,\"p99\":3,\"min\":1,\"max\":3,\"stddev_x100\":81,\"iqr\":2}"
+  var r = bench_parse_json_line(line)
+  assert_eq_str(r.name, "bare")
+  assert_eq(r.median, 2)
+  assert_eq(r.values.size, 3)
+end
+
+def t_json_parse_missing_returns_sentinel(): Void
+  ## A line without a name field yields an empty-name sentinel.
+  var r = bench_parse_json_line("not a benchjson line")
+  assert_eq_str(r.name, "")
+  assert_eq(r.median, 0)
+end
+
+## ---- File round-trip ----
+
+def t_file_save_load(): Void
+  var path = "/tmp/_bench_spec_roundtrip.jsonl"
+  ## Wipe any prior content.
+  write_file(path, "")
+  var vs1 = vec_new<Int>()
+  for i in 0..10
+    vs1.push(100 + i)
+  end
+  var vs2 = vec_new<Int>()
+  for i in 0..10
+    vs2.push(200 + i)
+  end
+  var r1 = _make_result("first", "ns_per_iter", vs1)
+  var r2 = _make_result("second", "ns_per_iter", vs2)
+  bench_save_to_file(path, r1)
+  bench_save_to_file(path, r2)
+  var loaded = bench_load_from_file(path)
+  assert_eq(loaded.size, 2)
+  assert_eq_str(loaded[0].name, "first")
+  assert_eq_str(loaded[1].name, "second")
+  assert_eq(loaded[0].median, r1.median)
+  assert_eq(loaded[1].median, r2.median)
+end
+
+def t_find_by_name_hit(): Void
+  var results = vec_new<BenchResult>()
+  var v = vec_new<Int>()
+  for i in 0..5
+    v.push(i)
+  end
+  results.push(_make_result("alpha", "ns_per_iter", v))
+  results.push(_make_result("beta", "ns_per_iter", v))
+  var found = bench_find_by_name(results, "beta")
+  assert_eq_str(found.name, "beta")
+end
+
+def t_find_by_name_miss(): Void
+  var results = vec_new<BenchResult>()
+  var v = vec_new<Int>()
+  for i in 0..5
+    v.push(i)
+  end
+  results.push(_make_result("alpha", "ns_per_iter", v))
+  var found = bench_find_by_name(results, "missing")
+  assert_eq_str(found.name, "")
+end
+
+## ---- Test helpers ----
+
+def t_synthesize_stats(): Void
+  ## bench_synthesize should produce the same derived stats as a real
+  ## bench_run on the same value vector.
+  var v = vec_new<Int>()
+  v.push(10)
+  v.push(20)
+  v.push(30)
+  v.push(40)
+  v.push(50)
+  v.push(60)
+  v.push(70)
+  v.push(80)
+  v.push(90)
+  v.push(100)
+  var r = bench_synthesize("synth", "ns_per_iter", v)
+  assert_eq_str(r.name, "synth")
+  assert_eq_str(r.unit, "ns_per_iter")
+  assert_eq(r.values.size, 10)
+  assert_eq(r.mean, 55)
+  assert_eq(r.median, 55)
+  assert_eq(r.min, 10)
+  assert_eq(r.max, 100)
+  assert_eq(r.n_iters_observed, 10)
+  assert_eq(r.n_outliers_removed, 0)
+end
+
+def t_format_human_string(): Void
+  var v = vec_new<Int>()
+  for i in 0..10
+    v.push(1000 + i)
+  end
+  var r = bench_synthesize("fmt", "ns_per_iter", v)
+  var s = bench_format_human(r)
+  ## Output should start with [bench] tag and contain the name.
+  assert_eq(str_starts_with(s, "[bench] fmt:"), true)
+  match str_byte_find(s, "median=")
+    Some(_) => assert_eq(true, true)
+    None => assert_eq(false, true)
+  end
+  match str_byte_find(s, "p99=")
+    Some(_) => assert_eq(true, true)
+    None => assert_eq(false, true)
+  end
+end
+
+def t_format_json_str(): Void
+  var v = vec_new<Int>()
+  for i in 0..5
+    v.push(100 + i * 10)
+  end
+  var r = bench_synthesize("jstr", "ns_per_iter", v)
+  var s = bench_format_json_str(r)
+  ## Output should start with BENCHJSON: prefix.
+  assert_eq(str_starts_with(s, "BENCHJSON:"), true)
+  ## Round-trip through the parser proves the format string round-trips.
+  var parsed = bench_parse_json_line(s)
+  assert_eq_str(parsed.name, "jstr")
+  assert_eq(parsed.median, r.median)
+  assert_eq(parsed.values.size, 5)
+end
+
+## ---- Main ----
+
+def main(): Int
+  describe("bench statistics") do ->
+    it("mean of [10,20,30,40,50] = 30") do -> t_mean() end
+    it("mean of empty vec = 0") do -> t_mean_empty() end
+    it("median of [5,1,3] = 3") do -> t_median_odd() end
+    it("median of [2,4,6,8] = 5") do -> t_median_even() end
+    it("p95 of 0..99 = 94") do -> t_percentile_p95() end
+    it("p99 of 0..99 = 98") do -> t_percentile_p99() end
+    it("percentile of single-element vec returns that element") do -> t_percentile_single() end
+    it("IQR of 0..99 = 50") do -> t_iqr() end
+    it("stddev of constants = 0") do -> t_stddev_constant() end
+    it("stddev of known sample matches expected ±2") do -> t_stddev_known() end
+  end
+
+  describe("bench MAD outlier rejection") do ->
+    it("keeps a tight cluster intact") do -> t_outlier_filter_keeps_clean() end
+    it("drops extreme outliers") do -> t_outlier_filter_drops_extreme() end
+    it("returns input unchanged when n < 3") do -> t_outlier_filter_too_few() end
+  end
+
+  describe("bench_run") do ->
+    it("default config produces well-formed result") do -> t_run_default() end
+    it("quick config runs 5 measure iters") do -> t_run_quick() end
+    it("custom iters honored") do -> t_run_custom_iters() end
+  end
+
+  describe("Mann-Whitney U") do ->
+    it("identical samples → 0") do -> t_mw_no_diff() end
+    it("xs uniformly larger → 1") do -> t_mw_xs_larger() end
+    it("ys uniformly larger → -1") do -> t_mw_ys_larger() end
+    it("n < 5 per side → 0") do -> t_mw_too_few() end
+  end
+
+  describe("bench_compare") do ->
+    it("identical distributions → no verdict") do -> t_compare_no_change() end
+    it("ns_per_iter +50% → regression") do -> t_compare_regression() end
+    it("ops_per_sec +30% → improvement") do -> t_compare_improvement() end
+    it("ops_per_sec -33% → regression") do -> t_compare_higher_better_regression() end
+  end
+
+  describe("JSON serialization") do ->
+    it("emit then parse preserves all fields") do -> t_json_roundtrip() end
+    it("parser accepts unprefixed JSON") do -> t_json_parse_unprefixed() end
+    it("parser returns empty-name sentinel on bad input") do -> t_json_parse_missing_returns_sentinel() end
+  end
+
+  describe("file persistence") do ->
+    it("save then load roundtrip preserves multiple entries") do -> t_file_save_load() end
+    it("find_by_name hits the right entry") do -> t_find_by_name_hit() end
+    it("find_by_name returns empty-name sentinel on miss") do -> t_find_by_name_miss() end
+  end
+
+  describe("test helpers") do ->
+    it("bench_synthesize computes derived stats from samples") do -> t_synthesize_stats() end
+    it("bench_format_human returns assertable string") do -> t_format_human_string() end
+    it("bench_format_json_str returns assertable JSON string") do -> t_format_json_str() end
+  end
+
+  return qspec_main()
+end

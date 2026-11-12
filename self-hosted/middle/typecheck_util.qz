@@ -1,0 +1,3969 @@
+##! # Type Checker Utilities
+##!
+##! Shared foundation for the Quartz type checker.
+##! Contains type/node constants, TypecheckState struct, and utility functions.
+
+import ast
+import diagnostic
+import explain
+import node_constants
+import type_constants
+import string_intern
+import std/state
+import typecheck_ctx
+import file_io
+import * from str_compat
+
+
+
+# ============================================================================
+# Type Checker Context
+# ============================================================================
+#
+# Storage layout (vector of vectors):
+#   0: errors (vector of error message strings)
+#   1: error_lines (vector of line numbers)
+#   2: error_cols (vector of column numbers)
+#   3: current_function_return_type (single-element vector)
+#   4: current_scope_depth (single-element vector)
+#   5: binding_names (vector of variable name strings)
+#   6: binding_types (vector of type kinds)
+#   7: binding_depths (vector of scope depths when bound)
+#   8: binding_mutables (vector of 0/1 for mutability)
+#   9: builtins (Map<String,Int>: name -> return type)
+#  10: reserved (for future use)
+#  11: struct_names (vector of struct names)
+#  12: struct_field_names (vector of vectors - each struct's field names)
+#  13: struct_field_types (vector of vectors - each struct's field types)
+#  14: enum_names (vector of enum names)
+#  15: enum_variant_names (vector of vectors - each enum's variant names)
+#  16: enum_variant_payloads (vector of vectors - payload types per variant)
+#  17: func_names (vector of function names)
+#  18: func_param_types (vector of vectors - each func's param types)
+#  19: func_return_types (vector of return type kinds)
+#  20: type_storage (for creating Type handles)
+#  21: source (source code string for error context)
+#  22: filename (source filename)
+#  23: (removed — was infer_globals)
+#  24: param_type_vars (map: param index -> type var ID)
+#  25: func_required_counts (count of required params per function)
+#  26: binding_param_counts (-1 for non-functions)
+#  27: binding_count (valid number of bindings)
+# ============================================================================
+# TcErrors — error and warning accumulator (sub-struct of TypecheckState)
+# ============================================================================
+
+## Accumulates type errors and warnings during semantic analysis.
+## Extracted from TypecheckState to reduce god-object field count.
+struct TcErrors
+  ## Vector of error messages
+  errors: Vec<String>
+  ## Vector of error line numbers
+  error_lines: Vec<Int>
+  ## Vector of error column numbers
+  error_cols: Vec<Int>
+  ## Vector of error source file paths (parallel to errors)
+  error_files: Vec<String>
+  ## Macro-expansion-chain idx per error (parallel; 0 = no chain).
+  ## Populated by `tc_error_at(tc, msg, s, h)` from `ast_get_expansion`.
+  ## `tc_error(tc, msg, line, col)` pushes 0 — call `tc_error_at` when
+  ## a node handle is in scope to get a rendered expansion chain on the
+  ## diagnostic. Macro hygiene retrofit · Tier 2 #8b-followup P2.c.
+  error_expansion_idxs: Vec<Int>
+  ## Vector of warning messages
+  warnings: Vec<String>
+  ## Vector of warning line numbers
+  warning_lines: Vec<Int>
+  ## Vector of warning column numbers
+  warning_cols: Vec<Int>
+  ## Vector of warning source file paths (parallel to warnings)
+  warning_files: Vec<String>
+  warning_expansion_idxs: Vec<Int>
+end
+
+# ============================================================================
+# TcScope — scope and binding state (sub-struct of TypecheckState)
+# ============================================================================
+
+## Manages variable bindings, scope depth, and return type tracking.
+## Extracted from TypecheckState to reduce god-object field count.
+struct TcScope
+  ## Scope binding names
+  binding_names: Vec<String>
+  ## Scope binding types
+  binding_types: Vec<Int>
+  ## Scope binding depths
+  binding_depths: Vec<Int>
+  ## Scope binding mutability flags
+  binding_mutables: Vec<Int>
+  ## Binding struct names
+  binding_struct_names: Vec<String>
+  ## Valid binding count
+  binding_count: Vec<Int>
+  ## Binding parameter counts
+  binding_param_counts: Vec<Int>
+  ## Binding type annotations (used as the dispatch_type — drives UFCS lookup,
+  ## trait-bound resolution, and parametric container reconstruction).
+  binding_type_annotations: Vec<String>
+  ## Display-type annotations parallel to binding_type_annotations.
+  ## For most bindings this string equals the dispatch type; for `impl Trait`
+  ## return-typed bindings this carries the opaque marker
+  ## ("impl <Trait>@<func_name>") that source-level type matching sees.
+  ## Phase 7 of the impl Trait sprint.
+  binding_display_types: Vec<String>
+  ## Binding type schemes for let-polymorphism (T3c.1 Phase 3)
+  ## Each entry is a Vec<Int> of quantified type variable IDs.
+  ## Empty vec = monomorphic binding. Non-empty = polymorphic (generalized).
+  binding_schemes: Vec<Vec<Int>>
+  ## Current scope depth stack
+  current_scope_depth: Vec<Int>
+  ## Current function return type stack
+  current_func_return_type: Vec<Int>
+  ## Current function effect-row index stack — single-element Vec, mirrors
+  ## current_func_return_type's pattern. Index into TcRegistry.func_names
+  ## of the function whose body is currently being typechecked. Set by
+  ## tc_function on entry; -1 means "no current function" (top-level scope
+  ## or untracked). tc_expr_call reads this to decide whether to invoke
+  ## tc_row_subsume against the callee's row.
+  ## Operation Piezoelectric Effects, B.7.
+  current_func_idx: Vec<Int>
+  ## Handler-effect label stack — LIFO stack of effect-name intern IDs
+  ## (interned in tc.interner) for enclosing `with` handler blocks.
+  ## Pushed by NODE_WITH typecheck when the handler expression resolves
+  ## to a registered effect decl; popped after the body is typechecked.
+  ## tc_expr_call consults this to narrow the QZ0610 subsumption check:
+  ## any callee effect label present on the stack is considered handled
+  ## by an enclosing with-block and does NOT need to be in the caller's
+  ## `can` row. Operation Piezoelectric Effects, C.2.
+  handler_effect_stack: Vec<Int>
+  ## Last lambda body type — for call-site return type validation
+  last_lambda_body_type: Int
+  ## Trait type params in scope during trait method signature parsing
+  trait_type_params: String
+  ## Self type: the implementing type inside impl/trait blocks (e.g. "Point")
+  impl_self_type: String
+  ## Macro hygiene: scope-set index per binding (parallel to binding_names).
+  ## 0 = empty scope set (legacy / user-source bindings see all refs whose
+  ## scope sets are ⊆ ∅, i.e. also empty — so existing code behaves unchanged).
+  ## Non-zero entries come from expansion: a binding introduced inside a
+  ## macro body carries the def-site scope, which the resolver (P3.c) uses
+  ## to disambiguate against caller-scope bindings with the same name.
+  ## Macro hygiene retrofit (Tier 2 #8b-followup) Phase 3 — schema only.
+  binding_scope_idxs: Vec<Int>
+  ## SURF.FLOW Phase 1 — flow-narrowing (smart-cast) side table.
+  ## Parallel flat Vecs, NOT a hash map: iteration is deterministic
+  ## insertion-order so fixpoint (gen1==gen2) holds. Each row records an
+  ## active refinement "binding `narrow_names[i]` is the `narrow_variant_idx[i]`
+  ## variant, inner type `narrow_inner_type[i]`" valid at scope depth
+  ## `narrow_depth[i]`. Pushed before walking an `if`'s then-branch, truncated
+  ## back on exit (tc_snapshot_narrow / tc_restore_narrow). narrow_count is a
+  ## single-element Vec holding the live row count (mirrors binding_count).
+  narrow_names: Vec<String>
+  narrow_variant_idx: Vec<Int>
+  narrow_inner_type: Vec<Int>
+  narrow_inner_struct: Vec<String>
+  narrow_depth: Vec<Int>
+  narrow_count: Vec<Int>
+  ## SURF.FLOW B1 — aliased-condition narrowing side table. A CONST local bound to
+  ## a narrowing-guard boolean (`c = x.some?`) records `c -> the guard's cond-node`
+  ## here so `if c` can re-classify against the stored guard and narrow `x` exactly
+  ## as `if x.some?` would. Same flat-Vec, insertion-order, deterministic discipline
+  ## as narrow_* (a hash map would break fixpoint). alias_names[i] = the const alias
+  ## binding name; alias_guard_node[i] = the AST node id of the guard expression it
+  ## was bound to; alias_depth[i] = scope depth (for scope-exit truncation);
+  ## alias_count = single-element live-row count (mirrors narrow_count). Only const
+  ## aliases are recorded (§2.3 gate 1); const-ness of alias AND subject is re-asserted
+  ## at the `if` site before narrowing.
+  alias_names: Vec<String>
+  alias_guard_node: Vec<Int>
+  alias_depth: Vec<Int>
+  alias_count: Vec<Int>
+end
+
+# ============================================================================
+# TcSafety — borrow checker, move semantics, and linearity state
+# ============================================================================
+
+## Tracks borrow states, move states, linear consumption, and partial moves.
+## Extracted from TypecheckState + module-level globals.
+struct TcSafety
+  ## Linear state tracking for bindings
+  binding_linear_states: Vec<Int>
+  ## Linear struct names for bindings
+  binding_linear_structs: Vec<String>
+  ## Borrow state tracking
+  binding_borrow_states: Vec<Int>
+  ## Shared borrow counts
+  binding_shared_borrow_counts: Vec<Int>
+  ## Borrow source indices
+  binding_borrow_sources: Vec<Int>
+  ## Mutable borrow flags
+  binding_is_mut_borrows: Vec<Int>
+  ## Line where borrow was created (for diagnostics)
+  binding_borrow_lines: Vec<Int>
+  ## Column where borrow was created (for diagnostics)
+  binding_borrow_cols: Vec<Int>
+  ## Move states: 0=Free, 1=Live, 2=Moved
+  move_states: Vec<Int>
+  ## Struct name for moveable binding
+  move_types: Vec<String>
+  ## Target where value was moved to
+  move_targets: Vec<String>
+  ## Line where move occurred
+  move_lines: Vec<Int>
+  ## Column where move occurred
+  move_cols: Vec<Int>
+  ## Type names registered as Copy
+  copy_types: Vec<String>
+  ## Comma-separated list of moved field names per binding
+  partial_moved_fields: Vec<String>
+  ## Comma-separated targets for partial moves
+  partial_move_targets: Vec<String>
+  ## Comma-separated lines for partial moves (as strings)
+  partial_move_lines: Vec<String>
+  ## Arena safety: var names referencing arena allocations
+  arena_var_names: Vec<String>
+  ## Arena safety: arena source for each tracked var
+  arena_var_sources: Vec<String>
+  ## Arena safety: line numbers for arena allocations
+  arena_var_lines: Vec<Int>
+  ## Arena safety: invalidated arena names
+  arena_invalidated: Vec<String>
+  ## Arena safety: line numbers for invalidation events (parallel to arena_invalidated)
+  arena_invalidated_lines: Vec<Int>
+  ## Arena safety: currently scoped arenas
+  arena_scoped_arenas: Vec<String>
+  ## Depth counter: >0 suppresses whole-struct partial move check during field access
+  field_access_depth: Int
+  ## Protocol state: protocol index per binding (-1 = not a protocol channel)
+  binding_protocol_ids: Vec<Int>
+  ## Protocol state: current DFA state per binding (0 = start state)
+  binding_protocol_states: Vec<Int>
+  ## Protocol type args per binding ("" if not generic, "Int" or "Int,String" for generic)
+  binding_protocol_type_args: Vec<String>
+end
+
+# ============================================================================
+# BorrowSummary — interprocedural borrow tracking per function (T3c.2)
+# ============================================================================
+
+## Describes what a function does with its borrowed parameters.
+## Generated from function signature annotations, refined by body analysis.
+## Used at call sites to enforce cross-function borrow safety.
+struct BorrowSummary
+  ## Param indices that take shared borrows (&T)
+  shared_params: Vec<Int>
+  ## Param indices that take exclusive borrows (&mut T)
+  exclusive_params: Vec<Int>
+  ## 0=none, 1=shared, 2=exclusive
+  return_borrow_kind: Int
+  ## -2=none, -1=local(unsound), 0..N=param index
+  return_borrow_source: Int
+  ## Bit i = 1 means param i's borrow escapes
+  escape_mask: Int
+end
+
+# ============================================================================
+# TcRegistry — type/function/struct/enum/trait/impl registries
+# ============================================================================
+
+## All registered type definitions, functions, traits, impls, and related metadata.
+## Extracted from TypecheckState + module-level globals.
+struct TcRegistry
+  struct_names: Vec<String>
+  struct_field_names: Vec<Vec<String>>
+  struct_field_types: Vec<Vec<Int>>
+  struct_type_params: Vec<String>
+  struct_field_annotations: Vec<Vec<String>>
+  struct_is_linear: Vec<Int>
+  ## V3 (§14.12.5) — 1 iff the struct was declared `@value`. Parallel to
+  ## struct_names. Populated by tc_register_struct_def from the AST is_value
+  ## flag (the typecheck-layer mirror of mir entry.is_value). Read ONLY by the
+  ## QZ0221 erased-@value-boundary diagnostic (inert at gate-0). Defaults to 0
+  ## for every struct, so it has zero effect until the value-semantics flip.
+  struct_is_value: Vec<Int>
+  ## R1.1 (PF3 Family-3 opt-out) — 1 iff the struct was declared `@repr(C)`.
+  ## Parallel to struct_names. Populated by tc_register_struct_def from the AST
+  ## repr_c flag. Read ONLY by the QZ0221 erased-@value-boundary diagnostic so
+  ## that `@repr(C)` (known-Boxed) structs are positively excluded from the
+  ## conservative flip-eligibility over-approximation. Inert at gate-0.
+  struct_repr_c: Vec<Int>
+  struct_field_defaults: Vec<Vec<Int>>
+  ## Binary DSL kind per struct: 0=normal, 1=binary block, 2=packed struct.
+  ## Parallel to struct_names. Lets MIR lowering / method synth distinguish
+  ## regular structs from `binary {}` / `packed struct(uN)` types.
+  struct_dsl_kind: Vec<Int>
+  ## Backing integer width (N) for packed struct(uN), 0 otherwise.
+  ## Parallel to struct_names.
+  struct_dsl_backing: Vec<Int>
+  ## P4.D.1: Per-struct row-var names. Lowercase-first generic params on
+  ## a struct (`struct Stream<T, e>`) are row variables, mirroring the
+  ## P3.F.1 function-level convention. Outer vec parallel to struct_names;
+  ## inner vec is that struct's row-var name list. Empty for structs with
+  ## only type-var params.
+  struct_row_var_names: Vec<Vec<String>>
+  ## P4.D.1: Per-struct generalized erv IDs parallel to struct_row_var_names.
+  ## Each entry is the fresh tc_erv_fresh allocated at registration time —
+  ## same role as func_generalized_ervs / trait_generalized_ervs. Future
+  ## struct-method body checks load these into tc.func_row_var_* before
+  ## walking the body so `def Stream.next<T, e>(self): ... can e` resolves
+  ## correctly.
+  struct_row_var_ids: Vec<Vec<Int>>
+  enum_names: Vec<String>
+  enum_variant_names: Vec<Vec<String>>
+  enum_variant_payloads: Vec<Vec<Int>>
+  enum_type_params: Vec<String>
+  enum_variant_field_annotations: Vec<Vec<String>>
+  func_names: Vec<String>
+  func_param_types: Vec<Vec<Int>>
+  func_return_types: Vec<Int>
+  func_return_annotations: Vec<String>
+  func_required_counts: Vec<Int>
+  func_param_fn_annotations: Vec<Vec<Int>>
+  trait_names: Vec<String>
+  trait_method_names: Vec<Vec<String>>
+  trait_method_sigs: Vec<Vec<Int>>
+  trait_method_defaults: Vec<Vec<Int>>
+  ## P3.F.3: Per-trait, per-method effect row. Outer vec parallel to
+  ## trait_names; inner vec parallel to that trait's method_names.
+  ## -1 = no `can` clause declared on the method. Populated in
+  ## tc_register_trait_def; resolved through the trait-level row-var
+  ## env so `trait Iterator<T>; def next(self): Option<T> can e end`
+  ## (hypothetical — needs explicit row-var in type params) wires up.
+  trait_method_effect_rows: Vec<Vec<Int>>
+  ## P3.F.3: Per-trait generalized ervs (the row-vars declared as
+  ## lowercase type-params on the trait). Used to instantiate fresh
+  ## ervs at method call sites — same pattern as func_generalized_ervs
+  ## from F.2.
+  trait_generalized_ervs: Vec<Vec<Int>>
+  trait_super_traits: Vec<String>
+  trait_type_params: Vec<String>
+  impl_trait_names: Vec<String>
+  impl_for_types: Vec<String>
+  impl_method_names: Vec<Vec<String>>
+  ## Negative impls: `impl !Trait for Type end` opt-outs.
+  ## Parallel vecs: neg_impl_trait_names[i] and neg_impl_for_types[i] are the
+  ## (trait, type) pair for the i-th negative impl. Consulted first in
+  ## tc_type_is_send / tc_type_is_sync / tc_check_trait_bound — a negative
+  ## impl always wins over structural auto-derivation.
+  neg_impl_trait_names: Vec<String>
+  neg_impl_for_types: Vec<String>
+  type_alias_names: Vec<String>
+  type_alias_types: Vec<String>
+  newtype_names: Vec<String>
+  newtype_wrapped_types: Vec<String>
+  newtype_type_ids: Vec<Int>
+  ## STRICT_NEWTYPES — 1 iff this newtype was declared with @strict.
+  ## A strict newtype rejects implicit conversion to/from its wrapped type
+  ## at let / arg / return / branch / index / comparison / shift positions.
+  ## Crossing the boundary requires the __as_strict / __from_strict
+  ## intrinsic. Parallel to newtype_names. Default 0 (loose, unchanged).
+  newtype_strict_flags: Vec<Int>
+  union_member_strings: Vec<String>
+  union_type_names: Vec<String>
+  intersection_member_strings: Vec<String>
+  intersection_record_fields: Vec<Vec<String>>
+  intersection_record_types: Vec<Vec<String>>
+  fn_type_annotations: Vec<String>
+  fn_type_param_counts: Vec<Int>
+  fn_type_return_types: Vec<Int>
+  ## Resolved param type IDs per fn type (T3c.1 Phase 3)
+  fn_type_param_types: Vec<Vec<Int>>
+  ## Effect bounds per fn type: 0=none, 1=@pure, 2=@io, 4=@suspend (CONC.9)
+  fn_type_effect_bounds: Vec<Int>
+  ## P3.F.2: Piezo-era `can` row per fn type. -1 = no can clause (untracked
+  ## or purely @-effect-bound); >=0 = row ID into TcRegistry.row_label_lists.
+  ## Parallel to fn_type_annotations. Populated by tc_parse_type when it
+  ## sees a ` can ...` suffix on an Fn annotation; consulted at indirect
+  ## call sites to subsume the caller's row.
+  fn_type_can_row_idx: Vec<Int>
+  func_type_params: Vec<String>
+  func_type_param_bounds: Vec<String>
+  func_param_annotations: Vec<String>
+  ## Comma-separated parameter names per function (for named arg validation)
+  func_param_names: Vec<String>
+  ## AST storage handle per function (for default value lookup)
+  func_ast_stores: Vec<Int>
+  ## AST function handle per function (for default value lookup)
+  func_ast_handles: Vec<Int>
+  record_signatures: Vec<String>
+  record_field_names: Vec<Vec<String>>
+  record_field_types: Vec<Vec<String>>
+  ## Row variable ID per record: 0 = closed, >0 = open (row var ID)
+  record_row_vars: Vec<Int>
+  ## Resolved field type IDs per record (ROW Phase 2 — H-M integration)
+  record_field_type_ids: Vec<Vec<Int>>
+  ## Tuple element types — indexed by ptype offset from PTYPE_BASE
+  tuple_elem_types: Vec<Vec<Int>>
+  ## impl Trait return type registry — parallel arrays
+  impl_return_func_names: Vec<String>
+  impl_return_concrete_types: Vec<String>
+  impl_return_trait_names: Vec<String>
+  ## -----------------------------------------------------------------------
+  ## Forall scheme registry (Rank-2 polymorphism, Phase E)
+  ## Each entry stores a quantified type: forall a b. body_type
+  ## Type ID = TYPE_FORALL_BASE + index into these arrays.
+  ## -----------------------------------------------------------------------
+  ## Quantified variable names per scheme (for display/error messages)
+  forall_var_names: Vec<Vec<String>>
+  ## Body type ID per scheme (the type under the forall binder)
+  forall_body_types: Vec<Int>
+  ## Quantified type variable IDs per scheme (negative IDs)
+  forall_var_ids: Vec<Vec<Int>>
+  ## -----------------------------------------------------------------------
+  ## Interprocedural borrow summaries (T3c.2 Phase 0)
+  ## Typed value storage; None = no summary. Parallel to func_names.
+  ## -----------------------------------------------------------------------
+  func_borrow_summaries: Vec<Option<BorrowSummary>>  # BorrowSummary defined above in this module
+  ## -----------------------------------------------------------------------
+  ## Effect rows + effect declarations (Operation Piezoelectric Effects,
+  ## Phase 1 Milestone B). Pure data infrastructure — semantics layered
+  ## on top in B.4-B.7.
+  ## -----------------------------------------------------------------------
+  ## Row store: Rémy/Leijen open rows. Each row has a list of effect-label
+  ## intern IDs and an optional tail variable (-1 = closed empty tail,
+  ## else type-var ID). Row ID = index into these parallel Vecs.
+  row_label_lists: Vec<Vec<Int>>
+  row_tail_vars: Vec<Int>
+  ## Effect declaration registry. Op data is stored flat across all
+  ## effects; effect_decl_op_starts[i] gives the start offset and
+  ## effect_decl_op_counts[i] the count for the i-th effect's ops.
+  effect_decl_names: Vec<String>
+  effect_decl_op_starts: Vec<Int>
+  effect_decl_op_counts: Vec<Int>
+  ## Flat op metadata across all effects.
+  ## Kind: 0=value, 1=function (default), 2=operation. Milestone B uses 1.
+  effect_decl_op_names: Vec<String>
+  effect_decl_op_kinds: Vec<Int>
+  effect_decl_op_param_types: Vec<Vec<Int>>
+  effect_decl_op_return_types: Vec<Int>
+  ## Per-function effect row ID, parallel to func_names.
+  ## -1 = untracked (no `can` clause); 0+ = row ID into row_* tables.
+  func_effect_row_idx: Vec<Int>
+  ## P3.F.2: Per-function list of "generalized" effect-row-variable IDs —
+  ## the ervs allocated by tc_func_row_var_bind during that function's
+  ## signature walk (one per lowercase type-param). Used at call sites to
+  ## instantiate fresh ervs before subsumption, so every call of a
+  ## polymorphic function gets its own row-var binding. Without this, the
+  ## first call's concrete row binds the generalized erv and every later
+  ## call inherits the same binding — breaking polymorphism across two
+  ## sites that use the same combinator with different effect rows.
+  func_generalized_ervs: Vec<Vec<Int>>
+end
+
+# TypecheckState - typecheck context with all registries
+## Type Checker Context.
+## Holds all state for the semantic analysis phase.
+struct TypecheckState
+  ## Error and warning accumulator
+  errs: TcErrors
+  ## Scope and binding state
+  scope: TcScope
+  ## Borrow checker, move semantics, and linearity state
+  safety: TcSafety
+  ## Type/function/struct/enum/trait/impl registries
+  registry: TcRegistry
+  ## Builtin function registry
+  builtins: Map<String, Int>
+  ## Type storage handle
+  type_storage: Vec<Int>
+  ## Source code string
+  source: Vec<String>
+  ## Source filename
+  filename: Vec<String>
+  ## Current module's source file path (updated per-function during TC)
+  current_file: String
+  ## Parameter type variable map
+  param_type_vars: Vec<String>
+  ## Builtin minimum arity
+  builtin_min_arity: Map<String, Int>
+  ## Builtin maximum arity
+  builtin_max_arity: Map<String, Int>
+  ## Builtin callback effect requirement (PSQ-6 / Sched effect, 2026-04-30):
+  ## maps builtin name → effect name string the first-arg callback must
+  ## declare in its `can` row. Empty/missing = no requirement. Today only
+  ## `sched_idle_hook_set` populates this with "Sched"; the call-site check
+  ## at typecheck_expr_handlers reads it to fire QZ1408 when a non-Sched
+  ## function is passed.
+  builtin_callback_effect: Map<String, String>
+  ## Sched-context body-walk min-depth (PSQ-6 / Sched effect, Phase C).
+  ## 0 = not inside a `can Sched` function body. > 0 = the scope depth
+  ## just inside the current Sched function — bindings whose binding_depth
+  ## is < this value are captures or globals (subject to the Sync check),
+  ## bindings >= this value are local params/vars (exempt). Saved + restored
+  ## across nested `tc_function` invocations so non-Sched lambdas inside
+  ## a Sched body don't drag their captures through the check.
+  in_sched_min_depth: Int
+  ## `@thread_local` global variable names (Phase A.5b item 3, 2026-05-01).
+  ## Populated at NODE_GLOBAL_VAR visit when the AST node's op slot
+  ## carries the `is_thread_local = 1` flag (parser sets it from
+  ## `@[thread_local] var ...`). Read at the QZ1408 emission site to
+  ## skip the Sync check — TLS storage is per-thread by definition,
+  ## so cross-thread sharing is impossible and the structural check
+  ## doesn't apply.
+  thread_local_globals: Map<String, Int>
+  ## Parameterized type bases
+  ptype_bases: Vec<Int>
+  ## Parameterized type arg1s
+  ptype_arg1s: Vec<Int>
+  ## Parameterized type arg2s
+  ptype_arg2s: Vec<Int>
+  ## Parameterized type struct/enum names (parallel to ptype_bases)
+  ptype_names: Vec<String>
+  ## Hash-cache for ptype interning. Key: "base|arg1|arg2".
+  ## Value: index into ptype_bases (= type_id - PTYPE_BASE).
+  ## Eliminates O(N) linear scan in tc_make_ptype that caused quadratic
+  ## blowup with heavy-import + struct-variant enum patterns.
+  ptype_intern_map: Map<String, Int>
+  ## Loop label stack for label validation
+  loop_labels: Vec<String>
+  ## String interner for canonical pointer deduplication
+  interner: StringInterner
+  ## Pending ptype variable names (parallel with bases/vars/vars2)
+  pending_ptype_names: Vec<String>
+  ## Pending ptype base types (TYPE_VEC, TYPE_MAP, etc.)
+  pending_ptype_bases: Vec<Int>
+  ## Pending ptype element type variables (negative IDs from tc_tv_fresh)
+  pending_ptype_vars: Vec<Int>
+  ## Pending ptype second type variables (Map value type), or 0
+  pending_ptype_vars2: Vec<Int>
+  ## Inferred Vec element type tracking: variable names
+  inferred_vec_vars: Vec<String>
+  ## Inferred Vec element type tracking: source lines where type was inferred
+  inferred_vec_lines: Vec<Int>
+  ## Pending map_new() init nodes by binding name. When `var m = map_new()`
+  ## runs, we record the init AST node here. When a later map_set/map_insert
+  ## infers the key type, we look up the init node and stamp its str2 so the
+  ## map_new codegen allocates the correct (string- vs int-key) layout.
+  ## Without this, fresh `map_new()` always allocates the string-key layout
+  ## and a subsequent intmap_set on it crashes with a layout mismatch.
+  pending_map_new_vars: Vec<String>
+  pending_map_new_nodes: Vec<Int>
+  ## WS1 — same mechanism for `set_new`: back-stamp the init node's str2 with a
+  ## value-layout struct element name so the set_new codegen allocates the
+  ## struct-compatible (string-hashmap) layout that qz_map_custom_* operates on.
+  ## Without this, fresh `set_new()` allocates the identity intmap layout and a
+  ## subsequent value-compare set_add crashes with a layout mismatch.
+  pending_set_new_vars: Vec<String>
+  pending_set_new_nodes: Vec<Int>
+  ## WS3 — set ELEMENT-TYPE tracking for value-compare ALGEBRA. `Set` is an
+  ## unparameterized type (no `Set<T>` annotation), so a set var carries no static
+  ## element type. Value-compare add/has/delete recover it from the ELEMENT argument,
+  ## but algebra ops (union/intersection/difference/is_subset) take another SET as the
+  ## 2nd arg — no element to inspect. So when a `set_add(s, structval)` is seen we
+  ## record s's name → the value-layout struct element name here; the algebra
+  ## annotation then looks up the receiver's name to stamp the op's element type so
+  ## codegen routes to the @qz_set_custom_* value-compare helpers. Function-scoped
+  ## (cleared at each tc_function boundary), same as pending_set_new — so it covers
+  ## the common local-var operand case; cross-function set returns are NOT tracked
+  ## (would need a parameterized Set<T> — filed).
+  set_struct_elem_vars: Vec<String>
+  set_struct_elem_types: Vec<String>
+  ## -----------------------------------------------------------------------
+  ## Unified type variable system (T3c.1 Phase 1)
+  ## Type variables are negative integers: -1, -2, -3, ...
+  ## Index into binding table: (0 - var_id) - 1
+  ## Binding of 0 means unbound.
+  ## -----------------------------------------------------------------------
+  ## Next type variable counter (starts at 1, first var is -1)
+  tv_next: Int
+  ## Type variable bindings: index = (0 - var_id) - 1, value = bound type (0 = unbound)
+  tv_bindings: Vec<Int>
+  ## Origin tracking: source line where each type var was created
+  tv_origin_lines: Vec<Int>
+  ## Origin tracking: source column where each type var was created
+  tv_origin_cols: Vec<Int>
+  ## Origin tracking: human-readable description of why the type var exists
+  tv_origin_descs: Vec<String>
+  ## -----------------------------------------------------------------------
+  ## Row variable system (ROW Phase 2)
+  ## Row variables track open record tails: { x: Int | .. }
+  ## IDs are positive integers from 1 upward.
+  ## Binding of 0 means unbound.
+  ## Binding of TYPE_RECORD_BASE+idx means bound to a remaining-fields record.
+  ## -----------------------------------------------------------------------
+  ## Next row variable counter (starts at 1, first rv is 1)
+  rv_next: Int
+  ## Row variable bindings: index = rv_id - 1, value = 0 (unbound) or TYPE_RECORD_BASE+idx
+  rv_bindings: Vec<Int>
+  ## -----------------------------------------------------------------------
+  ## Effect-row variable system (Operation Piezoelectric Effects, B.4)
+  ## Effect-row variables track open `can` clause tails: `can L | r`.
+  ## Distinct namespace from rv_* (records). IDs are positive integers
+  ## from 1 upward. Binding of -1 means unbound; otherwise bound to a
+  ## row ID (index into TcRegistry.row_label_lists / row_tail_vars).
+  ## -----------------------------------------------------------------------
+  erv_next: Int
+  ## Effect-row variable bindings: index = erv_id - 1, value = -1 (unbound)
+  ## or row_id (the row this var stands in for).
+  erv_bindings: Vec<Int>
+  ## -----------------------------------------------------------------------
+  ## Row-var name environment for the function currently being registered.
+  ## P3.F.1: lowercase type-param names (`def foo<e>(...)`) bind to a single
+  ## effect-row-var ID for the whole signature + body, so multiple `can e`
+  ## mentions resolve to the same erv and unify correctly. Uppercase names
+  ## remain type vars and do NOT enter this env.
+  ##
+  ## Parallel vecs, cleared on every tc_register_function_signature_named
+  ## entry before the signature is walked. Looked up by tc_attach_func_effect_row
+  ## (and by Fn-type / trait-method row resolution in F.2 / F.3).
+  func_row_var_names: Vec<String>
+  func_row_var_ids: Vec<Int>
+  ## -----------------------------------------------------------------------
+  ## Level-based generalization (Rémy 1992)
+  ## Each type variable has a level = the let-nesting depth when created.
+  ## Generalization quantifies variables with level > current_level.
+  ## -----------------------------------------------------------------------
+  ## Level per type variable (parallel to tv_bindings)
+  tv_levels: Vec<Int>
+  ## Current let-nesting depth (incremented at let-binding bodies)
+  tv_current_level: Int
+  ## -----------------------------------------------------------------------
+  ## Structured type error tracking (Phase C)
+  ## After a unification failure, these fields store what failed and where.
+  ## -----------------------------------------------------------------------
+  ## Last unification failure: expected type
+  last_unify_expected: Int
+  ## Last unification failure: actual type
+  last_unify_actual: Int
+  ## Last unification failure: depth in type structure (0=top)
+  last_unify_depth: Int
+  ## -----------------------------------------------------------------------
+  ## Skolem (rigid) type variables (Rank-2 polymorphism, Phase E)
+  ## Rigid variables represent universally quantified types and cannot
+  ## be unified with anything except themselves.
+  ## -----------------------------------------------------------------------
+  ## Whether each type variable is rigid (1=rigid/skolem, 0=flexible)
+  tv_is_rigid: Vec<Int>
+  ## -----------------------------------------------------------------------
+  ## Protocol registry (Session Types, Phase 4)
+  ## Each protocol is a named sequence of send/recv steps.
+  ## -----------------------------------------------------------------------
+  ## Protocol names: "ReqResp", "PingPong"
+  protocol_names: Vec<String>
+  ## Protocol type parameter strings: "Req, Resp"
+  protocol_type_params: Vec<String>
+  ## Protocol step kinds per protocol (flat: [kind1, kind2, ..., 0])
+  ## kind: 1=SEND, 2=RECV, 0=END
+  protocol_step_kinds: Vec<Vec<Int>>
+  ## Protocol step type IDs per protocol (parallel to step_kinds)
+  protocol_step_types: Vec<Vec<Int>>
+  ## Protocol step type annotations per protocol (raw strings for generic substitution)
+  ## Empty for non-generic protocols. For generic: ["T", "T"] parallels step_types.
+  protocol_step_type_annotations: Vec<Vec<String>>
+  ## -----------------------------------------------------------------------
+  ## Protocol DFA (CONC.8 — Protocol Composition)
+  ## Each protocol has a DFA: states with transitions (kind, type, next_state).
+  ## -----------------------------------------------------------------------
+  ## Number of DFA states per protocol
+  protocol_dfa_state_count: Vec<Int>
+  ## DFA transitions per protocol: flat Vec of [from_state, kind, type, to_state, ...]
+  ## Each transition is 4 consecutive ints. Multiple transitions per state supported.
+  protocol_dfa_transitions: Vec<Vec<Int>>
+  ## Accept state per protocol (the final state with no outgoing transitions)
+  protocol_dfa_accept: Vec<Int>
+  ## CMP-PARSER-FAIL-FAST: depth counter for tc_expr_call's UFCS rewrite
+  ## recursion. Capped at 32 to fast-fail any future method-resolution loop
+  ## instead of consuming multi-GB of RAM. Legitimate UFCS rewrite chains
+  ## are 1-3 levels deep; 32 is 8x the legitimate max, half of Rust's
+  ## general-purpose recursion_limit (128).
+  call_rewrite_depth: Int
+  ## Phase 3b.next: tc_parse_type result cache. Keyed by annotation string,
+  ## value is the resolved type ID. Safe for non-scope-dependent annotations
+  ## (primitives, structs, enums, Vec<T>, Map<K,V>, etc.). Skipped for forall
+  ## and impl Trait annotations which depend on lexical scope.
+  ## This cache saves the recursive substring churn inside tc_parse_type —
+  ## every `Vec<Int>` call allocates ~3 substrings and recurses; a hit returns
+  ## O(1) with zero allocation.
+  parse_type_cache: Map<String, Int>
+end
+
+# Protocol step kind constants
+const PROTO_STEP_END = 0
+const PROTO_STEP_SEND = 1
+const PROTO_STEP_RECV = 2
+
+# (Module-level globals consolidated into TcSafety, TcScope, and TcRegistry structs)
+
+# ============================================================================
+# Tuple type helpers
+# ============================================================================
+
+## Create a tuple ptype and register its element types.
+## elem_types: Vec of type IDs for each element.
+## Returns ptype ID.
+def tc_make_tuple_type(tc: TypecheckState, elem_types: Vec<Int>): Int
+  var arity = elem_types.size
+
+  # Tuples must intern on (arity, element-types) — not arity alone. The
+  # previous form `tc_make_ptype(TYPE_TUPLE, arity, 0)` collided with any
+  # other N-tuple, so the second N-tuple silently kept the first's
+  # element-types vector (the `size == 0` guard below blocked overwrite).
+  # That collision became visible once call-site type-arg substitution
+  # started producing concrete tuple instantiations (e.g. registering
+  # `(Int, Ev<String>)` after `(Int, Ev<T>)` had already populated the
+  # arity-2 slot) — the destructured payload reverted to T's erased
+  # TYPE_INT, manifesting as GENERIC_ENUM_PAYLOAD_ERASES_TO_INT QZ0200
+  # mismatches at every consumer that wanted the concrete type.
+  #
+  # Linear scan to deduplicate by elem_types content; on miss, allocate a
+  # fresh ptype slot and key it by (arity, slot_index) so each distinct
+  # tuple shape gets a unique TypeId. Slot count is small (~tens), so the
+  # scan stays cheap.
+  var n = tc.registry.tuple_elem_types.size
+  for ti in 0..n
+    var existing = tc.registry.tuple_elem_types[ti]
+    if existing.size == arity
+      var matches = 1
+      for ei in 0..arity
+        if existing[ei] != elem_types[ei]
+          matches = 0
+          break
+        end
+      end
+      if matches == 1
+        return type_constants::PTYPE_BASE + ti
+      end
+    end
+  end
+
+  # No existing tuple matches — allocate fresh. Use (next ptype slot + 1)
+  # as arg2 so tc_make_ptype's (base, arg1, arg2) interning produces a
+  # unique key per tuple. The +1 keeps arg2 > 0, distinguishing freshly
+  # allocated tuples from any latent caller that still passes arg2=0.
+  var next_idx = tc.ptype_bases.size
+  var ptype = typecheck::tc_make_ptype(tc, type_constants::TYPE_TUPLE, arity, next_idx + 1)
+  var idx = ptype - type_constants::PTYPE_BASE
+  while tc.registry.tuple_elem_types.size <= idx
+    tc.registry.tuple_elem_types.push(vec_new())
+  end
+  if tc.registry.tuple_elem_types[idx].size == 0
+    tc.registry.tuple_elem_types[idx] = elem_types
+  end
+  return ptype
+end
+
+## Get the element type at a given index for a tuple ptype.
+## Returns TYPE_INT as fallback if index is out of bounds.
+def tc_tuple_elem_type(tc: TypecheckState, ptype: Int, index: Int): Int
+  var idx = ptype - type_constants::PTYPE_BASE
+  if idx >= 0 and idx < tc.registry.tuple_elem_types.size
+    var elems = tc.registry.tuple_elem_types[idx]
+    if index >= 0 and index < elems.size
+      return elems[index]
+    end
+  end
+  return type_constants::TYPE_INT
+end
+
+## Get the arity of a tuple ptype.
+def tc_tuple_arity(tc: TypecheckState, ptype: Int): Int = typecheck::tc_ptype_arg1(tc, ptype)
+
+# ============================================================================
+# LookupResult — replaces -1 sentinel pattern for "not found"
+# ============================================================================
+
+## Result of a lookup operation in the type checker registries.
+## Replaces the -1 sentinel pattern with an enum + pattern matching.
+##
+## @since Phase 0.1 dogfooding
+enum LookupResult
+  Found(value: Int)
+  NotFound
+end
+
+## Extend LookupResult with method-call syntax.
+##
+## Dogfooding: validates extend block compilation in typecheck module.
+## Replaces duplicated free functions with methods on the enum.
+##
+## @since Phase 0 dogfooding
+extend LookupResult
+  ## Checks if a lookup succeeded.
+  ## @returns 1 if Found, 0 if NotFound
+  def is_found(): Int
+    match self
+      Found(_) => return 1
+      NotFound => return 0
+    end
+  end
+
+  ## Unwraps a Found result, panics on NotFound.
+  ## @returns The found value
+  ## @panics If result is NotFound
+  def unwrap(): Int
+    match self
+      Found(v) => return v
+      NotFound => {
+        puts("panic: unwrap called on NotFound")
+        return 0
+      }
+    end
+  end
+end
+def tc_set_source(tc: TypecheckState, source: String): Void
+  tc.source[0] = source
+end
+
+## Set the filename for error reporting.
+##
+## Parameters:
+##   tc       - Type checker context
+##   filename - Source filename
+def tc_set_filename(tc: TypecheckState, filename: String): Void
+  var file_vec = tc.filename
+  file_vec[0] = filename
+end
+
+# ============================================================================
+# Error Reporting
+# ============================================================================
+
+## Add a type error with source location.
+##
+## Parameters:
+##   tc      - Type checker context
+##   message - Error message describing the problem
+##   line    - Line number (1-based)
+##   col     - Column number (1-based)
+def tc_error(tc: TypecheckState, message: String, line: Int, col: Int): Void
+  tc_error_with_expansion(tc, message, line, col, 0)
+end
+
+## Like `tc_error` but reads line/col AND the macro-expansion-chain idx
+## directly from an AST node. Call this at any tc_error callsite that
+## already has a node handle in scope — the emitted diagnostic will
+## carry the expansion chain and render as a stack of
+## `note: in expansion of macro '$X' (defined at ...)` breadcrumbs.
+## Macro hygiene retrofit · Tier 2 #8b-followup P2.c.
+def tc_error_at(tc: TypecheckState, message: String, s: ast::AstStorage, h: AstNodeId): Void
+  var line = ast::ast_get_line(s, h)
+  var col = ast::ast_get_col(s, h)
+  var exp_idx = ast::ast_get_expansion(s, h)
+  tc_error_with_expansion(tc, message, line, col, exp_idx)
+end
+
+def tc_error_with_expansion(tc: TypecheckState, message: String, line: Int, col: Int, exp_idx: Int): Void
+  var errors = tc.errs.errors
+  var error_lines = tc.errs.error_lines
+  var error_cols = tc.errs.error_cols
+
+  # Error limit: stop accumulating after 30
+  if errors.size >= 30
+    return
+  end
+
+  # Duplicate suppression: skip if same file+line+col already reported
+  var cur_file = tc.current_file
+  var dup_count = error_lines.size
+  for di in 0..dup_count
+    if error_lines[di] == line
+      if error_cols[di] == col
+        if tc.errs.error_files[di] == cur_file
+          return
+        end
+      end
+    end
+  end
+
+  errors.push(message)
+  error_lines.push(line)
+  error_cols.push(col)
+  tc.errs.error_files.push(cur_file)
+  tc.errs.error_expansion_idxs.push(exp_idx)
+end
+
+## Report a type mismatch with structured expected/actual info.
+## Uses last_unify_expected/actual if available, otherwise falls back to
+## the provided types. Includes origin notes for type variables.
+def tc_error_type_mismatch(tc: TypecheckState, expected: Int, actual: Int, context: String, line: Int, col: Int): Void
+  var exp_name = tc_tv_type_name(tc, expected)
+  var act_name = tc_tv_type_name(tc, actual)
+  # Use unification failure info if available and more specific
+  if tc.last_unify_expected != 0 and tc.last_unify_actual != 0
+    exp_name = tc_tv_type_name(tc, tc.last_unify_expected)
+    act_name = tc_tv_type_name(tc, tc.last_unify_actual)
+  end
+  var msg = "Type mismatch #{context}: expected #{exp_name}, found #{act_name}"
+  tc_error(tc, msg, line, col)
+  # Add origin note for type variables
+  if expected < 0
+    var exp_idx = (0 - expected) - 1
+    if exp_idx >= 0 and exp_idx < tc.tv_origin_descs.size
+      var desc = tc.tv_origin_descs[exp_idx]
+      if str_byte_len(desc) > 0
+        var orig_line = tc.tv_origin_lines[exp_idx]
+        tc_error(tc, "  = note: type inferred as #{exp_name} at line #{str_from_int(orig_line)} (#{desc})", line, col)
+      end
+    end
+  end
+  # Reset last unification failure
+  tc.last_unify_expected = 0
+  tc.last_unify_actual = 0
+  tc.last_unify_depth = 0
+end
+
+## Get the number of type errors recorded.
+##
+## Parameters:
+##   tc - Type checker context
+##
+## Returns: Number of errors
+def tc_error_count(tc: TypecheckState): Int
+  var errors = tc.errs.errors
+  return errors.size
+end
+
+## Get the error message at the given index.
+##
+## Parameters:
+##   tc    - Type checker context
+##   index - Error index (0-based)
+##
+## Returns: Error message string
+def tc_get_error(tc: TypecheckState, index: Int): String
+  var errors = tc.errs.errors
+  return errors[index]
+end
+
+## Get the line number for error at index.
+##
+## Parameters:
+##   tc    - Type checker context
+##   index - Error index (0-based)
+##
+## Returns: Line number (1-based)
+def tc_get_error_line(tc: TypecheckState, index: Int): Int
+  var error_lines = tc.errs.error_lines
+  return error_lines[index]
+end
+
+## Get the column number for error at index.
+##
+## Parameters:
+##   tc    - Type checker context
+##   index - Error index (0-based)
+##
+## Returns: Column number (1-based)
+def tc_get_error_col(tc: TypecheckState, index: Int): Int
+  var error_cols = tc.errs.error_cols
+  return error_cols[index]
+end
+
+## Check if any type errors have been recorded.
+##
+## Parameters:
+##   tc - Type checker context
+##
+## Returns: true if errors exist
+def tc_has_errors(tc: TypecheckState): Bool = tc_error_count(tc) > 0
+
+## Print all recorded type errors to stderr (legacy plain text format).
+##
+## Parameters:
+##   tc - Type checker context
+def tc_print_errors(tc: TypecheckState): Void
+  var count = tc_error_count(tc)
+  for i in 0..count
+    var msg = tc_get_error(tc, i)
+    var line = tc_get_error_line(tc, i)
+    var col = tc_get_error_col(tc, i)
+    eputs("error[TYPE]: #{msg} at line #{line}, col #{col}")
+  end
+end
+
+## Extract error code from message if present (e.g., "QZ0106: ..." -> "QZ0106").
+## Returns empty string if no code prefix found.
+def tc_extract_error_code(msg: String): String
+  # Check for QZnnnn: prefix pattern
+  if str_byte_len(msg) >= 8
+    if str_byte_at(msg, 0) == 'Q' and str_byte_at(msg, 1) == 'Z'
+      # "QZ" prefix found, check for digits
+      var all_digits = 1
+      for di in 2..6
+        var c = str_byte_at(msg, di)
+        if c < '0' or c > '9'
+          all_digits = 0
+        end
+      end
+      if all_digits == 1
+        if str_byte_at(msg, 6) == ':'
+          return str_byte_slice(msg, 0, 6)
+        end
+      end
+    end
+  end
+  return ""
+end
+
+## Strip error code prefix from message (e.g., "QZ0106: non-exhaustive" -> "non-exhaustive").
+def tc_strip_error_code(msg: String): String
+  var code = tc_extract_error_code(msg)
+  if str_byte_len(code) > 0
+    # Skip "QZnnnn: " (8 chars)
+    if str_byte_len(msg) > 8
+      return str_byte_slice(msg, 8, str_byte_len(msg))
+    end
+    return str_byte_slice(msg, 7, str_byte_len(msg))
+  end
+  return msg
+end
+
+## Categorize an error message and return an appropriate error code.
+## For messages that already have codes (QZ1201, QZ0106, etc.), extracts them.
+## For uncoded messages, assigns codes based on the error pattern.
+def tc_categorize_error(msg: String): String
+  # First check if the message already has a code
+  var existing = tc_extract_error_code(msg)
+  if str_byte_len(existing) > 0
+    return existing
+  end
+
+  # Assign code by pattern matching on message prefix
+  if str_byte_len(msg) >= 20
+    if msg.starts_with("Match arm type misma")
+      return "QZ0202"
+    end
+  end
+  if str_byte_len(msg) >= 14
+    if msg.starts_with("Type mismatch ")
+      return "QZ0201"
+    end
+    if msg.starts_with("Type mismatch:")
+      return "QZ0201"
+    end
+  end
+  if str_byte_len(msg) >= 16
+    if msg.starts_with("Type annotation ")
+      return "QZ0201"
+    end
+  end
+  if str_byte_len(msg) >= 16
+    if msg.starts_with("Unknown struct: ")
+      return "QZ0301"
+    end
+  end
+  if str_byte_len(msg) >= 14
+    if msg.starts_with("Unknown enum: ")
+      return "QZ0302"
+    end
+  end
+  if str_byte_len(msg) >= 20
+    if msg.starts_with("Undefined function: ")
+      return "QZ0401"
+    end
+  end
+  if str_byte_len(msg) >= 20
+    if msg.starts_with("Undefined variable: ")
+      return "QZ0403"
+    end
+  end
+  if str_byte_len(msg) >= 14
+    if msg.starts_with("Unknown field:")
+      return "QZ0303"
+    end
+  end
+  if str_byte_len(msg) >= 37
+    if msg.starts_with("Cannot assign to immutable variable: ")
+      return "QZ0106"
+    end
+  end
+  # "Type mismatch in assignment" now covered by the broader check above
+
+  # Default: generic type error
+  return "QZ0200"
+end
+
+## Emit all recorded type errors as Rust-style colored diagnostics.
+##
+## Parameters:
+##   tc       - Type checker context
+##   filename - Source filename for display
+##   src_lines - Source text split by lines
+def tc_emit_diagnostics(tc: TypecheckState, filename: String, src_lines: Vec<String>): Void
+  # Cache for per-file source lines (avoid re-reading the same file)
+  var cached_file = filename
+  var cached_lines = src_lines
+
+  var count = tc_error_count(tc)
+  for i in 0..count
+    var raw_msg = tc_get_error(tc, i)
+    var line = tc_get_error_line(tc, i)
+    var col = tc_get_error_col(tc, i)
+    var error_file = tc.errs.error_files[i]
+
+    # Use the error's originating file, not the main file
+    var diag_file = error_file
+    var diag_lines = src_lines
+    if str_byte_len(error_file) > 0 and error_file != filename
+      # Load source from the originating module's file
+      if error_file == cached_file
+        diag_lines = cached_lines
+      else
+        var file_src = fio_read(error_file)
+        if str_byte_len(file_src) > 0
+          diag_lines = diagnostic::diag_split_source(file_src)
+          cached_file = error_file
+          cached_lines = diag_lines
+        end
+      end
+    else
+      diag_file = filename
+    end
+
+    # Extract or assign error code
+    var code = tc_categorize_error(raw_msg)
+    var msg = tc_strip_error_code(raw_msg)
+
+    # A3: arity errors carry a ` |SIG|<signature>` tail that the emission
+    # site appended (typecheck_expr_handlers). Split it off here so the
+    # displayed message stays one line; the tail is re-attached as a real
+    # `= note:` after the diagnostic is created. Runs before suggestion/
+    # caret logic so those operate on the clean message. Inert: only fires
+    # on a recorded arity error, dead during a clean self-compile.
+    var sig_note = ""
+    var sig_idx = __str_index(msg, " |SIG|")
+    if sig_idx >= 0
+      sig_note = str_byte_slice(msg, sig_idx + 6, str_byte_len(msg))
+      msg = str_byte_slice(msg, 0, sig_idx)
+    end
+
+    var d = diagnostic::diag_new(diagnostic::DIAG_ERROR, code, msg, diag_file, line, col)
+    diagnostic::diag_set_source(d, diag_lines)
+    if str_byte_len(sig_note) > 0
+      diagnostic::diag_add_note(d, "note: #{sig_note}")
+    end
+    # Attach macro-expansion chain if this error came from code inside a
+    # macro expansion. Populated by `tc_error_at`; 0 for legacy callers
+    # that only passed line/col.
+    if i < tc.errs.error_expansion_idxs.size
+      var exp_i = tc.errs.error_expansion_idxs[i]
+      diagnostic::diag_set_expansion(d, exp_i)
+      # The chain renderer lives in `ast.qz` (needs the `_ast_exp_*`
+      # store); push its lines as plain notes so the std formatters
+      # render them. A.16.1 lifted `diagnostic.qz` to `std/` and stripped
+      # its AST-dependent renderer, so producers own the walk.
+      if exp_i > 0
+        var exp_chain = ast::ast_expansion_notes(exp_i)
+        for eci in 0..exp_chain.size
+          diagnostic::diag_add_note(d, "note: #{exp_chain[eci]}")
+        end
+      end
+    end
+
+    # Extract suggestion if present (look for " Did you mean") and strip it
+    # from the message FIRST, so the caret span below is computed against the
+    # identifier only — not the trailing "Did you mean 'X'?" text. `core_msg`
+    # is the identifier-bearing message with any suggestion removed.
+    var core_msg = msg
+    var suggest_idx = 0
+    for si in 0..str_byte_len(msg) - 13
+      if str_byte_at(msg, si) == 'D' and str_byte_at(msg, si + 1) == 'i' and str_byte_at(msg, si + 2) == 'd'
+        # Found "Did"
+        suggest_idx = si
+        break
+      end
+    end
+    if suggest_idx > 0
+      var suggestion = str_byte_slice(msg, suggest_idx, str_byte_len(msg))
+      diagnostic::diag_set_suggestion(d, suggestion)
+      # Trim suggestion from message
+      var trimmed = str_byte_slice(msg, 0, suggest_idx)
+      # Remove trailing space
+      if str_byte_len(trimmed) > 0 and str_byte_at(trimmed, str_byte_len(trimmed) - 1) == ' '
+        trimmed = str_byte_slice(trimmed, 0, str_byte_len(trimmed) - 1)
+      end
+      core_msg = trimmed
+      d.message = trimmed
+    end
+
+    # Extract span length from the identifier in the (suggestion-stripped)
+    # message. All four codes format as "<prefix>: <identifier>", so the
+    # identifier is everything after the last ": " separator — no fragile
+    # per-code prefix magic numbers, and the span never bleeds into the
+    # suggestion text (previously 29 carets under an 8-char name).
+    if code == "QZ0301" or code == "QZ0302" or code == "QZ0401" or code == "QZ0403"
+      var sep = __str_index(core_msg, ": ")
+      if sep >= 0
+        var span = str_byte_len(core_msg) - (sep + 2)
+        if span > 1
+          diagnostic::diag_set_span(d, span)
+        end
+      end
+    end
+    # A2: underline the offending NAME (not a single `^`) on the
+    # identifier-bearing codes whose caret sits exactly at that name.
+    #
+    # QZ0106 immutable-assign: "Cannot assign to immutable variable: NAME" —
+    # caret is at the start of NAME, so the `": "`-tail is the name length.
+    if code == "QZ0106"
+      var isep = __str_index(core_msg, ": ")
+      if isep >= 0
+        var ispan = str_byte_len(core_msg) - (isep + 2)
+        if ispan > 1
+          diagnostic::diag_set_span(d, ispan)
+        end
+      end
+    end
+    # QZ0303/QZ0200 no-field/no-method: "... has no field 'NAME'" /
+    # "... has no method 'NAME'" — caret is at NAME; extract between the last
+    # pair of single quotes. Guarded on the message shape so the QZ0200 arity
+    # forms (which carry no trailing quoted name) are untouched.
+    if __str_index(core_msg, "has no field '") >= 0 or __str_index(core_msg, "has no method '") >= 0
+      var qend = 0 - 1
+      var qi = str_byte_len(core_msg) - 1
+      while qi >= 0
+        if str_byte_at(core_msg, qi) == 39
+          qend = qi
+          break
+        end
+        qi = qi - 1
+      end
+      if qend > 0
+        var qstart = 0 - 1
+        var qj = qend - 1
+        while qj >= 0
+          if str_byte_at(core_msg, qj) == 39
+            qstart = qj
+            break
+          end
+          qj = qj - 1
+        end
+        if qstart >= 0
+          var nspan = qend - (qstart + 1)
+          if nspan > 1
+            diagnostic::diag_set_span(d, nspan)
+          end
+        end
+      end
+    end
+
+    # Add contextual help notes based on error code
+    if code == "QZ0106"
+      # Immutability — suggest var
+      # Extract variable name from "Cannot assign to immutable variable: NAME"
+      if str_byte_len(msg) > 37
+        var var_name = str_byte_slice(msg, 37, str_byte_len(msg))
+        diagnostic::diag_add_note(d, "help: declare with 'var' to make it mutable: var #{var_name} = ...")
+      end
+    end
+    # A5: missing-return — the emitter (typecheck_walk) has no way to attach
+    # a note (the `error` effect carries only msg/line/col), so add the
+    # actionable fix-it here, keyed on the message shape. QZ0200 is shared
+    # (arity too), so gate on the substring, not the code. Inert: dead
+    # during a clean self-compile.
+    if __str_index(msg, "but has no return statement") >= 0
+      diagnostic::diag_add_note(d, "help: add 'return <expr>', or change the return type to Void")
+    end
+    if code == "QZ0201"
+      # A1: Type mismatch — extract expected/found and emit as notes.
+      # QZ0201 has three message families; this branch handled only the
+      # `... expected X but got Y` (call-arg) form and was DEAD for the other
+      # two, which are the ones users hit most:
+      #   1. "Type mismatch <ctx>: expected X, found Y" (tc_error_type_mismatch)
+      #   2. "... expected X but got Y"                  (call-arg check)
+      #   3. "Type annotation 'X' conflicts with inferred type 'Y'"
+      var exp_idx = __str_index(msg, "expected ")
+      var got_idx = __str_index(msg, "but got ")
+      # Family 1 uses ", found " as the separator instead of "but got ".
+      var found_idx = __str_index(msg, ", found ")
+      if exp_idx >= 0 and got_idx > exp_idx
+        # Family 2: "expected X but got Y"
+        var expected_part = str_byte_slice(msg, exp_idx + 9, got_idx)
+        var found_part = str_byte_slice(msg, got_idx + 8, str_byte_len(msg))
+        # Trim trailing spaces from expected
+        if str_byte_len(expected_part) > 0
+          if str_byte_at(expected_part, str_byte_len(expected_part) - 1) == ' '
+            expected_part = str_byte_slice(expected_part, 0, str_byte_len(expected_part) - 1)
+          end
+        end
+        diagnostic::diag_add_note(d, "expected: #{expected_part}")
+        diagnostic::diag_add_note(d, "found:    #{found_part}")
+      elsif exp_idx >= 0 and found_idx > exp_idx
+        # Family 1: "expected X, found Y"
+        var expected_part = str_byte_slice(msg, exp_idx + 9, found_idx)
+        var found_part = str_byte_slice(msg, found_idx + 8, str_byte_len(msg))
+        diagnostic::diag_add_note(d, "expected: #{expected_part}")
+        diagnostic::diag_add_note(d, "found:    #{found_part}")
+      else
+        # Family 3: "Type annotation 'X' conflicts with inferred type 'Y'"
+        var conf_idx = __str_index(msg, "conflicts with inferred type ")
+        var ann_idx = __str_index(msg, "Type annotation ")
+        if conf_idx >= 0 and ann_idx >= 0
+          # Annotated type: single-quoted right after "Type annotation ".
+          # ann_open points at the opening quote; scan from the char after it.
+          var ann_open = ann_idx + 16
+          var ann_close = ann_open + 1
+          while ann_close < str_byte_len(msg) and str_byte_at(msg, ann_close) != 39
+            ann_close = ann_close + 1
+          end
+          var ann_val = str_byte_slice(msg, ann_open + 1, ann_close)
+          # Inferred type: single-quoted after "inferred type ".
+          var inf_open = conf_idx + 29
+          var inf_close = inf_open + 1
+          while inf_close < str_byte_len(msg) and str_byte_at(msg, inf_close) != 39
+            inf_close = inf_close + 1
+          end
+          var inf_val = str_byte_slice(msg, inf_open + 1, inf_close)
+          diagnostic::diag_add_note(d, "expected: #{ann_val}")
+          diagnostic::diag_add_note(d, "found:    #{inf_val}")
+        end
+      end
+    end
+    if code == "QZ1205" or code == "QZ1206"
+      diagnostic::diag_add_note(d, "help: borrows prevent aliased mutation. Consider restructuring to avoid overlapping borrows.")
+    end
+    if code == "QZ1209"
+      diagnostic::diag_add_note(d, "help: cannot mutate a variable while it is borrowed. Drop the borrow first.")
+    end
+    if code == "QZ1211"
+      diagnostic::diag_add_note(d, "help: borrows cannot escape into struct fields. Store the value directly instead.")
+    end
+    if code == "QZ1201"
+      diagnostic::diag_add_note(d, "help: linear types must be consumed exactly once. Call a consuming function or use $consume().")
+    end
+    if code == "QZ1212"
+      diagnostic::diag_add_note(d, "help: values of types that implement Drop are moved, not copied. Pass a borrow (&x) if ownership is not needed.")
+    end
+    if code == "QZ1214"
+      diagnostic::diag_add_note(d, "help: both branches of an if/else must agree on whether a moveable value is consumed.")
+    end
+    if code == "QZ1215"
+      diagnostic::diag_add_note(d, "help: Copy and Drop are mutually exclusive. Copy means the value is duplicated; Drop means it has cleanup logic.")
+    end
+    if code == "QZ0203"
+      diagnostic::diag_add_note(d, "help: add an explicit type annotation, e.g.: var items = vec_new<Int>()")
+    end
+    # A4: non-exhaustive match — the witness (missing pattern) is already in
+    # the message; append an actionable fix-it. The emitter (typecheck_match)
+    # uses the free `error(msg, line, col)` helper which can't attach notes,
+    # so it's done here in the central loop, keyed on the code. Inert: dead
+    # during a clean self-compile (the compiler's own matches are exhaustive).
+    if code == "QZ0107"
+      diagnostic::diag_add_note(d, "help: add an arm for the missing pattern, or a catch-all '_ => ...'")
+    end
+    # A6: trait-bound failure — suggest the missing impl. Keyed on the
+    # "does not implement" substring (a family across QZ0162/QZ0221/QZ0614/
+    # QZ0626, most of which categorize as QZ0200 with no code prefix), not a
+    # single code. Inert: the compiler's own generics all satisfy their
+    # bounds, so this path is dead during a clean self-compile.
+    if __str_index(msg, "does not implement") >= 0
+      diagnostic::diag_add_note(d, "help: add 'impl <Trait> for <Type> do ... end'")
+    end
+    # A7: for codes that ship a rich `--explain` entry, append a one-line
+    # pointer so users discover the detailed docs (previously only reachable if
+    # they already knew to run `--explain`). The predicate reuses the explain
+    # table's own lookup: `explain_error` returns an "Unknown error code:"
+    # sentinel for codes with no entry, so the pointer is added ONLY for codes
+    # that actually have explain text. Added last (renders after the per-code
+    # notes) and exactly once per diagnostic. Inert: this whole loop runs only
+    # on recorded errors, and the compiler self-compiles clean, so it is dead
+    # code during self-compile.
+    if str_byte_len(code) > 0
+      if __str_index(explain::explain_error(code), "Unknown error code:") < 0
+        diagnostic::diag_add_note(d, "help: run 'quartz --explain #{code}' for a detailed explanation")
+      end
+    end
+
+    diagnostic::diag_emit(d)
+  end
+  if count >= 30
+    eputs("aborting due to 30 previous errors")
+  end
+end
+
+# ============================================================================
+# Error Helper Functions - Reduce Repetitive Error Messages
+# ============================================================================
+
+## Report undefined variable error with suggestion.
+##
+## Parameters:
+##   tc         - Type checker context
+##   name       - Variable name that wasn't found
+##   suggestion - Suggestion string (e.g., "Did you mean 'foo'?")
+##   line       - Line number
+##   col        - Column number
+def tc_error_undefined_var(tc: TypecheckState, name: String, suggestion: String, line: Int, col: Int): Void
+  var msg = "Undefined variable: #{name}#{suggestion}"
+  tc_error(tc, msg, line, col)
+end
+
+## Report unknown struct error.
+##
+## Parameters:
+##   tc          - Type checker context
+##   struct_name - Struct name that wasn't found
+##   line        - Line number
+##   col         - Column number
+def tc_error_unknown_struct(tc: TypecheckState, struct_name: String, line: Int, col: Int): Void
+  var msg = "Unknown struct: #{struct_name}"
+  tc_error(tc, msg, line, col)
+end
+
+## Report unknown enum error.
+##
+## Parameters:
+##   tc        - Type checker context
+##   enum_name - Enum name that wasn't found
+##   line      - Line number
+##   col       - Column number
+def tc_error_unknown_enum(tc: TypecheckState, enum_name: String, line: Int, col: Int): Void
+  var msg = "Unknown enum: #{enum_name}"
+  tc_error(tc, msg, line, col)
+end
+
+## Report unknown function error.
+##
+## Parameters:
+##   tc        - Type checker context
+##   func_name - Function name that wasn't found
+##   line      - Line number
+##   col       - Column number
+def tc_error_unknown_function(tc: TypecheckState, func_name: String, line: Int, col: Int): Void
+  var msg = "Undefined function: #{func_name}"
+  tc_error(tc, msg, line, col)
+end
+# ============================================================================
+# Scope Management
+# ============================================================================
+
+## Get current scope depth.
+##
+## Parameters:
+##   tc - Type checker context
+##
+## Returns: Current nesting depth (0 = global)
+def tc_get_depth(tc: TypecheckState): Int
+  var depth_vec = tc.scope.current_scope_depth
+  return depth_vec[0]
+end
+
+## Set current scope depth.
+##
+## Parameters:
+##   tc    - Type checker context
+##   depth - New depth value
+def tc_set_depth(tc: TypecheckState, depth: Int): Void
+  var depth_vec = tc.scope.current_scope_depth
+  depth_vec[0] = depth
+end
+
+## Get current binding count (valid number of bindings).
+##
+## Parameters:
+##   tc - Type checker context
+##
+## Returns: Number of valid bindings
+def tc_get_binding_count(tc: TypecheckState): Int
+  var count_vec = tc.scope.binding_count
+  return count_vec[0]
+end
+
+## Set binding count.
+##
+## Parameters:
+##   tc    - Type checker context
+##   count - New binding count
+def tc_set_binding_count(tc: TypecheckState, count: Int): Void
+  var count_vec = tc.scope.binding_count
+  count_vec[0] = count
+end
+
+# ============================================================================
+# SURF.FLOW Phase 1 — flow-narrowing (smart-cast) side table
+# ============================================================================
+
+## GAP-B2-nonident-narrow — access-path narrowing key. Flow-narrowing is
+## binding-keyed by a STRING (tc_narrow_add/lookup store names). To extend union
+## `is Member` narrowing from bare idents to field-access (`s.u`) and constant-
+## index element (`v[0]`) subjects, we synthesize a STABLE string key for the
+## access path and use it as the narrowing name — both the push side (classify /
+## apply_then_facts) and the read side (ident / field / index read handlers) call
+## THIS helper on the same subject node, so they agree by construction.
+##
+## Keys:
+##   IDENT `name`            → "name"           (identical to today's bare-name key)
+##   FIELD_ACCESS `b.f`      → "<key(b)>.f"
+##   INDEX `b[<const int>]`  → "<key(b)>[<n>]"  (constant index ONLY — a variable
+##                             index is not a stable path, returns "")
+## Returns "" for any subject that is not a stable, side-effect-free access path
+## (so callers fall back to today's no-narrowing behavior — additive).
+def tc_access_path_key(ast_storage: ast::AstStorage, node: AstNodeId): String
+  return "" if node < 0
+  var k = ast::ast_get_kind(ast_storage, node)
+  if k == node_constants::NODE_IDENT
+    return ast::ast_get_str1(ast_storage, node)
+  elsif k == node_constants::NODE_FIELD_ACCESS
+    var fa_base = tc_access_path_key(ast_storage, ast::ast_get_left(ast_storage, node))
+    return "" if str_byte_len(fa_base) == 0
+    var fa_field = ast::ast_get_str1(ast_storage, node)
+    return "" if str_byte_len(fa_field) == 0
+    return "#{fa_base}.#{fa_field}"
+  elsif k == node_constants::NODE_INDEX
+    var ix_base = tc_access_path_key(ast_storage, ast::ast_get_left(ast_storage, node))
+    return "" if str_byte_len(ix_base) == 0
+    # Only a CONSTANT integer index is a stable path key. A variable index can be
+    # reassigned between check and read, so it is not narrowable (returns "").
+    var ix_arg = ast::ast_get_right(ast_storage, node)
+    return "" if ix_arg < 0
+    return "" if ast::ast_get_kind(ast_storage, ix_arg) != node_constants::NODE_INT_LIT
+    var ix_n = ast::ast_get_int_val(ast_storage, ix_arg)
+    return "#{ix_base}[#{ix_n}]"
+  end
+  return ""
+end
+
+## Live row count of the narrow side table.
+def tc_narrow_count(tc: TypecheckState): Int
+  var nc = tc.scope.narrow_count
+  return nc[0]
+end
+
+## Push a refinement: `name` is narrowed to `variant_idx`, reading as
+## `inner_type` (with optional `inner_struct` for downstream field access),
+## active at `depth`. Insertion-order append into the parallel flat Vecs —
+## deterministic iteration is required for fixpoint stability.
+def tc_narrow_add(tc: TypecheckState, name: String, variant_idx: Int, inner_type: Int, inner_struct: String, depth: Int): Void
+  var n = tc_narrow_count(tc)
+  var names = tc.scope.narrow_names
+  var vidx = tc.scope.narrow_variant_idx
+  var itype = tc.scope.narrow_inner_type
+  var istruct = tc.scope.narrow_inner_struct
+  var depths = tc.scope.narrow_depth
+  # Reuse a freed slot if present (count < size after a restore), else push.
+  if n < names.size
+    names[n] = name
+    vidx[n] = variant_idx
+    itype[n] = inner_type
+    istruct[n] = inner_struct
+    depths[n] = depth
+  else
+    names.push(name)
+    vidx.push(variant_idx)
+    itype.push(inner_type)
+    istruct.push(inner_struct)
+    depths.push(depth)
+  end
+  var ncv = tc.scope.narrow_count
+  ncv[0] = n + 1
+end
+
+## Look up the innermost active refinement for `name` that applies at the
+## current scope depth. Returns the refined inner TypeId, or TYPE_ERROR if
+## no refinement is active. Searches newest-first so an inner narrow shadows
+## an outer one (matches the binding-shadowing rule).
+def tc_narrow_lookup(tc: TypecheckState, name: String): Int
+  var n = tc_narrow_count(tc)
+  var names = tc.scope.narrow_names
+  var itype = tc.scope.narrow_inner_type
+  var depths = tc.scope.narrow_depth
+  var current_depth = tc_get_depth(tc)
+  var i = n - 1
+  while i >= 0
+    if depths[i] <= current_depth and names[i] == name
+      return itype[i]
+    end
+    i -= 1
+  end
+  return type_constants::TYPE_ERROR
+end
+
+## SURF.FLOW Phase 2 — soundness invalidation. Drop EVERY active refinement for
+## `name` by TOMBSTONING (set the row's name to "" so tc_narrow_lookup skips it),
+## NOT by compacting. Compaction would desync the snapshot/restore discipline,
+## which is keyed purely on `narrow_count`: a snapshot records the row count, and
+## tc_restore_narrow restores it; if a middle row were removed and the count
+## decremented, a later restore-to-old-count would resurrect a stale row. Keeping
+## the count stable and tombstoning in place preserves insertion order and the
+## count invariant → fixpoint-stable. Called when a narrowed `var` is reassigned
+## (NODE_ASSIGN / NODE_COMPOUND_ASSIGN), mutably borrowed, or captured by a lambda
+## — any event that could make the guard's proof stale. No-op if `name` is not
+## narrowed; harmless on const names (const can't reach the invalidation hooks).
+def tc_narrow_invalidate(tc: TypecheckState, name: String): Void
+  var n = tc_narrow_count(tc)
+  var names = tc.scope.narrow_names
+  var i = 0
+  while i < n
+    if names[i] == name
+      names[i] = ""
+    end
+    i += 1
+  end
+end
+
+## SURF.FLOW S1 — invalidate `base` AND every access-path narrowing ROOTED at it
+## (`base.f`, `base.f.g`, `base[0]`). A `&mut self` method call on a receiver whose
+## access-path key is `base` can mutate not only `base`'s own cell but any interior
+## field/element cell (e.g. `self.opt = None`), so a narrowing on `base.opt` is
+## equally stale afterwards. Tombstones (name := "") to preserve the count invariant
+## the snapshot/restore discipline depends on (see tc_narrow_invalidate). No-op when
+## nothing under `base` is narrowed; harmless on const roots (const can't be mutated).
+def tc_narrow_invalidate_rooted(tc: TypecheckState, base: String): Void
+  return if str_byte_len(base) == 0
+  var n = tc_narrow_count(tc)
+  var names = tc.scope.narrow_names
+  var dot_prefix = "#{base}."
+  var idx_prefix = "#{base}["
+  var i = 0
+  while i < n
+    var nm = names[i]
+    if nm == base or str_starts_with(nm, dot_prefix) or str_starts_with(nm, idx_prefix)
+      names[i] = ""
+    end
+    i += 1
+  end
+end
+
+## SURF.FLOW Phase 2 soundness — narrow-expect base from a type ANNOTATION
+## string (e.g. a struct field annotation `"Option<Int>"` / `"Result<T,E>"`).
+## Only the base spelling matters; generic args are irrelevant to the suppression
+## decision (any `Option<...>` destination suppresses extracting an Option read).
+## Leading borrow/`&`/`&mut` prefixes are stripped so `&Option<T>` still detects.
+def tc_narrow_expect_base_of_annotation(tc: TypecheckState, annotation: String): Int
+  var a = annotation
+  # Strip leading borrow markers so `&Option<T>` / `&mut Result<T,E>` still detect.
+  if str_starts_with(a, "&mut ")
+    a = str_byte_slice(a, 5, str_byte_len(a))
+  elsif str_starts_with(a, "&")
+    a = str_byte_slice(a, 1, str_byte_len(a))
+  end
+  if str_starts_with(a, "Option<") or a == "Option"
+    return type_constants::TYPE_OPTION
+  end
+  if str_starts_with(a, "Result<") or a == "Result"
+    return type_constants::TYPE_RESULT
+  end
+  # SURF.FLOW Phase 3 — a user-enum-typed destination must also round-trip the wide
+  # enum word. Strip generic args and consult the enum registry; a known enum name
+  # maps to the shared TYPE_ENUM base (conservatively sound, see _of_type).
+  var abase = a
+  var lt = __char_index(abase, '<')
+  if lt > 0
+    abase = str_byte_slice(abase, 0, lt)
+  end
+  if str_byte_len(abase) > 0
+    if typecheck_registry::tc_lookup_enum(tc, abase).is_found()
+      return type_constants::TYPE_ENUM
+    end
+  end
+  return type_constants::TYPE_ERROR
+end
+
+## SURF.FLOW Phase 2/3 soundness — map a destination TYPE id to its narrow-expect
+## base. The wide enum types a narrowed read could be wrongly EXTRACTED into are
+## TYPE_OPTION / TYPE_RESULT and, since Phase 3, any user TYPE_ENUM. A narrowed read
+## flowing WHOLE into such a slot must round-trip the wide enum word (no payload
+## extract) — else a scalar/payload is stored where the wide enum word is required
+## and a later match/unwrap dereferences garbage (the Phase-2 SIGSEGV class, now
+## extended to Result + user enums). Everything else returns TYPE_ERROR ("narrow
+## freely"). Accepts a resolved type id (ptype or scalar). Returning the shared
+## TYPE_ENUM id for ALL user enums is conservatively SOUND: over-pinning only forces
+## the wide-word fallback (the user unwraps), and a narrowed enum-A read can only
+## reach an enum-typed destination that is enum A (a different enum would be a type
+## error independently). Centralized so let/assign/return/struct-field/call-arg agree.
+def tc_narrow_expect_base_of_type(tc: TypecheckState, dest_type: Int): Int
+  # Bare (un-parameterized) Option/Result/Enum ids are their own base.
+  if dest_type == type_constants::TYPE_OPTION or dest_type == type_constants::TYPE_RESULT
+    return dest_type
+  end
+  if dest_type == type_constants::TYPE_ENUM
+    return type_constants::TYPE_ENUM
+  end
+  # Inlined ptype test/base read (avoids a circular import on typecheck.qz):
+  # a ptype id is >= PTYPE_BASE and indexes the parallel ptype_bases Vec.
+  return type_constants::TYPE_ERROR if dest_type < type_constants::PTYPE_BASE
+  var pi = dest_type - type_constants::PTYPE_BASE
+  return type_constants::TYPE_ERROR if pi < 0 or pi >= tc.ptype_bases.size
+  var base = tc.ptype_bases[pi]
+  if base == type_constants::TYPE_OPTION or base == type_constants::TYPE_RESULT
+    return base
+  end
+  if base == type_constants::TYPE_ENUM
+    return type_constants::TYPE_ENUM
+  end
+  return type_constants::TYPE_ERROR
+end
+
+## SURF.FLOW Phase 2 soundness — narrow-expect base of a binding's DECLARED type
+## (used by the identifier handler to compare a narrowed subject's own base against
+## the active hint). Same bare-vs-ptype handling as _of_type.
+def tc_narrow_decl_base(tc: TypecheckState, decl_type: Int): Int
+  return tc_narrow_expect_base_of_type(tc, decl_type)
+end
+
+## Drop every refinement recorded at scope depth >= `depth`. Called on scope
+## exit so a narrowing can never leak past the `if`'s `end`.
+def tc_narrow_clear_at_depth(tc: TypecheckState, depth: Int): Void
+  var n = tc_narrow_count(tc)
+  var depths = tc.scope.narrow_depth
+  var live = n
+  while live > 0 and depths[live - 1] >= depth
+    live -= 1
+  end
+  var ncv = tc.scope.narrow_count
+  ncv[0] = live
+end
+
+## SURF.FLOW B1 — live row count of the alias side table.
+def tc_alias_count(tc: TypecheckState): Int
+  var ac = tc.scope.alias_count
+  return ac[0]
+end
+
+## SURF.FLOW B1 — record a const alias `name` bound to guard-cond-node `guard_node`,
+## active at `depth`. Insertion-order append into the parallel flat Vecs — deterministic
+## iteration is required for fixpoint stability (mirrors tc_narrow_add). Reuses a freed
+## slot when count < size (after a scope-exit truncation), else pushes.
+def tc_alias_add(tc: TypecheckState, name: String, guard_node: Int, depth: Int): Void
+  var n = tc_alias_count(tc)
+  var names = tc.scope.alias_names
+  var gnodes = tc.scope.alias_guard_node
+  var depths = tc.scope.alias_depth
+  if n < names.size
+    names[n] = name
+    gnodes[n] = guard_node
+    depths[n] = depth
+  else
+    names.push(name)
+    gnodes.push(guard_node)
+    depths.push(depth)
+  end
+  var acv = tc.scope.alias_count
+  acv[0] = n + 1
+end
+
+## SURF.FLOW B1 — look up the innermost live alias for `name` at the current scope
+## depth; returns the stored guard-cond-node id, or -1 if none. Newest-first scan so
+## an inner alias shadows an outer one (mirrors tc_narrow_lookup).
+def tc_alias_guard_lookup(tc: TypecheckState, name: String): Int
+  var n = tc_alias_count(tc)
+  var names = tc.scope.alias_names
+  var gnodes = tc.scope.alias_guard_node
+  var depths = tc.scope.alias_depth
+  var current_depth = tc_get_depth(tc)
+  var i = n - 1
+  while i >= 0
+    if depths[i] <= current_depth and names[i] == name
+      return gnodes[i]
+    end
+    i -= 1
+  end
+  return -1
+end
+
+## SURF.FLOW B1 — drop every alias recorded at scope depth >= `depth`. Called on scope
+## exit so an alias can never leak past its declaring block (mirrors
+## tc_narrow_clear_at_depth).
+def tc_alias_clear_at_depth(tc: TypecheckState, depth: Int): Void
+  var n = tc_alias_count(tc)
+  var depths = tc.scope.alias_depth
+  var live = n
+  while live > 0 and depths[live - 1] >= depth
+    live -= 1
+  end
+  var acv = tc.scope.alias_count
+  acv[0] = live
+end
+
+## Enter a new scope (function body, block, etc).
+## Increments scope depth for new bindings.
+##
+## Parameters:
+##   tc - Type checker context
+## Check if a loop label is currently in scope.
+def tc_has_loop_label(tc: TypecheckState, label: String): Bool
+  var labels = tc.loop_labels
+  for i in 0..labels.size
+    if labels[i] == label
+      return true
+    end
+  end
+  return false
+end
+
+## Remove the most recent loop label from the stack.
+def tc_pop_loop_label(tc: TypecheckState, label: String): Void
+  var labels = tc.loop_labels
+  if labels.size > 0
+    vec_pop(labels)
+  end
+end
+
+## Enter a new lexical scope. Bumps tc.scope.depth by 1.
+##
+## P5.2.f Step 3: drops the explicit `tc` parameter in favor of the
+## `typecheck_ctx` bridge (set once at the top of `compile()`). Callers
+## no longer thread `tc` through. This avoids the `can State` cascade
+## entirely — the bridge makes tc ambient at compile-level.
+##
+## PF3-P2 (value-types-finish): de-erased the former `with State(
+## as_int(tc)) do -> as_type<TypecheckState>(get()) … end` body-wrap.
+## The State indirection was pure dogfooding with no consumer; under
+## value-layout structs `as_int`/`as_type` are no-op i64 reinterprets
+## that drop the struct's refcount. We mutate `tc` directly via the
+## bridge handle. (See docs/bugs/done/STATE_CASCADE_TC_PARSE_TYPE_
+## RUNTIME_FAIL.md for why the `can State` cascade was abandoned.)
+def tc_enter_scope(): Void
+  var tc = typecheck_ctx::tc_ctx_get()
+  var depth = tc_get_depth(tc)
+  tc_set_depth(tc, depth + 1)
+end
+
+## Exit current scope.
+## Removes all bindings at current depth, then decrements depth.
+##
+## Parameters:
+##   tc - Type checker context
+def tc_lookup_binding_index(tc: TypecheckState, name: String): Int
+  var binding_names = tc.scope.binding_names
+  var binding_count = tc_get_binding_count(tc)
+  var i = binding_count - 1
+  while i >= 0
+    if binding_names[i].eq(name)
+      return i
+    end
+    i -= 1
+  end
+  return -1
+end
+
+
+## Bind a variable in the current scope.
+## Records name, type, depth, and mutability.
+##
+## Parameters:
+##   tc          - Type checker context
+##   name        - Variable name
+##   type_kind   - Type of the variable
+##   is_mutable  - Whether declared with 'var'
+##   struct_name - For struct types, the struct name; "" for non-structs
+def tc_scope_bind(tc: TypecheckState, name: String, type_kind: Int, is_mutable: Int, struct_name: String): Void
+  tc_scope_bind_with_params(tc, name, type_kind, is_mutable, -1, struct_name)
+end
+
+## Bind a variable in the current scope with function param count.
+## Records name, type, depth, mutability, and param count for lambdas.
+##
+## Parameters:
+##   tc          - Type checker context
+##   name        - Variable name
+##   type_kind   - Type of the variable
+##   is_mutable  - Whether declared with 'var'
+##   param_count - Number of parameters (-1 for non-functions)
+##   struct_name - For struct types, the struct name; "" for non-structs
+def tc_scope_bind_with_params(tc: TypecheckState, name: String, type_kind: Int, is_mutable: Int, param_count: Int, struct_name: String): Void
+  tc_scope_bind_full(tc, name, type_kind, is_mutable, param_count, struct_name, "")
+end
+
+## Full binding function with type annotation support.
+## Use this when the type annotation is available (for parameterized type safety).
+## Defaults the opacity display_type slot to the same string as the dispatch
+## annotation. Callers that need to install a distinct opaque display marker
+## (e.g. the `var x = make_iter()` path for impl Trait returns) should call
+## `tc_scope_bind_full_with_display` directly.
+def tc_scope_bind_full(tc: TypecheckState, name: String, type_kind: Int, is_mutable: Int, param_count: Int, struct_name: String, type_ann: String): Void
+  tc_scope_bind_full_with_display(tc, name, type_kind, is_mutable, param_count, struct_name, type_ann, type_ann)
+end
+
+## Phase 7: bind a variable while installing a separate display_type slot.
+## `type_ann` is the dispatch annotation (UFCS/trait-bound resolution reads
+## this); `display_type` is what source-level type matching (e.g. an explicit
+## `var x: T = expr` annotation, ternary unification, match-arm join) sees.
+## For non-opaque bindings the two strings are the same; for `impl Trait`
+## return-typed bindings the display_type carries the opaque marker
+## ("impl <Trait>@<func_name>") and the dispatch_type carries the resolved
+## concrete struct name.
+def tc_scope_bind_full_with_display(tc: TypecheckState, name: String, type_kind: Int, is_mutable: Int, param_count: Int, struct_name: String, type_ann: String, display_type: String): Void
+  var binding_names = tc.scope.binding_names
+  var binding_types = tc.scope.binding_types
+  var binding_depths = tc.scope.binding_depths
+  var binding_mutables = tc.scope.binding_mutables
+  var binding_param_counts = tc.scope.binding_param_counts
+  var binding_struct_names = tc.scope.binding_struct_names
+  var binding_type_annotations = tc.scope.binding_type_annotations
+  var binding_display_types = tc.scope.binding_display_types
+  var binding_scope_idxs = tc.scope.binding_scope_idxs
+  var depth = tc_get_depth(tc)
+  var binding_count = tc_get_binding_count(tc)
+  
+  var binding_linear_states = tc.safety.binding_linear_states
+  var binding_linear_structs = tc.safety.binding_linear_structs
+  var binding_borrow_states = tc.safety.binding_borrow_states
+  var binding_shared_borrow_counts = tc.safety.binding_shared_borrow_counts
+  var binding_borrow_sources = tc.safety.binding_borrow_sources
+  var binding_is_mut_borrows = tc.safety.binding_is_mut_borrows
+  var binding_borrow_lines = tc.safety.binding_borrow_lines
+  var binding_borrow_cols = tc.safety.binding_borrow_cols
+  var move_states = tc.safety.move_states
+  var move_types = tc.safety.move_types
+  var move_targets = tc.safety.move_targets
+  var move_lines = tc.safety.move_lines
+  var move_cols = tc.safety.move_cols
+  var partial_moved_fields = tc.safety.partial_moved_fields
+  var partial_move_targets = tc.safety.partial_move_targets
+  var partial_move_lines = tc.safety.partial_move_lines
+  # Check if we can reuse a slot or need to push new
+  if binding_count < binding_names.size
+    # Reuse existing slot (overwrite a "popped" entry)
+    binding_names[binding_count] = name
+    binding_types[binding_count] = type_kind
+    binding_depths[binding_count] = depth
+    binding_mutables[binding_count] = is_mutable
+    binding_param_counts[binding_count] = param_count
+    binding_struct_names[binding_count] = struct_name
+    binding_type_annotations[binding_count] = type_ann
+    if binding_count < binding_display_types.size
+      binding_display_types[binding_count] = display_type
+    else
+      while binding_display_types.size < binding_count
+        binding_display_types.push("")
+      end
+      binding_display_types.push(display_type)
+    end
+    # Scope-set idx for this binding. P3.a default is 0 (empty set);
+    # P3.c will set the non-zero value for bindings introduced inside
+    # a macro expansion. Keeping the vec strictly parallel to binding_names
+    # is load-bearing for the resolver's index-by-slot lookup.
+    if binding_count < binding_scope_idxs.size
+      binding_scope_idxs[binding_count] = 0
+    else
+      while binding_scope_idxs.size < binding_count
+        binding_scope_idxs.push(0)
+      end
+      binding_scope_idxs.push(0)
+    end
+    # Reset binding scheme (monomorphic by default)
+    if binding_count < tc.scope.binding_schemes.size
+      tc.scope.binding_schemes[binding_count] = vec_new()
+    end
+    binding_linear_states[binding_count] = 0
+    binding_linear_structs[binding_count] = ""
+    binding_borrow_states[binding_count] = 0
+    binding_shared_borrow_counts[binding_count] = 0
+    binding_borrow_sources[binding_count] = 0
+    binding_is_mut_borrows[binding_count] = 0
+    binding_borrow_lines[binding_count] = 0
+    binding_borrow_cols[binding_count] = 0
+    move_states[binding_count] = 0
+    move_types[binding_count] = 0
+    move_targets[binding_count] = 0
+    move_lines[binding_count] = 0
+    move_cols[binding_count] = 0
+    partial_moved_fields[binding_count] = ""
+    partial_move_targets[binding_count] = ""
+    partial_move_lines[binding_count] = ""
+    if binding_count < tc.safety.binding_protocol_ids.size
+      tc.safety.binding_protocol_ids[binding_count] = -1
+      tc.safety.binding_protocol_states[binding_count] = 0
+      if binding_count < tc.safety.binding_protocol_type_args.size
+        tc.safety.binding_protocol_type_args[binding_count] = ""
+      end
+    end
+  else
+    # Push new entry
+    binding_names.push(name)
+    binding_types.push(type_kind)
+    binding_depths.push(depth)
+    binding_mutables.push(is_mutable)
+    binding_param_counts.push(param_count)
+    binding_struct_names.push(struct_name)
+    binding_type_annotations.push(type_ann)
+    while binding_display_types.size < binding_names.size - 1
+      binding_display_types.push("")
+    end
+    binding_display_types.push(display_type)
+    while binding_scope_idxs.size < binding_names.size - 1
+      binding_scope_idxs.push(0)
+    end
+    binding_scope_idxs.push(0)
+    tc.scope.binding_schemes.push(vec_new())
+    binding_linear_states.push(0)
+    binding_linear_structs.push("")
+    binding_borrow_states.push(0)
+    binding_shared_borrow_counts.push(0)
+    binding_borrow_sources.push(0)
+    binding_is_mut_borrows.push(0)
+    binding_borrow_lines.push(0)
+    binding_borrow_cols.push(0)
+    move_states.push(0)
+    move_types.push("")
+    move_targets.push("")
+    move_lines.push(0)
+    move_cols.push(0)
+    partial_moved_fields.push("")
+    partial_move_targets.push("")
+    partial_move_lines.push("")
+    tc.safety.binding_protocol_ids.push(-1)
+    tc.safety.binding_protocol_states.push(0)
+    tc.safety.binding_protocol_type_args.push("")
+  end
+
+  tc_set_binding_count(tc, binding_count + 1)
+end
+
+## Look up a variable's type by name.
+## Searches from innermost to outermost scope.
+##
+## Legacy entry point — scope-set-unaware. Preserved for ~18 call sites
+## (UFCS/dispatch, closure capture analysis, generic resolution) that
+## don't have an AST handle in scope. The NODE_IDENT resolver in tc_expr
+## uses `tc_scope_lookup_at` for scope-set-aware hygiene; callers that
+## need the new behavior should migrate.
+##
+## Parameters:
+##   tc   - Type checker context
+##   name - Variable name to find
+##
+## Returns: Type kind, or TYPE_ERROR if not found
+def tc_scope_lookup(tc: TypecheckState, name: String): Int
+  var binding_names = tc.scope.binding_names
+  var binding_types = tc.scope.binding_types
+  var binding_depths = tc.scope.binding_depths
+  var current_depth = tc_get_depth(tc)
+  var binding_count = tc_get_binding_count(tc)
+
+  # Search backwards through valid bindings (innermost first)
+  var i = binding_count - 1
+  while i >= 0
+    var bound_name = binding_names[i]
+    var bound_depth = binding_depths[i]
+
+    # Only consider bindings in scope (depth <= current)
+    if bound_depth <= current_depth
+      if bound_name == name
+        return binding_types[i]
+      end
+    end
+    i -= 1
+  end
+
+  return type_constants::TYPE_ERROR
+end
+
+## Scope-set-aware lookup per Flatt POPL 2016 "Binding as Sets of Scopes."
+## Given a reference node `h` in storage `s`, resolves `name` to the
+## binding whose scope set is the largest subset of the reference's scope
+## set. Among equal-size candidates, innermost (largest depth) wins.
+##
+## When both the reference and every candidate binding have empty scope
+## sets (the common non-macro case), the result matches `tc_scope_lookup`
+## exactly — backwards-compat is load-bearing for ~19 call sites that
+## stay on the legacy entry.
+##
+## Parameters:
+##   tc   - Type checker context
+##   name - Variable name to find
+##   s    - AST storage holding `h` (for reading the ref's scope set)
+##   h    - AST node handle of the reference (NODE_IDENT, usually)
+##
+## Returns: Type kind of the chosen binding, or TYPE_ERROR if nothing
+##          in scope has a subset-compatible scope set.
+def tc_scope_lookup_at(tc: TypecheckState, name: String, s: ast::AstStorage, h: ast::AstNodeId): Int
+  var binding_names = tc.scope.binding_names
+  var binding_types = tc.scope.binding_types
+  var binding_depths = tc.scope.binding_depths
+  var binding_scope_idxs = tc.scope.binding_scope_idxs
+  var current_depth = tc_get_depth(tc)
+  var binding_count = tc_get_binding_count(tc)
+  var ref_ss = ast::ast_get_scope_set(s, h)
+
+  # Fast path: reference lives in the empty scope set (legacy / caller-source
+  # idents). Only empty-set bindings can match (∅ ⊆ ∅; nothing else ⊆ ∅).
+  # Walk innermost-first and short-circuit — identical behavior to the
+  # pre-hygiene resolver, which is what lets us ship without churning
+  # every non-macro test in the corpus.
+  if ref_ss == 0
+    var j = binding_count - 1
+    while j >= 0
+      var jd = binding_depths[j]
+      if jd <= current_depth and binding_names[j] == name
+        var jb_ss = 0
+        if j < binding_scope_idxs.size
+          jb_ss = binding_scope_idxs[j]
+        end
+        if jb_ss == 0
+          return binding_types[j]
+        end
+      end
+      j -= 1
+    end
+    return type_constants::TYPE_ERROR
+  end
+
+  # Hygiene path: reference is inside a macro expansion. Find the
+  # candidate binding with the largest subset scope set; tiebreak on
+  # innermost depth (matches the legacy shadowing rule).
+  var best_i = -1
+  var best_size = -1
+  var best_depth = -1
+  var i = binding_count - 1
+  while i >= 0
+    var bound_depth = binding_depths[i]
+    if bound_depth <= current_depth and binding_names[i] == name
+      var b_ss = 0
+      if i < binding_scope_idxs.size
+        b_ss = binding_scope_idxs[i]
+      end
+      if ast::ast_scope_set_is_subset(b_ss, ref_ss)
+        var b_size = ast::ast_scope_set_len(b_ss)
+        if b_size > best_size
+          best_i = i
+          best_size = b_size
+          best_depth = bound_depth
+        elsif b_size == best_size
+          if bound_depth > best_depth
+            best_i = i
+            best_depth = bound_depth
+          end
+        end
+      end
+    end
+    i -= 1
+  end
+
+  if best_i < 0
+    return type_constants::TYPE_ERROR
+  end
+  return binding_types[best_i]
+end
+
+## Stamp the most-recently-bound slot's scope set. Called by tc_stmt's
+## NODE_LET handler after `tc_scope_bind_*` to propagate the macro-expansion
+## scope set from the binding site AST node onto the binding itself.
+##
+## No-op when `ss == 0` or there is no last binding. Clamps to whatever
+## the binder actually wrote (reuse-slot vs push-new both end at
+## binding_count - 1).
+def tc_scope_set_last_binding_scope(tc: TypecheckState, ss: Int): Void
+  return if ss == 0
+  var binding_scope_idxs = tc.scope.binding_scope_idxs
+  var bc = tc_get_binding_count(tc)
+  if bc <= 0
+    return
+  end
+  var idx = bc - 1
+  while binding_scope_idxs.size <= idx
+    binding_scope_idxs.push(0)
+  end
+  binding_scope_idxs[idx] = ss
+end
+
+## Look up a variable's struct type name by name.
+## Used for trait method resolution.
+##
+## Parameters:
+##   tc   - Type checker context
+##   name - Variable name to find
+##
+## Returns: Struct name (String), or "" if not found or not a struct
+def tc_scope_lookup_struct_name(tc: TypecheckState, name: String): String
+  var binding_names = tc.scope.binding_names
+  var binding_depths = tc.scope.binding_depths
+  var binding_struct_names = tc.scope.binding_struct_names
+  var current_depth = tc_get_depth(tc)
+  var binding_count = tc_get_binding_count(tc)
+  
+  # Search backwards through valid bindings (innermost first)
+  var i = binding_count - 1
+  while i >= 0
+    var bound_name = binding_names[i]
+    var bound_depth = binding_depths[i]
+    
+    # Only consider bindings in scope (depth <= current)
+    if bound_depth <= current_depth
+      return binding_struct_names[i] if bound_name == name
+    end
+    i -= 1
+  end
+  
+  return ""
+end
+
+## Look up a variable's type annotation by name.
+## Used for parameterized type matching (Vec<T>, Map<K,V>, Ptr<T>).
+##
+## Parameters:
+##   tc   - Type checker context
+##   name - Variable name to find
+##
+## Returns: Type annotation string, or "" if not found
+def tc_scope_lookup_annotation(tc: TypecheckState, name: String): String
+  var binding_names = tc.scope.binding_names
+  var binding_type_annotations = tc.scope.binding_type_annotations
+  var binding_depths = tc.scope.binding_depths
+  var current_depth = tc_get_depth(tc)
+  var binding_count = tc_get_binding_count(tc)
+  
+  # Search backwards through valid bindings (innermost first)
+  var i = binding_count - 1
+  while i >= 0
+    var bound_name = binding_names[i]
+    var bound_depth = binding_depths[i]
+    
+    # Only consider bindings in scope (depth <= current)
+    if bound_depth <= current_depth
+      if bound_name == name
+        var ann_val = binding_type_annotations[i]
+        if str_byte_len(ann_val) > 0
+          return ann_val
+        end
+        return ""
+      end
+    end
+    i -= 1
+  end
+
+  return ""
+end
+
+## Look up a variable's source-level display type by name.
+## Phase 7: returns the opaque marker ("impl <Trait>@<func>") for opacity-typed
+## bindings, the parametric annotation for everything else, and "" if missing.
+def tc_scope_lookup_display_type(tc: TypecheckState, name: String): String
+  var binding_names = tc.scope.binding_names
+  var binding_display_types = tc.scope.binding_display_types
+  var binding_depths = tc.scope.binding_depths
+  var current_depth = tc_get_depth(tc)
+  var binding_count = tc_get_binding_count(tc)
+
+  var i = binding_count - 1
+  while i >= 0
+    var bound_name = binding_names[i]
+    var bound_depth = binding_depths[i]
+    if bound_depth <= current_depth
+      if bound_name == name
+        if i < binding_display_types.size
+          var dt = binding_display_types[i]
+          if str_byte_len(dt) > 0
+            return dt
+          end
+        end
+        return ""
+      end
+    end
+    i -= 1
+  end
+
+  return ""
+end
+
+## Look up a variable's mutability by name.
+##
+## Parameters:
+##   tc   - Type checker context
+##   name - Variable name to find
+##
+## Returns: 1 if mutable, 0 if immutable, -1 if not found
+def tc_scope_lookup_mutable(tc: TypecheckState, name: String): Int
+  var binding_names = tc.scope.binding_names
+  var binding_mutables = tc.scope.binding_mutables
+  var binding_depths = tc.scope.binding_depths
+  var current_depth = tc_get_depth(tc)
+  var binding_count = tc_get_binding_count(tc)
+  
+  var i = binding_count - 1
+  while i >= 0
+    var bound_name = binding_names[i]
+    var bound_depth = binding_depths[i]
+    
+    if bound_depth <= current_depth
+      if bound_name == name
+        return binding_mutables[i]
+      end
+    end
+    i -= 1
+  end
+  
+  return -1
+end
+
+## Look up a variable's function param count by name.
+## Used for lambda variables to validate call argument count.
+##
+## Parameters:
+##   tc   - Type checker context
+##   name - Variable name to find
+##
+## Returns: Param count if found and is a function, -1 otherwise
+def tc_scope_lookup_param_count(tc: TypecheckState, name: String): Int
+  var binding_names = tc.scope.binding_names
+  var binding_param_counts = tc.scope.binding_param_counts
+  var binding_depths = tc.scope.binding_depths
+  var current_depth = tc_get_depth(tc)
+  var binding_count = tc_get_binding_count(tc)
+  
+  var i = binding_count - 1
+  while i >= 0
+    var bound_name = binding_names[i]
+    var bound_depth = binding_depths[i]
+    
+    if bound_depth <= current_depth
+      if bound_name == name
+        return binding_param_counts[i]
+      end
+    end
+    i -= 1
+  end
+  
+  return -1
+end
+
+## Check if a variable exists in the current scope only.
+## Used to detect redeclaration at same scope level.
+##
+## Parameters:
+##   tc   - Type checker context
+##   name - Variable name to check
+##
+## Returns: 1 if exists at current depth, 0 otherwise
+def tc_scope_has_at_current(tc: TypecheckState, name: String): Int
+  var binding_names = tc.scope.binding_names
+  var binding_depths = tc.scope.binding_depths
+  var current_depth = tc_get_depth(tc)
+  var binding_count = tc_get_binding_count(tc)
+  
+  var i = binding_count - 1
+  while i >= 0
+    var bound_depth = binding_depths[i]
+    if bound_depth == current_depth
+      var bound_name = binding_names[i]
+      if bound_name == name
+        return 1
+      end
+    end
+    if bound_depth < current_depth
+      # Past current scope, stop searching
+      return 0
+    end
+    i -= 1
+  end
+  
+  return 0
+end
+
+# ============================================================================
+# Return Type Management
+# ============================================================================
+
+## Get current function's expected return type.
+##
+## Parameters:
+##   tc - Type checker context
+##
+## Returns: Return type kind
+def tc_get_return_type(tc: TypecheckState): Int
+  var ret_type_vec = tc.scope.current_func_return_type
+  return ret_type_vec[0]
+end
+
+## Set current function's expected return type.
+##
+## Parameters:
+##   tc        - Type checker context
+##   type_kind - Expected return type
+def tc_set_return_type(tc: TypecheckState, type_kind: Int): Void
+  var ret_type_vec = tc.scope.current_func_return_type
+  ret_type_vec[0] = type_kind
+end
+
+## Read the index (into TcRegistry.func_names) of the function whose
+## body is currently being typechecked. Returns -1 when there is no
+## current function — top-level scope or a phase that hasn't entered
+## tc_function yet.
+## Operation Piezoelectric Effects, B.7.
+def tc_get_current_func_idx(tc: TypecheckState): Int
+  var v = tc.scope.current_func_idx
+  if v.size == 0
+    return -1
+  end
+  return v[0]
+end
+
+## Set / clear the current function index (use -1 to clear).
+def tc_set_current_func_idx(tc: TypecheckState, idx: Int): Void
+  var v = tc.scope.current_func_idx
+  if v.size == 0
+    return
+  end
+  v[0] = idx
+end
+
+## Push an effect label (as an intern_id in tc.interner) onto the
+## handler-effect stack. Called by NODE_WITH typecheck when the handler
+## expression resolves to a registered effect decl.
+##
+## P5.2.f Step 4: tc is retrieved from the typecheck_ctx bridge (set
+## once at the top of compile()), not threaded through the signature.
+## PF3-P2: de-erased the dogfood body-wrap; mutate tc directly.
+def tc_handler_effect_push(effect_name_id: Int): Void
+  var tc = typecheck_ctx::tc_ctx_get()
+  tc.scope.handler_effect_stack.push(effect_name_id)
+end
+
+## Pop the top of the handler-effect stack. Called after NODE_WITH's
+## body has been typechecked. Paired 1-1 with tc_handler_effect_push.
+## P5.2.f Step 4: tc via bridge, same as push.
+def tc_handler_effect_pop(): Void
+  var tc = typecheck_ctx::tc_ctx_get()
+  var s = tc.scope.handler_effect_stack
+  if s.size > 0
+    var _t = s.pop()
+  end
+end
+
+## Return true if `effect_name_id` is currently on the handler-effect
+## stack — i.e., the callee's effect is handled by an enclosing
+## with-block. tc_expr_call's subsumption check uses this to narrow
+## the QZ0610 requirement set. P5.2.f Step 4: tc via bridge.
+## PF3-P2: de-erased the dogfood body-wrap; read tc directly.
+def tc_handler_effect_contains(effect_name_id: Int): Bool
+  var tc = typecheck_ctx::tc_ctx_get()
+  var s = tc.scope.handler_effect_stack
+  var n = s.size
+  var i = 0
+  var found = false
+  while i < n
+    if s[i] == effect_name_id
+      found = true
+      i = n
+    else
+      i += 1
+    end
+  end
+  return found
+end
+
+
+# ============================================================================
+# Pending Ptype Registry — track unresolved generic constructors
+# ============================================================================
+
+## Register a pending ptype for a variable (e.g., vec_new() without type params).
+## elem_var: type variable for element type (negative ID).
+## elem_var2: type variable for second param (Map value), or 0.
+def tc_register_pending_ptype(tc: TypecheckState, name: String, base: Int, elem_var: Int, elem_var2: Int): Void
+  tc.pending_ptype_names.push(name)
+  tc.pending_ptype_bases.push(base)
+  tc.pending_ptype_vars.push(elem_var)
+  tc.pending_ptype_vars2.push(elem_var2)
+end
+
+## Look up a pending ptype by variable name.
+## Returns index into pending arrays, or -1 if not found.
+def tc_lookup_pending_ptype(tc: TypecheckState, name: String): Int
+  var i = tc.pending_ptype_names.size - 1
+  while i >= 0
+    if tc.pending_ptype_names[i] == name
+      return i
+    end
+    i -= 1
+  end
+  return -1
+end
+
+## Resolve (remove) a pending ptype by variable name.
+## Called when a constraining use (e.g., push) determines the element type.
+def tc_resolve_pending_ptype(tc: TypecheckState, name: String): Void
+  var idx = tc_lookup_pending_ptype(tc, name)
+  return if idx < 0
+  # Remove entry by swapping with last and popping
+  var last = tc.pending_ptype_names.size - 1
+  if idx < last
+    tc.pending_ptype_names[idx] = tc.pending_ptype_names[last]
+    tc.pending_ptype_bases[idx] = tc.pending_ptype_bases[last]
+    tc.pending_ptype_vars[idx] = tc.pending_ptype_vars[last]
+    tc.pending_ptype_vars2[idx] = tc.pending_ptype_vars2[last]
+  end
+  vec_pop(tc.pending_ptype_names)
+  vec_pop(tc.pending_ptype_bases)
+  vec_pop(tc.pending_ptype_vars)
+  vec_pop(tc.pending_ptype_vars2)
+  return
+end
+
+## Clear all pending ptypes (called at function exit).
+def tc_clear_pending_ptypes(tc: TypecheckState): Void
+  var names = tc.pending_ptype_names
+  var bases = tc.pending_ptype_bases
+  var vars = tc.pending_ptype_vars
+  var vars2 = tc.pending_ptype_vars2
+  while names.size > 0
+    vec_pop(names)
+    vec_pop(bases)
+    vec_pop(vars)
+    vec_pop(vars2)
+  end
+end
+
+# ============================================================================
+# T3c.1 Phase 1: Unified Type Variable System
+# ============================================================================
+#
+# Type variables are negative integers in the TC type space: -1, -2, -3, ...
+# They index into TypecheckState.tv_bindings via: idx = (0 - var_id) - 1
+# A binding value of 0 means unbound.
+#
+# These functions operate on the TC type system directly.
+# Sole inference engine since Phase A retired infer.qz.
+# ============================================================================
+
+## Check if a type is a type variable.
+## Type variables are negative integers.
+def tc_tv_is_var(t: Int): Int
+  return 1 if t < 0
+  return 0
+end
+
+## Create a fresh type variable.
+## Returns a new negative integer type variable ID.
+def tc_tv_fresh(tc: TypecheckState): Int
+  var id = tc.tv_next
+  tc.tv_next = id + 1
+  tc.tv_bindings.push(0)
+  tc.tv_origin_lines.push(0)
+  tc.tv_origin_cols.push(0)
+  tc.tv_origin_descs.push("")
+  tc.tv_levels.push(tc.tv_current_level)
+  tc.tv_is_rigid.push(0)
+  return 0 - id
+end
+
+## Create a fresh type variable with origin tracking.
+## The origin info is used for error messages when unification fails.
+def tc_tv_fresh_with_origin(tc: TypecheckState, line: Int, col: Int, desc: String): Int
+  var id = tc.tv_next
+  tc.tv_next = id + 1
+  tc.tv_bindings.push(0)
+  tc.tv_origin_lines.push(line)
+  tc.tv_origin_cols.push(col)
+  tc.tv_origin_descs.push(desc)
+  tc.tv_levels.push(tc.tv_current_level)
+  tc.tv_is_rigid.push(0)
+  return 0 - id
+end
+
+## Create a fresh rigid (skolem) type variable.
+## Rigid variables cannot be unified with anything except themselves.
+## Used when checking against forall types — the universally quantified
+## variable must remain polymorphic (not be instantiated).
+def tc_tv_fresh_rigid(tc: TypecheckState, name: String): Int
+  var id = tc.tv_next
+  tc.tv_next = id + 1
+  tc.tv_bindings.push(0)
+  tc.tv_origin_lines.push(0)
+  tc.tv_origin_cols.push(0)
+  tc.tv_origin_descs.push("skolem '#{name}'")
+  tc.tv_levels.push(tc.tv_current_level)
+  tc.tv_is_rigid.push(1)
+  return 0 - id
+end
+
+## Check if a type variable is rigid (skolem).
+def tc_tv_is_rigid(tc: TypecheckState, var_id: Int): Int
+  var idx = (0 - var_id) - 1
+  if idx >= 0 and idx < tc.tv_is_rigid.size
+    return tc.tv_is_rigid[idx]
+  end
+  return 0
+end
+
+## Resolve a type through the binding chain.
+## If t is a bound type variable, follows the chain to the concrete type.
+## If t is an unbound type variable, returns t unchanged.
+## If t is a concrete type, returns t unchanged.
+def tc_tv_resolve(tc: TypecheckState, t: Int): Int
+  if t >= 0
+    return t
+  end
+  var idx = (0 - t) - 1
+  if idx < 0 or idx >= tc.tv_bindings.size
+    return t
+  end
+  var bound = tc.tv_bindings[idx]
+  if bound == 0
+    return t
+  end
+  # Chase binding chain (path compression not needed — chains are short)
+  return tc_tv_resolve(tc, bound)
+end
+
+## Bind a type variable to a type.
+## Precondition: var_id is a type variable (negative), bound_type is resolved.
+## Performs level lowering: any free variables in bound_type with level > var's level
+## are lowered to var's level (Rémy's eager level adjustment).
+def tc_tv_bind(tc: TypecheckState, var_id: Int, bound_type: Int): Void
+  var idx = (0 - var_id) - 1
+  if idx >= 0 and idx < tc.tv_bindings.size
+    tc.tv_bindings[idx] = bound_type
+    # Level lowering: lower free vars in bound_type to this var's level
+    var var_level = tc.tv_levels[idx]
+    tc_tv_lower_levels(tc, bound_type, var_level)
+  end
+end
+
+## Occurs check: does var_id appear anywhere inside type t?
+## Prevents infinite types (e.g., a = List<a>).
+## Recurses into ptype element types and function param/return types.
+def tc_tv_occurs_in(tc: TypecheckState, var_id: Int, t: Int): Int
+  var resolved = tc_tv_resolve(tc, t)
+  if resolved == var_id
+    return 1
+  end
+  # ROW Phase 2: Record types — check field type IDs for occurs
+  if typecheck_registry::tc_is_record_type(resolved)
+    var oc_rec_idx = resolved - type_constants::TYPE_RECORD_BASE
+    if oc_rec_idx >= 0 and oc_rec_idx < tc.registry.record_field_type_ids.size
+      var oc_fids = tc.registry.record_field_type_ids[oc_rec_idx]
+      for oc_fi in 0..oc_fids.size
+        if tc_tv_occurs_in(tc, var_id, oc_fids[oc_fi]) == 1
+          return 1
+        end
+      end
+    end
+    return 0
+  end
+
+  # If resolved is a ptype (>= PTYPE_BASE), check element types
+  if resolved >= type_constants::PTYPE_BASE
+    var ptype_idx = resolved - type_constants::PTYPE_BASE
+    if ptype_idx < tc.ptype_bases.size
+      # T3c.1 Phase 3: For function ptypes, recurse into structured param types
+      if tc.ptype_bases[ptype_idx] == type_constants::TYPE_FUNCTION
+        var fn_id = tc.ptype_arg1s[ptype_idx]
+        if fn_id >= 0 and fn_id < tc.registry.fn_type_param_types.size
+          var fn_params = tc.registry.fn_type_param_types[fn_id]
+          for oc_i in 0..fn_params.size
+            if tc_tv_occurs_in(tc, var_id, fn_params[oc_i]) == 1
+              return 1
+            end
+          end
+        end
+        if fn_id >= 0 and fn_id < tc.registry.fn_type_return_types.size
+          if tc_tv_occurs_in(tc, var_id, tc.registry.fn_type_return_types[fn_id]) == 1
+            return 1
+          end
+        end
+        return 0
+      end
+      # Non-function ptypes: check arg1/arg2
+      if ptype_idx < tc.ptype_arg1s.size
+        var arg1 = tc.ptype_arg1s[ptype_idx]
+        if arg1 != 0 and tc_tv_occurs_in(tc, var_id, arg1) == 1
+          return 1
+        end
+        if ptype_idx < tc.ptype_arg2s.size
+          var arg2 = tc.ptype_arg2s[ptype_idx]
+          if arg2 != 0 and tc_tv_occurs_in(tc, var_id, arg2) == 1
+            return 1
+          end
+        end
+      end
+    end
+  end
+  return 0
+end
+
+## Unify two types.
+## Returns 1 on success, 0 on failure.
+## If either type is a type variable, binds it to the other (with occurs check).
+## If both are concrete, checks structural equality.
+def tc_tv_unify(tc: TypecheckState, t1: Int, t2: Int): Int
+  var r1 = tc_tv_resolve(tc, t1)
+  var r2 = tc_tv_resolve(tc, t2)
+
+  # Same type (or same variable) — trivially unified
+  return 1 if r1 == r2
+
+  # TYPE_ERROR propagates (never a unification failure)
+  return 1 if r1 == type_constants::TYPE_ERROR
+  return 1 if r2 == type_constants::TYPE_ERROR
+
+  # TYPE_NEVER is a subtype of everything (bottom type)
+  return 1 if r1 == type_constants::TYPE_NEVER
+  return 1 if r2 == type_constants::TYPE_NEVER
+
+  # If r1 is a type variable, bind it to r2
+  if r1 < 0
+    # Rigid (skolem) variables cannot be unified
+    if tc_tv_is_rigid(tc, r1) == 1
+      tc.last_unify_expected = r1
+      tc.last_unify_actual = r2
+      tc.last_unify_depth = 0
+      return 0
+    end
+    if tc_tv_occurs_in(tc, r1, r2) == 1
+      return 0
+    end
+    tc_tv_bind(tc, r1, r2)
+    return 1
+  end
+
+  # If r2 is a type variable, bind it to r1
+  if r2 < 0
+    # Rigid (skolem) variables cannot be unified
+    if tc_tv_is_rigid(tc, r2) == 1
+      tc.last_unify_expected = r1
+      tc.last_unify_actual = r2
+      tc.last_unify_depth = 0
+      return 0
+    end
+    if tc_tv_occurs_in(tc, r2, r1) == 1
+      return 0
+    end
+    tc_tv_bind(tc, r2, r1)
+    return 1
+  end
+
+  # Both concrete — check structural equality
+  # Simple types: direct comparison
+  if r1 == r2
+    return 1
+  end
+
+  # Ptype unification: Vec<A> unifies with Vec<B> if A unifies with B
+  if r1 >= type_constants::PTYPE_BASE and r2 >= type_constants::PTYPE_BASE
+    var idx1 = r1 - type_constants::PTYPE_BASE
+    var idx2 = r2 - type_constants::PTYPE_BASE
+    if idx1 < tc.ptype_bases.size and idx2 < tc.ptype_bases.size
+      # T3c.1 Phase 3: Structured function type unification
+      if tc.ptype_bases[idx1] == type_constants::TYPE_FUNCTION and tc.ptype_bases[idx2] == type_constants::TYPE_FUNCTION
+        var fn_id1 = tc.ptype_arg1s[idx1]
+        var fn_id2 = tc.ptype_arg1s[idx2]
+        # Check arity match
+        var pc1 = 0
+        var pc2 = 0
+        if fn_id1 >= 0 and fn_id1 < tc.registry.fn_type_param_counts.size
+          pc1 = tc.registry.fn_type_param_counts[fn_id1]
+        end
+        if fn_id2 >= 0 and fn_id2 < tc.registry.fn_type_param_counts.size
+          pc2 = tc.registry.fn_type_param_counts[fn_id2]
+        end
+        if pc1 != pc2
+          return 0
+        end
+        # Unify each param type
+        var has_params1 = fn_id1 >= 0 and fn_id1 < tc.registry.fn_type_param_types.size
+        var has_params2 = fn_id2 >= 0 and fn_id2 < tc.registry.fn_type_param_types.size
+        if has_params1 and has_params2
+          var fpt1 = tc.registry.fn_type_param_types[fn_id1]
+          var fpt2 = tc.registry.fn_type_param_types[fn_id2]
+          if fpt1.size == fpt2.size and fpt1.size > 0
+            for u_i in 0..fpt1.size
+              if tc_tv_unify(tc, fpt1[u_i], fpt2[u_i]) == 0
+                return 0
+              end
+            end
+          end
+        end
+        # Unify return types
+        var rt1 = type_constants::TYPE_INT
+        var rt2 = type_constants::TYPE_INT
+        if fn_id1 >= 0 and fn_id1 < tc.registry.fn_type_return_types.size
+          rt1 = tc.registry.fn_type_return_types[fn_id1]
+        end
+        if fn_id2 >= 0 and fn_id2 < tc.registry.fn_type_return_types.size
+          rt2 = tc.registry.fn_type_return_types[fn_id2]
+        end
+        return tc_tv_unify(tc, rt1, rt2)
+      end
+      # Same base type (e.g., both Vec, both Map)
+      if tc.ptype_bases[idx1] == tc.ptype_bases[idx2]
+        # Unify element types
+        var arg1_1 = tc.ptype_arg1s[idx1]
+        var arg1_2 = tc.ptype_arg1s[idx2]
+        if tc_tv_unify(tc, arg1_1, arg1_2) == 0
+          return 0
+        end
+        # Unify second type args (Map value type)
+        var arg2_1 = tc.ptype_arg2s[idx1]
+        var arg2_2 = tc.ptype_arg2s[idx2]
+        if arg2_1 != 0 and arg2_2 != 0
+          return tc_tv_unify(tc, arg2_1, arg2_2)
+        end
+        return 1
+      end
+    end
+  end
+
+  # ROW Phase 2: Record type unification with row variables
+  if typecheck_registry::tc_is_record_type(r1) and typecheck_registry::tc_is_record_type(r2)
+    return tc_rv_unify_records(tc, r1, r2)
+  end
+
+  # Different concrete types — unification fails
+  # Store failure info for structured error messages
+  tc.last_unify_expected = r1
+  tc.last_unify_actual = r2
+  tc.last_unify_depth = 0
+  return 0
+end
+
+## Reset type variable state for a new function scope.
+## Clears all bindings, resets the counter.
+def tc_tv_reset(tc: TypecheckState): Void
+  tc.tv_next = 1
+  while tc.tv_bindings.size > 0
+    vec_pop(tc.tv_bindings)
+  end
+  while tc.tv_origin_lines.size > 0
+    vec_pop(tc.tv_origin_lines)
+  end
+  while tc.tv_origin_cols.size > 0
+    vec_pop(tc.tv_origin_cols)
+  end
+  while tc.tv_origin_descs.size > 0
+    vec_pop(tc.tv_origin_descs)
+  end
+  while tc.tv_levels.size > 0
+    vec_pop(tc.tv_levels)
+  end
+  while tc.tv_is_rigid.size > 0
+    vec_pop(tc.tv_is_rigid)
+  end
+  tc.tv_current_level = 0
+  # Also reset row variables
+  tc_rv_reset(tc)
+end
+
+## Enter a new let-binding level (increment nesting depth).
+## Call before type-checking the let-binding body.
+##
+## P5.2.f Step 4: tc via bridge. PF3-P2: de-erased body-wrap.
+def tc_tv_enter_level(): Void
+  var tc = typecheck_ctx::tc_ctx_get()
+  tc.tv_current_level = tc.tv_current_level + 1
+end
+
+## Exit a let-binding level (decrement nesting depth).
+## Call after type-checking the let-binding body.
+## P5.2.f Step 4: tc via bridge. PF3-P2: de-erased body-wrap.
+def tc_tv_exit_level(): Void
+  var tc = typecheck_ctx::tc_ctx_get()
+  tc.tv_current_level = tc.tv_current_level - 1
+end
+
+## Lower the levels of free type variables in a type to at most `target_level`.
+## This is Rémy's eager level adjustment — prevents premature generalization.
+def tc_tv_lower_levels(tc: TypecheckState, t: Int, target_level: Int): Void
+  var resolved = tc_tv_resolve(tc, t)
+
+  # Unbound type variable — lower its level if needed
+  if resolved < 0
+    var idx = (0 - resolved) - 1
+    if idx >= 0 and idx < tc.tv_levels.size
+      if tc.tv_levels[idx] > target_level
+        tc.tv_levels[idx] = target_level
+      end
+    end
+    return
+  end
+
+  # Concrete primitive — no vars to lower
+  if resolved >= 0 and resolved < type_constants::PTYPE_BASE
+    return
+  end
+
+  # ROW Phase 2: Record types — recurse into field type IDs
+  if typecheck_registry::tc_is_record_type(resolved)
+    var lr_idx = resolved - type_constants::TYPE_RECORD_BASE
+    if lr_idx >= 0 and lr_idx < tc.registry.record_field_type_ids.size
+      var lr_fids = tc.registry.record_field_type_ids[lr_idx]
+      for lr_i in 0..lr_fids.size
+        tc_tv_lower_levels(tc, lr_fids[lr_i], target_level)
+      end
+    end
+    return
+  end
+
+  # Ptype — recurse into structure
+  var lp_idx = resolved - type_constants::PTYPE_BASE
+  if lp_idx >= 0 and lp_idx < tc.ptype_bases.size
+    var lp_base = tc.ptype_bases[lp_idx]
+
+    # Function ptype — recurse into params and return type
+    if lp_base == type_constants::TYPE_FUNCTION
+      var lp_fn_id = tc.ptype_arg1s[lp_idx]
+      if lp_fn_id >= 0 and lp_fn_id < tc.registry.fn_type_param_types.size
+        var lp_params = tc.registry.fn_type_param_types[lp_fn_id]
+        for lp_j in 0..lp_params.size
+          tc_tv_lower_levels(tc, lp_params[lp_j], target_level)
+        end
+      end
+      if lp_fn_id >= 0 and lp_fn_id < tc.registry.fn_type_return_types.size
+        tc_tv_lower_levels(tc, tc.registry.fn_type_return_types[lp_fn_id], target_level)
+      end
+      return
+    end
+
+    # Non-function ptype — recurse into arg1/arg2
+    var lp_arg1 = tc.ptype_arg1s[lp_idx]
+    if lp_arg1 != 0
+      tc_tv_lower_levels(tc, lp_arg1, target_level)
+    end
+    var lp_arg2 = tc.ptype_arg2s[lp_idx]
+    if lp_arg2 != 0
+      tc_tv_lower_levels(tc, lp_arg2, target_level)
+    end
+  end
+end
+
+# ============================================================================
+# Row Variable System (ROW Phase 2)
+# ============================================================================
+
+## Create a fresh row variable. Returns a positive integer ID (1, 2, 3, ...).
+def tc_rv_fresh(tc: TypecheckState): Int
+  var rv = tc.rv_next
+  tc.rv_next = tc.rv_next + 1
+  tc.rv_bindings.push(0)
+  return rv
+end
+
+## Resolve a row variable to its binding.
+## Returns 0 if unbound, TYPE_RECORD_BASE+idx if bound to remaining fields.
+def tc_rv_resolve(tc: TypecheckState, rv: Int): Int
+  if rv <= 0
+    return 0
+  end
+  var idx = rv - 1
+  if idx >= tc.rv_bindings.size
+    return 0
+  end
+  var bound = tc.rv_bindings[idx]
+  return 0 if bound == 0
+  return bound
+end
+
+## Bind a row variable to a record type (remainder fields).
+def tc_rv_bind(tc: TypecheckState, rv: Int, bound_record: Int): Void
+  if rv <= 0
+    return
+  end
+  var idx = rv - 1
+  while tc.rv_bindings.size <= idx
+    tc.rv_bindings.push(0)
+  end
+  tc.rv_bindings[idx] = bound_record
+end
+
+## Reset row variable state for a new function scope.
+def tc_rv_reset(tc: TypecheckState): Void
+  tc.rv_next = 1
+  while tc.rv_bindings.size > 0
+    vec_pop(tc.rv_bindings)
+  end
+end
+
+# ============================================================================
+# Effect-Row Variable System (Operation Piezoelectric Effects, B.4)
+# ============================================================================
+
+## Allocate a fresh effect-row variable. Returns a positive integer ID.
+def tc_erv_fresh(tc: TypecheckState): Int
+  var erv = tc.erv_next
+  tc.erv_next = tc.erv_next + 1
+  tc.erv_bindings.push(-1)
+  return erv
+end
+
+## Resolve an effect-row variable to its bound row.
+## Returns -1 if unbound, else the row_id this var is bound to.
+def tc_erv_resolve(tc: TypecheckState, erv: Int): Int
+  if erv <= 0
+    return -1
+  end
+  var idx = erv - 1
+  if idx >= tc.erv_bindings.size
+    return -1
+  end
+  return tc.erv_bindings[idx]
+end
+
+## Bind an effect-row variable to a row ID.
+def tc_erv_bind(tc: TypecheckState, erv: Int, row_id: Int): Void
+  if erv <= 0
+    return
+  end
+  var idx = erv - 1
+  while tc.erv_bindings.size <= idx
+    tc.erv_bindings.push(-1)
+  end
+  tc.erv_bindings[idx] = row_id
+end
+
+## Clear the function-scope row-var env. Called at the start of every
+## function signature registration so a previous function's row-var names
+## never bleed into the next one.
+## P3.F.1.
+def tc_func_row_var_env_reset(tc: TypecheckState): Void
+  while tc.func_row_var_names.size > 0
+    vec_pop(tc.func_row_var_names)
+  end
+  while tc.func_row_var_ids.size > 0
+    vec_pop(tc.func_row_var_ids)
+  end
+end
+
+## Register a lowercase type-param name as an effect-row variable in the
+## current function's scope. Idempotent — if the name is already bound,
+## returns the existing erv. P3.F.1.
+def tc_func_row_var_bind(tc: TypecheckState, name: String): Int
+  for i in 0..tc.func_row_var_names.size
+    if tc.func_row_var_names[i] == name
+      return tc.func_row_var_ids[i]
+    end
+  end
+  var erv = tc_erv_fresh(tc)
+  tc.func_row_var_names.push(name)
+  tc.func_row_var_ids.push(erv)
+  return erv
+end
+
+## Look up a row-var name in the current function's scope.
+## Returns -1 if the name is not bound (caller should fall back to a
+## fresh erv or treat as an unknown tail per its own policy).
+## P3.F.1.
+def tc_func_row_var_lookup(tc: TypecheckState, name: String): Int
+  for i in 0..tc.func_row_var_names.size
+    if tc.func_row_var_names[i] == name
+      return tc.func_row_var_ids[i]
+    end
+  end
+  return -1
+end
+
+## Detect whether a type-param name is a row variable by convention.
+## Lowercase-first = row var, uppercase-first = type var.
+## (P3.F design, locked 2026-04-21.)
+def tc_name_is_row_var(name: String): Bool
+  if str_byte_len(name) == 0
+    return false
+  end
+  var c = str_byte_at(name, 0)
+  return c >= 'a' and c <= 'z'
+end
+
+## Get the row variable for a registered record type.
+## Returns 0 if closed, >0 if open.
+def tc_record_row_var(tc: TypecheckState, type_id: Int): Int
+  var idx = type_id - type_constants::TYPE_RECORD_BASE
+  if idx < 0 or idx >= tc.registry.record_row_vars.size
+    return 0
+  end
+  return tc.registry.record_row_vars[idx]
+end
+
+## Row-aware record unification.
+## Unifies two record types, respecting open/closed status:
+##  - Common fields must have compatible types
+##  - Extra fields in one record are absorbed by the other's row variable
+##  - If both closed, fields must match exactly (width subtyping)
+## Returns 1 on success, 0 on failure.
+def tc_rv_unify_records(tc: TypecheckState, rec1: Int, rec2: Int): Int
+  var names1 = typecheck_registry::tc_record_field_names(tc, rec1)
+  var names2 = typecheck_registry::tc_record_field_names(tc, rec2)
+  var rv1 = tc_record_row_var(tc, rec1)
+  var rv2 = tc_record_row_var(tc, rec2)
+  var fids1 = typecheck_registry::tc_record_field_type_ids(tc, rec1)
+  var fids2 = typecheck_registry::tc_record_field_type_ids(tc, rec2)
+
+  # Track which fields of rec2 are NOT in rec1 (extra fields for rec1's row var)
+  var extra2_names = vec_new<String>()
+  var extra2_types = vec_new<String>()
+  var extra2_fids = vec_new()
+  var types1 = typecheck_registry::tc_record_field_types(tc, rec1)
+  var types2 = typecheck_registry::tc_record_field_types(tc, rec2)
+
+  # Check rec2's fields against rec1
+  var j = 0
+  while j < names2.size
+    var found = 0
+    for k in 0..names1.size
+      if names1[k] == names2[j]
+        found = 1
+        # ROW Phase 2: Unify field type IDs for common fields
+        if k < fids1.size and j < fids2.size
+          if tc_tv_unify(tc, fids1[k], fids2[j]) == 0
+            return 0
+          end
+        end
+      end
+    end
+    if found == 0
+      # rec2 has a field not in rec1 — rec1 must be open to absorb it
+      if rv1 == 0
+        return 0
+      end
+      extra2_names.push(names2[j])
+      extra2_types.push(types2[j])
+      if j < fids2.size
+        extra2_fids.push(fids2[j])
+      end
+    end
+    j += 1
+  end
+
+  # Track which fields of rec1 are NOT in rec2
+  var extra1_names = vec_new<String>()
+  var extra1_types = vec_new<String>()
+  var extra1_fids = vec_new()
+  j = 0
+  while j < names1.size
+    var found = 0
+    for k in 0..names2.size
+      if names2[k] == names1[j]
+        found = 1
+      end
+    end
+    if found == 0
+      # rec1 has a field not in rec2 — rec2 must be open to absorb it
+      if rv2 == 0
+        return 0
+      end
+      extra1_names.push(names1[j])
+      extra1_types.push(types1[j])
+      if j < fids1.size
+        extra1_fids.push(fids1[j])
+      end
+    end
+    j += 1
+  end
+
+  # Bind row variables to remainder records
+  # If rec1 is open and rec2 has extra fields, bind rv1 to those extra fields
+  if rv1 > 0 and extra2_names.size > 0
+    var rv1_resolved = tc_rv_resolve(tc, rv1)
+    if rv1_resolved == 0
+      var remainder = typecheck_registry::tc_register_record_with_ids(tc, extra2_names, extra2_types, extra2_fids, rv2)
+      tc_rv_bind(tc, rv1, remainder)
+    end
+  end
+
+  # If rec2 is open and rec1 has extra fields, bind rv2 to those extra fields
+  if rv2 > 0 and extra1_names.size > 0
+    var rv2_resolved = tc_rv_resolve(tc, rv2)
+    if rv2_resolved == 0
+      var remainder = typecheck_registry::tc_register_record_with_ids(tc, extra1_names, extra1_types, extra1_fids, rv1)
+      tc_rv_bind(tc, rv2, remainder)
+    end
+  end
+
+  return 1
+end
+
+## Get origin line for a type variable.
+def tc_tv_origin_line(tc: TypecheckState, var_id: Int): Int
+  var idx = (0 - var_id) - 1
+  if idx >= 0 and idx < tc.tv_origin_lines.size
+    return tc.tv_origin_lines[idx]
+  end
+  return 0
+end
+
+## Get origin column for a type variable.
+def tc_tv_origin_col(tc: TypecheckState, var_id: Int): Int
+  var idx = (0 - var_id) - 1
+  if idx >= 0 and idx < tc.tv_origin_cols.size
+    return tc.tv_origin_cols[idx]
+  end
+  return 0
+end
+
+## Get origin description for a type variable.
+def tc_tv_origin_desc(tc: TypecheckState, var_id: Int): String
+  var idx = (0 - var_id) - 1
+  if idx >= 0 and idx < tc.tv_origin_descs.size
+    return tc.tv_origin_descs[idx]
+  end
+  return ""
+end
+
+## Format a type for error messages, resolving type variables.
+def tc_tv_type_name(tc: TypecheckState, t: Int): String
+  var resolved = tc_tv_resolve(tc, t)
+  if resolved < 0
+    return "?#{str_from_int(0 - resolved)}"
+  end
+  if resolved == type_constants::TYPE_INT
+    return "Int"
+  end
+  if resolved == type_constants::TYPE_BOOL
+    return "Bool"
+  end
+  if resolved == type_constants::TYPE_STRING
+    return "String"
+  end
+  if resolved == type_constants::TYPE_VOID
+    return "Void"
+  end
+  if resolved == type_constants::TYPE_F64
+    return "F64"
+  end
+  if resolved == type_constants::TYPE_NEVER
+    return "Never"
+  end
+  if resolved == type_constants::TYPE_UNKNOWN
+    return "Unknown"
+  end
+  # ROW Phase 2: Display record types as { x: Int, y: String | .. }
+  if typecheck_registry::tc_is_record_type(resolved)
+    var tn_rec_idx = resolved - type_constants::TYPE_RECORD_BASE
+    if tn_rec_idx >= 0 and tn_rec_idx < tc.registry.record_field_type_ids.size
+      var tn_fnames = typecheck_registry::tc_record_field_names(tc, resolved)
+      var tn_fids = tc.registry.record_field_type_ids[tn_rec_idx]
+      var tn_rv = tc_record_row_var(tc, resolved)
+      var tn_s = "{ "
+      for tn_fi in 0..tn_fnames.size
+        if tn_fi > 0
+          tn_s = "#{tn_s}, "
+        end
+        var tn_ft = "Unknown"
+        if tn_fi < tn_fids.size
+          tn_ft = tc_tv_type_name(tc, tn_fids[tn_fi])
+        end
+        tn_s = "#{tn_s}#{tn_fnames[tn_fi]}: #{tn_ft}"
+      end
+      if tn_rv > 0
+        var tn_rv_resolved = tc_rv_resolve(tc, tn_rv)
+        if tn_rv_resolved == 0
+          tn_s = "#{tn_s} | .."
+        end
+      end
+      return "#{tn_s} }"
+    end
+  end
+
+  # T3c.1 Phase 3: Display function ptypes as Fn(A, B): C
+  if resolved >= type_constants::PTYPE_BASE
+    var tn_pidx = resolved - type_constants::PTYPE_BASE
+    if tn_pidx < tc.ptype_bases.size
+      if tc.ptype_bases[tn_pidx] == type_constants::TYPE_FUNCTION
+        var tn_fn_id = tc.ptype_arg1s[tn_pidx]
+        if tn_fn_id >= 0 and tn_fn_id < tc.registry.fn_type_param_types.size
+          var tn_params = tc.registry.fn_type_param_types[tn_fn_id]
+          var tn_ret = type_constants::TYPE_INT
+          if tn_fn_id < tc.registry.fn_type_return_types.size
+            tn_ret = tc.registry.fn_type_return_types[tn_fn_id]
+          end
+          var tn_s = "Fn("
+          for tn_i in 0..tn_params.size
+            if tn_i > 0
+              tn_s = "#{tn_s}, "
+            end
+            tn_s = "#{tn_s}#{tc_tv_type_name(tc, tn_params[tn_i])}"
+          end
+          return "#{tn_s}): #{tc_tv_type_name(tc, tn_ret)}"
+        end
+      end
+    end
+  end
+  return "Type(#{str_from_int(resolved)})"
+end
+
+# ============================================================================
+# Let-Polymorphism (T3c.1 Phase 3)
+# ============================================================================
+
+## Substitute type variables in a type.
+## For each var in old_vars, replace with corresponding entry in new_vars.
+## Creates new fn_type registry entries for function types (never mutates existing).
+def tc_tv_substitute(tc: TypecheckState, t: Int, old_vars: Vec<Int>, new_vars: Vec<Int>): Int
+  var resolved = tc_tv_resolve(tc, t)
+
+  # Check if resolved is one of the old vars — return corresponding new var
+  for s_i in 0..old_vars.size
+    if resolved == old_vars[s_i]
+      return new_vars[s_i]
+    end
+  end
+
+  # ROW Phase 2: Record types — substitute field type IDs and row var
+  if typecheck_registry::tc_is_record_type(resolved)
+    var s_rec_idx = resolved - type_constants::TYPE_RECORD_BASE
+    if s_rec_idx >= 0 and s_rec_idx < tc.registry.record_field_type_ids.size
+      var s_fids = tc.registry.record_field_type_ids[s_rec_idx]
+      var s_fnames = typecheck_registry::tc_record_field_names(tc, resolved)
+      var s_ftypes = typecheck_registry::tc_record_field_types(tc, resolved)
+      var s_rv = tc_record_row_var(tc, resolved)
+      var s_new_fids = vec_new()
+      var s_changed = 0
+      for s_fi in 0..s_fids.size
+        var s_sub_fid = tc_tv_substitute(tc, s_fids[s_fi], old_vars, new_vars)
+        s_new_fids.push(s_sub_fid)
+        if s_sub_fid != s_fids[s_fi]
+          s_changed = 1
+        end
+      end
+      # Substitute row variable if it's in old_vars
+      var s_new_rv = s_rv
+      for s_rvi in 0..old_vars.size
+        if s_rv == old_vars[s_rvi]
+          s_new_rv = new_vars[s_rvi]
+          s_changed = 1
+        end
+      end
+      if s_changed == 1
+        return typecheck_registry::tc_register_record_with_ids(tc, s_fnames, s_ftypes, s_new_fids, s_new_rv)
+      end
+    end
+    return resolved
+  end
+
+  # Concrete primitive (positive, below PTYPE_BASE) — return unchanged
+  if resolved >= 0 and resolved < type_constants::PTYPE_BASE
+    return resolved
+  end
+
+  # Unbound type variable not in old_vars — return unchanged
+  if resolved < 0
+    return resolved
+  end
+
+  # Ptype — recurse into structure
+  var s_pidx = resolved - type_constants::PTYPE_BASE
+  if s_pidx < tc.ptype_bases.size
+    var s_base = tc.ptype_bases[s_pidx]
+
+    # Function ptype — substitute param types and return type
+    if s_base == type_constants::TYPE_FUNCTION
+      var s_fn_id = tc.ptype_arg1s[s_pidx]
+      if s_fn_id >= 0 and s_fn_id < tc.registry.fn_type_param_types.size
+        var s_orig_params = tc.registry.fn_type_param_types[s_fn_id]
+        var s_orig_ret = tc.registry.fn_type_return_types[s_fn_id]
+        var s_new_params = vec_new()
+        var s_changed = 0
+        for s_j in 0..s_orig_params.size
+          var s_sub = tc_tv_substitute(tc, s_orig_params[s_j], old_vars, new_vars)
+          s_new_params.push(s_sub)
+          if s_sub != s_orig_params[s_j]
+            s_changed = 1
+          end
+        end
+        var s_new_ret = tc_tv_substitute(tc, s_orig_ret, old_vars, new_vars)
+        if s_new_ret != s_orig_ret
+          s_changed = 1
+        end
+        if s_changed == 1
+          return typecheck_registry::tc_make_fn_type_from_types(tc, s_new_params, s_new_ret)
+        end
+        return resolved
+      end
+      return resolved
+    end
+
+    # Non-function ptype (Vec, Map, etc.) — substitute arg1/arg2
+    var s_arg1 = tc.ptype_arg1s[s_pidx]
+    var s_arg2 = tc.ptype_arg2s[s_pidx]
+    var s_new_a1 = tc_tv_substitute(tc, s_arg1, old_vars, new_vars)
+    var s_new_a2 = s_arg2
+    if s_arg2 != 0
+      s_new_a2 = tc_tv_substitute(tc, s_arg2, old_vars, new_vars)
+    end
+    if s_new_a1 != s_arg1 or s_new_a2 != s_arg2
+      return typecheck::tc_make_ptype(tc, s_base, s_new_a1, s_new_a2)
+    end
+  end
+
+  return resolved
+end
+
+## QZ0204: Detect unconstrained type variables in function scope.
+## Called at function exit after all body constraints have been propagated.
+## Scans all type variables created during this function for unbound status.
+def tc_check_unconstrained_type_vars(tc: TypecheckState): Void
+  var tv_count = tc.tv_bindings.size
+  if tv_count == 0
+    return
+  end
+  if tc.tv_origin_descs.size < tv_count
+    return
+  end
+  for i in 0..tv_count
+    if tc.tv_bindings[i] == 0
+      var orig_desc = tc.tv_origin_descs[i]
+      if str_byte_len(orig_desc) > 10
+        if orig_desc.starts_with("QZ0204_let")
+          var var_name = str_byte_slice(orig_desc, 11, str_byte_len(orig_desc))
+          var orig_line = tc.tv_origin_lines[i]
+          var orig_col = tc.tv_origin_cols[i]
+          if orig_line > 0
+            tc_error(tc, "QZ0204: Ambiguous type for '#{var_name}' — type could not be inferred from context (add a type annotation)", orig_line, orig_col)
+          end
+        end
+      end
+    end
+  end
+end
+
+## Collect free (unbound) type variables in a type.
+## Returns a Vec<Int> of unique unbound type variable IDs.
+def tc_tv_collect_free_vars(tc: TypecheckState, t: Int): Vec<Int>
+  var result = vec_new()
+  tc_tv_collect_free_vars_walk(tc, t, result)
+  return result
+end
+
+## Walk helper for collecting free type variables.
+def tc_tv_collect_free_vars_walk(tc: TypecheckState, t: Int, result: Vec<Int>): Void
+  var resolved = tc_tv_resolve(tc, t)
+
+  # Unbound type variable — add if not already in result
+  if resolved < 0
+    for cf_i in 0..result.size
+      return if result[cf_i] == resolved
+    end
+    result.push(resolved)
+    return
+  end
+
+  # ROW Phase 2: Record types — recurse into field type IDs + check row var
+  if typecheck_registry::tc_is_record_type(resolved)
+    var cf_rec_idx = resolved - type_constants::TYPE_RECORD_BASE
+    if cf_rec_idx >= 0 and cf_rec_idx < tc.registry.record_field_type_ids.size
+      var cf_fids = tc.registry.record_field_type_ids[cf_rec_idx]
+      for cf_fi in 0..cf_fids.size
+        tc_tv_collect_free_vars_walk(tc, cf_fids[cf_fi], result)
+      end
+    end
+    # Check for unbound row variable
+    var cf_rv = tc_record_row_var(tc, resolved)
+    if cf_rv > 0
+      var cf_rv_resolved = tc_rv_resolve(tc, cf_rv)
+      if cf_rv_resolved == 0
+        # Unbound row var — add if not already in result
+        for cf_ri in 0..result.size
+          return if result[cf_ri] == cf_rv
+        end
+        result.push(cf_rv)
+      end
+    end
+    return
+  end
+
+  # Concrete primitive — no free vars
+  if resolved >= 0 and resolved < type_constants::PTYPE_BASE
+    return
+  end
+
+  # Ptype — recurse into structure
+  var cf_pidx = resolved - type_constants::PTYPE_BASE
+  if cf_pidx < tc.ptype_bases.size
+    var cf_base = tc.ptype_bases[cf_pidx]
+
+    # Function ptype — recurse into params and return type
+    if cf_base == type_constants::TYPE_FUNCTION
+      var cf_fn_id = tc.ptype_arg1s[cf_pidx]
+      if cf_fn_id >= 0 and cf_fn_id < tc.registry.fn_type_param_types.size
+        var cf_params = tc.registry.fn_type_param_types[cf_fn_id]
+        for cf_j in 0..cf_params.size
+          tc_tv_collect_free_vars_walk(tc, cf_params[cf_j], result)
+        end
+      end
+      if cf_fn_id >= 0 and cf_fn_id < tc.registry.fn_type_return_types.size
+        tc_tv_collect_free_vars_walk(tc, tc.registry.fn_type_return_types[cf_fn_id], result)
+      end
+      return
+    end
+
+    # Non-function ptype — recurse into arg1/arg2
+    var cf_arg1 = tc.ptype_arg1s[cf_pidx]
+    if cf_arg1 != 0
+      tc_tv_collect_free_vars_walk(tc, cf_arg1, result)
+    end
+    var cf_arg2 = tc.ptype_arg2s[cf_pidx]
+    if cf_arg2 != 0
+      tc_tv_collect_free_vars_walk(tc, cf_arg2, result)
+    end
+  end
+end
+
+## Generalize a type: quantify type variables with level > current_level.
+## Level-based generalization (Rémy 1992) — only variables local to the
+## inner let-binding scope are generalized. Variables at or below the
+## current level escape and must not be quantified.
+## Only called on const (immutable) bindings — value restriction.
+def tc_generalize(tc: TypecheckState, t: Int): Vec<Int>
+  var result = vec_new()
+  tc_generalize_walk(tc, t, result)
+  return result
+end
+
+## Walk helper for level-based generalization.
+## Collects unbound type variables with level > tc.tv_current_level.
+def tc_generalize_walk(tc: TypecheckState, t: Int, result: Vec<Int>): Void
+  var resolved = tc_tv_resolve(tc, t)
+
+  # Unbound type variable — generalize if level > current_level
+  if resolved < 0
+    var gen_idx = (0 - resolved) - 1
+    if gen_idx >= 0 and gen_idx < tc.tv_levels.size
+      if tc.tv_levels[gen_idx] > tc.tv_current_level
+        # Check not already in result
+        for gw_i in 0..result.size
+          return if result[gw_i] == resolved
+        end
+        result.push(resolved)
+      end
+    end
+    return
+  end
+
+  # ROW Phase 2: Record types — recurse into field type IDs + check row var
+  if typecheck_registry::tc_is_record_type(resolved)
+    var gr_idx = resolved - type_constants::TYPE_RECORD_BASE
+    if gr_idx >= 0 and gr_idx < tc.registry.record_field_type_ids.size
+      var gr_fids = tc.registry.record_field_type_ids[gr_idx]
+      for gr_i in 0..gr_fids.size
+        tc_generalize_walk(tc, gr_fids[gr_i], result)
+      end
+    end
+    # Check for unbound row variable
+    var gr_rv = tc_record_row_var(tc, resolved)
+    if gr_rv > 0
+      var gr_rv_resolved = tc_rv_resolve(tc, gr_rv)
+      if gr_rv_resolved == 0
+        for gr_ri in 0..result.size
+          return if result[gr_ri] == gr_rv
+        end
+        result.push(gr_rv)
+      end
+    end
+    return
+  end
+
+  # Concrete primitive — no free vars
+  if resolved >= 0 and resolved < type_constants::PTYPE_BASE
+    return
+  end
+
+  # Ptype — recurse into structure
+  var gp_idx = resolved - type_constants::PTYPE_BASE
+  if gp_idx >= 0 and gp_idx < tc.ptype_bases.size
+    var gp_base = tc.ptype_bases[gp_idx]
+
+    # Function ptype — recurse into params and return type
+    if gp_base == type_constants::TYPE_FUNCTION
+      var gp_fn_id = tc.ptype_arg1s[gp_idx]
+      if gp_fn_id >= 0 and gp_fn_id < tc.registry.fn_type_param_types.size
+        var gp_params = tc.registry.fn_type_param_types[gp_fn_id]
+        for gp_j in 0..gp_params.size
+          tc_generalize_walk(tc, gp_params[gp_j], result)
+        end
+      end
+      if gp_fn_id >= 0 and gp_fn_id < tc.registry.fn_type_return_types.size
+        tc_generalize_walk(tc, tc.registry.fn_type_return_types[gp_fn_id], result)
+      end
+      return
+    end
+
+    # Non-function ptype — recurse into arg1/arg2
+    var gp_arg1 = tc.ptype_arg1s[gp_idx]
+    if gp_arg1 != 0
+      tc_generalize_walk(tc, gp_arg1, result)
+    end
+    var gp_arg2 = tc.ptype_arg2s[gp_idx]
+    if gp_arg2 != 0
+      tc_generalize_walk(tc, gp_arg2, result)
+    end
+  end
+end
+
+## Instantiate a polymorphic type by replacing quantified vars with fresh ones.
+## scheme: the quantified variable IDs from generalization.
+## Returns a new type with fresh type variables substituted in.
+def tc_instantiate(tc: TypecheckState, t: Int, scheme: Vec<Int>): Int
+  if scheme.size == 0
+    return t
+  end
+  var fresh = vec_new()
+  for inst_i in 0..scheme.size
+    # ROW Phase 2: Mixed schemes — negative IDs are type vars, positive are row vars
+    if scheme[inst_i] < 0
+      fresh.push(tc_tv_fresh(tc))
+    else
+      fresh.push(tc_rv_fresh(tc))
+    end
+  end
+  return tc_tv_substitute(tc, t, scheme, fresh)
+end
+
+# ============================================================================
+# Forall (Rank-2) Type Registration + Subsumption (Phase E)
+# ============================================================================
+
+## Register a forall type scheme.
+## var_names: names of quantified variables (e.g., ["a", "b"])
+## var_ids: negative type variable IDs for the quantified vars
+## body_type: the type under the forall binder
+## Returns TYPE_FORALL_BASE + index.
+def tc_register_forall(tc: TypecheckState, var_names: Vec<String>, var_ids: Vec<Int>, body_type: Int): Int
+  var idx = tc.registry.forall_body_types.size
+  tc.registry.forall_var_names.push(var_names)
+  tc.registry.forall_var_ids.push(var_ids)
+  tc.registry.forall_body_types.push(body_type)
+  return type_constants::TYPE_FORALL_BASE + idx
+end
+
+## Check if a type ID is a forall scheme.
+def tc_is_forall(t: Int): Int
+  if t >= type_constants::TYPE_FORALL_BASE and t < type_constants::TYPE_FORALL_BASE + 1000
+    return 1
+  end
+  return 0
+end
+
+## Get the body type of a forall scheme.
+def tc_forall_body(tc: TypecheckState, t: Int): Int
+  var idx = t - type_constants::TYPE_FORALL_BASE
+  if idx >= 0 and idx < tc.registry.forall_body_types.size
+    return tc.registry.forall_body_types[idx]
+  end
+  return type_constants::TYPE_ERROR
+end
+
+## Get the quantified variable IDs of a forall scheme.
+def tc_forall_var_ids(tc: TypecheckState, t: Int): Vec<Int>
+  var idx = t - type_constants::TYPE_FORALL_BASE
+  if idx >= 0 and idx < tc.registry.forall_var_ids.size
+    return tc.registry.forall_var_ids[idx]
+  end
+  return vec_new()
+end
+
+## Get the quantified variable names of a forall scheme.
+def tc_forall_var_names(tc: TypecheckState, t: Int): Vec<String>
+  var idx = t - type_constants::TYPE_FORALL_BASE
+  if idx >= 0 and idx < tc.registry.forall_var_names.size
+    return tc.registry.forall_var_names[idx]
+  end
+  return vec_new<String>()
+end
+
+## Subsumption check: does `actual` type subsume `expected` type?
+## Handles Rank-2 polymorphism via skolemization.
+##
+## Rules (simplified Dunfield-Krishnaswami 2013):
+## - If expected is forall: introduce skolems, check actual against body
+## - If actual is forall: instantiate with fresh vars, unify with expected
+## - Otherwise: delegate to tc_tv_unify
+##
+## Returns 1 on success, 0 on failure.
+def tc_subsumes(tc: TypecheckState, actual: Int, expected: Int): Int
+  # If expected is a forall type: check that actual works for ALL types
+  # (introduce skolem variables and verify no escape)
+  if tc_is_forall(expected) == 1
+    var exp_vars = tc_forall_var_ids(tc, expected)
+    var exp_names = tc_forall_var_names(tc, expected)
+    var exp_body = tc_forall_body(tc, expected)
+    # Create skolem (rigid) variables for each quantified var
+    var skolems = vec_new()
+    for sk_i in 0..exp_vars.size
+      var sk_name = ""
+      if sk_i < exp_names.size
+        sk_name = exp_names[sk_i]
+      end
+      skolems.push(tc_tv_fresh_rigid(tc, sk_name))
+    end
+    # Substitute skolems into the body
+    var skolem_body = tc_tv_substitute(tc, exp_body, exp_vars, skolems)
+    # Recurse: check actual against the skolemized body
+    return tc_subsumes(tc, actual, skolem_body)
+  end
+
+  # If actual is a forall type: instantiate with fresh (flexible) vars
+  if tc_is_forall(actual) == 1
+    var act_vars = tc_forall_var_ids(tc, actual)
+    var act_body = tc_forall_body(tc, actual)
+    # Create fresh type variables
+    var fresh = vec_new()
+    for fr_i in 0..act_vars.size
+      fresh.push(tc_tv_fresh(tc))
+    end
+    # Substitute fresh vars into the body
+    var fresh_body = tc_tv_substitute(tc, act_body, act_vars, fresh)
+    # Unify the instantiated body with expected
+    return tc_tv_unify(tc, fresh_body, expected)
+  end
+
+  # Neither is forall — plain unification
+  return tc_tv_unify(tc, actual, expected)
+end
+
+## Free all memory held by the TypecheckState.
+## Call after typecheck + interface hash computation, before MIR lowering.
+## After this call, tc is invalid — no TC operations may be performed.
+def tc_free(tc: TypecheckState): Void
+  # --- TcErrors ---
+  vec_free(tc.errs.errors)
+  vec_free(tc.errs.error_lines)
+  vec_free(tc.errs.error_cols)
+  vec_free(tc.errs.error_files)
+  vec_free(tc.errs.error_expansion_idxs)
+  vec_free(tc.errs.warnings)
+  vec_free(tc.errs.warning_lines)
+  vec_free(tc.errs.warning_cols)
+  vec_free(tc.errs.warning_files)
+  vec_free(tc.errs.warning_expansion_idxs)
+
+  # --- TcScope ---
+  vec_free(tc.scope.binding_names)
+  vec_free(tc.scope.binding_types)
+  vec_free(tc.scope.binding_depths)
+  vec_free(tc.scope.binding_mutables)
+  vec_free(tc.scope.binding_struct_names)
+  vec_free(tc.scope.binding_count)
+  vec_free(tc.scope.binding_param_counts)
+  vec_free(tc.scope.binding_type_annotations)
+  # binding_schemes is Vec<Vec<Int>> — free inner vecs first
+  for i in 0..tc.scope.binding_schemes.size
+    vec_free(tc.scope.binding_schemes[i])
+  end
+  vec_free(tc.scope.binding_schemes)
+  vec_free(tc.scope.current_scope_depth)
+  vec_free(tc.scope.current_func_return_type)
+  vec_free(tc.scope.current_func_idx)
+  vec_free(tc.scope.handler_effect_stack)
+
+  # --- TcSafety ---
+  vec_free(tc.safety.binding_linear_states)
+  vec_free(tc.safety.binding_linear_structs)
+  vec_free(tc.safety.binding_borrow_states)
+  vec_free(tc.safety.binding_shared_borrow_counts)
+  vec_free(tc.safety.binding_borrow_sources)
+  vec_free(tc.safety.binding_is_mut_borrows)
+  vec_free(tc.safety.binding_borrow_lines)
+  vec_free(tc.safety.binding_borrow_cols)
+  vec_free(tc.safety.move_states)
+  vec_free(tc.safety.move_types)
+  vec_free(tc.safety.move_targets)
+  vec_free(tc.safety.move_lines)
+  vec_free(tc.safety.move_cols)
+  vec_free(tc.safety.copy_types)
+  vec_free(tc.safety.partial_moved_fields)
+  vec_free(tc.safety.partial_move_targets)
+  vec_free(tc.safety.partial_move_lines)
+  vec_free(tc.safety.arena_var_names)
+  vec_free(tc.safety.arena_var_sources)
+  vec_free(tc.safety.arena_var_lines)
+  vec_free(tc.safety.arena_invalidated)
+  vec_free(tc.safety.arena_invalidated_lines)
+  vec_free(tc.safety.arena_scoped_arenas)
+
+  # --- TcRegistry --- skip inner vec frees (may contain null handles)
+  # Just free the flat Vec<T> fields — the inner Vecs in Vec<Vec<T>> fields
+  # will leak but the outer arrays are reclaimed. Safe because the inner
+  # Vec handles may be uninitialized zeros in sparse registration.
+  vec_free(tc.registry.struct_names)
+  vec_free(tc.registry.struct_field_names)
+  vec_free(tc.registry.struct_field_types)
+  vec_free(tc.registry.struct_type_params)
+  vec_free(tc.registry.struct_field_annotations)
+  vec_free(tc.registry.struct_is_linear)
+  vec_free(tc.registry.struct_field_defaults)
+  vec_free(tc.registry.enum_names)
+  vec_free(tc.registry.enum_variant_names)
+  vec_free(tc.registry.enum_variant_payloads)
+  vec_free(tc.registry.enum_type_params)
+  vec_free(tc.registry.enum_variant_field_annotations)
+  vec_free(tc.registry.func_names)
+  vec_free(tc.registry.func_param_types)
+  vec_free(tc.registry.func_return_types)
+  vec_free(tc.registry.func_return_annotations)
+  vec_free(tc.registry.func_required_counts)
+  vec_free(tc.registry.func_param_fn_annotations)
+  vec_free(tc.registry.trait_names)
+  vec_free(tc.registry.trait_method_names)
+  vec_free(tc.registry.trait_method_sigs)
+  vec_free(tc.registry.trait_method_defaults)
+  vec_free(tc.registry.trait_super_traits)
+  vec_free(tc.registry.trait_type_params)
+  vec_free(tc.registry.impl_trait_names)
+  vec_free(tc.registry.impl_for_types)
+  vec_free(tc.registry.impl_method_names)
+  vec_free(tc.registry.neg_impl_trait_names)
+  vec_free(tc.registry.neg_impl_for_types)
+  vec_free(tc.registry.type_alias_names)
+  vec_free(tc.registry.type_alias_types)
+  vec_free(tc.registry.newtype_names)
+  vec_free(tc.registry.newtype_wrapped_types)
+  vec_free(tc.registry.newtype_type_ids)
+  vec_free(tc.registry.union_member_strings)
+  vec_free(tc.registry.union_type_names)
+  vec_free(tc.registry.intersection_member_strings)
+  vec_free(tc.registry.intersection_record_fields)
+  vec_free(tc.registry.intersection_record_types)
+  vec_free(tc.registry.fn_type_annotations)
+  vec_free(tc.registry.fn_type_param_counts)
+  vec_free(tc.registry.fn_type_return_types)
+  vec_free(tc.registry.fn_type_param_types)
+  vec_free(tc.registry.func_type_params)
+  vec_free(tc.registry.func_type_param_bounds)
+  vec_free(tc.registry.func_param_annotations)
+  vec_free(tc.registry.func_param_names)
+  vec_free(tc.registry.func_ast_stores)
+  vec_free(tc.registry.func_ast_handles)
+  vec_free(tc.registry.record_signatures)
+  vec_free(tc.registry.record_field_names)
+  vec_free(tc.registry.record_field_types)
+  vec_free(tc.registry.record_row_vars)
+  vec_free(tc.registry.record_field_type_ids)
+  vec_free(tc.registry.tuple_elem_types)
+  vec_free(tc.registry.impl_return_func_names)
+  vec_free(tc.registry.impl_return_concrete_types)
+  vec_free(tc.registry.impl_return_trait_names)
+  vec_free(tc.registry.forall_var_names)
+  vec_free(tc.registry.forall_body_types)
+  vec_free(tc.registry.forall_var_ids)
+  vec_free(tc.registry.func_borrow_summaries)
+  vec_free(tc.registry.row_label_lists)
+  vec_free(tc.registry.row_tail_vars)
+  vec_free(tc.registry.effect_decl_names)
+  vec_free(tc.registry.effect_decl_op_starts)
+  vec_free(tc.registry.effect_decl_op_counts)
+  vec_free(tc.registry.effect_decl_op_names)
+  vec_free(tc.registry.effect_decl_op_kinds)
+  vec_free(tc.registry.effect_decl_op_param_types)
+  vec_free(tc.registry.effect_decl_op_return_types)
+  vec_free(tc.registry.func_effect_row_idx)
+
+  # --- TypecheckState direct fields ---
+  map_free(tc.builtins)
+  vec_free(tc.type_storage)
+  vec_free(tc.source)
+  vec_free(tc.filename)
+  vec_free(tc.param_type_vars)
+  map_free(tc.builtin_min_arity)
+  map_free(tc.builtin_max_arity)
+  map_free(tc.builtin_callback_effect)
+  vec_free(tc.ptype_bases)
+  vec_free(tc.ptype_arg1s)
+  vec_free(tc.ptype_arg2s)
+  vec_free(tc.ptype_names)
+  vec_free(tc.loop_labels)
+  vec_free(tc.pending_ptype_names)
+  vec_free(tc.pending_ptype_bases)
+  vec_free(tc.pending_ptype_vars)
+  vec_free(tc.pending_ptype_vars2)
+  vec_free(tc.inferred_vec_vars)
+  vec_free(tc.inferred_vec_lines)
+  vec_free(tc.tv_bindings)
+  vec_free(tc.tv_origin_lines)
+  vec_free(tc.tv_origin_cols)
+  vec_free(tc.tv_origin_descs)
+  vec_free(tc.rv_bindings)
+  vec_free(tc.erv_bindings)
+  vec_free(tc.func_row_var_names)
+  vec_free(tc.func_row_var_ids)
+  vec_free(tc.tv_levels)
+  vec_free(tc.tv_is_rigid)
+end
+
+# ============================================================================
+# Interprocedural Borrow — Pending Return Borrow (T3c.2 Phase 3)
+# ============================================================================
+# Set by NODE_CALL handler when callee's BorrowSummary indicates the return
+# value borrows from a parameter. Consumed by NODE_LET handler to record
+# the borrow chain on the new binding.
+
+## Pending return borrow state: [source_name_as_int, borrow_kind]
+var g_pending_return_borrow = vec_new()
+
+def tc_pending_borrow_set(source: Int, kind: Int): Void
+  vec_clear(g_pending_return_borrow)
+  g_pending_return_borrow.push(source)
+  g_pending_return_borrow.push(kind)
+end
+
+def tc_pending_borrow_get(): Vec = g_pending_return_borrow
+
+def tc_pending_borrow_clear(): Void = vec_clear(g_pending_return_borrow)
+
+# ============================================================================
+# Temporary (argument-position) borrow tracking — NLL release at statement end.
+#
+# A `&mut x` / `&x` (NODE_FUNC_REF borrow) sets x's borrow state, but when the
+# borrow is a temporary — a call argument like `inc(&mut c)` — nothing holds it
+# and the liveness-based release (keyed on the *holder* binding's last use)
+# never fires, because there is no holder. The borrow then persists and a later
+# `inc(&mut c)` wrongly trips QZ1205 (and stale states trip QZ1206/QZ1209/
+# QZ1212). An argument borrow's lifetime is the call/statement, so it must be
+# released at statement end. Bound borrows (`var r = &mut c`) are recorded in
+# binding_borrow_sources and released later via liveness — they are skipped
+# here. tc_stmt snapshots the list length on entry and releases only entries it
+# added, which keeps the release correct under statement nesting.
+# ============================================================================
+var g_temp_borrow_idxs = vec_new()
+var g_temp_borrow_kinds = vec_new()
+var g_temp_borrow_lines = vec_new()
+var g_temp_borrow_cols = vec_new()
+
+def tc_temp_borrow_count(): Int = g_temp_borrow_idxs.size
+
+def tc_temp_borrow_push(bidx: Int, kind: Int, line: Int, col: Int): Void
+  g_temp_borrow_idxs.push(bidx)
+  g_temp_borrow_kinds.push(kind)
+  g_temp_borrow_lines.push(line)
+  g_temp_borrow_cols.push(col)
+end
+
+# Has the binding `bidx` already been temp-borrowed at this exact source
+# position (line, col)? The type checker walks call arguments multiple times,
+# so the same `&mut x` / `&x` node is evaluated repeatedly; a re-evaluation
+# must be a no-op rather than self-conflicting with the borrow it itself
+# created. A borrow of the same binding at a DIFFERENT position is a genuine
+# second borrow (e.g. `foo(&mut c, &mut c)`) and is not matched here.
+def tc_temp_borrow_has(bidx: Int, line: Int, col: Int): Int
+  for i in 0..g_temp_borrow_idxs.size
+    if g_temp_borrow_idxs[i] == bidx and g_temp_borrow_lines[i] == line and g_temp_borrow_cols[i] == col
+      return 1
+    end
+  end
+  return 0
+end
+
+# Is `name` recorded as the borrow source of any binding? If so, a live holder
+# owns that borrow and we must NOT release it at statement end (it is freed via
+# liveness on the holder). Conservative: scanning all bindings (including
+# popped scopes) can only keep a borrow longer, never release one too early.
+def _tc_binding_is_bound_source(tc: TypecheckState, name: String): Int
+  for i in 0..tc.scope.binding_names.size
+    if tc.safety.binding_borrow_sources[i] != 0
+      if as_string(tc.safety.binding_borrow_sources[i]) == name
+        return 1
+      end
+    end
+  end
+  return 0
+end
+
+# Release temp borrows added since `start`, then truncate the list back to it.
+def tc_temp_borrow_release_from(tc: TypecheckState, start: Int): Void
+  var i = g_temp_borrow_idxs.size - 1
+  while i >= start
+    var bidx = g_temp_borrow_idxs[i]
+    var kind = g_temp_borrow_kinds[i]
+    if bidx >= 0 and bidx < tc.scope.binding_names.size
+      if _tc_binding_is_bound_source(tc, tc.scope.binding_names[bidx]) == 0
+        if kind == 1
+          tc.safety.binding_borrow_states[bidx] = 0
+        else
+          var sc = tc.safety.binding_shared_borrow_counts[bidx]
+          if sc > 0
+            tc.safety.binding_shared_borrow_counts[bidx] = sc - 1
+            if sc - 1 == 0
+              tc.safety.binding_borrow_states[bidx] = 0
+            end
+          end
+        end
+      end
+    end
+    i = i - 1
+  end
+  while g_temp_borrow_idxs.size > start
+    vec_pop(g_temp_borrow_idxs)
+    vec_pop(g_temp_borrow_kinds)
+    vec_pop(g_temp_borrow_lines)
+    vec_pop(g_temp_borrow_cols)
+  end
+end

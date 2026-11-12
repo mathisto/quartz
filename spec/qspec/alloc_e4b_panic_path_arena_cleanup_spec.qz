@@ -1,0 +1,193 @@
+## QSpec coverage for Phase E.4.b — panic-path arena cleanup.
+##
+## Phase E.1.a (`go_arena(f)`) and E.4.a slices 1-3.a (`go fn()` with
+## value/String/Vec/uniform-struct returns) BOTH wrapped the goroutine
+## body in `with Alloc.in_arena(ar) do ... end` followed by
+## `arena_destroy(ar)`. If the body panicked (Throws.throw), control
+## unwound through the with-block, the post-with `arena_destroy(ar)`
+## was bypassed, and the per-task arena leaked for the lifetime of the
+## process — a linear-in-panic-count RSS leak. See
+## `docs/bugs/AUTO_ARENA_PANIC_PATH_LEAK.md`.
+##
+## E.4.b wraps the body in an inner `with Throws { throw:
+## __qz_arena_panic_rec } do -> ... end` that captures the panic and
+## lets control return to the lambda scope so `arena_destroy(ar)` runs.
+## The lambda then returns `-1` — the same panic sentinel that
+## `panic_caught` used pre-fix — so `await fut` semantics are unchanged
+## for the parent. Re-throwing across the goroutine boundary into the
+## parent's `with Throws` setjmp would be a cross-stack longjmp and
+## abort the process, so we deliberately do NOT propagate the panic
+## upward; the original panic message is captured into
+## `_qz_arena_panic_msg` (`std/alloc.qz`) for diagnostic recovery.
+##
+## What these tests prove:
+##
+##   E4b.a — `go fn(): String` body panic: parent's `await fut` reads
+##           the -1 sentinel; the parent's outer `with Throws` does NOT
+##           fire (cross-stack propagation is deliberately disabled); the
+##           process completes cleanly (no SIGABRT from cross-stack
+##           longjmp).
+##   E4b.b — Success-path regression: a non-panicking goroutine still
+##           returns its value correctly under the new wrap.
+##   E4b.c — `go_arena(f)` opt-in API also handles body panic gracefully
+##           (returns -1 to await, no SIGABRT).
+##   E4b.d — 50 sequential panicking goroutines complete cleanly. Without
+##           the fix, each leaked an 8KB+ arena (400KB+ aggregate).
+
+import * from qspec
+import * from qspec/subprocess
+
+# -----------------------------------------------------------------------------
+# E4b.a — `go fn(): String` body panics. await fut reads -1 sentinel.
+# The parent's `with Throws { throw: my_throws }` should NOT fire because
+# the panic is intercepted inside the goroutine (cross-stack propagation
+# would be a longjmp-to-foreign-stack abort).
+# -----------------------------------------------------------------------------
+
+var _PANIC_RETURNS_SENTINEL: String = """import * from std/sync/composition/go
+import * from std/alloc
+
+def panicking_string(): String
+  throw(\"task-failed-here\")
+  return \"unreachable\"
+end
+
+var _parent_throws_fired = 0
+def my_throws(op: Int, argc: Int, argv: Int): Int
+  _parent_throws_fired = 1
+  return -1
+end
+
+def main(): Int
+  sched_init(1)
+  var sentinel = 0
+  with Throws { throw: my_throws } do ->
+    var fut = go panicking_string()
+    var result = await fut
+    if result == -1
+      sentinel = 1
+    end
+    0
+  end
+  if sentinel == 1 and _parent_throws_fired == 0
+    puts(\"sentinel-ok\")
+  else
+    puts(\"failed:sentinel=\" + str_from_int(sentinel) + \",parent_fired=\" + str_from_int(_parent_throws_fired))
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E4b.b — success-path regression: non-panicking String-returning
+# goroutine still returns its value correctly with the new outer Throws wrap.
+# -----------------------------------------------------------------------------
+
+var _SUCCESS_PATH_REGRESSION: String = """import * from std/sync/composition/go
+import * from std/alloc
+
+def normal_string(): String
+  var v = vec_new<Int>()
+  for i in 0..5
+    v.push(i)
+  end
+  return \"size=\" + str_from_int(v.size)
+end
+
+def main(): Int
+  sched_init(1)
+  var fut = go normal_string()
+  var s = await fut
+  if s == \"size=5\"
+    puts(\"success-ok\")
+  else
+    puts(\"failed:\" + s)
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E4b.c — `go_arena(f)` opt-in API (std/concurrency.qz `_go_arena_body`)
+# also handles body panic gracefully — returns -1 to await without
+# crashing the process.
+# -----------------------------------------------------------------------------
+
+var _GO_ARENA_PANIC_SENTINEL: String = """import * from std/sync/composition/go
+import * from std/alloc
+
+def panicking_int(): Int
+  throw(\"go-arena-panic\")
+  return 0
+end
+
+def main(): Int
+  sched_init(1)
+  var fut = go_arena(-> panicking_int())
+  var r = await fut
+  if r == -1
+    puts(\"go-arena-sentinel-ok\")
+  else
+    puts(\"failed:r=\" + str_from_int(r))
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E4b.d — 50 sequential panicking goroutines. Without the fix, each
+# leaked 8KB+ of arena (400KB+ aggregate). With the fix, the process
+# completes cleanly — sentinel return value preserved, no crash.
+# -----------------------------------------------------------------------------
+
+var _PANIC_LIFETIME_LOOP: String = """import * from std/sync/composition/go
+import * from std/alloc
+
+def panicker(): String
+  throw(\"loop-iter\")
+  return \"unreached\"
+end
+
+def main(): Int
+  sched_init(1)
+  var sentinel_count = 0
+  for i in 0..50
+    var fut = go panicker()
+    var r = await fut
+    if r == -1
+      sentinel_count = sentinel_count + 1
+    end
+  end
+  if sentinel_count == 50
+    puts(\"lifetime-50-ok\")
+  else
+    puts(\"failed:count=\" + str_from_int(sentinel_count))
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+def main(): Int
+  describe("Phase E.4.b — panic-path arena cleanup (auto-arena + go_arena)") do ->
+    it("`go fn(): String` body panic: await reads -1 sentinel; parent Throws does NOT fire") do ->
+      assert_run_stdout_eq(_PANIC_RETURNS_SENTINEL, "sentinel-ok\n")
+    end
+
+    it("success-path regression: non-panicking goroutine still returns its value") do ->
+      assert_run_stdout_eq(_SUCCESS_PATH_REGRESSION, "success-ok\n")
+    end
+
+    it("go_arena(f) opt-in API handles body panic gracefully (-1 sentinel, no abort)") do ->
+      assert_run_stdout_eq(_GO_ARENA_PANIC_SENTINEL, "go-arena-sentinel-ok\n")
+    end
+
+    it("50 sequential panicking goroutines complete cleanly (arena cleanup verified by no-abort)") do ->
+      assert_run_stdout_eq(_PANIC_LIFETIME_LOOP, "lifetime-50-ok\n")
+    end
+  end
+  return qspec_main()
+end

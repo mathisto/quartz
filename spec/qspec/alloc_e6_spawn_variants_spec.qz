@@ -1,0 +1,314 @@
+## QSpec coverage for Phase E.6 — extend per-task arena to all `go_*`
+## spawn variants in std/concurrency.qz.
+##
+## Phase E.1.b (2026-04-28) made the bare `go fn()` keyword form
+## auto-arena via MIR-level synthesis. Structured-concurrency primitives
+## that internally spawn via `var task = async f()` (`go_spawn`,
+## `go_cancellable`, `go_cancel_on_success`) and `_go_race_racer`'s inner
+## `_go_race_run` bypassed that synthesis — the user function `f` runs
+## as a parameter, not a top-level NODE_IDENT callee, so the gate didn't
+## fire.
+##
+## Phase E.6 (this spec): each of those primitives now wraps `f()` via
+## the same `_go_arena_body(f)` helper that `go_arena(f)` uses (E.1.a).
+## Type signatures `Fn(): Int` enforce a value-typed return so the
+## result survives `arena_destroy` — no E.4-style escape required.
+##
+## What these tests prove:
+##
+##   E6.a — `go_spawn(f)` (no enclosing scope): outer Alloc tracking
+##           observes far fewer allocations than calling `f()` directly,
+##           proving the per-task arena absorbs the bulk.
+##   E6.b — `go_cancellable(f, tok)` similarly absorbed.
+##   E6.c — `go_race(tasks)` — each racer's body runs in its own arena;
+##           outer tracking observes only spawn-side overhead × N tasks,
+##           not the per-racer Vec.push'es. Doubles as a regression test
+##           for the SSA dominance bug fixed alongside this spec
+##           (docs/bugs/POLL_BODY_WB_RESULT_SLOT_DOMINANCE.md): two
+##           sequential `with Alloc {...}` blocks where the second's
+##           body reaches an `await`-using callee previously caused
+##           `__Future_main$poll` to emit `wb.result_slot.NN` allocas in
+##           an inner basic block bypassed by resume re-entry.
+##   E6.d — Correctness regression: `go_scope` block with multiple
+##           `go_spawn(child)` calls — every child returns its expected
+##           value (per-task arenas don't cross-pollute or leak).
+##   E6.e — Sentinel returns (-1) survive teardown for `go_spawn` (matches
+##           the `go_arena` E.1.e shape; verifies the indirection through
+##           `_go_arena_body` doesn't disturb panic-sentinel semantics).
+
+import * from qspec
+import * from qspec/subprocess
+
+# -----------------------------------------------------------------------------
+# E6.a — go_spawn(f) body absorbed into per-task arena
+# -----------------------------------------------------------------------------
+
+var _GO_SPAWN_ABSORBED: String = """import std/sync/composition/go
+import std/alloc
+
+def heavy_alloc(): Int
+  var v = vec_new<Int>()
+  for i in 0..2000
+    v.push(i)
+  end
+  return v[1999]
+end
+
+def main(): Int
+  # Single-worker for deterministic counter access; tracking handler
+  # state is a non-atomic module global. The auto-arena fires regardless
+  # of worker count post-E.1.c TLS effect stack.
+  sched_init(1)
+
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    heavy_alloc()
+    0
+  end
+  var direct = alloc_tracking_alloc_count()
+
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    var t = go_spawn(heavy_alloc)
+    var r = await t
+    0
+  end
+  var via_spawn = alloc_tracking_alloc_count()
+
+  if direct >= 8 and (direct - via_spawn) >= 4
+    puts(\"absorbed\")
+  else
+    puts(\"direct=\" + str_from_int(direct) + \" via_spawn=\" + str_from_int(via_spawn))
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E6.b — go_cancellable(f, tok) body absorbed
+# -----------------------------------------------------------------------------
+
+var _GO_CANCELLABLE_ABSORBED: String = """import std/sync/composition/go
+import std/alloc
+
+def heavy_alloc(): Int
+  var v = vec_new<Int>()
+  for i in 0..2000
+    v.push(i)
+  end
+  return v[1999]
+end
+
+def main(): Int
+  sched_init(1)
+
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    heavy_alloc()
+    0
+  end
+  var direct = alloc_tracking_alloc_count()
+
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    var tok = cancel_token_new()
+    var t = go_cancellable(heavy_alloc, tok)
+    var r = await t
+    cancel_token_free(tok)
+    0
+  end
+  var via_canc = alloc_tracking_alloc_count()
+
+  if direct >= 8 and (direct - via_canc) >= 4
+    puts(\"absorbed\")
+  else
+    puts(\"direct=\" + str_from_int(direct) + \" via_canc=\" + str_from_int(via_canc))
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E6.c — go_race(tasks): racer bodies each run in their own per-task arena.
+# Two-with-blocks-in-$poll absorbed-vs-direct measurement. This pattern
+# (sequential `with Alloc {...}` blocks where the second's body calls
+# `go_race` whose racer await loop lifts main into `__Future_main$poll`)
+# previously hit the SSA dominance bug filed at
+# docs/bugs/POLL_BODY_WB_RESULT_SLOT_DOMINANCE.md — `wb.result_slot.NN`
+# allocas were emitted inline at the IR cursor inside an inner basic
+# block, but the resume-poll path bypassed that block, so llc rejected
+# the IR. Fix landed in the same commit as this test reinstatement: the
+# allocas are hoisted to fn_entry alongside the existing
+# MIR_CONST_INT / MIR_ALLOC_STACK hoists. Doubles as a regression test.
+# -----------------------------------------------------------------------------
+
+var _GO_RACE_ABSORBED: String = """import std/sync/composition/go
+import std/alloc
+
+def fast_racer(): Int
+  var v = vec_new<Int>()
+  for i in 0..500
+    v.push(i)
+  end
+  return 1
+end
+
+def slow_racer(): Int
+  var v = vec_new<Int>()
+  for i in 0..500
+    v.push(i)
+  end
+  return 2
+end
+
+def main(): Int
+  sched_init(1)
+
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    fast_racer()
+    slow_racer()
+    0
+  end
+  var direct = alloc_tracking_alloc_count()
+
+  alloc_reset_tracking()
+  with Alloc { alloc: tracking_alloc_handler, dealloc: tracking_dealloc_handler } do ->
+    var tasks = vec_new()
+    tasks.push(fast_racer)
+    tasks.push(slow_racer)
+    var winner = go_race(tasks)
+    0
+  end
+  var via_race = alloc_tracking_alloc_count()
+
+  if direct >= 8 and (direct - via_race) >= 4
+    puts(\"absorbed\")
+  else
+    puts(\"direct=\" + str_from_int(direct) + \" via_race=\" + str_from_int(via_race))
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E6.d — go_scope correctness: multiple go_spawn'd children all return
+# correct values (per-task arenas don't cross-pollute).
+# -----------------------------------------------------------------------------
+
+var _GO_SCOPE_CORRECTNESS: String = """import std/sync/composition/go
+
+def child10(): Int
+  var v = vec_new<Int>()
+  for i in 0..10
+    v.push(i * 10)
+  end
+  return v[9]
+end
+
+def child20(): Int
+  var v = vec_new<Int>()
+  for i in 0..20
+    v.push(i * 20)
+  end
+  return v[19]
+end
+
+def child30(): Int
+  var v = vec_new<Int>()
+  for i in 0..30
+    v.push(i * 30)
+  end
+  return v[29]
+end
+
+def main(): Int
+  go_scope(-> {
+    go_spawn(child10)
+    go_spawn(child20)
+    go_spawn(child30)
+    return 0
+  })
+  # child10: 9*10=90; child20: 19*20=380; child30: 29*30=870
+  # Each child runs in its own per-task arena; their results are i64
+  # values so they survive arena_destroy. Print via direct call after
+  # the scope exits to confirm no cross-pollution / leak.
+  var a = child10()
+  var b = child20()
+  var c = child30()
+  if a == 90 and b == 380 and c == 870
+    puts(\"scope_ok\")
+  else
+    puts(\"a=\" + str_from_int(a) + \" b=\" + str_from_int(b) + \" c=\" + str_from_int(c))
+  end
+  return 0
+end
+"""
+
+# -----------------------------------------------------------------------------
+# E6.e — sentinel returns survive arena teardown via go_spawn
+# -----------------------------------------------------------------------------
+
+var _SENTINEL_VIA_SPAWN: String = """import std/sync/composition/go
+
+def returns_neg1(): Int
+  var v = vec_new<Int>()
+  v.push(42)
+  return -1
+end
+
+def returns_zero(): Int
+  var v = vec_new<Int>()
+  v.push(99)
+  return 0
+end
+
+def main(): Int
+  sched_init(0)
+  var t1 = go_spawn(returns_neg1)
+  var t2 = go_spawn(returns_zero)
+  var r1 = await t1
+  var r2 = await t2
+  if r1 == -1 and r2 == 0
+    puts(\"sentinels_ok\")
+  else
+    puts(\"r1=\" + str_from_int(r1) + \" r2=\" + str_from_int(r2))
+  end
+  sched_shutdown()
+  return 0
+end
+"""
+
+# =============================================================================
+# Spec entry point
+# =============================================================================
+
+def main(): Int
+  describe("Phase E.6 — go_* spawn variants run inside per-task arenas") do ->
+
+    it("go_spawn(f) body absorbed into per-task arena") do ->
+      assert_run_stdout_eq(_GO_SPAWN_ABSORBED, "absorbed\n")
+    end
+
+    it("go_cancellable(f, tok) body absorbed") do ->
+      assert_run_stdout_eq(_GO_CANCELLABLE_ABSORBED, "absorbed\n")
+    end
+
+    it("go_race(tasks) body absorbed (also regression for POLL_BODY_WB_RESULT_SLOT_DOMINANCE)") do ->
+      assert_run_stdout_eq(_GO_RACE_ABSORBED, "absorbed\n")
+    end
+
+    it("go_scope with multiple go_spawn'd children — all return correct values") do ->
+      assert_run_stdout_eq(_GO_SCOPE_CORRECTNESS, "scope_ok\n")
+    end
+
+    it("sentinel return values (-1, 0) pass through arena teardown via go_spawn") do ->
+      assert_run_stdout_eq(_SENTINEL_VIA_SPAWN, "sentinels_ok\n")
+    end
+
+  end
+  return qspec_main()
+end

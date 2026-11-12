@@ -1,0 +1,245 @@
+## qzmod_remap — Phase 1.4.b / 1.4.b.1 acceptance coverage.
+##
+## The remap helper consumes a `QzmodLoadResult`'s TYPES section
+## (`types_tag` / `types_arg1` / `types_arg2` / `ptype_names`) plus the
+## producer's fn_type registry (`fn_type_annotations`) and re-creates each
+## parametric type in a fresh consumer `TypecheckState`, returning a
+## producer-idx → consumer-type-id mapping.
+##
+## Coverage:
+##   Happy path:
+##     1. Empty TYPES → ok=1 + empty remap.
+##     2. Single primitive-arg parametric (Vec<Int>) → resolves.
+##     3. Two-arg primitive parametric (Result<Int, String>) → resolves.
+##     4. PTYPE backreference (Vec<Option<Int>>) → outer remap uses inner.
+##     5. Interning (two identical entries → same consumer id).
+##     6. TYPE_STRUCT with ptype_name → name stamped on consumer ptype.
+##     7. TYPE_ENUM  with ptype_name → name stamped on consumer ptype.
+##     8. TYPE_FUNCTION → re-intern via `tc_register_fn_type` by annotation.
+##     9. Vec<Point>-shaped (ptype_name "Point", primitive elem) → name stamps.
+##   Advisory miss:
+##    10. Derived-base arg (TYPE_NEWTYPE_BASE+0) → ok=0.
+##    11. Forward PTYPE reference → ok=0.
+##    12. TYPE_FUNCTION with fn_id out of fn_type_annotations range → ok=0.
+
+import * from qspec
+import typecheck_walk
+import typecheck_util
+import typecheck_registry
+import qzmod_load
+import qzmod_remap
+import type_constants
+
+## Build an empty mock QzmodLoadResult whose pushable Vec fields can
+## be populated by each test. The miss-helper's `ok=0` doesn't matter
+## to the remap helper — it reads `types_*` directly.
+def _qr_mock_hit(): QzmodLoadResult
+  return qzmod_load::qzmod_load_miss("synthetic", "mock/remap_test")
+end
+
+## D3-container — an empty union/record band remap. These tests exercise
+## the ptype walk over primitive / struct / enum / fn / PTYPE args (no
+## container-nested union/record band ids), so an empty `ur` is correct:
+## `_qzmod_remap_arg` only consults it for a 2000..3999 arg, which none of
+## these synthetic TYPES rows present.
+def _qr_empty_ur(): QzmodUnionRecordRemap
+  return QzmodUnionRecordRemap {
+    union_producer_ids: vec_new<Int>(),
+    union_consumer_ids: vec_new<Int>(),
+    record_producer_ids: vec_new<Int>(),
+    record_consumer_ids: vec_new<Int>()
+  }
+end
+
+def main(): Int
+
+  describe("qzmod_remap · happy path") do ->
+
+    it("empty TYPES section → ok=1, empty remap") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qr_mock_hit()
+      var res = qzmod_remap::qzmod_build_ptype_remap(tc, hit, _qr_empty_ur())
+      assert_eq(res.ok, 1)
+      assert_eq(res.remap.size, 0)
+    end
+
+    it("single Vec<Int> entry → primitive arg passthrough") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qr_mock_hit()
+      hit.types_tag.push(type_constants::TYPE_VEC)
+      hit.types_arg1.push(type_constants::TYPE_INT)
+      hit.types_arg2.push(0)
+      var res = qzmod_remap::qzmod_build_ptype_remap(tc, hit, _qr_empty_ur())
+      assert_eq(res.ok, 1)
+      assert_eq(res.remap.size, 1)
+      var c_id = res.remap[0]
+      assert_eq(c_id >= type_constants::PTYPE_BASE, true)
+      var ci = c_id - type_constants::PTYPE_BASE
+      assert_eq(tc.ptype_bases[ci], type_constants::TYPE_VEC)
+      assert_eq(tc.ptype_arg1s[ci], type_constants::TYPE_INT)
+      assert_eq(tc.ptype_arg2s[ci], 0)
+    end
+
+    it("Result<Int, String> → both primitive args passthrough") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qr_mock_hit()
+      hit.types_tag.push(type_constants::TYPE_RESULT)
+      hit.types_arg1.push(type_constants::TYPE_INT)
+      hit.types_arg2.push(type_constants::TYPE_STRING)
+      var res = qzmod_remap::qzmod_build_ptype_remap(tc, hit, _qr_empty_ur())
+      assert_eq(res.ok, 1)
+      var ci = res.remap[0] - type_constants::PTYPE_BASE
+      assert_eq(tc.ptype_bases[ci], type_constants::TYPE_RESULT)
+      assert_eq(tc.ptype_arg1s[ci], type_constants::TYPE_INT)
+      assert_eq(tc.ptype_arg2s[ci], type_constants::TYPE_STRING)
+    end
+
+    it("Vec<Option<Int>> nested via PTYPE backreference") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qr_mock_hit()
+      # Slot 0: Option<Int>
+      hit.types_tag.push(type_constants::TYPE_OPTION)
+      hit.types_arg1.push(type_constants::TYPE_INT)
+      hit.types_arg2.push(0)
+      # Slot 1: Vec<slot-0> using producer-side PTYPE_BASE + 0
+      hit.types_tag.push(type_constants::TYPE_VEC)
+      hit.types_arg1.push(type_constants::PTYPE_BASE + 0)
+      hit.types_arg2.push(0)
+      var res = qzmod_remap::qzmod_build_ptype_remap(tc, hit, _qr_empty_ur())
+      assert_eq(res.ok, 1)
+      assert_eq(res.remap.size, 2)
+      # Slot 1's consumer ptype's arg1 must be slot 0's consumer id.
+      var s1_idx = res.remap[1] - type_constants::PTYPE_BASE
+      assert_eq(tc.ptype_arg1s[s1_idx], res.remap[0])
+      assert_eq(tc.ptype_bases[s1_idx], type_constants::TYPE_VEC)
+    end
+
+    it("duplicate TYPES entries intern to the same consumer id") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qr_mock_hit()
+      hit.types_tag.push(type_constants::TYPE_VEC)
+      hit.types_arg1.push(type_constants::TYPE_INT)
+      hit.types_arg2.push(0)
+      hit.types_tag.push(type_constants::TYPE_VEC)
+      hit.types_arg1.push(type_constants::TYPE_INT)
+      hit.types_arg2.push(0)
+      var res = qzmod_remap::qzmod_build_ptype_remap(tc, hit, _qr_empty_ur())
+      assert_eq(res.ok, 1)
+      assert_eq(res.remap[0], res.remap[1])
+    end
+
+  end
+
+  describe("qzmod_remap · ptype identity (Phase 1.4.b.1)") do ->
+
+    it("TYPE_STRUCT ptype with name → name stamped on consumer ptype") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qr_mock_hit()
+      hit.types_tag.push(type_constants::TYPE_STRUCT)
+      hit.types_arg1.push(type_constants::TYPE_INT)
+      hit.types_arg2.push(0)
+      hit.ptype_names.push("Point")
+      var res = qzmod_remap::qzmod_build_ptype_remap(tc, hit, _qr_empty_ur())
+      assert_eq(res.ok, 1)
+      assert_eq(res.remap.size, 1)
+      var consumer_id = res.remap[0]
+      assert_eq_str(typecheck::tc_ptype_name(tc, consumer_id), "Point")
+    end
+
+    it("TYPE_ENUM ptype with name → name stamped on consumer ptype") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qr_mock_hit()
+      hit.types_tag.push(type_constants::TYPE_ENUM)
+      hit.types_arg1.push(type_constants::TYPE_INT)
+      hit.types_arg2.push(0)
+      hit.ptype_names.push("Color")
+      var res = qzmod_remap::qzmod_build_ptype_remap(tc, hit, _qr_empty_ur())
+      assert_eq(res.ok, 1)
+      assert_eq_str(typecheck::tc_ptype_name(tc, res.remap[0]), "Color")
+    end
+
+    it("Vec<Point> shape → primitive elem + ptype_name 'Point' stamps") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qr_mock_hit()
+      hit.types_tag.push(type_constants::TYPE_VEC)
+      hit.types_arg1.push(type_constants::TYPE_STRUCT)
+      hit.types_arg2.push(1)
+      hit.ptype_names.push("Point")
+      var res = qzmod_remap::qzmod_build_ptype_remap(tc, hit, _qr_empty_ur())
+      assert_eq(res.ok, 1)
+      assert_eq_str(typecheck::tc_ptype_name(tc, res.remap[0]), "Point")
+    end
+
+    it("TYPE_FUNCTION → re-intern by annotation in consumer fn_type registry") do ->
+      var tc = typecheck::tc_new()
+      # Pre-register the same annotation on the consumer so we can
+      # confirm re-intern returns the existing fn_id, not a fresh one.
+      var pre_fn_id = typecheck_registry::tc_register_fn_type(tc, "Fn(Int) -> Int", 1, type_constants::TYPE_INT)
+      var hit = _qr_mock_hit()
+      hit.fn_type_annotations.push("Fn(Int) -> Int")
+      hit.types_tag.push(type_constants::TYPE_FUNCTION)
+      hit.types_arg1.push(0)  # producer fn_id 0 in the shipped registry
+      hit.types_arg2.push(0)
+      hit.ptype_names.push("")
+      var res = qzmod_remap::qzmod_build_ptype_remap(tc, hit, _qr_empty_ur())
+      assert_eq(res.ok, 1)
+      var consumer_ptype = res.remap[0]
+      # The consumer ptype's arg1 should be the existing consumer fn_id,
+      # not a fresh one — confirms re-intern lookup hit.
+      var ci = consumer_ptype - type_constants::PTYPE_BASE
+      assert_eq(tc.ptype_arg1s[ci], pre_fn_id)
+    end
+
+    it("TYPE_FUNCTION with novel annotation → registers fresh consumer fn_id") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qr_mock_hit()
+      hit.fn_type_annotations.push("Fn(String) -> Bool")
+      hit.types_tag.push(type_constants::TYPE_FUNCTION)
+      hit.types_arg1.push(0)
+      hit.types_arg2.push(0)
+      hit.ptype_names.push("")
+      var res = qzmod_remap::qzmod_build_ptype_remap(tc, hit, _qr_empty_ur())
+      assert_eq(res.ok, 1)
+      # Consumer's fn_type_annotations should now contain the annotation.
+      assert_eq(tc.registry.fn_type_annotations.size > 0, true)
+    end
+
+  end
+
+  describe("qzmod_remap · advisory misses (residual narrow scope)") do ->
+
+    it("derived-base arg (TYPE_NEWTYPE_BASE + 0) → ok=0") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qr_mock_hit()
+      hit.types_tag.push(type_constants::TYPE_VEC)
+      hit.types_arg1.push(type_constants::TYPE_NEWTYPE_BASE + 0)
+      hit.types_arg2.push(0)
+      var res = qzmod_remap::qzmod_build_ptype_remap(tc, hit, _qr_empty_ur())
+      assert_eq(res.ok, 0)
+    end
+
+    it("forward PTYPE reference (PTYPE_BASE + 5 in single-entry section) → ok=0") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qr_mock_hit()
+      hit.types_tag.push(type_constants::TYPE_VEC)
+      hit.types_arg1.push(type_constants::PTYPE_BASE + 5)
+      hit.types_arg2.push(0)
+      var res = qzmod_remap::qzmod_build_ptype_remap(tc, hit, _qr_empty_ur())
+      assert_eq(res.ok, 0)
+    end
+
+    it("TYPE_FUNCTION with fn_id out of fn_type_annotations range → ok=0") do ->
+      var tc = typecheck::tc_new()
+      var hit = _qr_mock_hit()
+      # Don't ship any fn_type_annotations, so fn_id 0 is out of range.
+      hit.types_tag.push(type_constants::TYPE_FUNCTION)
+      hit.types_arg1.push(0)
+      hit.types_arg2.push(0)
+      var res = qzmod_remap::qzmod_build_ptype_remap(tc, hit, _qr_empty_ur())
+      assert_eq(res.ok, 0)
+    end
+
+  end
+
+  return qspec_main()
+end

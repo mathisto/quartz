@@ -1,0 +1,3054 @@
+##! # be.be - Self-hosted Quartz compiler entry point
+##!
+##! Pipeline: Source -> Lexer -> Parser -> Resolver -> TypeCheck -> MIR -> LLVM IR
+##!
+##! The resolver handles import resolution, loading all imported modules
+##! and collecting their function definitions for compilation.
+##! Type checking runs after resolution to validate all modules.
+
+QUARTZ_VERSION = "5.12.21-alpha"
+
+import lexer
+import cfg
+import ast
+import cst_parser
+import cst_lower
+import macro_expand
+import derive
+import resolver
+import mir
+import mir_lower
+import intrinsic_registry
+import mir_lower_async_registry
+import mir_opt
+@cfg(feature: "egraph")
+import egraph
+@cfg(feature: "egraph")
+import egraph_opt
+import domtree
+import codegen
+import codegen_separate
+import codegen_c
+@cfg(feature: "wasm")
+import codegen_wasm
+import typecheck
+import typecheck_walk
+import typecheck_registry
+import typecheck_util
+import typecheck_diag
+import typecheck_ctx
+import std/diag
+import std/state
+import std/alloc
+import std/memory
+import liveness
+import exclusivity
+import ct_taint
+import diagnostic
+import explain
+import content_hash
+@cfg(feature: "lint")
+import lint
+import build_cache
+import std/cache
+import std/profile
+import dep_graph
+import string_intern
+import file_io
+import qzmod_remap
+import qzmod_format
+@cfg(feature: "lsp")
+import lsp
+@cfg(feature: "repl")
+import repl
+import * from str_compat
+# Phase 5.0b — persistent worker mode. TCP for connect-back IPC,
+# raw socket FFI for binary-safe send/recv, the protocol module from 5.0a
+# for length-prefixed JSON encode/decode.
+import std/net/tcp
+import std/ffi/socket
+import * from persistent_worker_protocol
+
+# Resolver tag constants (must match resolver.qz resolve_collect_funcs tags)
+## Function declaration tag.
+const RESOLVE_TAG_FUNC = 0
+## Struct definition tag.
+const RESOLVE_TAG_STRUCT_DEF = 4
+## Enum definition tag.
+const RESOLVE_TAG_ENUM_DEF = 5
+## Type alias definition tag.
+const RESOLVE_TAG_TYPE_ALIAS = 6
+## Newtype definition tag.
+const RESOLVE_TAG_NEWTYPE_DEF = 7
+## Trait definition tag.
+const RESOLVE_TAG_TRAIT_DEF = 8
+## Implementation block tag.
+const RESOLVE_TAG_IMPL_BLOCK = 9
+## External function declaration tag.
+const RESOLVE_TAG_EXTERN_FN = 10
+## External variable declaration tag.
+const RESOLVE_TAG_EXTERN_VAR = 11
+## Actor definition tag.
+const RESOLVE_TAG_ACTOR_DEF = 12
+## Binary DSL `type Name = binary { ... }` tag.
+const RESOLVE_TAG_BINARY_BLOCK = 13
+## Binary DSL `packed struct(uN) Name ... end` tag.
+const RESOLVE_TAG_PACKED_STRUCT = 14
+## Algebraic effect declaration (`effect E ... end`) tag. Added in D.7
+## so effect decls from imported stdlib modules (e.g. `std/log`) register
+## into tc.registry.effect_decls, making them visible to the rest of the
+## typecheck pipeline.
+const RESOLVE_TAG_EFFECT_DECL = 15
+
+## Code generation backend: "llvm" (default) or "c"
+var g_backend = ""
+
+## Effect inference: dump inferred effects for all functions
+var g_dump_effects = 0
+## Effect-row dump (Operation Piezoelectric Effects, B.3): print
+## per-function `can`-row info to stderr post-typecheck.
+var g_dump_effect_rows = 0
+var g_dump_effect_decls = 0
+## Output path for --emit-deps. When non-empty, compile() stops after the
+## import resolver has loaded every transitively-imported file, writes the
+## full path list to this file (one path per line, main file first), and
+## returns a sentinel empty-but-successful marker. Used by the Quake
+## launcher to build a dependency list for cache invalidation.
+var g_emit_deps_path = ""
+
+# Phase-boundary profiling lives in std/profile (Profile effect) since
+# A.6. --memory-stats / --progress flags wire to profile_set_human /
+# profile_set_ndjson at arg parse; phase markers in compile() use
+# bare prof_phase("name") calls dispatched through the effect.
+
+# Main compilation pipeline
+## Main compilation pipeline.
+##
+## Orchestrates all compiler phases:
+## 1. Lexing
+## 2. Parsing
+## 3. Import Resolution
+## 4. Type Checking
+## 5. MIR Lowering
+## 6. MIR Optimization (optional)
+## 7. Code Generation (LLVM IR)
+##
+## @param source Source code string
+## @param filename Source filename for error reporting
+## @param import_paths List of include paths
+## @param debug_mode Enable debug info generation (1 or 0)
+## @param target Target triple string (e.g. "x86_64-apple-macosx")
+## @param no_opt Disable optimizations (1 or 0)
+## @param overflow_check Enable integer overflow checks (1 or 0)
+## Phase 1.4.c.2.b membership probe — returns 1 if `store` appears in
+## the qzmod-hit ast_store set, 0 otherwise. Linear scan is fine: hits
+## are bounded by the import graph depth (≤30 modules in practice).
+def _qzh_in_set(store: Int, hit_stores: Vec<Int>): Int
+  for i in 0..hit_stores.size
+    if hit_stores[i] == store
+      return 1
+    end
+  end
+  return 0
+end
+
+## Phase 1.4.c.3 — membership probe for the injected func-name set
+## (linear scan; one set entry per shipped func across all hits).
+## Used by Phase 4.1 to skip the AST-path's
+## `tc_register_function_signature_named` call for funcs that the
+## inject body already registered. Generic methods (entry.name contains
+## `<`) aren't shipped by the producer — they fall through to the
+## AST-path here because their post-strip registry name doesn't match
+## entry.name.
+def _qzh_name_in(name: String, names: Vec<String>): Int
+  for i in 0..names.size
+    if str_eq(names[i], name)
+      return 1
+    end
+  end
+  return 0
+end
+
+## @returns Compiled LLVM IR string, or empty string on error
+def compile(source: String, filename: String, import_paths: Vec<String>, debug_mode: Int, target: String, no_opt: Int, overflow_check: Int, separate: Int, stack_alloc: Int, race_mode: Int, exclusivity_check: Int): String
+  # Initialize intrinsic registry before any compilation
+  intrinsic_registry::init_intrinsic_registry()
+  # Reset the cross-phase error counter so a prior compile() call can't
+  # contaminate this one (matters for tests / LSP / any driver that calls
+  # compile more than once in-process).
+  diagnostic::diag_reset_error_count()
+  # Reset macro-expansion-provenance store for the same reason. Populated
+  # by macro_expand when a node is synthesized inside a macro body
+  # (Tier 2 #8b-followup Phase 1 plumbing — readers land in P2).
+  ast::ast_expansion_reset()
+  # Reset macro-hygiene scope-set intern table and fresh-scope counter.
+  # Populated by the expander in P3.b; consumed by the resolver in P3.c.
+  # Must be called before parse/expand so each invocation gets a clean
+  # counter — the scope ids are compared by integer identity across the
+  # AST, and stale ids from a previous run would alias mid-expansion.
+  ast::ast_scope_reset()
+  # Cache the active-compile flags hash so the resolver's `.qzmod` probe
+  # can reject cache entries produced under a different target / debug /
+  # noopt / overflow set. Mirror of the whole-program quick-check sentinel
+  # at line ~219 — same disciple, one layer down. Without this set, a
+  # native compile's per-module cache survives a follow-on cross-compile
+  # and silently routes to the wrong `@cfg` overload (e.g. POSIX
+  # `socket_init_once` body served on a Windows target).
+  qzmod_format::qzmod_active_flags_set(target, debug_mode, no_opt, overflow_check, exclusivity_check)
+  # Isolate the qzmod MIR/type cache per --cache-dir, matching build_cache.
+  # Without this, qzmod_cache_root hardcoded `.quartz-cache` and ignored
+  # --cache-dir, so a spec compiled with `--cache-dir X` still read qzmod from
+  # `.quartz-cache` — contaminated by the last `quake build` — silently dropping
+  # wildcard-imported modules (terminal/socket). cache_get_dir() is "" under
+  # --no-cache (qzmod unused there), else the active --cache-dir.
+  qzmod_format::qzmod_active_cache_dir_set(build_cache::cache_get_dir())
+  # --- Tier 0: Pre-resolution quick-check ---
+  # If all source files are unchanged since last build, return cached IR immediately.
+  # This skips the entire pipeline: no lexing, parsing, resolution, typecheck, MIR, codegen.
+  #
+  # The cache is keyed by:
+  #   line 0: __config__|<target>|<debug>|<noopt>|<overflow>|<exclusivity>|<version>
+  #   line 1: <filename>|<main_hash>
+  #   line N: <dep_file>|<dep_hash>
+  # If the config sentinel doesn't match the current invocation, we
+  # invalidate the quick-check and fall through. This was a silent
+  # cross-compile bug: pre-fix, running with `--target=...` after a native
+  # build (or vice versa) returned the stale native IR because the
+  # quick-check only verified source hashes. Surfaced 2026-05-22 when the
+  # Phase 4 diagnostics demo cross-compiled to the wrong target.
+  if build_cache::cache_is_enabled()
+    var qc_path = "#{build_cache::cache_get_dir()}/module_paths.txt"
+    var qc_data = ""
+    if fio_exists(qc_path)
+      qc_data = fio_read(qc_path)
+    end
+    if str_byte_len(qc_data) > 0
+      var qc_lines = str_split(qc_data, "\n")
+      var debug_str = "0"
+      if debug_mode == 1
+        debug_str = "1"
+      end
+      var noopt_str = "0"
+      if no_opt == 1
+        noopt_str = "1"
+      end
+      var overflow_str = "0"
+      if overflow_check == 1
+        overflow_str = "1"
+      end
+      var excl_str = "0"
+      if exclusivity_check == 1
+        excl_str = "1"
+      end
+      var expected_config = "__config__|#{target}|#{debug_str}|#{noopt_str}|#{overflow_str}|#{excl_str}|#{QUARTZ_VERSION}"
+      var all_match = 1
+      # Sentinel line 0 must match the compile config. Mismatch = different
+      # target / debug / noopt / overflow / compiler version → cache MISS.
+      if qc_lines.size == 0
+        all_match = 0
+      else
+        if qc_lines[0] != expected_config
+          all_match = 0
+        end
+      end
+      if all_match == 1
+        # Skip line 0 (the config sentinel); the remainder is file|hash pairs.
+        for qc_idx in 1..qc_lines.size
+          var qc_line = qc_lines[qc_idx]
+          if str_byte_len(qc_line) > 0
+            var qc_sep = __char_index(qc_line, '|')
+            if qc_sep > 0
+              var qc_file = str_byte_slice(qc_line, 0, qc_sep)
+              var qc_hash = str_byte_slice(qc_line, qc_sep + 1, str_byte_len(qc_line))
+              var cur_hash = content_hash::content_hash_file(qc_file)
+              if cur_hash != qc_hash
+                all_match = 0
+                break
+              end
+            end
+          end
+        end
+      end
+      if all_match == 1
+        # Also verify the main source file hash (line 1, just after the config sentinel)
+        var main_hash = content_hash::content_hash(source)
+        var main_entry = "#{filename}|#{main_hash}"
+        if qc_lines.size > 1
+          var main_line = qc_lines[1]
+          if main_line != main_entry
+            all_match = 0
+          end
+        end
+      end
+      if all_match == 1
+        var wp_path = "#{build_cache::cache_get_dir()}/whole_program.ll"
+        var wp_hit = ""
+        if fio_exists(wp_path)
+          wp_hit = fio_read(wp_path)
+        end
+        if str_byte_len(wp_hit) > 0
+          return wp_hit
+        end
+      end
+    end
+  end
+
+  # Phase 1: Lexical analysis
+  prof_phase("init")
+  var interner = string_intern::intern_global()
+  var lex_result = lexer::lexer_tokenize(source, interner)
+  prof_phase("lex")
+
+  # Phase 2: Parsing
+  var types = lex_result.get_types()
+  var lexemes = lex_result.get_lexemes()
+  var lines = lex_result.get_lines()
+  var cols = lex_result.get_cols()
+  var count = lex_result.token_count()
+
+  # CST parse route (unconditional). The AST is produced via cst_parser ->
+  # cst_lower.
+  var ast_storage = ast::ast_new_storage()
+  var root = 0
+  var res = cst_parser::cst_parse_source(source)
+  if res.parser.had_error == 1
+    var cst_src_lines = diagnostic::diag_split_source(source)
+    # Multi-error recovery: the CST parser recovers after each syntax error and
+    # records EVERY one (err_msgs/err_lines), reporting all errors in one pass
+    # rather than bailing on the first. Emit each collected diagnostic; an empty
+    # recorded message means the generic text.
+    var cst_msgs = res.parser.err_msgs
+    var cst_lines = res.parser.err_lines
+    var ei = 0
+    while ei < cst_msgs.size
+      var cst_msg = "CST parse error"
+      if str_byte_len(cst_msgs[ei]) > 0
+        cst_msg = cst_msgs[ei]
+      end
+      var cst_d = diagnostic::diag_new(diagnostic::DIAG_ERROR, "QZ0101", cst_msg, filename, cst_lines[ei], 1)
+      diagnostic::diag_set_source(cst_d, cst_src_lines)
+      diagnostic::diag_emit(cst_d)
+      ei = ei + 1
+    end
+    return ""
+  end
+  # Thread the cross-compile target so `@cfg(os:/arch:/...)` decls evaluate
+  # against `--target`, not the host. Without this a `@cfg(os:"windows")` extern
+  # was wrongly dropped under a windows target.
+  cst_lower::cl_set_cfg_target(target)
+  root = cst_lower::cst_lower(res.parser.store, res.root, ast_storage)
+  prof_phase("parse")
+
+  # Set diagnostic context for derive and macro expansion phases
+  var macro_src_lines = diagnostic::diag_split_source(source)
+  derive::derive_set_diag_context(filename, macro_src_lines)
+  macro_expand::macro_set_diag_context(filename, macro_src_lines)
+
+  # Phase 2.4: Expand @derive annotations into impl blocks
+  derive::expand_derive_annotations(ast_storage, root)
+
+  # Phase 2.5: Macro expansion
+  root = macro_expand::expand_macros(ast_storage, root)
+
+  # Macro expansion emits diagnostics directly (no phase-local error flag).
+  # Without this check, an unknown `$macro` fired QZ0503 to stderr but the
+  # compiler then lowered the `0` placeholder, typechecked, and produced a
+  # silently-wrong binary. Bail now so downstream phases can't mask the error.
+  if diagnostic::diag_error_count() > 0
+    return ""
+  end
+
+  # --- Tier 1 preparation: Load previous dep graph before resolution overwrites it ---
+  var old_dg_names = vec_new<String>()
+  var old_dg_content_hashes = vec_new<String>()
+  var old_dg_iface_hashes = vec_new<String>()
+  var have_prev_graph = 0
+  if build_cache::cache_is_enabled()
+    var dg_cache_path = "#{build_cache::cache_get_dir()}/dep_graph.txt"
+    var dg_exists = fio_exists(dg_cache_path)
+    if dg_exists
+      var dg_loaded = dep_graph::depgraph_load(dg_cache_path)
+      if dg_loaded == 1
+        old_dg_names = dep_graph::depgraph_get_all_names()
+        old_dg_content_hashes = dep_graph::depgraph_get_all_content_hashes()
+        old_dg_iface_hashes = dep_graph::depgraph_get_all_interface_hashes()
+        have_prev_graph = 1
+      end
+    end
+  end
+
+  # Phase 3: Import resolution (populates dep graph with current data)
+  resolver::resolve_reset_loaded_paths()
+  var all_funcs = resolver::resolve_imports(ast_storage, root, filename, import_paths)
+  prof_phase("resolve")
+
+  # --emit-deps: resolution is complete, so resolve_get_loaded_paths() now
+  # holds every transitively-imported source file. Write them out (main file
+  # first, imports after), return a non-empty sentinel, and let do_build
+  # skip straight to the exit. Cheap: only lex+parse+resolve ran, no TC/MIR/CG.
+  if str_byte_len(g_emit_deps_path) > 0
+    var deps_sb = sb_new()
+    deps_sb.append(filename)
+    deps_sb.append("\n")
+    var loaded_paths = resolver::resolve_get_loaded_paths()
+    var dp_i = 0
+    while dp_i < loaded_paths.size
+      var lp = loaded_paths[dp_i]
+      if str_byte_len(lp) > 0 and lp != filename
+        deps_sb.append(lp)
+        deps_sb.append("\n")
+      end
+      dp_i += 1
+    end
+    var deps_content = deps_sb.to_string()
+    var deps_out = g_emit_deps_path
+    var _wr = fio_write(deps_out, deps_content)
+    return "__emit_deps_ok__"
+  end
+
+  # Set __main__ content hash in dep graph immediately after resolution.
+  # The resolver sets content hashes for imported modules but not for __main__
+  # (the entry module). Without this, depgraph_get_content_hash("__main__")
+  # returns "" and __main__ is always marked as changed.
+  dep_graph::depgraph_set_content_hash("__main__", content_hash::content_hash(source))
+
+  # --- Tier 1: Identify changed modules ---
+  var is_incremental = 0
+  var changed_modules = vec_new<String>()
+  var recompile_set = vec_new<String>()
+  if have_prev_graph == 1
+    var cur_names = dep_graph::depgraph_get_all_names()
+    for ni in 0..cur_names.size
+      var mod_name = cur_names[ni]
+      var cur_hash = dep_graph::depgraph_get_content_hash(mod_name)
+      # Find this module's old hash
+      var old_hash = ""
+      var oi = 0
+      while oi < old_dg_names.size
+        if old_dg_names[oi].eq(mod_name)
+          old_hash = old_dg_content_hashes[oi]
+          break
+        end
+        oi += 1
+      end
+      if str_byte_len(old_hash) == 0
+        # New module not in previous graph — mark as changed
+        changed_modules.push(mod_name)
+      elsif cur_hash != old_hash
+        # Content hash mismatch — source changed
+        changed_modules.push(mod_name)
+      end
+    end
+    # Also check if main source changed
+    var main_hash = content_hash::content_hash(source)
+    var old_main_hash = ""
+    for omi in 0..old_dg_names.size
+      if old_dg_names[omi].eq("__main__")
+        old_main_hash = old_dg_content_hashes[omi]
+        break
+      end
+    end
+    if str_byte_len(old_main_hash) > 0
+      if main_hash != old_main_hash
+        # Check if __main__ is already in changed_modules
+        var main_found = 0
+        for mfi in 0..changed_modules.size
+          if changed_modules[mfi].eq("__main__")
+            main_found = 1
+            break
+          end
+        end
+        if main_found == 0
+          changed_modules.push("__main__")
+        end
+      end
+    end
+    if changed_modules.size > 0
+      # Safety check: incremental compilation is only valid when compiling the
+      # SAME program as the cached dep graph. If the module set differs (different
+      # entry file, different imports), the cached fragments reference wrong string
+      # pool indices and metadata. Detect this by checking:
+      # 1. Old modules not in current set (removed modules)
+      # 2. Current module count != old module count (structural change)
+      var same_program = 1
+      if cur_names.size != old_dg_names.size
+        same_program = 0
+      else
+        # Check all old modules exist in current set
+        for ov_i in 0..old_dg_names.size
+          var old_mod = old_dg_names[ov_i]
+          var found_in_cur = 0
+          var cv_i = 0
+          while cv_i < cur_names.size
+            if cur_names[cv_i].eq(old_mod)
+              found_in_cur = 1
+              break
+            end
+            cv_i += 1
+          end
+          if found_in_cur == 0
+            same_program = 0
+            break
+          end
+        end
+      end
+      if same_program == 1
+        is_incremental = 1
+      end
+    end
+  end
+
+  # Phase 3.5: Build cache check (after resolution, before expensive phases)
+  # At this point resolve_loaded_paths contains all dependency source paths.
+  # We compute a deterministic cache key from ALL inputs and check the cache.
+  if build_cache::cache_is_enabled()
+    var loaded_paths = resolver::resolve_get_loaded_paths()
+    var dep_hashes = vec_new<String>()
+    dep_hashes.push(content_hash::content_hash(source))
+    # Hash compiler configuration
+    dep_hashes.push(target)
+    if debug_mode == 1
+      dep_hashes.push("debug=1")
+    else
+      dep_hashes.push("debug=0")
+    end
+    if no_opt == 1
+      dep_hashes.push("noopt=1")
+    else
+      dep_hashes.push("noopt=0")
+    end
+    if overflow_check == 1
+      dep_hashes.push("overflow=1")
+    else
+      dep_hashes.push("overflow=0")
+    end
+    if exclusivity_check == 1
+      dep_hashes.push("exclusivity=1")
+    else
+      dep_hashes.push("exclusivity=0")
+    end
+    dep_hashes.push(QUARTZ_VERSION)
+    # Hash all dependency source files
+    for lp_idx in 0..loaded_paths.size
+      dep_hashes.push(content_hash::content_hash_file(loaded_paths[lp_idx]))
+    end
+    var cache_key = content_hash::content_hash_combine(dep_hashes)
+
+    # Cache lookup — A.3 Pass 2 (2026-05-01): routes through the Cache
+    # effect rather than calling build_cache directly. Default handler
+    # (`@cache$cache_default_handler` in std/cache.qz) forwards to
+    # build_cache::cache_lookup, so behavior is unchanged for the
+    # self-compile path. Test handlers can install a mock via
+    # `with Cache { cache_op_lookup: my_mock } do compile(...) end`.
+    var cached_ir = cache_op_lookup(filename, cache_key)
+    if str_byte_len(cached_ir) > 0
+      return cached_ir
+    end
+  end
+
+  # Phase 4: Type checking
+  var tc = typecheck::tc_new()
+  tc.current_file = filename
+  # Phase 5.1: Install the active TypecheckState for the Diag effect bridge.
+  # All migrated leaf validators emit via `error(...)` / `warn(...)`; the
+  # bridge handler reads this slot to forward into tc.errs.
+  typecheck_diag::tc_diag_set(tc)
+  # Phase 5.2: Install the active TypecheckState for the typecheck_ctx
+  # bridge. Leaf helpers (tc_enter_scope, tc_handler_effect_*, tc_tv_*_
+  # level) fetch tc via `tc_ctx_get()` and mutate it directly. PF3-P2
+  # (value-types-finish) de-erased the former `with State(as_int(...))`
+  # dogfood wrap at those sites — see the note at the `with Diag` opener.
+  # Slot lifetime mirrors tc_diag_set above.
+  typecheck_ctx::tc_ctx_set(tc)
+  var func_count = all_funcs.size
+
+  # PF3-P2 (value-types-finish): the former `with State` widen (P5.2.f
+  # Step 1) is gone — see the de-erasure note at the `with Diag` opener
+  # below. The `with Diag` install still spans the entire typecheck pass.
+  #
+  # Vars declared inside the with-block lambda are lambda-local, so
+  # anything consumed after the block must be declared here first and
+  # assigned inside.
+  var generic_func_handles = vec_new()
+  # INC.1.3 — the qzmod hit set (collected during resolution) and the
+  # ast_store membership view (built from successful injects) both have
+  # to outlive the with-blocks so `mir_lower_all_incremental` below can
+  # consume them. Same hoisting pattern as `generic_func_handles`.
+  var qzmod_hits = resolver::resolve_get_qzmod_hits()
+  var hit_ast_stores = vec_new<Int>()
+  # INC.2.0 — subset of `hit_ast_stores` whose hit actually shipped MIR
+  # bodies (`mir_bodies_off.size > 0`). The body-TC skip below keys on
+  # THIS set, not `hit_ast_stores`. Rationale: body-TC is what writes the
+  # `ast_is_op_call` marks that mir_lower reads to route effect-op calls
+  # (`throw`, `suspend`, …) through MIR_PERFORM_OP. Skipping body-TC is
+  # only safe when the body's MIR comes from cache instead of being
+  # fresh-lowered. A successful inject of a *type-only* `.qzmod` (structs/
+  # enums but no `mir_bodies.bin` — produced when the same source file is
+  # loaded under two import-path spellings, e.g. `terminal` vs
+  # `std/terminal`, so its MIR is filed under the other identity) lands in
+  # `hit_ast_stores` (correct — its struct/enum AST-path registration must
+  # still tag-skip) but ships no MIR. For those, body-TC MUST run so the
+  # fresh mir_lower of the async `$poll` sees the op-call marks; otherwise
+  # `throw` lowers to `%v = load i64, ptr %throw` (an undefined SSA value)
+  # and `llc` rejects the whole IR file.
+  var hit_mir_ast_stores = vec_new<Int>()
+  # INC.1.8 — track qzmod hits whose inject returned 0 (advisory miss).
+  # The encoder doesn't currently ship newtype / alias / union / record /
+  # forall / protocol-based type IDs (see qzmod_remap.qz:36-40), so any
+  # module whose function signatures reference these types has all its
+  # decls skipped. mir_lower's PASS 0.999 then doesn't load its cached
+  # MIR, and PASS 1 fresh-lowers the body. If Tier 2 cache also skipped
+  # body-TC for that module (because it wasn't in recompile_set), the
+  # fresh-lowered body has no ast_is_op_call marks — effect-op calls
+  # like `error("...", 0, 0)` mis-resolve via suffix-search to wrong
+  # functions (e.g. `style$Style$error` 0-arg) and codegen emits
+  # arity-mismatched MIR_CALL. Force these modules into recompile_set so
+  # body-TC runs and AST gets marked correctly.
+  var failed_inject_modules = vec_new<String>()
+  # INC.1.9 — accumulating producer→consumer newtype remap, indexed by
+  # `producer_id - TYPE_NEWTYPE_BASE`. Each successful tc_inject_qzmod
+  # extends it via Step 5 so later hits (which import the earlier
+  # module) can resolve cross-module newtype references in their
+  # func_sig_blob / struct_fields_blob / enum_variants_blob /
+  # effect_ops_blob. Without this, inject silently fails for the ~17
+  # self-hosted modules whose signatures use AstNodeId / TypeId /
+  # MirReg / MirLabel / InternId, forcing them into recompile_set and
+  # keeping warm-mod wall stuck at ~36s.
+  var qzmod_newtype_remap = vec_new<Int>()
+
+  # PF3-P2 (value-types-finish): removed the outer `with State(as_int(tc))`
+  # wrap that formerly spanned the entire typecheck pass (P5.2.f Step 1).
+  # It installed an evidence slot that NO code consumed — nothing here
+  # performs a bare State `get()`/`set()`, and no callee declares `can
+  # State` (the cascade was abandoned for the typecheck_ctx bridge). The
+  # leaf helpers that DID read State opened their own inner `with State`
+  # (now also de-erased). `as_int(tc)` is a no-op i64 reinterpret that,
+  # under value-layout structs, drops the struct's refcount → UAF. tc is
+  # ambient via typecheck_ctx::tc_ctx_set(tc) above.
+  #
+  # Diag install covers the entire typecheck pass. tc_register_struct_def
+  # + tc_register_
+  # impl_block both declare `can Diag` and perform Diag.error on bad input
+  # (e.g. unknown type in a struct field). Without this wrap, Phase 4.0a
+  # registration of imported types runs outside any Diag handler, so the
+  # perform falls through to __qz_effect_unhandled and the compiler exits
+  # 66 with "unhandled effect op called" instead of reporting QZ0200.
+  # Repro: `struct Bad { x: Nonexistent }` — fixed unknown_type_annotation_spec.
+  with Diag {
+    error: typecheck_diag::tc_diag_error_handler,
+    warn: typecheck_diag::tc_diag_warn_handler
+  } do ->
+
+  # Phase 4.0 (pre): consume .qzmod cache hits collected during resolution.
+  # Phase 1.4.c.2.b — activate the qzmod_remap inject body. Each
+  # successful inject (return value 1) populates this module's
+  # struct/enum/alias/newtype/effect decls into `tc.registry` directly
+  # from the .qzmod artifact; we collect those modules' ast_stores so
+  # Phase 4.0a/4.0d below can tag-skip the corresponding AST-path
+  # registration. ast_set_str1 still runs unconditionally — MIR's
+  # mir_collect_structs reads AST str1 to populate the per-module
+  # struct registry codegen uses for `%struct.<name>` emission.
+  # qzmod_hits + hit_ast_stores are hoisted above the with-blocks
+  # (see comment) so they survive to MIR lowering.
+  # Phase 1.4.c.3 — collect the union of injected func names across all
+  # successful hits, so Phase 4.1 can tag-skip RESOLVE_TAG_FUNC entries
+  # that the inject body already registered. Generic methods aren't in
+  # this set (producer skips them — their post-strip registry name
+  # doesn't match entry.name); they still flow through the AST-path.
+  var injected_func_names = vec_new<String>()
+  # Phase 1.4.d — also collect trait names so Phase 4.0b can tag-skip
+  # RESOLVE_TAG_TRAIT_DEF entries the inject body's Step 8 already
+  # registered. Impl tag-skip uses the ast_store gate alone (an impl's
+  # entry.name is the for_type which isn't unique across impls of the
+  # same type — ast_store membership is the right granularity).
+  var injected_trait_names = vec_new<String>()
+  for qzh_i in 0..qzmod_hits.size
+    var hit = qzmod_hits[qzh_i]
+    var inject_ok = qzmod_remap::tc_inject_qzmod(tc, hit, qzmod_newtype_remap)
+    if inject_ok == 1
+      var hit_store = dep_graph::depgraph_get_ast_store(hit.module_name)
+      if hit_store != 0
+        hit_ast_stores.push(hit_store)
+        # INC.2.0 — only authorize the body-TC skip when this hit shipped
+        # MIR. A no-MIR hit still tag-skips struct/trait/impl registration
+        # (it's in `hit_ast_stores`) but its bodies are fresh-lowered, so
+        # body-TC must run to mark effect-op calls.
+        if hit.mir_bodies_off.size > 0
+          hit_mir_ast_stores.push(hit_store)
+        end
+      end
+      for fn_i in 0..hit.func_names.size
+        injected_func_names.push(hit.func_names[fn_i])
+      end
+      for tn_i in 0..hit.trait_names.size
+        injected_trait_names.push(hit.trait_names[tn_i])
+      end
+    else
+      # INC.1.8 — collect for the safety-net force-recompile below. Only
+      # modules with non-zero MIR body counts matter (encoder shipped at
+      # least one func), since the failure mode is fresh-lower-without-
+      # marked-AST. Empty-body hits (e.g. const-only modules) are harmless.
+      if hit.mir_bodies_off.size > 0
+        failed_inject_modules.push(hit.module_name)
+      end
+    end
+  end
+
+  # Phase 4.0: Register imported type definitions (before tc_program)
+  # This ensures that types from imported modules are known when the main file
+  # and imported function bodies are type-checked.
+  # Order matches tc_program: structs/enums/aliases/newtypes → traits → impl blocks
+
+  # Phase 4.0a: Register structs, enums, type aliases, newtypes from imports
+  # Set the AST node's str1 to the module-prefixed name before registering,
+  # matching the C bootstrap behavior (resolver.c:647).
+  #
+  # Phase 1.4.c.2.b tag-skip: entries whose ast_store landed in
+  # `hit_ast_stores` (above) were already registered by the qzmod
+  # inject body. ast_set_str1 still runs unconditionally — MIR's
+  # mir_collect_structs reads AST str1 for `%struct.<name>` codegen,
+  # which would otherwise diverge between cold (`%struct.mod$Name`)
+  # and warm (`%struct.Name`) paths. BINARY_BLOCK / PACKED_STRUCT
+  # are NOT tag-skipped because the inject body doesn't handle them
+  # (Phase 1.4.d).
+  for i in 0..func_count
+    var entry = all_funcs[i]
+    var tag = entry.tag
+    var qz_hit = _qzh_in_set(entry.ast_store, hit_ast_stores)
+    if tag == RESOLVE_TAG_STRUCT_DEF
+      ast::ast_set_str1(entry.ast_store, entry.node_id, entry.name)
+      if qz_hit == 0
+        typecheck::tc_register_struct_def(tc, entry.ast_store, entry.node_id)
+      end
+    elsif tag == RESOLVE_TAG_ENUM_DEF
+      ast::ast_set_str1(entry.ast_store, entry.node_id, entry.name)
+      if qz_hit == 0
+        typecheck::tc_register_enum_def(tc, entry.ast_store, entry.node_id)
+      end
+    elsif tag == RESOLVE_TAG_TYPE_ALIAS
+      ast::ast_set_str1(entry.ast_store, entry.node_id, entry.name)
+      if qz_hit == 0
+        typecheck::tc_register_type_alias_def(tc, entry.ast_store, entry.node_id)
+      end
+    elsif tag == RESOLVE_TAG_NEWTYPE_DEF
+      ast::ast_set_str1(entry.ast_store, entry.node_id, entry.name)
+      if qz_hit == 0
+        typecheck::tc_register_newtype_def(tc, entry.ast_store, entry.node_id)
+      end
+    elsif tag == RESOLVE_TAG_BINARY_BLOCK
+      ast::ast_set_str1(entry.ast_store, entry.node_id, entry.name)
+      typecheck::tc_register_binary_block_def(tc, entry.ast_store, entry.node_id)
+    elsif tag == RESOLVE_TAG_PACKED_STRUCT
+      ast::ast_set_str1(entry.ast_store, entry.node_id, entry.name)
+      typecheck::tc_register_packed_struct_def(tc, entry.ast_store, entry.node_id)
+    end
+  end
+
+  # Phase 4.0b: Register traits from imports (after types, before impl blocks)
+  #
+  # Phase 1.4.d tag-skip: when a trait's ast_store is in `hit_ast_stores`
+  # AND its prefixed name matches an injected name, skip the AST-path
+  # registration. The inject body's Step 8 already pushed name +
+  # method_names + method_sigs + defaults + super_traits + type_params
+  # into `tc.registry`. ast_set_str1 still runs unconditionally so any
+  # downstream MIR/codegen that reads the AST str1 sees the prefixed
+  # name (mirrors Phase 4.0a's ast_set_str1 + tag-skip discipline).
+  for i in 0..func_count
+    var entry = all_funcs[i]
+    if entry.tag == RESOLVE_TAG_TRAIT_DEF
+      ast::ast_set_str1(entry.ast_store, entry.node_id, entry.name)
+      var qz_trait_hit = 0
+      if hit_ast_stores.size > 0
+        if _qzh_in_set(entry.ast_store, hit_ast_stores) == 1
+          if _qzh_name_in(entry.name, injected_trait_names) == 1
+            qz_trait_hit = 1
+          end
+        end
+      end
+      if qz_trait_hit == 0
+        typecheck::tc_register_trait_def(tc, entry.ast_store, entry.node_id)
+      end
+    end
+  end
+
+  # Phase 4.0c: Register impl blocks from imports (after traits)
+  #
+  # Phase 1.4.d tag-skip: when an impl's ast_store is in `hit_ast_stores`
+  # the inject body's Step 9 already called `tc_register_impl` with the
+  # producer's (trait_name, for_type) pair. `tc_register_impl` itself
+  # is idempotent (g_impl_trait_name_ids dedup), but skipping the
+  # AST-path avoids the unnecessary AST walk + re-typecheck. The
+  # mangled `<for_type>$<method>` functions ride through Phase 4.1 as
+  # ordinary RESOLVE_TAG_FUNC entries — already tag-skipped there.
+  for i in 0..func_count
+    var entry = all_funcs[i]
+    if entry.tag == RESOLVE_TAG_IMPL_BLOCK
+      var qz_impl_hit = 0
+      if hit_ast_stores.size > 0
+        if _qzh_in_set(entry.ast_store, hit_ast_stores) == 1
+          qz_impl_hit = 1
+        end
+      end
+      if qz_impl_hit == 0
+        typecheck::tc_register_impl_block(tc, entry.ast_store, entry.node_id)
+      end
+    end
+  end
+
+  # Phase 4.0d: Register effect declarations from imports (D.7).
+  # Runs BEFORE tc_program's Phase 1.4 so effects declared in stdlib
+  # modules (e.g. `std/log`'s `Log`) are visible when the main module's
+  # typecheck resolves `with Log { emit: my_fn } do ... end` blocks.
+  # Local effect decls register later via Phase 1.4 of tc_program —
+  # this loop deliberately skips entries whose ast_store IS the root
+  # ast_storage so root's own effects don't double-register and thus
+  # preserve Phase 1.4's legitimate QZ0612 check for same-file
+  # duplicates. Cross-module same-name clashes still surface as QZ0612
+  # at Phase 1.4 when root tries to declare a name that's already
+  # been registered here from an import.
+  for i in 0..func_count
+    var entry = all_funcs[i]
+    if entry.tag == RESOLVE_TAG_EFFECT_DECL
+      if entry.ast_store != ast_storage
+        var qz_hit = _qzh_in_set(entry.ast_store, hit_ast_stores)
+        if qz_hit == 0
+          typecheck_walk::tc_register_effect_decl_node(tc, entry.ast_store, entry.node_id)
+        end
+      end
+    end
+  end
+
+  # Phase 4.0d: Register imported const declarations (skip main module — handled by tc_program)
+  for i in 0..func_count
+    var entry = all_funcs[i]
+    if entry.tag == 2
+      if entry.ast_store != ast_storage
+        ast::ast_set_str1(entry.ast_store, entry.node_id, entry.name)
+        typecheck_walk::tc_stmt(tc, entry.ast_store, entry.node_id)
+      end
+    end
+  end
+
+  # Phase 4.0e: Register imported global variables (skip main module — handled by tc_program)
+  for i in 0..func_count
+    var entry = all_funcs[i]
+    if entry.tag == 1
+      if entry.ast_store != ast_storage
+        ast::ast_set_str1(entry.ast_store, entry.node_id, entry.name)
+        typecheck_walk::tc_stmt(tc, entry.ast_store, entry.node_id)
+      end
+    end
+  end
+
+  # Phase 4.0f: Synthesize Binary DSL method signatures (encode / decode)
+  # AFTER all types / traits / impl blocks / imported enums are registered,
+  # so that `Bytes` and `ParseError` resolve when the user has imported
+  # `std/bytes` and `std/binary`. Without this late phase the lookups
+  # would fall back to Int and break pattern-match on Result<T, ParseError>.
+  for i in 0..func_count
+    var entry = all_funcs[i]
+    if entry.tag == RESOLVE_TAG_BINARY_BLOCK
+      typecheck::tc_synth_binary_block_methods(tc, entry.ast_store, entry.node_id)
+    elsif entry.tag == RESOLVE_TAG_PACKED_STRUCT
+      typecheck::tc_synth_packed_struct_methods(tc, entry.ast_store, entry.node_id)
+    end
+  end
+
+   # Phase 4.1: Register function signatures
+  # (generic_func_handles pre-declared above the State install)
+  #
+  # Phase 1.4.c.3 tag-skip: when a func's ast_store is in hit_ast_stores
+  # AND its prefixed_name matches an injected name (from this module's
+  # .qzmod hit), skip the AST-path registration — the inject body in
+  # Phase 4.0 (pre) already pushed the sig + effect row into
+  # `tc.registry`. Generic methods aren't shipped by the producer (their
+  # post-strip registry name doesn't match entry.name); they still flow
+  # through here. EXTERN_FN entries aren't shipped via qzmod either —
+  # they always flow through the AST-path.
+  for i in 0..func_count
+    var entry = all_funcs[i]
+    var mod_ast_storage = entry.ast_store
+    var func_handle = entry.node_id
+    var prefixed_name = entry.name
+    var tag = entry.tag
+    if tag == RESOLVE_TAG_FUNC
+      var qz_fn_hit = 0
+      if hit_ast_stores.size > 0
+        if _qzh_in_set(mod_ast_storage, hit_ast_stores) == 1
+          if _qzh_name_in(prefixed_name, injected_func_names) == 1
+            qz_fn_hit = 1
+          end
+        end
+      end
+      if qz_fn_hit == 0
+        # Use prefixed_name so cross-module calls like mod_a$helper() can be resolved
+        typecheck::tc_register_function_signature_named(tc, mod_ast_storage, func_handle, prefixed_name)
+        # Sync entry name with cleaned function name for generic extend methods.
+        # The type checker strips <T> from names like GBox<T>$get → GBox$get
+        # to produce valid LLVM identifiers. Only sync when < is present (generic).
+        if str_contains(prefixed_name, "<")
+          generic_func_handles.push(func_handle)
+          entry.name = ast::ast_get_str1(mod_ast_storage, func_handle)
+        end
+      end
+    end
+    if tag == RESOLVE_TAG_EXTERN_FN
+      # Extern fns store params in children (not left), use dedicated registration
+      # Pass prefixed_name so cross-module calls like ffi_mod$abs() can be resolved
+      typecheck::tc_register_extern_fn_signature_named(tc, mod_ast_storage, func_handle, prefixed_name)
+    end
+  end
+  # Phase 4.1b: Validate actor state field types are Send
+  # Actor fields are accessed from a different thread — non-Send types (CPtr, raw pointers)
+  # would be unsafe. Uses tc_type_is_send (already used for spawn safety).
+  for i in 0..func_count
+    var entry = all_funcs[i]
+    if entry.tag == RESOLVE_TAG_ACTOR_DEF
+      var actor_ast = entry.ast_store
+      var actor_node = entry.node_id
+      var actor_name = entry.name
+      var actor_children = ast::ast_get_children(actor_ast, actor_node)
+      var ac_count = actor_children.size
+      for ac_i in 0..ac_count
+        var ac_child = actor_children[ac_i]
+        var ac_kind = ast::ast_get_kind(actor_ast, ac_child)
+        if ac_kind == 37
+          var field_name = ast::ast_get_str1(actor_ast, ac_child)
+          var field_type_ann = ast::ast_get_str2(actor_ast, ac_child)
+          var field_type = typecheck::tc_parse_type(tc, field_type_ann)
+          if typecheck_registry::tc_type_is_send(tc, field_type, field_type_ann) == 0
+            var actor_line = ast::ast_get_line(actor_ast, actor_node)
+            var actor_col = ast::ast_get_col(actor_ast, actor_node)
+            typecheck_util::tc_error(tc, "QZ1303: Actor field '#{field_name}' has type '#{field_type_ann}' which is not Send — actor state must be safe to access from another thread", actor_line, actor_col)
+          end
+        end
+      end
+    end
+  end
+
+  # Phase 4.2: Liveness analysis (NLL pre-pass)
+  # Computes last-use info for each binding, enabling use-based borrow release.
+  liveness::analyze_all(all_funcs, ast_storage, root)
+
+  typecheck_walk::tc_program(tc, ast_storage, root)
+
+  end  # close ambient `with Diag` (P5.2.f Step 2 — widened from
+       # around tc_program to cover Phase 4.0 registration too)
+
+  if g_dump_effect_rows == 1
+    typecheck_registry::tc_dump_effect_rows(tc)
+  end
+
+  if g_dump_effect_decls == 1
+    typecheck_registry::tc_dump_effect_decls(tc)
+  end
+
+  # --- Tier 1+2: Interface hash computation + early cutoff ---
+  # Moved before tc_function loop so recompile_set is available for selective body checking.
+  # tc_compute_interface_hash reads only from tc.registry (populated by Phase 4.0-4.1).
+  if is_incremental == 1
+    var iface_names = dep_graph::depgraph_get_all_names()
+    for ini in 0..iface_names.size
+      var imod = iface_names[ini]
+      var iface_hash = typecheck::tc_compute_interface_hash(tc, imod)
+      dep_graph::depgraph_set_interface_hash(imod, iface_hash)
+    end
+    var prev_iface_for_cutoff = vec_new<String>()
+    for pii in 0..iface_names.size
+      var pimod = iface_names[pii]
+      var prev_iface = ""
+      var poi = 0
+      while poi < old_dg_names.size
+        if old_dg_names[poi].eq(pimod)
+          prev_iface = old_dg_iface_hashes[poi]
+          break
+        end
+        poi += 1
+      end
+      prev_iface_for_cutoff.push(prev_iface)
+    end
+    # Tier 2 safety (per-module fragment check): TC skip is only correct when
+    # a cached IR fragment exists for the unchanged module. Any unchanged
+    # module whose fragment is missing must be added to `changed_modules` BEFORE
+    # dep-graph invalidation, so it (and its dependents) land in recompile_set
+    # and get body-level TC. Otherwise codegen fresh-lowers MIR from an AST
+    # that was never typechecked this round — losing UFCS rewrites (e.g.
+    # `vec.push(x)` stays as MIR_CALL_INDIRECT instead of `vec_push` intrinsic)
+    # and producing IR with undefined locals like `%push`.
+    #
+    # The prior coarse guard ("if NO fragments exist, disable TC skip") missed
+    # the common case where SOME fragments exist (Int/Option/Result) but a
+    # module like `socket` happens to have never been extracted into its own
+    # fragment by prior builds.
+    #
+    # Cache fragments are keyed by SHORT name (e.g. `socket.ll` for dep-graph
+    # entry `std/ffi/socket`), so we normalize via `resolve_get_short_name`.
+    for mfi in 0..iface_names.size
+      var mf_mod = iface_names[mfi]
+      var mf_short = resolver::resolve_get_short_name(mf_mod)
+      var mf_path = "#{build_cache::cache_get_dir()}/modules/#{mf_short}.ll"
+      if fio_exists(mf_path) == 0
+        var mf_already = 0
+        for mci in 0..changed_modules.size
+          if changed_modules[mci].eq(mf_mod)
+            mf_already = 1
+            break
+          end
+        end
+        if mf_already == 0
+          changed_modules.push(mf_mod)
+        end
+      end
+    end
+
+    # INC.1.8 — push every module whose qzmod inject returned 0 into
+    # changed_modules. See the `failed_inject_modules` declaration for
+    # the rationale.
+    for fimi in 0..failed_inject_modules.size
+      var fim_mod = failed_inject_modules[fimi]
+      var fim_already = 0
+      for fmci in 0..changed_modules.size
+        if changed_modules[fmci].eq(fim_mod)
+          fim_already = 1
+          break
+        end
+      end
+      if fim_already == 0
+        changed_modules.push(fim_mod)
+      end
+    end
+
+    recompile_set = dep_graph::depgraph_invalidate_with_cutoff(changed_modules, prev_iface_for_cutoff)
+
+    # Normalize recompile_set to short names. The dep graph stores import-path
+    # names (e.g. `std/ffi/socket`), but function mangling (`socket$pipe_create`),
+    # cache fragment filenames (`socket.ll`), and `cg_extract_module` all use
+    # the short name. Downstream consumers (TC-skip gate below, codegen's
+    # `_cg_module_in_set`) compare against function-name prefixes, so they
+    # need the short name to match. Without normalization, nested-path modules
+    # silently fail the `in_set` check and have their bodies skipped even when
+    # they were just added to `changed_modules`.
+    var normalized_set = vec_new<String>()
+    for nsi in 0..recompile_set.size
+      var ns_short = resolver::resolve_get_short_name(recompile_set[nsi])
+      var ns_already = 0
+      for nsj in 0..normalized_set.size
+        if normalized_set[nsj].eq(ns_short)
+          ns_already = 1
+          break
+        end
+      end
+      if ns_already == 0
+        normalized_set.push(ns_short)
+      end
+    end
+    recompile_set = normalized_set
+
+    if build_cache::cache_get_explain()
+      if changed_modules.size > 0
+        var msg = "[cache] Tier 1: changed modules: "
+        for eci in 0..changed_modules.size
+          if eci > 0
+            msg = "#{msg}, "
+          end
+          msg = "#{msg}#{changed_modules[eci]}"
+        end
+        eputs("#{msg}")
+      end
+      if recompile_set.size > 0
+        var msg2 = "[cache] Tier 2: recompile set: "
+        for eri in 0..recompile_set.size
+          if eri > 0
+            msg2 = "#{msg2}, "
+          end
+          msg2 = "#{msg2}#{recompile_set[eri]}"
+        end
+        eputs("#{msg2}")
+        var total_mods = iface_names.size
+        var skip_count = total_mods - recompile_set.size
+        eputs("[cache] Tier 2: skipping TC+MIR for #{str_from_int(skip_count)}/#{str_from_int(total_mods)} modules")
+      else
+        eputs("[cache] Tier 2: no cached fragments — full TC this build")
+      end
+    end
+  end
+
+  # Phase 4.3.5: Rewrite function AST node str1 to canonical resolver name.
+  # The resolver collects all functions (including impl methods like `make` inside
+  # `impl Source for BoxB`) into `all_funcs` with mangled entry names (e.g.
+  # `BoxB$make`). The AST node's str1 still holds the bare source name (`make`).
+  # This is a problem for `tc_function`, which reads `func_name` from str1 and
+  # passes it to `tc_register_impl_return`. With multiple impls of the same trait
+  # method (e.g. `impl Source for BoxA` and `impl Source for BoxB`, both with
+  # `def make(self): impl Greet`), the bare name collides — only the first impl
+  # wins, and call sites dispatch through the wrong concrete return type.
+  # Phase 11 (RPITIT) fix: write the canonical mangled name into str1 here, AFTER
+  # all impl blocks have been registered (Phase 4.0c + tc_program Phase 1.6,
+  # which both rely on the bare str1 to build the mangled key) and BEFORE the
+  # function body type-check loop (which is what reads str1 as `func_name`).
+  for i in 0..func_count
+    var entry = all_funcs[i]
+    if entry.tag == RESOLVE_TAG_FUNC
+      ast::ast_set_str1(entry.ast_store, entry.node_id, entry.name)
+    end
+  end
+
+  # Phase 4.3.6: Re-mark op-call annotations across every module's AST.
+  # The AST cache (build_cache::cache_save_ast) ships parser-shape fields
+  # only — the op_call_* side-tables that body-TC writes (see
+  # typecheck_expr_handlers' C.3 block) are NOT persisted. Under
+  # --cache-ro / incremental skip, body-TC is skipped for unchanged
+  # modules, so their AST has no op-call marks; mir_lower falls through
+  # to indirect-call for effect ops like `throw(...)` and emits
+  # `load i64, ptr %throw` (undefined). This pass walks each distinct
+  # ast_store once and re-marks any NODE_CALL whose callee names a
+  # registered effect op. Idempotent — body-TC'd modules see no change.
+  # Must run AFTER Phase 4.0d (effect decls registered) and BEFORE
+  # Phase 4.4 (body-TC, which the skip case rides through to mir_lower).
+  var _remark_seen = vec_new<Int>()
+  for i in 0..func_count
+    var _rmk_entry = all_funcs[i]
+    var _rmk_store = _rmk_entry.ast_store
+    if _rmk_store == 0
+      continue
+    end
+    var _rmk_dup = 0
+    for _rmk_j in 0.._remark_seen.size
+      if _remark_seen[_rmk_j] == _rmk_store
+        _rmk_dup = 1
+        break
+      end
+    end
+    if _rmk_dup == 1
+      continue
+    end
+    _remark_seen.push(as_int_generic(_rmk_store))
+    typecheck_registry::tc_remark_op_calls_in_module(tc, _rmk_store)
+  end
+
+  # Phase 4.4: Type-check function bodies (selective in incremental mode)
+  var tc_checked_count = 0
+  var tc_skipped_count = 0
+  for i in 0..func_count
+    var entry = all_funcs[i]
+    var mod_ast_storage = entry.ast_store
+    var func_handle = entry.node_id
+    var tag = entry.tag
+    if tag == RESOLVE_TAG_FUNC
+      # Skip actor-synthetic function stubs (int_val=3, body=-1) — bodies generated in MIR
+      var func_body_node = ast::ast_get_right(mod_ast_storage, func_handle)
+      if func_body_node < 0
+        tc_skipped_count += 1
+      else
+      var should_check = 1
+      if recompile_set.size > 0
+        # Resolve the function's module via ast_store rather than the
+        # mangled-name prefix. Free functions use the short module name as
+        # prefix (`socket$pipe_create` → `socket`), but impl methods use the
+        # struct name (`Progress$spinner_only` → `Progress`). `recompile_set`
+        # contains short module names (see normalization after
+        # `depgraph_invalidate_with_cutoff`), so only an ast_store lookup
+        # correctly maps both flavors of entry to their owning module.
+        var dg_name = dep_graph::depgraph_name_for_ast_store(mod_ast_storage)
+        var mod_name = "__main__"
+        if str_byte_len(dg_name) > 0
+          mod_name = resolver::resolve_get_short_name(dg_name)
+        else
+          # Fallback: no ast_store mapping. Extract from function-name prefix.
+          # This path is rare (entry.ast_store should always be registered),
+          # but keeps the check safe.
+          var fn_name = entry.name
+          var dollar = __char_index(fn_name, '$')
+          if dollar > 0
+            mod_name = str_byte_slice(fn_name, 0, dollar)
+          end
+        end
+        var in_set = 0
+        for rsi in 0..recompile_set.size
+          if recompile_set[rsi].eq(mod_name)
+            in_set = 1
+            break
+          end
+        end
+        if in_set == 0
+          should_check = 0
+          for gfi in 0..generic_func_handles.size
+            if generic_func_handles[gfi] == func_handle
+              should_check = 1
+              break
+            end
+          end
+        end
+      end
+      # INC.1.5 — qzmod hit modules: body MIR comes from cache (INC.1.3+),
+      # and synthetic `__Future_*$poll/$new` + lambdas + actor proxies come
+      # from cache too (INC.1.5.1). Body typecheck only wrote AST mutations
+      # that subsequent passes (MIR-lowering, synthetic generation) consumed
+      # — with both now satisfied from cache, body-tc is dead work. Generics
+      # remain checked because the producer doesn't ship their bodies (they
+      # only exist as specializations at consumer call sites).
+      # INC.2.0 — gate on `hit_mir_ast_stores`, not `hit_ast_stores`: a hit
+      # that injected types but shipped no MIR has its bodies fresh-lowered,
+      # so body-TC must run (see the `hit_mir_ast_stores` declaration).
+      if hit_mir_ast_stores.size > 0
+        if _qzh_in_set(mod_ast_storage, hit_mir_ast_stores) == 1
+          var is_generic_hit = 0
+          for gfi2 in 0..generic_func_handles.size
+            if generic_func_handles[gfi2] == func_handle
+              is_generic_hit = 1
+              break
+            end
+          end
+          if is_generic_hit == 0
+            should_check = 0
+          end
+        end
+      end
+      if should_check == 1
+        # Set current_file for per-module diagnostic attribution.
+        # Look up by ast_store (handles wildcard imports whose functions have
+        # no module prefix in their resolved name — e.g. prelude).
+        var mod_path = dep_graph::depgraph_path_for_ast_store(mod_ast_storage)
+        if str_byte_len(mod_path) > 0
+          tc.current_file = mod_path
+        else
+          # Fall back to name-prefix lookup for entries whose ast_store wasn't
+          # registered (rare; shouldn't happen in practice).
+          var fn_name = entry.name
+          var dollar2 = __char_index(fn_name, '$')
+          if dollar2 > 0
+            var mname = str_byte_slice(fn_name, 0, dollar2)
+            var midx = dep_graph::depgraph_find_node(mname)
+            if midx >= 0
+              tc.current_file = dep_graph::depgraph_get_path(midx)
+            else
+              tc.current_file = filename
+            end
+          else
+            tc.current_file = filename
+          end
+        end
+        # PF3-P2 (value-types-finish): dropped the outer `with State(
+        # as_int(tc))` dogfood wrap — it installed an evidence slot that
+        # nothing consumed (leaf helpers body-wrap their own State, now
+        # also de-erased), and `as_int(tc)` is an unsafe refcount-dropping
+        # reinterpret under value-layout structs. `with Diag` stays — its
+        # handlers ARE consumed by tc_function's leaf validators.
+        with Diag {
+          error: typecheck_diag::tc_diag_error_handler,
+          warn: typecheck_diag::tc_diag_warn_handler
+        } do ->
+          typecheck_walk::tc_function(tc, mod_ast_storage, func_handle)
+        end
+        tc_checked_count += 1
+      else
+        tc_skipped_count += 1
+      end
+      end
+    end
+    # Note: RESOLVE_TAG_EXTERN_FN (10) entries are skipped — no body to type-check
+  end
+  if build_cache::cache_get_explain()
+    if tc_skipped_count > 0
+      eputs("[cache] Tier 2: TC checked #{str_from_int(tc_checked_count)} functions, skipped #{str_from_int(tc_skipped_count)}")
+    end
+  end
+
+  # Phase 4.5: Transitive borrow summary propagation (T3c.2 Phase 5)
+  typecheck::tc_propagate_borrow_summaries(tc)
+  prof_phase("typecheck")
+
+  # Emit any warnings (non-fatal diagnostics, always printed)
+  var warn_src_lines = diagnostic::diag_split_source(source)
+  typecheck::tc_emit_warnings(tc, filename, warn_src_lines)
+  
+  if typecheck::tc_has_errors(tc)
+    var src_lines = diagnostic::diag_split_source(source)
+    typecheck::tc_emit_diagnostics(tc, filename, src_lines)
+    return ""
+  end
+  
+
+  # Pre-compute interface hashes BEFORE freeing TC state.
+  # tc_compute_interface_hash reads TC data that's invalidated by tc_free.
+  var _iface_names = vec_new<String>()
+  var _iface_hashes = vec_new<String>()
+  if build_cache::cache_is_enabled() and is_incremental == 0
+    var pre_names = dep_graph::depgraph_get_all_names()
+    for pni in 0..pre_names.size
+      var pmod = pre_names[pni]
+      _iface_names.push(pmod)
+      _iface_hashes.push(typecheck::tc_compute_interface_hash(tc, pmod))
+    end
+  end
+
+  # Phase 6: MIR lowering — moved BEFORE `.qzmod` emit per INC.1.2 so the
+  # producer can ship per-function MIR bodies (`mir_bodies.bin` +
+  # `mir_bodies_off.bin`). MIR doesn't read tc; tc.registry stays alive
+  # through MIR lowering and is freed below after the qzmod emit reads it.
+  # Note: nil coalescing (??) is handled directly in MIR lowering
+  # Incremental: MIR lowers ALL functions (lambda numbering requires it) but
+  # suppresses struct-resolution warnings for unchanged modules (their TC
+  # annotations are missing because tc_function was skipped).
+  if is_incremental == 1
+    mir_lower::mir_lower_set_recompile(recompile_set)
+  end
+  # Freestanding targets: skip fuel_check instrumentation (BEAM-style
+  # reduction counting has no place in kernel / embedded builds; the
+  # `@__qz_fuel_refill` + `@__qz_sched_fuel` symbols it references are
+  # not emitted for freestanding targets). `codegen_runtime` uses the
+  # same string-suffix heuristic — inlined here to avoid a module import.
+  var _freestanding = 0
+  if str_ends_with(target, "-none")
+    _freestanding = 1
+  end
+  if str_ends_with(target, "-none-elf")
+    _freestanding = 1
+  end
+  mir_lower::mir_set_freestanding(_freestanding)
+  # B.5e.3 — mirror the flag into mir_lower_async_registry so its PASS
+  # 1.2b async-target registration gate works on the single-file kernel
+  # build (where qzmod_active_target() is empty). See
+  # mir_async_set_freestanding's doc + docs/design/D11_FREESTANDING_EFFECT_BRIDGE.md.
+  mir_lower_async_registry::mir_async_set_freestanding(_freestanding)
+  # INC.1.4 — consumer activation. `mir_lower_all_incremental` walks
+  # `qzmod_hits`, unpickles each module's cached MIR via
+  # `qzmod_load_mir_bodies`, runs `_qzmod_rewrite_call_names` to repair
+  # cross-module call names (producer can ship bare `EAGAIN` if
+  # `socket` wasn't in `all_funcs` at producer mir-lower time —
+  # consumer suffix-search resolves to `socket$EAGAIN`), then merges
+  # the loaded MirFuncs onto `mir_prog.functions`. PASS 1 skips body
+  # lowering for hit modules (their MIR is already in the program).
+  # `mir_lower_all` (legacy form) remains as a thin wrapper for
+  # `bootstrap.qz`'s recovery path.
+  var mir_prog = mir_lower::mir_lower_all_incremental(all_funcs, hit_ast_stores, qzmod_hits)
+  if is_incremental == 1
+    mir_lower::mir_lower_clear_recompile()
+  end
+  if g_dump_effects == 1
+    mir_lower_async_registry::mir_dump_effects(mir_prog)
+  end
+  prof_phase("mir")
+
+  # NET.4 Layer 3 — CT taint pass over `@ct`-marked functions. Cheap when no
+  # `@ct` annotations are present (one side-table lookup per function). Runs
+  # before mir_optimize so source-location-bearing diagnostics still point at
+  # the exact source SSA instruction.
+  ct_taint::ct_taint_program(mir_prog)
+  if diagnostic::diag_error_count() > 0
+    return ""
+  end
+  prof_phase("ct_taint")
+
+  # Phase 1.4.e: emit `.qzmod` artifacts for every non-__main__ module.
+  # Producer side of the cache pipeline. Walks the dep graph, partitions
+  # `all_funcs` by ast_store per module, builds a `QzmodEmitInput` view
+  # from `tc.registry`, and writes a directory of section .bin files
+  # plus a header.txt. Failure paths are silent (Principle #6 advisory).
+  # Phase 1.4.c.2 lit the consumer side — `qzmod_remap::tc_inject_qzmod`
+  # is invoked from compile()'s Phase 4.0 pre-pass; cache hits cause the
+  # matching Phase 4.0a/4.0d AST-path registration to tag-skip.
+  # INC.1.2 — also ships per-function MIR bodies from `mir_prog`.
+  # INC.1.5 — gate qzmod write on `cache_is_enabled()`. With `--no-cache`,
+  # the consumer (resolver) doesn't read .qzmod either; writing them anyway
+  # leaves stale files that future runs without `--no-cache` would consume.
+  # `quake guard` uses `--no-cache` for gen0→gen1 and gen1→gen2 precisely to
+  # ensure consistent IR across the two compiles.
+  if build_cache::cache_is_enabled() and build_cache::cache_is_writable() == 1
+    # INC.1.10: pass recompile_set + is_incremental so the emitter can skip
+    # unchanged modules on warm runs. The producer's tc.registry is a global
+    # process accumulator — re-emitting an unchanged module with a partial
+    # warm registry shrinks its fn_type_annotations.bin below the indexes its
+    # own TYPES section references, corrupting subsequent warm runs.
+    typecheck_registry::tc_emit_qzmod_modules(tc, all_funcs, mir_prog, detect_project_root(), target, debug_mode, no_opt, overflow_check, exclusivity_check, recompile_set, is_incremental)
+  end
+  prof_phase("qzmod_emit")
+
+  # DF.11: Free TypecheckState — TC is not read by Codegen
+  typecheck_registry::tc_registry_free_intern_ids()
+  typecheck_util::tc_free(tc)
+  prof_phase("tc_free")
+
+  # Phase 5.5: MIR optimization (gated behind @cfg(feature: "egraph"))
+  if no_opt == 0
+    mir_opt::mir_optimize(mir_prog, overflow_check)
+    _maybe_egraph_optimize(mir_prog, overflow_check)
+  end
+
+  # Phase 6: Code generation
+  # C backend: emit C code directly and return
+  if g_backend == "c"
+    return codegen_c::cg_c_codegen(mir_prog, all_funcs)
+  end
+
+  # WASM backend: emit WASM binary directly
+  if g_backend == "wasm"
+    return _compile_wasm(mir_prog, all_funcs)
+  end
+
+  # WASM text backend: emit human-readable WAT
+  if g_backend == "wasm-text"
+    return _compile_wasm_text(mir_prog, all_funcs)
+  end
+
+  # LLVM backend (default, incremental when possible)
+  var llvm_ir = ""
+  var extern_decls = ""
+  if separate == 1
+    # Separate compilation: emit per-module .ll files
+    # Returns manifest (list of .ll file paths), NOT LLVM IR
+    var topo_order = dep_graph::depgraph_topo_sort()
+    return codegen_separate::cg_codegen_separate(mir_prog, target, all_funcs, overflow_check, stack_alloc, topo_order, build_cache::cache_get_dir(), race_mode, exclusivity_check)
+  elsif is_incremental == 1
+    # Incremental path — arena dogfood deferred to a follow-up phase.
+    var cached_pool = cache_op_load_pool()
+    llvm_ir = codegen_separate::cg_codegen_incremental(mir_prog, target, all_funcs, overflow_check, stack_alloc, recompile_set, cached_pool, build_cache::cache_get_dir(), race_mode, exclusivity_check)
+    var inc_sb = sb_new()
+    inc_sb.append(llvm_ir)
+    extern_decls = codegen::cg_emit_extern_declarations(all_funcs, inc_sb, mir_prog, target)
+    sb_free(inc_sb)
+  elsif debug_mode == 1
+    # B.1 Phase 5.E (2026-05-02) — master_out is now allocated OUTSIDE the
+    # `with Alloc.in_arena(cg_arena)` install. The 128 MB pre-grown buffer
+    # lands on the default heap, never enters cg_arena, and the post-codegen
+    # `master_out.to_string()` runs in the caller (here) AFTER the with-block
+    # exits — so the resulting String allocates on the default heap directly.
+    # Eliminates the prior in-arena to_string copy + redundant
+    # `arena_promote_string(llvm_ir)` step that doubled ~80 MB of IR text at
+    # codegen peak. `cg_emit_extern_declarations` now scans master_out via
+    # `sb_byte_at` / `__sb_index_from` rather than requiring a String.
+    var master_out = sb_new_with_capacity(134217728)
+    var cg_arena = arena_new(65536)
+    with Alloc.in_arena(cg_arena) do ->
+      codegen::cg_codegen_debug(master_out, mir_prog, filename, target, all_funcs, overflow_check, stack_alloc, race_mode, build_cache::cache_get_dir(), exclusivity_check)
+      extern_decls = codegen::cg_emit_extern_declarations(all_funcs, master_out, mir_prog, target)
+      # B.1 Phase 4: emit top-N inside the arena. _profile_alloc_record
+      # mutates `_profile_alloc_bytes_by_site` from inside this with-block,
+      # so its bucket arrays grow into cg_arena. Reading them after
+      # arena_destroy dangles. Reading inside is safe.
+      if profile::profile_get_alloc_track() == 1
+        # Phase 5.D bumped from 20 to 60 to fit 33 new arena_<phase> bookends
+        # alongside the original 17 phase_<phase> + 4 chokepoint entries.
+        profile::profile_alloc_top_n(60)
+      end
+      0
+    end
+    llvm_ir = master_out.to_string()
+    sb_free(master_out)
+    extern_decls = arena_promote_string(extern_decls)
+    codegen::cg_promote_last_string_pool()
+    arena_destroy(cg_arena)
+  else
+    # B.1 Phase 5.E — see debug-path comment above for the master-out-outside-
+    # arena rationale.
+    var master_out = sb_new_with_capacity(134217728)
+    var cg_arena = arena_new(65536)
+    with Alloc.in_arena(cg_arena) do ->
+      codegen::cg_codegen(master_out, mir_prog, target, all_funcs, overflow_check, stack_alloc, race_mode, build_cache::cache_get_dir(), exclusivity_check)
+      extern_decls = codegen::cg_emit_extern_declarations(all_funcs, master_out, mir_prog, target)
+      # B.1 Phase 4: emit top-N inside the arena. See debug-path comment above.
+      if profile::profile_get_alloc_track() == 1
+        # Phase 5.D bumped from 20 to 60 to fit 33 new arena_<phase> bookends
+        # alongside the original 17 phase_<phase> + 4 chokepoint entries.
+        profile::profile_alloc_top_n(60)
+      end
+      0
+    end
+    llvm_ir = master_out.to_string()
+    sb_free(master_out)
+    extern_decls = arena_promote_string(extern_decls)
+    codegen::cg_promote_last_string_pool()
+    arena_destroy(cg_arena)
+  end
+
+  # Return the combined LLVM IR
+  var final_ir = "#{llvm_ir}\n#{extern_decls}"
+  # Debug builds: stamp `!dbg` locations onto every instruction and strip the
+  # `; __qzdbgloc` sentinels codegen emitted (see cg_apply_debug_locations).
+  if debug_mode == 1
+    final_ir = codegen::cg_apply_debug_locations(final_ir)
+  end
+  prof_phase("codegen")
+  prof_phase("compile_done")
+
+  # Store in cache if enabled (and writable — --cache-ro skips all writes)
+  if build_cache::cache_is_enabled() and build_cache::cache_is_writable() == 1
+    var loaded_paths = resolver::resolve_get_loaded_paths()
+    var dep_hashes = vec_new<String>()
+    dep_hashes.push(content_hash::content_hash(source))
+    dep_hashes.push(target)
+    if debug_mode == 1
+      dep_hashes.push("debug=1")
+    else
+      dep_hashes.push("debug=0")
+    end
+    if no_opt == 1
+      dep_hashes.push("noopt=1")
+    else
+      dep_hashes.push("noopt=0")
+    end
+    if overflow_check == 1
+      dep_hashes.push("overflow=1")
+    else
+      dep_hashes.push("overflow=0")
+    end
+    if exclusivity_check == 1
+      dep_hashes.push("exclusivity=1")
+    else
+      dep_hashes.push("exclusivity=0")
+    end
+    dep_hashes.push(QUARTZ_VERSION)
+    for lp_idx in 0..loaded_paths.size
+      dep_hashes.push(content_hash::content_hash_file(loaded_paths[lp_idx]))
+    end
+    var cache_key = content_hash::content_hash_combine(dep_hashes)
+    cache_op_store(filename, cache_key, final_ir)
+    build_cache::cache_flush()
+
+    # Save Tier 0 quick-check data: module_paths.txt + whole_program.ll.
+    # The first line is the compile-config sentinel — `target`, debug,
+    # noopt, overflow, and compiler version. The reader at the top of
+    # compile() invalidates the quick-check if its current config doesn't
+    # match this sentinel, which is the fix for the pre-2026-05-22 silent
+    # cross-compile cache bug (different --target returned stale IR).
+    var qc_debug = "0"
+    if debug_mode == 1
+      qc_debug = "1"
+    end
+    var qc_noopt = "0"
+    if no_opt == 1
+      qc_noopt = "1"
+    end
+    var qc_overflow = "0"
+    if overflow_check == 1
+      qc_overflow = "1"
+    end
+    var qc_excl = "0"
+    if exclusivity_check == 1
+      qc_excl = "1"
+    end
+    var qc_out = "__config__|#{target}|#{qc_debug}|#{qc_noopt}|#{qc_overflow}|#{qc_excl}|#{QUARTZ_VERSION}\n"
+    qc_out = "#{qc_out}#{filename}|#{content_hash::content_hash(source)}\n"
+    for lp_save in 0..loaded_paths.size
+      var lp_file = loaded_paths[lp_save]
+      qc_out = "#{qc_out}#{lp_file}|"
+      qc_out = "#{qc_out}#{content_hash::content_hash_file(lp_file)}"
+      qc_out = "#{qc_out}\n"
+    end
+    var _qcw1 = fio_write("#{build_cache::cache_get_dir()}/module_paths.txt", qc_out)
+    var _qcw2 = fio_write("#{build_cache::cache_get_dir()}/whole_program.ll", final_ir)
+
+    # INC.1.8: write placeholder V2 fragments for dep-graph modules with no
+    # reachable functions. The safety net at lines 871-887 forces every
+    # module without a `<short>.ll` fragment into `changed_modules`, which
+    # cascades through `depgraph_invalidate_with_cutoff` and pulls 40+
+    # modules into `recompile_set` even when only `__main__` changed.
+    # Empty placeholders (just the META_V2 header) let `fio_exists` return 1
+    # so the safety net stops over-invalidating. cg_codegen already wrote
+    # real fragments for modules with at least one reachable function;
+    # placeholders cover only the DCE-dropped ones.
+    var ph_all_names = dep_graph::depgraph_get_all_names()
+    var ph_seen = vec_new<String>()
+    for phi in 0..ph_all_names.size
+      var ph_short = resolver::resolve_get_short_name(ph_all_names[phi])
+      var ph_already = 0
+      for phj in 0..ph_seen.size
+        if ph_seen[phj].eq(ph_short)
+          ph_already = 1
+          break
+        end
+      end
+      if ph_already == 0
+        ph_seen.push(ph_short)
+        var ph_path = "#{build_cache::cache_get_dir()}/modules/#{ph_short}.ll"
+        if fio_exists(ph_path) == 0
+          var _phw = fio_write(ph_path, "META_V2:\n---\n")
+        end
+      end
+    end
+
+    # Save dependency graph with interface hashes for future incremental builds
+    dep_graph::depgraph_set_content_hash("__main__", content_hash::content_hash(source))
+    # Apply pre-computed interface hashes (computed before tc_free)
+    for sni in 0.._iface_names.size
+      dep_graph::depgraph_set_interface_hash(_iface_names[sni], _iface_hashes[sni])
+    end
+    dep_graph::depgraph_save("#{build_cache::cache_get_dir()}/dep_graph.txt")
+
+    # Save string pool for incremental codegen
+    cache_op_save_pool(codegen::cg_get_last_string_pool())
+  end
+
+  return final_ir
+end
+
+## Get command line argument at index n.
+def get_arg(n: Int): String = argv(n)
+
+# Determine host target at compile time via @cfg
+@cfg(all: os: "macos", arch: "aarch64")
+def get_host_target(): String = "aarch64-apple-macosx"
+
+@cfg(all: os: "macos", arch: "x86_64")
+def get_host_target(): String = "x86_64-apple-macosx"
+
+# TODO: Verify on Linux
+@cfg(all: os: "linux", arch: "aarch64")
+def get_host_target(): String = "aarch64-unknown-linux-gnu"
+
+# TODO: Verify on Linux
+@cfg(all: os: "linux", arch: "x86_64")
+def get_host_target(): String = "x86_64-unknown-linux-gnu"
+
+# Windows host stubs — when Quartz itself runs on Windows. Not exercised by
+# Phase 1 (cross-compile from Darwin); included for completeness so the host
+# detection table is closed across the four supported OS / arch combos.
+@cfg(all: os: "windows", arch: "x86_64")
+def get_host_target(): String = "x86_64-pc-windows-gnu"
+
+@cfg(all: os: "windows", arch: "aarch64")
+def get_host_target(): String = "aarch64-pc-windows-gnu"
+
+## Auto-detect stdlib path from the compiler binary location.
+## From `self-hosted/bin/quartz`, goes up 3 levels to project root,
+## then checks for `std/` subdirectory. Sentinel is `prelude.qz` because
+## it's the auto-injected module and can never move from std/ root.
+## Returns "" if auto-detection fails.
+def detect_stdlib_path(): String
+  var binary = argv(0)
+  var bin_dir = path_dir(binary)
+  var self_hosted = path_dir(bin_dir)
+  var root = path_dir(self_hosted)
+  var candidate = path_join(root, "std")
+  var probe = path_join(candidate, "prelude.qz")
+  var exists = fio_exists(probe)
+  if exists
+    return candidate
+  end
+  return ""
+end
+
+## Auto-detect project root by walking up from the compiler binary.
+## When std/ is found, its parent directory is the project root. This is
+## needed because std internal modules use `import std/...` prefix form
+## (see std/style.qz, std/terminal.qz, std/net/*) which requires the
+## project root on the include path to resolve.
+##
+## Returns "" if auto-detection fails.
+def detect_project_root(): String
+  var binary = argv(0)
+  var bin_dir = path_dir(binary)
+  var self_hosted = path_dir(bin_dir)
+  var root = path_dir(self_hosted)
+  var candidate = path_join(root, "std")
+  var probe = path_join(candidate, "prelude.qz")
+  var exists = fio_exists(probe)
+  if exists
+    return root
+  end
+  return ""
+end
+
+# ============================================================================
+# Inlined argparse (cannot import due to bootstrap compiler limitations)
+# ============================================================================
+
+
+struct ArgParser
+  prog_name: String
+  prog_version: String
+  prog_desc: String
+  short_names: Vec<String>
+  long_names: Vec<String>
+  descriptions: Vec<String>
+  kinds: Vec<String>
+  count: Int
+end
+
+struct ParsedArgs
+  keys: Vec<String>
+  values: Vec<String>
+  positionals: Vec<String>
+  command: String
+end
+
+## Create a new argument parser with auto-registered -h/--help and -v/--version.
+def argparser_new(name: String, version: String, desc: String): ArgParser
+  var p = ArgParser {
+    prog_name: name,
+    prog_version: version,
+    prog_desc: desc,
+    short_names: vec_new<String>(),
+    long_names: vec_new<String>(),
+    descriptions: vec_new<String>(),
+    kinds: vec_new<String>(),
+    count: 0
+  }
+  argparser_flag(p, "-h", "--help", "Show this help message")
+  argparser_flag(p, "-v", "--version", "Show version")
+  return p
+end
+
+## Register a boolean flag (no value).
+def argparser_flag(p: ArgParser, short_name: String, long_name: String, desc: String): Void
+  p.short_names.push(short_name)
+  p.long_names.push(long_name)
+  p.descriptions.push(desc)
+  p.kinds.push("F")
+  p.count = p.count + 1
+end
+
+## Register an option that takes a value.
+def argparser_option(p: ArgParser, short_name: String, long_name: String, desc: String): Void
+  p.short_names.push(short_name)
+  p.long_names.push(long_name)
+  p.descriptions.push(desc)
+  p.kinds.push("O")
+  p.count = p.count + 1
+end
+
+## Register a repeatable option (can appear multiple times).
+def argparser_option_repeat(p: ArgParser, short_name: String, long_name: String, desc: String): Void
+  p.short_names.push(short_name)
+  p.long_names.push(long_name)
+  p.descriptions.push(desc)
+  p.kinds.push("R")
+  p.count = p.count + 1
+end
+
+## Register a subcommand.
+def argparser_command(p: ArgParser, name: String, desc: String): Void
+  p.short_names.push("")
+  p.long_names.push(name)
+  p.descriptions.push(desc)
+  p.kinds.push("C")
+  p.count = p.count + 1
+end
+
+## Find an entry by short or long name. Returns index or -1.
+def argparser_find(p: ArgParser, arg: String): Int
+  for i in 0..p.count
+    var kind = p.kinds[i]
+    if kind != "C"
+      var sn = p.short_names[i]
+      if str_byte_len(sn) > 0
+        if sn == arg
+          return i
+        end
+      end
+      if p.long_names[i] == arg
+        return i
+      end
+    end
+  end
+  return -1
+end
+
+## Check if a string matches any registered command.
+def argparser_find_command(p: ArgParser, arg: String): Int
+  for i in 0..p.count
+    var kind = p.kinds[i]
+    if kind == "C"
+      if p.long_names[i] == arg
+        return i
+      end
+    end
+  end
+  return -1
+end
+
+## Check if a string starts with "-".
+def argparse_is_flag(s: String): Int
+  if str_byte_len(s) > 0
+    if str_byte_at(s, 0) == '-'
+      return 1
+    end
+  end
+  return 0
+end
+
+## Parse command-line arguments from argc/argv. Outer wrapper that
+## auto-handles --help and --version (exits) and prints + exits on
+## unknown flags. Use argparser_parse_argv when you need a non-exiting
+## variant (e.g. the persistent-worker dispatch loop, which must survive
+## a malformed request and respond with status: error).
+def argparser_parse_args(p: ArgParser): ParsedArgs
+  var argv = vec_new<String>()
+  var n_argc = argc()
+  for i in 0..n_argc
+    argv.push(get_arg(i))
+  end
+  var args = argparser_parse_argv_inner(p, argv, 1)
+  if parsed_has_in(args.keys, args.values, "--help")
+    argparser_print_help(p)
+    exit(0)
+  end
+  if parsed_has_in(args.keys, args.values, "--version")
+    puts("#{p.prog_name} #{p.prog_version}")
+    exit(0)
+  end
+  return args
+end
+
+## Parse a Vec<String> argv (argv[0] is the program name, like a real
+## process argv). Silent variant: never prints, never exits, unknown
+## flags are dropped on the floor. The persistent-worker dispatch loop
+## uses this so a malformed compile request can't take the worker down.
+def argparser_parse_argv(p: ArgParser, argv: Vec<String>): ParsedArgs
+  return argparser_parse_argv_inner(p, argv, 0)
+end
+
+## Inner parse loop. `strict=1` means errors print to stdout + exit
+## (the legacy CLI behavior); `strict=0` means errors are silently
+## tolerated (worker dispatch behavior).
+def argparser_parse_argv_inner(p: ArgParser, argv: Vec<String>, strict: Int): ParsedArgs
+  var keys = vec_new<String>()
+  var vals = vec_new<String>()
+  var positionals = vec_new<String>()
+  var command = ""
+  var found_command = 0
+  var n = argv.size
+  var i = 1
+
+  while i < n
+    var arg = argv[i]
+
+    # Check for -- separator
+    if arg == "--"
+      i += 1
+      while i < n
+        positionals.push(argv[i])
+        i += 1
+      end
+      break
+    end
+
+    # Check for =VALUE syntax (e.g., --target=x86_64)
+    var eq_pos = -1
+    for j in 0..str_byte_len(arg)
+      if str_byte_at(arg, j) == '='
+        eq_pos = j
+        break
+      end
+    end
+
+    if eq_pos > 0
+      var flag_part = str_byte_slice(arg, 0, eq_pos)
+      var val_part = str_byte_slice(arg, eq_pos + 1, str_byte_len(arg))
+      var idx = argparser_find(p, flag_part)
+      if idx >= 0
+        keys.push(p.long_names[idx])
+        vals.push(val_part)
+      end
+      i += 1
+    elsif argparse_is_flag(arg)
+      var idx = argparser_find(p, arg)
+      if idx >= 0
+        var kind = p.kinds[idx]
+        var long_name = p.long_names[idx]
+        if kind == "F"
+          keys.push(long_name)
+          vals.push("1")
+          i += 1
+        else
+          # OPTION or OPTION_REPEAT - consume next arg as value
+          i += 1
+          if i < n
+            keys.push(long_name)
+            vals.push(argv[i])
+          else
+            if strict == 1
+              print("error: ")
+              print(arg)
+              puts(" requires a value")
+            end
+          end
+          i += 1
+        end
+      else
+        # Unknown flag
+        if strict == 1
+          print("error: unknown option '")
+          print(arg)
+          puts("'")
+          argparser_print_help(p)
+          exit(1)
+        end
+        i += 1
+      end
+    else
+      # Not a flag - subcommand or positional
+      if found_command == 0
+        var cmd_idx = argparser_find_command(p, arg)
+        if cmd_idx >= 0
+          command = arg
+          found_command = 1
+          i += 1
+        else
+          positionals.push(arg)
+          i += 1
+        end
+      else
+        positionals.push(arg)
+        i += 1
+      end
+    end
+  end
+
+  return ParsedArgs { keys: keys, values: vals, positionals: positionals, command: command }
+end
+
+## Internal helper: check key in parallel vecs.
+def parsed_has_in(keys: Vec<String>, vals: Vec<String>, name: String): Int
+  var i = 0
+  var count = keys.size
+  while i < count
+    if keys[i] == name
+      return 1
+    end
+    i += 1
+  end
+  return 0
+end
+
+## Check if a flag or option was provided.
+def parsed_has(args: ParsedArgs, name: String): Int = parsed_has_in(args.keys, args.values, name)
+
+## Get the value of an option. Returns empty string if not found.
+def parsed_get(args: ParsedArgs, name: String): String
+  var i = 0
+  var count = args.keys.size
+  while i < count
+    if args.keys[i] == name
+      return args.values[i]
+    end
+    i += 1
+  end
+  return ""
+end
+
+## Get all values for a repeatable option.
+def parsed_get_all(args: ParsedArgs, name: String): Vec<String>
+  var result = vec_new<String>()
+  var i = 0
+  var count = args.keys.size
+  while i < count
+    if args.keys[i] == name
+      result.push(args.values[i])
+    end
+    i += 1
+  end
+  return result
+end
+
+## Get the matched subcommand name.
+def parsed_command(args: ParsedArgs): String = args.command
+
+## Get a positional argument by index.
+def parsed_positional(args: ParsedArgs, index: Int): String
+  if index < 0
+    return ""
+  end
+  if index >= args.positionals.size
+    return ""
+  end
+  return args.positionals[index]
+end
+
+## Print formatted help text.
+def argparser_print_help(p: ArgParser): Void
+  puts("#{p.prog_name} #{p.prog_version}")
+  if str_byte_len(p.prog_desc) > 0
+    puts(p.prog_desc)
+  end
+  puts("")
+
+  # Commands section
+  var has_commands = 0
+  var i = 0
+  while i < p.count
+    if p.kinds[i] == "C"
+      has_commands = 1
+      break
+    end
+    i += 1
+  end
+
+  if has_commands == 1
+    puts("Commands:")
+    i = 0
+    while i < p.count
+      if p.kinds[i] == "C"
+        var name = p.long_names[i]
+        var desc = p.descriptions[i]
+        print("  ")
+        print(name)
+        var pad = 20 - str_byte_len(name) - 2
+        for k in 0..pad
+          print(" ")
+        end
+        puts(desc)
+      end
+      i += 1
+    end
+    puts("")
+  end
+
+  # Options section
+  puts("Options:")
+  i = 0
+  while i < p.count
+    var kind = p.kinds[i]
+    if kind != "C"
+      var short_name = p.short_names[i]
+      var long_name = p.long_names[i]
+      var desc = p.descriptions[i]
+      var col = 2
+      print("  ")
+      if str_byte_len(short_name) > 0
+        print(short_name)
+        print(", ")
+        col += str_byte_len(short_name) + 2
+      else
+        print("    ")
+        col += 4
+      end
+      print(long_name)
+      col += str_byte_len(long_name)
+      if kind == "O"
+        print(" VALUE")
+        col += 6
+      end
+      if kind == "R"
+        print(" VALUE")
+        col += 6
+      end
+      var pad = 30 - col
+      if pad < 2
+        pad = 2
+      end
+      for k in 0..pad
+        print(" ")
+      end
+      puts(desc)
+    end
+    i += 1
+  end
+end
+
+# ============================================================================
+# CLI Entry Point
+# ============================================================================
+
+def main(): Int
+  var cli = argparser_new("quartz", QUARTZ_VERSION, "The Quartz compiler")
+
+  # Subcommands
+  argparser_command(cli, "build", "Compile source (use -o for binary output)")
+  argparser_command(cli, "check", "Type-check without emitting IR")
+  argparser_command(cli, "run",   "Compile and execute")
+  argparser_command(cli, "fmt",   "Format source code")
+  argparser_command(cli, "lint",  "Lint for style issues")
+  argparser_command(cli, "doc",   "Generate API documentation")
+  argparser_command(cli, "lsp",   "Start Language Server Protocol server")
+  argparser_command(cli, "repl",  "Start interactive REPL")
+
+  # Flags
+  argparser_flag(cli,   "-d", "--debug",          "Enable debug info")
+  argparser_flag(cli,   "-n", "--no-opt",          "Disable optimizations")
+  argparser_flag(cli,   "",   "--overflow-check",  "Enable overflow checks")
+  argparser_flag(cli,   "",   "--exclusivity-check", "Enable dynamic exclusivity (borrow) checks")
+
+  # Options
+  argparser_option(cli, "-O", "--opt-level",   "Optimization level (0-3)")
+  argparser_option(cli, "-t", "--target",      "Compilation target triple")
+  argparser_option(cli, "-b", "--backend",     "Code generation backend: llvm (default), c, or wasm")
+  argparser_option(cli, "",   "--stdlib-path", "Path to standard library")
+  argparser_option(cli, "",   "--explain",     "Explain an error code (e.g. QZ1205)")
+  argparser_option(cli, "",   "--error-format", "Output format: text (default) or json")
+  argparser_option(cli, "",   "--config",       "Path to .quartzlint config file")
+  argparser_flag(cli,   "",   "--fix",          "Auto-fix lint issues (modifies source files)")
+  argparser_option_repeat(cli, "-I", "--include", "Add include search path")
+  argparser_flag(cli,   "",   "--no-cache",      "Disable build cache")
+  argparser_option(cli, "",   "--cache-dir",     "Build cache directory (default: .quartz-cache). Use per-worker dirs (e.g. .quartz-cache-w0) to enable safe parallel cache sharing across qspec workers.")
+  argparser_flag(cli,   "",   "--explain-cache", "Show cache decisions for each module")
+  argparser_flag(cli,   "",   "--cache-ro",      "Read-only cache: read .qzmod artifacts but never write (parallel-safe; used by qspec)")
+  argparser_flag(cli,   "",   "--separate",      "Emit per-module .ll files for separate compilation")
+  argparser_flag(cli,   "",   "--stack-alloc",   "Enable stack allocation for @value struct returns (requires opt -O1+)")
+  argparser_option(cli, "-o", "--output",     "Output binary path (build to binary instead of IR)")
+  argparser_option(cli, "",   "--ir-output",  "Write LLVM IR to PATH instead of stdout (Phase 5.0b — used by the persistent-worker dispatcher to capture IR per-request without redirecting the worker's stdout)")
+  argparser_flag(cli,   "",   "--release",      "Release mode: apply opt -O2 and strip debug info")
+  argparser_flag(cli,   "",   "--memory-stats", "Report peak RSS memory usage per phase")
+  argparser_flag(cli,   "",   "--progress",     "Emit NDJSON progress events to stderr (one per phase)")
+  argparser_flag(cli,   "",   "--alloc-track",  "Track per-site allocation totals; emit top-20 at compile_done")
+  argparser_flag(cli,   "",   "--dump-effects", "Print inferred effects for all functions")
+  argparser_flag(cli,   "",   "--dump-effect-rows", "Print per-function effect rows from `can` clauses (post-typecheck)")
+  argparser_flag(cli,   "",   "--dump-effect-decls", "Print per-op effect declarations with classified kind (post-typecheck)")
+  argparser_flag(cli,   "",   "--test-row-unify", "Run embedded tc_row_unify acceptance tests and exit (B.4 dev flag)")
+  argparser_flag(cli,   "",   "--test-row-subst", "Run embedded tc_row_substitute / occurs-check tests and exit (B.5 dev flag)")
+  argparser_flag(cli,   "",   "--test-row-subsume", "Run embedded tc_row_subsume tests and exit (B.6 dev flag)")
+  argparser_flag(cli,   "",   "--race",         "Enable data race detection (instrument memory accesses)")
+  argparser_option(cli, "",   "--feature",      "Enable compile-time feature flag for @cfg(feature: \"name\")")
+  argparser_option(cli, "",   "--emit-deps",    "Resolve imports only; write every source path to the given file and exit")
+  argparser_flag(cli,   "",   "--persistent-worker", "Phase 5.0b — run as a long-lived compile worker. Connect-back to a TCP listener on 127.0.0.1:--connect-port, then loop reading length-prefixed JSON WorkRequest frames and writing WorkResponse frames. Used by `quake qspec` parallel mode (Phase 5.0c).")
+  argparser_option(cli, "",   "--connect-port", "Phase 5.0b — TCP port the persistent worker should connect back to (required when --persistent-worker is set; runner listens on 127.0.0.1:PORT and spawns each worker with the kernel-assigned port baked in).")
+
+  var args = argparser_parse_args(cli)
+
+  # Phase 5.0b — persistent worker mode. Intercept BEFORE any subcommand
+  # dispatch: --persistent-worker repurposes this binary as a per-request
+  # compile daemon. CLI flags / subcommands inside main() don't apply;
+  # the worker dispatch loop builds its own per-request ParsedArgs from
+  # WorkRequest.argv and routes through do_build directly.
+  if parsed_has(args, "--persistent-worker") == 1
+    var port_str = parsed_get(args, "--connect-port")
+    if str_byte_len(port_str) == 0
+      eputs("error: --persistent-worker requires --connect-port PORT\n")
+      return 1
+    end
+    var port = str_to_int(port_str)
+    return _run_persistent_worker(cli, port)
+  end
+
+  # Handle --explain before anything else
+  var explain_code = parsed_get(args, "--explain")
+  if str_byte_len(explain_code) > 0
+    puts(explain::explain_error(explain_code))
+    return 0
+  end
+
+  # Operation Piezoelectric Effects, B.4: developer flag that runs the
+  # embedded tc_row_unify acceptance tests and exits without touching
+  # any source file. Used by spec/qspec/effect_row_unify_spec.qz.
+  if parsed_has(args, "--test-row-unify") == 1
+    typecheck_registry::tc_run_unify_tests()
+    return 0
+  end
+  if parsed_has(args, "--test-row-subst") == 1
+    typecheck_registry::tc_run_subst_tests()
+    return 0
+  end
+  if parsed_has(args, "--test-row-subsume") == 1
+    typecheck_registry::tc_run_subsume_tests()
+    return 0
+  end
+
+  var cmd = parsed_command(args)
+
+  # If no subcommand, default to build if there's a source file
+  if str_byte_len(cmd) == 0
+    var file = parsed_positional(args, 0)
+    if str_byte_len(file) == 0
+      argparser_print_help(cli)
+      return 1
+    end
+    cmd = "build"
+  end
+
+  # Dispatch
+  match cmd
+    "build" => return do_build(args)
+    "check" => {
+      # TODO: suppress LLVM IR output for check-only mode
+      return do_build(args)
+    }
+    "run" => return do_run(args)
+    "fmt" => {
+      puts("Error: 'fmt' command is not yet available (requires bootstrap compiler fixes for tool imports)")
+      return 1
+    }
+    "lint" => return do_lint(args)
+    "lsp" => return _run_lsp()
+    "repl" => return _run_repl()
+    "doc" => {
+      puts("Error: 'doc' command runs as a separate tool.")
+      puts("Usage: quartz doc [--output DIR] [serve [--port PORT] [--theme THEME]]")
+      puts("")
+      puts("Build and run the doc tool:")
+      puts("  cd tools && ../self-hosted/bin/quartz build -I ../self-hosted/frontend doc.qz | \\")
+      puts("    llc -o doc.o -filetype=obj && clang doc.o -o doc && ./doc")
+      return 1
+    }
+    _ => {
+      puts("Error: unknown command '#{cmd}'")
+      return 1
+    }
+  end
+end
+
+## Run the compilation pipeline from parsed arguments.
+def do_build(args: ParsedArgs): Int
+  var file = parsed_positional(args, 0)
+  if str_byte_len(file) == 0
+    puts("Error: no source file specified")
+    puts("Usage: quartz build [options] <source.qz>")
+    return 1
+  end
+
+  # Collect include paths
+  var import_paths = parsed_get_all(args, "--include")
+
+  # Prepend stdlib path if specified, or auto-detect from binary location
+  var stdlib_path = parsed_get(args, "--stdlib-path")
+  if str_byte_len(stdlib_path) == 0
+    stdlib_path = getenv("QUARTZ_STDLIB_PATH")
+  end
+  if str_byte_len(stdlib_path) == 0
+    stdlib_path = detect_stdlib_path()
+  end
+  if str_byte_len(stdlib_path) > 0
+    var with_stdlib = vec_new<String>()
+    with_stdlib.push(stdlib_path)
+    # Also prepend project root so std-internal `import std/...` forms
+    # (std/style.qz, std/terminal.qz, std/net/*) resolve without explicit -I .
+    var project_root = detect_project_root()
+    if str_byte_len(project_root) > 0
+      with_stdlib.push(project_root)
+    end
+    each(import_paths, p: String -> with_stdlib.push(p))
+    import_paths = with_stdlib
+  end
+
+  # Ensure include paths end with /
+  var fixed_paths = vec_new<String>()
+  for pi in 0..import_paths.size
+    var p = import_paths[pi]
+    var plen = str_byte_len(p)
+    if plen > 0
+      var last_char = str_byte_at(p, plen - 1)
+      if last_char != '/'
+        p = "#{p}/"
+      end
+    end
+    fixed_paths.push(p)
+  end
+  import_paths = fixed_paths
+
+  # Read flags
+  var debug_mode = parsed_has(args, "--debug")
+  var no_opt = parsed_has(args, "--no-opt")
+  var overflow_check = parsed_has(args, "--overflow-check")
+  var exclusivity_check = parsed_has(args, "--exclusivity-check")
+  var stack_alloc = parsed_has(args, "--stack-alloc")
+  var race_mode = parsed_has(args, "--race")
+
+  # When producing a binary (-o flag), enable stack_alloc by default
+  # (safe with optimization, which is also default for binary output).
+  var output_path_check = parsed_get(args, "--output")
+  if str_byte_len(output_path_check) > 0
+    if debug_mode == 0 and no_opt == 0
+      stack_alloc = 1
+    end
+  end
+
+  # Error format
+  var error_format = parsed_get(args, "--error-format")
+  if error_format == "json"
+    diagnostic::diag_set_format(1)
+  end
+
+  # Optimization level
+  var opt_str = parsed_get(args, "--opt-level")
+  if str_byte_len(opt_str) > 0
+    var opt_char = str_byte_at(opt_str, 0)
+    if opt_char >= '0'
+      if opt_char <= '3'
+        if opt_char == '0'
+          no_opt = 1
+        end
+      end
+    end
+  end
+
+  # Target
+  var target = parsed_get(args, "--target")
+  if str_byte_len(target) == 0
+    target = get_host_target()
+  end
+
+  # Backend
+  g_backend = parsed_get(args, "--backend")
+
+  # Feature flags for @cfg(feature: "name") conditional compilation
+  var feature = parsed_get(args, "--feature")
+  if str_byte_len(feature) > 0
+    cfg::cfg_add_feature(feature)
+  end
+
+  # A.6 Pass 3: --memory-stats and --progress now configure the
+  # Profile default handler directly. Both setters capture the wall-
+  # time anchor on first enable; phase markers (prof_phase) +
+  # samples (prof_sample) + spans (prof_span_*) flow through the
+  # Profile effect's gate-and-emit handler.
+  profile::profile_set_human(parsed_has(args, "--memory-stats"))
+  profile::profile_set_ndjson(parsed_has(args, "--progress"))
+  profile::profile_set_alloc_track(parsed_has(args, "--alloc-track"))
+  if profile::profile_get_ndjson() == 1
+    prof_phase("compile_start")
+  end
+
+  # Effect inference dump
+  g_dump_effects = parsed_has(args, "--dump-effects")
+  g_dump_effect_rows = parsed_has(args, "--dump-effect-rows")
+  g_dump_effect_decls = parsed_has(args, "--dump-effect-decls")
+
+  # --emit-deps: when set, compile() stops after resolution, writes the
+  # transitively-imported path list to this file, and returns a non-empty
+  # sentinel so do_build treats it as success. We use an in-band string
+  # marker so the existing `str_byte_len(ir) == 0` failure check still works.
+  g_emit_deps_path = parsed_get(args, "--emit-deps")
+
+  var source = fio_read(file)
+
+  # --- Incremental compilation cache ---
+  var no_cache = parsed_has(args, "--no-cache")
+  var explain_cache = parsed_has(args, "--explain-cache")
+  var cache_dir = parsed_get(args, "--cache-dir")
+  if str_byte_len(cache_dir) == 0
+    cache_dir = ".quartz-cache"
+  end
+
+  if no_cache == 0
+    if explain_cache == 1
+      build_cache::cache_set_explain(1)
+    end
+    build_cache::cache_open(cache_dir)
+    if parsed_has(args, "--cache-ro") == 1
+      build_cache::cache_set_read_only()
+    end
+  end
+
+  var separate = parsed_has(args, "--separate")
+
+  var release_mode = parsed_has(args, "--release")
+
+  # WASM backend: set output path before compile so it writes binary directly
+  var output_path = parsed_get(args, "--output")
+  if g_backend == "wasm" and str_byte_len(output_path) > 0
+    _set_wasm_output_path(output_path)
+  end
+
+  var ir = compile(source, file, import_paths, debug_mode, target, no_opt, overflow_check, separate, stack_alloc, race_mode, exclusivity_check)
+  if str_byte_len(ir) == 0
+    return 1
+  end
+
+  # --emit-deps short-circuit: compile() wrote the dep list and returned a
+  # sentinel. Don't emit IR, just exit cleanly.
+  if ir == "__emit_deps_ok__"
+    return 0
+  end
+
+  # WASM backend with -o: file already written by backend, ir is status message
+  if g_backend == "wasm"
+    if str_byte_len(output_path) > 0
+      eputs(ir + "\n")
+    else
+      puts(ir)
+    end
+    return 0
+  end
+
+  # WASM text backend: output WAT text
+  if g_backend == "wasm-text"
+    if str_byte_len(output_path) > 0
+      var _wr = fio_write(output_path, ir)
+      eputs("wat:#{output_path}")
+    else
+      puts(ir)
+    end
+    return 0
+  end
+
+  # Check for -o flag: build to binary instead of printing IR
+  if str_byte_len(output_path) > 0
+    # Optimize by default when producing binaries.
+    # --debug or --no-opt disables optimization.
+    var optimize = 1
+    if debug_mode == 1 or no_opt == 1
+      optimize = 0
+    end
+    return build_binary(ir, output_path, optimize)
+  end
+
+  # Phase 5.0b — `--ir-output PATH` writes IR text to a file instead of
+  # stdout. The persistent-worker dispatcher uses this so per-request IR
+  # lands in a worker-local tmpfile without fighting for the worker's
+  # stdout (which is reserved for non-protocol diagnostics).
+  var ir_output_path = parsed_get(args, "--ir-output")
+  if str_byte_len(ir_output_path) > 0
+    var _wrote = fio_write(ir_output_path, ir)
+    return 0
+  end
+
+  if separate == 1
+    # In separate mode, ir is the manifest (list of .ll files written)
+    # Don't print to stdout — files were already written
+    eputs(ir)
+  else
+    puts(ir)
+  end
+  return 0
+end
+
+# ============================================================================
+# Build to Binary Pipeline
+# ============================================================================
+
+## Decode system() wait status into an exit code.
+def decode_wait_status(raw: Int): Int
+  var signaled = band(raw, 127)
+  if signaled != 0
+    return 128 + signaled
+  end
+  return band(shr(raw, 8), 255)
+end
+
+## WASM backend wrappers — gated behind @cfg(feature: "wasm").
+## When the wasm feature is disabled, these are stubs that report an error.
+@cfg(feature: "wasm")
+def _compile_wasm(mir_prog: mir::MirProgram, all_funcs: Vec<ResolverEntry>): String
+  return codegen_wasm::cg_wasm_codegen(mir_prog, all_funcs)
+end
+
+@cfg(not: feature: "wasm")
+def _compile_wasm(mir_prog: mir::MirProgram, all_funcs: Vec<ResolverEntry>): String
+  eputs("error: WASM backend not available (compile with --feature wasm)")
+  exit(1)
+  return ""
+end
+
+@cfg(feature: "wasm")
+def _compile_wasm_text(mir_prog: mir::MirProgram, all_funcs: Vec<ResolverEntry>): String
+  return codegen_wasm::cg_wasm_text_codegen(mir_prog, all_funcs)
+end
+
+@cfg(not: feature: "wasm")
+def _compile_wasm_text(mir_prog: mir::MirProgram, all_funcs: Vec<ResolverEntry>): String
+  eputs("error: WASM backend not available (compile with --feature wasm)")
+  exit(1)
+  return ""
+end
+
+@cfg(feature: "wasm")
+def _set_wasm_output_path(path: String): Void
+  codegen_wasm::g_wasm_output_path = path
+end
+
+@cfg(not: feature: "wasm")
+def _set_wasm_output_path(path: String): Void
+end
+
+## LSP server wrapper — gated behind @cfg(feature: "lsp").
+@cfg(feature: "lsp")
+def _run_lsp(): Int = lsp::lsp_main()
+
+@cfg(not: feature: "lsp")
+def _run_lsp(): Int
+  eputs("error: LSP server not available (compile with --feature lsp)")
+  return 1
+end
+
+## E-graph optimization wrapper — gated behind @cfg(feature: "egraph").
+## When disabled, MIR optimization is skipped (default-off because the
+## self-compile uses --no-opt anyway and the egraph module is ~3000 LOC
+## of dead weight in the typical build).
+@cfg(feature: "egraph")
+def _maybe_egraph_optimize(mir_prog: mir::MirProgram, overflow_check: Int): Void
+  egraph_opt::mir_egraph_optimize(mir_prog, overflow_check)
+end
+
+@cfg(not: feature: "egraph")
+def _maybe_egraph_optimize(mir_prog: mir::MirProgram, overflow_check: Int): Void
+end
+
+## REPL wrapper — gated behind @cfg(feature: "repl").
+@cfg(feature: "repl")
+def _run_repl(): Int = repl::repl_main()
+
+@cfg(not: feature: "repl")
+def _run_repl(): Int
+  eputs("error: REPL not available (compile with --feature repl)")
+  return 1
+end
+
+## Platform-specific linker stack size flag.
+@cfg(os: "macos")
+def _linker_stack_flag(): String = "-Wl,-stack_size,0x2000000"
+
+@cfg(os: "linux")
+def _linker_stack_flag(): String = ""
+
+## Compile IR string to a native binary at output_path.
+## If release is true, applies opt -O2 and strips debug info.
+## Returns 0 on success, 1 on failure.
+def build_binary(ir: String, output_path: String, release: Int): Int
+  var ir_path = "/tmp/_quartz_build.ll"
+  var opt_path = "/tmp/_quartz_build_opt.ll"
+  var obj_path = "/tmp/_quartz_build.o"
+  var err_path = "/tmp/_quartz_build.err"
+
+  var _wr = fio_write(ir_path, ir)
+
+  # Step 1: Optimize (release mode only)
+  var llc_input = ir_path
+  if release == 1
+    var opt_sb = sb_new()
+    sb_append(opt_sb, "opt -O2 ")
+    sb_append(opt_sb, ir_path)
+    sb_append(opt_sb, " -o ")
+    sb_append(opt_sb, opt_path)
+    sb_append(opt_sb, " -S 2>")
+    sb_append(opt_sb, err_path)
+    var opt_raw = system(sb_to_string(opt_sb))
+    if decode_wait_status(opt_raw) != 0
+      var opt_err = fio_read(err_path)
+      eputs("error: opt failed: #{opt_err}")
+      file_delete(ir_path)
+      file_delete(opt_path)
+      file_delete(err_path)
+      return 1
+    end
+    llc_input = opt_path
+  end
+
+  # Step 2: Assemble to object file
+  var llc_sb = sb_new()
+  sb_append(llc_sb, "llc -filetype=obj ")
+  if release == 1
+    sb_append(llc_sb, "-O2 ")
+  end
+  sb_append(llc_sb, llc_input)
+  sb_append(llc_sb, " -o ")
+  sb_append(llc_sb, obj_path)
+  sb_append(llc_sb, " 2>")
+  sb_append(llc_sb, err_path)
+  var llc_raw = system(sb_to_string(llc_sb))
+  if decode_wait_status(llc_raw) != 0
+    var llc_err = fio_read(err_path)
+    eputs("error: llc failed: #{llc_err}")
+    file_delete(ir_path)
+    file_delete(opt_path)
+    file_delete(obj_path)
+    file_delete(err_path)
+    return 1
+  end
+
+  # Step 3: Link to binary
+  var cc_sb = sb_new()
+  sb_append(cc_sb, "clang ")
+  if release == 0
+    sb_append(cc_sb, "-g ")
+  end
+  var stack_flag = _linker_stack_flag()
+  if str_byte_len(stack_flag) > 0
+    sb_append(cc_sb, stack_flag)
+    sb_append(cc_sb, " ")
+  end
+  sb_append(cc_sb, obj_path)
+  sb_append(cc_sb, " -o ")
+  sb_append(cc_sb, output_path)
+  sb_append(cc_sb, " 2>")
+  sb_append(cc_sb, err_path)
+  var cc_raw = system(sb_to_string(cc_sb))
+  if decode_wait_status(cc_raw) != 0
+    var cc_err = fio_read(err_path)
+    eputs("error: clang link failed: #{cc_err}")
+    file_delete(ir_path)
+    file_delete(opt_path)
+    file_delete(obj_path)
+    file_delete(err_path)
+    return 1
+  end
+
+  # Cleanup temp files
+  file_delete(ir_path)
+  file_delete(opt_path)
+  file_delete(obj_path)
+  file_delete(err_path)
+  return 0
+end
+
+## Lint a source file for style and correctness issues.
+## Lint subcommand — gated behind @cfg(feature: "lint"). The full
+## implementation pulls in the ~2400-LOC tools/lint.qz module, which is
+## dead weight for the typical compile path. Default-off; users enable
+## with `quartz --feature lint lint <file>`.
+@cfg(feature: "lint")
+def do_lint(args: ParsedArgs): Int
+  var file = parsed_positional(args, 0)
+  if str_byte_len(file) == 0
+    puts("Error: no source file specified")
+    puts("Usage: quartz lint [options] <source.qz>")
+    return 1
+  end
+
+  var source = fio_read(file)
+  if str_byte_len(source) == 0
+    puts("Error: could not read file '#{file}'")
+    return 1
+  end
+
+  # Set error format if requested
+  var fmt = parsed_get(args, "--error-format")
+  if fmt == "json"
+    diagnostic::diag_set_format(2)
+  end
+
+  # Load config
+  var config = lint::lint_default_config()
+  var config_path = parsed_get(args, "--config")
+  if str_byte_len(config_path) == 0
+    config_path = lint::lint_find_config()
+  end
+  if str_byte_len(config_path) > 0
+    config = lint::lint_load_config(config_path)
+  end
+
+  # Tier 1: Text-based rules (always run, even on broken files)
+  var result = lint::lint_file_with_config(source, file, config)
+
+  # Tier 2: AST-based rules (only if file parses successfully)
+  var interner = string_intern::intern_global()
+  var lex_result = lexer::lexer_tokenize(source, interner)
+  var types = lex_result.get_types()
+  var lexemes = lex_result.get_lexemes()
+  var lines = lex_result.get_lines()
+  var cols = lex_result.get_cols()
+  var count = lex_result.token_count()
+  # CST parse for the lint Tier-2 surface. Tier-2 runs only on a clean parse.
+  var cst_res = cst_parser::cst_parse_source(source)
+  if cst_res.parser.had_error == 0
+    var cst_storage = ast::ast_new_storage()
+    var cst_program = cst_lower::cst_lower(cst_res.parser.store, cst_res.root, cst_storage)
+    var src_lines = diagnostic::diag_split_source(source)
+    lint::lint_tier2(cst_storage, cst_program, source, file, src_lines, config, result)
+  end
+
+  # Apply fixes if --fix flag is set
+  var apply_fix = parsed_has(args, "--fix")
+  if apply_fix and result.fixes.size() > 0
+    var fixed_source = lint::lint_apply_fixes(source, result.fixes)
+    var _wr = fio_write(file, fixed_source)
+    puts("Applied #{result.fixes.size()} fix(es) to #{file}.")
+    return 0
+  end
+
+  lint::lint_result_emit(result)
+
+  if result.count == 0
+    puts("No issues found.")
+  else
+    puts("#{result.count} issue(s) found.")
+  end
+
+  return result.count > 0
+end
+
+@cfg(not: feature: "lint")
+def do_lint(args: ParsedArgs): Int
+  eputs("error: lint subcommand not available (recompile quartz with --feature lint)")
+  return 1
+end
+
+## Run the compile-and-execute pipeline from parsed arguments.
+def do_run(args: ParsedArgs): Int
+  var file = parsed_positional(args, 0)
+  if str_byte_len(file) == 0
+    puts("Error: no source file specified")
+    puts("Usage: quartz run [options] <source.qz> [-- program args...]")
+    return 1
+  end
+
+  # Collect include paths
+  var import_paths = parsed_get_all(args, "--include")
+
+  # Prepend stdlib path if specified, or auto-detect from binary location
+  var stdlib_path = parsed_get(args, "--stdlib-path")
+  if str_byte_len(stdlib_path) == 0
+    stdlib_path = getenv("QUARTZ_STDLIB_PATH")
+  end
+  if str_byte_len(stdlib_path) == 0
+    stdlib_path = detect_stdlib_path()
+  end
+  if str_byte_len(stdlib_path) > 0
+    var with_stdlib = vec_new<String>()
+    with_stdlib.push(stdlib_path)
+    # Also prepend project root so std-internal `import std/...` forms
+    # (std/style.qz, std/terminal.qz, std/net/*) resolve without explicit -I .
+    var project_root = detect_project_root()
+    if str_byte_len(project_root) > 0
+      with_stdlib.push(project_root)
+    end
+    each(import_paths, p: String -> with_stdlib.push(p))
+    import_paths = with_stdlib
+  end
+
+  # Ensure include paths end with /
+  var fixed_paths = vec_new<String>()
+  for pi in 0..import_paths.size
+    var p = import_paths[pi]
+    var plen = str_byte_len(p)
+    if plen > 0
+      var last_char = str_byte_at(p, plen - 1)
+      if last_char != '/'
+        p = "#{p}/"
+      end
+    end
+    fixed_paths.push(p)
+  end
+  import_paths = fixed_paths
+
+  # Read flags
+  var debug_mode = parsed_has(args, "--debug")
+  var no_opt = parsed_has(args, "--no-opt")
+  var overflow_check = parsed_has(args, "--overflow-check")
+  var exclusivity_check = parsed_has(args, "--exclusivity-check")
+  var stack_alloc = parsed_has(args, "--stack-alloc")
+  var race_mode = parsed_has(args, "--race")
+
+  # quartz run always produces a binary — enable stack_alloc by default
+  if debug_mode == 0 and no_opt == 0
+    stack_alloc = 1
+  end
+
+  # Error format
+  var error_format = parsed_get(args, "--error-format")
+  if error_format == "json"
+    diagnostic::diag_set_format(1)
+  end
+
+  # Optimization level
+  var opt_str = parsed_get(args, "--opt-level")
+  if str_byte_len(opt_str) > 0
+    var opt_char = str_byte_at(opt_str, 0)
+    if opt_char >= '0'
+      if opt_char <= '3'
+        if opt_char == '0'
+          no_opt = 1
+        end
+      end
+    end
+  end
+
+  # Target
+  var target = parsed_get(args, "--target")
+  if str_byte_len(target) == 0
+    target = get_host_target()
+  end
+
+  # Backend
+  g_backend = parsed_get(args, "--backend")
+
+  var source = fio_read(file)
+
+  # Cache
+  var no_cache = parsed_has(args, "--no-cache")
+  var explain_cache = parsed_has(args, "--explain-cache")
+  var cache_dir = parsed_get(args, "--cache-dir")
+  if str_byte_len(cache_dir) == 0
+    cache_dir = ".quartz-cache"
+  end
+  if no_cache == 0
+    if explain_cache == 1
+      build_cache::cache_set_explain(1)
+    end
+    build_cache::cache_open(cache_dir)
+    if parsed_has(args, "--cache-ro") == 1
+      build_cache::cache_set_read_only()
+    end
+  end
+
+  # Compile to IR
+  var ir = compile(source, file, import_paths, debug_mode, target, no_opt, overflow_check, 0, stack_alloc, race_mode, exclusivity_check)
+  if str_byte_len(ir) == 0
+    return 1
+  end
+
+  # Build to temp binary — optimize by default
+  var tmp_bin = "/tmp/_quartz_run_bin"
+  var optimize = 1
+  if debug_mode == 1 or no_opt == 1
+    optimize = 0
+  end
+  var build_result = build_binary(ir, tmp_bin, optimize)
+  if build_result != 0
+    return 1
+  end
+
+  # Execute the binary, forwarding any args after --
+  var run_sb = sb_new()
+  sb_append(run_sb, tmp_bin)
+  # Forward positional args beyond the source file
+  for ai in 1..args.positionals.size
+    sb_append(run_sb, " ")
+    sb_append(run_sb, args.positionals[ai])
+  end
+  var run_raw = system(sb_to_string(run_sb))
+  var exit_code = decode_wait_status(run_raw)
+
+  # Cleanup
+  file_delete(tmp_bin)
+
+  return exit_code
+end
+
+# ============================================================================
+# Phase 5.0b — Persistent worker mode
+# ============================================================================
+#
+# Invoked as `quartz --persistent-worker --connect-port=PORT`. The process
+# opens a TCP connection to 127.0.0.1:PORT (the runner's listener), then
+# loops reading length-prefixed JSON WorkRequest frames over that socket
+# and writing WorkResponse frames back. Each compile request runs through
+# the existing do_build pipeline with --ir-output redirecting LLVM IR to
+# a worker-local tmpfile so the worker's stdout stays free for diagnostics.
+#
+# v0 scope: serial dispatch (no in-flight overlap, no preemptive cancel).
+# Per-request stderr capture is wired (Phase 5.0c.1): if req.stderr_path
+# is non-empty, _pworker_compile redirects fd-2 to that path for the
+# duration of the compile via qz_redirect_stderr_to_file / qz_restore_stderr
+# (the FILE* underlying @stderr / @__stderrp is rebased in place; eputs
+# from typecheck/parser etc. land in the runner-named path).
+# State accumulation across requests (cache_open / dep_graph / global g_*
+# vars) remains the fsc-trap risk flagged in docs/design/QUARTZD.md D5;
+# the frozen-stdlib-base refactor in 5.0f is the load-bearing fix.
+
+## Read exactly N bytes from a TCP stream. Returns "" on EOF or socket
+## error. Binary-safe: uses raw socket_recv into a malloc'd buffer, then
+## materializes a Quartz string via cptr_to_string_with_len so embedded
+## NUL bytes (common in length prefixes — any body < 256 has 3 zero
+## bytes in the 4-byte LE prefix) are preserved.
+def _pworker_read_exact(stream: TcpStream, n: Int): String
+  if n <= 0
+    return ""
+  end
+  var buf = qz_malloc(n)
+  if buf == 0
+    return ""
+  end
+  var got = 0
+  while got < n
+    var bytes = socket::socket_recv(stream.fd, buf + got, n - got, 0)
+    if bytes <= 0
+      mem_free(buf)
+      return ""
+    end
+    got = got + bytes
+  end
+  var s = cptr_to_string_with_len(buf, n)
+  mem_free(buf)
+  return s
+end
+
+## Read one length-prefixed frame. Returns the FULL frame (4-byte length
+## prefix + body) so callers hand the result directly to decode_request /
+## decode_response. Returns "" on EOF / partial frame.
+def _pworker_read_frame(stream: TcpStream): String
+  var prefix = _pworker_read_exact(stream, 4)
+  if str_byte_len(prefix) != 4
+    return ""
+  end
+  var body_len = read_frame_length(prefix)
+  if body_len < 0
+    return ""
+  end
+  if body_len == 0
+    return prefix
+  end
+  var body = _pworker_read_exact(stream, body_len)
+  if str_byte_len(body) != body_len
+    return ""
+  end
+  return prefix + body
+end
+
+## Binary-safe write to a TCP stream. Loops on partial sends. Returns
+## total bytes sent or -1 on socket error. Bypasses tcp_write's
+## string_to_cstr/strdup path which truncates at the first embedded NUL —
+## a hard-no for length-prefixed frames.
+def _pworker_write_all(stream: TcpStream, data: String): Int
+  var total = str_byte_len(data)
+  if total == 0
+    return 0
+  end
+  var ptr = str_to_ptr(data)
+  var sent = 0
+  while sent < total
+    var n = socket::socket_send(stream.fd, ptr + sent, total - sent, 0)
+    if n < 0
+      return -1
+    end
+    sent = sent + n
+  end
+  return sent
+end
+
+## Wall time elapsed since `start_ns`, in milliseconds.
+def _pworker_ms_since(start_ns: Int): Int
+  return (time_mono_ns() - start_ns) / 1000000
+end
+
+## Build a WorkResponse for a control request (ping, shutdown) that
+## completed successfully without producing IR.
+def _pworker_ok_resp(request_id: Int, duration_ms: Int): WorkResponse
+  return WorkResponse {
+    request_id: request_id,
+    status: RESP_OK(),
+    exit_code: 0,
+    stdout: "",
+    stderr: "",
+    stderr_path: "",
+    ir_path: "",
+    duration_ms: duration_ms,
+  }
+end
+
+## Build a WorkResponse for an error case (decode failure, unknown
+## request kind). The error message ships inline in `stderr`.
+def _pworker_err_resp(request_id: Int, msg: String, duration_ms: Int): WorkResponse
+  return WorkResponse {
+    request_id: request_id,
+    status: RESP_ERROR(),
+    exit_code: 1,
+    stdout: "",
+    stderr: msg,
+    stderr_path: "",
+    ir_path: "",
+    duration_ms: duration_ms,
+  }
+end
+
+## Dispatch a compile request through do_build. argv from WorkRequest is
+## user-form (positional source file at index 0, e.g.
+## ["spec/foo.qz", "-I", "std", "--ir-output", "/tmp/r1.ll"]); the
+## argparser expects argv[0] to be a program name, so we prepend
+## "quartz" before parsing. Honours req.cwd via chdir before the build
+## (relative -I paths and source-file paths resolve correctly).
+def _pworker_compile(cli: ArgParser, req: WorkRequest, start_ns: Int): WorkResponse
+  if str_byte_len(req.cwd) > 0
+    var _cd = chdir(req.cwd)
+  end
+  var full_argv = vec_new<String>()
+  full_argv.push("quartz")
+  for i in 0..req.argv.size
+    full_argv.push(req.argv[i])
+  end
+  var args = argparser_parse_argv(cli, full_argv)
+  var ir_path = parsed_get(args, "--ir-output")
+  var saved_stderr = -1
+  if str_byte_len(req.stderr_path) > 0
+    saved_stderr = qz_redirect_stderr_to_file(req.stderr_path)
+  end
+  var exit_code = do_build(args)
+  if saved_stderr >= 0
+    var _r = qz_restore_stderr(saved_stderr)
+  end
+  var status = RESP_OK()
+  if exit_code != 0
+    status = RESP_ERROR()
+  end
+  return WorkResponse {
+    request_id: req.request_id,
+    status: status,
+    exit_code: exit_code,
+    stdout: "",
+    stderr: "",
+    stderr_path: req.stderr_path,
+    ir_path: ir_path,
+    duration_ms: _pworker_ms_since(start_ns),
+  }
+end
+
+## Process one decoded WorkRequest and produce a WorkResponse.
+def _pworker_handle(cli: ArgParser, req: WorkRequest): WorkResponse
+  var start_ns = time_mono_ns()
+  if req.kind == REQ_PING()
+    return _pworker_ok_resp(req.request_id, _pworker_ms_since(start_ns))
+  end
+  if req.kind == REQ_SHUTDOWN()
+    return _pworker_ok_resp(req.request_id, _pworker_ms_since(start_ns))
+  end
+  if req.kind == REQ_CANCEL()
+    # v0: single-threaded worker has no in-flight request at receive time
+    # (we only read a new frame after writing the previous response). So
+    # we ack with status: cancelled and continue. Phase 5.1 wires real
+    # preemptive cancellation once compile dispatches into a goroutine.
+    return WorkResponse {
+      request_id: req.request_id,
+      status: RESP_CANCELLED(),
+      exit_code: 0,
+      stdout: "",
+      stderr: "",
+      stderr_path: "",
+      ir_path: "",
+      duration_ms: _pworker_ms_since(start_ns),
+    }
+  end
+  if req.kind == REQ_COMPILE()
+    return _pworker_compile(cli, req, start_ns)
+  end
+  return _pworker_err_resp(req.request_id, "unknown request kind: #{req.kind}", _pworker_ms_since(start_ns))
+end
+
+## Main worker dispatch loop. Reads a frame, decodes, dispatches by kind,
+## writes a response frame, repeats. Exits cleanly on EOF / socket error
+## OR after responding to a SHUTDOWN request.
+def _pworker_loop(cli: ArgParser, stream: TcpStream): Int
+  while true
+    var frame = _pworker_read_frame(stream)
+    if str_byte_len(frame) == 0
+      var _close = tcp_close(stream)
+      return 0
+    end
+    var dec = decode_request(frame)
+    var resp = WorkResponse {
+      request_id: 0,
+      status: RESP_ERROR(),
+      exit_code: 1,
+      stdout: "",
+      stderr: "",
+      stderr_path: "",
+      ir_path: "",
+      duration_ms: 0,
+    }
+    var is_shutdown = 0
+    if dec.ok
+      resp = _pworker_handle(cli, dec.request)
+      if dec.request.kind == REQ_SHUTDOWN()
+        is_shutdown = 1
+      end
+    else
+      resp = _pworker_err_resp(0, "decode failed: #{dec.error_msg}", 0)
+    end
+    var encoded = encode_response(resp)
+    var written = _pworker_write_all(stream, encoded)
+    if written < 0
+      var _close = tcp_close(stream)
+      return 1
+    end
+    if is_shutdown == 1
+      var _close = tcp_close(stream)
+      return 0
+    end
+  end
+  return 0
+end
+
+## Persistent worker mode entry point. Connects to 127.0.0.1:port, then
+## runs the dispatch loop. The CLI arg parser is built once by main()
+## and threaded through every per-request dispatch — no per-request
+## flag registration cost.
+def _run_persistent_worker(cli: ArgParser, port: Int): Int
+  var conn = tcp_connect("127.0.0.1", port)
+  match conn
+    TcpResult::Err(e) => {
+      eputs("worker: connect to 127.0.0.1:#{port} failed: #{e.message}\n")
+      return 1
+    }
+    TcpResult::Ok(stream) => {
+      return _pworker_loop(cli, stream)
+    }
+  end
+  return 0
+end

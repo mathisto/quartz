@@ -1,0 +1,211 @@
+# File — Ergonomic file I/O wrappers
+#
+# Convenience functions and a FileHandle struct for file operations.
+# Wraps the built-in open_file/close_file/fread/fwrite/read_file/write_file
+# intrinsics.
+#
+# Example:
+#   import io/file
+#   file_write_all("/tmp/test.txt", "hello world")
+#   var content = file_read_all("/tmp/test.txt")
+#
+# Block-scoped open with throw-safe close (B.8 Phase 5):
+#   import * from std/io/file
+#   with file_scoped("/tmp/out", "w") do f ->
+#     if f != 0
+#       file_writeln(f, "hello")
+#     end
+#   end
+#   # implicit close on normal exit; on throw in "w"/"wb" mode
+#   # release_on_throw also file_delete(path) for rollback.
+# See FileGuard / file_scoped near the bottom of this file.
+
+import string
+import error
+import * from std/scoped
+
+## Read the entire contents of a file as a string.
+def file_read_all(path: String): String
+  return read_file(path)
+end
+
+## Write a string to a file, creating or overwriting it.
+def file_write_all(path: String, content: String): Void
+  var result = write_file(path, content)
+end
+
+## Read the entire contents of a file, returning Result<String, IoError>.
+def file_read(path: String): Result<String, IoError>
+  if not file_exists(path)
+    return Result::Err(io_error("File not found: #{path}", path))
+  end
+  var content = read_file(path)
+  return Result::Ok(content)
+end
+
+## Write a string to a file, returning Result<Int, IoError>.
+## Returns Ok(0) on success.
+def file_write(path: String, content: String): Result<Int, IoError>
+  var result = write_file(path, content)
+  return Result::Ok(0)
+end
+
+## Read a file and split it into lines.
+def file_read_lines(path: String): Vec<String>
+  var content = read_file(path)
+  return str_split(content, "\n")
+end
+
+## Append a string to a file.
+def file_append(path: String, s: String): Void
+  var h = open_file(path, "a")
+  if h != 0
+    var fw_result = fwrite(h, s, str_byte_len(s))
+    var cl_result = close_file(h)
+  end
+end
+
+## Copy a file from src to dst. Returns 1 on success, 0 on failure.
+def file_copy(src: String, dst: String): Int
+  var content = read_file(src)
+  if str_byte_len(content) == 0
+    # Could be empty file or read failure — try to detect
+    if not file_exists(src)
+      return 0
+    end
+  end
+  var wr = write_file(dst, content)
+  return 1
+end
+
+## Check if a file exists at the given path.
+def file_exists_at(path: String): Bool
+  return file_exists(path)
+end
+
+## List directory contents. Returns a Vec of filenames.
+def file_list_dir(path: String): Vec<String>
+  return readdir(path)
+end
+
+## FileHandle — handle-based file I/O for streaming.
+struct FileHandle
+  _handle: Int
+  _path: String
+end
+
+## Open a file with the given mode ("r", "w", "a").
+## Returns a FileHandle. Check .is_open() before using.
+def file_open(path: String, mode: String): FileHandle
+  var h = open_file(path, mode)
+  return FileHandle { _handle: h, _path: path }
+end
+
+extend FileHandle
+  ## Read n bytes from the file.
+  def read(n: Int): String
+    if @_handle == 0
+      return ""
+    end
+    return fread(@_handle, n)
+  end
+
+  ## Read a single line from the file.
+  def read_line(): String
+    if @_handle == 0
+      return ""
+    end
+    return file_read_line(@_handle)
+  end
+
+  ## Write data to the file. Returns number of bytes written.
+  def write_str(data: String): Int
+    if @_handle == 0
+      return 0
+    end
+    return fwrite(@_handle, data, str_byte_len(data))
+  end
+
+  ## Close the file handle.
+  def close(&mut self): Void
+    if @_handle != 0
+      close_file(@_handle)
+      @_handle = 0
+    end
+  end
+
+  ## Return true if the file handle is open.
+  def is_open(): Bool
+    return @_handle != 0
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Scoped file (B.8 Phase 5) — open-on-acquire, close-on-release, with
+# atomic-abort semantics on throw.
+# ---------------------------------------------------------------------------
+#
+# Usage:
+#
+#   with file_scoped("/tmp/out.txt", "w") do h ->
+#     fwrite(h, "hello", 5)
+#   end
+#   # normal exit: close_file(h) — partial OR complete writes commit.
+#   # throw: close_file(h) + file_delete("/tmp/out.txt") — partial-write
+#   # is removed so callers see "either fully written or absent."
+#
+# The asymmetry between release and release_on_throw is the load-bearing
+# Scoped feature: a body that fails mid-write does not leave a corrupt
+# file on disk. Callers that want commit-on-failure-too can construct a
+# FileGuard and override release_on_throw via a separate impl block.
+#
+# The bound `h` is the libc FILE* handle (existentially erased to Int).
+# Use `fwrite(h, str, len)` / `fread(h, n)` / file_read_line(h) inside
+# the body — same surface as FileHandle, just inline access to the raw
+# handle.
+
+## A scoped-file guard. Constructed lazily — open() runs from acquire,
+## NOT from the guard's construction. Pass to `with` to open + auto-close.
+struct FileGuard
+  path: String
+  mode: String
+end
+
+extend FileGuard with Scoped
+  ## Open the file. Blocks on the underlying open syscall, then returns
+  ## the libc FILE* handle (existentially erased to Int). Returns 0 on
+  ## open failure — callers should test `h != 0` inside the body if they
+  ## need to detect open failure (and still get auto-close semantics).
+  def acquire(self): Int = open_file(@path, @mode)
+
+  ## Close the file on normal block exit. fclose flushes any buffered
+  ## writes before closing, so the body's writes commit to disk.
+  def release(self, value: Int): Void
+    if value != 0
+      close_file(value)
+    end
+  end
+
+  ## Close-and-roll-back on exceptional block exit. Closes the handle
+  ## (fclose still flushes — libc has no portable "close without flush"),
+  ## then for write modes ("w" / "wb") unlinks the path so observers see
+  ## no partial-write artifact. Read modes ("r" / "rb") and append modes
+  ## ("a" / "ab") only close — deleting a read-only access would lose
+  ## data; deleting an append target would also erase pre-existing data.
+  ## Callers that want different rollback semantics can wrap a different
+  ## guard struct + impl.
+  def release_on_throw(self, value: Int, exc_msg: String): Void
+    if value != 0
+      close_file(value)
+    end
+    if str_eq(@mode, "w") or str_eq(@mode, "wb")
+      file_delete(@path)
+    end
+  end
+end
+
+## Construct a FileGuard for a `with`-block. Opens lazily — the actual
+## open_file call fires from the guard's `acquire`. Construction is free.
+def file_scoped(path: String, mode: String): FileGuard
+  return FileGuard { path: path, mode: mode }
+end

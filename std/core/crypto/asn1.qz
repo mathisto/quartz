@@ -1,0 +1,690 @@
+## std/core/crypto/asn1 — Minimal DER (X.690) decoder for the TLS 1.3 X.509 path
+##
+## NET.5b.1 substrate. The X.509 layer (NET.5b.2) walks a server certificate
+## as a tree of DER TLV (tag-length-value) triples and pulls out the few
+## fields TLS 1.3 needs (`tbsCertificate.subject`, `subjectPublicKeyInfo`,
+## `validity`, `extensions[*]`, then the outer `signature`). This module
+## ships the primitives that walk does — `der_open_sequence`,
+## `der_read_oid`, `der_read_integer_u64`, etc. — and a single `DerReader`
+## struct that threads `pos` / `err` / `val_ptr` / `val_len` through every
+## call.
+##
+## ## Prior art
+##
+## | Project | What we take from it |
+## |---|---|
+## | BearSSL (Pornin, `src/x509/`) | Enforced **minimal** length + INTEGER encoding (DER, not BER). Hand-coded byte walks, no allocator. The "we only parse what TLS needs" scope discipline. |
+## | rustls-webpki (`der.rs`) | Slice-based, no-copy parse — readers carry `(buf, pos, end)` and helpers return spans into the original buffer. Constructed-type "open" returns a child reader whose lifetime is the parent's value region. |
+## | mbedTLS (`asn1parse.c`) | Sticky-error reader pattern: once `err != 0`, every subsequent helper short-circuits. Final caller checks `err` once at the end. |
+## | OpenSSL `ASN1_*` / Go `encoding/asn1` | What NOT to do — template macros / reflection-driven decoders that pull in ~3k+ LoC. Out of scope for our ~5k-LoC TLS slice. |
+##
+## What v1 ships (per `docs/design/TLS_1_3_DESIGN.md` §"X.509 / DER"):
+##
+## - `DerReader` over a caller-owned `(buf: Int, len: Int)` raw byte span.
+##   No allocation — values returned as `(val_ptr, val_len)` slots on the
+##   reader, pointing into the original buffer.
+## - Tag + length primitives — `_der_read_tag` / `_der_read_length` with
+##   **minimal-form** length enforcement (rejects `0x82 0x00 0xFF`, requires
+##   `0x81 0xFF`).
+## - Specific primitives — `der_read_integer_u64` (unsigned ≤ 8-byte
+##   INTEGER, leading-zero pad accepted), `der_read_integer_span` (raw
+##   bytes for big-ints — RSA moduli, ECDSA r/s, signatures), `der_read_oid`,
+##   `der_read_octet_string`, `der_read_bit_string` (with unused-bits
+##   byte), `der_read_boolean` (strict 0x00/0xFF), `der_read_null`,
+##   `der_read_utctime` / `der_read_generalized_time` (→ unix seconds).
+## - Constructed combinators — `der_open_sequence`, `der_open_set`,
+##   `der_open_context` (explicit context-specific [n]). Each verifies the
+##   tag, returns a *child reader* spanning the value bytes, and advances
+##   the parent past the entire TLV. `der_close(child, parent)` checks the
+##   child was fully consumed and rolls any child-side error into the
+##   parent.
+## - Peek / skip — `der_peek_tag`, `der_skip_tlv` for OPTIONAL / context-
+##   selected branches in X.509 extensions.
+## - OID equality — `der_oid_equals` for raw-byte compare against the
+##   X.509-specific OID byte constants that live in `x509.qz`.
+##
+## What v1 deliberately does NOT do:
+##
+## - **Streaming / chunked parse.** Whole cert lives in one `(buf, len)`
+##   span. Real X.509 certs are < 4 KiB; OCSP / CRL are out of scope (v1
+##   has no revocation check).
+## - **High-tag-number form.** X.509 uses no tag > 30. We reject `tag & 0x1F
+##   == 0x1F` (the multi-byte tag escape).
+## - **Indefinite-length form.** That's BER only — DER forbids it. We reject
+##   `length_first_byte == 0x80`.
+## - **Object identifier decode to dotted form.** OIDs are compared as raw
+##   value-bytes throughout. The dotted decode is debug-only and lands as
+##   a stretch helper if a print path needs it.
+## - **String charset validation.** UTF-8 / PrintableString / IA5 are
+##   returned as raw spans; X.509 callers (DNS-name match) handle the
+##   ASCII-subset check.
+##
+## ## Reader contract
+##
+## ```quartz
+## struct DerReader
+##   buf: Int           # base ptr (immutable for the reader's lifetime)
+##   pos: Int           # next byte offset (advances on every read)
+##   end_pos: Int       # one-past-end offset (immutable post-construction)
+##   err: Int           # 0 = ok; first non-zero sticks for the rest of the parse
+##   val_ptr: Int       # last read TLV's value start (set by der_read_*)
+##   val_len: Int       # last read TLV's value length
+## end
+## ```
+##
+## Sticky error: once `err != 0`, every parse helper returns immediately
+## without touching `pos`, so the buffer is never walked past the failure
+## point. Callers check `r.err` *once* at the end of their parse function;
+## intermediate value extractions become trivially safe to chain.
+##
+## ## Constants
+##
+## Tag bytes (low-tag-number form: identifier octet = class<<6 | constructed<<5 | tag).
+## All single-byte; X.509 stays under tag 30.
+
+import * from ffi/socket  # malloc/free/memcpy + ptr_read_byte/ptr_write_byte
+
+# =============================================================================
+# Tag constants (X.690 §8.1, single-byte identifier octets)
+# =============================================================================
+
+# Universal class, primitive (class=00, P/C=0, tag in low 5 bits).
+def TAG_BOOLEAN(): Int = 0x01            # 1
+def TAG_INTEGER(): Int = 0x02            # 2
+def TAG_BIT_STRING(): Int = 0x03         # 3
+def TAG_OCTET_STRING(): Int = 0x04       # 4
+def TAG_NULL(): Int = 0x05               # 5
+def TAG_OID(): Int = 0x06                # 6
+def TAG_UTF8_STRING(): Int = 0x0c        # 12
+def TAG_PRINTABLE_STRING(): Int = 0x13   # 19
+def TAG_IA5_STRING(): Int = 0x16         # 22
+def TAG_UTC_TIME(): Int = 0x17           # 23
+def TAG_GENERALIZED_TIME(): Int = 0x18   # 24
+
+# Universal class, constructed (P/C bit = 1, so 0x20 | low-tag).
+def TAG_SEQUENCE(): Int = 0x30           # 48 (constructed)
+def TAG_SET(): Int = 0x31                # 49 (constructed)
+
+# Context-specific, constructed: class = 10b (0x80), P/C = 1 (0x20) → 0xA0 base.
+# der_open_context(r, n) checks for byte (0xA0 | n).
+def TAG_CONTEXT_CONSTRUCTED_0(): Int = 0xa0   # [0] EXPLICIT
+def TAG_CONTEXT_CONSTRUCTED_1(): Int = 0xa1
+def TAG_CONTEXT_CONSTRUCTED_2(): Int = 0xa2
+def TAG_CONTEXT_CONSTRUCTED_3(): Int = 0xa3
+
+# Context-specific, primitive: class = 10b, P/C = 0 → 0x80 base.
+def TAG_CONTEXT_PRIMITIVE_0(): Int = 0x80
+def TAG_CONTEXT_PRIMITIVE_1(): Int = 0x81
+def TAG_CONTEXT_PRIMITIVE_2(): Int = 0x82
+def TAG_CONTEXT_PRIMITIVE_6(): Int = 0x86   # GeneralName.iPAddress
+
+# =============================================================================
+# Error codes (negative; -1 reserved as the generic sentinel)
+# =============================================================================
+
+def DER_OK(): Int = 0
+def DER_ERR_EOF(): Int = 0 - 1            # read past buffer end
+def DER_ERR_TAG(): Int = 0 - 2            # expected tag did not match
+def DER_ERR_LEN(): Int = 0 - 3            # length encoding malformed / non-minimal
+def DER_ERR_TRAIL(): Int = 0 - 4          # bytes left over after expected end
+def DER_ERR_VALUE(): Int = 0 - 5          # value malformed (e.g., BOOLEAN not 0x00/0xFF)
+def DER_ERR_OVERFLOW(): Int = 0 - 6       # u64 read overflowed (INTEGER > 2^63-1 unsigned)
+def DER_ERR_UNSUPPORTED(): Int = 0 - 7    # high-tag-number form or indefinite length
+
+# =============================================================================
+# DerReader struct
+# =============================================================================
+
+struct DerReader
+  buf: Int        # caller-owned base ptr; immutable for the reader's lifetime
+  pos: Int        # next read offset, in [0, end_pos]
+  end_pos: Int    # one-past-end offset; immutable post-construction
+  err: Int        # 0 = ok; first non-zero sticks
+  val_ptr: Int    # last-read TLV's value start (set by der_read_*)
+  val_len: Int    # last-read TLV's value length
+end
+
+## Construct a reader over `(buf, len)`. `buf` must be a valid pointer to at
+## least `len` bytes; lifetime is the caller's responsibility. The reader is
+## non-owning — it never frees `buf`.
+def der_new(buf: Int, len: Int): DerReader
+  return DerReader {
+    buf: buf, pos: 0, end_pos: len,
+    err: 0, val_ptr: 0, val_len: 0,
+  }
+end
+
+## Bytes left between current pos and end_pos. Sticky-error-aware: returns 0
+## if the reader is in an error state.
+def der_remaining(r: DerReader): Int
+  if r.err != 0 then return 0 end
+  return r.end_pos - r.pos
+end
+
+## True (1) if the reader is positioned at end_pos and has no error.
+def der_at_end(r: DerReader): Int
+  if r.err != 0 then return 0 end
+  if r.pos == r.end_pos then return 1 end
+  return 0
+end
+
+## Force the reader into an error state with `code`. First non-zero wins —
+## subsequent set_err calls are no-ops, preserving the original failure code.
+def der_set_err(r: DerReader, code: Int): Void
+  if r.err == 0
+    r.err = code
+  end
+end
+
+# =============================================================================
+# Internal byte primitives
+# =============================================================================
+
+# Bounds-checked single-byte read, advances pos. Sets DER_ERR_EOF on read past
+# end and returns 0.
+def _der_read_byte(r: DerReader): Int
+  if r.err != 0 then return 0 end
+  if r.pos >= r.end_pos
+    der_set_err(r, DER_ERR_EOF())
+    return 0
+  end
+  var b = ptr_read_byte(r.buf + r.pos)
+  r.pos = r.pos + 1
+  return b
+end
+
+# Non-advancing single-byte read. Returns -1 if at end (caller distinguishes
+# from a real 0xFF byte by checking remaining first).
+def _der_peek_byte(r: DerReader): Int
+  if r.err != 0 then return 0 - 1 end
+  if r.pos >= r.end_pos then return 0 - 1 end
+  return ptr_read_byte(r.buf + r.pos)
+end
+
+# =============================================================================
+# Tag + length (X.690 §8.1.2, §8.1.3, §10.1 DER subset)
+# =============================================================================
+
+## Peek the next tag byte without advancing. Returns -1 if at end / errored —
+## callers should check `der_at_end` first if 0xFF is a meaningful tag (it
+## isn't in X.509, but the API stays honest).
+def der_peek_tag(r: DerReader): Int
+  return _der_peek_byte(r)
+end
+
+# Internal: read one tag byte, reject the high-tag-number escape.
+def _der_read_tag(r: DerReader): Int
+  var t = _der_read_byte(r)
+  if r.err != 0 then return 0 end
+  # Low-tag-number form only: the low 5 bits must NOT all be 1 (0x1F = escape
+  # into multi-byte tag form, which X.509 never uses).
+  if (t & 0x1f) == 0x1f
+    der_set_err(r, DER_ERR_UNSUPPORTED())
+    return 0
+  end
+  return t
+end
+
+# Internal: read length octet(s) per X.690 §8.1.3 DER rules.
+#
+#  - Short form: one byte, value 0..127, taken as the length directly.
+#  - Long form: first byte = 0x80 | n where n in 1..8; next n bytes are
+#    a big-endian unsigned length. DER additionally requires:
+#      * n != 0 (0x80 = indefinite-length, BER-only — rejected)
+#      * the encoded length must NOT fit in a shorter form (minimal-DER)
+#  - For X.509 use we cap n at 4 (max length ~4 GiB > any real cert).
+def _der_read_length(r: DerReader): Int
+  var b = _der_read_byte(r)
+  if r.err != 0 then return 0 end
+
+  if (b & 0x80) == 0
+    # Short form, value 0..127.
+    return b
+  end
+
+  var n = b & 0x7f
+  if n == 0
+    # Indefinite length is BER-only; DER forbids.
+    der_set_err(r, DER_ERR_UNSUPPORTED())
+    return 0
+  end
+  if n > 4
+    # Reject pathological lengths; nothing in TLS-relevant X.509 exceeds 2^32.
+    der_set_err(r, DER_ERR_LEN())
+    return 0
+  end
+
+  var len = 0
+  var i = 0
+  while i < n
+    var c = _der_read_byte(r)
+    if r.err != 0 then return 0 end
+    len = (len << 8) | c
+    i = i + 1
+  end
+
+  # Minimal-DER: length < 128 must use short form; an n-byte long form whose
+  # high byte was zero could have been shorter.
+  if len < 128
+    der_set_err(r, DER_ERR_LEN())
+    return 0
+  end
+  # Minimal-DER for long form: top byte (first of the n bytes after 0x80|n)
+  # must be non-zero. We checked the assembled value's MSB-octet implicitly
+  # by requiring `len >= 1 << ((n - 1) * 8)`.
+  if len < (1 << ((n - 1) * 8))
+    der_set_err(r, DER_ERR_LEN())
+    return 0
+  end
+
+  return len
+end
+
+# =============================================================================
+# TLV combinators
+# =============================================================================
+
+## Expect a TLV with `tag`, populate `r.val_ptr` / `r.val_len` to point at the
+## value bytes (inside the original buffer — no copy), and advance `r.pos`
+## past the entire TLV. On any mismatch / truncation, sets the appropriate
+## error code and leaves val_ptr/val_len untouched.
+def der_expect(r: DerReader, tag: Int): Void
+  if r.err != 0 then return end
+  var t = _der_read_tag(r)
+  if r.err != 0 then return end
+  if t != tag
+    der_set_err(r, DER_ERR_TAG())
+    return
+  end
+  var len = _der_read_length(r)
+  if r.err != 0 then return end
+  if r.pos + len > r.end_pos
+    der_set_err(r, DER_ERR_EOF())
+    return
+  end
+  r.val_ptr = r.buf + r.pos
+  r.val_len = len
+  r.pos = r.pos + len
+end
+
+## Expect a TLV with `tag` and return a child reader spanning the value. The
+## parent advances past the entire TLV. The child is independent — mutate
+## child.pos freely; close it with `der_close` to roll its error / leftover
+## bytes back into the parent.
+##
+## On tag mismatch / truncation, sets parent.err and returns an empty,
+## already-errored child reader so callers can call into it without crashing.
+def der_open_tlv(r: DerReader, tag: Int): DerReader
+  if r.err != 0
+    return DerReader { buf: 0, pos: 0, end_pos: 0, err: r.err, val_ptr: 0, val_len: 0, }
+  end
+  var t = _der_read_tag(r)
+  if r.err != 0
+    return DerReader { buf: 0, pos: 0, end_pos: 0, err: r.err, val_ptr: 0, val_len: 0, }
+  end
+  if t != tag
+    der_set_err(r, DER_ERR_TAG())
+    return DerReader { buf: 0, pos: 0, end_pos: 0, err: r.err, val_ptr: 0, val_len: 0, }
+  end
+  var len = _der_read_length(r)
+  if r.err != 0
+    return DerReader { buf: 0, pos: 0, end_pos: 0, err: r.err, val_ptr: 0, val_len: 0, }
+  end
+  if r.pos + len > r.end_pos
+    der_set_err(r, DER_ERR_EOF())
+    return DerReader { buf: 0, pos: 0, end_pos: 0, err: r.err, val_ptr: 0, val_len: 0, }
+  end
+  var child_buf = r.buf
+  var child_start = r.pos
+  r.pos = r.pos + len   # parent advances past the whole TLV
+  return DerReader {
+    buf: child_buf,
+    pos: child_start,
+    end_pos: child_start + len,
+    err: 0, val_ptr: 0, val_len: 0,
+  }
+end
+
+## Open a SEQUENCE; return a child reader over the elements.
+def der_open_sequence(r: DerReader): DerReader
+  return der_open_tlv(r, TAG_SEQUENCE())
+end
+
+## Open a SET; return a child reader over the elements.
+def der_open_set(r: DerReader): DerReader
+  return der_open_tlv(r, TAG_SET())
+end
+
+## Open a context-specific constructed [n], 0 ≤ n ≤ 3. Used for X.509's
+## `version [0] EXPLICIT INTEGER` and extension wrappers.
+def der_open_context(r: DerReader, n: Int): DerReader
+  if (n < 0) | (n > 3)
+    der_set_err(r, DER_ERR_UNSUPPORTED())
+    return DerReader { buf: 0, pos: 0, end_pos: 0, err: r.err, val_ptr: 0, val_len: 0, }
+  end
+  return der_open_tlv(r, 0xa0 | n)
+end
+
+## Close a child reader: verify it was fully consumed (`pos == end_pos`) and
+## had no internal error. Any child-side error or leftover bytes propagate to
+## `parent` via `der_set_err`. Returns 0 on success, the propagated code on
+## failure. Idiomatic use:
+##
+## ```quartz
+## var seq = der_open_sequence(r)
+## ... parse seq fields ...
+## der_close(seq, r)
+## ```
+def der_close(child: DerReader, parent: DerReader): Int
+  if child.err != 0
+    der_set_err(parent, child.err)
+    return parent.err
+  end
+  if child.pos != child.end_pos
+    der_set_err(parent, DER_ERR_TRAIL())
+    return parent.err
+  end
+  return 0
+end
+
+# =============================================================================
+# Primitive readers (populate r.val_ptr / r.val_len for span-returning ones)
+# =============================================================================
+
+## Read a BOOLEAN. Returns 1 for TRUE (0xFF), 0 for FALSE (0x00). DER §11.1
+## requires exactly these two byte values — any other (e.g. BER's "any
+## non-zero is TRUE") sets DER_ERR_VALUE.
+def der_read_boolean(r: DerReader): Int
+  der_expect(r, TAG_BOOLEAN())
+  if r.err != 0 then return 0 end
+  if r.val_len != 1
+    der_set_err(r, DER_ERR_VALUE())
+    return 0
+  end
+  var b = ptr_read_byte(r.val_ptr)
+  if b == 0 then return 0 end
+  if b == 0xff then return 1 end
+  der_set_err(r, DER_ERR_VALUE())
+  return 0
+end
+
+## Read a NULL. Verifies tag = 0x05 and length = 0; ignores no value bytes.
+def der_read_null(r: DerReader): Void
+  der_expect(r, TAG_NULL())
+  if r.err != 0 then return end
+  if r.val_len != 0
+    der_set_err(r, DER_ERR_VALUE())
+  end
+end
+
+## Read an unsigned INTEGER that fits in a 64-bit value. Accepts an optional
+## leading 0x00 padding byte (required by DER when the value's high bit
+## would otherwise be set, to keep the encoding unambiguously non-negative).
+## Rejects negative INTEGERs (high bit of leading non-zero byte set after
+## padding strip — common for serial numbers, but those use the span helper).
+##
+## On overflow (value ≥ 2^63), sets DER_ERR_OVERFLOW.
+def der_read_integer_u64(r: DerReader): Int
+  der_expect(r, TAG_INTEGER())
+  if r.err != 0 then return 0 end
+  var n = r.val_len
+  var p = r.val_ptr
+  if n == 0
+    der_set_err(r, DER_ERR_VALUE())
+    return 0
+  end
+
+  # The original first byte determines the encoded sign — its high bit is set
+  # iff the value is negative two's-complement. We MUST inspect the ORIGINAL
+  # lead byte for that check, before any pad-strip: the whole point of the
+  # canonical leading-0x00 pad is to mark a value whose mathematical bit-N is
+  # set as nevertheless positive.
+  var b0 = ptr_read_byte(p)
+  if (b0 & 0x80) != 0
+    # First byte has high bit set with no canonical pad in front → negative.
+    der_set_err(r, DER_ERR_VALUE())
+    return 0
+  end
+
+  # Pad strip (if present) + minimal-DER check.
+  var off = 0
+  if n > 1
+    var b1 = ptr_read_byte(p + 1)
+    if b0 == 0x00
+      # Leading zero is only canonical if the next byte's high bit is set
+      # (otherwise it's a redundant pad and violates minimal-DER).
+      if (b1 & 0x80) == 0
+        der_set_err(r, DER_ERR_VALUE())
+        return 0
+      end
+      off = 1
+    end
+  end
+
+  var remain = n - off
+  if remain > 8
+    der_set_err(r, DER_ERR_OVERFLOW())
+    return 0
+  end
+  var v = 0
+  var i = 0
+  while i < remain
+    v = (v << 8) | ptr_read_byte(p + off + i)
+    i = i + 1
+  end
+  # If the post-strip value has bit 63 set (an 8-byte unsigned value ≥ 2^63),
+  # we can't represent it as Quartz's i64. That's the canonical-pad + 8-byte +
+  # high-bit-set case (e.g., 0x02 0x09 0x00 0xff..ff).
+  if v < 0
+    der_set_err(r, DER_ERR_OVERFLOW())
+    return 0
+  end
+  return v
+end
+
+## Read an INTEGER as a raw byte span (val_ptr / val_len). Use this for big
+## ints (RSA moduli, ECDSA r/s, cert serial numbers). Preserves any leading
+## 0x00 pad — callers that want the unsigned-magnitude bytes strip the pad
+## themselves. Enforces minimal-DER (no `0x00 0x00 ...`, no `0xFF 0xFF ...`).
+def der_read_integer_span(r: DerReader): Void
+  der_expect(r, TAG_INTEGER())
+  if r.err != 0 then return end
+  var n = r.val_len
+  if n == 0
+    der_set_err(r, DER_ERR_VALUE())
+    return
+  end
+  if n > 1
+    var b0 = ptr_read_byte(r.val_ptr)
+    var b1 = ptr_read_byte(r.val_ptr + 1)
+    # Minimal-DER: leading 0x00 only as positive pad; leading 0xFF only as
+    # negative pad. The lookahead-byte's high bit decides.
+    if (b0 == 0x00) & ((b1 & 0x80) == 0)
+      der_set_err(r, DER_ERR_VALUE())
+      return
+    end
+    if (b0 == 0xff) & ((b1 & 0x80) != 0)
+      der_set_err(r, DER_ERR_VALUE())
+      return
+    end
+  end
+end
+
+## Read an OCTET STRING; (val_ptr, val_len) point at the value bytes inside
+## the original buffer (no copy).
+def der_read_octet_string(r: DerReader): Void
+  der_expect(r, TAG_OCTET_STRING())
+end
+
+## Read an OBJECT IDENTIFIER; (val_ptr, val_len) point at the encoded OID
+## bytes (the value portion, NOT the tag+length wrapper). Callers compare
+## with `der_oid_equals` against precomputed expected OID byte arrays.
+##
+## v1 deliberately does not decode to dotted form — `der_oid_equals` is the
+## only thing X.509 needs.
+def der_read_oid(r: DerReader): Void
+  der_expect(r, TAG_OID())
+  if r.err != 0 then return end
+  if r.val_len == 0
+    der_set_err(r, DER_ERR_VALUE())
+  end
+end
+
+## Read a BIT STRING. The first value byte is the "unused bits in the final
+## octet" count (X.690 §8.6.2); it's written to `*unused_bits_out` and the
+## remaining bytes land at (val_ptr+1, val_len-1) — but for convenience we
+## adjust val_ptr/val_len to skip the prefix byte so callers see the payload
+## directly. The unused-bits count is also written via `ptr_write_byte` to
+## the caller-provided out address.
+##
+## For X.509 SubjectPublicKey + signature fields, unused_bits is always 0;
+## callers verify that themselves.
+def der_read_bit_string(r: DerReader, unused_bits_out: Int): Void
+  der_expect(r, TAG_BIT_STRING())
+  if r.err != 0 then return end
+  if r.val_len < 1
+    der_set_err(r, DER_ERR_VALUE())
+    return
+  end
+  var unused = ptr_read_byte(r.val_ptr)
+  if unused > 7
+    der_set_err(r, DER_ERR_VALUE())
+    return
+  end
+  ptr_write_byte(unused_bits_out, unused)
+  r.val_ptr = r.val_ptr + 1
+  r.val_len = r.val_len - 1
+end
+
+# =============================================================================
+# Time (UTCTime / GeneralizedTime → unix seconds)
+# =============================================================================
+
+# Two ASCII digits → integer; on non-digit, set err and return 0.
+def _der_two_digit(r: DerReader, p: Int): Int
+  var d0 = ptr_read_byte(p)
+  var d1 = ptr_read_byte(p + 1)
+  if (d0 < 48) | (d0 > 57) | (d1 < 48) | (d1 > 57)
+    der_set_err(r, DER_ERR_VALUE())
+    return 0
+  end
+  return ((d0 - 48) * 10) + (d1 - 48)
+end
+
+# Four ASCII digits → integer (year for GeneralizedTime).
+def _der_four_digit(r: DerReader, p: Int): Int
+  var hi = _der_two_digit(r, p)
+  if r.err != 0 then return 0 end
+  var lo = _der_two_digit(r, p + 2)
+  return hi * 100 + lo
+end
+
+# Days-from-civil (Howard Hinnant 2013, public domain) — proleptic Gregorian
+# y/m/d → days since 1970-01-01. Handles all leap-year rules to year 999999.
+# Used to convert UTCTime / GeneralizedTime to unix seconds without depending
+# on host libc strftime / timegm.
+def _der_days_from_civil(y: Int, m: Int, d: Int): Int
+  var y2 = if m <= 2 then y - 1 else y end
+  var era = (if y2 >= 0 then y2 else y2 - 399 end) / 400
+  var yoe = y2 - era * 400
+  var moe = if m > 2 then m - 3 else m + 9 end
+  var doy = (153 * moe + 2) / 5 + d - 1
+  var doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+  return era * 146097 + doe - 719468
+end
+
+## Read a UTCTime ("YYMMDDhhmmssZ", 13 bytes). Per RFC 5280 §4.1.2.5.1, the
+## 2-digit year YY ∈ {50..99} → 19YY, {00..49} → 20YY. Returns unix seconds.
+def der_read_utctime(r: DerReader): Int
+  der_expect(r, TAG_UTC_TIME())
+  if r.err != 0 then return 0 end
+  if r.val_len != 13
+    der_set_err(r, DER_ERR_VALUE())
+    return 0
+  end
+  if ptr_read_byte(r.val_ptr + 12) != 0x5a   # trailing 'Z'
+    der_set_err(r, DER_ERR_VALUE())
+    return 0
+  end
+  var yy = _der_two_digit(r, r.val_ptr)
+  var mm = _der_two_digit(r, r.val_ptr + 2)
+  var dd = _der_two_digit(r, r.val_ptr + 4)
+  var hh = _der_two_digit(r, r.val_ptr + 6)
+  var mi = _der_two_digit(r, r.val_ptr + 8)
+  var ss = _der_two_digit(r, r.val_ptr + 10)
+  if r.err != 0 then return 0 end
+  var year = if yy >= 50 then 1900 + yy else 2000 + yy end
+  if (mm < 1) | (mm > 12) | (dd < 1) | (dd > 31) | (hh > 23) | (mi > 59) | (ss > 60)
+    der_set_err(r, DER_ERR_VALUE())
+    return 0
+  end
+  var days = _der_days_from_civil(year, mm, dd)
+  return days * 86400 + hh * 3600 + mi * 60 + ss
+end
+
+## Read a GeneralizedTime ("YYYYMMDDhhmmssZ", 15 bytes; v1 rejects fractional
+## seconds / non-Z timezones — X.509 since RFC 5280 forbids them anyway).
+## Returns unix seconds.
+def der_read_generalized_time(r: DerReader): Int
+  der_expect(r, TAG_GENERALIZED_TIME())
+  if r.err != 0 then return 0 end
+  if r.val_len != 15
+    der_set_err(r, DER_ERR_VALUE())
+    return 0
+  end
+  if ptr_read_byte(r.val_ptr + 14) != 0x5a
+    der_set_err(r, DER_ERR_VALUE())
+    return 0
+  end
+  var year = _der_four_digit(r, r.val_ptr)
+  var mm = _der_two_digit(r, r.val_ptr + 4)
+  var dd = _der_two_digit(r, r.val_ptr + 6)
+  var hh = _der_two_digit(r, r.val_ptr + 8)
+  var mi = _der_two_digit(r, r.val_ptr + 10)
+  var ss = _der_two_digit(r, r.val_ptr + 12)
+  if r.err != 0 then return 0 end
+  if (mm < 1) | (mm > 12) | (dd < 1) | (dd > 31) | (hh > 23) | (mi > 59) | (ss > 60)
+    der_set_err(r, DER_ERR_VALUE())
+    return 0
+  end
+  var days = _der_days_from_civil(year, mm, dd)
+  return days * 86400 + hh * 3600 + mi * 60 + ss
+end
+
+# =============================================================================
+# Skip / peek helpers for OPTIONAL fields in X.509
+# =============================================================================
+
+## Skip the next TLV regardless of tag — used inside extension parsing for
+## OIDs we don't care about, and inside Name parsing for non-CN attributes.
+## Sets err if no full TLV can be read.
+def der_skip_tlv(r: DerReader): Void
+  if r.err != 0 then return end
+  var t = _der_read_tag(r)
+  if r.err != 0 then return end
+  var len = _der_read_length(r)
+  if r.err != 0 then return end
+  if r.pos + len > r.end_pos
+    der_set_err(r, DER_ERR_EOF())
+    return
+  end
+  r.pos = r.pos + len
+end
+
+# =============================================================================
+# OID equality (raw-byte compare on the value portion)
+# =============================================================================
+
+## Byte-compare two OID value spans. Use after `der_read_oid` to match the
+## parsed OID against a precomputed expected-OID byte array (the byte
+## constants in `x509.qz` are the value-portion bytes only, with no tag or
+## length prefix).
+def der_oid_equals(p1: Int, l1: Int, p2: Int, l2: Int): Int
+  if l1 != l2 then return 0 end
+  var i = 0
+  while i < l1
+    if ptr_read_byte(p1 + i) != ptr_read_byte(p2 + i) then return 0 end
+    i = i + 1
+  end
+  return 1
+end

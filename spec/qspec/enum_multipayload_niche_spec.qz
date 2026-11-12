@@ -1,0 +1,596 @@
+## Multi-payload enum niche — M1 scaffold tests (enum-niche workstream, Swift-parity
+## terminal increment). Design: docs/design/ENUM_NICHE_MULTIPAYLOAD.md.
+##
+## ┌─────────────────────────────────────────────────────────────────────────┐
+## │ M1 LIVE (gate flipped 2026-06-13). `mir_boxed_niche_multi_payload_live()` │
+## │ == 1 — a NON-colliding 2-single-boxed-payload user enum niches into ONE   │
+## │ word (`payload_ptr | tag`; read masks `& spare_mask` / `& ~spare_mask`).  │
+## │ These behavioral round-trips lock OBSERVABLE behavior identically under    │
+## │ BOTH representations — they passed under the tagged box pre-flip AND pass  │
+## │ under the packed-word niche now — a differential oracle held across the    │
+## │ flip. NICHED at gate=1: VRes{VOk,VErr} (non-colliding 2-boxed). STILL      │
+## │ SPILLED by design: Res{Ok,Err} (variant names collide with built-in       │
+## │ Result ⇒ forced SPILL so construct/read agree), IRes{Int,Int} (no common  │
+## │ spare bit), built-in Option/Result (held out of M1 per the audit).        │
+## └─────────────────────────────────────────────────────────────────────────┘
+##
+## M1 scope (RFC §6 Phase M1): an enum with EXACTLY TWO payload-carrying variants,
+## BOTH carrying a single BOXED-pointer payload (`Result<&A,&B>`-shaped). Such an
+## enum niches into ONE word by packing a 1-bit discriminant (decl index) into the
+## common low alignment bits of the two 8-aligned payload pointers:
+##   - variant 0 (Ok) ⇒ ptr | 0 = ptr          (Ok stays a bare pointer — FREE)
+##   - variant 1 (Err) ⇒ ptr | 1
+##   read tag = value & (spare_mask) ; payload ptr = value & ~spare_mask
+##
+## SPILL (correct, not a gap): primitive-payload `{A(Int),B(Int)}` (no spare bit) and
+## >2-payload / >8-variant enums stay on the tagged-box path (RFC §8 floor).
+##
+## Coverage (RFC §7):
+##   1. pure router verdicts (enum_layout_multi): 2-boxed ⇒ NICHE_MULTI(low_zero=3);
+##      {Box,Int}/{Int,Int}/3-payload/9-variant ⇒ SPILL.
+##   2. ctx spare-bit query (mir_multi_enum_common_spare) eligibility truth table.
+##   3. 2-boxed-Result construct/match/is/unwrap round-trip for BOTH variants.
+##   4. nesting — Option<Result<A,B>> and Result<Result<..>,..> (Some(None)≠None style).
+##   5. Vec<Result<A,B>> element-position round-trip.
+##   6. {Int,Int} tag-fallback — must NOT niche, stays tagged, still correct.
+##   7. async-suspend round-trip is a STANDALONE smoke (spec/qz/enum_multipayload_
+##      poll_smoke.qz) per the qspec-lambda go-fn caveat (CLAUDE.md).
+import * from qspec
+import niche as nm
+import mir
+import ast
+
+# ───────────────────────── behavioral fixtures ─────────────────────────
+
+# Two distinct boxed payload structs (non-@value ⇒ niche-eligible boxed pointers).
+struct NodeA
+  a: Int
+end
+struct NodeB
+  b: Int
+end
+
+# The M1 flagship shape: exactly two payload variants, both a single boxed pointer.
+enum Res
+  Ok(n: NodeA)
+  Err(e: NodeB)
+end
+
+# Another 2-boxed shape with collection payloads (Result<Vec, String> analog).
+enum VRes
+  VOk(v: Vec)
+  VErr(s: String)
+end
+
+# Tag-fallback floor: two full-width Int payloads share no spare bit ⇒ MUST tag.
+enum IRes
+  IOk(x: Int)
+  IErr(y: Int)
+end
+
+# Outer Option<Result<..>> nesting — inner Res is the payload of an Option.
+struct ResHolder
+  r: Res
+end
+
+# ─────────────── enum-niche 3a: N-variant all-boxed niche fixtures ──────────────
+# 3a widens the M1 exactly-2 clamp to N (1≤N≤8) ALL-boxed-payload variants (no
+# dataless mix — that's 3b). Each variant carries a single boxed-struct pointer, so
+# every payload word shares the 3 low alignment spare bits; the tag is the variant
+# DECLARATION index packed into those bits. Construct: variant i ⇒ `ptr | i`
+# (i=0 ⇒ bare ptr — free); read tag = `value & 7`, payload = `value & ~7`. These
+# round-trips are LAYOUT-AGNOSTIC: they assert the variant selected AND the payload
+# value, holding identically under the SPILL (gate=0) and packed-word (gate=1) reps.
+
+# 3-variant all-boxed (N=3): smallest N>2 case.
+enum Tri3
+  T3A(p: NodeA)
+  T3B(p: NodeB)
+  T3C(p: NodeA)
+end
+
+# 8-variant all-boxed (N=8): the 3-bit ceiling (2^3 = 8 tag values exactly).
+enum Oct8
+  O0(p: NodeA)
+  O1(p: NodeA)
+  O2(p: NodeA)
+  O3(p: NodeA)
+  O4(p: NodeA)
+  O5(p: NodeA)
+  O6(p: NodeA)
+  O7(p: NodeA)
+end
+
+# 9-variant all-boxed (N=9 > 8): exceeds the 3-bit ceiling ⇒ MUST SPILL even at
+# gate=1 (proves the >8 fallback). Tagged-box path, still correct.
+enum Non9
+  N0(p: NodeA)
+  N1(p: NodeA)
+  N2(p: NodeA)
+  N3(p: NodeA)
+  N4(p: NodeA)
+  N5(p: NodeA)
+  N6(p: NodeA)
+  N7(p: NodeA)
+  N8(p: NodeA)
+end
+
+# ─────────── enum-niche 3b: boxed + dataless-MIX niche fixtures ──────────────
+# 3b lifts the 3a `dataless == 0` restriction: an enum with ≥2 single-boxed payload
+# variants MAY also carry dataless variants and still niche into ONE word. Payload
+# variants pack their decl-index tag (`ptr | i`); each dataless variant IS the small
+# integer equal to its decl index (`0 | tag_i = tag_i`) in an otherwise-zero word.
+# Dispatch is tag-bits-only (`& 7`) — uniform across payload and dataless variants;
+# dataless arms bind no payload so the read never derefs a dataless word. No collision
+# with a payload word `ptr | tag_j` (boxed ptrs ≥ 4096). LAYOUT-AGNOSTIC round-trips:
+# assert the variant selected AND payload survives AND dataless arms fire without deref,
+# holding identically under SPILL (gate=0) and packed-word (gate=1).
+
+# 2 boxed payload variants + 2 dataless (V=4, decl indices 0..3).
+enum Mix4
+  Mp(v: NodeA)
+  Mq(v: NodeB)
+  Empty
+  Done
+end
+
+def mix4_code(m: Mix4): Int
+  return match m
+    Mp(n) => n.a + 1000
+    Mq(e) => e.b + 2000
+    Empty => 7000
+    Done => 9000
+  end
+end
+
+def tri3_code(t: Tri3): Int
+  return match t
+    T3A(n) => n.a + 1000
+    T3B(e) => e.b + 2000
+    T3C(n) => n.a + 3000
+  end
+end
+
+def oct8_code(o: Oct8): Int
+  return match o
+    O0(p) => p.a + 0
+    O1(p) => p.a + 10
+    O2(p) => p.a + 20
+    O3(p) => p.a + 30
+    O4(p) => p.a + 40
+    O5(p) => p.a + 50
+    O6(p) => p.a + 60
+    O7(p) => p.a + 70
+  end
+end
+
+def non9_code(n: Non9): Int
+  return match n
+    N0(p) => p.a + 0
+    N1(p) => p.a + 100
+    N2(p) => p.a + 200
+    N3(p) => p.a + 300
+    N4(p) => p.a + 400
+    N5(p) => p.a + 500
+    N6(p) => p.a + 600
+    N7(p) => p.a + 700
+    N8(p) => p.a + 800
+  end
+end
+
+def res_ok(n: Int): Res = Res::Ok(NodeA { a: n })
+def res_err(n: Int): Res = Res::Err(NodeB { b: n })
+
+## Named helper for a typed `None` of Option<Res> — bare `None` doesn't resolve in
+## this spec pipeline (mirrors option_boxed_struct_niche_spec's none_point()).
+def none_res(): Option<Res> = Option::None
+
+def res_code(r: Res): Int
+  return match r
+    Ok(n) => n.a
+    Err(e) => 0 - e.b
+  end
+end
+
+def ires_code(r: IRes): Int
+  return match r
+    IOk(x) => x
+    IErr(y) => 0 - y
+  end
+end
+
+# ───────────────────────── pure-router unit ctx ─────────────────────────
+
+## A fresh MirContext with the boxed structs + the multi-payload enums registered,
+## so the ctx-aware spare-bit query (mir_multi_enum_common_spare) and the layout
+## verdict (mir_multi_enum_layout) are testable directly against the registry.
+def _mp_ctx(): mir::MirContext
+  var prog = mir::mir_new_program()
+  var ctx = mir::mir_new_context(prog)
+  var store = ast::ast_new_storage()
+  mir::mir_ctx_register_struct(ctx, "NodeA", ["a"], ["Int"], 0, 0, 0, [], store)
+  mir::mir_ctx_register_struct(ctx, "NodeB", ["b"], ["Int"], 0, 0, 0, [], store)
+  return ctx
+end
+
+def main(): Int
+  # ════════════════════════════════════════════════════════════════════════
+  # 1. PURE ROUTER — enum_layout_multi verdicts (string + int inputs, no ctx).
+  #    common_low_zero = 3 for 8-aligned boxed payloads; the router niches iff the
+  #    common spare bits alone can name every variant (2^low_zero >= V) AND V <= 8
+  #    (the 3-bit ceiling) AND there are >= 2 payload variants (enum-niche 3a
+  #    widened this from exactly-2 to N; single-payload keeps its dedicated path).
+  # ════════════════════════════════════════════════════════════════════════
+  describe("enum_layout_multi — pure multi-payload niche-vs-spill router") do ->
+    it("2 boxed payload variants, 0 dataless, low_zero=3 ⇒ NICHE_MULTI") do ->
+      # payload_variant_count=2, dataless=0, common_low_zero=3, common_extra=0
+      var l = nm::enum_layout_multi(2, 0, 3, 0)
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_NICHE_MULTI)
+    end
+    it("NICHE_MULTI records the spare low-zero bit count (3)") do ->
+      var l = nm::enum_layout_multi(2, 0, 3, 0)
+      assert_eq(nm::enum_layout_niche_start(l), 3)
+    end
+    it("common_low_zero=0 (a scalar payload present) ⇒ SPILL") do ->
+      # {Box, Int}: the Int payload contributes 0 spare bits ⇒ intersection 0.
+      var l = nm::enum_layout_multi(2, 0, 0, 0)
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_SPILL)
+    end
+    it("{Int,Int} (low_zero=0, no extra) ⇒ SPILL (information-theoretic floor)") do ->
+      var l = nm::enum_layout_multi(2, 0, 0, 0)
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_SPILL)
+    end
+    it("only ONE payload variant is the single-payload path, NOT multi ⇒ SPILL") do ->
+      var l = nm::enum_layout_multi(1, 1, 3, 0)
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_SPILL)
+    end
+    it("3 payload variants (enum-niche 3a: N-variant) ⇒ NICHE_MULTI (3 ≤ 2^3)") do ->
+      # 3a widened the pure router from exactly-2 to N≥2 payload variants. Three
+      # boxed payloads (low_zero=3 ⇒ capacity 8) name all 3 with room to spare ⇒
+      # NICHE_MULTI. (Eligibility for the N>2 case is gated upstream in
+      # mir_multi_enum_common_spare; the pure router decides from the SHAPE.)
+      var l = nm::enum_layout_multi(3, 0, 3, 0)
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_NICHE_MULTI)
+    end
+    it("9 total variants exceeds the 3-bit (≤8) ceiling ⇒ SPILL") do ->
+      # Even with low_zero=3 (capacity 8), 9 variants need a 4th bit ⇒ the
+      # v <= NICHE_MULTI_MAX_VARIANTS guard forces SPILL. (This is the >8 fallback
+      # that the Non9 behavioral round-trip below exercises end-to-end.)
+      var l = nm::enum_layout_multi(2, 7, 3, 0)
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_SPILL)
+    end
+    it("low_zero too small to name V variants ⇒ SPILL") do ->
+      # 2 variants need 1 bit; low_zero=0 cannot host it.
+      var l = nm::enum_layout_multi(2, 0, 0, 0)
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_SPILL)
+    end
+    # enum-niche 3b — dataless-mix verdicts (the pure router already counts
+    # dataless into V; these pin the boundary the 3b construct/eligibility ride on).
+    it("2 boxed payload + 1 dataless (V=3 ≤ 2^3) ⇒ NICHE_MULTI") do ->
+      var l = nm::enum_layout_multi(2, 1, 3, 0)
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_NICHE_MULTI)
+    end
+    it("3 boxed payload + 5 dataless (V=8, fills the ceiling) ⇒ NICHE_MULTI") do ->
+      var l = nm::enum_layout_multi(3, 5, 3, 0)
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_NICHE_MULTI)
+    end
+    it("3 boxed payload + 6 dataless (V=9 > 8) ⇒ SPILL (exceeds ceiling)") do ->
+      var l = nm::enum_layout_multi(3, 6, 3, 0)
+      assert_eq(nm::enum_layout_kind(l), nm::ENUM_LAYOUT_SPILL)
+    end
+  end
+
+  # ════════════════════════════════════════════════════════════════════════
+  # 2. GATE LIVE — mir_boxed_niche_multi_payload_live() == 1 (M1 FLIPPED 2026-06-13).
+  #    A non-colliding 2-single-boxed-payload user enum niches; built-in Option/Result
+  #    stay EXCLUDED (the audit verdict) and an UNREGISTERED enum (no payload-type
+  #    info in the ctx) cannot be proven M1-shaped ⇒ SPILL. The full-pipeline niche
+  #    eligibility is exercised by the behavioral round-trips below (sections 3–6);
+  #    here we pin the gate value + the exclusion/unknown SPILL guards directly.
+  # ════════════════════════════════════════════════════════════════════════
+  describe("multi-payload niche gate — M1 is LIVE (flipped)") do ->
+    it("mir_boxed_niche_multi_payload_live() == 1 (gate is LIVE)") do ->
+      assert_eq(mir::mir_boxed_niche_multi_payload_live(), 1)
+    end
+    it("mir_multi_spare accessors round-trip the descriptor fields") do ->
+      # The spare descriptor [low_zero=3, extra=0, eligible=1] — accessors return
+      # exactly what was packed (the gate-aware eligibility is computed by
+      # mir_multi_enum_common_spare from the ctx; here we just check the record).
+      var sp = mir::mir_multi_spare_new(3, 0, 1)
+      assert_eq(mir::mir_multi_spare_eligible(sp), 1)
+      assert_eq(mir::mir_multi_spare_low_zero(sp), 3)
+    end
+    it("mir_multi_enum_is_niche is 0 for an unregistered enum (no payload info)") do ->
+      # Even at gate=1, an enum the ctx has no variant/payload-type info for cannot
+      # be proven M1-shaped ⇒ conservatively SPILL.
+      var ctx = _mp_ctx()
+      assert_eq(mir::mir_multi_enum_is_niche(ctx, "Res"), 0)
+    end
+    it("mir_multi_enum_is_niche is 0 for built-in Option/Result (excluded at gate=1)") do ->
+      var ctx = _mp_ctx()
+      assert_eq(mir::mir_multi_enum_is_niche(ctx, "Option"), 0)
+      assert_eq(mir::mir_multi_enum_is_niche(ctx, "Result"), 0)
+    end
+  end
+
+  # ════════════════════════════════════════════════════════════════════════
+  # 3. ROUND-TRIP — 2-boxed construct/match/is/unwrap, BOTH variants. Res{Ok,Err}
+  #    SPILLS (variant names collide with built-in Result ⇒ forced SPILL so construct
+  #    and read agree — §14.9 asymmetry resolution); VRes{VOk,VErr} (non-colliding)
+  #    NICHES at gate=1. ALLOC-FREE ORACLE (commentary, RFC §7.3) for the niched
+  #    VRes: VOk(p) emits the bare pointer (tag 0 — no box) and VErr(p) emits `p | 1`;
+  #    the read masks one i64. Behavior is identical under both reps — this is the
+  #    differential oracle that held across the flip.
+  # ════════════════════════════════════════════════════════════════════════
+  describe("Res (2-boxed Result) — construct/match/is round-trip, both variants") do ->
+    it("Ok(NodeA) is Ok, not Err; payload recovers") do ->
+      x = res_ok(42)
+      assert_eq(x is Ok, 1)
+      assert_eq(x is Err, 0)
+      assert_eq(res_code(x), 42)
+    end
+    it("Err(NodeB) is Err, not Ok; payload recovers (negated)") do ->
+      y = res_err(7)
+      assert_eq(y is Err, 1)
+      assert_eq(y is Ok, 0)
+      assert_eq(res_code(y), 0 - 7)
+    end
+    it("the two variants are mutually distinct round-tripping through a fn") do ->
+      a = res_ok(5)
+      b = res_err(5)
+      assert_eq(a is Ok, 1)
+      assert_eq(b is Ok, 0)
+      assert_eq(a is Err, 0)
+      assert_eq(b is Err, 1)
+    end
+    it("Ok payload field survives the round-trip intact (no tag-bit clobber)") do ->
+      # Post-flip this asserts the masked pointer (value & ~7) still derefs NodeA.
+      x = Res::Ok(NodeA { a: 999 })
+      v = match x
+        Ok(n) => n.a
+        Err(e) => -1
+      end
+      assert_eq(v, 999)
+    end
+    it("Err payload field survives the round-trip intact") do ->
+      y = Res::Err(NodeB { b: 123 })
+      v = match y
+        Ok(n) => -1
+        Err(e) => e.b
+      end
+      assert_eq(v, 123)
+    end
+    it("Result<Vec,String>-shaped VRes round-trips both variants") do ->
+      var vs = vec_new<Int>()
+      vs.push(11)
+      vs.push(22)
+      ok = VRes::VOk(vs)
+      err = VRes::VErr("boom")
+      assert_eq(ok is VOk, 1)
+      assert_eq(err is VErr, 1)
+      var got = 0
+      match ok
+        VOk(v) => got = v.size
+        VErr(s) => got = -1
+      end
+      assert_eq(got, 2)
+      var msg_ok = 0
+      match err
+        VOk(v) => msg_ok = -1
+        VErr(s) => msg_ok = s.size
+      end
+      assert_eq(msg_ok, 4)
+    end
+  end
+
+  # ════════════════════════════════════════════════════════════════════════
+  # 4. NESTING — Option<Result<A,B>> and a struct-field Result. The "Some(None) ≠
+  #    None" analog: a niche Result packed into an outer Option's payload pointer
+  #    must not tag-bit-collide; the inner variant survives. (Innermost-only
+  #    niching per RFC §2 — the outer SPILLs if it can't host both.)
+  # ════════════════════════════════════════════════════════════════════════
+  describe("nesting — Option<Result<..>> and struct-field Result") do ->
+    it("Some(Ok) ≠ Some(Err): inner variant survives the outer Option") do ->
+      so = Option::Some(res_ok(8))
+      se = Option::Some(res_err(8))
+      var a = 0
+      match so
+        Some(r) => a = res_code(r)
+        None => a = -100
+      end
+      var b = 0
+      match se
+        Some(r) => b = res_code(r)
+        None => b = -100
+      end
+      assert_eq(a, 8)
+      assert_eq(b, 0 - 8)
+    end
+    it("None vs Some(Ok) on Option<Res> stays distinct") do ->
+      n = none_res()
+      s = Option::Some(res_ok(3))
+      assert_eq(n is None, 1)
+      assert_eq(s is Some, 1)
+      assert_eq(n is Some, 0)
+    end
+    it("Res inside a struct field round-trips both variants") do ->
+      ho = ResHolder { r: res_ok(77) }
+      he = ResHolder { r: res_err(77) }
+      assert_eq(ho.r is Ok, 1)
+      assert_eq(he.r is Err, 1)
+      assert_eq(res_code(ho.r), 77)
+      assert_eq(res_code(he.r), 0 - 77)
+    end
+  end
+
+  # ════════════════════════════════════════════════════════════════════════
+  # 5. Vec<Result<A,B>> — element-position threading (the analog of the shipped
+  #    Vec<Option<T>> element-niche). push/get round-trip, both variants.
+  # ════════════════════════════════════════════════════════════════════════
+  describe("Vec<Res> — element-position round-trip") do ->
+    it("push/get preserves each variant + payload") do ->
+      var rs = vec_new<Res>()
+      rs.push(res_ok(1))
+      rs.push(res_err(2))
+      rs.push(res_ok(3))
+      rs.push(res_err(4))
+      assert_eq(rs[0] is Ok, 1)
+      assert_eq(rs[1] is Err, 1)
+      assert_eq(rs[2] is Ok, 1)
+      assert_eq(rs[3] is Err, 1)
+      assert_eq(res_code(rs[0]), 1)
+      assert_eq(res_code(rs[1]), 0 - 2)
+      assert_eq(res_code(rs[2]), 3)
+      assert_eq(res_code(rs[3]), 0 - 4)
+    end
+  end
+
+  # ════════════════════════════════════════════════════════════════════════
+  # 6. TAG-FALLBACK FLOOR — {Int,Int} MUST NOT niche (no common spare bit), stays
+  #    on the tagged-box SPILL path, still correct. RFC §8: this is the honest
+  #    ceiling, not a gap. (Holds identically pre- and post-flip — IRes never
+  #    niches under either gate.)
+  # ════════════════════════════════════════════════════════════════════════
+  describe("IRes {Int,Int} — tag-fallback floor (MUST stay tagged, still correct)") do ->
+    it("IOk(x) is IOk and recovers x") do ->
+      r = IRes::IOk(55)
+      assert_eq(r is IOk, 1)
+      assert_eq(r is IErr, 0)
+      assert_eq(ires_code(r), 55)
+    end
+    it("IErr(y) is IErr and recovers y (negated)") do ->
+      r = IRes::IErr(9)
+      assert_eq(r is IErr, 1)
+      assert_eq(r is IOk, 0)
+      assert_eq(ires_code(r), 0 - 9)
+    end
+    it("IOk(5) and IErr(5) with the SAME payload value stay distinct") do ->
+      # The information-theoretic crux: A(x) vs B(x) for the same x are
+      # indistinguishable WITHOUT a tag — so {Int,Int} MUST keep its tag word.
+      a = IRes::IOk(5)
+      b = IRes::IErr(5)
+      assert_eq(a is IOk, 1)
+      assert_eq(b is IOk, 0)
+      assert_eq(ires_code(a), 5)
+      assert_eq(ires_code(b), 0 - 5)
+    end
+  end
+
+  # ════════════════════════════════════════════════════════════════════════
+  # 7. enum-niche 3a — N-VARIANT (N>2) ALL-BOXED niche round-trips. The construct/
+  #    read/bind machinery is N-general (tag = decl index in the 3 low spare bits);
+  #    3a widens the eligibility/router clamp from exactly-2 to N (1≤N≤8). These
+  #    round-trips construct EACH variant, match EACH arm, and assert both the
+  #    variant selected AND that the boxed payload value survives the tag-bit pack/
+  #    mask. Layout-agnostic: correct under SPILL (gate=0) and packed-word (gate=1).
+  # ════════════════════════════════════════════════════════════════════════
+  describe("Tri3 (N=3 all-boxed) — every variant round-trips, payload survives") do ->
+    it("T3A is T3A only; payload recovers") do ->
+      x = Tri3::T3A(NodeA { a: 5 })
+      assert_eq(x is T3A, 1)
+      assert_eq(x is T3B, 0)
+      assert_eq(x is T3C, 0)
+      assert_eq(tri3_code(x), 1005)
+    end
+    it("T3B is T3B only; payload recovers") do ->
+      x = Tri3::T3B(NodeB { b: 6 })
+      assert_eq(x is T3B, 1)
+      assert_eq(x is T3A, 0)
+      assert_eq(x is T3C, 0)
+      assert_eq(tri3_code(x), 2006)
+    end
+    it("T3C is T3C only; payload recovers (tag=2, the 3rd decl index)") do ->
+      x = Tri3::T3C(NodeA { a: 7 })
+      assert_eq(x is T3C, 1)
+      assert_eq(x is T3A, 0)
+      assert_eq(x is T3B, 0)
+      assert_eq(tri3_code(x), 3007)
+    end
+    it("three distinct variants with the SAME payload value stay distinct") do ->
+      a = Tri3::T3A(NodeA { a: 9 })
+      c = Tri3::T3C(NodeA { a: 9 })
+      assert_eq(tri3_code(a), 1009)
+      assert_eq(tri3_code(c), 3009)
+    end
+  end
+
+  describe("Oct8 (N=8 all-boxed) — all 8 tags fill the 3-bit ceiling exactly") do ->
+    it("each of the 8 variants selects its own arm + recovers payload") do ->
+      assert_eq(oct8_code(Oct8::O0(NodeA { a: 1 })), 1)
+      assert_eq(oct8_code(Oct8::O1(NodeA { a: 1 })), 11)
+      assert_eq(oct8_code(Oct8::O2(NodeA { a: 1 })), 21)
+      assert_eq(oct8_code(Oct8::O3(NodeA { a: 1 })), 31)
+      assert_eq(oct8_code(Oct8::O4(NodeA { a: 1 })), 41)
+      assert_eq(oct8_code(Oct8::O5(NodeA { a: 1 })), 51)
+      assert_eq(oct8_code(Oct8::O6(NodeA { a: 1 })), 61)
+      assert_eq(oct8_code(Oct8::O7(NodeA { a: 1 })), 71)
+    end
+    it("the highest tag (O7 = decl index 7 = 0b111) round-trips losslessly") do ->
+      x = Oct8::O7(NodeA { a: 333 })
+      assert_eq(x is O7, 1)
+      assert_eq(x is O0, 0)
+      assert_eq(oct8_code(x), 403)
+    end
+    it("O0 (tag 0 ⇒ bare ptr, free) and O7 (tag 7) with same payload stay distinct") do ->
+      lo = Oct8::O0(NodeA { a: 42 })
+      hi = Oct8::O7(NodeA { a: 42 })
+      assert_eq(oct8_code(lo), 42)
+      assert_eq(oct8_code(hi), 112)
+    end
+  end
+
+  describe("Non9 (N=9 > 8) — exceeds 3-bit ceiling ⇒ SPILL fallback, still correct") do ->
+    it("the 9th variant forces SPILL; all variants still round-trip") do ->
+      assert_eq(non9_code(Non9::N0(NodeA { a: 2 })), 2)
+      assert_eq(non9_code(Non9::N4(NodeA { a: 2 })), 402)
+      assert_eq(non9_code(Non9::N8(NodeA { a: 2 })), 802)
+    end
+    it("N8 (the variant that would need a 4th tag bit) is distinct from N0") do ->
+      a = Non9::N0(NodeA { a: 3 })
+      b = Non9::N8(NodeA { a: 3 })
+      assert_eq(a is N0, 1)
+      assert_eq(b is N8, 1)
+      assert_eq(a is N8, 0)
+      assert_eq(non9_code(a), 3)
+      assert_eq(non9_code(b), 803)
+    end
+  end
+
+  describe("Mix4 (2 boxed payload + 2 dataless) — enum-niche 3b round-trip") do ->
+    it("each payload variant fires its own arm + recovers payload") do ->
+      assert_eq(mix4_code(Mix4::Mp(NodeA { a: 5 })), 1005)
+      assert_eq(mix4_code(Mix4::Mq(NodeB { b: 7 })), 2007)
+    end
+    it("each DATALESS variant fires its own arm without deref") do ->
+      assert_eq(mix4_code(Mix4::Empty), 7000)
+      assert_eq(mix4_code(Mix4::Done), 9000)
+    end
+    it("payload variants `is`-test true for themselves, false for others") do ->
+      p = Mix4::Mp(NodeA { a: 1 })
+      assert_eq(p is Mp, 1)
+      assert_eq(p is Mq, 0)
+      assert_eq(p is Empty, 0)
+      assert_eq(p is Done, 0)
+    end
+    it("dataless variants `is`-test true for themselves, false for others") do ->
+      e = Mix4::Empty
+      assert_eq(e is Empty, 1)
+      assert_eq(e is Done, 0)
+      assert_eq(e is Mp, 0)
+      assert_eq(e is Mq, 0)
+    end
+    it("a dataless word never collides with a payload word (same decl space)") do ->
+      # Mp (tag 0 ⇒ bare ptr ≥ 4096) vs Empty (tag 2 ⇒ the small int 2): distinct.
+      mp = Mix4::Mp(NodeA { a: 2 })
+      empty = Mix4::Empty
+      assert_eq(mp is Mp, 1)
+      assert_eq(empty is Empty, 1)
+      assert_eq(mp is Empty, 0)
+      assert_eq(empty is Mp, 0)
+      assert_eq(mix4_code(mp), 1002)
+      assert_eq(mix4_code(empty), 7000)
+    end
+  end
+
+  return qspec_main()
+end

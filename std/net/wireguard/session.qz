@@ -1,0 +1,255 @@
+## std/net/wireguard/session - WireGuard transport session
+##
+## A `Session` is the post-handshake symmetric state for one direction of a
+## WG link. After Noise IKpsk2 completes, both sides hold matching keys
+## (initiator's t_send == responder's t_recv, and vice versa) and a pair of
+## per-direction counters used as ChaCha20-Poly1305 nonces.
+##
+## Per WG paper §5.4.6:
+##   - Send: AEAD(t_send, counter_send, plaintext, ∅) — counter is monotonic;
+##           after 2^60 messages or REKEY_AFTER_TIME, initiate a new handshake.
+##   - Recv: AEAD-decrypt with t_recv keyed by the receiver-side counter from
+##           the wire packet header. Replay defense via RFC 6479 sliding window
+##           (Step 2.2 in transport.qz — Session reserves the buffer here).
+##
+## Layout (single 352-byte malloc'd buffer):
+##   [0..32)    t_send
+##   [32..64)   t_recv
+##   [64..72)   send_counter      — u64 host order, monotonic, starts at 0
+##   [72..80)   last_recv_counter — u64 host order, highest counter seen
+##   [80..336)  replay_bitmap     — 32 × u64 = 2048-bit RFC 6479 window
+##   [336..344) established_ms    — u64 host order, time_mono_ns()/1_000_000
+##                                  at handshake completion (drives REKEY/REJECT
+##                                  timers in Step 2.3)
+##
+## Identifying fields (inline, immutable for the session lifetime):
+##   - local_index:  u32 this side picks at handshake time. Peer echoes it as
+##                   `receiver_index` in transport packets so we can look up
+##                   this session.
+##   - peer_index:   u32 peer picked. We put it in the `receiver_index` slot
+##                   of every transport packet we send.
+##   - is_initiator: 0 or 1. Determines key role for `noise_split` (in
+##                   handshake.qz). Useful at higher layers for asymmetric
+##                   timer policy (only initiator drives REKEY_AFTER_TIME).
+##
+## See docs/design/WIREGUARD_UNIKERNEL_DESIGN.md "Transport packets" + "Timer
+## state machine".
+
+import std/core/crypto/zeroize
+import * from ffi/socket  # malloc/free/memcpy/memset
+
+# =============================================================================
+# Layout constants
+# =============================================================================
+
+def session_buf_size(): Int = 352
+
+def _t_send_off(): Int = 0
+def _t_recv_off(): Int = 32
+def _send_counter_off(): Int = 64
+def _last_recv_off(): Int = 72
+def _replay_off(): Int = 80
+def _replay_bytes(): Int = 256          # 32 × u64
+def _established_off(): Int = 336
+
+# =============================================================================
+# Session
+# =============================================================================
+
+## Live transport session for one peer direction.
+##
+## A Session is produced by `handshake.qz`'s `wg_finalize_session` after both
+## sides complete the Noise IKpsk2 exchange. Hold for the session's lifetime
+## (until REJECT_AFTER_TIME or replacement by a new handshake), then call
+## `session_destroy` to wipe keys.
+struct Session
+  buf: Int                # malloc'd 352 bytes
+  local_index: Int        # u32 — this side's session handle
+  peer_index: Int         # u32 — peer's session handle
+  is_initiator: Int       # 0 or 1
+end
+
+## Allocate a zeroed session buffer. Used by handshake.qz; not exported as
+## API surface. Caller fills t_send/t_recv via `session_t_send` / `session_t_recv`
+## ptrs and sets `established_ms` via `session_set_established_ms`.
+def session_new_zero(local_index: Int, peer_index: Int, is_initiator: Int): Session
+  var buf = malloc(session_buf_size())
+  memset(buf, 0, session_buf_size())
+  return Session {
+    buf: buf,
+    local_index: local_index,
+    peer_index: peer_index,
+    is_initiator: is_initiator
+  }
+end
+
+## Wipe transport keys + replay state, free buffer. Session must not be used
+## after.
+def session_destroy(s: Session): Void
+  zeroize(s.buf, session_buf_size())
+  free(s.buf)
+end
+
+# =============================================================================
+# Key accessors — internal-use; never expose these pointers to wire format.
+# =============================================================================
+
+def session_t_send(s: Session): Int
+  return s.buf + _t_send_off()
+end
+
+def session_t_recv(s: Session): Int
+  return s.buf + _t_recv_off()
+end
+
+# =============================================================================
+# Counter helpers — host-order u64 read/write
+# =============================================================================
+
+## Read a 64-bit unsigned integer in host byte order from a buffer.
+## (Quartz Int is 64-bit signed; counters fit safely below 2^60.)
+def _read_u64_host(p: Int): Int
+  var v = 0
+  var i = 7
+  while i >= 0
+    v = (v * 256) + ptr_read_byte(p + i)
+    i -= 1
+  end
+  return v
+end
+
+def _write_u64_host(p: Int, v: Int): Void
+  var i = 0
+  var x = v
+  while i < 8
+    ptr_write_byte(p + i, x & 255)
+    x = x / 256
+    i += 1
+  end
+end
+
+## Atomically read-and-increment the send counter. Returns the value to use
+## as this packet's nonce (the value BEFORE increment, per WG: counter starts
+## at 0 and the first packet uses nonce 0).
+##
+## After 2^60 messages or REKEY_AFTER_TIME elapsed, the higher layer should
+## initiate a new handshake. This function does NOT enforce that limit —
+## transport.qz checks before calling.
+def session_next_send_counter(s: Session): Int
+  var p = s.buf + _send_counter_off()
+  var v = _read_u64_host(p)
+  _write_u64_host(p, v + 1)
+  return v
+end
+
+def session_send_counter(s: Session): Int
+  return _read_u64_host(s.buf + _send_counter_off())
+end
+
+def session_last_recv_counter(s: Session): Int
+  return _read_u64_host(s.buf + _last_recv_off())
+end
+
+# =============================================================================
+# Established-at — drives Phase 2.3 timer machinery
+# =============================================================================
+
+def session_set_established_ms(s: Session, ms: Int): Void
+  _write_u64_host(s.buf + _established_off(), ms)
+end
+
+def session_established_ms(s: Session): Int
+  return _read_u64_host(s.buf + _established_off())
+end
+
+# =============================================================================
+# RFC 6479 sliding-window replay defense
+#
+# The replay bitmap covers the most recent 2048 receive counters relative to
+# `last_recv_counter`. Bit position `b = counter mod W` indicates whether the
+# corresponding counter has already been seen. When `last_recv` advances by
+# delta, the `delta` bit positions just below the new top are cleared (those
+# bits previously stood for stale counters now `delta` further in the past
+# than the current window's bottom; clearing makes them available for
+# future-arriving counters in the new window).
+#
+# Reference: RFC 6479 §3.2 ("IPsec Anti-Replay Algorithm without Bit
+# Shifting"). This implementation is the byte-addressed circular variant.
+# =============================================================================
+
+def session_replay_window_bits(): Int = 2048
+
+def session_replay_buf(s: Session): Int
+  return s.buf + _replay_off()
+end
+
+def _set_last_recv_counter(s: Session, c: Int): Void
+  _write_u64_host(s.buf + _last_recv_off(), c)
+end
+
+# Bitmap byte-addressed bit ops. `idx` is in [0, 2048).
+def _bitmap_set(bitmap: Int, idx: Int): Void
+  var byte_off = idx / 8
+  var bit_pos = idx & 7
+  var b = ptr_read_byte(bitmap + byte_off)
+  ptr_write_byte(bitmap + byte_off, b | (1 << bit_pos))
+end
+
+def _bitmap_clear(bitmap: Int, idx: Int): Void
+  var byte_off = idx / 8
+  var bit_pos = idx & 7
+  var b = ptr_read_byte(bitmap + byte_off)
+  ptr_write_byte(bitmap + byte_off, b & (255 ^ (1 << bit_pos)))
+end
+
+def _bitmap_get(bitmap: Int, idx: Int): Int
+  var byte_off = idx / 8
+  var bit_pos = idx & 7
+  var b = ptr_read_byte(bitmap + byte_off)
+  return (b >> bit_pos) & 1
+end
+
+## Check that `counter` has not been seen before; on success record it as seen
+## and (if greater than the current top) advance the window. Returns 0 on OK,
+## -1 on REJECT (replay or out-of-window-old).
+##
+## Per WG paper §5.4.6, transport.qz calls this after AEAD-decrypt SUCCEEDS.
+## (Order matters — checking before decrypt would let an attacker poison
+## the bitmap with forged counters and cause legitimate retransmissions to
+## drop. Decrypt-then-check is correct.)
+def session_check_and_set_recv(s: Session, counter: Int): Int
+  if counter < 0
+    return 0 - 1
+  end
+
+  var bitmap = session_replay_buf(s)
+  var W = session_replay_window_bits()
+  var last = session_last_recv_counter(s)
+
+  if counter > last
+    var delta = counter - last
+    if delta >= W
+      memset(bitmap, 0, _replay_bytes())
+    else
+      var i = 1
+      while i <= delta
+        _bitmap_clear(bitmap, (last + i) % W)
+        i += 1
+      end
+    end
+    _set_last_recv_counter(s, counter)
+    _bitmap_set(bitmap, counter % W)
+    return 0
+  end
+
+  if last - counter >= W
+    return 0 - 1
+  end
+
+  var idx = counter % W
+  if _bitmap_get(bitmap, idx) == 1
+    return 0 - 1
+  end
+  _bitmap_set(bitmap, idx)
+  return 0
+end

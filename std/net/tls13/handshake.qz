@@ -1,0 +1,1173 @@
+## std/net/tls13/handshake — TLS 1.3 handshake message wire codec (RFC 8446 §4)
+##
+## NET.5c.1 substrate. Encodes / decodes the TLS 1.3 Handshake protocol
+## messages — ClientHello, ServerHello, EncryptedExtensions, Certificate,
+## CertificateVerify, Finished — plus the extension wire format inside
+## CH/SH/EE. The state machine (NET.5d) consumes / produces these. The
+## record layer (NET.5c.2) wraps them in AEAD-protected TLSCiphertext.
+##
+## ## Prior art
+##
+## | Project | What we take from it |
+## |---|---|
+## | rustls `tls/codec.rs` | `Codec<'a>` trait + slice-based reader + Vec-based writer. The "every message-struct rolls up to one encode/decode call" shape. |
+## | picotls (`picotls.c`) | Macro-driven inline encoders — Quartz's idiom prefers explicit functions but the "open / close length backfill" pattern is identical. |
+## | BoringSSL `ssl/handshake.cc` (CBB) | Crypto Byte Builder's length-prefixed vector "open / close" API — exactly what `cw_open_uXX_len` does here. |
+## | Go `crypto/tls/handshake_messages.go` | Per-message marshal/unmarshal functions on structs; the test pattern of "encode → decode → struct round-trip" is mirrored in `spec/qz/tls_handshake_smoke.qz`. |
+## | RFC 8446 §4 | Canonical reference for every wire shape encoded here. |
+##
+## ## Scope (per `docs/design/TLS_1_3_DESIGN.md`)
+##
+## | Encoded / decoded                          | NOT (filed forward)                        |
+## |--------------------------------------------|--------------------------------------------|
+## | ClientHello + ServerHello                  | HelloRetryRequest — NET.5g                |
+## | EncryptedExtensions                        | NewSessionTicket — no resumption v1       |
+## | Certificate + CertificateVerify            | CertificateRequest — no mTLS v1           |
+## | Finished                                   | KeyUpdate — v2                             |
+## | extension: server_name (SNI)               | early_data                                 |
+## | extension: supported_versions              | psk_key_exchange_modes                     |
+## | extension: supported_groups (CH)           | pre_shared_key                             |
+## | extension: key_share (CH list + SH single) | cookie                                     |
+## | extension: signature_algorithms            | post_handshake_auth                        |
+## | extension: ALPN                            | oid_filters / cert_authorities             |
+## | named groups: x25519, x25519_mlkem768      | secp256r1 / others                         |
+## | sig schemes: ed25519                       | rsa_pss_* / ecdsa_secp256r1 / …            |
+## | cipher suites: 0x1301/02/03                | 0x1304 (CCM) / 0x1305 (CCM_8)              |
+##
+## ## Codec contract
+##
+## All wire integers are big-endian (RFC 8446 §3, X.690-style). Variable-
+## length vectors are length-prefixed: `opaque foo<lo..hi>` encodes as a
+## big-endian length followed by content, where length-byte count is the
+## smallest integer N such that 2^(8N)-1 ≥ hi:
+##
+##   * `<0..255>`              → u8 length
+##   * `<0..65535>`            → u16 length
+##   * `<0..2^24-1>`           → u24 length  (3 bytes BE)
+##   * `<0..2^32-1>`           → u32 length
+##
+## We use the "open / close" pattern for nested length-prefixed vectors:
+## `cw_open_u16_len(w)` reserves 2 bytes at the current write head and
+## returns the saved offset; the caller writes inner content; then
+## `cw_close_u16_len(w, saved)` backfills the length octets with the
+## number of bytes written since.
+##
+## On the reader side, `cr_open_u16_len(r)` reads the length prefix and
+## returns a child `CodecReader` whose `end_pos` is `r.pos + length`;
+## parent's `pos` advances past the entire vector. `cr_close(child, parent)`
+## verifies the child was fully consumed and propagates any error.
+##
+## ## Module layering
+##
+## - "wire" primitives (CodecWriter / CodecReader / uXX / open / close)
+## - Constants (HandshakeType / ExtensionType / NamedGroup / SigScheme /
+##   CipherSuite)
+## - Extension struct types + per-type encode/decode
+## - Handshake message struct types + per-message encode/decode
+
+import * from ffi/socket
+
+# =============================================================================
+# Wire codec primitives
+# =============================================================================
+
+## Bytes-writer with grow-on-demand backing storage. Caller frees `buf`
+## after consuming the encoded bytes.
+struct CodecWriter
+  buf: Int
+  cap: Int
+  pos: Int
+end
+
+## Allocate a CodecWriter with initial `cap` bytes. The buffer grows
+## (`_cw_ensure`) when a write would overflow.
+def cw_new(cap: Int): CodecWriter
+  var c = if cap < 16 then 16 else cap end
+  return CodecWriter { buf: malloc(c), cap: c, pos: 0, }
+end
+
+## Free the writer's backing buffer. After this call the writer must
+## not be touched. Callers usually copy `w.buf` somewhere stable then
+## free; or take ownership of `w.buf` directly and skip the call.
+def cw_free(w: CodecWriter): Void
+  if w.buf != 0 then free(w.buf) end
+  w.buf = 0
+end
+
+# Internal: ensure the writer has room for `n` more bytes; grow by 2× if not.
+def _cw_ensure(w: CodecWriter, n: Int): Void
+  if w.pos + n <= w.cap then return end
+  var ncap = w.cap * 2
+  while ncap < w.pos + n
+    ncap = ncap * 2
+  end
+  var newbuf = malloc(ncap)
+  memcpy(newbuf, w.buf, w.pos)
+  free(w.buf)
+  w.buf = newbuf
+  w.cap = ncap
+end
+
+## Append a single byte.
+def cw_u8(w: CodecWriter, v: Int): Void
+  _cw_ensure(w, 1)
+  ptr_write_byte(w.buf + w.pos, v & 0xff)
+  w.pos = w.pos + 1
+end
+
+## Append a big-endian u16 (2 bytes).
+def cw_u16(w: CodecWriter, v: Int): Void
+  _cw_ensure(w, 2)
+  ptr_write_byte(w.buf + w.pos,     (v >> 8) & 0xff)
+  ptr_write_byte(w.buf + w.pos + 1, v & 0xff)
+  w.pos = w.pos + 2
+end
+
+## Append a big-endian u24 (3 bytes). Used for Handshake.length + Certificate's
+## cert_data<1..2^24-1> wrappers.
+def cw_u24(w: CodecWriter, v: Int): Void
+  _cw_ensure(w, 3)
+  ptr_write_byte(w.buf + w.pos,     (v >> 16) & 0xff)
+  ptr_write_byte(w.buf + w.pos + 1, (v >> 8) & 0xff)
+  ptr_write_byte(w.buf + w.pos + 2, v & 0xff)
+  w.pos = w.pos + 3
+end
+
+## Append a big-endian u32 (4 bytes).
+def cw_u32(w: CodecWriter, v: Int): Void
+  _cw_ensure(w, 4)
+  ptr_write_byte(w.buf + w.pos,     (v >> 24) & 0xff)
+  ptr_write_byte(w.buf + w.pos + 1, (v >> 16) & 0xff)
+  ptr_write_byte(w.buf + w.pos + 2, (v >> 8) & 0xff)
+  ptr_write_byte(w.buf + w.pos + 3, v & 0xff)
+  w.pos = w.pos + 4
+end
+
+## Append `len` bytes from `src_ptr`.
+def cw_bytes(w: CodecWriter, src_ptr: Int, len: Int): Void
+  if len <= 0 then return end
+  _cw_ensure(w, len)
+  memcpy(w.buf + w.pos, src_ptr, len)
+  w.pos = w.pos + len
+end
+
+## Append a String's bytes (no length prefix).
+def cw_string_bytes(w: CodecWriter, s: String): Void
+  var n = str_byte_len(s)
+  _cw_ensure(w, n)
+  var i = 0
+  while i < n
+    ptr_write_byte(w.buf + w.pos + i, str_byte_at(s, i))
+    i = i + 1
+  end
+  w.pos = w.pos + n
+end
+
+## Reserve 1 byte for a length prefix; return the offset to backfill later.
+def cw_open_u8_len(w: CodecWriter): Int
+  var saved = w.pos
+  cw_u8(w, 0)
+  return saved
+end
+
+## Backfill a 1-byte length prefix opened at `saved`. Errors silently on
+## overflow > 255 (caller should ensure scope is small enough).
+def cw_close_u8_len(w: CodecWriter, saved: Int): Void
+  var len = w.pos - saved - 1
+  ptr_write_byte(w.buf + saved, len & 0xff)
+end
+
+## Reserve 2 bytes for a u16 length prefix; return the offset to backfill.
+def cw_open_u16_len(w: CodecWriter): Int
+  var saved = w.pos
+  cw_u16(w, 0)
+  return saved
+end
+
+## Backfill a 2-byte u16 length prefix opened at `saved`.
+def cw_close_u16_len(w: CodecWriter, saved: Int): Void
+  var len = w.pos - saved - 2
+  ptr_write_byte(w.buf + saved,     (len >> 8) & 0xff)
+  ptr_write_byte(w.buf + saved + 1, len & 0xff)
+end
+
+## Reserve 3 bytes for a u24 length prefix; return the offset.
+def cw_open_u24_len(w: CodecWriter): Int
+  var saved = w.pos
+  cw_u24(w, 0)
+  return saved
+end
+
+## Backfill a 3-byte u24 length prefix opened at `saved`.
+def cw_close_u24_len(w: CodecWriter, saved: Int): Void
+  var len = w.pos - saved - 3
+  ptr_write_byte(w.buf + saved,     (len >> 16) & 0xff)
+  ptr_write_byte(w.buf + saved + 1, (len >> 8) & 0xff)
+  ptr_write_byte(w.buf + saved + 2, len & 0xff)
+end
+
+# -----------------------------------------------------------------------------
+# Reader
+# -----------------------------------------------------------------------------
+
+## Cursor-based byte reader. Sticky-error pattern mirrors `DerReader` from
+## std/core/crypto/asn1 — once `err` is non-zero, downstream reads
+## short-circuit and the eventual caller checks once.
+struct CodecReader
+  buf: Int
+  pos: Int
+  end_pos: Int
+  err: Int
+end
+
+## Codec error codes (negative; -200 base distinguishes from DER err range).
+def CODEC_OK(): Int = 0
+def CODEC_ERR_EOF(): Int = 0 - 200    # read past buffer end
+def CODEC_ERR_LEN(): Int = 0 - 201    # length-prefix overflow / negative
+def CODEC_ERR_TRAIL(): Int = 0 - 202  # leftover bytes after expected end
+def CODEC_ERR_VALUE(): Int = 0 - 203  # value out of range / disallowed
+
+def cr_new(buf: Int, len: Int): CodecReader
+  return CodecReader { buf: buf, pos: 0, end_pos: len, err: 0, }
+end
+
+def cr_remaining(r: CodecReader): Int
+  if r.err != 0 then return 0 end
+  return r.end_pos - r.pos
+end
+
+def cr_at_end(r: CodecReader): Int
+  if r.err != 0 then return 0 end
+  if r.pos == r.end_pos then return 1 end
+  return 0
+end
+
+def cr_set_err(r: CodecReader, code: Int): Void
+  if r.err == 0 then r.err = code end
+end
+
+def cr_u8(r: CodecReader): Int
+  if r.err != 0 then return 0 end
+  if r.pos >= r.end_pos
+    cr_set_err(r, CODEC_ERR_EOF())
+    return 0
+  end
+  var b = ptr_read_byte(r.buf + r.pos)
+  r.pos = r.pos + 1
+  return b
+end
+
+def cr_u16(r: CodecReader): Int
+  if r.err != 0 then return 0 end
+  if r.pos + 2 > r.end_pos
+    cr_set_err(r, CODEC_ERR_EOF())
+    return 0
+  end
+  var hi = ptr_read_byte(r.buf + r.pos)
+  var lo = ptr_read_byte(r.buf + r.pos + 1)
+  r.pos = r.pos + 2
+  return (hi << 8) | lo
+end
+
+def cr_u24(r: CodecReader): Int
+  if r.err != 0 then return 0 end
+  if r.pos + 3 > r.end_pos
+    cr_set_err(r, CODEC_ERR_EOF())
+    return 0
+  end
+  var b2 = ptr_read_byte(r.buf + r.pos)
+  var b1 = ptr_read_byte(r.buf + r.pos + 1)
+  var b0 = ptr_read_byte(r.buf + r.pos + 2)
+  r.pos = r.pos + 3
+  return (b2 << 16) | (b1 << 8) | b0
+end
+
+def cr_u32(r: CodecReader): Int
+  if r.err != 0 then return 0 end
+  if r.pos + 4 > r.end_pos
+    cr_set_err(r, CODEC_ERR_EOF())
+    return 0
+  end
+  var b3 = ptr_read_byte(r.buf + r.pos)
+  var b2 = ptr_read_byte(r.buf + r.pos + 1)
+  var b1 = ptr_read_byte(r.buf + r.pos + 2)
+  var b0 = ptr_read_byte(r.buf + r.pos + 3)
+  r.pos = r.pos + 4
+  return (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+end
+
+## Open a length-prefixed sub-region: read length, return a child reader
+## spanning `length` bytes; parent advances past the entire vector. On
+## any error returns a child with err set so downstream reads short-circuit.
+def cr_open_u8_len(r: CodecReader): CodecReader
+  if r.err != 0 then return CodecReader { buf: 0, pos: 0, end_pos: 0, err: r.err, } end
+  var len = cr_u8(r)
+  if r.err != 0 then return CodecReader { buf: 0, pos: 0, end_pos: 0, err: r.err, } end
+  if r.pos + len > r.end_pos
+    cr_set_err(r, CODEC_ERR_EOF())
+    return CodecReader { buf: 0, pos: 0, end_pos: 0, err: r.err, }
+  end
+  var child = CodecReader { buf: r.buf, pos: r.pos, end_pos: r.pos + len, err: 0, }
+  r.pos = r.pos + len
+  return child
+end
+
+def cr_open_u16_len(r: CodecReader): CodecReader
+  if r.err != 0 then return CodecReader { buf: 0, pos: 0, end_pos: 0, err: r.err, } end
+  var len = cr_u16(r)
+  if r.err != 0 then return CodecReader { buf: 0, pos: 0, end_pos: 0, err: r.err, } end
+  if r.pos + len > r.end_pos
+    cr_set_err(r, CODEC_ERR_EOF())
+    return CodecReader { buf: 0, pos: 0, end_pos: 0, err: r.err, }
+  end
+  var child = CodecReader { buf: r.buf, pos: r.pos, end_pos: r.pos + len, err: 0, }
+  r.pos = r.pos + len
+  return child
+end
+
+def cr_open_u24_len(r: CodecReader): CodecReader
+  if r.err != 0 then return CodecReader { buf: 0, pos: 0, end_pos: 0, err: r.err, } end
+  var len = cr_u24(r)
+  if r.err != 0 then return CodecReader { buf: 0, pos: 0, end_pos: 0, err: r.err, } end
+  if r.pos + len > r.end_pos
+    cr_set_err(r, CODEC_ERR_EOF())
+    return CodecReader { buf: 0, pos: 0, end_pos: 0, err: r.err, }
+  end
+  var child = CodecReader { buf: r.buf, pos: r.pos, end_pos: r.pos + len, err: 0, }
+  r.pos = r.pos + len
+  return child
+end
+
+## Close a child reader: verify fully-consumed + no internal error; propagate
+## up to parent on failure.
+def cr_close(child: CodecReader, parent: CodecReader): Int
+  if child.err != 0
+    cr_set_err(parent, child.err)
+    return parent.err
+  end
+  if child.pos != child.end_pos
+    cr_set_err(parent, CODEC_ERR_TRAIL())
+    return parent.err
+  end
+  return 0
+end
+
+# =============================================================================
+# Constants — TLS 1.3 protocol-level (RFC 8446 §4 + IANA registries)
+# =============================================================================
+
+# HandshakeType (RFC 8446 §4 + §B.3 — only the v1-relevant ones).
+def HS_CLIENT_HELLO(): Int = 1
+def HS_SERVER_HELLO(): Int = 2
+def HS_NEW_SESSION_TICKET(): Int = 4         # decoded as opaque; v1 client ignores
+def HS_END_OF_EARLY_DATA(): Int = 5          # no early data v1
+def HS_ENCRYPTED_EXTENSIONS(): Int = 8
+def HS_CERTIFICATE(): Int = 11
+def HS_CERTIFICATE_REQUEST(): Int = 13        # no mTLS v1
+def HS_CERTIFICATE_VERIFY(): Int = 15
+def HS_FINISHED(): Int = 20
+def HS_KEY_UPDATE(): Int = 24                 # v2
+
+# ExtensionType (RFC 8446 §4.2 + IANA).
+def EXT_SERVER_NAME(): Int = 0
+def EXT_SUPPORTED_GROUPS(): Int = 10
+def EXT_SIGNATURE_ALGORITHMS(): Int = 13
+def EXT_ALPN(): Int = 16
+def EXT_SUPPORTED_VERSIONS(): Int = 43
+def EXT_KEY_SHARE(): Int = 51
+
+# Server_name name_type (RFC 6066 §3).
+def NAME_TYPE_HOST_NAME(): Int = 0
+
+# NamedGroup (RFC 8446 §4.2.7 + draft-ietf-tls-ecdhe-mlkem-04 §4).
+def GROUP_X25519(): Int = 0x001d
+def GROUP_X25519_MLKEM768(): Int = 0x11ec     # hybrid PQ — first preference
+
+# SignatureScheme (RFC 8446 §4.2.3).
+def SIG_ED25519(): Int = 0x0807
+
+# CipherSuite (RFC 8446 §B.4 — v1 ships three of five).
+def CIPHER_AES_128_GCM_SHA256(): Int = 0x1301
+def CIPHER_AES_256_GCM_SHA384(): Int = 0x1302
+def CIPHER_CHACHA20_POLY1305_SHA256(): Int = 0x1303
+
+# ProtocolVersion — sent as legacy_version 0x0303 + supported_versions [0x0304].
+def TLS_LEGACY_VERSION(): Int = 0x0303
+def TLS_VERSION_1_3(): Int = 0x0304
+
+# =============================================================================
+# Extension wire format
+# =============================================================================
+
+# Each extension on the wire = u16 type | u16 len | data (RFC 8446 §4.2).
+# We encode each known extension type with a dedicated helper that writes
+# the full <type, len, data> triple. Unknown extensions on the read side
+# are skipped via `_cr_skip_extension`.
+
+## Encode a server_name (SNI) extension carrying a single host_name. RFC 6066
+## §3 — server_name<1..2^16-1> of ServerName, each {NameType, opaque<1..2^16-1>}.
+def ext_encode_server_name(w: CodecWriter, hostname: String): Void
+  cw_u16(w, EXT_SERVER_NAME())
+  var ext_len = cw_open_u16_len(w)
+  var list_len = cw_open_u16_len(w)
+  cw_u8(w, NAME_TYPE_HOST_NAME())
+  var name_len = cw_open_u16_len(w)
+  cw_string_bytes(w, hostname)
+  cw_close_u16_len(w, name_len)
+  cw_close_u16_len(w, list_len)
+  cw_close_u16_len(w, ext_len)
+end
+
+## Encode supported_versions for ClientHello: list of u16 versions.
+def ext_encode_supported_versions_ch(w: CodecWriter, versions: Vec<Int>): Void
+  cw_u16(w, EXT_SUPPORTED_VERSIONS())
+  var ext_len = cw_open_u16_len(w)
+  var list_len = cw_open_u8_len(w)
+  var i = 0
+  while i < versions.size()
+    cw_u16(w, versions[i])
+    i = i + 1
+  end
+  cw_close_u8_len(w, list_len)
+  cw_close_u16_len(w, ext_len)
+end
+
+## Encode supported_versions for ServerHello: single u16 selected version.
+def ext_encode_supported_versions_sh(w: CodecWriter, version: Int): Void
+  cw_u16(w, EXT_SUPPORTED_VERSIONS())
+  var ext_len = cw_open_u16_len(w)
+  cw_u16(w, version)
+  cw_close_u16_len(w, ext_len)
+end
+
+## Encode supported_groups (CH only): list of u16 named groups.
+def ext_encode_supported_groups(w: CodecWriter, groups: Vec<Int>): Void
+  cw_u16(w, EXT_SUPPORTED_GROUPS())
+  var ext_len = cw_open_u16_len(w)
+  var list_len = cw_open_u16_len(w)
+  var i = 0
+  while i < groups.size()
+    cw_u16(w, groups[i])
+    i = i + 1
+  end
+  cw_close_u16_len(w, list_len)
+  cw_close_u16_len(w, ext_len)
+end
+
+## Encode signature_algorithms (CH only): list of u16 SignatureScheme.
+def ext_encode_signature_algorithms(w: CodecWriter, schemes: Vec<Int>): Void
+  cw_u16(w, EXT_SIGNATURE_ALGORITHMS())
+  var ext_len = cw_open_u16_len(w)
+  var list_len = cw_open_u16_len(w)
+  var i = 0
+  while i < schemes.size()
+    cw_u16(w, schemes[i])
+    i = i + 1
+  end
+  cw_close_u16_len(w, list_len)
+  cw_close_u16_len(w, ext_len)
+end
+
+## One key_share entry: u16 group | u16 keylen | key_bytes.
+struct KeyShareEntry
+  group: Int
+  key_ptr: Int
+  key_len: Int
+end
+
+## Encode a key_share extension for ClientHello: list of KeyShareEntry.
+def ext_encode_key_share_ch(w: CodecWriter, entries: Vec<KeyShareEntry>): Void
+  cw_u16(w, EXT_KEY_SHARE())
+  var ext_len = cw_open_u16_len(w)
+  var list_len = cw_open_u16_len(w)
+  var i = 0
+  while i < entries.size()
+    var e = entries[i]
+    cw_u16(w, e.group)
+    var key_len = cw_open_u16_len(w)
+    cw_bytes(w, e.key_ptr, e.key_len)
+    cw_close_u16_len(w, key_len)
+    i = i + 1
+  end
+  cw_close_u16_len(w, list_len)
+  cw_close_u16_len(w, ext_len)
+end
+
+## Encode a key_share extension for ServerHello: a single KeyShareEntry
+## (the chosen group + the server's public key).
+def ext_encode_key_share_sh(w: CodecWriter, entry: KeyShareEntry): Void
+  cw_u16(w, EXT_KEY_SHARE())
+  var ext_len = cw_open_u16_len(w)
+  cw_u16(w, entry.group)
+  var key_len = cw_open_u16_len(w)
+  cw_bytes(w, entry.key_ptr, entry.key_len)
+  cw_close_u16_len(w, key_len)
+  cw_close_u16_len(w, ext_len)
+end
+
+## Encode an ALPN extension: each protocol is u8-len-prefixed inside a u16-len
+## outer list. v1 use case: client offers ["http/1.1"], server picks one.
+def ext_encode_alpn(w: CodecWriter, protocols: Vec<String>): Void
+  cw_u16(w, EXT_ALPN())
+  var ext_len = cw_open_u16_len(w)
+  var list_len = cw_open_u16_len(w)
+  var i = 0
+  while i < protocols.size()
+    var p_len = cw_open_u8_len(w)
+    cw_string_bytes(w, protocols[i])
+    cw_close_u8_len(w, p_len)
+    i = i + 1
+  end
+  cw_close_u16_len(w, list_len)
+  cw_close_u16_len(w, ext_len)
+end
+
+# =============================================================================
+# Handshake message struct types (decoded shape)
+# =============================================================================
+
+## ClientHello decoded shape. Fields not consumed during the handshake are
+## not extracted (compression methods, legacy_version — we just verify
+## these are at the wire level).
+##
+## Notes:
+##   - `random` is always exactly 32 bytes; the decoder allocates a copy.
+##     Caller frees with `ch_msg_free`.
+##   - `cipher_suites` is a Vec<Int> of u16 suite IDs.
+##   - `key_shares` is a Vec<KeyShareEntry> — the KeyShareEntry's `key_ptr`
+##     borrows from the input buffer (no copy). Caller must keep the input
+##     buffer alive while iterating.
+##   - `server_name` is "" if no SNI extension. `alpn` is empty Vec if no
+##     ALPN extension.
+##   - `raw_ptr` / `raw_len` span the entire handshake message INCLUDING
+##     the 4-byte header — needed for transcript-hash input.
+struct ClientHelloMsg
+  random: Int                     # allocated 32-byte copy (caller frees)
+  legacy_session_id_ptr: Int      # borrowed; 0..32 bytes
+  legacy_session_id_len: Int
+  cipher_suites: Vec<Int>
+  supported_versions: Vec<Int>
+  named_groups: Vec<Int>
+  sig_algs: Vec<Int>
+  key_shares: Vec<KeyShareEntry>
+  server_name: String
+  alpn: Vec<String>
+  raw_ptr: Int
+  raw_len: Int
+end
+
+## ServerHello decoded shape. RFC 8446 §4.1.3 — the on-wire ProtocolVersion
+## is the legacy `0x0303`; the real selected version lives in the
+## supported_versions extension (decoded into `selected_version`).
+struct ServerHelloMsg
+  random: Int                     # allocated 32-byte copy
+  legacy_session_id_echo_ptr: Int # borrowed
+  legacy_session_id_echo_len: Int
+  cipher_suite: Int               # the single selected u16 suite
+  selected_version: Int           # 0x0304 if supported_versions present, 0x0303 otherwise
+  selected_group: Int             # named group of the server's key_share
+  key_share_ptr: Int              # borrowed pointer to the server's pubkey bytes
+  key_share_len: Int
+  raw_ptr: Int
+  raw_len: Int
+end
+
+## EncryptedExtensions decoded shape. Only `alpn` is materialized for v1.
+struct EncryptedExtensionsMsg
+  alpn: Vec<String>
+  raw_ptr: Int
+  raw_len: Int
+end
+
+## A single CertificateEntry inside a Certificate message.
+struct CertEntry
+  cert_data_ptr: Int              # borrowed; one DER cert
+  cert_data_len: Int
+end
+
+## Certificate decoded shape.
+struct CertificateMsg
+  request_context_ptr: Int        # borrowed; empty for server certs
+  request_context_len: Int
+  entries: Vec<CertEntry>
+  raw_ptr: Int
+  raw_len: Int
+end
+
+## CertificateVerify decoded shape.
+struct CertificateVerifyMsg
+  algorithm: Int                  # SignatureScheme (SIG_ED25519 for v1)
+  signature_ptr: Int              # borrowed
+  signature_len: Int
+  raw_ptr: Int
+  raw_len: Int
+end
+
+## Finished decoded shape — verify_data is hash-length-sized (32 for
+## SHA-256, 48 for SHA-384). Caller knows which.
+struct FinishedMsg
+  verify_data_ptr: Int            # borrowed
+  verify_data_len: Int
+  raw_ptr: Int
+  raw_len: Int
+end
+
+# Free helpers — Cert/CV/Fin all have no allocations beyond what the parent
+# input buffer holds, so they're no-ops. CH/SH copy the 32-byte random.
+def ch_msg_free(m: ClientHelloMsg): Void
+  if m.random != 0 then free(m.random) end
+end
+
+def sh_msg_free(m: ServerHelloMsg): Void
+  if m.random != 0 then free(m.random) end
+end
+
+# =============================================================================
+# Handshake message encoders
+# =============================================================================
+
+# Each encoder writes a complete Handshake message: u8 msg_type | u24 length
+# | body. Returns no value — caller takes ownership of `w.buf` and `w.pos`
+# bytes once done.
+
+## ClientHello inputs gathered into a builder struct (struct args >>>>
+## positional args once we hit 8+ fields).
+struct ClientHelloOut
+  random: Int                     # 32 bytes
+  session_id_ptr: Int             # 0..32 bytes, usually 0 / 32 random for compat
+  session_id_len: Int
+  cipher_suites: Vec<Int>
+  named_groups: Vec<Int>
+  key_shares: Vec<KeyShareEntry>
+  sig_algs: Vec<Int>
+  alpn: Vec<String>
+  hostname: String                # "" → omit SNI
+end
+
+def hs_encode_client_hello(w: CodecWriter, ch: ClientHelloOut): Void
+  cw_u8(w, HS_CLIENT_HELLO())
+  var hs_len = cw_open_u24_len(w)
+    cw_u16(w, TLS_LEGACY_VERSION())                  # legacy_version
+    cw_bytes(w, ch.random, 32)                        # random
+    var sid_len = cw_open_u8_len(w)                  # legacy_session_id
+    cw_bytes(w, ch.session_id_ptr, ch.session_id_len)
+    cw_close_u8_len(w, sid_len)
+    var cs_len = cw_open_u16_len(w)                  # cipher_suites
+    var i = 0
+    while i < ch.cipher_suites.size()
+      cw_u16(w, ch.cipher_suites[i])
+      i = i + 1
+    end
+    cw_close_u16_len(w, cs_len)
+    cw_u8(w, 1)                                       # legacy_compression_methods<1..2^8-1>
+    cw_u8(w, 0)                                       #   = [0] (null)
+    var ext_len = cw_open_u16_len(w)                 # extensions
+      var sv = vec_new<Int>()
+      sv.push(TLS_VERSION_1_3())
+      ext_encode_supported_versions_ch(w, sv)
+      ext_encode_supported_groups(w, ch.named_groups)
+      ext_encode_signature_algorithms(w, ch.sig_algs)
+      ext_encode_key_share_ch(w, ch.key_shares)
+      if str_byte_len(ch.hostname) > 0
+        ext_encode_server_name(w, ch.hostname)
+      end
+      if ch.alpn.size() > 0
+        ext_encode_alpn(w, ch.alpn)
+      end
+    cw_close_u16_len(w, ext_len)
+  cw_close_u24_len(w, hs_len)
+end
+
+## ServerHello builder.
+struct ServerHelloOut
+  random: Int                     # 32 bytes
+  session_id_echo_ptr: Int        # mirrors CH's session_id
+  session_id_echo_len: Int
+  cipher_suite: Int
+  selected_group: Int
+  server_key_share_ptr: Int       # the server's pubkey for the chosen group
+  server_key_share_len: Int
+end
+
+def hs_encode_server_hello(w: CodecWriter, sh: ServerHelloOut): Void
+  cw_u8(w, HS_SERVER_HELLO())
+  var hs_len = cw_open_u24_len(w)
+    cw_u16(w, TLS_LEGACY_VERSION())                  # legacy_version
+    cw_bytes(w, sh.random, 32)                        # random
+    var sid_len = cw_open_u8_len(w)                  # legacy_session_id_echo
+    cw_bytes(w, sh.session_id_echo_ptr, sh.session_id_echo_len)
+    cw_close_u8_len(w, sid_len)
+    cw_u16(w, sh.cipher_suite)                        # cipher_suite
+    cw_u8(w, 0)                                       # legacy_compression_method (single 0)
+    var ext_len = cw_open_u16_len(w)                 # extensions
+      ext_encode_supported_versions_sh(w, TLS_VERSION_1_3())
+      var ks = KeyShareEntry { group: sh.selected_group, key_ptr: sh.server_key_share_ptr, key_len: sh.server_key_share_len, }
+      ext_encode_key_share_sh(w, ks)
+    cw_close_u16_len(w, ext_len)
+  cw_close_u24_len(w, hs_len)
+end
+
+## EncryptedExtensions — emit only the ALPN selection (if any). The server's
+## server_name echo (acknowledgement of the client's SNI) is intentionally
+## elided per RFC 8446 §4.2.11 — the spec allows omission and clients
+## generally don't care.
+def hs_encode_encrypted_extensions(w: CodecWriter, alpn_selected: String): Void
+  cw_u8(w, HS_ENCRYPTED_EXTENSIONS())
+  var hs_len = cw_open_u24_len(w)
+    var ext_len = cw_open_u16_len(w)
+      if str_byte_len(alpn_selected) > 0
+        var protos = vec_new<String>()
+        protos.push(alpn_selected)
+        ext_encode_alpn(w, protos)
+      end
+    cw_close_u16_len(w, ext_len)
+  cw_close_u24_len(w, hs_len)
+end
+
+## Certificate message — list of CertEntry. v1 emits the SHA-256-or-larger
+## chain as-is, each entry's extensions block is an empty u16-len. The
+## request_context is always empty for server certificates.
+def hs_encode_certificate(w: CodecWriter, entries: Vec<CertEntry>): Void
+  cw_u8(w, HS_CERTIFICATE())
+  var hs_len = cw_open_u24_len(w)
+    cw_u8(w, 0)                                       # certificate_request_context<0..2^8-1> = empty
+    var list_len = cw_open_u24_len(w)
+      var i = 0
+      while i < entries.size()
+        var e = entries[i]
+        var cert_len = cw_open_u24_len(w)            # cert_data<1..2^24-1>
+        cw_bytes(w, e.cert_data_ptr, e.cert_data_len)
+        cw_close_u24_len(w, cert_len)
+        cw_u16(w, 0)                                  # per-entry Extensions = empty
+        i = i + 1
+      end
+    cw_close_u24_len(w, list_len)
+  cw_close_u24_len(w, hs_len)
+end
+
+## CertificateVerify — { SignatureScheme u16, opaque signature<0..2^16-1> }.
+def hs_encode_certificate_verify(w: CodecWriter, algorithm: Int,
+                                 sig_ptr: Int, sig_len: Int): Void
+  cw_u8(w, HS_CERTIFICATE_VERIFY())
+  var hs_len = cw_open_u24_len(w)
+    cw_u16(w, algorithm)
+    var sig_len_pos = cw_open_u16_len(w)
+    cw_bytes(w, sig_ptr, sig_len)
+    cw_close_u16_len(w, sig_len_pos)
+  cw_close_u24_len(w, hs_len)
+end
+
+## Finished — opaque verify_data[Hash.length]; the length is implicit from
+## the negotiated hash (32 for SHA-256, 48 for SHA-384). NOT length-prefixed
+## on the wire — the Handshake.length frames it.
+def hs_encode_finished(w: CodecWriter, verify_data_ptr: Int, verify_data_len: Int): Void
+  cw_u8(w, HS_FINISHED())
+  var hs_len = cw_open_u24_len(w)
+    cw_bytes(w, verify_data_ptr, verify_data_len)
+  cw_close_u24_len(w, hs_len)
+end
+
+# =============================================================================
+# Handshake message header (decode)
+# =============================================================================
+
+## Parse the Handshake header (u8 msg_type | u24 length). Returns the
+## msg_type; sets `body_len_out` to the body length via ptr-write so the
+## caller can take a body slice. On EOF / malformed header, sets r.err and
+## returns -1.
+def hs_decode_header(r: CodecReader, body_len_out: Int): Int
+  if r.err != 0 then return 0 - 1 end
+  if r.pos + 4 > r.end_pos
+    cr_set_err(r, CODEC_ERR_EOF())
+    return 0 - 1
+  end
+  var msg_type = cr_u8(r)
+  var body_len = cr_u24(r)
+  if r.pos + body_len > r.end_pos
+    cr_set_err(r, CODEC_ERR_EOF())
+    return 0 - 1
+  end
+  # Write body_len to caller (ptr-out so we don't allocate a tuple).
+  ptr_write_byte(body_len_out,     (body_len >> 24) & 0xff)
+  ptr_write_byte(body_len_out + 1, (body_len >> 16) & 0xff)
+  ptr_write_byte(body_len_out + 2, (body_len >> 8) & 0xff)
+  ptr_write_byte(body_len_out + 3, body_len & 0xff)
+  return msg_type
+end
+
+# =============================================================================
+# Handshake message decoders
+# =============================================================================
+
+# Per-message decoders take the WHOLE handshake message bytes (including the
+# 4-byte header) so they can populate raw_ptr/raw_len for transcript hashing.
+# They internally re-parse the header, then dispatch on the body.
+
+# Internal: skip unknown extension contents — read the u16 length and advance.
+def _skip_ext_body(r: CodecReader): Void
+  var body = cr_open_u16_len(r)
+  # Just advance by the length; don't validate contents.
+  body.pos = body.end_pos
+  cr_close(body, r)
+end
+
+# Decode a CH extension block (the outer u16-len wrapper has been opened by
+# the caller, `ext_block` is the inner reader).
+def _decode_ch_extensions(ext_block: CodecReader, ch: ClientHelloMsg): Void
+  while cr_at_end(ext_block) == 0
+    if ext_block.err != 0 then return end
+    var ext_type = cr_u16(ext_block)
+    if ext_block.err != 0 then return end
+    if ext_type == EXT_SUPPORTED_VERSIONS()
+      var body = cr_open_u16_len(ext_block)
+      var list = cr_open_u8_len(body)
+      while cr_at_end(list) == 0
+        var v = cr_u16(list)
+        if list.err == 0 then ch.supported_versions.push(v) end
+      end
+      cr_close(list, body)
+      cr_close(body, ext_block)
+    end
+    if ext_type == EXT_SUPPORTED_GROUPS()
+      var body = cr_open_u16_len(ext_block)
+      var list = cr_open_u16_len(body)
+      while cr_at_end(list) == 0
+        var g = cr_u16(list)
+        if list.err == 0 then ch.named_groups.push(g) end
+      end
+      cr_close(list, body)
+      cr_close(body, ext_block)
+    end
+    if ext_type == EXT_SIGNATURE_ALGORITHMS()
+      var body = cr_open_u16_len(ext_block)
+      var list = cr_open_u16_len(body)
+      while cr_at_end(list) == 0
+        var s = cr_u16(list)
+        if list.err == 0 then ch.sig_algs.push(s) end
+      end
+      cr_close(list, body)
+      cr_close(body, ext_block)
+    end
+    if ext_type == EXT_KEY_SHARE()
+      var body = cr_open_u16_len(ext_block)
+      var list = cr_open_u16_len(body)
+      while cr_at_end(list) == 0
+        var g = cr_u16(list)
+        var key = cr_open_u16_len(list)
+        if list.err == 0
+          var entry = KeyShareEntry { group: g, key_ptr: key.buf + key.pos, key_len: key.end_pos - key.pos, }
+          ch.key_shares.push(entry)
+        end
+        # Advance child past the bytes we've borrowed.
+        key.pos = key.end_pos
+        cr_close(key, list)
+      end
+      cr_close(list, body)
+      cr_close(body, ext_block)
+    end
+    if ext_type == EXT_SERVER_NAME()
+      var body = cr_open_u16_len(ext_block)
+      var list = cr_open_u16_len(body)
+      while cr_at_end(list) == 0
+        var nt = cr_u8(list)
+        var name = cr_open_u16_len(list)
+        if (list.err == 0) & (nt == NAME_TYPE_HOST_NAME()) & (str_byte_len(ch.server_name) == 0)
+          ch.server_name = str_from_ptr(int_to_cptr(name.buf + name.pos), name.end_pos - name.pos)
+        end
+        name.pos = name.end_pos
+        cr_close(name, list)
+      end
+      cr_close(list, body)
+      cr_close(body, ext_block)
+    end
+    if ext_type == EXT_ALPN()
+      var body = cr_open_u16_len(ext_block)
+      var list = cr_open_u16_len(body)
+      while cr_at_end(list) == 0
+        var pp = cr_open_u8_len(list)
+        if list.err == 0
+          var s = str_from_ptr(int_to_cptr(pp.buf + pp.pos), pp.end_pos - pp.pos)
+          ch.alpn.push(s)
+        end
+        pp.pos = pp.end_pos
+        cr_close(pp, list)
+      end
+      cr_close(list, body)
+      cr_close(body, ext_block)
+    end
+    # Unknown / unsupported extension — skip the body length + bytes.
+    if (ext_type != EXT_SUPPORTED_VERSIONS()) & (ext_type != EXT_SUPPORTED_GROUPS()) & (ext_type != EXT_SIGNATURE_ALGORITHMS()) & (ext_type != EXT_KEY_SHARE()) & (ext_type != EXT_SERVER_NAME()) & (ext_type != EXT_ALPN())
+      _skip_ext_body(ext_block)
+    end
+  end
+end
+
+## Decode a ClientHello from the full handshake message bytes (including the
+## 4-byte header). Returns a populated ClientHelloMsg; on error, the
+## struct's `random` is 0 (sentinel for "not allocated"). Caller MUST call
+## `ch_msg_free` on success to release the random copy.
+def hs_decode_client_hello(buf: Int, len: Int): ClientHelloMsg
+  var m = ClientHelloMsg {
+    random: 0,
+    legacy_session_id_ptr: 0, legacy_session_id_len: 0,
+    cipher_suites: vec_new<Int>(),
+    supported_versions: vec_new<Int>(),
+    named_groups: vec_new<Int>(),
+    sig_algs: vec_new<Int>(),
+    key_shares: vec_new<KeyShareEntry>(),
+    server_name: "",
+    alpn: vec_new<String>(),
+    raw_ptr: buf, raw_len: len,
+  }
+
+  var r = cr_new(buf, len)
+  var blen_out = malloc(4)
+  var mt = hs_decode_header(r, blen_out)
+  free(blen_out)
+  if (r.err != 0) | (mt != HS_CLIENT_HELLO()) then return m end
+
+  # legacy_version — must be 0x0303 per RFC 8446 §4.1.2.
+  var lv = cr_u16(r)
+  if (r.err != 0) | (lv != TLS_LEGACY_VERSION()) then return m end
+
+  # random[32] — allocate a copy.
+  if r.pos + 32 > r.end_pos then return m end
+  m.random = malloc(32)
+  memcpy(m.random, r.buf + r.pos, 32)
+  r.pos = r.pos + 32
+
+  # legacy_session_id<0..32>
+  var sid = cr_open_u8_len(r)
+  if r.err != 0 then return m end
+  m.legacy_session_id_ptr = sid.buf + sid.pos
+  m.legacy_session_id_len = sid.end_pos - sid.pos
+  sid.pos = sid.end_pos
+  cr_close(sid, r)
+
+  # cipher_suites<2..2^16-2>
+  var cs = cr_open_u16_len(r)
+  while cr_at_end(cs) == 0
+    var sv = cr_u16(cs)
+    if cs.err == 0 then m.cipher_suites.push(sv) end
+  end
+  cr_close(cs, r)
+
+  # legacy_compression_methods<1..2^8-1> — must be exactly [0] per RFC 8446.
+  var cm_len = cr_u8(r)
+  if (r.err != 0) | (cm_len < 1) then return m end
+  var cm0 = cr_u8(r)
+  if (r.err != 0) | (cm0 != 0)
+    if r.err == 0 then cr_set_err(r, CODEC_ERR_VALUE()) end
+    return m
+  end
+  # Skip any extra compression methods (RFC allows; we don't care).
+  var skip_n = cm_len - 1
+  while skip_n > 0
+    cr_u8(r)
+    skip_n = skip_n - 1
+  end
+  if r.err != 0 then return m end
+
+  # extensions<8..2^16-1>
+  var ext_block = cr_open_u16_len(r)
+  if r.err != 0 then return m end
+  _decode_ch_extensions(ext_block, m)
+  cr_close(ext_block, r)
+
+  return m
+end
+
+# Decode SH extensions (subset — only supported_versions + key_share).
+def _decode_sh_extensions(ext_block: CodecReader, sh: ServerHelloMsg): Void
+  while cr_at_end(ext_block) == 0
+    if ext_block.err != 0 then return end
+    var ext_type = cr_u16(ext_block)
+    if ext_block.err != 0 then return end
+    if ext_type == EXT_SUPPORTED_VERSIONS()
+      var body = cr_open_u16_len(ext_block)
+      sh.selected_version = cr_u16(body)
+      cr_close(body, ext_block)
+    end
+    if ext_type == EXT_KEY_SHARE()
+      var body = cr_open_u16_len(ext_block)
+      sh.selected_group = cr_u16(body)
+      var key = cr_open_u16_len(body)
+      sh.key_share_ptr = key.buf + key.pos
+      sh.key_share_len = key.end_pos - key.pos
+      key.pos = key.end_pos
+      cr_close(key, body)
+      cr_close(body, ext_block)
+    end
+    if (ext_type != EXT_SUPPORTED_VERSIONS()) & (ext_type != EXT_KEY_SHARE())
+      _skip_ext_body(ext_block)
+    end
+  end
+end
+
+## Decode a ServerHello.
+def hs_decode_server_hello(buf: Int, len: Int): ServerHelloMsg
+  var m = ServerHelloMsg {
+    random: 0,
+    legacy_session_id_echo_ptr: 0, legacy_session_id_echo_len: 0,
+    cipher_suite: 0,
+    selected_version: TLS_LEGACY_VERSION(),
+    selected_group: 0,
+    key_share_ptr: 0, key_share_len: 0,
+    raw_ptr: buf, raw_len: len,
+  }
+
+  var r = cr_new(buf, len)
+  var blen_out = malloc(4)
+  var mt = hs_decode_header(r, blen_out)
+  free(blen_out)
+  if (r.err != 0) | (mt != HS_SERVER_HELLO()) then return m end
+
+  var lv = cr_u16(r)
+  if (r.err != 0) | (lv != TLS_LEGACY_VERSION()) then return m end
+
+  if r.pos + 32 > r.end_pos then return m end
+  m.random = malloc(32)
+  memcpy(m.random, r.buf + r.pos, 32)
+  r.pos = r.pos + 32
+
+  var sid = cr_open_u8_len(r)
+  if r.err != 0 then return m end
+  m.legacy_session_id_echo_ptr = sid.buf + sid.pos
+  m.legacy_session_id_echo_len = sid.end_pos - sid.pos
+  sid.pos = sid.end_pos
+  cr_close(sid, r)
+
+  m.cipher_suite = cr_u16(r)
+  var cm = cr_u8(r)
+  if (r.err != 0) | (cm != 0) then return m end
+
+  var ext_block = cr_open_u16_len(r)
+  if r.err != 0 then return m end
+  _decode_sh_extensions(ext_block, m)
+  cr_close(ext_block, r)
+
+  return m
+end
+
+## Decode EncryptedExtensions — extract only ALPN for v1.
+def hs_decode_encrypted_extensions(buf: Int, len: Int): EncryptedExtensionsMsg
+  var m = EncryptedExtensionsMsg { alpn: vec_new<String>(), raw_ptr: buf, raw_len: len, }
+  var r = cr_new(buf, len)
+  var blen_out = malloc(4)
+  var mt = hs_decode_header(r, blen_out)
+  free(blen_out)
+  if (r.err != 0) | (mt != HS_ENCRYPTED_EXTENSIONS()) then return m end
+
+  var ext_block = cr_open_u16_len(r)
+  if r.err != 0 then return m end
+  while cr_at_end(ext_block) == 0
+    if ext_block.err != 0
+      cr_close(ext_block, r)
+      return m
+    end
+    var et = cr_u16(ext_block)
+    if et == EXT_ALPN()
+      var body = cr_open_u16_len(ext_block)
+      var list = cr_open_u16_len(body)
+      while cr_at_end(list) == 0
+        var pp = cr_open_u8_len(list)
+        if list.err == 0
+          var s = str_from_ptr(int_to_cptr(pp.buf + pp.pos), pp.end_pos - pp.pos)
+          m.alpn.push(s)
+        end
+        pp.pos = pp.end_pos
+        cr_close(pp, list)
+      end
+      cr_close(list, body)
+      cr_close(body, ext_block)
+    end
+    if et != EXT_ALPN()
+      _skip_ext_body(ext_block)
+    end
+  end
+  cr_close(ext_block, r)
+  return m
+end
+
+## Decode a Certificate message — extract the entry list.
+def hs_decode_certificate(buf: Int, len: Int): CertificateMsg
+  var m = CertificateMsg {
+    request_context_ptr: 0, request_context_len: 0,
+    entries: vec_new<CertEntry>(),
+    raw_ptr: buf, raw_len: len,
+  }
+  var r = cr_new(buf, len)
+  var blen_out = malloc(4)
+  var mt = hs_decode_header(r, blen_out)
+  free(blen_out)
+  if (r.err != 0) | (mt != HS_CERTIFICATE()) then return m end
+
+  var rc = cr_open_u8_len(r)
+  if r.err != 0 then return m end
+  m.request_context_ptr = rc.buf + rc.pos
+  m.request_context_len = rc.end_pos - rc.pos
+  rc.pos = rc.end_pos
+  cr_close(rc, r)
+
+  var list = cr_open_u24_len(r)
+  if r.err != 0 then return m end
+  while cr_at_end(list) == 0
+    var cert = cr_open_u24_len(list)
+    if list.err != 0
+      cr_close(list, r)
+      return m
+    end
+    var entry = CertEntry { cert_data_ptr: cert.buf + cert.pos, cert_data_len: cert.end_pos - cert.pos, }
+    m.entries.push(entry)
+    cert.pos = cert.end_pos
+    cr_close(cert, list)
+    # Skip per-entry Extensions (v1 doesn't parse them).
+    var ext = cr_open_u16_len(list)
+    ext.pos = ext.end_pos
+    cr_close(ext, list)
+  end
+  cr_close(list, r)
+  return m
+end
+
+## Decode a CertificateVerify.
+def hs_decode_certificate_verify(buf: Int, len: Int): CertificateVerifyMsg
+  var m = CertificateVerifyMsg {
+    algorithm: 0,
+    signature_ptr: 0, signature_len: 0,
+    raw_ptr: buf, raw_len: len,
+  }
+  var r = cr_new(buf, len)
+  var blen_out = malloc(4)
+  var mt = hs_decode_header(r, blen_out)
+  free(blen_out)
+  if (r.err != 0) | (mt != HS_CERTIFICATE_VERIFY()) then return m end
+
+  m.algorithm = cr_u16(r)
+  var sig = cr_open_u16_len(r)
+  if r.err != 0 then return m end
+  m.signature_ptr = sig.buf + sig.pos
+  m.signature_len = sig.end_pos - sig.pos
+  sig.pos = sig.end_pos
+  cr_close(sig, r)
+  return m
+end
+
+## Decode a Finished. `verify_data_len` is the negotiated hash length —
+## the wire format only frames it via Handshake.length, so the decoder
+## returns everything left after the header.
+def hs_decode_finished(buf: Int, len: Int): FinishedMsg
+  var m = FinishedMsg {
+    verify_data_ptr: 0, verify_data_len: 0,
+    raw_ptr: buf, raw_len: len,
+  }
+  var r = cr_new(buf, len)
+  var blen_out = malloc(4)
+  var mt = hs_decode_header(r, blen_out)
+  free(blen_out)
+  if (r.err != 0) | (mt != HS_FINISHED()) then return m end
+  m.verify_data_ptr = r.buf + r.pos
+  m.verify_data_len = r.end_pos - r.pos
+  r.pos = r.end_pos
+  return m
+end

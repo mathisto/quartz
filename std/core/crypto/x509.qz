@@ -1,0 +1,865 @@
+## std/core/crypto/x509 — Minimal X.509 v3 parser + Ed25519 chain verify
+##
+## NET.5b.2 substrate. Walks an RFC 5280 X.509 v3 certificate DER blob,
+## extracts the few fields TLS 1.3 actually needs (issuer, subject,
+## SubjectPublicKeyInfo, Validity, signature, BasicConstraints CA bit,
+## SubjectAltName dNSName list), and verifies an Ed25519-signed chain
+## against a trust store.
+##
+## ## Scope (per `docs/design/TLS_1_3_DESIGN.md` §"X.509 / DER")
+##
+## v1 verifies the SMALLEST useful subset of RFC 5280 + RFC 6125 + RFC 8410:
+##
+## | Supported                                       | NOT supported (filed forward) |
+## |-------------------------------------------------|-------------------------------|
+## | Ed25519 SPKI + Ed25519 signature                | RSA-PSS, ECDSA, RSASSA-PKCS1-v1_5 — NET.6 |
+## | BasicConstraints (CA + pathLenConstraint)       | name constraints, policy constraints — NET.6 |
+## | SubjectAltName: dNSName + iPAddress             | URI, RFC822, otherName, EDIPartyName |
+## | RFC 6125 left-most wildcard match               | wildcards in subdomain (e.g. `a*b.example.com`) |
+## | UTCTime + GeneralizedTime validity              | timezone offsets, fractional seconds |
+## | self-signed leaf == single-cert chain           | cross-signing, name chaining via DN |
+## | UTF8String / PrintableString / IA5String CN     | T61String, UniversalString (deprecated) |
+## | strict-DER (rejects BER ambiguity)              | OCSP / CRL revocation — NET.6 |
+## | trust store = `Vec<Cert>` byte-equal subject    | path validation §6.1 full algorithm — NET.6 |
+##
+## ## Prior art
+##
+## | Project | What we take from it |
+## |---|---|
+## | rustls-webpki | Slice-based no-copy parse; chain-walk by byte-equal Issuer<->Subject; Ed25519 SPKI extract pattern (`spki.qz`). The MIT-licensed reference for "minimal X.509 you need for TLS". |
+## | BearSSL `src/x509/x509_minimal.c` | SAN parsing + name compare; the discipline of "if it's not in the cert, don't synthesise it" (no default-value materialisation, no implicit promotion). |
+## | mbedTLS `library/x509_crt.c` | The struct-field-per-extracted-field shape; extension dispatch via OID compare. |
+## | Go `crypto/x509` | What NOT to do — pulls in 8k LoC of name parsing, ASN.1 templates, EKU enforcement, and policy walks. |
+## | RFC 5280 §4 + RFC 6125 §6.4.3 + RFC 8410 §10 | Canonical references. |
+##
+## ## Cert struct contract
+##
+## All `_ptr` fields point INTO the original `der_buf` — the parser does
+## not allocate any byte storage. The Cert struct is valid only while the
+## caller holds `der_buf` alive. The String fields (`subject_cn` + the
+## `san_dns` Vec elements) ARE freshly allocated via `str_from_ptr` —
+## those outlive `der_buf`. The `Vec<String>` itself is allocated via
+## `vec_new` and the Cert struct owns it.
+##
+## Lifetime rule: free `der_buf` AFTER you finish using the Cert.
+##
+## ## API
+##
+## ```quartz
+## struct Cert { ... }   # see below
+##
+## # Parse — populates Cert.err on failure (X509_ERR_* code, sticks).
+## def x509_parse(der_buf: Int, der_len: Int): Cert
+##
+## # Validity bounds (now_unix in seconds).
+## def x509_check_validity(cert: Cert, now_unix: Int): Int
+##
+## # RFC 6125 hostname match against SAN dNSName list.
+## def x509_match_hostname(cert: Cert, hostname: String): Int
+##
+## # Verify Ed25519 signature over tbsCertificate using the SPKI bytes of
+## # the signer (i.e. the issuer cert's SPKI, or the cert's own SPKI for
+## # self-signed). Returns 1 if valid, 0 otherwise.
+## def x509_verify_signature(cert: Cert, signer_spki_ptr: Int): Int
+##
+## # Full chain verification — checks parse, validity, hostname (on leaf),
+## # sig at every link, CA bit + path length on intermediates, and that the
+## # chain terminates at a cert in `roots`. Returns 0 = OK or X509_ERR_*.
+## def x509_verify_chain(leaf: Cert, intermediates: Vec<Cert>,
+##                       roots: Vec<Cert>, now_unix: Int, hostname: String): Int
+## ```
+##
+## ## Error codes
+##
+## Negative; -100 base distinguishes X.509 errors from ASN.1 errors (-1..-7).
+
+import * from ffi/socket   # malloc/free, ptr_read_byte, ptr_write_byte, int_to_cptr
+import * from std/core/crypto/asn1
+import * from std/core/crypto/ed25519
+
+# =============================================================================
+# Error codes
+# =============================================================================
+
+def X509_OK(): Int = 0
+def X509_ERR_PARSE(): Int = 0 - 100      # DER parse failure (asn1 set err)
+def X509_ERR_VERSION(): Int = 0 - 101    # version != 3
+def X509_ERR_ALG(): Int = 0 - 102        # SPKI or sig algorithm OID not Ed25519
+def X509_ERR_TIME(): Int = 0 - 103       # now < notBefore or now >= notAfter
+def X509_ERR_HOSTNAME(): Int = 0 - 104   # SAN dNSName / iPAddress doesn't match
+def X509_ERR_SIG(): Int = 0 - 105        # signature verification failed
+def X509_ERR_CHAIN(): Int = 0 - 106      # no path to a root in trust store
+def X509_ERR_CA(): Int = 0 - 107         # intermediate lacks CA bit / over path-len
+def X509_ERR_KEY_LEN(): Int = 0 - 108    # Ed25519 SPKI BIT STRING != 32 bytes / unused != 0
+def X509_ERR_SIG_LEN(): Int = 0 - 109    # Ed25519 signature BIT STRING != 64 bytes / unused != 0
+
+# =============================================================================
+# Known-OID comparators (value bytes only, no tag/length prefix)
+# =============================================================================
+
+# id-Ed25519 = 1.3.101.112 → DER value bytes: 2B 65 70 (RFC 8410 §3)
+def _is_oid_ed25519(p: Int, l: Int): Int
+  if l != 3 then return 0 end
+  if ptr_read_byte(p)     != 0x2b then return 0 end
+  if ptr_read_byte(p + 1) != 0x65 then return 0 end
+  if ptr_read_byte(p + 2) != 0x70 then return 0 end
+  return 1
+end
+
+# id-at-commonName = 2.5.4.3 → 55 04 03
+def _is_oid_common_name(p: Int, l: Int): Int
+  if l != 3 then return 0 end
+  if ptr_read_byte(p)     != 0x55 then return 0 end
+  if ptr_read_byte(p + 1) != 0x04 then return 0 end
+  if ptr_read_byte(p + 2) != 0x03 then return 0 end
+  return 1
+end
+
+# id-ce-basicConstraints = 2.5.29.19 → 55 1D 13
+def _is_oid_basic_constraints(p: Int, l: Int): Int
+  if l != 3 then return 0 end
+  if ptr_read_byte(p)     != 0x55 then return 0 end
+  if ptr_read_byte(p + 1) != 0x1d then return 0 end
+  if ptr_read_byte(p + 2) != 0x13 then return 0 end
+  return 1
+end
+
+# id-ce-subjectAltName = 2.5.29.17 → 55 1D 11
+def _is_oid_subject_alt_name(p: Int, l: Int): Int
+  if l != 3 then return 0 end
+  if ptr_read_byte(p)     != 0x55 then return 0 end
+  if ptr_read_byte(p + 1) != 0x1d then return 0 end
+  if ptr_read_byte(p + 2) != 0x11 then return 0 end
+  return 1
+end
+
+# =============================================================================
+# Cert struct
+# =============================================================================
+
+struct Cert
+  err: Int                 # 0 if parse OK, X509_ERR_* otherwise
+  raw_ptr: Int             # whole DER cert (borrowed from caller)
+  raw_len: Int
+  tbs_ptr: Int             # tbsCertificate TLV (tag+length+value) — sig is over THIS
+  tbs_len: Int
+  spki_ptr: Int            # 32 bytes for Ed25519 (the raw key, no BIT STRING wrapper)
+  spki_len: Int
+  spki_is_ed25519: Int     # 1 if SPKI algorithm OID = id-Ed25519
+  not_before: Int          # unix seconds
+  not_after: Int
+  subject_cn: String       # commonName attribute value, or "" if none
+  san_dns: Vec<String>     # dNSName entries (empty Vec if SAN extension absent)
+  is_ca: Int               # BasicConstraints CA bit; 0 if extension absent
+  path_len: Int            # BasicConstraints pathLenConstraint; -1 if absent
+  sig_ptr: Int             # 64 bytes for Ed25519 (raw sig, no BIT STRING wrapper)
+  sig_len: Int
+  sig_is_ed25519: Int      # 1 if signatureAlgorithm OID = id-Ed25519
+  issuer_ptr: Int          # raw issuer Name TLV (for chain matching)
+  issuer_len: Int
+  subject_ptr: Int         # raw subject Name TLV (for chain matching)
+  subject_len: Int
+end
+
+# Allocate an empty/errored Cert (for error returns from sub-parsers).
+def _cert_err(code: Int): Cert
+  return Cert {
+    err: code,
+    raw_ptr: 0, raw_len: 0,
+    tbs_ptr: 0, tbs_len: 0,
+    spki_ptr: 0, spki_len: 0, spki_is_ed25519: 0,
+    not_before: 0, not_after: 0,
+    subject_cn: "",
+    san_dns: vec_new<String>(),
+    is_ca: 0, path_len: 0 - 1,
+    sig_ptr: 0, sig_len: 0, sig_is_ed25519: 0,
+    issuer_ptr: 0, issuer_len: 0,
+    subject_ptr: 0, subject_len: 0,
+  }
+end
+
+# =============================================================================
+# Sub-parsers (called from x509_parse)
+# =============================================================================
+
+# Read AlgorithmIdentifier ::= SEQUENCE { OID, parameters ANY OPTIONAL }
+# Returns 1 if the algorithm is Ed25519 (RFC 8410: parameters MUST be absent),
+# 0 otherwise. Sets cert.err and returns 0 on parse failure.
+def _read_alg_id_is_ed25519(parent: DerReader, cert: Cert): Int
+  var alg = der_open_sequence(parent)
+  der_read_oid(alg)
+  if alg.err != 0
+    cert.err = X509_ERR_PARSE()
+    return 0
+  end
+  var is_ed = _is_oid_ed25519(alg.val_ptr, alg.val_len)
+  # RFC 8410 §3: "The parameters field MUST be absent." Accept absent;
+  # any present field is technically illegal for Ed25519. We tolerate a NULL
+  # for robustness (some encoders emit it), reject anything else.
+  if der_at_end(alg) == 0
+    var t = der_peek_tag(alg)
+    if t == TAG_NULL()
+      der_read_null(alg)
+    end
+  end
+  der_close(alg, parent)
+  if parent.err != 0
+    cert.err = X509_ERR_PARSE()
+    return 0
+  end
+  return is_ed
+end
+
+# Read Validity ::= SEQUENCE { notBefore Time, notAfter Time }
+# Time ::= CHOICE { utcTime UTCTime, generalTime GeneralizedTime }
+def _read_validity(tbs: DerReader, cert: Cert): Void
+  var v = der_open_sequence(tbs)
+
+  var t1 = der_peek_tag(v)
+  if t1 == TAG_UTC_TIME()
+    cert.not_before = der_read_utctime(v)
+  end
+  if t1 == TAG_GENERALIZED_TIME()
+    cert.not_before = der_read_generalized_time(v)
+  end
+  if (t1 != TAG_UTC_TIME()) & (t1 != TAG_GENERALIZED_TIME())
+    cert.err = X509_ERR_PARSE()
+  end
+
+  var t2 = der_peek_tag(v)
+  if t2 == TAG_UTC_TIME()
+    cert.not_after = der_read_utctime(v)
+  end
+  if t2 == TAG_GENERALIZED_TIME()
+    cert.not_after = der_read_generalized_time(v)
+  end
+  if (t2 != TAG_UTC_TIME()) & (t2 != TAG_GENERALIZED_TIME())
+    cert.err = X509_ERR_PARSE()
+  end
+
+  der_close(v, tbs)
+  if tbs.err != 0 then cert.err = X509_ERR_PARSE() end
+end
+
+# Walk an RDNSequence (SEQUENCE OF SET OF AttributeTypeAndValue) and pull
+# out the commonName, if present. Sets cert.subject_cn (empty string if none).
+# `which` is "subject" or "issuer" — purely for debug; we use the byte span
+# capture (subject_ptr/subject_len, issuer_ptr/issuer_len) for chain matching,
+# not the CN string.
+def _walk_name_for_cn(name: DerReader, cert: Cert): Void
+  while der_at_end(name) == 0
+    if name.err != 0 then return end
+    # Each element of RDNSequence is a SET OF AttributeTypeAndValue.
+    var rdn = der_open_set(name)
+    while der_at_end(rdn) == 0
+      if rdn.err != 0 then return end
+      # AttributeTypeAndValue ::= SEQUENCE { OID, value ANY }
+      var atv = der_open_sequence(rdn)
+      der_read_oid(atv)
+      if atv.err != 0
+        cert.err = X509_ERR_PARSE()
+        return
+      end
+      var is_cn = _is_oid_common_name(atv.val_ptr, atv.val_len)
+      # Value is one of UTF8String / PrintableString / IA5String —
+      # all DirectoryString choices. Read by peek-and-dispatch; skip if
+      # not a string type we recognise (no error — name attribute
+      # values can be arbitrary).
+      var vtag = der_peek_tag(atv)
+      var vp = 0
+      var vl = 0
+      if (vtag == TAG_UTF8_STRING()) | (vtag == TAG_PRINTABLE_STRING()) | (vtag == TAG_IA5_STRING())
+        der_expect(atv, vtag)
+        vp = atv.val_ptr
+        vl = atv.val_len
+      end
+      if atv.err != 0
+        cert.err = X509_ERR_PARSE()
+        return
+      end
+      if (is_cn == 1) & (vp != 0) & (str_byte_len(cert.subject_cn) == 0)
+        # First CN wins (X.509 allows multiple but RFC 6125 §6.4.4
+        # warns clients only to trust the most-specific; v1 trusts the
+        # first encountered).
+        cert.subject_cn = str_from_ptr(int_to_cptr(vp), vl)
+      end
+      # Skip any remaining bytes inside the AttributeTypeAndValue
+      # (e.g. an unsupported value tag) — der_close validates trailing.
+      while der_at_end(atv) == 0
+        der_skip_tlv(atv)
+      end
+      der_close(atv, rdn)
+    end
+    der_close(rdn, name)
+  end
+end
+
+# Read SubjectPublicKeyInfo ::= SEQUENCE { AlgorithmIdentifier, subjectPublicKey BIT STRING }
+def _read_spki(tbs: DerReader, cert: Cert): Void
+  var spki = der_open_sequence(tbs)
+  cert.spki_is_ed25519 = _read_alg_id_is_ed25519(spki, cert)
+  if cert.err != 0 then return end
+  if cert.spki_is_ed25519 == 0
+    cert.err = X509_ERR_ALG()
+    # keep parsing so the rest of the cert fields fill in for diagnostics
+  end
+
+  # BIT STRING — der_read_bit_string consumes the unused-bits prefix.
+  var unused_byte = malloc(1)
+  ptr_write_byte(unused_byte, 0)
+  der_read_bit_string(spki, unused_byte)
+  if spki.err != 0
+    free(unused_byte)
+    cert.err = X509_ERR_PARSE()
+    return
+  end
+  if ptr_read_byte(unused_byte) != 0
+    free(unused_byte)
+    cert.err = X509_ERR_KEY_LEN()
+    return
+  end
+  free(unused_byte)
+
+  # For Ed25519 the SPKI is exactly the 32-byte public key.
+  if cert.spki_is_ed25519 == 1
+    if spki.val_len != 32
+      cert.err = X509_ERR_KEY_LEN()
+      return
+    end
+  end
+  cert.spki_ptr = spki.val_ptr
+  cert.spki_len = spki.val_len
+  der_close(spki, tbs)
+  if tbs.err != 0 then cert.err = X509_ERR_PARSE() end
+end
+
+# Parse the BasicConstraints extension extnValue payload (an OCTET STRING
+# containing a SEQUENCE { CA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER
+# OPTIONAL }). The extnValue OCTET STRING wrapper is already consumed; here
+# `payload` is a reader over the SEQUENCE.
+def _parse_basic_constraints_payload(payload: DerReader, cert: Cert): Void
+  var bc = der_open_sequence(payload)
+  cert.is_ca = 0
+  cert.path_len = 0 - 1
+  # CA BOOLEAN DEFAULT FALSE — present only if TRUE in well-formed certs,
+  # but accept FALSE too.
+  if der_at_end(bc) == 0
+    var t = der_peek_tag(bc)
+    if t == TAG_BOOLEAN()
+      cert.is_ca = der_read_boolean(bc)
+    end
+  end
+  if der_at_end(bc) == 0
+    var t2 = der_peek_tag(bc)
+    if t2 == TAG_INTEGER()
+      cert.path_len = der_read_integer_u64(bc)
+    end
+  end
+  der_close(bc, payload)
+  if payload.err != 0 then cert.err = X509_ERR_PARSE() end
+end
+
+# Parse SubjectAltName extension extnValue (an OCTET STRING containing a
+# SEQUENCE OF GeneralName). We extract dNSName ([2] IMPLICIT IA5String) and
+# iPAddress ([7] IMPLICIT OCTET STRING) entries; everything else is skipped.
+# iPAddress lands in `san_dns` as a synthetic "ipv4:1.2.3.4" or
+# "ipv6:..." string for v1 — simplifies the match path.
+def _parse_san_payload(payload: DerReader, cert: Cert): Void
+  var seq = der_open_sequence(payload)
+  while der_at_end(seq) == 0
+    if seq.err != 0 then return end
+    var t = der_peek_tag(seq)
+    # [2] IMPLICIT IA5String — context-specific primitive, byte 0x82.
+    if t == TAG_CONTEXT_PRIMITIVE_2()
+      der_expect(seq, TAG_CONTEXT_PRIMITIVE_2())
+      if seq.err == 0
+        var name = str_from_ptr(int_to_cptr(seq.val_ptr), seq.val_len)
+        cert.san_dns.push(name)
+      end
+    end
+    # [7] IMPLICIT OCTET STRING — iPAddress, byte 0x87. v1 doesn't decode;
+    # we just skip (TLS-1.3-over-HTTPS uses dNSName matching by hostname).
+    if t == TAG_CONTEXT_PRIMITIVE_6()   # [6] = URI, skip
+      der_skip_tlv(seq)
+    end
+    if t == 0x87   # [7] iPAddress
+      der_skip_tlv(seq)
+    end
+    if (t != TAG_CONTEXT_PRIMITIVE_2()) & (t != TAG_CONTEXT_PRIMITIVE_6()) & (t != 0x87)
+      # Any other GeneralName variant we don't care about
+      der_skip_tlv(seq)
+    end
+  end
+  der_close(seq, payload)
+  if payload.err != 0 then cert.err = X509_ERR_PARSE() end
+end
+
+# Parse the Extensions ::= SEQUENCE OF Extension block. Extension is
+# SEQUENCE { extnID OID, critical BOOLEAN DEFAULT FALSE, extnValue OCTET STRING }.
+def _parse_extensions(tbs: DerReader, cert: Cert): Void
+  # Extensions are wrapped in [3] EXPLICIT SEQUENCE OF Extension.
+  var wrapper = der_open_context(tbs, 3)
+  if tbs.err != 0
+    cert.err = X509_ERR_PARSE()
+    return
+  end
+  var ext_seq = der_open_sequence(wrapper)
+  if wrapper.err != 0
+    cert.err = X509_ERR_PARSE()
+    return
+  end
+
+  while der_at_end(ext_seq) == 0
+    if ext_seq.err != 0 then return end
+    var ext = der_open_sequence(ext_seq)
+    der_read_oid(ext)
+    if ext.err != 0
+      cert.err = X509_ERR_PARSE()
+      return
+    end
+    var oid_p = ext.val_ptr
+    var oid_l = ext.val_len
+
+    # Skip the optional critical BOOLEAN — we don't enforce criticality v1.
+    if der_peek_tag(ext) == TAG_BOOLEAN()
+      der_read_boolean(ext)
+    end
+
+    # extnValue is always OCTET STRING; its content is a tag-specific structure.
+    der_read_octet_string(ext)
+    if ext.err != 0
+      cert.err = X509_ERR_PARSE()
+      return
+    end
+    var payload = der_new(ext.val_ptr, ext.val_len)
+
+    if _is_oid_basic_constraints(oid_p, oid_l) == 1
+      _parse_basic_constraints_payload(payload, cert)
+    end
+    if _is_oid_subject_alt_name(oid_p, oid_l) == 1
+      _parse_san_payload(payload, cert)
+    end
+    # Other OIDs ignored — the payload reader is discarded.
+
+    der_close(ext, ext_seq)
+  end
+  der_close(ext_seq, wrapper)
+  der_close(wrapper, tbs)
+  if tbs.err != 0 then cert.err = X509_ERR_PARSE() end
+end
+
+# =============================================================================
+# Top-level parse
+# =============================================================================
+
+## Parse a DER-encoded X.509 v3 certificate. `der_buf` must point at the
+## entire `Certificate` SEQUENCE; `der_len` is its length in bytes. Returns
+## a populated Cert with `err == 0` on success, or `err == X509_ERR_*` on
+## failure (other fields are best-effort).
+##
+## The returned Cert's `_ptr` fields BORROW from `der_buf`; the caller MUST
+## keep `der_buf` alive until done with the Cert. The `subject_cn` String
+## and `san_dns` Vec are separately allocated and outlive `der_buf`.
+def x509_parse(der_buf: Int, der_len: Int): Cert
+  var cert = _cert_err(0)
+  cert.raw_ptr = der_buf
+  cert.raw_len = der_len
+
+  var r = der_new(der_buf, der_len)
+  var outer = der_open_sequence(r)
+  if r.err != 0
+    cert.err = X509_ERR_PARSE()
+    return cert
+  end
+
+  # tbsCertificate — capture its raw bytes (tag+length+value) for sigverify.
+  var tbs_start = outer.pos
+  var tbs = der_open_sequence(outer)
+  if outer.err != 0
+    cert.err = X509_ERR_PARSE()
+    return cert
+  end
+  cert.tbs_ptr = outer.buf + tbs_start
+  cert.tbs_len = outer.pos - tbs_start
+
+  # version [0] EXPLICIT INTEGER — DEFAULT v1. If present, MUST be v3 (value 2)
+  # for any cert that uses v3 extensions; we require v3 outright.
+  if der_peek_tag(tbs) == TAG_CONTEXT_CONSTRUCTED_0()
+    var ver = der_open_context(tbs, 0)
+    var v = der_read_integer_u64(ver)
+    der_close(ver, tbs)
+    if tbs.err != 0
+      cert.err = X509_ERR_PARSE()
+      return cert
+    end
+    if v != 2
+      cert.err = X509_ERR_VERSION()
+      return cert
+    end
+  end
+  if tbs.err != 0
+    cert.err = X509_ERR_PARSE()
+    return cert
+  end
+
+  # serialNumber CertificateSerialNumber — INTEGER, value bytes opaque to us.
+  der_read_integer_span(tbs)
+  if tbs.err != 0
+    cert.err = X509_ERR_PARSE()
+    return cert
+  end
+
+  # signature AlgorithmIdentifier — this is the tbs-level alg field. RFC
+  # 5280 §4.1.1.2: MUST contain the same value as `signatureAlgorithm` at
+  # the outer level. We parse and stash for the outer-level check later.
+  var tbs_sig_alg_is_ed = _read_alg_id_is_ed25519(tbs, cert)
+  if cert.err != 0 then return cert end
+
+  # issuer Name — capture raw bytes for chain matching, then walk for CN.
+  var issuer_start = tbs.pos
+  var issuer = der_open_sequence(tbs)
+  if tbs.err != 0
+    cert.err = X509_ERR_PARSE()
+    return cert
+  end
+  cert.issuer_ptr = tbs.buf + issuer_start
+  cert.issuer_len = tbs.pos - issuer_start
+  # We don't extract issuer CN — only subject. Skip the contents.
+  while der_at_end(issuer) == 0
+    der_skip_tlv(issuer)
+  end
+  der_close(issuer, tbs)
+  if tbs.err != 0
+    cert.err = X509_ERR_PARSE()
+    return cert
+  end
+
+  # validity
+  _read_validity(tbs, cert)
+  if cert.err != 0 then return cert end
+
+  # subject Name — capture raw bytes + extract CN.
+  var subject_start = tbs.pos
+  var subject = der_open_sequence(tbs)
+  if tbs.err != 0
+    cert.err = X509_ERR_PARSE()
+    return cert
+  end
+  cert.subject_ptr = tbs.buf + subject_start
+  cert.subject_len = tbs.pos - subject_start
+  _walk_name_for_cn(subject, cert)
+  if cert.err != 0 then return cert end
+  der_close(subject, tbs)
+  if tbs.err != 0
+    cert.err = X509_ERR_PARSE()
+    return cert
+  end
+
+  # subjectPublicKeyInfo
+  _read_spki(tbs, cert)
+  if cert.err != 0 then return cert end
+
+  # Optional [1] issuerUniqueID and [2] subjectUniqueID — skip.
+  if der_peek_tag(tbs) == 0x81   # [1] primitive (BIT STRING IMPLICIT)
+    der_skip_tlv(tbs)
+  end
+  if der_peek_tag(tbs) == 0x82   # [2] primitive
+    der_skip_tlv(tbs)
+  end
+
+  # Optional [3] EXPLICIT extensions — v3 only.
+  if der_peek_tag(tbs) == TAG_CONTEXT_CONSTRUCTED_3()
+    _parse_extensions(tbs, cert)
+    if cert.err != 0 then return cert end
+  end
+
+  der_close(tbs, outer)
+  if outer.err != 0
+    cert.err = X509_ERR_PARSE()
+    return cert
+  end
+
+  # signatureAlgorithm — second AlgorithmIdentifier; must equal the tbs one.
+  cert.sig_is_ed25519 = _read_alg_id_is_ed25519(outer, cert)
+  if cert.err != 0 then return cert end
+  if cert.sig_is_ed25519 != tbs_sig_alg_is_ed
+    cert.err = X509_ERR_ALG()
+    return cert
+  end
+  if cert.sig_is_ed25519 == 0
+    cert.err = X509_ERR_ALG()
+    return cert
+  end
+
+  # signatureValue BIT STRING
+  var sig_unused = malloc(1)
+  ptr_write_byte(sig_unused, 0)
+  der_read_bit_string(outer, sig_unused)
+  if outer.err != 0
+    free(sig_unused)
+    cert.err = X509_ERR_PARSE()
+    return cert
+  end
+  if ptr_read_byte(sig_unused) != 0
+    free(sig_unused)
+    cert.err = X509_ERR_SIG_LEN()
+    return cert
+  end
+  free(sig_unused)
+  if outer.val_len != 64
+    cert.err = X509_ERR_SIG_LEN()
+    return cert
+  end
+  cert.sig_ptr = outer.val_ptr
+  cert.sig_len = outer.val_len
+
+  der_close(outer, r)
+  if r.err != 0
+    cert.err = X509_ERR_PARSE()
+    return cert
+  end
+  if der_at_end(r) == 0
+    cert.err = X509_ERR_PARSE()
+    return cert
+  end
+
+  return cert
+end
+
+# =============================================================================
+# Verification primitives
+# =============================================================================
+
+## Check that `now_unix` falls within the cert's validity window. Returns 0
+## (X509_OK) if valid, X509_ERR_TIME otherwise.
+def x509_check_validity(cert: Cert, now_unix: Int): Int
+  if cert.err != 0 then return cert.err end
+  if now_unix < cert.not_before then return X509_ERR_TIME() end
+  if now_unix >= cert.not_after then return X509_ERR_TIME() end
+  return X509_OK()
+end
+
+# ASCII lowercase a single byte (RFC 6125 hostname matching is case-insensitive).
+def _ascii_lower(b: Int): Int
+  if (b >= 65) & (b <= 90) then return b + 32 end
+  return b
+end
+
+# Length of a String's underlying bytes.
+def _str_len(s: String): Int = str_byte_len(s)
+
+# Byte-wise case-insensitive equality between a String and an arbitrary
+# byte span. Both sides ASCII-lowered before compare. Returns 1 on match.
+def _str_ieq_span(s: String, p: Int, l: Int): Int
+  if _str_len(s) != l then return 0 end
+  var i = 0
+  while i < l
+    var a = _ascii_lower(str_byte_at(s, i))
+    var b = _ascii_lower(ptr_read_byte(p + i))
+    if a != b then return 0 end
+    i = i + 1
+  end
+  return 1
+end
+
+# Case-insensitive String equality (both strings).
+def _str_ieq(a: String, b: String): Int
+  var al = _str_len(a)
+  if al != _str_len(b) then return 0 end
+  var i = 0
+  while i < al
+    if _ascii_lower(str_byte_at(a, i)) != _ascii_lower(str_byte_at(b, i)) then return 0 end
+    i = i + 1
+  end
+  return 1
+end
+
+# RFC 6125 §6.4.3 wildcard match: the SAN entry may have exactly ONE wildcard
+# `*` in the LEFT-MOST label, and it matches exactly one DNS label of the
+# hostname (and only one; it does NOT span dots). Examples:
+#   pattern `*.example.com`  matches `foo.example.com`,  rejects `example.com`,
+#                            rejects `a.b.example.com`,  rejects `a*b.example.com`.
+#   pattern `foo.example.com` literal match only.
+# Returns 1 on match.
+def _wildcard_match(pattern: String, hostname: String): Int
+  var pl = _str_len(pattern)
+  var hl = _str_len(hostname)
+  if pl == 0 then return 0 end
+
+  # Wildcard must be at position 0 AND must be followed by a `.`.
+  if str_byte_at(pattern, 0) != 0x2a   # '*'
+    # No wildcard — exact case-insensitive compare.
+    return _str_ieq(pattern, hostname)
+  end
+  if pl < 2 then return 0 end
+  if str_byte_at(pattern, 1) != 0x2e   # '.'
+    return 0
+  end
+
+  # Find the first '.' in hostname — that's the boundary the '*' is matched
+  # against. The hostname before the dot is the wildcard match (must be
+  # non-empty, per RFC 6125).
+  var dot_idx = 0 - 1
+  var i = 0
+  while i < hl
+    if str_byte_at(hostname, i) == 0x2e
+      dot_idx = i
+      i = hl
+    end
+    i = i + 1
+  end
+  if dot_idx <= 0 then return 0 end   # no dot, or starts with dot → no match
+
+  # The hostname's tail (from dot_idx) must equal the pattern's tail (from 1).
+  var pat_tail_len = pl - 1
+  var host_tail_len = hl - dot_idx
+  if pat_tail_len != host_tail_len then return 0 end
+  var j = 0
+  while j < pat_tail_len
+    var pa = _ascii_lower(str_byte_at(pattern, 1 + j))
+    var ha = _ascii_lower(str_byte_at(hostname, dot_idx + j))
+    if pa != ha then return 0 end
+    j = j + 1
+  end
+  return 1
+end
+
+## Match `hostname` against the cert's SubjectAltName dNSName list under RFC
+## 6125. Returns 1 on match, 0 otherwise. CN is NOT consulted — per RFC 6125
+## §6.4.4 and modern browser behaviour, only SAN is trusted for hostname
+## verification. Certs without SAN are rejected.
+def x509_match_hostname(cert: Cert, hostname: String): Int
+  if cert.err != 0 then return 0 end
+  if cert.san_dns.size() == 0 then return 0 end
+  var i = 0
+  while i < cert.san_dns.size()
+    if _wildcard_match(cert.san_dns[i], hostname) == 1 then return 1 end
+    i = i + 1
+  end
+  return 0
+end
+
+## Verify the Ed25519 signature on this cert's tbsCertificate using the
+## given signer SPKI (32-byte Ed25519 public key, raw — no BIT STRING wrapper;
+## the format `cert.spki_ptr` exposes). Returns 1 on valid signature, 0
+## otherwise. For a self-signed cert, pass `cert.spki_ptr` as the signer.
+def x509_verify_signature(cert: Cert, signer_spki_ptr: Int): Int
+  if cert.err != 0 then return 0 end
+  if cert.sig_is_ed25519 != 1 then return 0 end
+  if cert.sig_len != 64 then return 0 end
+  if cert.tbs_ptr == 0 then return 0 end
+  return ed25519_verify(cert.sig_ptr, cert.tbs_ptr, cert.tbs_len, signer_spki_ptr)
+end
+
+# =============================================================================
+# Full chain verification
+# =============================================================================
+
+# Find an issuer for `cert` in `candidates`. Returns the index, or -1 if no
+# candidate's subject_raw byte-matches cert's issuer_raw. RFC 5280 §6.1.4
+# allows any name matching, but byte-equal subject_raw == issuer_raw covers
+# every practically deployed case and is what BoringSSL + rustls do for the
+# simple chain walk.
+def _find_issuer(cert: Cert, candidates: Vec<Cert>): Int
+  var i = 0
+  while i < candidates.size()
+    var c = candidates[i]
+    if c.err == 0
+      if (c.subject_len == cert.issuer_len) & (c.subject_len > 0)
+        var eq = 1
+        var j = 0
+        while j < c.subject_len
+          if ptr_read_byte(c.subject_ptr + j) != ptr_read_byte(cert.issuer_ptr + j)
+            eq = 0
+            j = c.subject_len
+          end
+          j = j + 1
+        end
+        if eq == 1 then return i end
+      end
+    end
+    i = i + 1
+  end
+  return 0 - 1
+end
+
+## Verify a full cert chain. Walks: leaf → optional intermediates → root.
+## At each link, checks:
+##   - cert's validity window includes `now_unix`
+##   - signer is found in (intermediates ∪ roots) by Issuer byte-equal Subject
+##   - signer cert has BasicConstraints CA=true (for intermediates / roots)
+##   - signer's path_len (if set) ≥ remaining hops below signer
+##   - cert's sig verifies under signer.spki_ptr
+##   - chain terminates at a cert in `roots`
+##   - leaf's SAN matches `hostname`
+##
+## Returns 0 (X509_OK) on success, or the first X509_ERR_* encountered.
+## Self-signed leafs ARE supported: when the leaf's Issuer matches a root
+## directly AND `intermediates` is empty, the chain has length 1.
+def x509_verify_chain(leaf: Cert, intermediates: Vec<Cert>, roots: Vec<Cert>,
+                      now_unix: Int, hostname: String): Int
+  if leaf.err != 0 then return leaf.err end
+
+  # Hostname check on the leaf.
+  if x509_match_hostname(leaf, hostname) == 0 then return X509_ERR_HOSTNAME() end
+
+  # Walk: starting from leaf, find issuer in intermediates or roots; verify
+  # sig; check CA bit + path length on the issuer; advance to issuer; repeat
+  # until we hit a root.
+  var current = leaf
+  var hops_below = 0  # number of certs already verified below `current` (path-len constraint)
+  var max_iter = intermediates.size() + roots.size() + 2
+  var iter = 0
+
+  while iter < max_iter
+    # Validity of current.
+    var vt = x509_check_validity(current, now_unix)
+    if vt != 0 then return vt end
+
+    # Find issuer. Look in roots FIRST (so a root-signed cert terminates
+    # cleanly even if the same subject is also in intermediates).
+    var ridx = _find_issuer(current, roots)
+    if ridx >= 0
+      var root = roots[ridx]
+      # Root cert validity also checked.
+      var rt = x509_check_validity(root, now_unix)
+      if rt != 0 then return rt end
+      # Root must have CA bit (unless current IS the root, i.e. self-signed leaf).
+      var self_signed = if (current.subject_len == root.subject_len) & (current.subject_len > 0) then
+        var eq = 1
+        var k = 0
+        while k < current.subject_len
+          if ptr_read_byte(current.subject_ptr + k) != ptr_read_byte(root.subject_ptr + k)
+            eq = 0
+            k = current.subject_len
+          end
+          k = k + 1
+        end
+        eq
+      else 0 end
+      if (self_signed == 0) & (root.is_ca == 0) then return X509_ERR_CA() end
+      # Path-len check on root.
+      if (root.path_len >= 0) & (root.path_len < hops_below) then return X509_ERR_CA() end
+      # Verify signature.
+      if x509_verify_signature(current, root.spki_ptr) == 0 then return X509_ERR_SIG() end
+      return X509_OK()
+    end
+
+    # Look in intermediates.
+    var iidx = _find_issuer(current, intermediates)
+    if iidx < 0 then return X509_ERR_CHAIN() end
+    var inter = intermediates[iidx]
+    if inter.err != 0 then return inter.err end
+    var it = x509_check_validity(inter, now_unix)
+    if it != 0 then return it end
+    if inter.is_ca == 0 then return X509_ERR_CA() end
+    if (inter.path_len >= 0) & (inter.path_len < hops_below) then return X509_ERR_CA() end
+    if x509_verify_signature(current, inter.spki_ptr) == 0 then return X509_ERR_SIG() end
+
+    current = inter
+    hops_below = hops_below + 1
+    iter = iter + 1
+  end
+
+  return X509_ERR_CHAIN()
+end

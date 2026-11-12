@@ -1,0 +1,197 @@
+import * from qspec
+
+# item 20 Phase 5 — TRANSITIVE self-mutation persistence.
+#
+# A value-struct method that mutates `self` ONLY by calling another self-method
+# (with NO direct `self.field =` in its own body) must still be detected as a
+# mutating value-self receiver, so its `self` is passed borrowed (by the caller's
+# slot address / live CoW buffer) rather than copied+decomposed — otherwise the
+# transitive mutation is lost, the same failure mode Phases 1/2 fixed for direct
+# mutation.
+#
+# HOW IT WORKS (mir_body_assigns_self_field, mir_lower.qz): the detection is a
+# whole-tree work-queue scan that flags `mutates_self_field` on the FIRST of
+#   (a) a DIRECT `self.field =` store, OR
+#   (b) a self-rooted UFCS call (`self.foo()` / `self.field.foo()`, via
+#       mir_receiver_is_self_rooted) — a conservative OVER-approximation: any
+#       self-method call MAY mutate self, so the enclosing method is flagged.
+# This is the design's endorsed "bias toward over-detection" (BORROW_RECEIVER_
+# CONVENTION.md §5 Phase 5): over-flagging a read-only self-method caller only
+# passes self by-pointer instead of by-copy (correctness-preserving, mild perf);
+# under-flagging loses mutations (a correctness bug). The whole-tree walk descends
+# into loop/if bodies, so transitively-mutating calls nested in control flow are
+# caught. UFCS-only, so a free call merely passing self by value is excluded.
+#
+# GATE-0-INERT: every consumer (mir_func_param0_is_mut_value_receiver, the CoW
+# field-store gate) short-circuits when no struct is value-layout, so the marker
+# is dead for plain (gate-0) structs ⇒ byte-identical self-compile.
+
+# --- ≤16B value receiver (2 Int = 16B, eager-copy layout, not CoW) ---
+
+@value
+struct TCounter
+  n: Int
+  hi: Int
+end
+
+extend TCounter
+  def inc(&mut self): Void
+    self.n = self.n + 1
+  end
+  # TRANSITIVE: mutates self only via callee, no direct self.field= here.
+  def inc_twice(self): Void
+    self.inc()
+    self.inc()
+  end
+  # Deeper chain: inc_chain -> incc -> inc.
+  def incc(self): Void
+    self.inc()
+  end
+  def inc_chain(self): Void
+    self.incc()
+    self.incc()
+    self.incc()
+  end
+  # Transitive mutation nested inside a loop body.
+  def inc_loop(self): Void
+    for _i in 0..5
+      self.inc()
+    end
+  end
+  # Transitive mutation nested inside an if (false branch takes no effect).
+  def inc_if(self, flag: Int): Void
+    if flag == 1
+      self.inc()
+    end
+  end
+end
+
+# A free-function self-method (not in extend) that mutates self directly.
+def raw_inc(&mut self: TCounter): Void
+  self.n = self.n + 1
+end
+
+extend TCounter
+  # Transitive mutation via a FREE-FUNCTION self-method called UFCS-style.
+  def inc_via_free(self): Void
+    self.raw_inc()
+    self.raw_inc()
+  end
+end
+
+def tc_transitive_twice(): Void
+  var c = TCounter { n: 0, hi: 100 }
+  c.inc_twice()
+  print(c.n.to_s())
+  print("\n")
+end
+
+def tc_transitive_chain(): Void
+  var c = TCounter { n: 0, hi: 0 }
+  c.inc_chain()
+  print(c.n.to_s())
+  print("\n")
+end
+
+def tc_transitive_loop(): Void
+  var c = TCounter { n: 0, hi: 0 }
+  c.inc_loop()
+  print(c.n.to_s())
+  print("\n")
+end
+
+def tc_transitive_if(): Void
+  var c = TCounter { n: 0, hi: 0 }
+  c.inc_if(1)
+  c.inc_if(0)
+  print(c.n.to_s())
+  print("\n")
+end
+
+def tc_transitive_via_free(): Void
+  var c = TCounter { n: 0, hi: 0 }
+  c.inc_via_free()
+  print(c.n.to_s())
+  print("\n")
+end
+
+# --- >16B CoW value receiver (3 Int = 24B → cow layout) ---
+
+@value
+struct TBig
+  a: Int
+  b: Int
+  c: Int
+end
+
+extend TBig
+  def bumpa(&mut self): Void
+    self.a = self.a + 1
+  end
+  # A->B->C->D transitive chain over a CoW buffer: bump4 -> bump2 -> bumpa.
+  def bump2(self): Void
+    self.bumpa()
+    self.bumpa()
+  end
+  def bump4(self): Void
+    self.bump2()
+    self.bump2()
+  end
+  def sum3(self): Int
+    return self.a + self.b + self.c
+  end
+end
+
+def tbig_transitive_chain(): Void
+  # CoW (>16B): 4 in-place increments via a purely transitive call chain must
+  # all land in the caller's live buffer.
+  var b = TBig { a: 0, b: 10, c: 20 }
+  b.bump4()
+  print(b.a.to_s())
+  print("\n")
+end
+
+def tbig_readonly_after_transitive(): Void
+  # The other fields survive the CoW transitive mutation; the buffer isn't
+  # dropped/reallocated out from under the caller.
+  var b = TBig { a: 0, b: 10, c: 20 }
+  b.bump4()
+  print(b.sum3().to_s())
+  print("\n")
+end
+
+def main(): Int
+  describe("transitive value-self mutation — <=16B receiver (item 20 P5)") do ->
+    it("mutation via a callee (inc_twice -> inc) persists into the caller's slot") do ->
+      assert_output("2\n", tc_transitive_twice)
+    end
+
+    it("deeper chain (inc_chain -> incc -> inc) persists") do ->
+      assert_output("3\n", tc_transitive_chain)
+    end
+
+    it("transitive mutation nested in a loop body persists") do ->
+      assert_output("5\n", tc_transitive_loop)
+    end
+
+    it("transitive mutation nested in an if persists (false branch is a no-op)") do ->
+      assert_output("1\n", tc_transitive_if)
+    end
+
+    it("transitive mutation via a free-function self-method (UFCS) persists") do ->
+      assert_output("2\n", tc_transitive_via_free)
+    end
+  end
+
+  describe("transitive value-self mutation — >16B CoW receiver (item 20 P5)") do ->
+    it("A->B->C->D transitive chain persists in place across a CoW buffer") do ->
+      assert_output("4\n", tbig_transitive_chain)
+    end
+
+    it("other fields survive the CoW transitive mutation (buffer not dropped)") do ->
+      assert_output("34\n", tbig_readonly_after_transitive)
+    end
+  end
+
+  return qspec_main()
+end

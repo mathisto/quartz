@@ -1,0 +1,220 @@
+## Regression: match-arm payload binding must shadow a same-named free
+## function / method.
+##
+## Pre-existing bug (surfaced 2026-06-02 via `quake`'s `fail()`):
+## `mir_ctx_apply_pending_bind` emitted a STORE_VAR for an enum-pattern
+## payload binding but never registered the name in the MIR binding scope
+## (`mir_ctx_bind_var`). In the arm body, the NODE_IDENT lowering's
+## `mir_ctx_lookup_var(name)` then missed and fell through to the function
+## registry — so a binding like `AssertionFailed(msg) => msg` resolved
+## `msg` to the free method `progress$Col$msg` and emitted
+## `ptrtoint @progress$Col$msg`. The arm returned a FUNCTION POINTER where
+## the String field was expected; stringifying it during the throw unwind
+## SEGFAULTed (single-field BuildError variants made `fail()` unusable).
+##
+## Root-cause fix: `mir_ctx_apply_pending_bind` now `alloc_slot` +
+## `bind_var`s each non-wildcard payload name before the STORE_VAR, exactly
+## like the struct- and vec-destructure paths. Pattern bindings now shadow
+## same-named functions/methods, as scoping requires.
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("match payload binding shadows same-named method") do ->
+    it("single-field variant binding returns the field, not a func ref") do ->
+      assert_run_stdout_eq("""
+enum E
+  A(msg: String)
+  B(x: String, y: Int)
+end
+
+struct Box
+  text: String
+end
+
+extend Box
+  def msg(self): String
+    return self.text
+  end
+end
+
+def render(e: E): String
+  match e
+    E::A(msg) => msg
+    E::B(x, y) => x
+  end
+end
+
+def main(): Int
+  puts(render(E::A("hello-A")))
+  puts(render(E::B("hello-B", 7)))
+  return 0
+end
+""", "hello-A\nhello-B\n")
+    end
+
+    it("shadowing binding flows cleanly through a throw payload") do ->
+      assert_run_stdout_eq("""
+import std/throws
+
+enum BErr
+  Two(cmd: String, code: Int)
+  One(msg: String)
+end
+
+struct Box
+  text: String
+end
+
+extend Box
+  def msg(self): String
+    return self.text
+  end
+end
+
+def berr_str(err: BErr): String
+  match err
+    BErr::Two(cmd, code) => cmd
+    BErr::One(msg) => msg
+  end
+end
+
+def raise_it(err: BErr): Void
+  throw(berr_str(err))
+end
+
+def cap(op_name: Int, argc: Int, argv: Int): Int
+  puts("CAUGHT: " + as_string(load(argv, 0)))
+  return 1
+end
+
+def main(): Int
+  with Throws { throw: cap } do ->
+    raise_it(BErr::Two("two-cmd", 134))
+  end
+  with Throws { throw: cap } do ->
+    raise_it(BErr::One("one-msg"))
+  end
+  return 0
+end
+""", "CAUGHT: two-cmd\nCAUGHT: one-msg\n")
+    end
+  end
+
+  ## Sibling sites of the same binding-shadow class (the deferred set from
+  ## the 2026-06-02 overnight sprint). Each is a distinct lowering path that
+  ## emitted STORE_VAR for a binding without a preceding `mir_ctx_bind_var`,
+  ## so a binding whose name collides with a free function resolved to the
+  ## FUNCTION POINTER (`@<name>`) in the arm/loop body instead of the bound
+  ## value. Fixed by alloc_slot + bind_var before the store, exactly like
+  ## the match/struct/vec paths.
+  ##
+  ## NOTE: these MUST be exercised with a fresh / `--no-cache` compile.
+  ## qspec/subprocess always passes `--no-cache`, so it sees the true
+  ## behavior. A warm `.quartz-cache` populated by a fixed compiler will
+  ## serve the corrected MIR to a broken one and mask the bug — the
+  ## cache-ro contamination class (ed82d719).
+  describe("binding shadow across the deferred lowering sites") do ->
+    it("try/catch enum-access payload shadows a free function") do ->
+      assert_run_stdout_eq("""
+def e(): String = "FUNC-REF-BUG"
+
+def risky(): Result<String, String>
+  return Result::Err("payload-ok")
+end
+
+def main(): Int
+  puts(try risky() catch Err(e) e)
+  return 0
+end
+""", "payload-ok\n")
+    end
+
+    it("select op_kind=5 (recvable) arm binding shadows a free function") do ->
+      assert_run_stdout_eq("""
+import * from std/sync/communication/channel
+import * from std/sync/composition/scope
+
+def v(): Int = 99999
+
+def main(): Int
+  var ch = channel_new(8)
+  send(ch, 42)
+  select
+    case v = recvable(ch) => puts("got=" + str_from_int(v))
+    case _ = deadline_ms(1000) => puts("FAIL: deadline")
+  end
+  return 0
+end
+""", "got=42\n")
+    end
+
+    it("select op_kind=0 (recv) arm binding shadows a free function") do ->
+      assert_run_stdout_eq("""
+import * from std/sync/communication/channel
+
+def v(): Int = 99999
+
+def main(): Int
+  var ch = channel_new(8)
+  send(ch, 42)
+  select
+    case v = recv(ch) => puts("got=" + str_from_int(v))
+    case _ = timeout(1000) => puts("FAIL: timeout")
+  end
+  return 0
+end
+""", "got=42\n")
+    end
+
+    it("select op_kind=3 (await) arm binding shadows a free function") do ->
+      assert_run_stdout_eq("""
+import * from std/sync/communication/channel
+import * from std/sync/composition/awaitable
+
+def x(): Int = 88888
+
+def compute(): Int
+  return 42
+end
+
+def main(): Int
+  var t = go compute()
+  select
+    case x = await t => puts("got=" + str_from_int(x))
+    case _ = timeout(1000) => puts("FAIL: timeout")
+  end
+  return 0
+end
+""", "got=42\n")
+    end
+
+    it("for-await channel loop variable shadows a free function") do ->
+      assert_run_stdout_eq("""
+import * from std/sync/communication/channel
+
+def msg(): Int = 77777
+
+def producer(ch: Int): Int
+  send(ch, 10)
+  send(ch, 20)
+  send(ch, 30)
+  channel_close(ch)
+  return 0
+end
+
+def main(): Int
+  var ch = channel_new(8)
+  var w = go producer(ch)
+  for await msg in ch
+    puts(str_from_int(msg))
+  end
+  return 0
+end
+""", "10\n20\n30\n")
+    end
+  end
+
+  return qspec_main()
+end

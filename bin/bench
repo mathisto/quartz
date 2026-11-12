@@ -1,0 +1,1155 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# =============================================================================
+# Quartz Benchmark Suite — World-Class Performance Tracking
+# =============================================================================
+#
+# Statistically rigorous, self-adversarial benchmark runner with:
+# - Per-iteration sample storage for historical reanalysis
+# - Standard deviation, IQR, coefficient of variation reporting
+# - Peak RSS memory measurement via /usr/bin/time
+# - Compiler metrics (binary size, IR lines, function count)
+# - Cohen's d effect size for regression detection
+# - Self-compilation benchmark (compiler compiling itself)
+# - Fair cross-language comparisons (grouped by allocation strategy)
+#
+# Usage:
+#   bin/bench                    # Run all benchmarks (10 iterations)
+#   bin/bench --quick            # Quick mode: fibonacci + selfcomp (5 iterations)
+#   bin/bench --precise          # Precise mode: 30 iterations
+#   bin/bench --compare          # Compare against previous run
+#   bin/bench --ci               # CI mode: exit 1 on significant regressions
+#   bin/bench --history [NAME]   # Show historical results
+#   bin/bench fibonacci sieve    # Run specific benchmarks
+#
+
+require 'sqlite3'
+require 'fileutils'
+require 'optparse'
+require 'tmpdir'
+require 'open3'
+
+PROJECT_ROOT = File.expand_path('..', __dir__)
+BENCHMARKS_DIR = File.join(PROJECT_ROOT, 'benchmarks')
+DB_PATH = File.join(BENCHMARKS_DIR, 'results.sqlite3')
+QUARTZ_COMPILER = File.join(PROJECT_ROOT, 'self-hosted/bin/quartz')
+
+ITERATIONS = 10          # Standard: enough for meaningful stddev
+ITERATIONS_QUICK = 5     # Quick: per-build validation
+ITERATIONS_PRECISE = 30  # Precise: deep analysis
+
+# Ensure LLVM tools (llc) are in PATH
+LLVM_BIN = '/opt/homebrew/opt/llvm/bin'
+ENV['PATH'] = "#{LLVM_BIN}:#{ENV['PATH']}" if File.directory?(LLVM_BIN)
+
+# ---------------------------------------------------------------------------
+# Benchmark Registry
+# ---------------------------------------------------------------------------
+BENCHMARKS = {
+  'fibonacci'     => { dir: 'fibonacci',     qz: 'fib.qz',    c: 'fib.c',    rs: 'fib.rs',    zig: 'fib.zig',    bl: 'fib.bl' },
+  'sum'           => { dir: 'sum',           qz: 'sum.qz',    c: 'sum.c',    rs: 'sum.rs',    zig: 'sum.zig' },
+  'sieve'         => { dir: 'sieve',         qz: 'sieve.qz',  c: 'sieve.c',  rs: 'sieve.rs',  zig: 'sieve.zig', byte_qz: 'sieve_byte.qz', bitvec_qz: 'sieve_bitvec.qz' },
+  'string_concat' => { dir: 'string_concat', qz: 'concat.qz', c: 'concat.c', rs: 'concat.rs', zig: 'concat.zig' },
+  'matrix'        => { dir: 'matrix',        qz: 'matrix.qz', c: 'matrix.c', rs: 'matrix.rs', zig: 'matrix.zig' },
+  'binary_trees'  => { dir: 'binary_trees',  qz: 'trees.qz',  c: 'trees.c',  rs: 'trees.rs',  zig: 'trees.zig',
+                        arena_qz: 'trees_arena.qz', bump_qz: 'trees_bump.qz',
+                        bump_c: 'trees_bump.c', bump_rs: 'trees_bump.rs' },
+}
+
+# Language definitions — ordered for display
+LANGUAGES = %w[
+  quartz-self
+  quartz-arena quartz-bump quartz-byte
+  c c-bump
+  rust rust-bump
+  zig
+]
+
+LANG_LABELS = {
+  'quartz-self'      => 'Quartz (self-hosted)',
+  'quartz-arena'     => 'Quartz (arena)',
+  'quartz-bump'      => 'Quartz (bump)',
+  'quartz-byte'      => 'Quartz (byte)',
+  'c'                => 'C (clang -O2)',
+  'c-bump'           => 'C bump (clang -O2)',
+  'rust'             => 'Rust (rustc -O)',
+  'rust-bump'        => 'Rust bump (rustc -O)',
+  'zig'              => 'Zig (-OReleaseFast)',
+  'selfcomp'         => 'Self-compilation',
+}
+
+# Allocation strategy grouping for honest reporting
+STRATEGY_GROUPS = {
+  'binary_trees' => {
+    'malloc/free (per-node)' => %w[c rust quartz-self],
+    'bump/arena (bulk dealloc)' => %w[c-bump rust-bump zig quartz-arena quartz-bump],
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Colors
+# ---------------------------------------------------------------------------
+module C
+  def self.reset  = "\e[0m"
+  def self.bold   = "\e[1m"
+  def self.dim    = "\e[2m"
+  def self.red    = "\e[31m"
+  def self.green  = "\e[32m"
+  def self.yellow = "\e[33m"
+  def self.blue   = "\e[34m"
+  def self.cyan   = "\e[36m"
+  def self.gray   = "\e[90m"
+end
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+def init_db
+  FileUtils.mkdir_p(File.dirname(DB_PATH))
+  db = SQLite3::Database.new(DB_PATH)
+
+  # Original table
+  db.execute <<-SQL
+    CREATE TABLE IF NOT EXISTS runs (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      timestamp TEXT NOT NULL,
+      git_sha TEXT,
+      quartz_version TEXT,
+      benchmark TEXT NOT NULL,
+      language TEXT NOT NULL,
+      compile_time_ms REAL,
+      run_time_ms REAL,
+      iterations INTEGER DEFAULT 5
+    )
+  SQL
+
+  # Per-iteration sample storage
+  db.execute <<-SQL
+    CREATE TABLE IF NOT EXISTS samples (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      benchmark TEXT NOT NULL,
+      language TEXT NOT NULL,
+      iteration INTEGER NOT NULL,
+      run_time_ms REAL NOT NULL,
+      peak_rss_kb INTEGER
+    )
+  SQL
+
+  # Compiler metrics table (Quartz-specific longitudinal metrics)
+  db.execute <<-SQL
+    CREATE TABLE IF NOT EXISTS compiler_metrics (
+      id INTEGER PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      timestamp TEXT NOT NULL,
+      git_sha TEXT,
+      quartz_version TEXT,
+      benchmark TEXT NOT NULL,
+      language TEXT NOT NULL,
+      binary_size_bytes INTEGER,
+      ir_line_count INTEGER,
+      ir_func_count INTEGER
+    )
+  SQL
+
+  # Migrations for existing databases
+  columns = db.execute("PRAGMA table_info(runs)").map { |c| c[1] }
+  migrations = {
+    'quartz_version'     => 'TEXT',
+    'run_time_stddev_ms' => 'REAL',
+    'run_time_min_ms'    => 'REAL',
+    'run_time_max_ms'    => 'REAL',
+    'run_time_iqr_ms'    => 'REAL',
+    'run_time_cv'        => 'REAL',
+    'peak_rss_kb'        => 'INTEGER',
+    'binary_size_bytes'  => 'INTEGER',
+    'ir_line_count'      => 'INTEGER',
+    'ir_func_count'      => 'INTEGER',
+  }
+  migrations.each do |col, type|
+    unless columns.include?(col)
+      db.execute("ALTER TABLE runs ADD COLUMN #{col} #{type}")
+    end
+  end
+
+  db
+end
+
+def get_version
+  vf = File.join(PROJECT_ROOT, 'VERSION')
+  File.exist?(vf) ? File.read(vf).strip : 'unknown'
+end
+
+def get_git_sha
+  sha = `git -C #{PROJECT_ROOT} rev-parse --short HEAD 2>/dev/null`.strip
+  sha.empty? ? nil : sha
+end
+
+# ---------------------------------------------------------------------------
+# Statistics Engine
+# ---------------------------------------------------------------------------
+def compute_stats(times)
+  return nil if times.nil? || times.empty?
+  n = times.length
+  sorted = times.sort
+  mean = times.sum / n.to_f
+
+  # Variance and standard deviation (sample variance, n-1)
+  if n > 1
+    variance = times.map { |t| (t - mean) ** 2 }.sum / (n - 1).to_f
+    stddev = Math.sqrt(variance)
+  else
+    variance = 0.0
+    stddev = 0.0
+  end
+
+  # Median
+  mid = n / 2
+  median_val = n.odd? ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2.0
+
+  # IQR (interquartile range)
+  q1 = sorted[n / 4]
+  q3 = sorted[(3 * n) / 4]
+  iqr = q3 - q1
+
+  # Coefficient of variation (lower = more stable)
+  cv = mean > 0 ? (stddev / mean) : 0.0
+
+  {
+    median: median_val, mean: mean, stddev: stddev,
+    min: sorted.first, max: sorted.last,
+    iqr: iqr, cv: cv, samples: times, n: n
+  }
+end
+
+# Cohen's d effect size for regression detection
+# Returns: { significant: bool, d: float, delta_pct: float }
+def regression_analysis(current_samples, previous_samples)
+  return { significant: false, d: 0.0, delta_pct: 0.0 } if
+    current_samples.nil? || previous_samples.nil? ||
+    current_samples.length < 3 || previous_samples.length < 3
+
+  mean_c = current_samples.sum / current_samples.length.to_f
+  mean_p = previous_samples.sum / previous_samples.length.to_f
+
+  var_c = current_samples.map { |x| (x - mean_c)**2 }.sum / (current_samples.length - 1).to_f
+  var_p = previous_samples.map { |x| (x - mean_p)**2 }.sum / (previous_samples.length - 1).to_f
+
+  pooled_std = Math.sqrt((var_c + var_p) / 2.0)
+  return { significant: false, d: 0.0, delta_pct: 0.0 } if pooled_std == 0
+
+  d = (mean_c - mean_p) / pooled_std
+  delta_pct = mean_p > 0 ? ((mean_c - mean_p) / mean_p * 100.0) : 0.0
+
+  # Significant regression: large effect size AND meaningful absolute change
+  significant = d > 0.8 && delta_pct > 5.0
+
+  { significant: significant, d: d, delta_pct: delta_pct }
+end
+
+# ---------------------------------------------------------------------------
+# Compilation helpers
+# ---------------------------------------------------------------------------
+def compile_quartz(compiler, source, exe, tmpdir)
+  ll = File.join(tmpdir, 'prog.ll')
+  opt_ll = File.join(tmpdir, 'prog.opt.ll')
+
+  t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  system("#{compiler} #{source} > #{ll} 2>/dev/null")
+  return nil unless $?.success? && File.size?(ll)
+
+  # Middle-end optimization (mem2reg, SROA, GVN, LICM, loop vectorization, etc.)
+  system("opt -O2 -S #{ll} -o #{opt_ll} 2>/dev/null")
+  return nil unless $?.success?
+
+  # Backend codegen optimization, then link
+  obj = File.join(tmpdir, 'prog.o')
+  system("llc -O2 -filetype=obj #{opt_ll} -o #{obj} 2>/dev/null")
+  return nil unless $?.success?
+  system("clang #{obj} -o #{exe} 2>/dev/null")
+  return nil unless $?.success?
+  t1 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+  # Collect compiler metrics
+  ir_lines = File.readlines(ll).length rescue 0
+  ir_funcs = File.readlines(ll).count { |l| l.start_with?('define ') } rescue 0
+  bin_size = File.size?(exe) || 0
+
+  {
+    compile_ms: (t1 - t0) * 1000.0,
+    ir_line_count: ir_lines,
+    ir_func_count: ir_funcs,
+    binary_size_bytes: bin_size,
+  }
+end
+
+def compile_c(source, exe)
+  t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  system("clang -O2 -o #{exe} #{source} 2>/dev/null")
+  return nil unless $?.success?
+  t1 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  { compile_ms: (t1 - t0) * 1000.0 }
+end
+
+def compile_rust(source, exe)
+  t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  system("rustc -O -o #{exe} #{source} 2>/dev/null")
+  return nil unless $?.success?
+  t1 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  { compile_ms: (t1 - t0) * 1000.0 }
+end
+
+def compile_go(source, exe)
+  t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  system("go build -o #{exe} #{source} 2>/dev/null")
+  return nil unless $?.success?
+  t1 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  { compile_ms: (t1 - t0) * 1000.0 }
+end
+
+def compile_zig(source, exe, tmpdir)
+  t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  system("zig build-exe -OReleaseFast --cache-dir #{tmpdir}/zig-cache -femit-bin=#{exe} #{source} 2>/dev/null")
+  return nil unless $?.success?
+  t1 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  { compile_ms: (t1 - t0) * 1000.0 }
+end
+
+# ---------------------------------------------------------------------------
+# Run + measure (with peak RSS via /usr/bin/time)
+# ---------------------------------------------------------------------------
+
+# Detect platform-appropriate time command
+def time_command
+  if RUBY_PLATFORM =~ /darwin/
+    '/usr/bin/time -l'
+  elsif File.exist?('/usr/bin/time')
+    '/usr/bin/time -v'  # GNU time
+  else
+    nil
+  end
+end
+
+def parse_rss(time_output)
+  if RUBY_PLATFORM =~ /darwin/
+    # macOS: "   12345  maximum resident set size" (bytes)
+    if m = time_output.match(/(\d+)\s+maximum resident set size/)
+      return m[1].to_i / 1024  # Convert bytes to KB
+    end
+  else
+    # GNU/Linux: "Maximum resident set size (kbytes): 12345"
+    if m = time_output.match(/Maximum resident set size.*?:\s*(\d+)/)
+      return m[1].to_i  # Already in KB
+    end
+  end
+  nil
+end
+
+def run_timed(exe, *args)
+  time_stderr = "/tmp/bench_time_#{$$}_#{rand(100000)}"
+  time_cmd = time_command
+
+  t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+  if time_cmd
+    # Use /usr/bin/time to capture RSS; time writes to stderr
+    full_cmd = "#{time_cmd} #{exe} #{args.join(' ')} 2>#{time_stderr}"
+    output = `#{full_cmd}`
+    success = $?.success?
+  else
+    output, _err, status = Open3.capture3(exe, *args)
+    success = status.success?
+  end
+
+  t1 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+  rss_kb = nil
+  if time_cmd && File.exist?(time_stderr)
+    rss_kb = parse_rss(File.read(time_stderr))
+    FileUtils.rm_f(time_stderr)
+  end
+
+  return nil unless success
+  [(t1 - t0) * 1000.0, output.strip, rss_kb]
+end
+
+def run_iterations(exe, n, args: [])
+  times = []
+  rss_values = []
+  output = nil
+  n.times do
+    result = run_timed(exe, *args)
+    return nil if result.nil?
+    times << result[0]
+    output = result[1]
+    rss_values << result[2] if result[2]
+  end
+  # Peak RSS = max across iterations (most representative)
+  peak_rss = rss_values.max
+  [compute_stats(times), output, peak_rss]
+end
+
+# ---------------------------------------------------------------------------
+# Self-compilation benchmark
+# ---------------------------------------------------------------------------
+def run_selfcomp(run_id, db, iteration_count)
+  return {} unless File.exist?(QUARTZ_COMPILER)
+  qz_source = File.join(PROJECT_ROOT, 'self-hosted/quartz.qz')
+  return {} unless File.exist?(qz_source)
+
+  include_flags = "-I self-hosted/frontend -I self-hosted/middle -I self-hosted/backend -I self-hosted/error -I std"
+  results = {}
+  bench_name = 'selfcomp'
+
+  Dir.mktmpdir('bench-selfcomp') do |tmpdir|
+    compile_times = []
+    link_times = []
+    total_times = []
+    rss_values = []
+
+    iteration_count.times do |i|
+      ll = File.join(tmpdir, "selfcomp_#{i}.ll")
+      exe = File.join(tmpdir, "selfcomp_#{i}")
+      time_stderr = "/tmp/bench_selfcomp_time_#{$$}_#{i}"
+      time_cmd = time_command
+
+      # Phase 1: Quartz → LLVM IR
+      t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      if time_cmd
+        system("#{time_cmd} #{QUARTZ_COMPILER} #{include_flags} #{qz_source} > #{ll} 2>#{time_stderr}")
+      else
+        system("#{QUARTZ_COMPILER} #{include_flags} #{qz_source} > #{ll} 2>/dev/null")
+      end
+      t1 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+      unless $?.success? && File.size?(ll)
+        $stderr.puts "  selfcomp: compilation failed on iteration #{i}"
+        next
+      end
+
+      compile_ms = (t1 - t0) * 1000.0
+
+      # Capture RSS from compilation phase
+      rss_kb = nil
+      if time_cmd && File.exist?(time_stderr)
+        rss_kb = parse_rss(File.read(time_stderr))
+        FileUtils.rm_f(time_stderr)
+      end
+      rss_values << rss_kb if rss_kb
+
+      # Phase 2: LLVM IR → binary (opt -O2 + llc -O2 for codegen, then link)
+      t2 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      opt_ll = File.join(tmpdir, "selfcomp_#{i}.opt.ll")
+      obj = File.join(tmpdir, "selfcomp_#{i}.o")
+      system("opt -O2 -S #{ll} -o #{opt_ll} 2>/dev/null")
+      system("llc -O2 -filetype=obj #{opt_ll} -o #{obj} 2>/dev/null")
+      system("clang -Wl,-stack_size,0x2000000 #{obj} -o #{exe} 2>/dev/null")
+      t3 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+      link_ms = (t3 - t2) * 1000.0
+      total_ms = compile_ms + link_ms
+
+      compile_times << compile_ms
+      link_times << link_ms
+      total_times << total_ms
+
+      # Store per-iteration sample
+      db.execute(
+        'INSERT INTO samples (run_id, benchmark, language, iteration, run_time_ms, peak_rss_kb) VALUES (?, ?, ?, ?, ?, ?)',
+        [run_id, bench_name, 'selfcomp-compile', i, compile_ms, rss_kb]
+      )
+      db.execute(
+        'INSERT INTO samples (run_id, benchmark, language, iteration, run_time_ms, peak_rss_kb) VALUES (?, ?, ?, ?, ?, ?)',
+        [run_id, bench_name, 'selfcomp-link', i, link_ms, nil]
+      )
+      db.execute(
+        'INSERT INTO samples (run_id, benchmark, language, iteration, run_time_ms, peak_rss_kb) VALUES (?, ?, ?, ?, ?, ?)',
+        [run_id, bench_name, 'selfcomp-total', i, total_ms, rss_kb]
+      )
+
+      # Clean up IR to save disk (keep last one for metrics)
+      FileUtils.rm_f(exe) unless i == iteration_count - 1
+      FileUtils.rm_f(ll)  unless i == iteration_count - 1
+    end
+
+    next if compile_times.empty?
+
+    # Collect compiler metrics from last iteration's IR
+    last_ll = File.join(tmpdir, "selfcomp_#{iteration_count - 1}.ll")
+    last_exe = File.join(tmpdir, "selfcomp_#{iteration_count - 1}")
+    ir_lines = File.exist?(last_ll) ? File.readlines(last_ll).length : 0
+    ir_funcs = File.exist?(last_ll) ? File.readlines(last_ll).count { |l| l.start_with?('define ') } : 0
+    bin_size = File.exist?(last_exe) ? File.size(last_exe) : 0
+
+    compile_stats = compute_stats(compile_times)
+    link_stats = compute_stats(link_times)
+    total_stats = compute_stats(total_times)
+    peak_rss = rss_values.max
+
+    # Store to runs table (compile phase is the primary metric)
+    ['selfcomp-compile', 'selfcomp-link', 'selfcomp-total'].zip(
+      [compile_stats, link_stats, total_stats]
+    ).each do |lang, stats|
+      db.execute(
+        'INSERT INTO runs (run_id, timestamp, git_sha, quartz_version, benchmark, language, compile_time_ms, run_time_ms, run_time_stddev_ms, run_time_min_ms, run_time_max_ms, run_time_iqr_ms, run_time_cv, peak_rss_kb, binary_size_bytes, ir_line_count, ir_func_count, iterations) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [run_id, Time.now.iso8601, get_git_sha, get_version, bench_name, lang,
+         nil, stats[:median], stats[:stddev], stats[:min], stats[:max],
+         stats[:iqr], stats[:cv], peak_rss, bin_size, ir_lines, ir_funcs,
+         iteration_count]
+      )
+    end
+
+    # Store compiler metrics
+    db.execute(
+      'INSERT INTO compiler_metrics (run_id, timestamp, git_sha, quartz_version, benchmark, language, binary_size_bytes, ir_line_count, ir_func_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [run_id, Time.now.iso8601, get_git_sha, get_version, bench_name, 'quartz-self',
+       bin_size, ir_lines, ir_funcs]
+    )
+
+    results = {
+      compile: compile_stats, link: link_stats, total: total_stats,
+      peak_rss_kb: peak_rss, ir_lines: ir_lines, ir_funcs: ir_funcs,
+      binary_size: bin_size
+    }
+  end
+
+  results
+end
+
+# ---------------------------------------------------------------------------
+# Benchmark runner
+# ---------------------------------------------------------------------------
+def run_benchmark(bench_name, bench_info, run_id, db, iteration_count)
+  dir = File.join(BENCHMARKS_DIR, bench_info[:dir])
+  results = {}
+
+  Dir.mktmpdir("bench-#{bench_name}") do |tmpdir|
+    LANGUAGES.each do |lang|
+      exe = File.join(tmpdir, "#{bench_name}_#{lang}")
+      compile_result = nil
+      source = nil
+
+      case lang
+      when 'quartz-self'
+        source = File.join(dir, bench_info[:qz])
+        next unless File.exist?(source) && File.exist?(QUARTZ_COMPILER)
+        compile_result = compile_quartz(QUARTZ_COMPILER, source, exe, tmpdir)
+      when 'quartz-arena'
+        next unless bench_info[:arena_qz]
+        source = File.join(dir, bench_info[:arena_qz])
+        next unless File.exist?(source) && File.exist?(QUARTZ_COMPILER)
+        compile_result = compile_quartz(QUARTZ_COMPILER, source, exe, tmpdir)
+      when 'quartz-bump'
+        next unless bench_info[:bump_qz]
+        source = File.join(dir, bench_info[:bump_qz])
+        next unless File.exist?(source) && File.exist?(QUARTZ_COMPILER)
+        compile_result = compile_quartz(QUARTZ_COMPILER, source, exe, tmpdir)
+      when 'quartz-byte'
+        next unless bench_info[:byte_qz]
+        source = File.join(dir, bench_info[:byte_qz])
+        next unless File.exist?(source) && File.exist?(QUARTZ_COMPILER)
+        compile_result = compile_quartz(QUARTZ_COMPILER, source, exe, tmpdir)
+      when 'c'
+        source = File.join(dir, bench_info[:c])
+        next unless File.exist?(source)
+        compile_result = compile_c(source, exe)
+      when 'c-bump'
+        next unless bench_info[:bump_c]
+        source = File.join(dir, bench_info[:bump_c])
+        next unless File.exist?(source)
+        compile_result = compile_c(source, exe)
+      when 'rust'
+        source = File.join(dir, bench_info[:rs])
+        next unless File.exist?(source)
+        compile_result = compile_rust(source, exe)
+      when 'rust-bump'
+        next unless bench_info[:bump_rs]
+        source = File.join(dir, bench_info[:bump_rs])
+        next unless File.exist?(source)
+        compile_result = compile_rust(source, exe)
+      when 'zig'
+        source = File.join(dir, bench_info[:zig])
+        next unless File.exist?(source)
+        compile_result = compile_zig(source, exe, tmpdir)
+      end
+
+      next if compile_result.nil?
+
+      compile_ms = compile_result[:compile_ms]
+      iters = iteration_count
+      run_args = []
+
+      run_result = run_iterations(exe, iters, args: run_args)
+      next if run_result.nil?
+
+      stats, output, peak_rss = run_result
+      results[lang] = {
+        compile_ms: compile_ms, stats: stats, output: output,
+        peak_rss_kb: peak_rss,
+        ir_line_count: compile_result[:ir_line_count],
+        ir_func_count: compile_result[:ir_func_count],
+        binary_size_bytes: compile_result[:binary_size_bytes],
+      }
+
+      # Store per-iteration samples
+      stats[:samples].each_with_index do |sample_ms, i|
+        db.execute(
+          'INSERT INTO samples (run_id, benchmark, language, iteration, run_time_ms, peak_rss_kb) VALUES (?, ?, ?, ?, ?, ?)',
+          [run_id, bench_name, lang, i, sample_ms, peak_rss]
+        )
+      end
+
+      # Store aggregate to runs table
+      db.execute(
+        'INSERT INTO runs (run_id, timestamp, git_sha, quartz_version, benchmark, language, compile_time_ms, run_time_ms, run_time_stddev_ms, run_time_min_ms, run_time_max_ms, run_time_iqr_ms, run_time_cv, peak_rss_kb, binary_size_bytes, ir_line_count, ir_func_count, iterations) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [run_id, Time.now.iso8601, get_git_sha, get_version, bench_name, lang,
+         compile_ms, stats[:median], stats[:stddev], stats[:min], stats[:max],
+         stats[:iqr], stats[:cv], peak_rss,
+         compile_result[:binary_size_bytes], compile_result[:ir_line_count],
+         compile_result[:ir_func_count], iters]
+      )
+
+      # Store compiler metrics for Quartz variants
+      if lang.start_with?('quartz-') && compile_result[:ir_line_count]
+        db.execute(
+          'INSERT INTO compiler_metrics (run_id, timestamp, git_sha, quartz_version, benchmark, language, binary_size_bytes, ir_line_count, ir_func_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [run_id, Time.now.iso8601, get_git_sha, get_version, bench_name, lang,
+           compile_result[:binary_size_bytes], compile_result[:ir_line_count],
+           compile_result[:ir_func_count]]
+        )
+      end
+    end
+  end
+
+  results
+end
+
+# ---------------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------------
+def format_ms(ms)
+  return 'N/A' if ms.nil?
+  if ms >= 1000
+    format('%.3fs', ms / 1000.0)
+  elsif ms >= 100
+    format('%.1fms', ms)
+  elsif ms >= 1
+    format('%.1fms', ms)
+  else
+    format('%.2fms', ms)
+  end
+end
+
+def format_rss(kb)
+  return '' if kb.nil?
+  if kb >= 1024 * 1024
+    format('%.1f GB', kb / (1024.0 * 1024.0))
+  elsif kb >= 1024
+    format('%.1f MB', kb / 1024.0)
+  else
+    "#{kb} KB"
+  end
+end
+
+def format_bytes(bytes)
+  return '' if bytes.nil? || bytes == 0
+  if bytes >= 1024 * 1024
+    format('%.1f MB', bytes / (1024.0 * 1024.0))
+  elsif bytes >= 1024
+    format('%.1f KB', bytes / 1024.0)
+  else
+    "#{bytes} B"
+  end
+end
+
+def ratio_str(run_ms, baseline_ms)
+  return '' if baseline_ms.nil? || run_ms.nil? || baseline_ms == 0
+  r = run_ms / baseline_ms
+  if r < 1.05 && r > 0.95
+    "#{C.gray}(~1.0x C)#{C.reset}"
+  elsif r >= 1.05
+    "#{C.yellow}(%.1fx C)#{C.reset}" % r
+  else
+    "#{C.green}(%.2fx C)#{C.reset}" % r
+  end
+end
+
+def print_results(bench_name, results)
+  puts "#{C.cyan}#{C.bold}#{bench_name}#{C.reset}"
+
+  strategy_groups = STRATEGY_GROUPS[bench_name]
+
+  if strategy_groups
+    # Grouped display for benchmarks with allocation strategy variants
+    strategy_groups.each do |strategy, langs|
+      strategy_langs = langs.select { |l| results[l] }
+      next if strategy_langs.empty?
+
+      # Find baseline within this strategy group
+      baseline_lang = strategy_langs.find { |l| l.start_with?('c') }
+      baseline_ms = baseline_lang ? results[baseline_lang][:stats][:median] : nil
+
+      puts "  #{C.dim}Strategy: #{strategy}#{C.reset}"
+      strategy_langs.each do |lang|
+        print_result_line(lang, results[lang], baseline_ms, baseline_lang)
+      end
+    end
+
+    # Also show any ungrouped results
+    ungrouped = results.keys - strategy_groups.values.flatten
+    if ungrouped.any?
+      c_time = results.dig('c', :stats, :median)
+      ungrouped.each do |lang|
+        print_result_line(lang, results[lang], c_time, 'c')
+      end
+    end
+  else
+    # Standard display: C as baseline
+    c_time = results.dig('c', :stats, :median)
+    LANGUAGES.each do |lang|
+      r = results[lang]
+      next if r.nil?
+      print_result_line(lang, r, c_time, 'c')
+    end
+  end
+
+  # Correctness check: all outputs should match
+  outputs = results.values.map { |r| r[:output] }.compact.uniq
+  if outputs.length > 1
+    puts "  #{C.red}⚠ OUTPUTS DIFFER: #{outputs.inspect}#{C.reset}"
+  elsif outputs.length == 1
+    puts "  #{C.green}✓ All outputs match: #{outputs.first[0..30]}#{C.reset}"
+  end
+
+  puts
+end
+
+def print_result_line(lang, r, baseline_ms, baseline_lang)
+  label = (LANG_LABELS[lang] || lang).ljust(24)
+  stats = r[:stats]
+
+  time_str = format_ms(stats[:median]).rjust(10)
+  stddev_str = stats[:stddev] > 0 ? " ± #{format_ms(stats[:stddev])}" : ""
+  cv_str = stats[:cv] > 0 ? "#{C.dim}(CV #{'%.1f' % (stats[:cv] * 100)}%)#{C.reset}" : ""
+
+  ratio = lang == baseline_lang ? "#{C.dim}(baseline)#{C.reset}" : ratio_str(stats[:median], baseline_ms)
+
+  rss_str = r[:peak_rss_kb] ? "  #{C.dim}#{format_rss(r[:peak_rss_kb])}#{C.reset}" : ""
+
+  # Memory warning: flag if RSS > 2x the C baseline
+  rss_warn = ""
+  if r[:peak_rss_kb] && baseline_ms
+    # Find baseline RSS in results context — can't easily do this here,
+    # so we just flag very large RSS values (> 50MB for now)
+    if r[:peak_rss_kb] > 50_000
+      rss_warn = " #{C.yellow}⚠#{C.reset}"
+    end
+  end
+
+  puts "    #{label} #{C.bold}#{time_str}#{C.reset}#{stddev_str} #{cv_str}  #{ratio}#{rss_str}#{rss_warn}"
+end
+
+def print_selfcomp_results(results)
+  return if results.empty?
+
+  puts "#{C.cyan}#{C.bold}selfcomp#{C.reset} #{C.dim}(compiler compiling itself)#{C.reset}"
+
+  if results[:compile]
+    stats = results[:compile]
+    puts "    #{'Compile (→ IR)'.ljust(24)} #{C.bold}#{format_ms(stats[:median]).rjust(10)}#{C.reset} ± #{format_ms(stats[:stddev])} #{C.dim}(CV #{'%.1f' % (stats[:cv] * 100)}%)#{C.reset}"
+  end
+  if results[:link]
+    stats = results[:link]
+    puts "    #{'Link (→ binary)'.ljust(24)} #{C.bold}#{format_ms(stats[:median]).rjust(10)}#{C.reset} ± #{format_ms(stats[:stddev])} #{C.dim}(CV #{'%.1f' % (stats[:cv] * 100)}%)#{C.reset}"
+  end
+  if results[:total]
+    stats = results[:total]
+    puts "    #{'Total pipeline'.ljust(24)} #{C.bold}#{format_ms(stats[:median]).rjust(10)}#{C.reset} ± #{format_ms(stats[:stddev])} #{C.dim}(CV #{'%.1f' % (stats[:cv] * 100)}%)#{C.reset}"
+  end
+
+  # Compiler metrics
+  metrics = []
+  metrics << "#{results[:ir_funcs]} functions" if results[:ir_funcs] && results[:ir_funcs] > 0
+  metrics << "#{results[:ir_lines]} IR lines" if results[:ir_lines] && results[:ir_lines] > 0
+  metrics << format_bytes(results[:binary_size]) if results[:binary_size] && results[:binary_size] > 0
+  if results[:peak_rss_kb]
+    metrics << "#{format_rss(results[:peak_rss_kb])} peak RSS"
+  end
+
+  unless metrics.empty?
+    puts "    #{C.dim}Metrics: #{metrics.join(' │ ')}#{C.reset}"
+  end
+
+  puts
+end
+
+# ---------------------------------------------------------------------------
+# History
+# ---------------------------------------------------------------------------
+def show_history(db, bench_filter, limit)
+  puts "#{C.cyan}#{C.bold}Benchmark History#{C.reset}"
+  puts
+
+  query = 'SELECT run_id, timestamp, git_sha, quartz_version, benchmark, language, run_time_ms, run_time_stddev_ms, peak_rss_kb FROM runs'
+  params = []
+
+  if bench_filter
+    query += ' WHERE benchmark = ?'
+    params << bench_filter
+  end
+
+  query += ' ORDER BY timestamp DESC LIMIT ?'
+  params << limit
+
+  rows = db.execute(query, params)
+
+  if rows.empty?
+    puts "  No results yet. Run #{C.bold}bin/bench#{C.reset} first."
+    return
+  end
+
+  # Group by run_id
+  grouped = rows.group_by { |r| r[0] }
+  grouped.each do |rid, entries|
+    ts = entries.first[1][0..18]
+    sha = entries.first[2] || '?'
+    ver = entries.first[3] || '?'
+    puts "#{C.dim}#{ts} (#{sha}) v#{ver}#{C.reset}"
+
+    by_bench = entries.group_by { |r| r[4] }
+    by_bench.each do |bname, langs|
+      c_ms = langs.find { |l| l[5] == 'c' }&.dig(6)
+      puts "  #{C.bold}#{bname}#{C.reset}"
+      langs.each do |row|
+        lang = row[5]
+        ms = row[6]
+        stddev = row[7]
+        rss = row[8]
+        label = (LANG_LABELS[lang] || lang).ljust(24)
+        ratio = ratio_str(ms, c_ms)
+        stddev_str = stddev ? " ± #{format_ms(stddev)}" : ""
+        rss_str = rss ? "  #{C.dim}#{format_rss(rss)}#{C.reset}" : ""
+        puts "    #{label} #{format_ms(ms).rjust(10)}#{stddev_str}  #{ratio}#{rss_str}"
+      end
+    end
+    puts
+  end
+end
+
+def compare_with_previous(db, current_run_id)
+  # Get the two most recent distinct run_ids
+  run_ids = db.execute(
+    'SELECT DISTINCT run_id FROM runs ORDER BY timestamp DESC LIMIT 2'
+  ).flatten
+
+  return nil if run_ids.length < 2
+  prev_id = run_ids[1]
+
+  # Get per-iteration samples for statistical comparison
+  current_entries = db.execute(
+    'SELECT benchmark, language, run_time_ms FROM runs WHERE run_id = ?', [current_run_id]
+  )
+  prev_entries = db.execute(
+    'SELECT benchmark, language, run_time_ms FROM runs WHERE run_id = ?', [prev_id]
+  )
+
+  # Get samples for Cohen's d analysis
+  current_samples = {}
+  db.execute(
+    'SELECT benchmark, language, run_time_ms FROM samples WHERE run_id = ?', [current_run_id]
+  ).each { |b, l, ms| (current_samples["#{b}/#{l}"] ||= []) << ms }
+
+  prev_samples = {}
+  db.execute(
+    'SELECT benchmark, language, run_time_ms FROM samples WHERE run_id = ?', [prev_id]
+  ).each { |b, l, ms| (prev_samples["#{b}/#{l}"] ||= []) << ms }
+
+  prev_map = {}
+  prev_entries.each { |b, l, ms| prev_map["#{b}/#{l}"] = ms }
+
+  regressions = []
+  puts "#{C.cyan}#{C.bold}Comparison vs Previous Run#{C.reset}"
+  puts
+
+  current_entries.group_by { |r| r[0] }.each do |bench, entries|
+    puts "  #{C.bold}#{bench}#{C.reset}"
+    entries.each do |_, lang, ms|
+      key = "#{bench}/#{lang}"
+      prev_ms = prev_map[key]
+      label = (LANG_LABELS[lang] || lang).ljust(24)
+
+      if prev_ms && prev_ms > 0
+        delta = ((ms - prev_ms) / prev_ms * 100.0)
+
+        # Cohen's d analysis if samples available
+        cs = current_samples[key]
+        ps = prev_samples[key]
+        analysis = regression_analysis(cs, ps)
+
+        if analysis[:significant]
+          regressions << { bench: bench, lang: lang, delta: delta, d: analysis[:d] }
+          puts "    #{label} #{C.red}+#{'%.1f' % delta}%#{C.reset} #{C.red}(d=#{'%.2f' % analysis[:d]}, significant)#{C.reset} (#{format_ms(prev_ms)} → #{format_ms(ms)})"
+        elsif delta > 15.0
+          regressions << { bench: bench, lang: lang, delta: delta, d: analysis[:d] }
+          puts "    #{label} #{C.red}+#{'%.1f' % delta}%#{C.reset} (#{format_ms(prev_ms)} → #{format_ms(ms)})"
+        elsif delta > 5.0
+          puts "    #{label} #{C.yellow}+#{'%.1f' % delta}%#{C.reset} (#{format_ms(prev_ms)} → #{format_ms(ms)})"
+        elsif delta < -5.0
+          puts "    #{label} #{C.green}#{'%.1f' % delta}%#{C.reset} (#{format_ms(prev_ms)} → #{format_ms(ms)})"
+        else
+          puts "    #{label} #{C.gray}~#{'%.1f' % delta}%#{C.reset}"
+        end
+      else
+        puts "    #{label} #{C.gray}(no previous data)#{C.reset}"
+      end
+    end
+  end
+  puts
+
+  regressions
+end
+
+# ---------------------------------------------------------------------------
+# Concurrency Benchmarks
+# ---------------------------------------------------------------------------
+CONC_BENCHMARKS = %w[spawn_rate channel_throughput fanout_fanin contention mixed_workload]
+CONC_DIR = File.join(BENCHMARKS_DIR, 'concurrency')
+
+def parse_bench_output(output)
+  metrics = {}
+  output.each_line do |line|
+    if m = line.match(/^BENCH:(\w+):(\w+):(\d+)/)
+      metrics[m[2]] = m[3].to_i
+    end
+  end
+  metrics
+end
+
+def run_conc_benchmark(bench_name, run_id, db, iteration_count)
+  results = {}
+
+  Dir.mktmpdir("bench-conc-#{bench_name}") do |tmpdir|
+    # Quartz
+    qz_source = File.join(CONC_DIR, "#{bench_name}.qz")
+    if File.exist?(qz_source) && File.exist?(QUARTZ_COMPILER)
+      exe = File.join(tmpdir, "#{bench_name}_qz")
+      cr = compile_quartz(QUARTZ_COMPILER, qz_source, exe, tmpdir)
+      if cr
+        all_metrics = []
+        iteration_count.times do |i|
+          result = run_timed(exe)
+          next if result.nil?
+          metrics = parse_bench_output(result[1])
+          all_metrics << metrics
+          db.execute(
+            'INSERT INTO samples (run_id, benchmark, language, iteration, run_time_ms, peak_rss_kb) VALUES (?, ?, ?, ?, ?, ?)',
+            [run_id, "conc_#{bench_name}", 'quartz', i, result[0], result[2]]
+          )
+        end
+        unless all_metrics.empty?
+          results['quartz'] = { metrics: all_metrics, compile_ms: cr[:compile_ms] }
+        end
+      end
+    end
+
+    # Go
+    go_source = File.join(CONC_DIR, "#{bench_name}.go")
+    if File.exist?(go_source) && !`which go 2>/dev/null`.strip.empty?
+      exe = File.join(tmpdir, "#{bench_name}_go")
+      cr = compile_go(go_source, exe)
+      if cr
+        all_metrics = []
+        iteration_count.times do |i|
+          result = run_timed(exe)
+          next if result.nil?
+          metrics = parse_bench_output(result[1])
+          all_metrics << metrics
+          db.execute(
+            'INSERT INTO samples (run_id, benchmark, language, iteration, run_time_ms, peak_rss_kb) VALUES (?, ?, ?, ?, ?, ?)',
+            [run_id, "conc_#{bench_name}", 'go', i, result[0], result[2]]
+          )
+        end
+        unless all_metrics.empty?
+          results['go'] = { metrics: all_metrics, compile_ms: cr[:compile_ms] }
+        end
+      end
+    end
+  end
+
+  results
+end
+
+def print_conc_results(bench_name, results)
+  puts "  #{C.bold}#{bench_name}#{C.reset}"
+
+  # Find the primary throughput metric from first Quartz result
+  metric_key = nil
+  results.each do |_, data|
+    if data[:metrics] && !data[:metrics].empty?
+      # Use the first metric that ends in _per_sec
+      metric_key = data[:metrics].first.keys.find { |k| k.end_with?('_per_sec') }
+      break
+    end
+  end
+  metric_key ||= 'elapsed_ns'
+
+  results.each do |lang, data|
+    values = data[:metrics].map { |m| m[metric_key] || 0 }
+    next if values.empty?
+    sorted = values.sort
+    median = sorted[sorted.length / 2]
+    label = lang.ljust(12)
+
+    if metric_key.end_with?('_per_sec')
+      if median >= 1_000_000
+        puts "    #{label} #{C.cyan}#{format('%.2fM', median / 1_000_000.0)}#{C.reset} #{metric_key.sub('_per_sec', '')}/s"
+      elsif median >= 1_000
+        puts "    #{label} #{C.cyan}#{format('%.1fK', median / 1_000.0)}#{C.reset} #{metric_key.sub('_per_sec', '')}/s"
+      else
+        puts "    #{label} #{C.cyan}#{median}#{C.reset} #{metric_key.sub('_per_sec', '')}/s"
+      end
+    else
+      puts "    #{label} #{C.cyan}#{format_ms(median / 1_000_000.0)}#{C.reset}"
+    end
+  end
+  puts
+end
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+options = { quick: false, precise: false, history: false, compare: false, ci: false, conc: false, limit: 20 }
+
+OptionParser.new do |opts|
+  opts.banner = "Usage: #{$PROGRAM_NAME} [options] [benchmark_name]"
+
+  opts.on('-q', '--quick', 'Quick mode — fibonacci + selfcomp, 5 iterations') do
+    options[:quick] = true
+  end
+
+  opts.on('-p', '--precise', 'Precise mode — 30 iterations for deep analysis') do
+    options[:precise] = true
+  end
+
+  opts.on('-H', '--history [NAME]', 'Show history (optionally for one benchmark)') do |name|
+    options[:history] = true
+    options[:history_name] = name
+  end
+
+  opts.on('-c', '--compare', 'Compare results against previous run') do
+    options[:compare] = true
+  end
+
+  opts.on('--ci', 'CI mode — exit 1 if any benchmark shows significant regression') do
+    options[:ci] = true
+    options[:compare] = true
+  end
+
+  opts.on('--conc', 'Run concurrency benchmarks (Quartz vs Go)') do
+    options[:conc] = true
+  end
+
+  opts.on('-l', '--limit N', Integer, 'Limit history rows (default: 20)') do |n|
+    options[:limit] = n
+  end
+
+  opts.on('-h', '--help', 'Show this help') do
+    puts opts
+    exit
+  end
+end.parse!
+
+db = init_db
+
+if options[:history]
+  show_history(db, options[:history_name] || ARGV[0], options[:limit])
+  exit
+end
+
+# Determine iteration count
+iteration_count = if options[:precise]
+                    ITERATIONS_PRECISE
+                  elsif options[:quick]
+                    ITERATIONS_QUICK
+                  else
+                    ITERATIONS
+                  end
+
+# Determine which benchmarks to run
+bench_names = if ARGV.any?
+                ARGV.select { |a| BENCHMARKS.key?(a) || a == 'selfcomp' }
+              elsif options[:quick]
+                ['fibonacci']  # selfcomp always runs in quick mode below
+              else
+                BENCHMARKS.keys
+              end
+
+if bench_names.empty? && !options[:quick]
+  puts "#{C.red}No matching benchmarks.#{C.reset}"
+  puts "Available: #{(BENCHMARKS.keys + ['selfcomp']).join(', ')}"
+  exit 1
+end
+
+# Check compilers
+missing = []
+missing << 'quartz-self' unless File.exist?(QUARTZ_COMPILER)
+missing << 'clang' if `which clang 2>/dev/null`.strip.empty?
+missing << 'rustc' if `which rustc 2>/dev/null`.strip.empty?
+missing << 'zig' if `which zig 2>/dev/null`.strip.empty?
+
+unless missing.empty?
+  puts "#{C.yellow}Note: missing compilers (will skip): #{missing.join(', ')}#{C.reset}"
+end
+
+# Header
+version = get_version
+sha = get_git_sha || 'N/A'
+run_id = "#{sha}-#{Time.now.strftime('%Y%m%d%H%M%S')}"
+
+puts
+puts "#{C.bold}Quartz Benchmarks#{C.reset} — v#{version} (#{sha})"
+puts "#{'=' * 70}"
+mode_label = options[:precise] ? 'precise' : (options[:quick] ? 'quick' : 'standard')
+puts "#{C.dim}#{iteration_count} iterations per benchmark (#{mode_label}), median ± stddev reported#{C.reset}"
+puts
+
+# Run regular benchmarks
+bench_names.reject { |n| n == 'selfcomp' }.each do |name|
+  info = BENCHMARKS[name]
+  next unless info
+  results = run_benchmark(name, info, run_id, db, iteration_count)
+  print_results(name, results)
+end
+
+# Always run selfcomp (unless only specific non-selfcomp benchmarks were requested)
+run_selfcomp_bench = options[:quick] || bench_names.include?('selfcomp') || !ARGV.any?
+if run_selfcomp_bench
+  selfcomp_results = run_selfcomp(run_id, db, [iteration_count, 3].max)  # At least 3 iterations
+  print_selfcomp_results(selfcomp_results)
+end
+
+# Run concurrency benchmarks if requested
+if options[:conc]
+  puts "#{C.bold}Concurrency Benchmarks#{C.reset} (Quartz vs Go)"
+  puts "#{'=' * 70}"
+  CONC_BENCHMARKS.each do |name|
+    results = run_conc_benchmark(name, run_id, db, iteration_count)
+    print_conc_results(name, results)
+  end
+end
+
+puts "#{C.dim}Results saved to #{DB_PATH}#{C.reset}"
+
+if options[:compare]
+  regressions = compare_with_previous(db, run_id)
+  if options[:ci] && regressions && regressions.any?
+    puts "#{C.red}#{C.bold}CI FAILURE: #{regressions.length} benchmark(s) regressed significantly#{C.reset}"
+    regressions.each do |r|
+      d_info = r[:d] > 0 ? " (Cohen's d=#{'%.2f' % r[:d]})" : ""
+      puts "  #{r[:bench]}/#{r[:lang]}: +#{'%.1f' % r[:delta]}%#{d_info}"
+    end
+    exit 1
+  end
+end

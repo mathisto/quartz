@@ -1,0 +1,521 @@
+## QSpec coverage expansion for the Alloc effect (Phase A.6).
+##
+## Where A.1–A.5 lock in the substrate (effect declaration, blessed
+## default install, codegen routing, fast-path, stdlib handler library),
+## A.6 covers the *integration surface* — the corners where multiple
+## handlers interact, where handlers themselves allocate, where
+## arguments take edge values, and where Alloc handler-throws compose
+## with `with Throws` recovery.
+##
+## Test groups:
+##   A. Multi-level nesting / handler stack discipline (3 tests)
+##   B. Recursion-bypass stress (3 tests)
+##   C. Edge cases — zero-byte alloc, null dealloc, large requests (3 tests)
+##   D. D5 throw-on-deny composition + bypass-flag-leak regression (3 tests)
+##
+## Total: 12 tests. All snippets use `str_from_int` + `+` concat for
+## runtime-value rendering — `#{...}` inside a triple-quoted spec string
+## interpolates at SPEC compile time, not subprocess runtime.
+##
+## Out of scope (defer to Phase B):
+##   - Per-call closure-style handler state (multiple concurrent arenas).
+##   - `with Alloc.in_arena(ar) do ... end` / `Alloc.deny_all` ergonomic
+##     sugar — these wrap A.5's module-global handler library.
+##
+## See `docs/design/ALLOC_EFFECT_PLAN.md` for the multi-phase plan.
+
+import * from qspec
+import * from qspec/subprocess
+
+# =============================================================================
+# Group A — Multi-level nesting / handler stack discipline (3 tests)
+# =============================================================================
+
+# A1. Three-level nesting — innermost handler wins for every alloc inside it.
+# Each level marks the size argument with a distinct multiplier so we can
+# distinguish which handler ran. Outer/middle counters MUST stay 0 because
+# the call site is lexically inside the innermost scope.
+var _NEST_3DEEP_INNERMOST_WINS: String = """import std/alloc
+
+var outer_calls = 0
+var middle_calls = 0
+var inner_calls = 0
+
+def outer_a(op: Int, argc: Int, argv: Int): Int
+  outer_calls = outer_calls + 1
+  return default_alloc_handler(op, argc, argv)
+end
+
+def middle_a(op: Int, argc: Int, argv: Int): Int
+  middle_calls = middle_calls + 1
+  return default_alloc_handler(op, argc, argv)
+end
+
+def inner_a(op: Int, argc: Int, argv: Int): Int
+  inner_calls = inner_calls + 1
+  return default_alloc_handler(op, argc, argv)
+end
+
+def main(): Int
+  with Alloc { alloc: outer_a, dealloc: default_dealloc_handler } do ->
+    with Alloc { alloc: middle_a, dealloc: default_dealloc_handler } do ->
+      with Alloc { alloc: inner_a, dealloc: default_dealloc_handler } do ->
+        var p1 = alloc(8)
+        var p2 = alloc(8)
+        var p3 = alloc(8)
+        dealloc(p1)
+        dealloc(p2)
+        dealloc(p3)
+      end
+    end
+  end
+  puts(\"outer=\" + str_from_int(outer_calls) + \" middle=\" + str_from_int(middle_calls) + \" inner=\" + str_from_int(inner_calls))
+  return 0
+end
+"""
+
+# A2. Outer scope reverts after inner exits — alloc inside outer-after-
+# inner must hit OUTER, not the (already-popped) inner.
+var _OUTER_REVERTS_AFTER_INNER: String = """import std/alloc
+
+var outer_calls = 0
+var inner_calls = 0
+
+def outer_h(op: Int, argc: Int, argv: Int): Int
+  outer_calls = outer_calls + 1
+  return default_alloc_handler(op, argc, argv)
+end
+
+def inner_h(op: Int, argc: Int, argv: Int): Int
+  inner_calls = inner_calls + 1
+  return default_alloc_handler(op, argc, argv)
+end
+
+def main(): Int
+  with Alloc { alloc: outer_h, dealloc: default_dealloc_handler } do ->
+    var p_pre = alloc(8)
+    dealloc(p_pre)
+    with Alloc { alloc: inner_h, dealloc: default_dealloc_handler } do ->
+      var p_inner = alloc(8)
+      dealloc(p_inner)
+    end
+    var p_post = alloc(8)
+    dealloc(p_post)
+  end
+  puts(\"outer=\" + str_from_int(outer_calls) + \" inner=\" + str_from_int(inner_calls))
+  return 0
+end
+"""
+
+# A3. Three sequential `with Alloc` scopes — each handler's counter
+# advances ONLY during its own scope. Verifies install/uninstall is
+# clean across three back-to-back scopes (no cross-scope leakage,
+# state restored to the prelude default between scopes).
+var _3FOLD_SEQUENTIAL_INSTALL: String = """import std/alloc
+
+var ha_calls = 0
+var hb_calls = 0
+var hc_calls = 0
+
+def ha(op: Int, argc: Int, argv: Int): Int
+  ha_calls = ha_calls + 1
+  return default_alloc_handler(op, argc, argv)
+end
+
+def hb(op: Int, argc: Int, argv: Int): Int
+  hb_calls = hb_calls + 1
+  return default_alloc_handler(op, argc, argv)
+end
+
+def hc(op: Int, argc: Int, argv: Int): Int
+  hc_calls = hc_calls + 1
+  return default_alloc_handler(op, argc, argv)
+end
+
+def main(): Int
+  with Alloc { alloc: ha, dealloc: default_dealloc_handler } do ->
+    var p = alloc(8)
+    dealloc(p)
+  end
+  with Alloc { alloc: hb, dealloc: default_dealloc_handler } do ->
+    var p = alloc(8)
+    dealloc(p)
+  end
+  with Alloc { alloc: hc, dealloc: default_dealloc_handler } do ->
+    var p = alloc(8)
+    dealloc(p)
+  end
+  puts(\"a=\" + str_from_int(ha_calls) + \" b=\" + str_from_int(hb_calls) + \" c=\" + str_from_int(hc_calls))
+  return 0
+end
+"""
+
+# =============================================================================
+# Group B — Recursion-bypass stress (3 tests)
+# =============================================================================
+
+# B1. Handler builds a Vec<Int> of allocation records. Under routing,
+# `records.push(size)` itself routes through @__qz_alloc → wrapper. The
+# bypass-flag mechanism (set by perform around the handler call) makes
+# the wrapper take direct @malloc, so internal Vec.push allocations do
+# NOT re-enter the handler. Without bypass, this would infinite-loop.
+var _HANDLER_BUILDS_VEC: String = """import std/alloc
+
+var records: Vec<Int> = vec_new<Int>()
+
+def vec_record_handler(op: Int, argc: Int, argv: Int): Int
+  var size = load(argv, 0)
+  records.push(size)
+  return mem_alloc(size)
+end
+
+def main(): Int
+  with Alloc { alloc: vec_record_handler, dealloc: default_dealloc_handler } do ->
+    var p1 = alloc(8)
+    var p2 = alloc(16)
+    var p3 = alloc(32)
+    dealloc(p1)
+    dealloc(p2)
+    dealloc(p3)
+  end
+  puts(\"n=\" + str_from_int(records.size) + \" first=\" + str_from_int(records.get(0)) + \" last=\" + str_from_int(records.get(records.size - 1)))
+  return 0
+end
+"""
+
+# B2. Handler calls `puts(...)` with string concat — `+` allocates a new
+# string buffer via qz_str_concat, which under routing=on goes through
+# @__qz_alloc. Bypass flag prevents handler re-entry from the str_concat
+# allocation. Without bypass: infinite recursion.
+var _HANDLER_PUTS_INTERPOLATION: String = """import std/alloc
+
+var fired = 0
+
+def puts_handler(op: Int, argc: Int, argv: Int): Int
+  var size = load(argv, 0)
+  fired = fired + 1
+  puts(\"alloc:\" + str_from_int(size))
+  return mem_alloc(size)
+end
+
+def main(): Int
+  with Alloc { alloc: puts_handler, dealloc: default_dealloc_handler } do ->
+    var p1 = alloc(7)
+    var p2 = alloc(13)
+    dealloc(p1)
+    dealloc(p2)
+  end
+  puts(\"fired=\" + str_from_int(fired))
+  return 0
+end
+"""
+
+# B3. Handler calls a 3-deep helper chain that itself allocates at every
+# level. Under routing=on, every helper-internal mem_alloc is bypass-
+# flagged so it goes direct to @malloc — no re-entry. Confirms bypass
+# is set on entry and held across arbitrary call depth, not just the
+# immediate handler body.
+var _HANDLER_DEEP_HELPER_CHAIN: String = """import std/alloc
+
+var helper_calls = 0
+
+def helper_c(n: Int): Int
+  var p = mem_alloc(8)
+  store(p, 0, n + 1)
+  var v = load(p, 0)
+  mem_free(p)
+  return v
+end
+
+def helper_b(n: Int): Int
+  var p = mem_alloc(8)
+  store(p, 0, n + 2)
+  var v = load(p, 0)
+  mem_free(p)
+  return v + helper_c(n)
+end
+
+def helper_a(n: Int): Int
+  var p = mem_alloc(8)
+  store(p, 0, n + 3)
+  var v = load(p, 0)
+  mem_free(p)
+  return v + helper_b(n)
+end
+
+def chain_handler(op: Int, argc: Int, argv: Int): Int
+  var size = load(argv, 0)
+  helper_calls = helper_calls + 1
+  var _ignored = helper_a(size)
+  return mem_alloc(size)
+end
+
+def main(): Int
+  with Alloc { alloc: chain_handler, dealloc: default_dealloc_handler } do ->
+    var p1 = alloc(8)
+    var p2 = alloc(8)
+    dealloc(p1)
+    dealloc(p2)
+  end
+  puts(\"helper_calls=\" + str_from_int(helper_calls))
+  return 0
+end
+"""
+
+# =============================================================================
+# Group C — Edge cases (3 tests)
+# =============================================================================
+
+# C1. alloc(0) — handler observes size=0, mem_alloc(0) returns a valid
+# pointer (Darwin libc behavior; @malloc(0) returns a non-null pointer
+# that is safely freeable). Verifies no special-case crash on the size
+# boundary and that argv[0] propagates 0 correctly.
+var _ALLOC_ZERO_BYTES: String = """import std/alloc
+
+var observed_size = 999
+
+def size_handler(op: Int, argc: Int, argv: Int): Int
+  var size = load(argv, 0)
+  observed_size = size
+  return mem_alloc(size)
+end
+
+def main(): Int
+  with Alloc { alloc: size_handler, dealloc: default_dealloc_handler } do ->
+    var p = alloc(0)
+    dealloc(p)
+  end
+  puts(\"observed=\" + str_from_int(observed_size))
+  return 0
+end
+"""
+
+# C2. dealloc(NULL) — handler observes ptr=0. The default backing
+# `mem_free(0)` is a C-standard no-op, so the runtime accepts it. Verifies
+# argv-decoding of the pointer argument when the value is the null
+# sentinel — common when callers conditionally dealloc.
+var _DEALLOC_NULL_SENTINEL: String = """import std/alloc
+
+var observed_ptr = 999
+
+def watching_dealloc(op: Int, argc: Int, argv: Int): Int
+  observed_ptr = load(argv, 0)
+  return 0
+end
+
+def main(): Int
+  with Alloc { alloc: default_alloc_handler, dealloc: watching_dealloc } do ->
+    dealloc(int_to_cptr(0))
+  end
+  puts(\"observed=\" + str_from_int(observed_ptr))
+  return 0
+end
+"""
+
+# C3. Counter handler with a single very large request — single alloc
+# request exceeds the entire budget. Verifies the >budget check fires on
+# the first allocation rather than waiting for cumulative drift.
+var _COUNTER_LARGE_FIRST_REQUEST: String = """import std/alloc
+
+def main(): Int
+  alloc_set_budget(64)
+  with Alloc { alloc: counter_alloc_handler, dealloc: counter_dealloc_handler } do ->
+    var p = alloc(1048576)
+  end
+  return 0
+end
+"""
+
+# =============================================================================
+# Group D — D5 throw-on-deny composition + bypass-flag-leak regression (3 tests)
+# =============================================================================
+
+# D1. Outer `with Throws` catches the deny handler's throw — recovery
+# message printed, control resumes after the with-Alloc block. The
+# Throws handler returns a sentinel value; control does NOT continue
+# past the original `alloc(...)` call site (kind=2 unwind).
+var _OUTER_THROWS_CATCHES_DENY: String = """import std/alloc
+
+def my_throws(op: Int, argc: Int, argv: Int): Int
+  puts(\"caught_deny\")
+  return 0
+end
+
+def main(): Int
+  with Throws { throw: my_throws } do ->
+    with Alloc { alloc: deny_alloc_handler, dealloc: deny_dealloc_handler } do ->
+      var p = alloc(8)
+      puts(\"unreached\")
+    end
+  end
+  puts(\"after_throws_block\")
+  return 0
+end
+"""
+
+# D2. **Bypass-flag-leak regression** — proves a handler-thrown longjmp
+# leaves `@__qz_alloc_in_handler` correctly restored, so the user's outer
+# Alloc handler still observes post-recovery allocations. The fix lives at
+# the with-block level (B.0a, 2026-04-27): every with-block snapshots the
+# flag before setjmp and the wb.catch block restores from the snapshot.
+# Restoring to the saved value (rather than zeroing) preserves the
+# invariant when the with-block is nested inside an outer handler body.
+#
+# The test installs an outer tracker, an inner deny under a Throws
+# frame. Pre-throw allocation is observed by tracker. Post-recovery
+# Vec push (which internally @__qz_alloc's via routing) IS observed
+# because the bypass flag was restored at the Throws catch.
+var _BYPASS_FLAG_LEAK_REGRESSION: String = """import std/alloc
+
+var tracker_calls = 0
+
+def tracker_alloc(op: Int, argc: Int, argv: Int): Int
+  tracker_calls = tracker_calls + 1
+  return default_alloc_handler(op, argc, argv)
+end
+
+def my_throws(op: Int, argc: Int, argv: Int): Int
+  return 0
+end
+
+def main(): Int
+  with Alloc { alloc: tracker_alloc, dealloc: default_dealloc_handler } do ->
+    var v_pre = vec_new<Int>()
+    v_pre.push(1)
+    v_pre.push(2)
+    var pre_count = tracker_calls
+    with Throws { throw: my_throws } do ->
+      with Alloc { alloc: deny_alloc_handler, dealloc: deny_dealloc_handler } do ->
+        var p = alloc(8)
+      end
+    end
+    var v_post = vec_new<Int>()
+    v_post.push(3)
+    v_post.push(4)
+    var post_count = tracker_calls
+    if post_count == pre_count
+      puts(\"bypass_flag_leak_present\")
+    else
+      puts(\"bypass_flag_leak_fixed\")
+    end
+  end
+  return 0
+end
+"""
+
+# D3. Control test for D2 — when a handler returns NORMALLY (no throw),
+# the perform machinery's bypass-flag restore on the return path runs as
+# expected. A subsequent mem_alloc under routing=on hits the tracker.
+# This proves the leak is specific to the longjmp-exit path; the
+# straight-line path is fine.
+var _NO_LEAK_WHEN_NO_THROW: String = """import std/alloc
+
+var tracker_calls = 0
+
+def tracker_alloc(op: Int, argc: Int, argv: Int): Int
+  tracker_calls = tracker_calls + 1
+  return default_alloc_handler(op, argc, argv)
+end
+
+def passthrough_alloc(op: Int, argc: Int, argv: Int): Int
+  return default_alloc_handler(op, argc, argv)
+end
+
+def main(): Int
+  with Alloc { alloc: tracker_alloc, dealloc: default_dealloc_handler } do ->
+    var v_pre = vec_new<Int>()
+    v_pre.push(1)
+    var pre_count = tracker_calls
+    with Alloc { alloc: passthrough_alloc, dealloc: default_dealloc_handler } do ->
+      var p = alloc(8)
+      dealloc(p)
+    end
+    var v_post = vec_new<Int>()
+    v_post.push(2)
+    var post_count = tracker_calls
+    if post_count > pre_count
+      puts(\"tracker_observed_post\")
+    else
+      puts(\"tracker_bypassed_post\")
+    end
+  end
+  return 0
+end
+"""
+
+# =============================================================================
+# Spec entry point
+# =============================================================================
+
+def main(): Int
+  describe("Alloc effect coverage expansion (Phase A.6)") do ->
+
+    # --- Group A: Multi-level nesting / handler stack discipline -----
+
+    it("3-deep nest — innermost handler wins, outer/middle untouched") do ->
+      assert_run_stdout_eq(_NEST_3DEEP_INNERMOST_WINS,
+        "outer=0 middle=0 inner=3\n")
+    end
+
+    it("alloc inside outer-after-inner reverts to outer handler") do ->
+      assert_run_stdout_eq(_OUTER_REVERTS_AFTER_INNER,
+        "outer=2 inner=1\n")
+    end
+
+    it("3 sequential `with Alloc` scopes — independent handler counters") do ->
+      assert_run_stdout_eq(_3FOLD_SEQUENTIAL_INSTALL,
+        "a=1 b=1 c=1\n")
+    end
+
+    # --- Group B: Recursion-bypass stress -----------------------------
+
+    it("handler builds Vec<Int> internally — bypass prevents re-entry") do ->
+      assert_run_stdout_eq(_HANDLER_BUILDS_VEC, "n=3 first=8 last=32\n")
+    end
+
+    it("handler calls puts() with str concat — bypass holds across alloc") do ->
+      assert_run_stdout_eq(_HANDLER_PUTS_INTERPOLATION,
+        "alloc:7\nalloc:13\nfired=2\n")
+    end
+
+    it("handler calls 3-deep helper chain that allocates — no re-entry") do ->
+      assert_run_stdout_eq(_HANDLER_DEEP_HELPER_CHAIN, "helper_calls=2\n")
+    end
+
+    # --- Group C: Edge cases -----------------------------------------
+
+    it("alloc(0) — handler receives size=0, mem_alloc(0) returns valid ptr") do ->
+      assert_run_stdout_eq(_ALLOC_ZERO_BYTES, "observed=0\n")
+    end
+
+    it("dealloc(NULL) — handler receives ptr=0, mem_free(0) is a no-op") do ->
+      assert_run_stdout_eq(_DEALLOC_NULL_SENTINEL, "observed=0\n")
+    end
+
+    it("counter handler — single request larger than entire budget throws") do ->
+      assert_run_panics(_COUNTER_LARGE_FIRST_REQUEST, "budget exceeded")
+    end
+
+    # --- Group D: D5 composition + bypass-flag-leak regression -------
+
+    it("outer Throws catches deny-throw — control resumes after with-Alloc") do ->
+      assert_run_stdout_eq(_OUTER_THROWS_CATCHES_DENY,
+        "caught_deny\nafter_throws_block\n")
+    end
+
+    it("bypass-flag preserved across handler-thrown longjmp (B.0a)") do ->
+      # Locks in the B.0a fix: every with-block save/restores
+      # @__qz_alloc_in_handler around its setjmp, so a longjmp out of
+      # an Alloc handler doesn't leak the bypass flag into post-catch
+      # user code. Tracker count grows past pre_count after recovery
+      # because vec push allocations route through perform again.
+      assert_run_stdout_eq(_BYPASS_FLAG_LEAK_REGRESSION,
+        "bypass_flag_leak_fixed\n")
+    end
+
+    it("control — bypass flag DOES restore correctly when no throw fires") do ->
+      assert_run_stdout_eq(_NO_LEAK_WHEN_NO_THROW, "tracker_observed_post\n")
+    end
+  end
+  return qspec_main()
+end

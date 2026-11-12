@@ -1,0 +1,588 @@
+## std/tui/light.qz — Brogue-shaped lighting (Phase 6.4 of the v0.6 cell engine).
+##
+## A first-class lighting model for Quartz TUI. Lights contribute
+## additive RGB to a per-cell `LightBuffer`; the buffer applies onto a
+## `Plane` at flush time, additively blending tile colors with
+## accumulated light. Roguelikes get the Brogue look (point lights with
+## radial sqrt-falloff, ambient tint, shadow flags, optional flicker)
+## without bolting it on as an afterthought.
+##
+## **The math (Brogue's `paintLight`).**
+##
+##   1. For each cell within `light.radius` of `light.origin` that is
+##      visible from the origin (line-of-sight not blocked by
+##      `blocks_light`), compute Euclidean `distance`.
+##   2. `multiplier = 100 - (100 - fade_to_pct) * distance / radius`
+##      — linear fall from 100% at origin to `fade_to_pct`% at the
+##      radius edge.
+##   3. Optional flicker (`LIGHT_FLAG_FLICKER` set on the light) jitters
+##      `multiplier` by `±flicker_pct` percent, deterministic per
+##      `(frame, origin)` so the same frame index reproduces the same
+##      jitter (good for replay / golden tests).
+##   4. Add `(color_r * multiplier / 100, color_g * multiplier / 100,
+##      color_b * multiplier / 100)` into the buffer's `light_r/g/b` at
+##      that cell, clamping each channel at 255.
+##   5. If `LIGHT_FLAG_MAINTAIN_SHADOWS` is NOT set, clear the cell's
+##      `shadow_flags` entry — the cell is no longer in shadow. The
+##      player's miner's-light in Brogue sets MAINTAIN_SHADOWS so the
+##      player can be silhouetted against their own light. Magical
+##      lights do not set it; mundane torches do not set it either.
+##
+## **LOS / FOV.** Visibility is determined by `std/tui/fov.qz`'s
+## symmetric shadowcasting walker (Albert Ford 2019). Light
+## propagation is symmetric — cell A is lit by a light at B iff cell B
+## would be lit by a light at A under the same geometry. Phase 6.4
+## shipped a private Bresenham LOS walk; Phase 6.5 swapped to
+## `fov_for_each_visible` for symmetric semantics. The user-facing
+## `light_buffer_paint` API did not change.
+##
+## **Color encoding.** `Channel.color` and the buffer's RGB triplets
+## use the same `std/style.qz` scheme: `_RGB_FLAG | (r<<16) | (g<<8) |
+## b` for packed truecolor, ANSI 16 / 256-palette for indexed. Light
+## buffers always store truecolor RGB (0-255 each). Apply blends light
+## additively against cell `bg` and `fg` channels — non-truecolor cells
+## (default-color, ANSI 16, palette) are passed through unchanged in
+## v0.6.4 (filed as the v0.7 ANSI-to-RGB expansion polish).
+##
+## **Default-color cells.** A cell with `bg.default_color: true` has no
+## known underlying RGB, so additive blend is mathematically undefined.
+## v0.6.4 treats default-color cells as RGB `(0,0,0)` for the purpose
+## of light apply — the dominant terminal default is dark, and the
+## additive math degenerates to "the light contribution becomes the
+## visible color." Apps that need precise theming should set explicit
+## bg colors before applying light.
+##
+## See `docs/design/TUI_V06_CELL_ENGINE.md` D4 (lighting design).
+##
+## @since 5.28.x
+
+import std/tui/cell as cl
+import std/tui/plane as pl
+import std/tui/blend as bl
+import std/tui/fov as fv
+
+# =============================================================================
+# Light flags (bitset)
+# =============================================================================
+
+## When set, paint does NOT clear `shadow_flags` for cells it touches.
+## Brogue's player miner's-light sets this — the player is still
+## visually "in shadow" even when standing in their own light.
+def LIGHT_FLAG_MAINTAIN_SHADOWS(): Int = 1
+
+## App-level marker bit. Not consumed by paint or apply — included so
+## consumers can tag magical lights and filter them at the gameplay
+## layer (e.g., "monsters that see through magical light only").
+def LIGHT_FLAG_MAGICAL(): Int = 2
+
+## When set, paint applies a deterministic per-frame jitter of
+## `±flicker_pct%` to the multiplier. Frame=0 with FLICKER set still
+## produces a fixed-but-non-zero jitter; tests that need zero flicker
+## should leave the flag clear.
+def LIGHT_FLAG_FLICKER(): Int = 4
+
+## Truecolor sentinel bit. Mirrors `std/style.qz::_RGB_FLAG()`.
+def _RGB_FLAG(): Int = 0x1000000
+
+# =============================================================================
+# Light struct
+# =============================================================================
+
+## A point light source.
+##
+## - `origin_x`, `origin_y`: cell coordinates of the light.
+## - `color_r`, `color_g`, `color_b`: additive RGB contribution at full
+##   intensity (each 0-255).
+## - `radius`: integer cell radius. Lights paint cells where Euclidean
+##   distance <= radius.
+## - `fade_to_pct`: intensity at the radius edge, 0-100. 100 = no
+##   falloff (constant intensity inside the disk); 0 = full falloff
+##   (zero contribution at the edge).
+## - `flags`: bitset (`LIGHT_FLAG_MAINTAIN_SHADOWS`, `_MAGICAL`,
+##   `_FLICKER`).
+## - `flicker_pct`: 0-30. Jitter amplitude when FLICKER is set.
+struct Light
+  origin_x:    Int
+  origin_y:    Int
+  color_r:     Int
+  color_g:     Int
+  color_b:     Int
+  radius:      Int
+  fade_to_pct: Int
+  flags:       Int
+  flicker_pct: Int
+end
+
+## Construct a light with explicit fields. The convenience
+## constructors below cover common cases.
+def light_new(
+  origin_x: Int, origin_y: Int,
+  color_r: Int, color_g: Int, color_b: Int,
+  radius: Int, fade_to_pct: Int,
+  flags: Int, flicker_pct: Int
+): Light
+  return Light {
+    origin_x:    origin_x,
+    origin_y:    origin_y,
+    color_r:     color_r,
+    color_g:     color_g,
+    color_b:     color_b,
+    radius:      radius,
+    fade_to_pct: fade_to_pct,
+    flags:       flags,
+    flicker_pct: flicker_pct
+  }
+end
+
+## A torch — warm yellow-orange RGB, default falloff to 0% at edge.
+## Mundane (no MAINTAIN_SHADOWS).
+def light_torch(x: Int, y: Int, radius: Int): Light
+  return light_new(x, y, 255, 180, 80, radius, 0, 0, 0)
+end
+
+## The player's miner's-light — pale yellow, MAINTAIN_SHADOWS so the
+## player remains visually in shadow even when standing in it.
+def light_miners(x: Int, y: Int, radius: Int): Light
+  return light_new(x, y, 200, 200, 160, radius,
+                   30, LIGHT_FLAG_MAINTAIN_SHADOWS(), 0)
+end
+
+## A flickering torch — same color as `light_torch` but with the
+## FLICKER flag and a 15% jitter amplitude.
+def light_torch_flicker(x: Int, y: Int, radius: Int): Light
+  return light_new(x, y, 255, 180, 80, radius,
+                   0, LIGHT_FLAG_FLICKER(), 15)
+end
+
+# =============================================================================
+# Light flag predicates
+# =============================================================================
+
+## True iff `bit` is set in `flags`.
+def light_flag_has(flags: Int, bit: Int): Bool
+  return (flags & bit) != 0
+end
+
+# =============================================================================
+# LightBuffer struct
+# =============================================================================
+
+## Per-cell additive light accumulator.
+##
+## - `width`, `height`: dimensions in cells.
+## - `light_r`, `light_g`, `light_b`: row-major `width*height` Vecs
+##   carrying additive R/G/B contributions per cell. Initialized to
+##   the ambient (`ambient_r/g/b`) values.
+## - `shadow_flags`: row-major `width*height` `Vec<Bool>`. Initialized
+##   `true` (every cell starts in shadow). Lights without
+##   `MAINTAIN_SHADOWS` clear this for cells they reach.
+## - `ambient_r/g/b`: the ambient RGB tint baked into the buffer at
+##   construction. `light_buffer_clear` resets every cell to ambient
+##   without resetting `width/height`.
+struct LightBuffer
+  width:        Int
+  height:       Int
+  light_r:      Vec<Int>
+  light_g:      Vec<Int>
+  light_b:      Vec<Int>
+  shadow_flags: Vec<Bool>
+  ambient_r:    Int
+  ambient_g:    Int
+  ambient_b:    Int
+end
+
+## Internal: build a `Vec<Int>` of length `n` filled with `v`.
+def _lb_fill_int(n: Int, v: Int): Vec<Int>
+  var out = vec_new<Int>()
+  var nn = n
+  if nn < 0
+    nn = 0
+  end
+  var i = 0
+  while i < nn
+    out.push(v)
+    i += 1
+  end
+  return out
+end
+
+## Internal: build a `Vec<Bool>` of length `n` filled with `v`.
+def _lb_fill_bool(n: Int, v: Bool): Vec<Bool>
+  var out = vec_new<Bool>()
+  var nn = n
+  if nn < 0
+    nn = 0
+  end
+  var i = 0
+  while i < nn
+    out.push(v)
+    i += 1
+  end
+  return out
+end
+
+## Construct a fresh `LightBuffer` at `(w, h)` with the given ambient
+## RGB tint. Every cell's R/G/B starts at `(ambient_r, ambient_g,
+## ambient_b)`; every cell is in shadow.
+def light_buffer_new(w: Int, h: Int, ambient_r: Int, ambient_g: Int, ambient_b: Int): LightBuffer
+  var ww = w
+  var hh = h
+  if ww < 0
+    ww = 0
+  end
+  if hh < 0
+    hh = 0
+  end
+  var n = ww * hh
+  return LightBuffer {
+    width:        ww,
+    height:       hh,
+    light_r:      _lb_fill_int(n, ambient_r),
+    light_g:      _lb_fill_int(n, ambient_g),
+    light_b:      _lb_fill_int(n, ambient_b),
+    shadow_flags: _lb_fill_bool(n, true),
+    ambient_r:    ambient_r,
+    ambient_g:    ambient_g,
+    ambient_b:    ambient_b
+  }
+end
+
+## Reset every cell back to ambient + every `shadow_flags` entry to
+## `true`. Width/height/ambient unchanged.
+def light_buffer_clear(buf: LightBuffer): LightBuffer
+  var n = buf.width * buf.height
+  return LightBuffer {
+    width:        buf.width,
+    height:       buf.height,
+    light_r:      _lb_fill_int(n, buf.ambient_r),
+    light_g:      _lb_fill_int(n, buf.ambient_g),
+    light_b:      _lb_fill_int(n, buf.ambient_b),
+    shadow_flags: _lb_fill_bool(n, true),
+    ambient_r:    buf.ambient_r,
+    ambient_g:    buf.ambient_g,
+    ambient_b:    buf.ambient_b
+  }
+end
+
+## Read the R component at `(x, y)`. Returns 0 for OOB queries.
+def light_buffer_get_r(buf: LightBuffer, x: Int, y: Int): Int
+  if x < 0 or y < 0 or x >= buf.width or y >= buf.height
+    return 0
+  end
+  var v = buf.light_r
+  return v[y * buf.width + x]
+end
+
+## Read the G component at `(x, y)`. Returns 0 for OOB queries.
+def light_buffer_get_g(buf: LightBuffer, x: Int, y: Int): Int
+  if x < 0 or y < 0 or x >= buf.width or y >= buf.height
+    return 0
+  end
+  var v = buf.light_g
+  return v[y * buf.width + x]
+end
+
+## Read the B component at `(x, y)`. Returns 0 for OOB queries.
+def light_buffer_get_b(buf: LightBuffer, x: Int, y: Int): Int
+  if x < 0 or y < 0 or x >= buf.width or y >= buf.height
+    return 0
+  end
+  var v = buf.light_b
+  return v[y * buf.width + x]
+end
+
+## True iff the cell at `(x, y)` is still in shadow (no light without
+## MAINTAIN_SHADOWS has reached it). Returns `true` for OOB queries.
+def light_buffer_in_shadow(buf: LightBuffer, x: Int, y: Int): Bool
+  if x < 0 or y < 0 or x >= buf.width or y >= buf.height
+    return true
+  end
+  var v = buf.shadow_flags
+  return v[y * buf.width + x]
+end
+
+# =============================================================================
+# Integer arithmetic helpers
+# =============================================================================
+
+## Clamp `n` to `[0, 255]`.
+def _clamp_byte(n: Int): Int
+  if n < 0
+    return 0
+  end
+  if n > 255
+    return 255
+  end
+  return n
+end
+
+## Splitmix64-style integer hash. Stable, well-distributed enough for
+## flicker jitter. Output is treated mod-N at the call site.
+def _hash_mix(a: Int, b: Int, c: Int): Int
+  var h = (a * 0x9E3779B97F4A7C15) ^ (b * 0xBF58476D1CE4E5B9) ^ (c * 0x94D049BB133111EB)
+  h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9
+  h = (h ^ (h >> 27)) * 0x94D049BB133111EB
+  h = h ^ (h >> 31)
+  if h < 0
+    h = -h
+  end
+  return h
+end
+
+# =============================================================================
+# light_buffer_paint — the Brogue math, riding on fov_for_each_visible
+# =============================================================================
+
+## Internal: copy a `Vec<Int>` (deep). Quartz's value semantics for
+## Vec on rebind is shared-handle — so we copy explicitly before
+## mutating to avoid clobbering the caller's input buffer.
+def _lb_copy_int(v: Vec<Int>): Vec<Int>
+  var out = vec_new<Int>()
+  var n = v.size
+  var i = 0
+  while i < n
+    out.push(v[i])
+    i += 1
+  end
+  return out
+end
+
+def _lb_copy_bool(v: Vec<Bool>): Vec<Bool>
+  var out = vec_new<Bool>()
+  var n = v.size
+  var i = 0
+  while i < n
+    out.push(v[i])
+    i += 1
+  end
+  return out
+end
+
+## Paint a single light's contribution onto the buffer.
+##
+## `frame` drives flicker — when `LIGHT_FLAG_FLICKER` is set on the
+## light, the multiplier is jittered by a deterministic
+## `(frame, origin)`-keyed amount in `±flicker_pct%`. Tests that don't
+## care about flicker should pass `frame=0` and leave FLICKER clear.
+##
+## `blocks_light` is the LOS predicate: `(x, y) -> Bool` — true iff
+## that cell blocks light propagation. Apps wrap their world state via
+## closure capture: `(x, y) -> { grid[y * w + x] is Wall }`.
+##
+## Returns a fresh `LightBuffer` with this light's contribution added.
+## Composes by repeated invocation: `buf2 = paint(buf1, light_a, ...);
+## buf3 = paint(buf2, light_b, ...)`.
+def light_buffer_paint(
+  buf: LightBuffer,
+  light: Light,
+  frame: Int,
+  blocks_light: Fn(Int, Int): Bool
+): LightBuffer
+  if light.radius <= 0
+    return buf
+  end
+
+  # Flicker jitter — deterministic per (frame, origin).
+  var jitter = 0
+  if light_flag_has(light.flags, LIGHT_FLAG_FLICKER())
+    var amp = light.flicker_pct
+    if amp < 0
+      amp = 0
+    end
+    if amp > 30
+      amp = 30
+    end
+    if amp > 0
+      var span = 2 * amp + 1
+      var h = _hash_mix(frame, light.origin_x, light.origin_y)
+      jitter = (h % span) - amp
+    end
+  end
+
+  # Copy mutable buffers — don't clobber caller's input. The visit
+  # closure below mutates these by reference.
+  var new_r = _lb_copy_int(buf.light_r)
+  var new_g = _lb_copy_int(buf.light_g)
+  var new_b = _lb_copy_int(buf.light_b)
+  var new_shadows = _lb_copy_bool(buf.shadow_flags)
+
+  var width = buf.width
+  var height = buf.height
+  var radius = light.radius
+  var fade_to_pct = light.fade_to_pct
+  var color_r = light.color_r
+  var color_g = light.color_g
+  var color_b = light.color_b
+  var clear_shadow = not light_flag_has(light.flags, LIGHT_FLAG_MAINTAIN_SHADOWS())
+
+  # The visit closure: for each cell the FOV walker reports as visible,
+  # compute the Brogue multiplier from `dist` + cached `jitter`, then
+  # accumulate into the per-channel light Vecs.
+  var contribute: Fn(Int, Int, Int): Void = (x: Int, y: Int, dist: Int) -> {
+    if x < 0 or y < 0 or x >= width or y >= height
+      return
+    end
+    var falloff = (100 - fade_to_pct) * dist / radius
+    var multiplier = 100 - falloff + jitter
+    if multiplier < 0
+      multiplier = 0
+    end
+    if multiplier > 200
+      multiplier = 200
+    end
+    var add_r = color_r * multiplier / 100
+    var add_g = color_g * multiplier / 100
+    var add_b = color_b * multiplier / 100
+    var idx = y * width + x
+    new_r[idx] = _clamp_byte(new_r[idx] + add_r)
+    new_g[idx] = _clamp_byte(new_g[idx] + add_g)
+    new_b[idx] = _clamp_byte(new_b[idx] + add_b)
+    if clear_shadow
+      new_shadows[idx] = false
+    end
+  }
+
+  fv::fov_for_each_visible(light.origin_x, light.origin_y, radius,
+                           blocks_light, contribute)
+
+  return LightBuffer {
+    width:        width,
+    height:       height,
+    light_r:      new_r,
+    light_g:      new_g,
+    light_b:      new_b,
+    shadow_flags: new_shadows,
+    ambient_r:    buf.ambient_r,
+    ambient_g:    buf.ambient_g,
+    ambient_b:    buf.ambient_b
+  }
+end
+
+# =============================================================================
+# light_buffer_apply — additive blend buffer onto a Plane
+# =============================================================================
+
+## Internal: pack `(r,g,b)` (each 0-255) into a truecolor Int.
+def _pack_rgb(r: Int, g: Int, b: Int): Int
+  return _RGB_FLAG() | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF)
+end
+
+## Internal: unpack the R/G/B of a truecolor Int. Returns `(0,0,0)` if
+## `c` is not truecolor — that's the "treat default-color / palette /
+## ANSI16 as black baseline" convention from the module docstring.
+def _unpack_r(c: Int): Int
+  if c < _RGB_FLAG()
+    return 0
+  end
+  return (c >> 16) & 0xFF
+end
+
+def _unpack_g(c: Int): Int
+  if c < _RGB_FLAG()
+    return 0
+  end
+  return (c >> 8) & 0xFF
+end
+
+def _unpack_b(c: Int): Int
+  if c < _RGB_FLAG()
+    return 0
+  end
+  return c & 0xFF
+end
+
+## Internal: blend a single channel's color int with the additive
+## (lr, lg, lb) RGB. Returns a truecolor Int.
+##
+## - If the channel uses default_color (no underlying RGB), treat the
+##   underlying color as black `(0,0,0)` and return `(lr, lg, lb)`
+##   packed as truecolor with `default_color` cleared in the caller.
+## - If the channel is truecolor, additive blend with clamping.
+## - If the channel is palette / ANSI 16, return the channel's color
+##   unchanged (v0.6.4 limitation; v0.7 will lift via ANSI→RGB
+##   expansion).
+def _apply_channel(channel: cl::Channel, lr: Int, lg: Int, lb: Int): cl::Channel
+  if channel.default_color
+    return cl::Channel {
+      color:         _pack_rgb(lr, lg, lb),
+      alpha:         channel.alpha,
+      default_color: false,
+      palette:       false
+    }
+  end
+  if channel.palette
+    return channel
+  end
+  if channel.color < _RGB_FLAG()
+    # ANSI 16 / 256-palette without the explicit `palette: true` flag.
+    # v0.6.4 leaves these alone; ANSI→RGB expansion is a v0.7 polish.
+    return channel
+  end
+  var cr = _unpack_r(channel.color)
+  var cg = _unpack_g(channel.color)
+  var cb = _unpack_b(channel.color)
+  var nr = _clamp_byte(cr + lr)
+  var ng = _clamp_byte(cg + lg)
+  var nb = _clamp_byte(cb + lb)
+  return cl::Channel {
+    color:         _pack_rgb(nr, ng, nb),
+    alpha:         channel.alpha,
+    default_color: false,
+    palette:       false
+  }
+end
+
+## Apply the buffer's light onto `plane`, additively blending each
+## cell's `bg` and `fg` channels with the buffer's per-cell RGB.
+##
+## Plane and buffer are independent in dimension — the apply walks the
+## intersection. Cells outside the buffer's dimensions are passed
+## through unchanged. (In practice, callers should size the buffer to
+## the plane's dimensions.)
+##
+## Returns a new `Plane`. The input is unchanged.
+def light_buffer_apply(buf: LightBuffer, plane: pl::Plane): pl::Plane
+  var pw = plane.w
+  var ph = plane.h
+  var bw = buf.width
+  var bh = buf.height
+  var src_cells = plane.cells
+  var lr_v = buf.light_r
+  var lg_v = buf.light_g
+  var lb_v = buf.light_b
+  var new_cells = vec_new<cl::Cell>()
+  var y = 0
+  while y < ph
+    var x = 0
+    while x < pw
+      var src = src_cells[y * pw + x]
+      if x < bw and y < bh
+        var idx = y * bw + x
+        var lr = lr_v[idx]
+        var lg = lg_v[idx]
+        var lb = lb_v[idx]
+        var new_fg = _apply_channel(src.fg, lr, lg, lb)
+        var new_bg = _apply_channel(src.bg, lr, lg, lb)
+        new_cells.push(cl::Cell {
+          egc:   src.egc,
+          fg:    new_fg,
+          bg:    new_bg,
+          attrs: src.attrs
+        })
+      else
+        new_cells.push(src)
+      end
+      x += 1
+    end
+    y += 1
+  end
+  return pl::Plane {
+    rel_x:  plane.rel_x,
+    rel_y:  plane.rel_y,
+    z:      plane.z,
+    w:      pw,
+    h:      ph,
+    cells:  new_cells,
+    parent: plane.parent
+  }
+end

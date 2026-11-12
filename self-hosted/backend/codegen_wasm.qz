@@ -1,0 +1,2252 @@
+##! # Direct WASM Bytecode Backend
+##!
+##! Emits WebAssembly binary (.wasm) directly from MIR, with no LLVM
+##! dependency. Parallel to codegen_c.qz (C) and codegen.qz (LLVM IR).
+##!
+##! Architecture: walks MIR program → builds Vec<Int> of bytes → writes
+##! binary file via -o flag or returns hex dump for debugging.
+##!
+##! @see wasm_encode WASM binary encoding primitives
+##! @see codegen_c C backend (structural template)
+##! @since 5.26.0
+
+import mir
+import op_constants
+import wasm_encode
+import wasm_runtime
+
+# =============================================================================
+# String pool (collect unique strings for data section)
+# =============================================================================
+
+var g_wasm_strings = vec_new<String>()
+var g_wasm_string_offsets = vec_new<Int>()
+var g_wasm_string_count = 0
+var g_wasm_data_offset = 0
+
+## Reset the string pool for a new compilation.
+def _wasm_reset_pool(): Void
+  g_wasm_strings = vec_new<String>()
+  g_wasm_string_offsets = vec_new<Int>()
+  g_wasm_string_count = 0
+  # Reserve first 1024 bytes for stack pointer and scratch space
+  g_wasm_data_offset = 1024
+end
+
+## Add a string to the pool. Returns the memory offset where its data starts.
+## Strings are laid out as: [i64 len][char data...][null]
+## The returned offset points to data[0] (matching Quartz convention).
+def _wasm_add_string(val: String): Int
+  # Check for existing
+  var i = 0
+  while i < g_wasm_string_count
+    if g_wasm_strings[i] == val
+      return g_wasm_string_offsets[i]
+    end
+    i += 1
+  end
+  # New string: lay out [i64 len][data][null]
+  var len = str_byte_len(val)
+  var base = g_wasm_data_offset
+  # 8 bytes for i64 length prefix, then len+1 for data+null
+  var data_offset = base + 8
+  g_wasm_data_offset = data_offset + len + 1
+  # Align to 8 bytes
+  if g_wasm_data_offset % 8 != 0
+    g_wasm_data_offset = g_wasm_data_offset + (8 - g_wasm_data_offset % 8)
+  end
+  g_wasm_strings.push(val)
+  g_wasm_string_offsets.push(data_offset)
+  g_wasm_string_count = g_wasm_string_count + 1
+  return data_offset
+end
+
+## Pre-scan all MIR functions for string constants.
+def _wasm_prescan_strings(prog: mir::MirProgram): Void
+  var funcs = mir::mir_get_functions(prog)
+  for fi in 0..funcs.size
+    var func = funcs[fi]
+    var blocks = mir::mir_func_get_blocks(func)
+    for bi in 0..blocks.size
+      var blk = blocks[bi]
+      var instrs = mir::mir_block_get_instructions(blk)
+      for ii in 0..instrs.size
+        var instr = instrs[ii]
+        if mir::mir_instr_get_kind(instr) == 3
+          _wasm_add_string(mir::mir_instr_get_string_val(instr))
+        end
+      end
+    end
+  end
+  # Also scan string pool from MIR program
+  var pool = mir::mir_get_string_pool(prog)
+  for si in 0..pool.size
+    _wasm_add_string(pool[si])
+  end
+end
+
+# =============================================================================
+# Function type deduplication — moved to wasm_runtime.qz so synth bodies can
+# register types for call_indirect (HOF synth needs closure-dispatch type idxs).
+# Re-exposed here under the original names via thin delegating wrappers so
+# existing call sites keep working without churn.
+# =============================================================================
+
+def _wasm_reset_types(): Void
+  wasm_runtime::_wasm_reset_types()
+end
+
+def _wasm_register_type(entry: Vec<Int>): Int
+  return wasm_runtime::_wasm_register_type(entry)
+end
+
+def _wasm_get_type_idx(arity: Int, has_result: Int): Int
+  return wasm_runtime::_wasm_get_type_idx(arity, has_result)
+end
+
+def _wasm_get_type_idx_i32(num_i32_params: Int, has_i32_result: Int): Int
+  return wasm_runtime::_wasm_get_type_idx_i32(num_i32_params, has_i32_result)
+end
+
+# =============================================================================
+# Import tracking
+# =============================================================================
+
+var g_wasm_import_names = vec_new<String>()
+var g_wasm_import_module = vec_new<String>()
+var g_wasm_import_type_idx = vec_new<Int>()
+var g_wasm_import_count = 0
+
+# User-tagged `@export` functions. Populated during function-index
+# assignment; consumed by `_wasm_build_export_section` after all indices
+# are resolved. Stores MIR names (same key used for
+# `wasm_runtime::_wasm_get_func_idx`).
+var g_wasm_user_exports = vec_new<String>()
+
+# Track void-returning functions (names) for call emission
+var g_wasm_void_funcs = vec_new<String>()
+
+def _wasm_mark_void_func(name: String): Void
+  g_wasm_void_funcs.push(name)
+end
+
+def _wasm_is_void_call(name: String): Int
+  for i in 0..g_wasm_void_funcs.size
+    if g_wasm_void_funcs[i] == name
+      return 1
+    end
+  end
+  return 0
+end
+
+# `mir_func_get_return_type(func)` is always 0 (MIR_TYPE_INT) for user
+# functions because every `mir_new_function` call passes MIR_TYPE_INT —
+# the integer never reflects the source-level Void annotation. Derive
+# void-ness from `return_type_name` instead, which is reliably set.
+def _wasm_func_returns_void(func: mir::MirFunc): Int
+  if mir::mir_func_get_return_type_name(func) == "Void"
+    return 1
+  end
+  return 0
+end
+
+def _wasm_reset_imports(): Void
+  g_wasm_import_names = vec_new<String>()
+  g_wasm_import_module = vec_new<String>()
+  g_wasm_import_type_idx = vec_new<Int>()
+  g_wasm_import_count = 0
+  g_wasm_void_funcs = vec_new<String>()
+end
+
+## Add an import with explicit type index. Returns the function index.
+def _wasm_add_import_typed(module: String, name: String, type_idx: Int): Int
+  var i = 0
+  while i < g_wasm_import_count
+    if g_wasm_import_names[i] == name and g_wasm_import_module[i] == module
+      return i
+    end
+    i += 1
+  end
+  g_wasm_import_names.push(name)
+  g_wasm_import_module.push(module)
+  g_wasm_import_type_idx.push(type_idx)
+  var idx = g_wasm_import_count
+  g_wasm_import_count = g_wasm_import_count + 1
+  return idx
+end
+
+## Add an import with Quartz-style signature (all i64). Returns function index.
+def _wasm_add_import(module: String, name: String, arity: Int, has_result: Int): Int
+  # Check existing
+  var i = 0
+  while i < g_wasm_import_count
+    if g_wasm_import_names[i] == name and g_wasm_import_module[i] == module
+      return i
+    end
+    i += 1
+  end
+  var type_idx = _wasm_get_type_idx(arity, has_result)
+  g_wasm_import_names.push(name)
+  g_wasm_import_module.push(module)
+  g_wasm_import_type_idx.push(type_idx)
+  var idx = g_wasm_import_count
+  g_wasm_import_count = g_wasm_import_count + 1
+  return idx
+end
+
+# =============================================================================
+# Section builders
+# =============================================================================
+
+## Build the Type section: all unique function signatures.
+def _wasm_build_type_section(): Vec<Int>
+  var content = vec_new<Int>()
+  var n = wasm_runtime::_wasm_get_type_count()
+  wasm_encode::wasm_emit_u32(content, n)
+  var i = 0
+  while i < n
+    wasm_encode::wasm_emit_bytes(content, wasm_runtime::_wasm_get_type_entry(i))
+    i += 1
+  end
+  var section = vec_new<Int>()
+  wasm_encode::wasm_emit_section(section, wasm_encode::WASM_SECTION_TYPE, content)
+  return section
+end
+
+## Build the Import section.
+def _wasm_build_import_section(): Vec<Int>
+  var content = vec_new<Int>()
+  wasm_encode::wasm_emit_u32(content, g_wasm_import_count)
+  var i = 0
+  while i < g_wasm_import_count
+    wasm_encode::wasm_emit_name(content, g_wasm_import_module[i])
+    wasm_encode::wasm_emit_name(content, g_wasm_import_names[i])
+    wasm_encode::wasm_emit_byte(content, wasm_encode::WASM_IMPORT_FUNC)
+    wasm_encode::wasm_emit_u32(content, g_wasm_import_type_idx[i])
+    i += 1
+  end
+  var section = vec_new<Int>()
+  wasm_encode::wasm_emit_section(section, wasm_encode::WASM_SECTION_IMPORT, content)
+  return section
+end
+
+## Build the Function section: type index for each defined function.
+def _wasm_build_function_section(func_type_indices: Vec<Int>): Vec<Int>
+  var content = vec_new<Int>()
+  wasm_encode::wasm_emit_u32(content, func_type_indices.size)
+  for i in 0..func_type_indices.size
+    wasm_encode::wasm_emit_u32(content, func_type_indices[i])
+  end
+  var section = vec_new<Int>()
+  wasm_encode::wasm_emit_section(section, wasm_encode::WASM_SECTION_FUNCTION, content)
+  return section
+end
+
+## Build the Memory section: 1 page minimum, no maximum (growable).
+def _wasm_build_memory_section(): Vec<Int>
+  var content = vec_new<Int>()
+  wasm_encode::wasm_emit_u32(content, 1)  # 1 memory
+  wasm_encode::wasm_emit_byte(content, 0) # limits: no maximum
+  wasm_encode::wasm_emit_u32(content, 1)  # initial: 1 page (64KB)
+  var section = vec_new<Int>()
+  wasm_encode::wasm_emit_section(section, wasm_encode::WASM_SECTION_MEMORY, content)
+  return section
+end
+
+## Build the Export section: memory + _start + every user `@export`.
+##
+## User functions tagged `@export def foo(): ...` are surfaced under
+## their source name so the host (JS / wasmtime) can call them
+## directly. Each name was recorded into `g_wasm_user_exports` during
+## function-index assignment; indices are resolved here via
+## `wasm_runtime::_wasm_get_func_idx(name)` after the whole index
+## table is populated.
+def _wasm_build_export_section(start_func_idx: Int): Vec<Int>
+  var content = vec_new<Int>()
+  var total = 2 + g_wasm_user_exports.size
+  wasm_encode::wasm_emit_u32(content, total)
+  # Export memory
+  wasm_encode::wasm_emit_name(content, "memory")
+  wasm_encode::wasm_emit_byte(content, wasm_encode::WASM_EXPORT_MEMORY)
+  wasm_encode::wasm_emit_u32(content, 0)  # memory index 0
+  # Export _start
+  wasm_encode::wasm_emit_name(content, "_start")
+  wasm_encode::wasm_emit_byte(content, wasm_encode::WASM_EXPORT_FUNC)
+  wasm_encode::wasm_emit_u32(content, start_func_idx)
+  # Export each @export function.
+  var i = 0
+  while i < g_wasm_user_exports.size
+    var export_name = g_wasm_user_exports[i]
+    var export_idx = wasm_runtime::_wasm_get_func_idx(export_name)
+    wasm_encode::wasm_emit_name(content, export_name)
+    wasm_encode::wasm_emit_byte(content, wasm_encode::WASM_EXPORT_FUNC)
+    wasm_encode::wasm_emit_u32(content, export_idx)
+    i += 1
+  end
+  var section = vec_new<Int>()
+  wasm_encode::wasm_emit_section(section, wasm_encode::WASM_SECTION_EXPORT, content)
+  return section
+end
+
+## Build the Data section: string constants in linear memory.
+def _wasm_build_data_section(): Vec<Int>
+  if g_wasm_string_count == 0
+    return vec_new<Int>()
+  end
+  var content = vec_new<Int>()
+  wasm_encode::wasm_emit_u32(content, g_wasm_string_count)
+  var i = 0
+  while i < g_wasm_string_count
+    var str_val = g_wasm_strings[i]
+    var str_len = str_byte_len(str_val)
+    var data_offset = g_wasm_string_offsets[i]
+    var base_offset = data_offset - 8  # length prefix is 8 bytes before data
+
+    # Active data segment: memory 0, offset expression
+    wasm_encode::wasm_emit_byte(content, 0)  # active, memory 0
+    # Offset: i32.const <base_offset>, end
+    wasm_encode::wasm_emit_byte(content, wasm_encode::WASM_I32_CONST)
+    wasm_encode::wasm_emit_i32(content, base_offset)
+    wasm_encode::wasm_emit_byte(content, wasm_encode::WASM_END)
+
+    # Data: 8 bytes for i64 length (little-endian) + string bytes + null
+    var data_size = 8 + str_len + 1
+    wasm_encode::wasm_emit_u32(content, data_size)
+    # Length prefix (i64 little-endian)
+    wasm_encode::wasm_emit_f64_bits(content, str_len)
+    # String bytes
+    var j = 0
+    while j < str_len
+      wasm_encode::wasm_emit_byte(content, str_byte_at(str_val, j))
+      j += 1
+    end
+    # Null terminator
+    wasm_encode::wasm_emit_byte(content, 0)
+
+    i += 1
+  end
+  var section = vec_new<Int>()
+  wasm_encode::wasm_emit_section(section, wasm_encode::WASM_SECTION_DATA, content)
+  return section
+end
+
+# =============================================================================
+# Function table (for indirect calls / closures)
+# =============================================================================
+
+# Table entries: maps table index → WASM function index
+var g_wasm_table_entries = vec_new<Int>()
+var g_wasm_table_count = 0
+# Maps function name → table index (for FUNC_REF lookup)
+var g_wasm_table_names = vec_new<String>()
+
+def _wasm_reset_table(): Void
+  g_wasm_table_entries = vec_new<Int>()
+  g_wasm_table_count = 0
+  g_wasm_table_names = vec_new<String>()
+end
+
+## Get or create a table entry for a function. Returns the table index.
+def _wasm_get_table_entry(func_name: String): Int
+  var i = 0
+  while i < g_wasm_table_count
+    if g_wasm_table_names[i] == func_name
+      return i
+    end
+    i += 1
+  end
+  # Not found — will be resolved later when func indices are assigned
+  g_wasm_table_names.push(func_name)
+  g_wasm_table_entries.push(-1)  # placeholder, filled during codegen
+  var idx = g_wasm_table_count
+  g_wasm_table_count = g_wasm_table_count + 1
+  return idx
+end
+
+## Pre-scan all MIR_FUNC_REF instructions to build the function table.
+def _wasm_prescan_func_refs(prog: mir::MirProgram): Void
+  var funcs = mir::mir_get_functions(prog)
+  for fi in 0..funcs.size
+    var func = funcs[fi]
+    var blocks = mir::mir_func_get_blocks(func)
+    for bi in 0..blocks.size
+      var blk = blocks[bi]
+      var instrs = mir::mir_block_get_instructions(blk)
+      for ii in 0..instrs.size
+        var instr = instrs[ii]
+        if mir::mir_instr_get_kind(instr) == 10
+          _wasm_get_table_entry(mir::mir_instr_get_func_name(instr))
+        end
+      end
+    end
+  end
+end
+
+## Resolve table entries: fill in actual function indices.
+def _wasm_resolve_table(): Void
+  for i in 0..g_wasm_table_count
+    var fidx = wasm_runtime::_wasm_get_func_idx(g_wasm_table_names[i])
+    if fidx >= 0
+      g_wasm_table_entries[i] = fidx
+    end
+  end
+end
+
+## Build the Table section: one funcref table.
+## Always emitted (call_indirect requires table 0 to exist).
+def _wasm_build_table_section(): Vec<Int>
+  var min_size = g_wasm_table_count
+  if min_size == 0
+    min_size = 1  # minimum 1 entry so call_indirect doesn't fail validation
+  end
+  var content = vec_new<Int>()
+  wasm_encode::wasm_emit_u32(content, 1)     # 1 table
+  wasm_encode::wasm_emit_byte(content, 0x70) # funcref
+  wasm_encode::wasm_emit_byte(content, 0)    # limits: no max
+  wasm_encode::wasm_emit_u32(content, min_size)
+  var section = vec_new<Int>()
+  wasm_encode::wasm_emit_section(section, wasm_encode::WASM_SECTION_TABLE, content)
+  return section
+end
+
+## Build the Element section: populate funcref table.
+def _wasm_build_element_section(): Vec<Int>
+  if g_wasm_table_count == 0
+    return vec_new<Int>()
+  end
+  var content = vec_new<Int>()
+  wasm_encode::wasm_emit_u32(content, 1)    # 1 element segment
+  # Active element: table 0, offset i32.const 0
+  wasm_encode::wasm_emit_byte(content, 0)   # flags: active, table 0
+  wasm_encode::wasm_emit_byte(content, wasm_encode::WASM_I32_CONST)
+  wasm_encode::wasm_emit_i32(content, 0)
+  wasm_encode::wasm_emit_byte(content, wasm_encode::WASM_END)
+  # Function indices
+  wasm_encode::wasm_emit_u32(content, g_wasm_table_count)
+  for i in 0..g_wasm_table_count
+    wasm_encode::wasm_emit_u32(content, g_wasm_table_entries[i])
+  end
+  var section = vec_new<Int>()
+  wasm_encode::wasm_emit_section(section, wasm_encode::WASM_SECTION_ELEMENT, content)
+  return section
+end
+
+# =============================================================================
+# Global variable mapping
+# =============================================================================
+
+# Global index 0 = heap pointer (always present)
+# User globals start at index 1
+var g_wasm_global_names = vec_new<String>()
+var g_wasm_global_indices = vec_new<Int>()
+var g_wasm_global_count = 0
+
+def _wasm_reset_globals(): Void
+  g_wasm_global_names = vec_new<String>()
+  g_wasm_global_indices = vec_new<Int>()
+  g_wasm_global_count = 0
+end
+
+## Get the WASM global index for a named variable. Returns -1 if not found.
+def _wasm_get_global_idx(name: String): Int
+  var i = 0
+  while i < g_wasm_global_count
+    if g_wasm_global_names[i] == name
+      return g_wasm_global_indices[i]
+    end
+    i += 1
+  end
+  return -1
+end
+
+## Register a global variable. Returns the WASM global index.
+def _wasm_add_global(name: String, global_idx: Int): Void
+  g_wasm_global_names.push(name)
+  g_wasm_global_indices.push(global_idx)
+  g_wasm_global_count = g_wasm_global_count + 1
+end
+
+# =============================================================================
+# Variable → local index mapping (per-function, rebuilt each time)
+# =============================================================================
+
+var g_wasm_var_names = vec_new<String>()
+var g_wasm_var_indices = vec_new<Int>()
+var g_wasm_var_count = 0
+var g_wasm_num_params = 0
+var g_wasm_max_reg = 0
+var g_wasm_dispatch_local = 0
+
+def _wasm_reset_locals(): Void
+  g_wasm_var_names = vec_new<String>()
+  g_wasm_var_indices = vec_new<Int>()
+  g_wasm_var_count = 0
+end
+
+## Map SSA register ID → WASM local index.
+def _wasm_reg_local(reg_id: Int): Int
+  return g_wasm_num_params + reg_id
+end
+
+## Map named variable → WASM local index.
+def _wasm_var_local(name: String): Int
+  var i = 0
+  while i < g_wasm_var_count
+    if g_wasm_var_names[i] == name
+      return g_wasm_var_indices[i]
+    end
+    i += 1
+  end
+  # Not found — add it dynamically
+  var idx = g_wasm_num_params + g_wasm_max_reg + 1 + g_wasm_var_count
+  g_wasm_var_names.push(name)
+  g_wasm_var_indices.push(idx)
+  g_wasm_var_count = g_wasm_var_count + 1
+  return idx
+end
+
+# =============================================================================
+# Binary operation → WASM opcode mapping
+# =============================================================================
+
+def _wasm_binary_op(buf: Vec<Int>, op: Int): Void
+  if op == op_constants::OP_ADD
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_ADD)
+  elsif op == op_constants::OP_SUB
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_SUB)
+  elsif op == op_constants::OP_MUL
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_MUL)
+  elsif op == op_constants::OP_DIV
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_DIV_S)
+  elsif op == op_constants::OP_MOD
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_REM_S)
+  elsif op == op_constants::OP_EQ
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_EQ)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_EXTEND_I32_U)
+  elsif op == op_constants::OP_NE
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_NE)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_EXTEND_I32_U)
+  elsif op == op_constants::OP_LT
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_LT_S)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_EXTEND_I32_U)
+  elsif op == op_constants::OP_LE
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_LE_S)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_EXTEND_I32_U)
+  elsif op == op_constants::OP_GT
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_GT_S)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_EXTEND_I32_U)
+  elsif op == op_constants::OP_GE
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_GE_S)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_EXTEND_I32_U)
+  elsif op == op_constants::OP_AND
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_AND)
+  elsif op == op_constants::OP_OR
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_OR)
+  elsif op == op_constants::OP_BIT_AND
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_AND)
+  elsif op == op_constants::OP_BIT_OR
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_OR)
+  elsif op == op_constants::OP_BIT_XOR
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_XOR)
+  elsif op == op_constants::OP_SHL
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_SHL)
+  elsif op == op_constants::OP_SHR
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_SHR_U)
+  else
+    # Unknown op — emit add as fallback (should not happen)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_ADD)
+  end
+end
+
+# =============================================================================
+# Instruction emission
+# =============================================================================
+
+## Emit a single MIR instruction as WASM bytecode.
+def _wasm_emit_instr(buf: Vec<Int>, prog: mir::MirProgram, instr: mir::MirInstr): Void
+  var kind = mir::mir_instr_get_kind(instr)
+  var dest = mir::mir_instr_get_dest_id(instr)
+
+  # MIR_NOP = 0
+  if kind == 0
+    return
+  end
+
+
+  # MIR_CONST_INT = 1
+  if kind == 1
+    var val = mir::mir_instr_get_int_val(instr)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(buf, val)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_CONST_BOOL = 2
+  if kind == 2
+    var val = mir::mir_instr_get_int_val(instr)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(buf, val)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_CONST_STRING = 3
+  if kind == 3
+    var str_val = mir::mir_instr_get_string_val(instr)
+    var offset = _wasm_add_string(str_val)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(buf, offset)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_LOAD_VAR = 4
+  if kind == 4
+    var var_name = mir::mir_instr_get_var_name(instr)
+    var slot1 = mir::mir_instr_get_slot1(instr)
+    if slot1 == 1
+      # Global variable
+      var gidx = _wasm_get_global_idx(var_name)
+      if gidx >= 0
+        wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_GLOBAL_GET)
+        wasm_encode::wasm_emit_u32(buf, gidx)
+      else
+        wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+        wasm_encode::wasm_emit_i64(buf, 0)
+      end
+    else
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+      wasm_encode::wasm_emit_u32(buf, _wasm_var_local(var_name))
+    end
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_STORE_VAR = 5
+  if kind == 5
+    var var_name = mir::mir_instr_get_var_name(instr)
+    var src = mir::mir_instr_get_operand2(instr)
+    var slot1 = mir::mir_instr_get_slot1(instr)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(src))
+    if slot1 == 1
+      # Global variable
+      var gidx = _wasm_get_global_idx(var_name)
+      if gidx >= 0
+        wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_GLOBAL_SET)
+        wasm_encode::wasm_emit_u32(buf, gidx)
+      else
+        wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_DROP)
+      end
+    else
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+      wasm_encode::wasm_emit_u32(buf, _wasm_var_local(var_name))
+    end
+    return
+  end
+
+  # MIR_BINARY = 6
+  if kind == 6
+    var op = mir::mir_instr_get_op(instr)
+    var left = mir::mir_instr_get_operand1(instr)
+    var right = mir::mir_instr_get_operand2(instr)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(left))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(right))
+    _wasm_binary_op(buf, op)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_UNARY = 7
+  if kind == 7
+    var op = mir::mir_instr_get_op(instr)
+    var operand = mir::mir_instr_get_operand1(instr)
+    if op == op_constants::OP_SUB or op == op_constants::OP_NEG
+      # Negate: 0 - operand
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+      wasm_encode::wasm_emit_i64(buf, 0)
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+      wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(operand))
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_SUB)
+    elsif op == op_constants::OP_NOT
+      # Logical not: val == 0 ? 1 : 0
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+      wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(operand))
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_EQZ)
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_EXTEND_I32_U)
+    elsif op == op_constants::OP_BIT_NOT
+      # Bitwise not: xor with -1
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+      wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(operand))
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+      wasm_encode::wasm_emit_i64(buf, -1)
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_XOR)
+    else
+      # Unknown unary — pass through
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+      wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(operand))
+    end
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_CALL = 8
+  if kind == 8
+    var func_name = mir::mir_instr_get_func_name(instr)
+    var args = mir::mir_instr_get_args(instr)
+    # Push args
+    for ai in 0..args.size
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+      wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(args[ai]))
+    end
+    var fidx = wasm_runtime::_wasm_get_func_idx(func_name)
+    if fidx >= 0
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_CALL)
+      wasm_encode::wasm_emit_u32(buf, fidx)
+      # Void functions don't push a return value — supply i64 0 for local.set
+      if _wasm_is_void_call(func_name)
+        wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+        wasm_encode::wasm_emit_i64(buf, 0)
+      end
+    else
+      # Unknown function — panic instead of silently returning 0
+      for ai in 0..args.size
+        wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_DROP)
+      end
+      var err_str_c = _wasm_add_string("WASM: undefined function: " + func_name)
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+      wasm_encode::wasm_emit_i64(buf, err_str_c)
+      var panic_c = wasm_runtime::_wasm_get_func_idx("panic")
+      if panic_c >= 0
+        # panic's synthesized signature is (param i64) (result i64); the
+        # call already pushes the result the LOCAL_SET below consumes.
+        wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_CALL)
+        wasm_encode::wasm_emit_u32(buf, panic_c)
+      else
+        # No panic available — supply a placeholder so LOCAL_SET has a value
+        wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+        wasm_encode::wasm_emit_i64(buf, 0)
+      end
+    end
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_INTRINSIC = 9 — same as CALL but looked up in import table
+  if kind == 9
+    var func_name = mir::mir_instr_get_func_name(instr)
+    # Resolve unified map_* names to backend hashmap_*/intmap_* via elem_type (slot2).
+    var _elem_slot = mir::mir_instr_get_slot2(instr)
+    var _elem_type = ""
+    if _elem_slot != 0
+      _elem_type = as_string(_elem_slot)
+    end
+    func_name = wasm_runtime::_wasm_resolve_map_name(func_name, _elem_type)
+    func_name = wasm_runtime::_wasm_resolve_set_name(func_name, _elem_type)
+    var args = mir::mir_instr_get_args(instr)
+    for ai in 0..args.size
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+      wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(args[ai]))
+    end
+    var fidx = wasm_runtime::_wasm_get_func_idx(func_name)
+    if fidx >= 0
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_CALL)
+      wasm_encode::wasm_emit_u32(buf, fidx)
+      # Void functions don't push a return value — supply i64 0 for local.set
+      if _wasm_is_void_call(func_name)
+        wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+        wasm_encode::wasm_emit_i64(buf, 0)
+      end
+    else
+      # Unsupported intrinsic — panic instead of silently returning 0
+      for ai in 0..args.size
+        wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_DROP)
+      end
+      var err_str_i = _wasm_add_string("WASM: unsupported intrinsic: " + func_name)
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+      wasm_encode::wasm_emit_i64(buf, err_str_i)
+      var panic_i = wasm_runtime::_wasm_get_func_idx("panic")
+      if panic_i >= 0
+        # panic returns i64 — its result feeds the LOCAL_SET below.
+        wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_CALL)
+        wasm_encode::wasm_emit_u32(buf, panic_i)
+      else
+        wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+        wasm_encode::wasm_emit_i64(buf, 0)
+      end
+    end
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_FUNC_REF = 10 — function pointer (table index << 1, low bit 0)
+  if kind == 10
+    var func_name = mir::mir_instr_get_func_name(instr)
+    var table_idx = _wasm_get_table_entry(func_name)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(buf, table_idx * 2)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_CALL_INDIRECT = 11 — indirect call via function pointer
+  # Tagged pointer: low bit 0 = plain fn (table_index << 1),
+  #                 low bit 1 = closure (env_ptr | 1)
+  if kind == 11
+    var fn_ptr = mir::mir_instr_get_operand1(instr)
+    var args = mir::mir_instr_get_args(instr)
+    var arg_count = args.size
+
+    # Check low bit: fn_ptr & 1
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(fn_ptr))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(buf, 1)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_AND)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+
+    # if (is_closure) { closure path } else { plain path }
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_IF)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_TYPE_I64)  # returns i64
+
+    # === Closure path ===
+    # Stack for call_indirect: [args...] [i32 table_index]
+    # Push env_ptr as first arg (for closure call)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(fn_ptr))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(buf, -2)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_AND)
+    # Push user args
+    for ai in 0..arg_count
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+      wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(args[ai]))
+    end
+    # Load fn table index from env[0]: env_ptr & ~1, load i64, >> 1, wrap to i32
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(fn_ptr))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(buf, -2)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_AND)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_i64_load(buf, 0)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(buf, 1)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_SHR_U)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    # call_indirect with closure type (env + args → i64)
+    var closure_type = _wasm_get_type_idx(arg_count + 1, 1)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_CALL_INDIRECT)
+    wasm_encode::wasm_emit_u32(buf, closure_type)
+    wasm_encode::wasm_emit_u32(buf, 0)  # table 0
+
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_ELSE)
+
+    # === Plain function path ===
+    # Stack: [args...] [i32 table_index]
+    # Push user args first
+    for ai in 0..arg_count
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+      wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(args[ai]))
+    end
+    # Then table_index = fn_ptr >> 1
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(fn_ptr))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(buf, 1)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_SHR_U)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    # call_indirect with plain type (args → i64)
+    var plain_type = _wasm_get_type_idx(arg_count, 1)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_CALL_INDIRECT)
+    wasm_encode::wasm_emit_u32(buf, plain_type)
+    wasm_encode::wasm_emit_u32(buf, 0)  # table 0
+
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_END)
+
+    # Store result
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_ALLOC = 12 — heap allocation
+  if kind == 12
+    var size = mir::mir_instr_get_slot1(instr)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(buf, size * 8)
+    var alloc_idx = wasm_runtime::_wasm_get_func_idx("alloc")
+    if alloc_idx >= 0
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_CALL)
+      wasm_encode::wasm_emit_u32(buf, alloc_idx)
+    end
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_LOAD = 13 — load i64 from pointer
+  if kind == 13
+    var ptr = mir::mir_instr_get_operand1(instr)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(ptr))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_i64_load(buf, 0)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_STORE = 14 — store i64 to pointer (slot1 = byte offset for struct fields)
+  if kind == 14
+    var ptr = mir::mir_instr_get_operand1(instr)
+    var val = mir::mir_instr_get_operand2(instr)
+    var offset = mir::mir_instr_get_slot1(instr)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(ptr))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(val))
+    wasm_encode::wasm_emit_i64_store(buf, offset * 8)
+    return
+  end
+
+  # MIR_FIELD_ACCESS = 15 — struct field: ptr[field_idx]
+  if kind == 15
+    var ptr = mir::mir_instr_get_operand1(instr)
+    var field_idx = mir::mir_instr_get_slot1(instr)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(ptr))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_i64_load(buf, field_idx * 8)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_INDEX = 16 — Vec element load: vec[idx].
+  #
+  # Vec layout (mirrors LLVM): header[0]=capacity, header[1]=size,
+  # header[2]=data_ptr, header[3]=elem_width. `ptr` here is the Vec
+  # handle, NOT the data pointer. Bug fixed 2026-04-19 — the old
+  # implementation did `*(ptr + idx*8)` which treated the Vec handle
+  # as if it WERE the data buffer. For idx=0 that returned capacity,
+  # idx=1 returned size, idx=2 returned the data pointer itself —
+  # explaining why `chip8_ram[0x200]` always read 0 and the emulator
+  # silently no-oped. Now: load header[2] first, then index into
+  # the actual data buffer.
+  if kind == 16
+    var ptr = mir::mir_instr_get_operand1(instr)
+    var idx = mir::mir_instr_get_operand2(instr)
+    # Push header address, wrap to i32, load data_ptr from offset 16.
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(ptr))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_i64_load(buf, 16)
+    # data_ptr is now on stack as i64. Compute data_ptr + idx * 8.
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(idx))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(buf, 8)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_MUL)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_ADD)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_i64_load(buf, 0)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_INDEX_STORE = 17 — Vec element store: vec[idx] = val.
+  # Same Vec-handle indirection as MIR_INDEX above. `val` lives in
+  # instr.args[0] — set via mir_instr_set_args(instr, [val_val]) by
+  # the MIR lowering in mir_lower_stmt_handlers.qz. The WASM codegen
+  # used to read slot1 instead, which happened to be `dest` and
+  # produced the observable symptom: stores landed at the right
+  # address but with whatever junk happened to be in the dest reg
+  # instead of the requested value (typically 0).
+  if kind == 17
+    var ptr = mir::mir_instr_get_operand1(instr)
+    var idx = mir::mir_instr_get_operand2(instr)
+    var store_args = mir::mir_instr_get_args(instr)
+    var val = store_args[0]
+    # Push header address, wrap to i32, load data_ptr from offset 16.
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(ptr))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_i64_load(buf, 16)
+    # data_ptr now on stack. Compute data_ptr + idx * 8 as the store address.
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(idx))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(buf, 8)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_MUL)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_ADD)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    # Push value to store.
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(val))
+    wasm_encode::wasm_emit_i64_store(buf, 0)
+    return
+  end
+
+  # MIR_PHI = 18 — read from phi variable
+  if kind == 18
+    var phi_name = mir::mir_instr_get_var_name(instr)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_var_local(phi_name))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_SELECT = 20 — ternary: cond ? a : b
+  if kind == 20
+    var cond = mir::mir_instr_get_operand1(instr)
+    var a = mir::mir_instr_get_operand2(instr)
+    var b = mir::mir_instr_get_slot1(instr)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(cond))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_IF)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_TYPE_I64)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(a))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_ELSE)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(b))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_END)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_INLINE_C = 21 — not supported in WASM
+  if kind == 21
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_UNREACHABLE)
+    return
+  end
+
+  # MIR_ADDR_OF = 24 — get address of variable
+  if kind == 24
+    # No linear-memory var allocation on the WASM backend yet — fail loudly
+    # rather than silently pushing 0 (R4.1: unimplemented backend path).
+    panic("WASM backend: address-of (MIR_ADDR_OF) not implemented (R4.1: unimplemented backend path)")
+  end
+
+  # MIR_CONST_FLOAT = 25
+  if kind == 25
+    # Float-string → bits not parsed on the WASM backend yet — fail loudly
+    # rather than silently emitting 0 (R4.1: unimplemented backend path).
+    panic("WASM backend: float constants (MIR_CONST_FLOAT) not implemented (R4.1: unimplemented backend path)")
+  end
+
+  # MIR_UNION_WRAP = 26 — create tagged pair [tag, payload]
+  if kind == 26
+    var tag_reg = mir::mir_instr_get_operand1(instr)
+    var payload_reg = mir::mir_instr_get_operand2(instr)
+    # alloc(16), store tag at [0], payload at [8]
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(buf, 16)
+    var alloc_idx = wasm_runtime::_wasm_get_func_idx("alloc")
+    if alloc_idx >= 0
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_CALL)
+      wasm_encode::wasm_emit_u32(buf, alloc_idx)
+    end
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    # store tag at [ptr + 0]
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(tag_reg))
+    wasm_encode::wasm_emit_i64_store(buf, 0)
+    # store payload at [ptr + 8]
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(payload_reg))
+    wasm_encode::wasm_emit_i64_store(buf, 8)
+    return
+  end
+
+  # MIR_UNION_TAG = 27 — extract tag from [tag, payload]
+  if kind == 27
+    var ptr = mir::mir_instr_get_operand1(instr)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(ptr))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_i64_load(buf, 0)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_UNION_UNWRAP = 28 — extract payload from [tag, payload]
+  if kind == 28
+    var ptr = mir::mir_instr_get_operand1(instr)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(ptr))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_i64_load(buf, 8)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_ALLOC_STACK = 29 — same as ALLOC for WASM
+  if kind == 29
+    var size = mir::mir_instr_get_slot1(instr)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(buf, size * 8)
+    var alloc_idx = wasm_runtime::_wasm_get_func_idx("alloc")
+    if alloc_idx >= 0
+      wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_CALL)
+      wasm_encode::wasm_emit_u32(buf, alloc_idx)
+    end
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_VEC_DATA_PTR = 30 — extract data pointer from vec header.
+  # Vec layout matches the LLVM backend: header[0] + header[1] are
+  # capacity/size slots, header[2] is the data pointer (see
+  # codegen_instr.qz's MIR_VEC_DATA_PTR: GEP i64 offset 2 == 16 bytes).
+  # Loading from offset 0 here was a pre-existing bug that made every
+  # `vec[i]` on WASM read the capacity/size slot instead of an element.
+  if kind == 30
+    var ptr = mir::mir_instr_get_operand1(instr)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(ptr))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_i64_load(buf, 16)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_INDEX_RAW = 31 — same as MIR_INDEX but without bounds check.
+  # Still a Vec handle operand1; still needs the header[2] data_ptr
+  # indirection. The comment claimed "raw" meant plain pointer + idx,
+  # but the LLVM counterpart also goes through header[2].
+  if kind == 31
+    var ptr = mir::mir_instr_get_operand1(instr)
+    var idx = mir::mir_instr_get_operand2(instr)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(ptr))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_i64_load(buf, 16)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(idx))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(buf, 8)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_MUL)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_ADD)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_i64_load(buf, 0)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # MIR_INDEX_STORE_RAW = 32 — same as MIR_INDEX_STORE but no bounds check.
+  if kind == 32
+    var ptr = mir::mir_instr_get_operand1(instr)
+    var idx = mir::mir_instr_get_operand2(instr)
+    var raw_store_args = mir::mir_instr_get_args(instr)
+    var val = raw_store_args[0]
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(ptr))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_i64_load(buf, 16)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(idx))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(buf, 8)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_MUL)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I64_ADD)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(val))
+    wasm_encode::wasm_emit_i64_store(buf, 0)
+    return
+  end
+
+  # MIR_LOAD_OFFSET = 19 — load from ptr + byte offset
+  # Encoding: slot1 = base pointer register, slot2 = field index
+  if kind == 19
+    var ptr = mir::mir_instr_get_slot1(instr)
+    var offset = mir::mir_instr_get_slot2(instr)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(ptr))
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_I32_WRAP_I64)
+    wasm_encode::wasm_emit_i64_load(buf, offset * 8)
+    wasm_encode::wasm_emit_byte(buf, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(buf, _wasm_reg_local(dest))
+    return
+  end
+
+  # Fallback for any unhandled kind — fail loudly rather than silently
+  # emitting 0 (R4.1: unimplemented backend path).
+  panic("WASM backend: MIR kind #{kind} not implemented (R4.1: unimplemented backend path)")
+end
+
+# =============================================================================
+# Function body emission with dispatch-loop control flow
+# =============================================================================
+
+## Find the index of a block handle in the blocks vector.
+def _wasm_find_block_idx(blocks: Vec, num_blocks: Int, handle: Int): Int
+  var i = 0
+  while i < num_blocks
+    if blocks[i] == handle
+      return i
+    end
+    i += 1
+  end
+  return 0
+end
+
+## Pre-scan a function for the max SSA register ID.
+def _wasm_max_reg_id(func: mir::MirFunc): Int
+  var max_id = 0
+  var blocks = mir::mir_func_get_blocks(func)
+  for bi in 0..blocks.size
+    var blk = blocks[bi]
+    var instrs = mir::mir_block_get_instructions(blk)
+    for ii in 0..instrs.size
+      var instr = instrs[ii]
+      var dest = mir::mir_instr_get_dest_id(instr)
+      if dest > max_id
+        max_id = dest
+      end
+    end
+    # Also check terminator data (register IDs for return values)
+    var term_data = mir::mir_block_get_term_data(blk)
+    if term_data > max_id and mir::mir_block_get_term_kind(blk) == 0
+      max_id = term_data
+    end
+  end
+  return max_id
+end
+
+## Emit a complete WASM function body from a MIR function.
+def _wasm_emit_func_body(prog: mir::MirProgram, func: mir::MirFunc): Vec<Int>
+  var body = vec_new<Int>()
+  var params = mir::mir_func_get_params(func)
+  var blocks = mir::mir_func_get_blocks(func)
+  var locals = mir::mir_func_get_locals(func)
+  var ret_is_void = _wasm_func_returns_void(func)
+  var num_blocks = blocks.size
+
+  # Set up local mapping
+  _wasm_reset_locals()
+  g_wasm_num_params = params.size
+  g_wasm_max_reg = _wasm_max_reg_id(func)
+
+  # Pre-register named locals
+  for li in 0..locals.size
+    _wasm_var_local(locals[li])
+  end
+
+  # Pre-scan ALL blocks for variable names used in STORE_VAR and PHI
+  # to ensure dispatch local doesn't collide with dynamically-added vars
+  for bi in 0..blocks.size
+    var blk = blocks[bi]
+    var instrs = mir::mir_block_get_instructions(blk)
+    for ii in 0..instrs.size
+      var instr = instrs[ii]
+      var ik = mir::mir_instr_get_kind(instr)
+      if ik == 4 or ik == 5 or ik == 18
+        _wasm_var_local(mir::mir_instr_get_var_name(instr))
+      end
+    end
+  end
+
+  # Pre-register parameter names as named locals so the count below covers
+  # the param-init copy emitted further down. Without this, params with no
+  # matching STORE_VAR get added later via _wasm_var_local() and overflow
+  # the declared local count → wasmtime rejects with "local index out of bounds".
+  for pi in 0..params.size
+    _wasm_var_local(params[pi])
+  end
+
+  # Total locals: SSA registers + named vars + dispatch target
+  var num_ssa = g_wasm_max_reg + 1
+  var num_vars = g_wasm_var_count
+  g_wasm_dispatch_local = g_wasm_num_params + num_ssa + num_vars
+
+  # Local declarations: group by type
+  # 2 groups: i64 locals (SSA + vars), i32 dispatch target
+  var num_i64_locals = num_ssa + num_vars
+  if num_blocks <= 1
+    # Single block: no dispatch needed
+    wasm_encode::wasm_emit_u32(body, 1)
+    wasm_encode::wasm_emit_u32(body, num_i64_locals)
+    wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_TYPE_I64)
+  else
+    wasm_encode::wasm_emit_u32(body, 2)
+    wasm_encode::wasm_emit_u32(body, num_i64_locals)
+    wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_TYPE_I64)
+    wasm_encode::wasm_emit_u32(body, 1)
+    wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_TYPE_I32)
+  end
+
+  # Initialize named variables from function parameters.
+  # The MIR doesn't contain STORE_VAR for params — the codegen layer
+  # must copy WASM params (locals 0..P-1) to named variable locals.
+  for pi in 0..params.size
+    var pname = params[pi]
+    var var_idx = _wasm_var_local(pname)
+    wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_LOCAL_GET)
+    wasm_encode::wasm_emit_u32(body, pi)  # WASM param local
+    wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_LOCAL_SET)
+    wasm_encode::wasm_emit_u32(body, var_idx)  # named variable local
+  end
+
+  if num_blocks == 0
+    # Empty function
+    if ret_is_void == 0
+      wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_I64_CONST)
+      wasm_encode::wasm_emit_i64(body, 0)
+    end
+    wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_END)
+    return body
+  end
+
+  if num_blocks == 1
+    # Single block: no dispatch loop needed
+    var blk = blocks[0]
+    var instrs = mir::mir_block_get_instructions(blk)
+    for ii in 0..instrs.size
+      _wasm_emit_instr(body, prog, instrs[ii])
+    end
+    # Terminator
+    var term_kind = mir::mir_block_get_term_kind(blk)
+    if term_kind == 0
+      var ret_reg = mir::mir_block_get_term_data(blk)
+      if ret_is_void == 0 and ret_reg >= 0
+        wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_LOCAL_GET)
+        wasm_encode::wasm_emit_u32(body, _wasm_reg_local(ret_reg))
+      end
+    end
+    wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_END)
+    return body
+  end
+
+  # Multi-block: dispatch loop
+  # Structure:
+  #   loop $dispatch
+  #     block $exit
+  #       block $b0
+  #         block $b1
+  #           ...
+  #           block $b(N-1)
+  #             local.get $dispatch
+  #             br_table <targets> $exit
+  #           end
+  #           ;; block N-1 code
+  #         end
+  #         ;; block N-2 code
+  #       end
+  #       ;; block 0 code
+  #     end ;; $exit
+  #   end ;; $dispatch
+
+  # Open: loop $dispatch
+  wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_LOOP)
+  wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_TYPE_VOID)
+
+  # Open: block $exit
+  wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_BLOCK)
+  wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_TYPE_VOID)
+
+  # Open all block constructs (outermost = b0, innermost = b(N-1))
+  for bi in 0..num_blocks
+    wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_BLOCK)
+    wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_TYPE_VOID)
+  end
+
+  # Dispatch: br_table
+  wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_LOCAL_GET)
+  wasm_encode::wasm_emit_u32(body, g_wasm_dispatch_local)
+  wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_BR_TABLE)
+  wasm_encode::wasm_emit_u32(body, num_blocks)  # num targets
+  for bi in 0..num_blocks
+    # Target for block bi = N - 1 - bi (from innermost nesting)
+    wasm_encode::wasm_emit_u32(body, num_blocks - 1 - bi)
+  end
+  wasm_encode::wasm_emit_u32(body, num_blocks)  # default → $exit
+
+  # Emit blocks in reverse order (innermost first)
+  var bi = num_blocks - 1
+  while bi >= 0
+    # Close the block construct for this block
+    wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_END)
+
+    # Emit block bi's instructions
+    var blk = blocks[bi]
+    var instrs = mir::mir_block_get_instructions(blk)
+    for ii in 0..instrs.size
+      _wasm_emit_instr(body, prog, instrs[ii])
+    end
+
+    # Emit terminator
+    var term_kind = mir::mir_block_get_term_kind(blk)
+    var dispatch_depth = bi + 1  # depth to $dispatch loop from block bi
+
+    # TERM_RETURN = 0
+    if term_kind == 0
+      var ret_reg = mir::mir_block_get_term_data(blk)
+      if ret_is_void == 0 and ret_reg >= 0
+        wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_LOCAL_GET)
+        wasm_encode::wasm_emit_u32(body, _wasm_reg_local(ret_reg))
+        wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_RETURN)
+      else
+        wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_RETURN)
+      end
+    end
+
+    # TERM_JUMP = 1
+    if term_kind == 1
+      var target_handle = mir::mir_block_get_term_data(blk)
+      var target_idx = _wasm_find_block_idx(blocks, num_blocks, target_handle)
+      wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_I32_CONST)
+      wasm_encode::wasm_emit_i32(body, target_idx)
+      wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_LOCAL_SET)
+      wasm_encode::wasm_emit_u32(body, g_wasm_dispatch_local)
+      wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_BR)
+      wasm_encode::wasm_emit_u32(body, dispatch_depth)
+    end
+
+    # TERM_BRANCH = 2
+    if term_kind == 2
+      var cond_reg = mir::mir_block_get_term_data(blk)
+      var true_idx = _wasm_find_block_idx(blocks, num_blocks, mir::mir_block_get_branch_true(blk))
+      var false_idx = _wasm_find_block_idx(blocks, num_blocks, mir::mir_block_get_branch_false(blk))
+      # if cond: dispatch = true_idx else dispatch = false_idx
+      wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_LOCAL_GET)
+      wasm_encode::wasm_emit_u32(body, _wasm_reg_local(cond_reg))
+      wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_I32_WRAP_I64)
+      wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_IF)
+      wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_TYPE_VOID)
+      wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_I32_CONST)
+      wasm_encode::wasm_emit_i32(body, true_idx)
+      wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_LOCAL_SET)
+      wasm_encode::wasm_emit_u32(body, g_wasm_dispatch_local)
+      wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_ELSE)
+      wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_I32_CONST)
+      wasm_encode::wasm_emit_i32(body, false_idx)
+      wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_LOCAL_SET)
+      wasm_encode::wasm_emit_u32(body, g_wasm_dispatch_local)
+      wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_END)
+      wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_BR)
+      wasm_encode::wasm_emit_u32(body, dispatch_depth)
+    end
+
+    # TERM_UNREACHABLE = 3
+    if term_kind == 3
+      wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_UNREACHABLE)
+    end
+
+    bi = bi - 1
+  end
+
+  # Close $exit block
+  wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_END)
+  # Close $dispatch loop
+  wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_END)
+
+  # Fallthrough: return 0 (shouldn't reach here)
+  if ret_is_void == 0
+    wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_I64_CONST)
+    wasm_encode::wasm_emit_i64(body, 0)
+  end
+  wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_END)
+  return body
+end
+
+## Build the Code section from function bodies.
+def _wasm_build_code_section(bodies: Vec<Vec<Int>>): Vec<Int>
+  var content = vec_new<Int>()
+  wasm_encode::wasm_emit_u32(content, bodies.size)
+  for i in 0..bodies.size
+    var body = bodies[i]
+    wasm_encode::wasm_emit_u32(content, vec_size(body))
+    wasm_encode::wasm_emit_bytes(content, body)
+  end
+  var section = vec_new<Int>()
+  wasm_encode::wasm_emit_section(section, wasm_encode::WASM_SECTION_CODE, content)
+  return section
+end
+
+## Emit _start wrapper: calls qz_main, passes result to proc_exit.
+def _wasm_emit_start_body(main_func_idx: Int, proc_exit_idx: Int): Vec<Int>
+  var body = vec_new<Int>()
+  wasm_encode::wasm_emit_u32(body, 0)  # 0 local groups
+  # Call __qz_module_init first if the MIR emitted one. This is what
+  # inits module-level globals that have non-const initializers (e.g.
+  # `var g = vec_new<Int>()`). LLVM backend wires it into qz_main; on
+  # WASM we invoke it directly before main. Without this, every
+  # `var x = vec_new<Int>()` global reads from a zero handle, which
+  # the Vec helpers happily treat as an address — producing aliased
+  # writes across every global Vec in the program. (Observable symptom:
+  # chip8.qz's `g_display` reads returned the `g_ram` font bytes because
+  # both globals resolved to the same data region.)
+  var init_idx = wasm_runtime::_wasm_get_func_idx("__qz_module_init")
+  if init_idx >= 0
+    wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_CALL)
+    wasm_encode::wasm_emit_u32(body, init_idx)
+    # __qz_module_init returns i64 (always 0) — drop it to keep the
+    # stack balanced; we don't need the value and the next i64 op
+    # would push one of its own.
+    wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_DROP)
+  end
+  # Call qz_main → returns i64
+  wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_CALL)
+  wasm_encode::wasm_emit_u32(body, main_func_idx)
+  # Wrap i64 → i32 for proc_exit
+  wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_I32_WRAP_I64)
+  # Call proc_exit
+  wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_CALL)
+  wasm_encode::wasm_emit_u32(body, proc_exit_idx)
+  wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_UNREACHABLE)
+  wasm_encode::wasm_emit_byte(body, wasm_encode::WASM_END)
+  return body
+end
+
+# =============================================================================
+# Hex encoding (for stdout output)
+# =============================================================================
+
+def _wasm_hex_char(nibble: Int): Int
+  if nibble < 10
+    return 48 + nibble   # '0' + nibble
+  end
+  return 97 + nibble - 10  # 'a' + (nibble - 10)
+end
+
+## Convert bytes to hex string for stdout output.
+def _wasm_to_hex(bytes: Vec<Int>): String
+  var sb = sb_new()
+  var i = 0
+  var len = vec_size(bytes)
+  while i < len
+    var b = vec_get(bytes, i)
+    sb_append_char(sb, _wasm_hex_char(b / 16))
+    sb_append_char(sb, _wasm_hex_char(b % 16))
+    i += 1
+  end
+  return sb_to_string(sb)
+end
+
+# =============================================================================
+# Binary file output
+# =============================================================================
+
+## Write raw bytes to a file using builtin open_file/fwrite/close_file.
+def _wasm_write_binary(path: String, bytes: Vec<Int>): Int
+  var len = vec_size(bytes)
+  var buf = mem_alloc(len)
+  var i = 0
+  while i < len
+    ptr_write_byte(ptr_add(buf, i), vec_get(bytes, i))
+    i += 1
+  end
+  var fp = open_file(path, "wb")
+  if fp == 0
+    qz_free(buf)
+    return -1
+  end
+  var written = fwrite(fp, buf, len)
+  close_file(fp)
+  qz_free(buf)
+  return written
+end
+
+# =============================================================================
+# Main entry point
+# =============================================================================
+
+## Output path for binary .wasm file. Set by the driver before calling compile.
+var g_wasm_output_path = ""
+
+# =============================================================================
+# Intrinsic pre-scan (uses wasm_runtime for synth classification)
+# =============================================================================
+
+## Pre-scan MIR for all intrinsic calls. Synthesized intrinsics get
+## built-in function bodies; others become env:: imports.
+def _wasm_prescan_intrinsics(prog: mir::MirProgram, proc_exit_idx: Int, fd_write_idx: Int, heap_ptr_global: Int): Void
+  # Collect all unique intrinsic names
+  var needed = vec_new<String>()
+  var funcs = mir::mir_get_functions(prog)
+  for fi in 0..funcs.size
+    var func = funcs[fi]
+    var blocks = mir::mir_func_get_blocks(func)
+    for bi in 0..blocks.size
+      var blk = blocks[bi]
+      var instrs = mir::mir_block_get_instructions(blk)
+      for ii in 0..instrs.size
+        var instr = instrs[ii]
+        var kind = mir::mir_instr_get_kind(instr)
+        if kind == 9
+          var raw_name = mir::mir_instr_get_func_name(instr)
+          # Resolve unified map_* names via elem_type (slot2) so the synth
+          # registry uses backend-specific hashmap_*/intmap_* names.
+          var _elem_slot = mir::mir_instr_get_slot2(instr)
+          var _elem_type = ""
+          if _elem_slot != 0
+            _elem_type = as_string(_elem_slot)
+          end
+          var name = wasm_runtime::_wasm_resolve_map_name(raw_name, _elem_type)
+          name = wasm_runtime::_wasm_resolve_set_name(name, _elem_type)
+          if wasm_runtime::_wasm_get_func_idx(name) < 0
+            # Check if already in needed list
+            var found = 0
+            for ni in 0..needed.size
+              if needed[ni] == name
+                found = 1
+              end
+            end
+            if found == 0
+              needed.push(name)
+            end
+          end
+        end
+        if kind == 12 or kind == 29
+          if wasm_runtime::_wasm_get_func_idx("alloc") < 0
+            var found = 0
+            for ni in 0..needed.size
+              if needed[ni] == "alloc"
+                found = 1
+              end
+            end
+            if found == 0
+              needed.push("alloc")
+            end
+          end
+        end
+      end
+    end
+  end
+
+  # Register each: synthesized → deferred function body, other → import
+  for ni in 0..needed.size
+    var name = needed[ni]
+    if wasm_runtime::_wasm_get_func_idx(name) < 0 and wasm_runtime::_wasm_is_synthesized(name)
+      # Will be defined as a function later (index assigned after MIR funcs)
+      wasm_runtime::wasm_rt_register_synth(name)
+    elsif wasm_runtime::_wasm_get_func_idx(name) < 0
+      # Import from env
+      # Determine arity by scanning all uses
+      var arity = 1
+      var has_result = 1
+      for fi in 0..funcs.size
+        var func = funcs[fi]
+        var blocks = mir::mir_func_get_blocks(func)
+        for bi in 0..blocks.size
+          var blk = blocks[bi]
+          var instrs = mir::mir_block_get_instructions(blk)
+          for ii in 0..instrs.size
+            var instr = instrs[ii]
+            if mir::mir_instr_get_kind(instr) == 9
+              var raw_inner = mir::mir_instr_get_func_name(instr)
+              var elem_inner_slot = mir::mir_instr_get_slot2(instr)
+              var elem_inner = ""
+              if elem_inner_slot != 0
+                elem_inner = as_string(elem_inner_slot)
+              end
+              var resolved_inner = wasm_runtime::_wasm_resolve_map_name(raw_inner, elem_inner)
+              resolved_inner = wasm_runtime::_wasm_resolve_set_name(resolved_inner, elem_inner)
+              if resolved_inner == name
+                arity = mir::mir_instr_get_args(instr).size
+                if mir::mir_instr_get_dest_type(instr) == 3
+                  has_result = 0
+                end
+              end
+            end
+          end
+        end
+      end
+      var idx = _wasm_add_import("env", name, arity, has_result)
+      wasm_runtime::_wasm_set_func_idx(name, idx)
+    end
+  end
+end
+
+## Generate WASM binary from MIR program.
+## If g_wasm_output_path is set, writes .wasm file and returns status message.
+## Otherwise returns hex-encoded bytes for stdout.
+## Build Global section: heap pointer (mutable i64) + user globals.
+def _wasm_build_global_section(initial_heap: Int, prog: mir::MirProgram): Vec<Int>
+  var global_names = mir::mir_get_global_names(prog)
+  var global_inits = mir::mir_get_global_inits(prog)
+  var global_str_inits = mir::mir_get_global_str_inits(prog)
+  var num_user_globals = global_names.size
+
+  var content = vec_new<Int>()
+  wasm_encode::wasm_emit_u32(content, 1 + num_user_globals)
+
+  # Global 0: heap pointer (mutable i64)
+  wasm_encode::wasm_emit_byte(content, wasm_encode::WASM_TYPE_I64)
+  wasm_encode::wasm_emit_byte(content, 1)  # mutable
+  wasm_encode::wasm_emit_byte(content, wasm_encode::WASM_I64_CONST)
+  wasm_encode::wasm_emit_i64(content, initial_heap)
+  wasm_encode::wasm_emit_byte(content, wasm_encode::WASM_END)
+
+  # User globals: all mutable i64, init to integer value or 0
+  for gi in 0..num_user_globals
+    var gname = global_names[gi]
+    var gidx = gi + 1  # offset by heap pointer
+    _wasm_add_global(gname, gidx)
+    wasm_encode::wasm_emit_byte(content, wasm_encode::WASM_TYPE_I64)
+    wasm_encode::wasm_emit_byte(content, 1)  # mutable
+    wasm_encode::wasm_emit_byte(content, wasm_encode::WASM_I64_CONST)
+    # Use string initializer if available (pointer to data section)
+    if gi < global_str_inits.size and str_byte_len(global_str_inits[gi]) > 0
+      var str_offset = _wasm_add_string(global_str_inits[gi])
+      wasm_encode::wasm_emit_i64(content, str_offset)
+    elsif gi < global_inits.size
+      wasm_encode::wasm_emit_i64(content, global_inits[gi])
+    else
+      wasm_encode::wasm_emit_i64(content, 0)
+    end
+    wasm_encode::wasm_emit_byte(content, wasm_encode::WASM_END)
+  end
+
+  var section = vec_new<Int>()
+  wasm_encode::wasm_emit_section(section, wasm_encode::WASM_SECTION_GLOBAL, content)
+  return section
+end
+
+def cg_wasm_codegen(prog: mir::MirProgram, all_funcs: Vec<ResolverEntry>): String
+  # Reset all state
+  _wasm_reset_pool()
+  _wasm_reset_types()
+  _wasm_reset_imports()
+  wasm_runtime::_wasm_reset_func_map()
+  wasm_runtime::_wasm_reset_synth()
+  _wasm_reset_table()
+  _wasm_reset_globals()
+
+  # Pre-scan strings (sets g_wasm_data_offset to end of string data)
+  _wasm_prescan_strings(prog)
+  var heap_ptr_global = 0  # global index 0
+
+  # Register WASI imports
+  var proc_exit_type = _wasm_get_type_idx_i32(1, 0)
+  var proc_exit_idx = _wasm_add_import_typed("wasi_snapshot_preview1", "proc_exit", proc_exit_type)
+  wasm_runtime::_wasm_set_func_idx("proc_exit", proc_exit_idx)
+
+  # fd_write: (fd: i32, iovs: i32, iovs_len: i32, nwritten: i32) -> i32
+  var fd_write_type = _wasm_get_type_idx_i32(4, 1)
+  var fd_write_idx = _wasm_add_import_typed("wasi_snapshot_preview1", "fd_write", fd_write_type)
+  wasm_runtime::_wasm_set_func_idx("fd_write", fd_write_idx)
+
+  # Pre-scan intrinsics — synthesized become defined functions, rest become imports
+  _wasm_prescan_intrinsics(prog, proc_exit_idx, fd_write_idx, heap_ptr_global)
+
+  # Register internal helper functions (memcpy, memset, realloc, alloc_str)
+  wasm_runtime::_wasm_register_internal_helpers()
+
+  # Pre-scan function references for indirect call table
+  _wasm_prescan_func_refs(prog)
+
+  # Assign function indices to all MIR functions
+  # Order: imports | MIR functions | synthesized functions | _start
+  var mir_funcs = mir::mir_get_functions(prog)
+  var func_type_indices = vec_new<Int>()
+  var main_func_idx = -1
+
+  for fi in 0..mir_funcs.size
+    var func = mir_funcs[fi]
+    var name = mir::mir_func_get_name(func)
+    var params = mir::mir_func_get_params(func)
+    var has_result = 1
+    if _wasm_func_returns_void(func) == 1
+      has_result = 0
+      _wasm_mark_void_func(name)
+    end
+    var type_idx = _wasm_get_type_idx(params.size, has_result)
+    func_type_indices.push(type_idx)
+    var func_idx = g_wasm_import_count + fi
+    wasm_runtime::_wasm_set_func_idx(name, func_idx)
+    if name == "main"
+      main_func_idx = func_idx
+    end
+    # Record user-requested WASM exports (@export def foo()) for the
+    # export section emitter. Index is looked up by name later.
+    if mir::mir_func_is_export(func)
+      g_wasm_user_exports.push(name)
+    end
+  end
+
+  # Assign indices to synthesized functions (after MIR functions)
+  var synth_base = g_wasm_import_count + mir_funcs.size
+  for si in 0..wasm_runtime::wasm_rt_get_synth_count()
+    var sname = wasm_runtime::wasm_rt_get_synth_name(si)
+    var synth_idx = synth_base + si
+    wasm_runtime::_wasm_set_func_idx(sname, synth_idx)
+    var synth_info = wasm_runtime::_wasm_synth_type_info(sname)
+    if synth_info % 2 == 0
+      _wasm_mark_void_func(sname)
+    end
+    func_type_indices.push(_wasm_get_type_idx(synth_info / 2, synth_info % 2))
+  end
+
+  # Resolve internal helper function indices (now that synth indices are assigned)
+  wasm_runtime::wasm_rt_set_helper_indices(wasm_runtime::_wasm_get_func_idx("__wasm_memcpy"), wasm_runtime::_wasm_get_func_idx("__wasm_memset"), wasm_runtime::_wasm_get_func_idx("__wasm_realloc"), wasm_runtime::_wasm_get_func_idx("__wasm_alloc_str"))
+
+  # _start wrapper: defined after synthesized functions
+  var start_type = _wasm_get_type_idx(0, 0)
+  func_type_indices.push(start_type)
+  var start_func_idx = synth_base + wasm_runtime::wasm_rt_get_synth_count()
+
+  # Resolve function table entries now that all indices are assigned
+  _wasm_resolve_table()
+
+  # Build module sections
+  var module = vec_new<Int>()
+  wasm_encode::wasm_emit_header(module)
+  wasm_encode::wasm_emit_bytes(module, _wasm_build_type_section())
+  wasm_encode::wasm_emit_bytes(module, _wasm_build_import_section())
+  wasm_encode::wasm_emit_bytes(module, _wasm_build_function_section(func_type_indices))
+  wasm_encode::wasm_emit_bytes(module, _wasm_build_table_section())
+  wasm_encode::wasm_emit_bytes(module, _wasm_build_memory_section())
+  wasm_encode::wasm_emit_bytes(module, _wasm_build_global_section(g_wasm_data_offset, prog))
+  wasm_encode::wasm_emit_bytes(module, _wasm_build_export_section(start_func_idx))
+  wasm_encode::wasm_emit_bytes(module, _wasm_build_element_section())
+
+  # Code section: MIR functions + synthesized functions + _start
+  var bodies = vec_new<Vec<Int>>()
+  for fi in 0..mir_funcs.size
+    bodies.push(_wasm_emit_func_body(prog, mir_funcs[fi]))
+  end
+
+  # Emit synthesized function bodies (dispatched via _wasm_emit_synth_body)
+  for si in 0..wasm_runtime::wasm_rt_get_synth_count()
+    var sname = wasm_runtime::wasm_rt_get_synth_name(si)
+    bodies.push(wasm_runtime::_wasm_emit_synth_body(sname, proc_exit_idx, fd_write_idx, heap_ptr_global))
+  end
+
+  # _start wrapper
+  if main_func_idx >= 0
+    bodies.push(_wasm_emit_start_body(main_func_idx, proc_exit_idx))
+  else
+    var fallback = vec_new<Int>()
+    wasm_encode::wasm_emit_u32(fallback, 0)
+    wasm_encode::wasm_emit_byte(fallback, wasm_encode::WASM_I32_CONST)
+    wasm_encode::wasm_emit_i32(fallback, 1)
+    wasm_encode::wasm_emit_byte(fallback, wasm_encode::WASM_CALL)
+    wasm_encode::wasm_emit_u32(fallback, proc_exit_idx)
+    wasm_encode::wasm_emit_byte(fallback, wasm_encode::WASM_UNREACHABLE)
+    wasm_encode::wasm_emit_byte(fallback, wasm_encode::WASM_END)
+    bodies.push(fallback)
+  end
+  wasm_encode::wasm_emit_bytes(module, _wasm_build_code_section(bodies))
+
+  # Data section: string constants
+  wasm_encode::wasm_emit_bytes(module, _wasm_build_data_section())
+
+  # Output
+  if str_byte_len(g_wasm_output_path) > 0
+    var written = _wasm_write_binary(g_wasm_output_path, module)
+    if written < 0
+      eputs("error: failed to write #{g_wasm_output_path}")
+      return ""
+    end
+    return "wasm:#{g_wasm_output_path} (#{vec_size(module)} bytes)"
+  end
+
+  # No output path: return hex dump
+  return _wasm_to_hex(module)
+end
+
+# =============================================================================
+# WAT Text Output (--backend wasm-text)
+# =============================================================================
+
+## Emit a single MIR instruction as WAT text comment + instructions.
+def _wat_emit_instr(out: Int, prog: mir::MirProgram, instr: mir::MirInstr, indent: String): Void
+  var kind = mir::mir_instr_get_kind(instr)
+  var dest = mir::mir_instr_get_dest_id(instr)
+  if kind == 0
+    return
+  end
+
+  if kind == 1
+    var val = mir::mir_instr_get_int_val(instr)
+    sb_append(out, "#{indent}i64.const #{val}\n")
+    sb_append(out, "#{indent}local.set $v#{dest}\n")
+    return
+  end
+  if kind == 2
+    var val = mir::mir_instr_get_int_val(instr)
+    sb_append(out, "#{indent}i64.const #{val}\n")
+    sb_append(out, "#{indent}local.set $v#{dest}\n")
+    return
+  end
+  if kind == 3
+    var str_val = mir::mir_instr_get_string_val(instr)
+    var offset = _wasm_add_string(str_val)
+    sb_append(out, "#{indent};; string \"#{str_val}\"\n")
+    sb_append(out, "#{indent}i64.const #{offset}\n")
+    sb_append(out, "#{indent}local.set $v#{dest}\n")
+    return
+  end
+  if kind == 4
+    var var_name = mir::mir_instr_get_var_name(instr)
+    var slot1 = mir::mir_instr_get_slot1(instr)
+    if slot1 == 1
+      var gidx = _wasm_get_global_idx(var_name)
+      sb_append(out, "#{indent}global.get #{gidx} ;; #{var_name}\n")
+    else
+      sb_append(out, "#{indent}local.get $#{var_name}\n")
+    end
+    sb_append(out, "#{indent}local.set $v#{dest}\n")
+    return
+  end
+  if kind == 5
+    var var_name = mir::mir_instr_get_var_name(instr)
+    var src = mir::mir_instr_get_operand2(instr)
+    var slot1 = mir::mir_instr_get_slot1(instr)
+    sb_append(out, "#{indent}local.get $v#{src}\n")
+    if slot1 == 1
+      var gidx = _wasm_get_global_idx(var_name)
+      sb_append(out, "#{indent}global.set #{gidx} ;; #{var_name}\n")
+    else
+      sb_append(out, "#{indent}local.set $#{var_name}\n")
+    end
+    return
+  end
+  if kind == 6
+    var op = mir::mir_instr_get_op(instr)
+    var left = mir::mir_instr_get_operand1(instr)
+    var right = mir::mir_instr_get_operand2(instr)
+    var op_name = "i64.add"
+    if op == op_constants::OP_SUB
+      op_name = "i64.sub"
+    elsif op == op_constants::OP_MUL
+      op_name = "i64.mul"
+    elsif op == op_constants::OP_DIV
+      op_name = "i64.div_s"
+    elsif op == op_constants::OP_MOD
+      op_name = "i64.rem_s"
+    elsif op == op_constants::OP_EQ
+      op_name = "i64.eq+extend"
+    elsif op == op_constants::OP_NE
+      op_name = "i64.ne+extend"
+    elsif op == op_constants::OP_LT
+      op_name = "i64.lt_s+extend"
+    elsif op == op_constants::OP_LE
+      op_name = "i64.le_s+extend"
+    elsif op == op_constants::OP_GT
+      op_name = "i64.gt_s+extend"
+    elsif op == op_constants::OP_GE
+      op_name = "i64.ge_s+extend"
+    end
+    sb_append(out, "#{indent}local.get $v#{left}\n")
+    sb_append(out, "#{indent}local.get $v#{right}\n")
+    sb_append(out, "#{indent}#{op_name}\n")
+    sb_append(out, "#{indent}local.set $v#{dest}\n")
+    return
+  end
+  if kind == 8
+    var func_name = mir::mir_instr_get_func_name(instr)
+    var args = mir::mir_instr_get_args(instr)
+    for ai in 0..args.size
+      sb_append(out, "#{indent}local.get $v#{args[ai]}\n")
+    end
+    sb_append(out, "#{indent}call $#{func_name}\n")
+    if _wasm_is_void_call(func_name)
+      sb_append(out, "#{indent}i64.const 0 ;; void call fixup\n")
+    end
+    sb_append(out, "#{indent}local.set $v#{dest}\n")
+    return
+  end
+  if kind == 9
+    var func_name = mir::mir_instr_get_func_name(instr)
+    # Resolve unified map_* names to backend hashmap_*/intmap_* via elem_type (slot2).
+    var _elem_slot = mir::mir_instr_get_slot2(instr)
+    var _elem_type = ""
+    if _elem_slot != 0
+      _elem_type = as_string(_elem_slot)
+    end
+    func_name = wasm_runtime::_wasm_resolve_map_name(func_name, _elem_type)
+    func_name = wasm_runtime::_wasm_resolve_set_name(func_name, _elem_type)
+    var args = mir::mir_instr_get_args(instr)
+    for ai in 0..args.size
+      sb_append(out, "#{indent}local.get $v#{args[ai]}\n")
+    end
+    sb_append(out, "#{indent}call $#{func_name} ;; intrinsic\n")
+    if _wasm_is_void_call(func_name)
+      sb_append(out, "#{indent}i64.const 0 ;; void call fixup\n")
+    end
+    sb_append(out, "#{indent}local.set $v#{dest}\n")
+    return
+  end
+  if kind == 10
+    var func_name = mir::mir_instr_get_func_name(instr)
+    var table_idx = _wasm_get_table_entry(func_name)
+    sb_append(out, "#{indent}i64.const #{table_idx * 2} ;; func_ref #{func_name}\n")
+    sb_append(out, "#{indent}local.set $v#{dest}\n")
+    return
+  end
+  if kind == 11
+    var fn_ptr = mir::mir_instr_get_operand1(instr)
+    var args = mir::mir_instr_get_args(instr)
+    sb_append(out, "#{indent};; call_indirect v#{fn_ptr} (#{args.size} args)\n")
+    sb_append(out, "#{indent}local.get $v#{fn_ptr}\n")
+    sb_append(out, "#{indent};; [tagged dispatch: closure/plain]\n")
+    sb_append(out, "#{indent}local.set $v#{dest}\n")
+    return
+  end
+  if kind == 12 or kind == 29
+    var size = mir::mir_instr_get_int_val(instr)
+    sb_append(out, "#{indent}i64.const #{size * 8}\n")
+    sb_append(out, "#{indent}call $alloc\n")
+    sb_append(out, "#{indent}local.set $v#{dest}\n")
+    return
+  end
+  if kind == 14
+    var ptr = mir::mir_instr_get_operand1(instr)
+    var val = mir::mir_instr_get_operand2(instr)
+    var offset = mir::mir_instr_get_slot1(instr)
+    sb_append(out, "#{indent}local.get $v#{ptr}\n")
+    sb_append(out, "#{indent}i32.wrap_i64\n")
+    sb_append(out, "#{indent}local.get $v#{val}\n")
+    sb_append(out, "#{indent}i64.store offset=#{offset * 8}\n")
+    return
+  end
+  if kind == 19
+    var ptr = mir::mir_instr_get_slot1(instr)
+    var offset = mir::mir_instr_get_slot2(instr)
+    sb_append(out, "#{indent}local.get $v#{ptr}\n")
+    sb_append(out, "#{indent}i32.wrap_i64\n")
+    sb_append(out, "#{indent}i64.load offset=#{offset * 8}\n")
+    sb_append(out, "#{indent}local.set $v#{dest}\n")
+    return
+  end
+  # Default: comment with kind number
+  sb_append(out, "#{indent};; MIR kind=#{kind} -> v#{dest}\n")
+  sb_append(out, "#{indent}i64.const 0\n")
+  sb_append(out, "#{indent}local.set $v#{dest}\n")
+end
+
+## Generate WAT text from MIR program.
+def cg_wasm_text_codegen(prog: mir::MirProgram, all_funcs: Vec<ResolverEntry>): String
+  # Reset state (same as binary path)
+  _wasm_reset_pool()
+  _wasm_reset_types()
+  _wasm_reset_imports()
+  wasm_runtime::_wasm_reset_func_map()
+  wasm_runtime::_wasm_reset_synth()
+  _wasm_reset_table()
+  _wasm_reset_globals()
+
+  _wasm_prescan_strings(prog)
+
+  # Register WASI imports
+  var proc_exit_type = _wasm_get_type_idx_i32(1, 0)
+  var proc_exit_idx = _wasm_add_import_typed("wasi_snapshot_preview1", "proc_exit", proc_exit_type)
+  wasm_runtime::_wasm_set_func_idx("proc_exit", proc_exit_idx)
+  var fd_write_type = _wasm_get_type_idx_i32(4, 1)
+  var fd_write_idx = _wasm_add_import_typed("wasi_snapshot_preview1", "fd_write", fd_write_type)
+  wasm_runtime::_wasm_set_func_idx("fd_write", fd_write_idx)
+
+  var heap_ptr_global = 0
+  _wasm_prescan_intrinsics(prog, proc_exit_idx, fd_write_idx, heap_ptr_global)
+  _wasm_prescan_func_refs(prog)
+
+  # Register internal helpers (same as binary path)
+  wasm_runtime::_wasm_register_internal_helpers()
+
+  # Assign function indices (same as binary path)
+  var mir_funcs = mir::mir_get_functions(prog)
+  for fi in 0..mir_funcs.size
+    var func = mir_funcs[fi]
+    var name = mir::mir_func_get_name(func)
+    var params = mir::mir_func_get_params(func)
+    var has_result = 1
+    if _wasm_func_returns_void(func) == 1
+      has_result = 0
+      _wasm_mark_void_func(name)
+    end
+    _wasm_get_type_idx(params.size, has_result)
+    wasm_runtime::_wasm_set_func_idx(name, g_wasm_import_count + fi)
+  end
+  var synth_base = g_wasm_import_count + mir_funcs.size
+  for si in 0..wasm_runtime::wasm_rt_get_synth_count()
+    var sname = wasm_runtime::wasm_rt_get_synth_name(si)
+    wasm_runtime::_wasm_set_func_idx(sname, synth_base + si)
+    var synth_info = wasm_runtime::_wasm_synth_type_info(sname)
+    if synth_info % 2 == 0
+      _wasm_mark_void_func(sname)
+    end
+  end
+  _wasm_resolve_table()
+
+  # Build globals
+  var global_names = mir::mir_get_global_names(prog)
+  for gi in 0..global_names.size
+    _wasm_add_global(global_names[gi], gi + 1)
+  end
+
+  # Emit WAT text
+  var out = sb_new()
+  sb_append(out, "(module\n")
+
+  # Imports
+  for i in 0..g_wasm_import_count
+    sb_append(out, "  (import \"#{g_wasm_import_module[i]}\" \"#{g_wasm_import_names[i]}\" (func $#{g_wasm_import_names[i]}")
+    sb_append(out, "))\n")
+  end
+
+  # Memory
+  sb_append(out, "  (memory (export \"memory\") 1)\n")
+
+  # Globals
+  sb_append(out, "  (global $heap_ptr (mut i64) (i64.const #{g_wasm_data_offset}))\n")
+  for gi in 0..global_names.size
+    sb_append(out, "  (global $g_#{global_names[gi]} (mut i64) (i64.const 0))\n")
+  end
+
+  # Table
+  if g_wasm_table_count > 0
+    sb_append(out, "  (table #{g_wasm_table_count} funcref)\n")
+    sb_append(out, "  (elem (i32.const 0)")
+    for i in 0..g_wasm_table_count
+      sb_append(out, " $#{g_wasm_table_names[i]}")
+    end
+    sb_append(out, ")\n")
+  end
+
+  # Functions
+  for fi in 0..mir_funcs.size
+    var func = mir_funcs[fi]
+    var name = mir::mir_func_get_name(func)
+    var params = mir::mir_func_get_params(func)
+    var blocks = mir::mir_func_get_blocks(func)
+    var ret_is_void = _wasm_func_returns_void(func)
+
+    sb_append(out, "  (func $#{name}")
+    for pi in 0..params.size
+      sb_append(out, " (param $#{params[pi]} i64)")
+    end
+    if ret_is_void == 0
+      sb_append(out, " (result i64)")
+    end
+    sb_append(out, "\n")
+
+    # Locals
+    _wasm_reset_locals()
+    g_wasm_num_params = params.size
+    g_wasm_max_reg = _wasm_max_reg_id(func)
+    var locals = mir::mir_func_get_locals(func)
+    for li in 0..locals.size
+      _wasm_var_local(locals[li])
+    end
+    for bi in 0..blocks.size
+      var blk = blocks[bi]
+      var instrs = mir::mir_block_get_instructions(blk)
+      for ii in 0..instrs.size
+        var instr = instrs[ii]
+        var ik = mir::mir_instr_get_kind(instr)
+        if ik == 4 or ik == 5 or ik == 18
+          _wasm_var_local(mir::mir_instr_get_var_name(instr))
+        end
+      end
+    end
+
+    # Declare locals
+    var num_ssa = g_wasm_max_reg + 1
+    for ri in 0..num_ssa
+      sb_append(out, "    (local $v#{ri} i64)\n")
+    end
+    for vi in 0..g_wasm_var_count
+      sb_append(out, "    (local $#{g_wasm_var_names[vi]} i64)\n")
+    end
+    if blocks.size > 1
+      sb_append(out, "    (local $dispatch i32)\n")
+    end
+
+    # Param init
+    for pi in 0..params.size
+      sb_append(out, "    local.get $#{params[pi]}\n")
+      sb_append(out, "    local.set $#{params[pi]}\n")
+    end
+
+    # Blocks
+    for bi in 0..blocks.size
+      var blk = blocks[bi]
+      sb_append(out, "    ;; block #{bi}\n")
+      var instrs = mir::mir_block_get_instructions(blk)
+      for ii in 0..instrs.size
+        _wat_emit_instr(out, prog, instrs[ii], "    ")
+      end
+      # Terminator
+      var term_kind = mir::mir_block_get_term_kind(blk)
+      if term_kind == 0
+        var ret_reg = mir::mir_block_get_term_data(blk)
+        if ret_is_void == 0 and ret_reg >= 0
+          sb_append(out, "    local.get $v#{ret_reg}\n")
+        end
+        sb_append(out, "    return\n")
+      elsif term_kind == 1
+        sb_append(out, "    ;; jump -> block\n")
+      elsif term_kind == 2
+        var cond_reg = mir::mir_block_get_term_data(blk)
+        sb_append(out, "    ;; branch v#{cond_reg} -> true/false\n")
+      elsif term_kind == 3
+        sb_append(out, "    unreachable\n")
+      end
+    end
+
+    # Fallthrough return
+    if ret_is_void == 0
+      sb_append(out, "    i64.const 0\n")
+    end
+    sb_append(out, "  )\n\n")
+  end
+
+  # Synthesized functions (just stubs in WAT)
+  for si in 0..wasm_runtime::wasm_rt_get_synth_count()
+    sb_append(out, "  (func $#{wasm_runtime::wasm_rt_get_synth_name(si)} ;; synthesized\n")
+    sb_append(out, "    ;; [built-in implementation]\n")
+    sb_append(out, "  )\n")
+  end
+
+  # Export _start
+  sb_append(out, "  (func $_start (export \"_start\")\n")
+  sb_append(out, "    call $main\n")
+  sb_append(out, "    i32.wrap_i64\n")
+  sb_append(out, "    call $proc_exit\n")
+  sb_append(out, "    unreachable\n")
+  sb_append(out, "  )\n")
+
+  # String data
+  for si in 0..g_wasm_string_count
+    var str_val = g_wasm_strings[si]
+    var data_offset = g_wasm_string_offsets[si]
+    sb_append(out, "  ;; data @#{data_offset}: \"#{str_val}\"\n")
+  end
+
+  sb_append(out, ")\n")
+  return sb_to_string(out)
+end

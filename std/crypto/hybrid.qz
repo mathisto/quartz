@@ -1,0 +1,236 @@
+## std/crypto/hybrid — TLS 1.3 X25519MLKEM768 hybrid KEM (NET.3c).
+##
+## Per draft-ietf-tls-ecdhe-mlkem-04, IANA Supported Group codepoint 0x11EC.
+## Production-deployed at scale (Cloudflare default for client connections,
+## Chrome 124+, Apple iMessage PQ3, Signal PQXDH).
+##
+## Wire format (the catch is the concatenation order — §4.1 of the draft
+## REVERSES the framework default to put the FIPS-certified ML-KEM piece
+## at the front of the wire):
+##
+##   ek      (1216 B) = mlkem768_ek (1184) ∥ x25519_pubkey (32)
+##   dk_seed   (96 B) = mlkem768_dk_seed (64 = d ∥ z) ∥ x25519_sk (32)
+##   ct      (1120 B) = mlkem768_ct (1088) ∥ x25519_eph_pubkey (32)
+##   ss        (64 B) = mlkem_ss (32) ∥ x25519_ss (32)
+##
+## Shared-secret combiner: plain concat. No HKDF wrap, no length prefix.
+## TLS 1.3's transcript hash binds both halves into every derived key, which
+## is what gives the construction its split-prevention guarantee. For uses
+## WITHOUT a transcript hash (HPKE-class), use std/crypto/xwing instead —
+## plain-concat is non-committing in that setting.
+##
+## Seed-form dk: we store ML-KEM's dk as the 64-byte seed (d, z), not the
+## 2400-byte expanded form. The seed-as-key form preempts MAL-BIND-K-CT
+## (Schmieg/Cremers) — each decapsulation re-derives the expanded dk from
+## the seed, implicitly re-validating H(ek). One-time cost per decaps is
+## roughly one ML-KEM.KeyGen (~10 ms on the host); negligible relative to
+## a TLS handshake. See docs/design/MLKEM_DESIGN.md "Open questions Q2".
+##
+## See:
+##   - draft-ietf-tls-ecdhe-mlkem-04 https://datatracker.ietf.org/doc/html/draft-ietf-tls-ecdhe-mlkem-04
+##   - docs/design/MLKEM_DESIGN.md "Hybrid wire format (TLS 1.3 X25519MLKEM768)"
+
+import * from ffi/socket
+import * from std/core/crypto/curve25519     # x25519_secret_to_public / x25519_ecdh
+import * from std/core/crypto/mlkem          # _mlkem_keygen_internal / encaps / decaps
+import * from std/core/crypto/secret         # Secret<Int> + secret_wrap (NET.4.1)
+import * from std/core/crypto/zeroize        # zeroize for sensitive scratch
+import * from std/crypto/rng                 # entropy_fill
+
+# =============================================================================
+# Sizes (exposed as functions for callers + audit)
+# =============================================================================
+
+def HYBRID_X25519MLKEM768_EK_BYTES(): Int        = 1216     # 1184 + 32
+def HYBRID_X25519MLKEM768_DK_SEED_BYTES(): Int   = 96       # 64 (mlkem d+z) + 32 (x25519 sk)
+def HYBRID_X25519MLKEM768_CT_BYTES(): Int        = 1120     # 1088 + 32
+def HYBRID_X25519MLKEM768_SS_BYTES(): Int        = 64       # 32 + 32
+
+# Byte offsets within the wire formats.
+def _MLKEM_EK_LEN(): Int  = 1184
+def _MLKEM_CT_LEN(): Int  = 1088
+def _MLKEM_SS_LEN(): Int  = 32
+def _MLKEM_DK_LEN(): Int  = 2400
+def _MLKEM_D_LEN(): Int   = 32
+def _MLKEM_Z_LEN(): Int   = 32
+def _X25519_KEY_LEN(): Int = 32
+
+# =============================================================================
+# Derandomised internal API — ACVP-pinnable, used by the smoke tests.
+# =============================================================================
+
+# Build a hybrid key pair from explicit seeds. Internal/test entry point.
+#   d, z   : 32-byte mlkem KeyGen seeds.
+#   x25519_sk : 32-byte raw x25519 private scalar (unclamped; will be
+#               clamped at use time inside curve25519).
+#   out_ek_1216    : 1184B mlkem ek ∥ 32B x25519 pubkey
+#   out_dk_seed_96 : 32B d ∥ 32B z ∥ 32B x25519_sk
+#
+# NET.4.1 B: all three seed inputs carry the `Secret<Int>` discipline so
+# the hybrid layer participates end-to-end. The output dk_seed buffer
+# stays `Int` per the output convention (caller wraps before threading
+# the seed downstream; see `hybrid_x25519_mlkem768_keygen` for the
+# wrap-at-allocation pattern).
+def hybrid_x25519_mlkem768_keygen_internal(
+    out_ek: Int, out_dk_seed: Int,
+    d: Secret<Int>, z: Secret<Int>, x25519_sk: Secret<Int>
+): Void
+  # 1. ML-KEM keygen. Use the public Secret<Int>-typed surface so d/z flow
+  #    through without an explicit unwrap; mlkem768_keygen_internal handles
+  #    the seam internally. Output the expanded dk into a scratch buffer;
+  #    we only ship the seed.
+  var mlkem_dk_scratch = malloc(2400)
+  mlkem768_keygen_internal(out_ek, mlkem_dk_scratch, d, z)
+  zeroize(mlkem_dk_scratch, 2400)
+  free(mlkem_dk_scratch)
+
+  # 2. x25519 pubkey appended after the mlkem ek.
+  x25519_secret_to_public(out_ek + 1184, x25519_sk)
+
+  # 3. Seed-form dk: (d, z, x25519_sk). Unwrap at the byte-copy boundary;
+  #    each unwrap is the audit-greppable declassification site for that
+  #    slice of the dk_seed.
+  memcpy(out_dk_seed,       secret_unwrap(d),         32)
+  memcpy(out_dk_seed + 32,  secret_unwrap(z),         32)
+  memcpy(out_dk_seed + 64,  secret_unwrap(x25519_sk), 32)
+end
+
+# Encapsulate with explicit seeds (no entropy_fill). Internal entry point.
+#   ek_1216         : the public hybrid encapsulation key.
+#   mlkem_m_32      : 32-byte ML-KEM Encaps_internal message m.
+#   x25519_eph_sk_32: 32-byte x25519 ephemeral scalar (unclamped).
+#
+# Returns 1 on success, 0 if either component rejected (modulus check on
+# mlkem ek, or all-zero x25519 ECDH output).
+#
+# NET.4.1 B: the two seed inputs (mlkem_m, x25519_eph_sk) carry the
+# `Secret<Int>` discipline end-to-end. mlkem_m flows through
+# `mlkem768_encaps_internal` (the public Secret<Int>-typed surface);
+# x25519_eph_sk threads as Secret<Int> across both x25519 calls.
+def hybrid_x25519_mlkem768_encaps_internal(
+    out_ct: Int, out_ss: Int,
+    ek: Int, mlkem_m: Secret<Int>, x25519_eph_sk: Secret<Int>
+): Int
+  # 1. ML-KEM encaps half: c_mlkem ∥ K_mlkem.
+  var mlkem_ek = ek                                # ek[0..1184]
+  var x25519_peer_pub = ek + 1184                  # ek[1184..1216]
+  var mlkem_ct = out_ct                            # ct[0..1088]
+  var x25519_eph_pub = out_ct + 1088               # ct[1088..1120]
+  var mlkem_ss = out_ss                            # ss[0..32]
+  var x25519_ss = out_ss + 32                      # ss[32..64]
+
+  var rc = mlkem768_encaps_internal(mlkem_ct, mlkem_ss, mlkem_ek, mlkem_m)
+  if rc == 0
+    return 0
+  end
+
+  # 2. x25519 half: write the ephemeral pubkey as the "ciphertext" half,
+  #    compute ECDH with the peer pubkey from ek for the shared secret.
+  x25519_secret_to_public(x25519_eph_pub, x25519_eph_sk)
+  var rc_ecdh = x25519_ecdh(x25519_ss, x25519_eph_sk, x25519_peer_pub)
+  if rc_ecdh == 0
+    # All-zero ECDH (peer sent a malicious low-order point). Zero outputs
+    # so the caller cannot accidentally use the partial result.
+    memset(out_ct, 0, 1120)
+    memset(out_ss, 0, 64)
+    return 0
+  end
+
+  return 1
+end
+
+# Decapsulate the hybrid ciphertext to recover the 64-byte shared secret.
+# Always returns 1 — the ML-KEM half absorbs ciphertext tampering via
+# implicit rejection (J(z ∥ c)), and the x25519 half's all-zero check is
+# enforced as a hard reject (returns 0) because there's no analogous
+# absorbing branch in DH; a low-order peer pubkey is a protocol error
+# the caller MUST observe.
+#
+# NET.4.1 B: the dk_seed (the 96-byte (d ∥ z ∥ x25519_sk) seed-form) is
+# the secret input. One declassification at the top peels back to the raw
+# pointer; each of the three slices is then re-wrapped at its logical
+# boundary (d/z for ml-kem re-derive, x25519_sk for the ECDH), making each
+# slice an audit-greppable secrecy event.
+def hybrid_x25519_mlkem768_decaps_internal(
+    out_ss: Int, ct: Int, dk_seed: Secret<Int>
+): Int
+  # Parse dk_seed. One unwrap at the top — the 96-byte buffer is the
+  # secrecy boundary the hybrid layer sees; the three slices below carry
+  # the discipline forward, each as its own Secret<Int>.
+  var dk_seed_raw = secret_unwrap(dk_seed)
+  var d           = secret_wrap(dk_seed_raw)        # dk_seed[0..32]
+  var z           = secret_wrap(dk_seed_raw + 32)   # dk_seed[32..64]
+  var x25519_sk   = secret_wrap(dk_seed_raw + 64)   # dk_seed[64..96]
+
+  # 1. Re-derive expanded mlkem dk from (d, z). This re-validates H(ek)
+  #    implicitly (the dk has H(ek) baked in), which is the MAL-BIND-K-CT
+  #    mitigation.
+  var mlkem_ek = malloc(1184)
+  var mlkem_dk = malloc(2400)
+  mlkem768_keygen_internal(mlkem_ek, mlkem_dk, d, z)
+
+  # 2. Parse ct, run ML-KEM decaps (implicit rejection lives inside).
+  #    The expanded mlkem_dk is secret-derived; wrap at the decaps boundary.
+  var mlkem_ct = ct                               # ct[0..1088]
+  var x25519_eph_pub = ct + 1088                  # ct[1088..1120]
+  var mlkem_ss = out_ss                           # ss[0..32]
+  var x25519_ss = out_ss + 32                     # ss[32..64]
+  mlkem768_decaps_internal(mlkem_ss, mlkem_ct, secret_wrap(mlkem_dk))
+
+  # 3. x25519 ECDH with peer's ephemeral pubkey.
+  var rc_ecdh = x25519_ecdh(x25519_ss, x25519_sk, x25519_eph_pub)
+
+  # Wipe expanded dk before returning.
+  zeroize(mlkem_dk, 2400)
+  free(mlkem_ek)
+  free(mlkem_dk)
+
+  if rc_ecdh == 0
+    memset(out_ss, 0, 64)
+    return 0
+  end
+  return 1
+end
+
+# =============================================================================
+# Top-level randomised API
+# =============================================================================
+
+# Generate a fresh X25519MLKEM768 key pair. NET.4.1 B: the entropy bytes
+# flow into the internal seam already wrapped — three slices, three
+# audit-greppable secret_wrap boundary entries.
+def hybrid_x25519_mlkem768_keygen(out_ek: Int, out_dk_seed: Int): Void
+  var rand = malloc(96)              # 32 (d) + 32 (z) + 32 (x25519_sk)
+  entropy_fill(rand, 96)
+  hybrid_x25519_mlkem768_keygen_internal(
+    out_ek, out_dk_seed,
+    secret_wrap(rand),          # d
+    secret_wrap(rand + 32),     # z
+    secret_wrap(rand + 64)      # x25519_sk
+  )
+  zeroize(rand, 96)
+  free(rand)
+end
+
+# Encapsulate to a peer's hybrid ek. Draws m + ephemeral x25519 sk from
+# entropy_fill. Returns 1 on success, 0 on ek rejection or all-zero ECDH.
+# NET.4.1 B: m and x25519_eph_sk wrap at the internal-API boundary.
+def hybrid_x25519_mlkem768_encaps(out_ct: Int, out_ss: Int, ek: Int): Int
+  var rand = malloc(64)              # 32 (m) + 32 (x25519_eph_sk)
+  entropy_fill(rand, 64)
+  var rc = hybrid_x25519_mlkem768_encaps_internal(
+    out_ct, out_ss, ek,
+    secret_wrap(rand),          # m
+    secret_wrap(rand + 32)      # x25519_eph_sk
+  )
+  zeroize(rand, 64)
+  free(rand)
+  return rc
+end
+
+# NET.4.1 B: dk_seed is the secret decapsulation seed; wrap at the
+# internal-API boundary. The internal layer threads the discipline through
+# the three slices.
+def hybrid_x25519_mlkem768_decaps(out_ss: Int, ct: Int, dk_seed: Int): Int
+  return hybrid_x25519_mlkem768_decaps_internal(out_ss, ct, secret_wrap(dk_seed))
+end

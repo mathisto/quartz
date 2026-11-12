@@ -1,0 +1,1255 @@
+##! # Codegen Utilities
+##!
+##! Shared foundation for LLVM IR code generation.
+##! Contains CodegenState struct, output helpers, name sanitization,
+##! string pool management, type/operator mapping, and memory ordering helpers.
+##!
+##! @see codegen Main code generation module
+##! @since 5.13.0
+
+import mir
+import compiler_types
+import op_constants
+import std/emit
+import std/profile
+import codegen_ctx
+import file_io
+import build_cache
+import * from str_compat
+
+# ============================================================================
+# Memory Ordering Constants
+# ============================================================================
+
+## Relaxed memory ordering.
+const ORDERING_RELAXED = 0
+## Acquire memory ordering.
+const ORDERING_ACQUIRE = 2
+## Release memory ordering.
+const ORDERING_RELEASE = 3
+## Acquire/Release memory ordering.
+const ORDERING_ACQ_REL = 4
+## Sequentially consistent memory ordering.
+const ORDERING_SEQ_CST = 5
+
+# ============================================================================
+# Codegen State (passed through all functions)
+# ============================================================================
+
+## Codegen State passed through all functions.
+## Holds global state for LLVM IR generation.
+struct CodegenState
+  ## Global string pool (for @.str.N)
+  string_pool: Vec<String>
+  ## Count of strings in pool
+  string_count: Int
+  ## Local variable names for current function
+  local_vars: Vec<String>
+  ## Count of local variables
+  local_count: Int
+  ## Counter for unique label generation
+  label_counter: Int
+  ## Debug mode flag (0=off, 1=on)
+  debug_mode: Int
+  ## Source filename for debugging
+  source_file: String
+  ## Index of current function being emitted
+  func_index: Int
+  ## DILocation line numbers
+  dilocation_lines: Vec
+  ## DILocation function indices
+  dilocation_funcs: Vec
+  ## Current basic block (ambient cursor; None until codegen positions it).
+  ## PF3-P1b: typed nullable — was `mir::MirBlock` init'd via `as_type<…>(0)`,
+  ## an erased typed-null that drops the COW refcount at gate-1 (UAF).
+  current_block: Option<mir::MirBlock>
+  ## Current function (ambient cursor; None until cg_begin_function sets it).
+  current_func: Option<mir::MirFunc>
+  ## Current program (ambient cursor; None observed only at the cg_find_function
+  ## boundary, which lifts it into Option<MirFunc> for callers — see §11.28)
+  current_prog: Option<mir::MirProgram>
+  ## Count of loop metadata nodes (deprecated — use loop_metadata_ids.size instead)
+  loop_metadata_count: Int
+  ## Shared metadata ID counter — prevents ID collision between debug and loop metadata
+  metadata_counter: Int
+  ## Actual metadata IDs for each DILocation (parallel to dilocation_lines/funcs)
+  dilocation_ids: Vec
+  ## Base metadata IDs for each loop's vectorization metadata pair
+  loop_metadata_ids: Vec
+  ## Call-site lookup keys for extern variables. Each extern registered
+  ## via resolver appears twice: once under its bare C name (`printf`) and
+  ## once under its module-qualified form (`stdio$printf`) so that both
+  ## plain and `module::fn` call sites resolve without codegen-time
+  ## demangling. See extern_var_c_names for the link-time C symbol.
+  extern_var_names: Vec<String>
+  ## Link-time C symbols parallel to extern_var_names. Always the bare C
+  ## name — what actually appears at `call ... @<name>` in LLVM IR.
+  extern_var_c_names: Vec<String>
+  ## Parameter counts for extern variables
+  extern_var_pcounts: Vec
+  ## Return types for extern variables
+  extern_var_rtypes: Vec<String>
+  ## B.10 P3.1c — the *Quartz* return type NAME per extern (parallel to
+  ## extern_var_rtypes), e.g. "Pair"/"Int"/"F64". The LLVM type in rtypes loses
+  ## the struct identity (a by-value struct defaults to "i64"); the call site +
+  ## declare emit recompute the C-ABI coerce type from this name via the
+  ## classifier. "" / scalar names take the legacy path.
+  extern_var_ret_qtypes: Vec<String>
+  ## Offsets into flat parameter type list
+  extern_var_offsets: Vec
+  ## Flattened list of extern parameter types
+  extern_var_flat_ptypes: Vec<String>
+  ## B.10 P3.1c — the *Quartz* param type NAMES (flattened, parallel to
+  ## extern_var_flat_ptypes). Same role as extern_var_ret_qtypes for params:
+  ## a struct-by-value param's identity that drives caller-side ABI coercion.
+  extern_var_flat_pqtypes: Vec<String>
+  ## Variadic flag per extern (1=variadic, 0=non-variadic)
+  extern_var_is_variadic: Vec
+  ## overflow check flag (0=off, 1=on)
+  overflow_check: Int
+  ## Counter for overflow check labels
+  overflow_label_counter: Int
+  ## dynamic exclusivity check flag (0=off, 1=on) — gates emission of
+  ## qz_begin_access/qz_end_access brackets and the exclusivity panic helper.
+  ## When 0, IR is byte-identical to today (no bracket, no helper).
+  exclusivity_check: Int
+  ## Function names used as MIR_FUNC_REF targets (cannot change ABI)
+  func_ref_targets: Vec<String>
+  ## Reachable function names (DCE). Empty when dce_active=0 (gate is a no-op).
+  ## Populated by cg_compute_reachable from main + handler entries + funcref
+  ## targets + naked/weak/cconv-x86 + module_init, then transitive closure
+  ## over MIR_CALL / MIR_FUNC_REF edges.
+  reachable_funcs: Map<String, Int>
+  ## DCE gate flag. 0 = emit every function (incremental + separate paths).
+  ## 1 = consult reachable_funcs and skip unreachable (full-build paths).
+  dce_active: Int
+  ## Escape analysis results for current function: escaped_regs[reg] = 1 if heap-promoted
+  escaped_regs: Vec<Int>
+  ## Register origin table for current function: reg_origins[reg] = alloc_stack_dest+1
+  ## if that register derives from a MIR_ALLOC_STACK, 0 otherwise. Used to veto
+  ## LLVM tail-call emission when call args would alias caller-local allocas.
+  reg_origins: Vec<Int>
+  ## Current module name for separate compilation (empty = monolithic mode)
+  current_module: String
+  ## Per-module string pools: parallel vecs of (module_name, pool, count)
+  sep_mod_names: Vec<String>
+  sep_mod_pools: Vec
+  sep_mod_counts: Vec
+  ## Stack allocation optimization for @value struct returns (M.R.8)
+  stack_alloc: Int
+  ## Race detector mode (0=off, 1=on) — instrument memory accesses for data race detection
+  race_mode: Int
+  ## Synthesized-function names registered for DISubprogram emission — module-init
+  ## thunks and the @main wrapper are not MIR functions but still need debug scopes.
+  ## Parallel to synth_func_sp_ids.
+  synth_func_names: Vec<String>
+  ## DISubprogram metadata ids parallel to synth_func_names.
+  synth_func_sp_ids: Vec
+  ## Compilation target triple (e.g. "x86_64-pc-windows-gnu",
+  ## "aarch64-apple-macosx"). Set once at entry to cg_codegen via
+  ## cg_set_target_triple. Read by intrinsic emitters that need to
+  ## branch IR shape on the host OS (e.g. stderr access via @stderr vs
+  ## @__stderrp vs __acrt_iob_func(2)).
+  target_triple: String
+end
+
+## Creates a new codegen state.
+##
+## Initializes all state fields. Use accessor functions to
+## manipulate state during code generation.
+##
+## @returns Codegen state handle
+def cg_new_state(): CodegenState
+  return CodegenState {
+    string_pool: vec_new<String>(),
+    string_count: 0,
+    local_vars: vec_new<String>(),
+    local_count: 0,
+    label_counter: 0,
+    debug_mode: 0,
+    source_file: "",
+    func_index: 0,
+    dilocation_lines: vec_new(),
+    dilocation_funcs: vec_new(),
+    current_block: Option::None,
+    current_func: Option::None,
+    current_prog: Option::None,
+    loop_metadata_count: 0,
+    metadata_counter: 0,
+    dilocation_ids: vec_new(),
+    loop_metadata_ids: vec_new(),
+    extern_var_names: vec_new<String>(),
+    extern_var_c_names: vec_new<String>(),
+    extern_var_pcounts: vec_new(),
+    extern_var_rtypes: vec_new<String>(),
+    extern_var_ret_qtypes: vec_new<String>(),
+    extern_var_offsets: vec_new(),
+    extern_var_flat_ptypes: vec_new<String>(),
+    extern_var_flat_pqtypes: vec_new<String>(),
+    extern_var_is_variadic: vec_new(),
+    overflow_check: 0,
+    overflow_label_counter: 0,
+    exclusivity_check: 0,
+    func_ref_targets: vec_new<String>(),
+    reachable_funcs: map_new<String, Int>(),
+    dce_active: 0,
+    escaped_regs: vec_new(),
+    reg_origins: vec_new(),
+    current_module: "",
+    sep_mod_names: vec_new<String>(),
+    sep_mod_pools: vec_new(),
+    sep_mod_counts: vec_new(),
+    stack_alloc: 0,
+    race_mode: 0,
+    synth_func_names: vec_new<String>(),
+    synth_func_sp_ids: vec_new(),
+    target_triple: ""
+  }
+end
+
+## Set the compilation target triple. Should be called once at codegen entry.
+def cg_set_target_triple(state: CodegenState, target: String): Void
+  state.target_triple = target
+end
+
+## Check if the current target is Windows. Mirrors cg_is_windows in
+## codegen_runtime.qz; lives here so intrinsic emitters (which don't depend
+## on codegen_runtime) can branch IR shape.
+def cg_state_is_windows(state: CodegenState): Int
+  if str_contains(state.target_triple, "windows")
+    return 1
+  end
+  return 0
+end
+
+## Check if the current target is freestanding (no libc / no OS).
+## Mirrors cg_is_freestanding in codegen_runtime.qz; lives here so
+## intrinsic emitters can gate libc-shaped IR emission (print/eputs/
+## fprintf/write).
+def cg_state_is_freestanding(state: CodegenState): Int
+  if str_ends_with(state.target_triple, "-none")
+    return 1
+  end
+  if str_ends_with(state.target_triple, "-none-elf")
+    return 1
+  end
+  return 0
+end
+
+## Check if a function name is a MIR_FUNC_REF target (cannot change ABI).
+def cg_is_func_ref_target(state: CodegenState, name: String): Int
+  var count = state.func_ref_targets.size
+  for i in 0..count
+    if state.func_ref_targets[i].eq(name)
+      return 1
+    end
+  end
+  return 0
+end
+
+## Set debug mode flag.
+def cg_set_debug_mode(state: CodegenState, enabled: Int): Void
+  state.debug_mode = enabled
+end
+
+## Set overflow check flag.
+def cg_set_overflow_check(state: CodegenState, enabled: Int): Void
+  state.overflow_check = enabled
+end
+
+## Set dynamic exclusivity check flag.
+def cg_set_exclusivity_check(state: CodegenState, enabled: Int): Void
+  state.exclusivity_check = enabled
+end
+
+def cg_set_stack_alloc(state: CodegenState, enabled: Int): Void
+  state.stack_alloc = enabled
+end
+
+def cg_set_race_mode(state: CodegenState, enabled: Int): Void
+  state.race_mode = enabled
+end
+
+## Get debug mode flag.
+def cg_get_debug_mode(state: CodegenState): Int = state.debug_mode
+
+## Set source file path (for debug info).
+def cg_set_source_file(state: CodegenState, filename: String): Void
+  state.source_file = filename
+end
+
+## Get source file path.
+def cg_get_source_file(state: CodegenState): String = state.source_file
+
+## Set current function index.
+def cg_set_func_index(state: CodegenState, idx: Int): Void
+  state.func_index = idx
+end
+
+## Get current function index.
+def cg_get_func_index(state: CodegenState): Int = state.func_index
+
+## Initialize metadata counter for debug builds.
+## Reserves IDs 0-9 for fixed metadata and 10..10+func_count-1 for DISubprograms.
+## Must be called after function count is known, before any function codegen.
+def cg_init_metadata_counter(state: CodegenState, func_count: Int): Void
+  state.metadata_counter = 10 + func_count
+end
+
+## Get or create a DILocation metadata ID for a given line/function.
+## Returns the actual LLVM metadata ID (allocated from shared counter).
+def cg_get_dilocation(state: CodegenState, line: Int, func_idx: Int): Int
+  var actual_line = line
+  if actual_line <= 0
+    actual_line = 1
+  end
+
+  var lines = state.dilocation_lines
+  var funcs = state.dilocation_funcs
+  var count = lines.size
+
+  # Search for existing entry — return previously assigned metadata ID
+  for i in 0..count
+    if lines[i] == actual_line
+      if funcs[i] == func_idx
+        return state.dilocation_ids[i]
+      end
+    end
+  end
+
+  # Create new entry — allocate metadata ID from shared counter
+  lines.push(actual_line)
+  funcs.push(func_idx)
+  var md_id = state.metadata_counter
+  state.metadata_counter = state.metadata_counter + 1
+  state.dilocation_ids.push(md_id)
+  return md_id
+end
+
+## Get number of registered DILocations.
+def cg_get_dilocation_count(state: CodegenState): Int = state.dilocation_lines.size
+
+## Emit a debug-location sentinel comment into the IR stream.
+##
+## The post-pass `cg_apply_debug_locations` consumes these: every instruction
+## line that follows a sentinel — until the next sentinel or function boundary —
+## is stamped with `, !dbg !<loc_id>`, then the sentinel itself is stripped.
+## This is the single chokepoint for debug-location coverage: emitting one
+## sentinel per MIR instruction (in cg_emit_instr) gives `!dbg` on every
+## instruction that instruction lowers to, with no per-emit-site plumbing.
+##
+## `loc_id` must be a DILocation metadata id obtained from cg_get_dilocation.
+def cg_emit_dbg_sentinel(out: Int, loc_id: Int): Void
+  sb_append(out, "  ; __qzdbgloc ")
+  sb_append_int(out, loc_id)
+  sb_append(out, "\n")
+end
+
+## Generate next unique label ID.
+def cg_next_label(state: CodegenState): Int
+  var lbl = state.label_counter
+  state.label_counter = lbl + 1
+  return lbl
+end
+
+## Get string constant pool.
+def cg_get_string_pool(state: CodegenState): Vec<String> = state.string_pool
+
+## Get count of string constants.
+def cg_get_string_count(state: CodegenState): Int = state.string_count
+
+## Set count of string constants.
+def cg_set_string_count(state: CodegenState, count: Int): Void
+  state.string_count = count
+end
+
+## Get local variables vector.
+def cg_get_local_vars(state: CodegenState): Vec<String> = state.local_vars
+
+## Get count of local variables.
+def cg_get_local_count(state: CodegenState): Int = state.local_count
+
+## Set count of local variables.
+def cg_set_local_count(state: CodegenState, count: Int): Void
+  state.local_count = count
+end
+
+## Sanitize identifier for LLVM IR
+## LLVM identifiers must be alphanumeric + underscore
+## Quartz allows ? and ! as trailing chars
+def cg_sanitize_llvm_name(name: String): String
+  var len = str_byte_len(name)
+  var sb = sb_new()
+  defer sb_free(sb)
+  for i in 0..len
+    var c = str_byte_at(name, i)
+    match c
+      63 => sb.append("Q")
+      33 => sb.append("X")
+      _ => sb_append_char(sb, c)
+    end
+  end
+  return sb.to_string()
+end
+
+## Sanitize user variable names that would collide with SSA temporaries.
+## Codegen uses %v{N} for SSA values; if a user names a variable v1, v2, etc.
+## it would produce %v1 which collides. Prefix these with "_u." to avoid that.
+def cg_sanitize_var_name(name: String): String
+  var len = str_byte_len(name)
+  if len < 2
+    return name
+  end
+  # A user variable spelled `v<digits>` collides with the `%v<N>` SSA
+  # temp namespace; `p<digits>` collides with the `%p<N>` positional
+  # incoming-parameter namespace (HB-DOG.10 — `def f(p1, p2)` emitted
+  # `%p1 = alloca` against the incoming `%p1`). Mangle both with a
+  # `_u.` prefix the codegen never generates itself.
+  var first = str_byte_at(name, 0)
+  if first != 'v' and first != 'p'  # 'v' / 'p'
+    return name
+  end
+  # Check if rest is all digits
+  var all_digits = 1
+  for i in 1..len
+    var c = str_byte_at(name, i)
+    if c < '0' or c > '9'  # '0'-'9'
+      all_digits = 0
+    end
+  end
+  if all_digits == 1
+    return "_u.#{name}"
+  end
+  return name
+end
+
+## Check if a function name is a monomorphized generic specialization.
+## Detects the `$N$` numeric segment (e.g. `vec_push$1$Token` has digit after first `$`).
+def cg_is_monomorphized(name: String): Int
+  var dollar = __char_index(name, '$')
+  if dollar < 0
+    return 0
+  end
+  # Check if char after $ is a digit (0-9)
+  var after = dollar + 1
+  if after >= str_byte_len(name)
+    return 0
+  end
+  var c = str_byte_at(name, after)
+  if c >= '0' and c <= '9'
+    return 1
+  end
+  return 0
+end
+
+## Extract the module name from a function name.
+## `lexer$tokenize` → `lexer`, `lexer$$helper` → `lexer`, `main` → `__main__`
+def cg_module_for_func(func_name: String): String
+  var dollar = __char_index(func_name, '$')
+  if dollar < 0
+    return "__main__"
+  end
+  return str_byte_slice(func_name, 0, dollar)
+end
+
+## Check if a function is module-private (double-dollar `$$`).
+def cg_is_private_func(name: String): Int
+  var dollar = __char_index(name, '$')
+  if dollar < 0
+    return 0
+  end
+  var next = dollar + 1
+  if next < str_byte_len(name) and str_byte_at(name, next) == '$'
+    return 1
+  end
+  return 0
+end
+
+## Add a string to the global pool, returning its index.
+def cg_add_string(state: CodegenState, s: String): Int
+  # Dedup: check if string already exists in pool
+  var pool = cg_get_string_pool(state)
+  var count = cg_get_string_count(state)
+  for di in 0..count
+    if pool[di].eq(s)
+      return di
+    end
+  end
+  # Not found — append
+  # Strings are already unescaped by the lexer (lex_unescape_string).
+  # Raw strings (r"...") skip lexer unescaping, preserving literal backslashes.
+  pool.push(s)
+  cg_set_string_count(state, count + 1)
+  return count
+end
+
+## Check if a local variable name is already allocated.
+def cg_is_var_allocated(state: CodegenState, name: String): Int
+  var locals = cg_get_local_vars(state)
+  return 1 if any?(locals, existing: Int -> as_string(existing).eq(name))
+  return 0
+end
+
+## Allocate a local variable if not already present.
+def cg_alloc_var(state: CodegenState, name: String): Void
+  if cg_is_var_allocated(state, name) == 0
+    cg_get_local_vars(state).push(name)
+    cg_set_local_count(state, cg_get_local_count(state) + 1)
+  end
+end
+
+## Reset local variable tracking for a new function.
+def cg_reset_locals(state: CodegenState): Void
+  state.local_vars = vec_new<String>()
+  cg_set_local_count(state, 0)
+end
+
+## Find index of an extern function by its bare C name, or -1.
+## Extern callees always arrive at codegen with their bare symbol name
+## (resolver registers tag=10 entries by base_name only; no prefix ever
+## applied at call sites). An exact lookup is sufficient.
+def cg_extern_var_index(state: CodegenState, name: String): Int
+  var names = state.extern_var_names
+  for i in 0..names.size
+    if names[i].eq(name)
+      return i
+    end
+  end
+  return -1
+end
+
+## Get the LLVM type of the j-th declared param for variadic extern at index idx
+def cg_extern_var_param_type(state: CodegenState, idx: Int, j: Int): String
+  var offset = state.extern_var_offsets[idx]
+  return state.extern_var_flat_ptypes[offset + j]
+end
+
+## B.10 P3.1c — the Quartz type NAME of the j-th declared param for extern idx
+## (parallel to cg_extern_var_param_type). The caller passes this to the C-ABI
+## classifier to decide struct-by-value coercion.
+def cg_extern_var_pqtype(state: CodegenState, idx: Int, j: Int): String
+  var offset = state.extern_var_offsets[idx]
+  return state.extern_var_flat_pqtypes[offset + j]
+end
+
+## Check if the extern at index idx is variadic (1=yes, 0=no)
+def cg_extern_is_variadic(state: CodegenState, idx: Int): Int = state.extern_var_is_variadic[idx]
+
+## Look up a MIR function by name in the current program
+def cg_find_function(state: CodegenState, name: String): Option<mir::MirFunc>
+  if state.current_prog.is_none()
+    return Option::None
+  end
+  var prog = state.current_prog.unwrap()
+  var funcs = mir::mir_get_functions(prog)
+  var count = funcs.size
+  for i in 0..count
+    var f = funcs[i]
+    if mir::mir_func_get_name(f).eq(name)
+      return Option::Some(f)
+    end
+  end
+  return Option::None
+end
+
+## Format an operand ID as LLVM IR value reference (%vN).
+def cg_format_operand(id: Int): String
+  var out = sb_new()
+  defer sb_free(out)
+  out.append("%v")
+  out.append(id.to_s())
+  return out.to_string()
+end
+
+# ============================================================================
+# LLVM IR Output Helpers
+# ============================================================================
+
+## Emit raw string to output.
+def cg_emit(out: Int, s: String): Void
+  prof_alloc_site("cg_emit", str_byte_len(s))
+  sb_append(out, s)
+end
+
+## Emit string followed by newline to output.
+def cg_emit_line(out: Int, s: String): Void
+  prof_alloc_site("cg_emit_line", str_byte_len(s) + 1)
+  sb_append(out, s)
+  sb_append(out, "\n")
+end
+
+## Emit integer directly to output without creating a temporary string.
+## Uses sb_append_int which formats directly into the StringBuilder buffer.
+def cg_emit_int(out: Int, n: Int): Void
+  prof_alloc_site("cg_emit_int", 16)
+  sb_append_int(out, n)
+end
+
+## Convert a character code to a single-character string.
+def cg_char_to_str(c: Int): String
+  # Use str_slice to extract single char from a reference string
+  # This is a workaround since we don't have char_to_string intrinsic
+  var chars = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+  return str_byte_slice(chars, c - 32, c - 31) if c >= ' ' and c <= '~'
+  return "?"
+end
+
+## Convert a byte to a 2-digit hex string.
+def cg_hex_byte(n: Int): String
+  var hex = "0123456789ABCDEF"
+  var hi = (n / 16) % 16
+  var lo = n % 16
+  return "#{str_byte_slice(hex, hi, hi + 1)}#{str_byte_slice(hex, lo, lo + 1)}"
+end
+
+## Escape string for LLVM IR constant.
+def cg_escape_string(s: String): String
+  var out = sb_new()
+  defer sb_free(out)
+  var len = str_byte_len(s)
+  for i in 0..len
+    var c = str_byte_at(s, i)
+    if c == '\n'
+      out.append("\\0A")
+    elsif c == '\r'
+      out.append("\\0D")
+    elsif c == '\t'
+      out.append("\\09")
+    elsif c == '"'
+      out.append("\\22")
+    elsif c == '\\'
+      out.append("\\5C")
+    elsif c < ' ' or c > '~'
+      out.append("\\")
+      out.append(cg_hex_byte(c))
+    else
+      out.append(cg_char_to_str(c))
+    end
+  end
+  return out.to_string()
+end
+
+## Emit all collected string constants at module end.
+def cg_emit_string_constants(state: CodegenState, out: Int): Void
+  var pool = cg_get_string_pool(state)
+  var count = cg_get_string_count(state)
+  for i in 0..count
+    var s = pool[i]
+    var slen = str_byte_len(s) + 1
+    sb_append(out, "@.str.")
+    sb_append(out, i.to_s())
+    sb_append(out, " = private unnamed_addr constant <{ i64, [")
+    sb_append(out, slen.to_s())
+    sb_append(out, " x i8] }> <{ i64 ")
+    sb_append(out, str_byte_len(s).to_s())
+    sb_append(out, ", [")
+    sb_append(out, slen.to_s())
+    sb_append(out, " x i8] c\"")
+    sb_append(out, cg_escape_string(s))
+    sb_append(out, "\\00\" }>, align 16\n")
+  end
+end
+
+## Emit LLVM loop vectorization metadata (Phase S.3).
+## Uses metadata IDs allocated from the shared counter during codegen.
+## Dedups before emitting — separate-compilation cache fragments can
+## push the same id back into `loop_metadata_ids` twice, which would
+## emit duplicate `!N = !{...}` definitions and trip llc's
+## "Metadata id is already used" error.
+def cg_emit_loop_metadata(state: CodegenState, out: Int): Void
+  var seen = vec_new<Int>()
+  var count = state.loop_metadata_ids.size
+  for i in 0..count
+    var md_id = state.loop_metadata_ids[i]
+    var dup = 0
+    for j in 0..seen.size
+      if seen[j] == md_id
+        dup = 1
+      end
+    end
+    if dup == 1
+      ## Already emitted — skip this id.
+    else
+      seen.push(md_id)
+      var md_s = md_id.to_s()
+      var md_next = (md_id + 1).to_s()
+      cg_emit(out, "!")
+      cg_emit(out, md_s)
+      cg_emit(out, " = distinct !{!")
+      cg_emit(out, md_s)
+      cg_emit(out, ", !")
+      cg_emit(out, md_next)
+      cg_emit_line(out, "}")
+      cg_emit(out, "!")
+      cg_emit(out, md_next)
+      cg_emit_line(out, " = !{!\"llvm.loop.vectorize.enable\", i1 1}")
+    end
+  end
+end
+
+## Unescape source string (convert \n to newline, etc.).
+## NOTE: Uses while loop because we need manual index control for escape sequences.
+def cg_unescape_string(s: String): String
+  var out = sb_new()
+  defer sb_free(out)
+  var len = str_byte_len(s)
+  var i = 0
+  while i < len
+    var c = str_byte_at(s, i)
+    if c == '\\' and i + 1 < len
+      # Backslash - check next char
+      var next = str_byte_at(s, i + 1)
+      if next == 'n'
+        sb_append_char(out, '\n')
+        i += 2
+      elsif next == 't'
+        sb_append_char(out, '\t')
+        i += 2
+      elsif next == 'r'
+        sb_append_char(out, '\r')
+        i += 2
+      elsif next == '\\'
+        sb_append_char(out, '\\')
+        i += 2
+      elsif next == '"'
+        sb_append_char(out, '"')
+        i += 2
+      elsif next == '#'
+        sb_append_char(out, '#')
+        i += 2
+      else
+        sb_append_char(out, c)
+        i += 1
+      end
+    else
+      sb_append_char(out, c)
+      i += 1
+    end
+  end
+  return out.to_string()
+end
+
+## Pre-scan function to collect all variable names that need allocation.
+def cg_collect_vars(state: CodegenState, func: mir::MirFunc): Void
+  cg_reset_locals(state)
+
+  # Add parameters first
+  var params = mir::mir_func_get_params(func)
+  each(params, p: Int -> cg_alloc_var(state, as_string(p)))
+
+  # Scan all blocks for STORE_VAR instructions
+  var blocks = mir::mir_func_get_blocks(func)
+  var block_count = blocks.size
+  for b in 0..block_count
+    var block = blocks[b]
+    var instrs = mir::mir_block_get_instructions(block)
+    var instr_count = instrs.size
+    for j in 0..instr_count
+      var instr = instrs[j]
+      var kind = mir::mir_instr_get_kind(instr)
+      if kind == mir::MIR_STORE_VAR
+        var var_name = mir::mir_instr_get_var_name(instr)
+        cg_alloc_var(state, var_name)
+      end
+    end
+  end
+end
+
+# ============================================================================
+# LLVM Type Helpers
+# ============================================================================
+
+## Convert MIR type to LLVM type string.
+def type_to_llvm(t: Int): String
+  return "i64" if t == mir::MIR_TYPE_INT
+  return "i1" if t == mir::MIR_TYPE_BOOL
+  return "ptr" if t == mir::MIR_TYPE_STRING
+  return "void" if t == mir::MIR_TYPE_VOID
+  return "i64"
+end
+
+# ============================================================================
+# Operator Helpers
+# ============================================================================
+
+## Convert MIR binary operator to LLVM instruction name.
+def op_to_llvm(op: Int): String
+  return "add" if op == op_constants::OP_ADD
+  return "sub" if op == op_constants::OP_SUB
+  return "mul" if op == op_constants::OP_MUL
+  return "sdiv" if op == op_constants::OP_DIV
+  return "srem" if op == op_constants::OP_MOD
+  return "and" if op == op_constants::OP_AND_LEGACY
+  return "and" if op == op_constants::OP_AND
+  return "or" if op == op_constants::OP_OR_LEGACY
+  return "or" if op == op_constants::OP_OR
+  return "and" if op == op_constants::OP_BIT_AND
+  return "or" if op == op_constants::OP_BIT_OR
+  return "xor" if op == op_constants::OP_BIT_XOR
+  return "shl" if op == op_constants::OP_SHL
+  return "ashr" if op == op_constants::OP_SHR
+  return "add"
+end
+
+## Convert MIR comparison operator to LLVM condition code (signed).
+def cmp_to_llvm(op: Int): String
+  return "eq" if op == op_constants::OP_EQ
+  return "ne" if op == op_constants::OP_NE
+  return "slt" if op == op_constants::OP_LT
+  return "sle" if op == op_constants::OP_LE
+  return "sgt" if op == op_constants::OP_GT
+  return "sge"
+end
+
+## Convert MIR comparison operator to LLVM condition code (unsigned).
+def cmp_to_llvm_unsigned(op: Int): String
+  return "eq" if op == op_constants::OP_EQ
+  return "ne" if op == op_constants::OP_NE
+  return "ult" if op == op_constants::OP_LT
+  return "ule" if op == op_constants::OP_LE
+  return "ugt" if op == op_constants::OP_GT
+  return "uge"
+end
+
+## Check if an operator is a comparison operator.
+def is_comparison(op: Int): Int
+  if op >= op_constants::OP_EQ
+    return 1 if op <= op_constants::OP_GE
+  end
+  return 0
+end
+
+## Convert MIR float operator to LLVM instruction name.
+def float_op_to_llvm(op: Int): String
+  return "fadd" if op == op_constants::OP_ADD
+  return "fsub" if op == op_constants::OP_SUB
+  return "fmul" if op == op_constants::OP_MUL
+  return "fdiv" if op == op_constants::OP_DIV
+  return "frem" if op == op_constants::OP_MOD
+  return "fadd"
+end
+
+## Convert MIR float comparison to LLVM condition code (ordered).
+def float_cmp_to_llvm(op: Int): String
+  return "oeq" if op == op_constants::OP_EQ
+  return "one" if op == op_constants::OP_NE
+  return "olt" if op == op_constants::OP_LT
+  return "ole" if op == op_constants::OP_LE
+  return "ogt" if op == op_constants::OP_GT
+  return "oge"
+end
+
+# ============================================================================
+# Intrinsic Emission
+# ============================================================================
+
+## Emit inttoptr conversion from i64 to typed pointer
+##
+## @param out     File handle for output
+## @param dest    Destination name (without %v prefix, e.g., "5.ptr")
+## @param src     Source register name (without %v prefix)
+## @param lltype  LLVM type string (e.g., "i8*", "i64*")
+##
+## P5.3.a pilot: body-wrapped through the `Emit` effect. Sets the
+## active sink via `codegen_ctx::cg_ctx_set(out)`, installs `with Emit`
+## with the default handlers, and perform-routes each append through
+## `emit(...)` / `emit_line(...)`. Byte-identical output to the direct
+## `cg_emit(out, s)` calls — the pilot proves the effect machinery on a
+## real codegen helper without changing emitted IR.
+def cg_emit_inttoptr(dest: String, src: String, lltype: String): Void can Emit
+  emit("  %v")
+  emit(dest)
+  emit(" = inttoptr i64 %v")
+  emit(src)
+  emit(" to ")
+  emit_line(lltype)
+end
+
+## Emit inttoptr with integer dest (id + suffix) and integer src.
+## Avoids string allocation for the common "#{d}.suffix" pattern.
+def cg_emit_inttoptr_is(dest_id: Int, dest_suffix: String, src_id: Int, lltype: String): Void can Emit
+  emit("  %v")
+  emit_int(dest_id)
+  emit(dest_suffix)
+  emit(" = inttoptr i64 %v")
+  emit_int(src_id)
+  emit(" to ")
+  emit_line(lltype)
+end
+
+## Emit Vec header unpack (first half): inttoptr + GEP len + load len
+## Defines: %{p}{d}.vec (ptr), %{p}{d}.len (i64)
+## P5.3.c: routed through the `Emit` effect.
+def cg_emit_vec_unpack_header(p: String, d: String, src: String): Void can Emit
+  emit("  %")
+  emit(p)
+  emit(d)
+  emit(".vec = inttoptr i64 %v")
+  emit(src)
+  emit_line(" to ptr")
+  emit("  %")
+  emit(p)
+  emit(d)
+  emit(".len_ptr = getelementptr inbounds i64, ptr %")
+  emit(p)
+  emit(d)
+  emit_line(".vec, i64 1")
+  emit("  %")
+  emit(p)
+  emit(d)
+  emit(".len = load i64, ptr %")
+  emit(p)
+  emit(d)
+  emit_line(".len_ptr, align 8")
+end
+
+## Emit Vec data unpack (second half): GEP data_ptr + load data + inttoptr to ptr
+## Requires %{p}{d}.vec already defined (from cg_emit_vec_unpack_header)
+## Defines: %{p}{d}.data (i64), %{p}{d}.arr (ptr)
+## P5.3.c: routed through the `Emit` effect.
+def cg_emit_vec_unpack_data(p: String, d: String): Void can Emit
+  emit("  %")
+  emit(p)
+  emit(d)
+  emit(".data_ptr = getelementptr inbounds i64, ptr %")
+  emit(p)
+  emit(d)
+  emit_line(".vec, i64 2")
+  emit("  %")
+  emit(p)
+  emit(d)
+  emit(".data = load i64, ptr %")
+  emit(p)
+  emit(d)
+  emit_line(".data_ptr, align 8")
+  emit("  %")
+  emit(p)
+  emit(d)
+  emit(".arr = inttoptr i64 %")
+  emit(p)
+  emit(d)
+  emit_line(".data to ptr")
+end
+
+## Emit full Vec unpack: header + data in one call
+## Defines: %{p}{d}.vec, %{p}{d}.len, %{p}{d}.data, %{p}{d}.arr
+def cg_emit_vec_unpack(p: String, d: String, src: String): Void can Emit
+  cg_emit_vec_unpack_header(p, d, src)
+  cg_emit_vec_unpack_data(p, d)
+end
+
+## Allocate a new Vec: header (24 bytes) + data array (cap * 8 bytes)
+## Defines: %{p}{d}.res_vec (i64*), %{p}{d}.res_arr (i64*)
+## @param cap_val  LLVM value for capacity (e.g., "%map42.len" or "%tak42.cnt")
+## @param len_val  LLVM value for initial length (same as cap, or "0" for filter)
+def cg_emit_vec_alloc(p: String, d: String, cap_val: String, len_val: String): Void can Emit
+  emit("  %")
+  emit(p)
+  emit(d)
+  emit_line(".res_vec = call ptr @malloc(i64 24)")
+  emit("  store i64 ")
+  emit(cap_val)
+  emit(", ptr %")
+  emit(p)
+  emit(d)
+  emit_line(".res_vec, align 8")
+  emit("  %")
+  emit(p)
+  emit(d)
+  emit(".res_cap_ptr = getelementptr inbounds i64, ptr %")
+  emit(p)
+  emit(d)
+  emit_line(".res_vec, i64 1")
+  emit("  store i64 ")
+  emit(len_val)
+  emit(", ptr %")
+  emit(p)
+  emit(d)
+  emit_line(".res_cap_ptr, align 8")
+  emit("  %")
+  emit(p)
+  emit(d)
+  emit(".data_size = mul i64 ")
+  emit(cap_val)
+  emit_line(", 8")
+  emit("  %")
+  emit(p)
+  emit(d)
+  emit(".res_data_mem = call ptr @malloc(i64 %")
+  emit(p)
+  emit(d)
+  emit_line(".data_size)")
+  emit("  %")
+  emit(p)
+  emit(d)
+  emit(".res_data = ptrtoint ptr %")
+  emit(p)
+  emit(d)
+  emit_line(".res_data_mem to i64")
+  emit("  %")
+  emit(p)
+  emit(d)
+  emit(".data_ptr2 = getelementptr inbounds i64, ptr %")
+  emit(p)
+  emit(d)
+  emit_line(".res_vec, i64 2")
+  emit("  store i64 %")
+  emit(p)
+  emit(d)
+  emit(".res_data, ptr %")
+  emit(p)
+  emit(d)
+  emit_line(".data_ptr2, align 8")
+  emit("  %")
+  emit(p)
+  emit(d)
+  emit(".res_arr = inttoptr i64 %")
+  emit(p)
+  emit(d)
+  emit_line(".res_data to ptr")
+end
+
+## Emit ptrtoint conversion from typed pointer to i64
+##
+## @param out     File handle for output
+## @param dest    Destination name (without %v prefix)
+## @param src     Source register name (without %v prefix)
+## @param lltype  LLVM type string (e.g., "i8*", "i64*")
+## P5.3.c: routed through the `Emit` effect.
+def cg_emit_ptrtoint(dest: String, src: String, lltype: String): Void can Emit
+  emit("  %v")
+  emit(dest)
+  emit(" = ptrtoint ")
+  emit(lltype)
+  emit(" %v")
+  emit(src)
+  emit_line(" to i64")
+end
+
+## B.10 Vec-pack — the LLVM `sizeof(%struct.Name)` idiom as an INLINE CONSTANT
+## EXPRESSION operand string: `ptrtoint (%struct.Name* getelementptr (%struct.Name,
+## %struct.Name* null, i32 1) to i64)`. LLVM folds this to the struct's exact packed
+## byte size (the same value `getelementptr %struct.Name, ptr p, i64 idx` scales by),
+## so the Vec per-element stride can never disagree with the `%struct.Name` field
+## layout. Usable anywhere an i64 operand is accepted (alloc bytes, header[3], mul).
+def cg_struct_sizeof_const(struct_name: String): String
+  return "ptrtoint (%struct.#{struct_name}* getelementptr (%struct.#{struct_name}, %struct.#{struct_name}* null, i32 1) to i64)"
+end
+
+# ============================================================================
+# Memory Ordering Helpers
+# ============================================================================
+
+## Convert memory ordering constant to LLVM string.
+def ordering_to_string(val: Int): String
+  return "monotonic" if val == ORDERING_RELAXED
+  return "acquire" if val == ORDERING_ACQUIRE
+  return "release" if val == ORDERING_RELEASE
+  return "acq_rel" if val == ORDERING_ACQ_REL
+  return "seq_cst" if val == ORDERING_SEQ_CST
+  return "seq_cst"
+end
+
+## Derive CAS failure ordering from success ordering.
+## Failure ordering cannot include "release".
+def failure_ordering(success: String): String
+  return "seq_cst" if success == "seq_cst"
+  return "acquire" if success == "acq_rel"
+  return "monotonic" if success == "release"
+  return "acquire" if success == "acquire"
+  return "monotonic" if success == "monotonic"
+  return "seq_cst"
+end
+
+## Resolve a MIR register to its compile-time constant value.
+## Scans the current block for a MIR_CONST_INT instruction defining reg_id.
+## Returns the constant value, or 5 (seq_cst) if not found.
+def resolve_ordering(state: CodegenState, reg_id: MirReg): String
+  var block = state.current_block.unwrap()
+  var instrs = mir::mir_block_get_instructions(block)
+  var count = instrs.size
+  for i in 0..count
+    var instr = instrs[i]
+    var kind = mir::mir_instr_get_kind(instr)
+    if kind == mir::MIR_CONST_INT
+      var did = mir::mir_instr_get_dest_id(instr)
+      if did == reg_id
+        var val = mir::mir_instr_get_int_val(instr)
+        return ordering_to_string(val)
+      end
+    end
+  end
+  return "seq_cst"
+end
+
+## Resolve a MIR register to its compile-time constant integer value.
+## Scans the current block for a MIR_CONST_INT instruction defining reg_id.
+## Returns the constant value, or 0 if not found.
+def cg_resolve_const_int(state: CodegenState, reg_id: MirReg): Int
+  var block = state.current_block.unwrap()
+  var instrs = mir::mir_block_get_instructions(block)
+  var count = instrs.size
+  for i in 0..count
+    var instr = instrs[i]
+    var kind = mir::mir_instr_get_kind(instr)
+    if kind == mir::MIR_CONST_INT
+      var did = mir::mir_instr_get_dest_id(instr)
+      if did == reg_id
+        return mir::mir_instr_get_int_val(instr)
+      end
+    end
+  end
+  return 0
+end
+
+# ============================================================================
+# Target-Aware Constants (shared across intrinsic handler files)
+# ============================================================================
+
+## MAP_PRIVATE|MAP_ANONYMOUS flags for mmap (arena data blocks).
+## macOS: 0x0002 | 0x1000 = 4098; Linux: 0x0002 | 0x0020 = 34
+var g_mmap_flags = "4098"
+
+## Set the mmap flags for the current compilation target.
+def cg_set_target_mmap_flags(target: String): Void
+  if str_contains(target, "linux")
+    g_mmap_flags = "34"
+  else
+    g_mmap_flags = "4098"
+  end
+end
+
+## Get the mmap flags for the current compilation target.
+def cg_get_mmap_flags(): String = g_mmap_flags
+
+# ============================================================================
+# Option Inline Helpers (shared across intrinsic handler files)
+# ============================================================================
+
+## Emit Option::Some(val) inline. Produces SSA register %{prefix}.res as i64.
+## @param prefix  Unique SSA name prefix (e.g. "osome42")
+## @param val_reg  LLVM SSA register holding the value (e.g. "%v42.offset")
+def cg_emit_option_some_inline(prefix: String, val_reg: String): Void can Emit
+  emit("  %")
+  emit(prefix)
+  emit_line(".mem = call ptr @malloc(i64 16)")
+  emit("  %")
+  emit(prefix)
+  emit(".tag = bitcast ptr %")
+  emit(prefix)
+  emit_line(".mem to ptr")
+  emit("  store i64 0, ptr %")
+  emit(prefix)
+  emit_line(".tag")
+  emit("  %")
+  emit(prefix)
+  emit(".vgep = getelementptr i8, ptr %")
+  emit(prefix)
+  emit_line(".mem, i64 8")
+  emit("  %")
+  emit(prefix)
+  emit(".vp = bitcast ptr %")
+  emit(prefix)
+  emit_line(".vgep to ptr")
+  emit("  store i64 ")
+  emit(val_reg)
+  emit(", ptr %")
+  emit(prefix)
+  emit_line(".vp")
+  emit("  %")
+  emit(prefix)
+  emit(".res = ptrtoint ptr %")
+  emit(prefix)
+  emit_line(".mem to i64")
+end
+
+## Emit Option::None inline. Produces SSA register %{prefix}.res as i64.
+## @param prefix  Unique SSA name prefix (e.g. "onone42")
+## P5.3.c: routed through the `Emit` effect.
+def cg_emit_option_none_inline(prefix: String): Void can Emit
+  emit("  %")
+  emit(prefix)
+  emit_line(".mem = call ptr @malloc(i64 16)")
+  emit("  %")
+  emit(prefix)
+  emit(".tag = bitcast ptr %")
+  emit(prefix)
+  emit_line(".mem to ptr")
+  emit("  store i64 1, ptr %")
+  emit(prefix)
+  emit_line(".tag")
+  emit("  %")
+  emit(prefix)
+  emit(".vgep = getelementptr i8, ptr %")
+  emit(prefix)
+  emit_line(".mem, i64 8")
+  emit("  %")
+  emit(prefix)
+  emit(".vp = bitcast ptr %")
+  emit(prefix)
+  emit_line(".vgep to ptr")
+  emit("  store i64 0, ptr %")
+  emit(prefix)
+  emit_line(".vp")
+  emit("  %")
+  emit(prefix)
+  emit(".res = ptrtoint ptr %")
+  emit(prefix)
+  emit_line(".mem to i64")
+end
+
+## INC.1.7 — derive the per-fragment short module name from a mangled
+## function name. Free functions in module `M` are mangled as `M$fn`;
+## `__main__`'s functions have no `$` prefix. Private helpers use the
+## `M$$fn` double-dollar form which still picks the first `$` so it
+## bins under `M`.
+def cg_extract_module(func_name: String): String
+  var dollar = __char_index(func_name, '$')
+  if dollar < 0
+    return "__main__"
+  end
+  return str_byte_slice(func_name, 0, dollar)
+end
+
+## INC.1.7 — write per-module fragment files + the `.format_v2`
+## sentinel. Shared between the cold path (`cg_codegen`) and the warm
+## path (`cg_codegen_incremental`). When `cache_dir` is empty the
+## helper is a no-op so cache-disabled cold runs cost nothing.
+## Each `fresh_mod_builders[i]` is freed here once its fragment lands;
+## the caller MUST NOT free the builders separately. `fresh_mod_meta[i]`
+## is a `Vec<Int>` of loop-metadata IDs that the function emissions
+## inside module `fresh_mod_names[i]` pushed onto `state.loop_metadata_ids`.
+def cg_write_module_fragments(fresh_mod_names: Vec<String>, fresh_mod_builders: Vec<Int>, fresh_mod_meta: Vec<Int>, cache_dir: String): Void
+  if str_byte_len(cache_dir) == 0
+    return
+  end
+  # --cache-ro: skip the fragment writes but still free each builder
+  # (the caller relies on this helper owning the sb_free).
+  var ro = build_cache::cache_is_writable() == 0
+  for fsi in 0..fresh_mod_names.size
+    var frag_path = "#{cache_dir}/modules/#{fresh_mod_names[fsi]}.ll"
+    var meta_header = "META_V2:"
+    var mod_meta = fresh_mod_meta[fsi]
+    var mhi = 0
+    while mhi < vec_size(mod_meta)
+      if mhi > 0
+        meta_header = meta_header.concat(",")
+      end
+      var mid = vec_get(mod_meta, mhi)
+      meta_header = meta_header.concat(mid.to_s())
+      mhi += 1
+    end
+    meta_header = meta_header.concat("\n---\n")
+    var fsb = fresh_mod_builders[fsi]
+    if ro == false
+      var frag_ir = sb_to_string(fsb)
+      var frag_content = "#{meta_header}#{frag_ir}"
+      var _fw = fio_write(frag_path, frag_content)
+    end
+    sb_free(fsb)
+  end
+  if ro == false
+    var inc_format_sentinel = "#{cache_dir}/modules/.format_v2"
+    var _sw = fio_write(inc_format_sentinel, "1\n")
+  end
+end

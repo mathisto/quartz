@@ -1,0 +1,356 @@
+## TcpAcceptableSelectable — D.11 Phase 2 chunk 2a.
+##
+## Validates the Selectable wrapper for non-blocking TCP accept.
+##   - construction returns a valid struct
+##   - try_poll fall-through: returns None on an empty accept queue
+##   - try_poll firing: a connected-but-not-yet-accepted client surfaces
+##     in the payload as a positive fd
+##   - composition inside `select`:
+##       * empty listener + default arm  → default wins
+##       * pending client + default arm  → accept arm wins, fd > 0
+##       * pending client + far deadline → accept beats deadline
+##       * pending client + uncancelled  → accept beats uncancelled cancel
+##       * empty listener + pre-cancel   → cancellable throws via Throws
+##
+## **Spec setup:** every test binds the listener to port 0 (kernel picks)
+## and sets it non-blocking via `tcp_listener_set_nonblocking` before
+## composing into select — the Selectable's try_poll expects the listener
+## fd to be non-blocking, otherwise socket_accept would block the entire
+## select runtime.
+##
+## **No real goroutines spawned.** Per the project caveat in CLAUDE.md
+## ("Spec authoring caveat for `go fn()` inside qspec lambdas"), `go fn()`
+## inside qspec doesn't spawn a worker thread. Instead, we connect a
+## client BEFORE the select on the same thread; the kernel buffers the
+## handshake in the listener's accept queue so the subsequent
+## (synchronous) socket_accept inside try_poll pops it immediately.
+
+import * from qspec
+import * from std/net/tcp
+import * from std/ffi/socket
+import * from std/sync/composition/scope
+import * from std/throws
+
+# Capture for Throws-driven assertions on the cancel-throw path.
+var ta_caught_count = 0
+var ta_caught_msg = ""
+
+def ta_capture(op_name: Int, argc: Int, argv: Int): Int
+  ta_caught_msg = as_type<String>(load(argv, 0))
+  ta_caught_count += 1
+  return 0
+end
+
+def ta_reset_capture(): Void
+  ta_caught_count = 0
+  ta_caught_msg = ""
+end
+
+# ---------------------------------------------------------------------------
+# Helpers — listener open + nonblock; client connect; cleanup.
+# ---------------------------------------------------------------------------
+
+# Open a non-blocking loopback listener; return its fd (or -1 on failure).
+# Caller owns close via socket_close (or tcp_close_listener).
+def ta_open_nb_listener(): Int
+  match tcp_listen(0)
+    Ok(l) => {
+      var rc = tcp_listener_set_nonblocking(l)
+      if rc < 0
+        var ignore = tcp_close_listener(l)
+        return -1
+      end
+      return l.fd
+    }
+    Err(e) => {
+      return -1
+    }
+  end
+end
+
+# Return the listener's bound port via getsockname-equivalent. Done by
+# round-tripping the listener handle: we re-listen and capture the port
+# in one shot. To avoid that, the helpers below take a (fd, port) pair
+# returned by ta_open_nb_listener_port.
+
+# Open a non-blocking loopback listener; return (fd, port) packed into
+# a small struct. Port is needed by ta_connect_one to dial the listener.
+struct TaListener
+  fd: Int
+  port: Int
+end
+
+def ta_open_nb_listener_port(): TaListener
+  match tcp_listen(0)
+    Ok(l) => {
+      var rc = tcp_listener_set_nonblocking(l)
+      if rc < 0
+        var ignore = tcp_close_listener(l)
+        return TaListener { fd: -1, port: 0 }
+      end
+      return TaListener { fd: l.fd, port: l.port }
+    }
+    Err(e) => {
+      return TaListener { fd: -1, port: 0 }
+    }
+  end
+end
+
+# Connect a client to 127.0.0.1:port; return the client's fd or -1.
+# On loopback, tcp_connect returns once the SYN+SYN-ACK+ACK handshake
+# completes — the listener's accept queue has the pending connection
+# by the time this function returns, so a subsequent non-blocking
+# socket_accept on the listener fd pops it immediately.
+def ta_connect_one(port: Int): Int
+  match tcp_connect("127.0.0.1", port)
+    Ok(s) => { return s.fd }
+    Err(e) => { return -1 }
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Test 1: construction returns a valid struct. Smoke-only — proves the
+# extend block typechecks and the constructor returns a value the
+# subsequent select arms can consume.
+# ---------------------------------------------------------------------------
+
+def ta_test_construction(): Int
+  var l = ta_open_nb_listener_port()
+  if l.fd < 0
+    return -1
+  end
+  var sel = tcp_acceptable(l.fd)
+  # If the struct constructor took the listener_fd correctly we can
+  # observe it; the spec doesn't assert on the field directly (the
+  # selectable runtime is the consumer), but reaching this point at
+  # all means the impl block compiled.
+  socket_close(l.fd)
+  return 1
+end
+
+# ---------------------------------------------------------------------------
+# Test 2: try_poll fall-through. Listener with no client → default arm
+# wins. Proves the chunked-poll non-firing path does NOT block.
+# ---------------------------------------------------------------------------
+
+def ta_test_default_wins_empty(): Int
+  var l = ta_open_nb_listener_port()
+  if l.fd < 0
+    return -1
+  end
+  var fired = 0
+  select
+    case fd = tcp_acceptable(l.fd) => fired = 1
+    default => fired = 99
+  end
+  socket_close(l.fd)
+  return fired
+end
+
+# ---------------------------------------------------------------------------
+# Test 3: try_poll firing path through select. Client connected before
+# the select runs → the accept arm wins and the bound fd is positive.
+# ---------------------------------------------------------------------------
+
+def ta_test_accept_wins_when_pending(): Int
+  var l = ta_open_nb_listener_port()
+  if l.fd < 0
+    return -1
+  end
+  var cfd = ta_connect_one(l.port)
+  if cfd < 0
+    socket_close(l.fd)
+    return -2
+  end
+  var got = -3
+  select
+    case fd = tcp_acceptable(l.fd) => got = fd
+    default => got = -99
+  end
+  # got should be the accepted server-side client fd (> 0). The
+  # client-side fd (cfd) is a separate handle on the connecting side.
+  var saw_positive = 0
+  if got > 0
+    saw_positive = 1
+    socket_close(got)
+  end
+  socket_close(cfd)
+  socket_close(l.fd)
+  # Diagnostic: encode got value into return so failure surfaces it.
+  # >0 → saw_positive (returns 1); -99 → returns -99 (default fired);
+  # 0 → returns 0 (try_poll succeeded but with fd=0 — diagnose);
+  # -3 → returns -3 (select didn't run at all).
+  if saw_positive == 1
+    return 1
+  end
+  return got
+end
+
+# ---------------------------------------------------------------------------
+# Test 4: accept beats a far-future deadline. Same as Test 3 but with a
+# deadline arm proving Selectable composition (not just default arm).
+# ---------------------------------------------------------------------------
+
+def ta_test_accept_beats_far_deadline(): Int
+  var l = ta_open_nb_listener_port()
+  if l.fd < 0
+    return -1
+  end
+  var cfd = ta_connect_one(l.port)
+  if cfd < 0
+    socket_close(l.fd)
+    return -2
+  end
+  var got = -3
+  select
+    case fd = tcp_acceptable(l.fd) => got = fd
+    case _ = deadline_ms(60000) => got = -98
+    default => got = -99
+  end
+  var saw_positive = 0
+  if got > 0
+    saw_positive = 1
+    socket_close(got)
+  end
+  socket_close(cfd)
+  socket_close(l.fd)
+  return saw_positive
+end
+
+# ---------------------------------------------------------------------------
+# Test 5: accept beats an uncancelled scope. Proves cancellable doesn't
+# fire when the scope is fresh.
+# ---------------------------------------------------------------------------
+
+def ta_test_accept_beats_uncancelled_scope(): Int
+  var l = ta_open_nb_listener_port()
+  if l.fd < 0
+    return -1
+  end
+  var cfd = ta_connect_one(l.port)
+  if cfd < 0
+    socket_close(l.fd)
+    return -2
+  end
+  var s = scope_with_cancel(scope_root())
+  var got = -3
+  select
+    case fd = tcp_acceptable(l.fd) => got = fd
+    case _ = cancellable(s) => got = -98
+    default => got = -99
+  end
+  var saw_positive = 0
+  if got > 0
+    saw_positive = 1
+    socket_close(got)
+  end
+  socket_close(cfd)
+  socket_close(l.fd)
+  return saw_positive
+end
+
+# ---------------------------------------------------------------------------
+# Test 6: pre-cancelled scope beats an empty-accept listener. cancellable
+# fires on a scope that was cancelled before the select. complete
+# throws "shutdown" via Throws; the surrounding handler captures the
+# throw. tcp_acceptable's try_poll returns None and never wins. Proves
+# the cancel-cascade-fires-promptly composition used by Phase 2c's
+# keep-alive loop.
+# ---------------------------------------------------------------------------
+
+var ta_arm_body_ran = 0
+
+def ta_cancel_throw_body(l_fd: Int, s: Int): Int
+  ta_arm_body_ran = 0
+  select
+    case fd = tcp_acceptable(l_fd) => ta_arm_body_ran = 1
+    case _ = cancellable(s) => ta_arm_body_ran = 2
+  end
+  return 0
+end
+
+def ta_test_cancellable_throws_on_pre_cancelled(): Int
+  var l = ta_open_nb_listener_port()
+  if l.fd < 0
+    return -1
+  end
+  var s = scope_with_cancel(scope_root())
+  scope_cancel_with(s, "shutdown")
+  ta_reset_capture()
+  with Throws { throw: ta_capture } do ->
+    ta_cancel_throw_body(l.fd, s)
+    0
+  end
+  socket_close(l.fd)
+  return ta_caught_count
+end
+
+def ta_test_cancellable_carries_reason(): String
+  var l = ta_open_nb_listener_port()
+  if l.fd < 0
+    return ""
+  end
+  var s = scope_with_cancel(scope_root())
+  scope_cancel_with(s, "shutdown")
+  ta_reset_capture()
+  with Throws { throw: ta_capture } do ->
+    ta_cancel_throw_body(l.fd, s)
+    0
+  end
+  socket_close(l.fd)
+  return ta_caught_msg
+end
+
+def ta_test_cancellable_arm_body_skipped(): Int
+  var l = ta_open_nb_listener_port()
+  if l.fd < 0
+    return -1
+  end
+  var s = scope_with_cancel(scope_root())
+  scope_cancel_with(s, "shutdown")
+  ta_reset_capture()
+  ta_arm_body_ran = 0
+  with Throws { throw: ta_capture } do ->
+    ta_cancel_throw_body(l.fd, s)
+    0
+  end
+  socket_close(l.fd)
+  return ta_arm_body_ran
+end
+
+def main(): Int
+  describe("TcpAcceptableSelectable — D.11 Phase 2 chunk 2a") do ->
+    it("tcp_acceptable returns a valid Selectable wrapper") do ->
+      assert_eq(ta_test_construction(), 1)
+    end
+
+    it("select with no pending connection falls through to default") do ->
+      assert_eq(ta_test_default_wins_empty(), 99)
+    end
+
+    it("select with one pending connection binds a positive fd") do ->
+      assert_eq(ta_test_accept_wins_when_pending(), 1)
+    end
+
+    it("accept beats a far-future deadline_ms in the same select") do ->
+      assert_eq(ta_test_accept_beats_far_deadline(), 1)
+    end
+
+    it("accept beats an uncancelled scope in the same select") do ->
+      assert_eq(ta_test_accept_beats_uncancelled_scope(), 1)
+    end
+
+    it("pre-cancelled scope throws via Throws (handler observes one throw)") do ->
+      assert_eq(ta_test_cancellable_throws_on_pre_cancelled(), 1)
+    end
+
+    it("cancel-throw message carries the scope's user-supplied reason") do ->
+      assert_eq_str(ta_test_cancellable_carries_reason(), "shutdown")
+    end
+
+    it("the firing arm's body never runs once cancellable throws") do ->
+      assert_eq(ta_test_cancellable_arm_body_skipped(), 0)
+    end
+  end
+  return qspec_main()
+end

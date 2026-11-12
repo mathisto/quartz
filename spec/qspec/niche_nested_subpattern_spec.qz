@@ -1,0 +1,391 @@
+## Nested constructor sub-pattern niche read + BIND seam (enum-niche tail items 1 + 6).
+##
+## A nested sub-pattern `Outer(Inner::Variant(...))` dispatches on the INNER
+## value's tag (item 1) AND may BIND the inner payload (item 6). The three read
+## seams (mir_lower_if_pattern, statement-context match arm, value-context match
+## arm) emit the inner tag read through the niche seam (mir_get_enum_tag_nested)
+## so a niche-represented inner (M1 user enum packed as `payload_ptr | tag`, or a
+## built-in Result tagged box) dispatches to the right arm. Item 6 adds the BIND:
+## `Outer(Inner::V(x)) => ... x ...` recovers the inner payload via the SAME
+## niche/spill classifier the read uses (§14.10.Q4 construct/read/bind agreement)
+## — niche inner ⇒ `& ~spare_mask`, spill/tagged inner ⇒ `load@+1`. Asserting the
+## bound VALUE (x.v) catches a mask/load mismatch.
+##
+## Outer enum has 3 variants (one payload + two dataless) ⇒ the outer SPILLS, so
+## the inner niche value sits at a real spill slot (offset spi+1) — the exact
+## shape the raw-spill read mis-handles.
+##
+## Deeper nesting (Outer(Mid(Inner(x)))) is OUT OF SCOPE (item 6c — filed).
+import * from qspec
+
+struct Inner
+  v: Int
+end
+
+# M1 user enum: two distinct-named single-boxed payload variants ⇒ NICHE_MULTI
+# (packed `payload_ptr | tag`). Unconditionally-niched inner oracle at gate=1.
+enum IRes
+  Good(g: Inner)
+  Bad(b: Inner)
+end
+
+# Spill outer (3 variants) holding an M1-niche inner.
+enum Outer2
+  Hold(r: IRes)
+  None2
+  Other2
+end
+
+# Built-in Result inner (M2 seam) inside a spill outer.
+enum Wrap
+  Carry(r: Result<Inner, Inner>)
+  Empty
+  Other
+end
+
+# Built-in Option inner inside a SPILL outer. Construct/read/bind seam (item
+# 6 optfix): the inner Option<Inner> niches (Some = bare Inner ptr, None = 0).
+# The OPERAND-LESS `None` had no ambient type so it fell to a SPILL tagged box
+# (a nonzero box pointer) while `Some` niche-built — a construct/read disagreement
+# (§14.10.Q4) that made a None payload mis-dispatch to the `Some` arm. The fix
+# primes niche_expected from the outer variant's declared `Option<Inner>` field
+# type so `None` niche-builds to 0, matching the niche read (`val == 0` ⇒ None).
+enum WrapO
+  CarryO(c: Option<Inner>)
+  EmptyO
+  OtherO
+end
+
+def mk_good(n: Int): Outer2 = Outer2::Hold(IRes::Good(Inner { v: n }))
+def mk_bad(n: Int): Outer2 = Outer2::Hold(IRes::Bad(Inner { v: n }))
+
+def mk_carry_ok(n: Int): Wrap = Wrap::Carry(Result::Ok(Inner { v: n }))
+def mk_carry_err(n: Int): Wrap = Wrap::Carry(Result::Err(Inner { v: n }))
+
+def mk_some(n: Int): WrapO = WrapO::CarryO(Option::Some(Inner { v: n }))
+def mk_none(): WrapO = WrapO::CarryO(Option::None)
+
+# item 40 — @value (value-layout) inner payload nested in a SPILL outer. The
+# construct side INLINE-EMBEDS the value's words at the inner box's payload slot
+# (offset +1) instead of a payload pointer. The nested BIND must therefore bind
+# the INTERIOR ADDRESS (inner_box + (idx+1)*8) and mark the name arena-owned, so
+# field reads use flat offset+0 — NOT the plain-spill `load@+1` (which loads the
+# inlined FIRST WORD as a payload pointer ⇒ arm derefs an int ⇒ SIGSEGV). Two
+# shapes: VInner1 (1-field, ≤16B inline) and VBig (3-field, >16B header-stripped
+# CoW). These DISCRIMINATE at gate-0 because @value is value-layout there (the
+# PLAIN-struct cases above are boxed at gate-0 and exercise the load@+1 path).
+@value
+struct VInner1
+  v: Int
+end
+
+@value
+struct VBig
+  a: Int
+  b: Int
+  c: Int
+end
+
+# Option<@value> inner, inline (≤16B).
+enum WrapVO
+  CarryVO(c: Option<VInner1>)
+  EmptyVO
+  OtherVO
+end
+
+# Result<@value> inner, inline (≤16B).
+enum WrapVR
+  CarryVR(r: Result<VInner1, VInner1>)
+  EmptyVR
+  OtherVR
+end
+
+# Option<@value> inner, >16B CoW (3-field).
+enum WrapVOB
+  CarryVOB(c: Option<VBig>)
+  EmptyVOB
+  OtherVOB
+end
+
+# Result<@value> inner, >16B CoW (3-field).
+enum WrapVRB
+  CarryVRB(r: Result<VBig, VBig>)
+  EmptyVRB
+  OtherVRB
+end
+
+def mk_vsome(n: Int): WrapVO = WrapVO::CarryVO(Option::Some(VInner1 { v: n }))
+def mk_vnone(): WrapVO = WrapVO::CarryVO(Option::None)
+def mk_vok(n: Int): WrapVR = WrapVR::CarryVR(Result::Ok(VInner1 { v: n }))
+def mk_verr(n: Int): WrapVR = WrapVR::CarryVR(Result::Err(VInner1 { v: n }))
+def mk_vbsome(n: Int): WrapVOB = WrapVOB::CarryVOB(Option::Some(VBig { a: n, b: n + 1, c: n + 2 }))
+def mk_vbok(n: Int): WrapVRB = WrapVRB::CarryVRB(Result::Ok(VBig { a: n, b: n + 1, c: n + 2 }))
+def mk_vberr(n: Int): WrapVRB = WrapVRB::CarryVRB(Result::Err(VBig { a: n, b: n + 1, c: n + 2 }))
+
+# Bind the inline @value Option payload; read x.v through the interior address.
+def bind_voption(w: WrapVO): Int
+  return match w
+    CarryVO(Option::Some(x)) => x.v
+    CarryVO(Option::None) => 0 - 1
+    EmptyVO => 100
+    OtherVO => 200
+  end
+end
+
+# Bind the inline @value Result payload (Ok and Err both inline-embedded).
+def bind_vresult(w: WrapVR): Int
+  return match w
+    CarryVR(Result::Ok(x)) => x.v
+    CarryVR(Result::Err(x)) => 1000 + x.v
+    EmptyVR => 100
+    OtherVR => 200
+  end
+end
+
+# Bind the >16B CoW @value Option payload; sum all three fields (flat offset+0).
+def bind_vboption(w: WrapVOB): Int
+  return match w
+    CarryVOB(Option::Some(g)) => g.a + g.b + g.c
+    CarryVOB(Option::None) => 0 - 1
+    EmptyVOB => 100
+    OtherVOB => 200
+  end
+end
+
+# Bind the >16B CoW @value Result payload; sum all three fields.
+def bind_vbresult(w: WrapVRB): Int
+  return match w
+    CarryVRB(Result::Ok(g)) => g.a + g.b + g.c
+    CarryVRB(Result::Err(g)) => 1000 + g.a + g.b + g.c
+    EmptyVRB => 100
+    OtherVRB => 200
+  end
+end
+
+# --- Item 1 wildcard tag-dispatch (regression guard: the read still works) ---
+
+# Nested sub-pattern dispatch for the M1 user-enum inner (wildcard inner bind).
+def probe_user(w: Outer2): Int
+  return match w
+    Hold(IRes::Good(_)) => 1
+    Hold(IRes::Bad(_)) => 2
+    None2 => 100
+    Other2 => 200
+  end
+end
+
+# Nested sub-pattern dispatch for the built-in Result inner (M2 seam).
+def probe_result(w: Wrap): Int
+  return match w
+    Carry(Result::Ok(_)) => 1
+    Carry(Result::Err(_)) => 2
+    Empty => 100
+    Other => 200
+  end
+end
+
+# Nested sub-pattern dispatch for the built-in Option inner (NO bind). This is
+# the reduced item-6 optfix bug: a None payload mis-dispatched to the Some arm
+# (returned 1 for None) because None was constructed as a SPILL tagged box while
+# the read niche-classified the slot.
+def probe_option(w: WrapO): Int
+  return match w
+    CarryO(Option::Some(_)) => 1
+    CarryO(Option::None) => 2
+    EmptyO => 3
+    OtherO => 4
+  end
+end
+
+# --- Item 6 NAMED inner binds (the new feature) ---
+
+# M1 user-enum inner: bind `x` (a niche-packed Inner ⇒ recover via `& ~spare_mask`)
+# and read x.v through it. good ⇒ 42, bad ⇒ -7, dataless arms 100/200.
+def bind_user(w: Outer2): Int
+  return match w
+    Hold(IRes::Good(x)) => x.v
+    Hold(IRes::Bad(x)) => 0 - x.v
+    None2 => 100
+    Other2 => 200
+  end
+end
+
+# Built-in Result inner: nested in a SPILL outer ⇒ the inner Result is a TAGGED
+# BOX (NOT niche-packed), so the bind must `load@+1`, NOT mask. ok ⇒ 42,
+# err ⇒ 1007. Asserting x.v catches a mask/load mismatch (the §14.10.Q4 trap).
+def bind_result(w: Wrap): Int
+  return match w
+    Carry(Result::Ok(x)) => x.v
+    Carry(Result::Err(x)) => 1000 + x.v
+    Empty => 100
+    Other => 200
+  end
+end
+
+# Built-in Option inner: nested in a SPILL outer ⇒ the inner Option niches
+# (Some = bare Inner ptr, None = 0). The bind is IDENTITY on the niche scalar.
+# some(Inner{v:7}) ⇒ 7, none ⇒ -1, dataless arms 100/200.
+def bind_option(w: WrapO): Int
+  return match w
+    CarryO(Option::Some(x)) => x.v
+    CarryO(Option::None) => 0 - 1
+    EmptyO => 100
+    OtherO => 200
+  end
+end
+
+def main(): Int
+  describe("nested sub-pattern tag dispatch — M1 user-enum inner (item 1 regression)") do ->
+    it("Hold(Good) dispatches to arm 1 (inner Good, niche tag 0)") do ->
+      assert_eq(probe_user(mk_good(42)), 1)
+    end
+    it("Hold(Bad) dispatches to arm 2 (inner Bad, niche tag 1)") do ->
+      assert_eq(probe_user(mk_bad(7)), 2)
+    end
+    it("Good vs Bad stay distinct through the nested dispatch") do ->
+      assert_eq(probe_user(mk_good(5)), 1)
+      assert_eq(probe_user(mk_bad(5)), 2)
+    end
+    it("dataless outer variants still reach their arms") do ->
+      assert_eq(probe_user(Outer2::None2), 100)
+      assert_eq(probe_user(Outer2::Other2), 200)
+    end
+  end
+
+  describe("nested sub-pattern tag dispatch — built-in Result inner (item 1 regression)") do ->
+    it("Carry(Ok) dispatches to arm 1 (inner Ok, niche tag 0)") do ->
+      assert_eq(probe_result(mk_carry_ok(42)), 1)
+    end
+    it("Carry(Err) dispatches to arm 2 (inner Err, niche tag 1)") do ->
+      assert_eq(probe_result(mk_carry_err(7)), 2)
+    end
+    it("Ok vs Err stay distinct through the nested dispatch") do ->
+      assert_eq(probe_result(mk_carry_ok(5)), 1)
+      assert_eq(probe_result(mk_carry_err(5)), 2)
+    end
+    it("dataless outer variants still reach their arms") do ->
+      assert_eq(probe_result(Wrap::Empty), 100)
+      assert_eq(probe_result(Wrap::Other), 200)
+    end
+  end
+
+  describe("nested sub-pattern BIND — M1 user-enum inner (niche & ~spare_mask)") do ->
+    it("Hold(Good(x)) binds x; x.v == 42") do ->
+      assert_eq(bind_user(mk_good(42)), 42)
+    end
+    it("Hold(Bad(x)) binds x; 0 - x.v == -7") do ->
+      assert_eq(bind_user(mk_bad(7)), 0 - 7)
+    end
+    it("the two payload binds stay distinct") do ->
+      assert_eq(bind_user(mk_good(11)), 11)
+      assert_eq(bind_user(mk_bad(11)), 0 - 11)
+    end
+    it("dataless outer arms still reach (bind path doesn't break dispatch)") do ->
+      assert_eq(bind_user(Outer2::None2), 100)
+      assert_eq(bind_user(Outer2::Other2), 200)
+    end
+  end
+
+  describe("nested sub-pattern BIND — built-in Result inner (spill/tagged load@+1)") do ->
+    it("Carry(Ok(x)) binds x; x.v == 42 (load@+1, NOT mask)") do ->
+      assert_eq(bind_result(mk_carry_ok(42)), 42)
+    end
+    it("Carry(Err(x)) binds x; 1000 + x.v == 1007") do ->
+      assert_eq(bind_result(mk_carry_err(7)), 1007)
+    end
+    it("the two payload binds stay distinct") do ->
+      assert_eq(bind_result(mk_carry_ok(3)), 3)
+      assert_eq(bind_result(mk_carry_err(3)), 1003)
+    end
+    it("dataless outer arms still reach (bind path doesn't break dispatch)") do ->
+      assert_eq(bind_result(Wrap::Empty), 100)
+      assert_eq(bind_result(Wrap::Other), 200)
+    end
+  end
+
+  describe("nested sub-pattern tag dispatch — built-in Option inner (item 6 optfix)") do ->
+    it("CarryO(Some) dispatches to arm 1 (inner Some, niche bare ptr)") do ->
+      assert_eq(probe_option(mk_some(7)), 1)
+    end
+    it("CarryO(None) dispatches to arm 2 (inner None, niche 0) — was mis-dispatching to 1") do ->
+      assert_eq(probe_option(mk_none()), 2)
+    end
+    it("Some vs None stay distinct through the nested dispatch") do ->
+      assert_eq(probe_option(mk_some(5)), 1)
+      assert_eq(probe_option(mk_none()), 2)
+    end
+    it("dataless outer variants still reach their arms") do ->
+      assert_eq(probe_option(WrapO::EmptyO), 3)
+      assert_eq(probe_option(WrapO::OtherO), 4)
+    end
+  end
+
+  describe("nested sub-pattern BIND — built-in Option inner (niche identity)") do ->
+    it("CarryO(Some(x)) binds x; x.v == 7") do ->
+      assert_eq(bind_option(mk_some(7)), 7)
+    end
+    it("CarryO(None) reaches its arm; 0 - 1 == -1") do ->
+      assert_eq(bind_option(mk_none()), 0 - 1)
+    end
+    it("the Some bind and the None arm stay distinct") do ->
+      assert_eq(bind_option(mk_some(11)), 11)
+      assert_eq(bind_option(mk_none()), 0 - 1)
+    end
+    it("dataless outer arms still reach (bind path doesn't break dispatch)") do ->
+      assert_eq(bind_option(WrapO::EmptyO), 100)
+      assert_eq(bind_option(WrapO::OtherO), 200)
+    end
+  end
+
+  describe("item 40 — nested BIND of an INLINE @value inner payload (interior address)") do ->
+    it("CarryVO(Some(x)) binds the inline @value Option payload; x.v == 7") do ->
+      assert_eq(bind_voption(mk_vsome(7)), 7)
+    end
+    it("CarryVO(None) reaches its arm; -1") do ->
+      assert_eq(bind_voption(mk_vnone()), 0 - 1)
+    end
+    it("inline @value binds stay distinct across calls") do ->
+      assert_eq(bind_voption(mk_vsome(11)), 11)
+      assert_eq(bind_voption(mk_vnone()), 0 - 1)
+    end
+    it("dataless outer arms still reach (inline @value path)") do ->
+      assert_eq(bind_voption(WrapVO::EmptyVO), 100)
+      assert_eq(bind_voption(WrapVO::OtherVO), 200)
+    end
+    it("CarryVR(Ok(x)) binds the inline @value Result payload; x.v == 42") do ->
+      assert_eq(bind_vresult(mk_vok(42)), 42)
+    end
+    it("CarryVR(Err(x)) binds the inline @value Result Err payload; 1000 + x.v == 1007") do ->
+      assert_eq(bind_vresult(mk_verr(7)), 1007)
+    end
+    it("inline @value Result Ok/Err stay distinct") do ->
+      assert_eq(bind_vresult(mk_vok(3)), 3)
+      assert_eq(bind_vresult(mk_verr(3)), 1003)
+    end
+  end
+
+  describe("item 40 — nested BIND of a >16B CoW @value inner payload (flat offset+0)") do ->
+    it("CarryVOB(Some(g)) reads all 3 fields of the >16B @value Option payload; 10+11+12 == 33") do ->
+      assert_eq(bind_vboption(mk_vbsome(10)), 33)
+    end
+    it("CarryVOB(None) reaches its arm; -1") do ->
+      assert_eq(bind_vboption(WrapVOB::EmptyVOB), 100)
+    end
+    it("CarryVRB(Ok(g)) reads all 3 fields of the >16B @value Result Ok payload; 20+21+22 == 63") do ->
+      assert_eq(bind_vbresult(mk_vbok(20)), 63)
+    end
+    it("CarryVRB(Err(g)) reads all 3 fields of the >16B @value Result Err payload; 1000+5+6+7 == 1018") do ->
+      assert_eq(bind_vbresult(mk_vberr(5)), 1018)
+    end
+    it(">16B @value binds stay distinct (no header-shift across fields)") do ->
+      assert_eq(bind_vboption(mk_vbsome(100)), 303)
+      assert_eq(bind_vbresult(mk_vbok(0)), 3)
+    end
+    it("dataless outer arms still reach (>16B @value path)") do ->
+      assert_eq(bind_vbresult(WrapVRB::EmptyVRB), 100)
+      assert_eq(bind_vbresult(WrapVRB::OtherVRB), 200)
+    end
+  end
+
+  return qspec_main()
+end

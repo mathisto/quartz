@@ -1,0 +1,470 @@
+## Scheduler Benchmark Harness (P21+)
+##
+## Headless benchmark for the M:N work-stealing scheduler.
+## Runs 8 scenarios, outputs BENCHJSON lines for bench_history.qz.
+##
+## Usage:
+##   sched_bench                  # All scenarios, 10 iterations
+##   sched_bench --quick          # 5 iterations
+##   sched_bench --precise        # 30 iterations
+##   sched_bench --scenario NAME  # Single scenario
+##   sched_bench --json-only      # Suppress BENCH: lines
+##
+## Statistics + warmup + outlier rejection are routed through
+## std/bench (Phase C.8 Phase 3 dogfood, 2026-05-02). Each scenario
+## function returns a throughput rate (ops/sec, msgs/sec, etc.) — we
+## use bench_run_values so the function's return is the sample
+## directly, rather than its elapsed time.
+
+import * from std/bench
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+var g_iterations = 10
+var g_json_only = 0
+var g_scenario_filter = ""
+
+# ============================================================================
+# Arg parsing
+# ============================================================================
+
+def parse_args(): Void
+  var n = argc()
+  var i = 1
+  while i < n
+    var arg = argv(i)
+    if str_eq(arg, "--quick")
+      g_iterations = 5
+    elsif str_eq(arg, "--precise")
+      g_iterations = 30
+    elsif str_eq(arg, "--json-only")
+      g_json_only = 1
+    elsif str_eq(arg, "--scenario")
+      i += 1
+      if i < n
+        g_scenario_filter = argv(i)
+      end
+    elsif str_eq(arg, "--iterations")
+      i += 1
+      if i < n
+        g_iterations = str_to_int(argv(i))
+      end
+    end
+    i += 1
+  end
+end
+
+# ============================================================================
+# Metadata collection
+# ============================================================================
+
+def capture_cmd(cmd: String): String
+  var handle = pipe_open(cmd, "r")
+  if handle == 0
+    return ""
+  end
+  var result = ""
+  var buf = fread(handle, 256)
+  while str_byte_len(buf) > 0
+    result = str_concat(result, buf)
+    buf = fread(handle, 256)
+  end
+  pipe_close(handle)
+  # Trim trailing newline
+  var len = str_byte_len(result)
+  if len > 0 and str_byte_at(result, len - 1) == '\n'
+    result = str_slice(result, 0, len - 1)
+  end
+  return result
+end
+
+def collect_sha(): String = capture_cmd("git rev-parse --short HEAD 2>/dev/null")
+
+# ============================================================================
+# JSON emission (manual, following site/server.qz pattern)
+#
+# Statistics (median/p25/p75/p95/p99/mean/stddev/IQR/MAD-outliers) come
+# from std/bench via bench_run_values; this file only ferries those
+# values plus scheduler-specific metadata (sha, workers, params.n,
+# rss_mb) into the on-the-wire JSON shape consumed by bench_history.
+# ============================================================================
+
+def emit_json(r: BenchResult, param_n: Int,
+              rss: Int, sha: String, workers: Int): Void
+  var sb = sb_new()
+  sb_append(sb, "BENCHJSON:{\"v\":2,\"ts\":\"")
+  sb_append(sb, capture_cmd("date -u +%Y-%m-%dT%H:%M:%S 2>/dev/null"))
+  sb_append(sb, "\",\"sha\":\"")
+  sb_append(sb, sha)
+  sb_append(sb, "\",\"workers\":")
+  sb_append(sb, workers.to_s())
+  sb_append(sb, ",\"scenario\":\"")
+  sb_append(sb, r.name)
+  sb_append(sb, "\",\"name\":\"")
+  sb_append(sb, r.name)
+  sb_append(sb, "\",\"params\":{\"n\":")
+  sb_append(sb, param_n.to_s())
+  sb_append(sb, "},\"iters\":")
+  sb_append(sb, r.n_iters_observed.to_s())
+  sb_append(sb, ",\"outliers_removed\":")
+  sb_append(sb, r.n_outliers_removed.to_s())
+  sb_append(sb, ",\"values\":[")
+  for i in 0..r.values.size
+    if i > 0
+      sb_append(sb, ",")
+    end
+    sb_append(sb, r.values[i].to_s())
+  end
+  var p25 = bench_percentile(r.values, 2500)
+  var p75 = bench_percentile(r.values, 7500)
+  sb_append(sb, "],\"mean\":")
+  sb_append(sb, r.mean.to_s())
+  sb_append(sb, ",\"median\":")
+  sb_append(sb, r.median.to_s())
+  sb_append(sb, ",\"p25\":")
+  sb_append(sb, p25.to_s())
+  sb_append(sb, ",\"p75\":")
+  sb_append(sb, p75.to_s())
+  sb_append(sb, ",\"p95\":")
+  sb_append(sb, r.p95.to_s())
+  sb_append(sb, ",\"p99\":")
+  sb_append(sb, r.p99.to_s())
+  sb_append(sb, ",\"min\":")
+  sb_append(sb, r.min.to_s())
+  sb_append(sb, ",\"max\":")
+  sb_append(sb, r.max.to_s())
+  sb_append(sb, ",\"stddev_x100\":")
+  sb_append(sb, r.stddev_x100.to_s())
+  sb_append(sb, ",\"iqr\":")
+  sb_append(sb, r.iqr.to_s())
+  sb_append(sb, ",\"unit\":\"")
+  sb_append(sb, r.unit)
+  sb_append(sb, "\",\"rss_mb\":")
+  sb_append(sb, (rss / 1048576).to_s())
+  sb_append(sb, "}")
+  puts(sb_to_string(sb))
+end
+
+def emit_bench(scenario: String, metric: String, value: Int): Void
+  if g_json_only == 0
+    eprint("  #{scenario}: #{value} #{metric}\n")
+  end
+end
+
+# ============================================================================
+# Scenario helpers
+# ============================================================================
+
+def noop(): Int = 0
+
+def channel_producer(ch: Int, count: Int, done: Int): Void
+  var i = 0
+  while i < count
+    send(ch, i + 1)
+    i += 1
+  end
+  send(done, 1)
+end
+
+def fanout_worker(start: Int, count: Int): Int
+  var sum = 0
+  for i in start..(start + count)
+    sum += i
+  end
+  return sum
+end
+
+def contention_worker(counter_ptr: Int, iters: Int): Void
+  for i in 0..iters
+    atomic_add(counter_ptr, 1)
+  end
+end
+
+def steal_worker(done: Int): Void
+  send(done, 1)
+end
+
+def herd_worker(inbox: Int, done: Int, base_time: Int): Void
+  recv(inbox)
+  var wake_time = time_mono_ns() - base_time
+  send(done, wake_time)
+end
+
+# ============================================================================
+# Scenarios
+# ============================================================================
+
+def scenario_spawn_rate(): Int
+  var n = 100000
+  var start = time_mono_ns()
+  var tasks = vec_new()
+  for i in 0..n
+    var t = async noop()
+    sched_spawn(t)
+    tasks.push(t)
+  end
+  for i in 0..n
+    await tasks[i]
+  end
+  var elapsed = time_mono_ns() - start
+  return n * 1000000000 / elapsed
+end
+
+def scenario_channel_throughput(): Int
+  var n = 10000
+  var ch = channel_new(1024)
+  var done = channel_new(1)
+  var start = time_mono_ns()
+  go channel_producer(ch, n, done)
+  # Main thread acts as consumer
+  var i = 0
+  while i < n
+    recv(ch)
+    i += 1
+  end
+  recv(done)
+  var elapsed = time_mono_ns() - start
+  return n * 1000000000 / elapsed
+end
+
+def scenario_fanout_fanin(): Int
+  var n = 100000
+  var num_workers = 8
+  var per_worker = n / num_workers
+  var start = time_mono_ns()
+  var tasks = vec_new()
+  for i in 0..num_workers
+    var s = i * per_worker
+    var t = async fanout_worker(s, per_worker)
+    sched_spawn(t)
+    tasks.push(t)
+  end
+  var total = 0
+  for i in 0..num_workers
+    total += await tasks[i]
+  end
+  var elapsed = time_mono_ns() - start
+  return n * 1000000000 / elapsed
+end
+
+def scenario_contention(): Int
+  var num_tasks = 8
+  var iters_per = 125000
+  var total_ops = num_tasks * iters_per
+  var counter_ptr = mem_alloc(8)
+  atomic_store(counter_ptr, 0, 0)
+  var start = time_mono_ns()
+  var tasks = vec_new()
+  for i in 0..num_tasks
+    var t = async contention_worker(counter_ptr, iters_per)
+    sched_spawn(t)
+    tasks.push(t)
+  end
+  for i in 0..num_tasks
+    await tasks[i]
+  end
+  var elapsed = time_mono_ns() - start
+  qz_free(counter_ptr)
+  return total_ops * 1000000000 / elapsed
+end
+
+def scenario_steal_throughput(): Int
+  var n = 100000
+  var done_ch = channel_new_unbounded()
+  var start = time_mono_ns()
+  for i in 0..n
+    go steal_worker(done_ch)
+  end
+  for i in 0..n
+    recv(done_ch)
+  end
+  var elapsed = time_mono_ns() - start
+  return n * 1000000000 / elapsed
+end
+
+def scenario_wake_burst(): Int
+  var n = 10000
+  var inboxes = vec_new()
+  var done_ch = channel_new_unbounded()
+  var base_time = time_mono_ns()
+  # Spawn workers, each blocks on recv
+  for i in 0..n
+    var inbox = channel_new(1)
+    inboxes.push(inbox)
+    go herd_worker(inbox, done_ch, base_time)
+  end
+  # Let all workers park
+  sched_yield()
+  sched_yield()
+  sched_yield()
+  # Burst-send to wake all
+  var t0 = time_mono_ns()
+  for i in 0..n
+    send(inboxes[i], 1)
+  end
+  # Collect all responses (total wake time, not individual)
+  for i in 0..n
+    recv(done_ch)
+  end
+  var elapsed = time_mono_ns() - t0
+  return n * 1000000000 / elapsed
+end
+
+def scenario_scalability_curve(): Int
+  # Measure spawn rate at 1K, 10K, 100K, 1M
+  # Return scaling efficiency * 1000 (integer-scaled)
+  var scales = [1000, 10000, 100000, 1000000]
+  var rates = vec_new()
+  for si in 0..4
+    var n = scales[si]
+    var start = time_mono_ns()
+    var tasks = vec_new()
+    for i in 0..n
+      var t = async noop()
+      sched_spawn(t)
+      tasks.push(t)
+    end
+    for i in 0..n
+      await tasks[i]
+    end
+    var elapsed = time_mono_ns() - start
+    var rate = n * 1000000000 / elapsed
+    rates.push(rate)
+  end
+  # Scaling efficiency = rate_1M / rate_1K * 1000
+  if rates[0] > 0
+    return rates[3] * 1000 / rates[0]
+  end
+  return 0
+end
+
+def scenario_memory_efficiency(): Int
+  # Measure bytes per task at 100K
+  var n = 100000
+  var rss_before = mem_current_rss()
+  var tasks = vec_new()
+  for i in 0..n
+    var t = async noop()
+    sched_spawn(t)
+    tasks.push(t)
+  end
+  # Measure after spawn, before await
+  var rss_after = mem_current_rss()
+  for i in 0..n
+    await tasks[i]
+  end
+  var delta = rss_after - rss_before
+  if delta < 0
+    delta = 0
+  end
+  return delta / n
+end
+
+# ============================================================================
+# Runner
+# ============================================================================
+
+## Dispatch the named scenario by suffix-matching. Returns 0 if the
+## name doesn't match (caller filtered already, so this should never
+## fire on the dispatch path; defensive default).
+def dispatch_scenario(name: String): Int
+  if str_eq(name, "spawn_rate")
+    return scenario_spawn_rate()
+  end
+  if str_eq(name, "channel_throughput")
+    return scenario_channel_throughput()
+  end
+  if str_eq(name, "fanout_fanin")
+    return scenario_fanout_fanin()
+  end
+  if str_eq(name, "contention")
+    return scenario_contention()
+  end
+  if str_eq(name, "steal_throughput")
+    return scenario_steal_throughput()
+  end
+  if str_eq(name, "wake_burst")
+    return scenario_wake_burst()
+  end
+  if str_eq(name, "scalability_curve")
+    return scenario_scalability_curve()
+  end
+  if str_eq(name, "memory_efficiency")
+    return scenario_memory_efficiency()
+  end
+  return 0
+end
+
+# Module-level scenario name for dispatch_via_global. Quartz lambdas
+# can capture local vars, but routing through a module slot keeps the
+# bench_run_values closure trivially constructible.
+var _g_scenario_name = ""
+
+def _g_scenario_runner(): Int = dispatch_scenario(_g_scenario_name)
+
+def run_scenario_fn(name: String, unit: String, param_n: Int, iters: Int,
+                    sha: String, workers: Int): Void
+  if str_byte_len(g_scenario_filter) > 0
+    if str_eq(g_scenario_filter, name) == 0
+      return
+    end
+  end
+
+  _g_scenario_name = name
+  var cfg = BenchConfig {
+    name: name,
+    unit: unit,
+    warmup_iters: 1,
+    measure_iters: iters,
+    reject_outliers: true
+  }
+  ## sched_bench scenarios are noisy (scheduler + GC + OS) — keep MAD
+  ## outlier rejection on by default (matches std/bench default).
+  var r = bench_run_values(cfg, _g_scenario_runner)
+
+  var rss = mem_current_rss()
+
+  emit_bench(name, unit, r.median)
+  emit_json(r, param_n, rss, sha, workers)
+end
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main(): Int
+  parse_args()
+
+  sched_init(0)
+  var sha = collect_sha()
+  var workers = sched_worker_count()
+
+  if g_json_only == 0
+    eprint("=== Quartz Scheduler Benchmark ===\n")
+    eprint("SHA: #{sha} | Workers: #{workers} | Iterations: #{g_iterations}\n\n")
+  end
+
+  var iters = g_iterations
+
+  run_scenario_fn("spawn_rate", "tasks_per_sec", 100000, iters, sha, workers)
+  run_scenario_fn("channel_throughput", "msgs_per_sec", 10000, iters, sha, workers)
+  run_scenario_fn("fanout_fanin", "items_per_sec", 100000, iters, sha, workers)
+  run_scenario_fn("contention", "ops_per_sec", 1000000, iters, sha, workers)
+  run_scenario_fn("steal_throughput", "tasks_per_sec", 100000, iters, sha, workers)
+  run_scenario_fn("wake_burst", "wakes_per_sec", 10000, iters, sha, workers)
+  # Scalability and memory use fewer iterations (heavyweight: 1M tasks per iter)
+  var heavy_iters = iters
+  if heavy_iters > 3
+    heavy_iters = 3
+  end
+  run_scenario_fn("scalability_curve", "efficiency_x1000", 1000000, heavy_iters, sha, workers)
+  run_scenario_fn("memory_efficiency", "bytes_per_task", 100000, heavy_iters, sha, workers)
+
+  if g_json_only == 0
+    eprint("\nDone.\n")
+  end
+
+  return 0
+end

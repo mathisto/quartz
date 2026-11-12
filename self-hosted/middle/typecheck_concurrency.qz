@@ -1,0 +1,201 @@
+##! # Type Checker Concurrency
+##!
+##! Send/Sync trait checking, spawn safety, await, and select validation.
+##!
+##! @see typecheck_walk Main AST walking module
+
+import typecheck
+import typecheck_util
+import typecheck_registry
+import typecheck_capture
+import ast
+import diagnostic
+import node_constants
+import type_constants
+import std/diag
+import * from str_compat
+
+# ============================================================================
+# Concurrency - spawn/await/select
+# ============================================================================
+
+## Check Send/Sync safety for a lambda being passed to go/taskgroup_spawn.
+## For each captured variable:
+##   - Not Send -> QZ1301 error (cannot cross thread boundary)
+##   - Send but not Sync -> force-move (prevents aliased mutable access)
+##
+## Parameters:
+##   tc          - Type checker context
+##   ast_storage - AST storage handle
+##   lambda_node - Lambda AST node handle
+##   line        - Source line for errors
+##   col         - Source column for errors
+def tc_check_spawn_safety(tc: TypecheckState, ast_storage: ast::AstStorage, lambda_node: AstNodeId, line: Int, col: Int): Void can Diag
+  # Re-collect captures from lambda body (ast_get_extra returns Int, not Vec)
+  var params = ast::ast_get_left(ast_storage, lambda_node)
+  var param_names = vec_new<String>()
+  if params > 0
+    var pc = vec_size(params)
+    for pi in 0..pc
+      var p = params[pi]
+      param_names.push(ast::ast_get_str1(ast_storage, p))
+    end
+  end
+  var captures = typecheck_capture::tc_collect_captures(tc, ast_storage, lambda_node, param_names)
+  var cap_count = vec_size(captures)
+  for ci in 0..cap_count
+    var cap_name = captures[ci]
+    var cap_type = typecheck_util::tc_scope_lookup(tc, cap_name)
+    var cap_sname = typecheck_util::tc_scope_lookup_struct_name(tc, cap_name)
+
+    # Check Send
+    if typecheck_registry::tc_type_is_send(tc, cap_type, cap_sname) == 0
+      var type_label = cap_sname
+      if str_byte_len(type_label) == 0
+        type_label = typecheck::tc_type_name(cap_type)
+      end
+      error("QZ1301: Type '#{type_label}' is not Send — cannot cross thread boundary (captured variable '#{cap_name}')", line, col)
+    else
+      # Send but not Sync -> force-move to prevent aliased mutable access
+      if typecheck_registry::tc_type_is_sync(tc, cap_type, cap_sname) == 0
+        typecheck_registry::tc_force_move_for_spawn(tc, cap_name, line, col)
+      end
+    end
+  end
+end
+
+## Emit QZ1302 error for 'go' with closure variable callee.
+def tc_error_go_closure(name: String, line: Int, col: Int): Void can Diag
+  error("QZ1302: 'go' cannot be used with closure variable '#{name}' — closures may capture non-Send types. Use 'go (-> body)' with an explicit lambda instead", line, col)
+end
+
+## A.5c Phase 2 (QZ1409, 2026-05-02): Send check on direct arguments to
+## a `go fn(args)` spawn, where `fn` is a named top-level function. Args
+## evaluate in the caller's thread and the result crosses the worker
+## thread boundary at spawn — so each must be Send. The lambda-callee
+## form `go (-> body)()` is covered by `tc_check_spawn_safety` above
+## (captures via QZ1301); the closure-callee form by `tc_error_go_closure`
+## (QZ1302). This handler closes the third hole.
+##
+## Coverage: identifier args (`go fn(local_var)`) get full type + struct
+## lookup via scope. Non-identifier args (call expressions, field accesses,
+## arithmetic) are skipped here — typecheck_walk has already walked them
+## via tc_expr in the inner-CALL pass, so a future enhancement could
+## stash per-node TypeIds and revisit. For the 90% case (passing a local
+## variable), this lands the check at the right place.
+def tc_check_go_args_send(tc: TypecheckState, ast_storage: ast::AstStorage, inner_call: AstNodeId, line: Int, col: Int): Void can Diag
+  var args = ast::ast_get_children(ast_storage, inner_call)
+  if args == 0
+    return
+  end
+  var arg_count = vec_size(args)
+  for ai in 0..arg_count
+    var arg_node = args[ai]
+    var arg_kind = ast::ast_get_kind(ast_storage, arg_node)
+    if arg_kind != node_constants::NODE_IDENT
+      # Non-identifier args (calls, indexing, etc.) — see scope note above.
+    else
+      var arg_name = ast::ast_get_str1(ast_storage, arg_node)
+      var arg_type = typecheck_util::tc_scope_lookup(tc, arg_name)
+      if arg_type != type_constants::TYPE_ERROR
+        var arg_sname = typecheck_util::tc_scope_lookup_struct_name(tc, arg_name)
+        if typecheck_registry::tc_type_is_send(tc, arg_type, arg_sname) == 0
+          var type_label = arg_sname
+          if str_byte_len(type_label) == 0
+            type_label = typecheck::tc_type_name(arg_type)
+          end
+          var arg_line = ast::ast_get_line(ast_storage, arg_node)
+          var arg_col = ast::ast_get_col(ast_storage, arg_node)
+          if arg_line == 0
+            arg_line = line
+            arg_col = col
+          end
+          error("QZ1409: argument '#{arg_name}' of type '#{type_label}' is not Send — cannot cross thread boundary at goroutine spawn", arg_line, arg_col)
+        end
+      end
+    end
+  end
+end
+
+## Type check an await expression.
+##
+## Await takes a Task<T> handle and returns T (the task's result).
+##
+## Parameters:
+##   tc          - Type checker context
+##   task_type   - Type of the task handle being awaited
+##   line        - Source line for errors
+##   col         - Source column for errors
+##
+## Returns: The unwrapped result type
+def tc_check_await(tc: TypecheckState, task_type: TypeId, line: Int, col: Int): Int
+  # Unwrap Task<T> or Future<T> to get T
+  if typecheck::tc_is_ptype(task_type)
+    var base = typecheck::tc_base_kind(tc, task_type)
+    if base == type_constants::TYPE_TASK
+      return typecheck::tc_ptype_arg1(tc, task_type)
+    end
+    if base == type_constants::TYPE_FUTURE
+      return typecheck::tc_ptype_arg1(tc, task_type)
+    end
+  end
+  # Future type without parametric wrapping (bare)
+  if task_type == type_constants::TYPE_FUTURE
+    return type_constants::TYPE_INT
+  end
+  # Backwards compat: accept bare Int as task handle
+  return type_constants::TYPE_INT
+end
+
+## Type check a select expression.
+##
+## Select waits on multiple channel operations. Returns the type of the arm bodies.
+##
+## Parameters:
+##   tc          - Type checker context
+##   arm_count   - Number of select arms
+##   line        - Source line for errors
+##   col         - Source column for errors
+##
+## Returns: Result type of the select (unified type of all arms)
+def tc_check_select(arm_count: Int, line: Int, col: Int): Int can Diag
+  if arm_count == 0
+    error("Select statement must have at least one arm", line, col)
+    return type_constants::TYPE_ERROR
+  end
+
+  # All arm bodies should have the same type
+  # For now, select is used for control flow (Void)
+  return type_constants::TYPE_VOID
+end
+
+## Type check a select arm.
+##
+## Arm types:
+## - recv(ch) as x => body  (op_kind = 0): binds x to received value
+## - send(ch, value) => body (op_kind = 1): sends value on channel
+## - default => body (op_kind = 2): executes if no channel is ready
+##
+## Parameters:
+##   tc          - Type checker context
+##   op_kind     - 0=recv, 1=send, 2=default
+##   channel_type - Type of the channel expression
+##   line        - Source line for errors
+##   col         - Source column for errors
+##
+## Returns: true if arm is valid
+def tc_check_select_arm(op_kind: Int, channel_type: TypeId, line: Int, col: Int): Bool can Diag
+  if op_kind == 0
+    # recv - channel should be Int (channel handle)
+    return true
+  elsif op_kind == 1
+    # send - channel should be Int, payload will be type checked separately
+    return true
+  elsif op_kind == 2
+    # default - no channel, always valid
+    return true
+  else
+    error("Invalid select arm operation", line, col)
+    return false
+  end
+end

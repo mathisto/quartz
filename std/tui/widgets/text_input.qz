@@ -1,0 +1,594 @@
+## std/tui/widgets/text_input.qz — single-line editable text widget.
+##
+## Edit semantics:
+##   - Printable codepoint → insert at cursor, advance cursor
+##   - Backspace → delete codepoint before cursor, retract cursor
+##   - Delete → delete codepoint at cursor, cursor unchanged
+##   - Left / Right → move cursor by one codepoint
+##   - Home / End → cursor to start / end
+##   - Ctrl-W → delete word before cursor (whitespace-bounded)
+##   - Ctrl-U → delete from cursor to start
+##   - Enter → emit Submitted (validates first if validate_on is OnSubmit)
+##   - Other keys → no-op (returns input unchanged + TextInputEvent::Idle)
+##
+## Validation:
+##   - validator: Fn(String): Result<(), String> returns Ok/Err per value
+##   - validate_on: Never | OnChange | OnSubmit | OnBlur
+##   - On validation failure, last_error: Option<String> is populated
+##     with the Err message and TextInputEvent::Changed is emitted
+##     (Submitted is suppressed even if Enter was the trigger)
+##
+## Cursor is codepoint-indexed; value is byte-stored. The widget
+## translates between the two via str_size / str_codepoint_byte_len.
+## Wide characters (CJK, emoji) count as one cursor stop and render
+## as 2 cells; alignment is wcwidth-aware via std/tui/layout::visible_width.
+##
+## v0.3.2 single-line only. No horizontal scroll within the input —
+## content beyond width is clipped at the right edge by the layout
+## consumer. Multi-line editing (TextArea) is a separate v0.4+ effort.
+##
+## @since 5.28.x
+
+import std/tui/runtime as tui
+import std/terminal
+import std/string
+import style
+
+# ============================================================
+# Public types
+# ============================================================
+
+## Semantic events emitted by `text_input_update`. The widget itself
+## doesn't bubble; the parent inspects this enum after each update.
+##
+## - None: nothing semantic happened (cursor moved, key was a no-op,
+##         event already emitted, etc).
+## - Changed: value mutated this update. Includes both successful
+##            edits (insert / delete / word-delete / clear) AND
+##            validation failures triggered by Enter under OnSubmit
+##            (in which case last_error is populated).
+## - Submitted: Enter was pressed AND validation passed (or
+##              validate_on was Never).
+## - Blurred: emitted only by `text_input_blur` (parent-driven);
+##            never by `text_input_update`.
+enum TextInputEvent
+  # `Idle` (rather than `None`) avoids a runtime crash from the `is`
+  # keyword conflating a non-Option None variant with Option::None.
+  Idle
+  Changed
+  Submitted
+  Blurred
+end
+
+## When to run the validator.
+##
+## - Never:    validation never runs. last_error stays None.
+## - OnChange: validator runs after every value-mutating edit.
+## - OnSubmit: validator runs only when Enter is pressed.
+## - OnBlur:   validator runs only when text_input_blur is called.
+enum ValidateOn
+  Never
+  OnChange
+  OnSubmit
+  OnBlur
+end
+
+## Per-slot Style values for rendering. Each field defaults to a
+## sensible no-op style; consumer overrides selectively.
+struct TextInputStyles
+  prompt:      Style
+  value:       Style
+  placeholder: Style
+  cursor:      Style
+end
+
+## Build the default styles. Used by `text_input_new` and as a
+## reset target for theme-swapping.
+def text_input_styles_default(): TextInputStyles
+  return TextInputStyles {
+    prompt:      Style.new(),
+    value:       Style.new(),
+    placeholder: Style.new().dim(),
+    cursor:      Style.new().inverse()
+  }
+end
+
+## Always-Ok validator — the default when no validator is supplied.
+## Returns None (valid). Validators returning Some(message) signal
+## error with the given message.
+def text_input_validator_ok(_value: String): Option<String>
+  return Option::None
+end
+
+## TextInput widget.
+##
+## Cursor is a codepoint index in [0, str_size(value)]. Empty value
+## → cursor 0. Editing operations preserve the codepoint→byte
+## translation invariants.
+struct TextInput
+  value:       String
+  cursor:      Int                         # codepoint index
+  prompt:      String
+  placeholder: String
+  max_length:  Int                         # 0 = unlimited (codepoints)
+  validator:   Fn(String): Option<String>
+  validate_on: ValidateOn
+  last_error:  Option<String>
+  styles:      TextInputStyles
+end
+
+# ============================================================
+# Constructors + builders
+# ============================================================
+
+## Construct a fresh TextInput with empty value, default styles, no
+## validator (always-Ok), no prompt or placeholder, and unlimited length.
+def text_input_new(): TextInput
+  return TextInput {
+    value:       "",
+    cursor:      0,
+    prompt:      "",
+    placeholder: "",
+    max_length:  0,
+    validator:   text_input_validator_ok,
+    validate_on: ValidateOn::OnChange,
+    last_error:  Option::None,
+    styles:      text_input_styles_default()
+  }
+end
+
+## Set the prompt rendered before the value.
+def text_input_with_prompt(t: TextInput, p: String): TextInput
+  return TextInput {
+    value: t.value, cursor: t.cursor, prompt: p,
+    placeholder: t.placeholder, max_length: t.max_length,
+    validator: t.validator, validate_on: t.validate_on,
+    last_error: t.last_error, styles: t.styles
+  }
+end
+
+## Set the placeholder text shown when value is empty AND widget unfocused.
+def text_input_with_placeholder(t: TextInput, ph: String): TextInput
+  return TextInput {
+    value: t.value, cursor: t.cursor, prompt: t.prompt,
+    placeholder: ph, max_length: t.max_length,
+    validator: t.validator, validate_on: t.validate_on,
+    last_error: t.last_error, styles: t.styles
+  }
+end
+
+## Set the maximum value length in codepoints. 0 = unlimited (default).
+## Inserts that would exceed max_length are silently dropped (event
+## stays None for that keypress).
+def text_input_with_max_length(t: TextInput, n: Int): TextInput
+  return TextInput {
+    value: t.value, cursor: t.cursor, prompt: t.prompt,
+    placeholder: t.placeholder, max_length: n,
+    validator: t.validator, validate_on: t.validate_on,
+    last_error: t.last_error, styles: t.styles
+  }
+end
+
+## Set the validator function. The default is a Result::Ok-always
+## function; override to enforce constraints (length, charset, etc).
+def text_input_with_validator(
+  t: TextInput,
+  v: Fn(String): Option<String>
+): TextInput
+  return TextInput {
+    value: t.value, cursor: t.cursor, prompt: t.prompt,
+    placeholder: t.placeholder, max_length: t.max_length,
+    validator: v, validate_on: t.validate_on,
+    last_error: t.last_error, styles: t.styles
+  }
+end
+
+## Set when the validator runs.
+def text_input_with_validate_on(t: TextInput, mode: ValidateOn): TextInput
+  return TextInput {
+    value: t.value, cursor: t.cursor, prompt: t.prompt,
+    placeholder: t.placeholder, max_length: t.max_length,
+    validator: t.validator, validate_on: mode,
+    last_error: t.last_error, styles: t.styles
+  }
+end
+
+## Replace the styles struct.
+def text_input_with_styles(t: TextInput, s: TextInputStyles): TextInput
+  return TextInput {
+    value: t.value, cursor: t.cursor, prompt: t.prompt,
+    placeholder: t.placeholder, max_length: t.max_length,
+    validator: t.validator, validate_on: t.validate_on,
+    last_error: t.last_error, styles: s
+  }
+end
+
+# ============================================================
+# Accessors
+# ============================================================
+
+def text_input_value(t: TextInput): String = t.value
+def text_input_cursor(t: TextInput): Int = t.cursor
+def text_input_last_error(t: TextInput): Option<String> = t.last_error
+def text_input_size(t: TextInput): Int = t.value.size
+
+# ============================================================
+# State setters (programmatic; do NOT validate)
+# ============================================================
+
+## Replace the value without running the validator. Cursor is clamped
+## to the new value's length. Use this for restore-from-save and
+## similar programmatic flows where the value is already trusted.
+def text_input_set_value_unchecked(t: TextInput, v: String): TextInput
+  var n = v.size
+  var c = t.cursor
+  if c > n
+    c = n
+  end
+  return TextInput {
+    value: v, cursor: c, prompt: t.prompt,
+    placeholder: t.placeholder, max_length: t.max_length,
+    validator: t.validator, validate_on: t.validate_on,
+    last_error: Option::None, styles: t.styles
+  }
+end
+
+## Empty the value, reset cursor to 0, clear last_error. No validator
+## run.
+def text_input_clear(t: TextInput): TextInput
+  return TextInput {
+    value: "", cursor: 0, prompt: t.prompt,
+    placeholder: t.placeholder, max_length: t.max_length,
+    validator: t.validator, validate_on: t.validate_on,
+    last_error: Option::None, styles: t.styles
+  }
+end
+
+## Move the cursor without changing the value. Clamped to [0, size].
+def text_input_set_cursor(t: TextInput, c: Int): TextInput
+  var n = t.value.size
+  var clamped = c
+  if clamped < 0
+    clamped = 0
+  end
+  if clamped > n
+    clamped = n
+  end
+  return TextInput {
+    value: t.value, cursor: clamped, prompt: t.prompt,
+    placeholder: t.placeholder, max_length: t.max_length,
+    validator: t.validator, validate_on: t.validate_on,
+    last_error: t.last_error, styles: t.styles
+  }
+end
+
+# ============================================================
+# Focus events (parent-driven)
+# ============================================================
+
+## Inform the widget that focus was just lost. Returns
+## TextInputEvent::Blurred and runs the validator if validate_on is
+## OnBlur. Parent typically calls this when its FocusRing rotates
+## away from this widget.
+def text_input_blur(t: TextInput): (TextInput, TextInputEvent)
+  if t.validate_on is OnBlur
+    var validated = _text_input_run_validator(t)
+    return (validated, TextInputEvent::Blurred)
+  end
+  return (t, TextInputEvent::Blurred)
+end
+
+# ============================================================
+# Update + view
+# ============================================================
+
+## Pure update — pattern-matches FrameMsg::Key, applies the edit, and
+## returns the next state alongside a Cmd<M> (always Cmd::None in
+## v0.3.2) and a TextInputEvent describing what just happened.
+##
+## Non-Key messages are no-ops.
+def text_input_update<M>(
+  t: TextInput,
+  msg: tui::FrameMsg<M>
+): (TextInput, tui::Cmd<M>, TextInputEvent)
+  match msg
+    tui::FrameMsg::Key(k) => return _text_input_handle_key(t, k.code)
+    _ => return (t, tui::Cmd::None, TextInputEvent::Idle)
+  end
+end
+
+## Render the widget. `focused` is supplied by the parent (typically
+## `focus_ring_is_focused(ring, MyId::Input)`); the widget doesn't
+## know its own focus state.
+##
+## When unfocused with empty value, renders the placeholder.
+## When focused, the cursor codepoint is rendered with cursor style
+## (typically reverse video) inline with the value. At end-of-value,
+## a single space is appended for the cursor to occupy.
+def text_input_view(t: TextInput, focused: Bool): String
+  var sb = sb_new()
+
+  # Prompt
+  if str_byte_len(t.prompt) > 0
+    sb_append(sb, t.styles.prompt.render(t.prompt))
+  end
+
+  # Body — placeholder vs value-with-cursor
+  if str_byte_len(t.value) == 0 and not focused
+    sb_append(sb, t.styles.placeholder.render(t.placeholder))
+    return sb_to_string(sb)
+  end
+
+  if not focused
+    # Focused-off, value present: just render value plain.
+    sb_append(sb, t.styles.value.render(t.value))
+    return sb_to_string(sb)
+  end
+
+  # Focused: render value with cursor at t.cursor.
+  var n = t.value.size
+  var before = _text_input_codepoint_slice(t.value, 0, t.cursor)
+  if str_byte_len(before) > 0
+    sb_append(sb, t.styles.value.render(before))
+  end
+
+  if t.cursor < n
+    var cursor_cp = _text_input_codepoint_at(t.value, t.cursor)
+    sb_append(sb, t.styles.cursor.render(cursor_cp))
+    var after = _text_input_codepoint_slice(t.value, t.cursor + 1, n)
+    if str_byte_len(after) > 0
+      sb_append(sb, t.styles.value.render(after))
+    end
+  else
+    # Cursor at end-of-value: render a styled space block.
+    sb_append(sb, t.styles.cursor.render(" "))
+  end
+
+  return sb_to_string(sb)
+end
+
+## Width changes are no-ops in v0.3.2 (single-line, no horizontal
+## scroll within the input). Provided for API uniformity with other
+## widgets and forward-compat with multi-line / scrolling input.
+def text_input_set_size(t: TextInput, _w: Int, _h: Int): TextInput = t
+
+# ============================================================
+# Internal — key dispatch
+# ============================================================
+
+# Handle a single key code. Returns the same triple shape as
+# text_input_update so the dispatcher's match arms fall through cleanly.
+def _text_input_handle_key<M>(
+  t: TextInput,
+  code: Int
+): (TextInput, tui::Cmd<M>, TextInputEvent)
+  if code == terminal::KEY_BACKSPACE()
+    return _text_input_after_change(_text_input_backspace(t))
+  end
+  if code == terminal::KEY_DELETE()
+    return _text_input_after_change(_text_input_delete(t))
+  end
+  if code == terminal::KEY_LEFT()
+    return (text_input_set_cursor(t, t.cursor - 1), tui::Cmd::None, TextInputEvent::Idle)
+  end
+  if code == terminal::KEY_RIGHT()
+    return (text_input_set_cursor(t, t.cursor + 1), tui::Cmd::None, TextInputEvent::Idle)
+  end
+  if code == terminal::KEY_HOME()
+    return (text_input_set_cursor(t, 0), tui::Cmd::None, TextInputEvent::Idle)
+  end
+  if code == terminal::KEY_END()
+    return (text_input_set_cursor(t, t.value.size), tui::Cmd::None, TextInputEvent::Idle)
+  end
+  if code == terminal::KEY_CTRL_W()
+    return _text_input_after_change(_text_input_word_delete(t))
+  end
+  if code == terminal::KEY_CTRL_U()
+    return _text_input_after_change(_text_input_delete_to_start(t))
+  end
+  if code == terminal::KEY_ENTER()
+    return _text_input_submit(t)
+  end
+  # Printable codepoint? Insert.
+  if _text_input_is_printable(code)
+    return _text_input_after_change(_text_input_insert(t, code))
+  end
+  # Anything else (Tab, Escape, unhandled control codes, EOF) — no-op.
+  return (t, tui::Cmd::None, TextInputEvent::Idle)
+end
+
+# Whether `code` should be inserted as a printable codepoint.
+# Excludes ASCII control range and the special KEY_* sentinels (1000-
+# 1099, set aside in std/terminal for non-Unicode key codes — KEY_UP,
+# KEY_DOWN, KEY_DELETE, etc.). Real Unicode codepoints (CJK U+4E2D,
+# emoji U+1F36A, etc.) sail through unchanged.
+def _text_input_is_printable(code: Int): Bool
+  if code < 0x20
+    return false
+  end
+  if code == 0x7F
+    return false  # DEL — handled as backspace already
+  end
+  if code >= 1000 and code < 1100
+    return false  # std/terminal KEY_* sentinel range
+  end
+  return true
+end
+
+# After a value-mutating op, optionally run the OnChange validator and
+# return the triple. Helper consolidates Cmd::None + Changed event.
+def _text_input_after_change<M>(t: TextInput): (TextInput, tui::Cmd<M>, TextInputEvent)
+  var next = t
+  if t.validate_on is OnChange
+    next = _text_input_run_validator(t)
+  end
+  return (next, tui::Cmd::None, TextInputEvent::Changed)
+end
+
+# Submit on Enter. If validate_on is OnSubmit, run the validator;
+# success → Submitted event, failure → Changed event with last_error
+# populated (no Submitted, parent shouldn't act on submission).
+def _text_input_submit<M>(t: TextInput): (TextInput, tui::Cmd<M>, TextInputEvent)
+  if t.validate_on is OnSubmit
+    var validated = _text_input_run_validator(t)
+    if validated.last_error is Some
+      return (validated, tui::Cmd::None, TextInputEvent::Changed)
+    end
+    return (validated, tui::Cmd::None, TextInputEvent::Submitted)
+  end
+  return (t, tui::Cmd::None, TextInputEvent::Submitted)
+end
+
+# Run the validator and update last_error. Returns a new TextInput.
+def _text_input_run_validator(t: TextInput): TextInput
+  var fn: Fn(String): Option<String> = t.validator
+  var err = fn(t.value)
+  return TextInput {
+    value: t.value, cursor: t.cursor, prompt: t.prompt,
+    placeholder: t.placeholder, max_length: t.max_length,
+    validator: t.validator, validate_on: t.validate_on,
+    last_error: err, styles: t.styles
+  }
+end
+
+# ============================================================
+# Internal — edit primitives
+# ============================================================
+
+# Insert codepoint `cp` at cursor. Respects max_length (silent drop on
+# overflow). Cursor advances by 1 codepoint on success.
+def _text_input_insert(t: TextInput, cp: Int): TextInput
+  var n = t.value.size
+  if t.max_length > 0 and n >= t.max_length
+    return t  # silent drop
+  end
+  var byte_offset = _text_input_codepoint_to_byte(t.value, t.cursor)
+  var before = str_byte_slice(t.value, 0, byte_offset)
+  var after = str_byte_slice(t.value, byte_offset, str_byte_len(t.value))
+  var inserted = str_from_codepoint(cp)
+  return TextInput {
+    value: before + inserted + after, cursor: t.cursor + 1, prompt: t.prompt,
+    placeholder: t.placeholder, max_length: t.max_length,
+    validator: t.validator, validate_on: t.validate_on,
+    last_error: t.last_error, styles: t.styles
+  }
+end
+
+# Delete the codepoint immediately before the cursor. Cursor retracts
+# by 1. No-op if cursor is 0.
+def _text_input_backspace(t: TextInput): TextInput
+  if t.cursor == 0
+    return t
+  end
+  var prev_byte = _text_input_codepoint_to_byte(t.value, t.cursor - 1)
+  var cur_byte = _text_input_codepoint_to_byte(t.value, t.cursor)
+  var before = str_byte_slice(t.value, 0, prev_byte)
+  var after = str_byte_slice(t.value, cur_byte, str_byte_len(t.value))
+  return TextInput {
+    value: before + after, cursor: t.cursor - 1, prompt: t.prompt,
+    placeholder: t.placeholder, max_length: t.max_length,
+    validator: t.validator, validate_on: t.validate_on,
+    last_error: t.last_error, styles: t.styles
+  }
+end
+
+# Delete the codepoint at the cursor (forward delete). No-op if cursor
+# is at end. Cursor unchanged.
+def _text_input_delete(t: TextInput): TextInput
+  var n = t.value.size
+  if t.cursor >= n
+    return t
+  end
+  var cur_byte = _text_input_codepoint_to_byte(t.value, t.cursor)
+  var next_byte = _text_input_codepoint_to_byte(t.value, t.cursor + 1)
+  var before = str_byte_slice(t.value, 0, cur_byte)
+  var after = str_byte_slice(t.value, next_byte, str_byte_len(t.value))
+  return TextInput {
+    value: before + after, cursor: t.cursor, prompt: t.prompt,
+    placeholder: t.placeholder, max_length: t.max_length,
+    validator: t.validator, validate_on: t.validate_on,
+    last_error: t.last_error, styles: t.styles
+  }
+end
+
+# Ctrl-W — delete word before cursor (whitespace-bounded). Walks left
+# through whitespace, then through non-whitespace until next whitespace
+# boundary. Cursor lands at the start of the deleted region.
+def _text_input_word_delete(t: TextInput): TextInput
+  if t.cursor == 0
+    return t
+  end
+  var c = t.cursor
+  # 1. Skip trailing whitespace (codepoints right of the deletion start).
+  while c > 0 and string::is_whitespace(_text_input_codepoint_at_int(t.value, c - 1))
+    c = c - 1
+  end
+  # 2. Walk over the word body.
+  while c > 0 and not string::is_whitespace(_text_input_codepoint_at_int(t.value, c - 1))
+    c = c - 1
+  end
+  var start_byte = _text_input_codepoint_to_byte(t.value, c)
+  var end_byte = _text_input_codepoint_to_byte(t.value, t.cursor)
+  var before = str_byte_slice(t.value, 0, start_byte)
+  var after = str_byte_slice(t.value, end_byte, str_byte_len(t.value))
+  return TextInput {
+    value: before + after, cursor: c, prompt: t.prompt,
+    placeholder: t.placeholder, max_length: t.max_length,
+    validator: t.validator, validate_on: t.validate_on,
+    last_error: t.last_error, styles: t.styles
+  }
+end
+
+# Ctrl-U — delete from start of value to cursor. Cursor lands at 0.
+def _text_input_delete_to_start(t: TextInput): TextInput
+  if t.cursor == 0
+    return t
+  end
+  var cur_byte = _text_input_codepoint_to_byte(t.value, t.cursor)
+  var after = str_byte_slice(t.value, cur_byte, str_byte_len(t.value))
+  return TextInput {
+    value: after, cursor: 0, prompt: t.prompt,
+    placeholder: t.placeholder, max_length: t.max_length,
+    validator: t.validator, validate_on: t.validate_on,
+    last_error: t.last_error, styles: t.styles
+  }
+end
+
+# ============================================================
+# Internal — UTF-8 codepoint indexing
+# ============================================================
+
+# Convert a codepoint index to the corresponding byte offset by
+# walking from the start. cp_idx == size returns byte_len.
+def _text_input_codepoint_to_byte(s: String, cp_idx: Int): Int
+  var byte_i = 0
+  var seen = 0
+  var total_bytes = str_byte_len(s)
+  while seen < cp_idx and byte_i < total_bytes
+    byte_i = byte_i + str_codepoint_byte_len(s, byte_i)
+    seen = seen + 1
+  end
+  return byte_i
+end
+
+# Return the codepoint at position `cp_idx` as a single-codepoint String.
+# Caller must ensure cp_idx < str_size(s).
+def _text_input_codepoint_at(s: String, cp_idx: Int): String
+  var byte_off = _text_input_codepoint_to_byte(s, cp_idx)
+  var stride = str_codepoint_byte_len(s, byte_off)
+  return str_byte_slice(s, byte_off, byte_off + stride)
+end
+
+# Same as above but returns the Int codepoint value.
+def _text_input_codepoint_at_int(s: String, cp_idx: Int): Int
+  var byte_off = _text_input_codepoint_to_byte(s, cp_idx)
+  return str_codepoint_at(s, byte_off)
+end
+
+# Slice `s` by codepoint index range [start_cp, end_cp). End_cp may
+# equal str_size(s). Returns the corresponding byte-substring.
+def _text_input_codepoint_slice(s: String, start_cp: Int, end_cp: Int): String
+  var start_byte = _text_input_codepoint_to_byte(s, start_cp)
+  var end_byte = _text_input_codepoint_to_byte(s, end_cp)
+  return str_byte_slice(s, start_byte, end_byte)
+end

@@ -1,0 +1,628 @@
+##! Build Cache — Content-addressed module cache for incremental compilation
+##!
+##! Manages the `.quartz-cache/` directory, manifest, and cached LLVM IR.
+##! Uses content hashes as cache keys (Go-style content-addressed caching).
+##!
+##! Architecture note: Uses parallel vectors instead of Vec<Struct> because
+##! the C bootstrap compiler does not support Vec<UserDefinedStruct> with
+##! field access. This matches the codebase's established pattern.
+##!
+##! Known gap: --explain-cache diagnostic output is disabled because the
+##! C bootstrap binary lacks stderr output intrinsics (eprint/eputs compile
+##! to no-ops). Will be enabled once the C bootstrap supports stderr output
+##! or the compiler achieves full self-hosting.
+##!
+##! Cache structure:
+##!   .quartz-cache/
+##!   ├── manifest          # Pipe-separated entries (one per module)
+##!   ├── modules/
+##!   │   ├── <hash>.ll     # Cached LLVM IR for a module
+##!   │   └── ...
+##!   └── ast/
+##!       ├── <module>.ast  # Cached parsed AST for a module
+##!       └── ...
+
+import ast
+import string_intern
+import file_io
+import std/intern
+
+# ============================================================================
+# Cache state — parallel vectors (C bootstrap compatible)
+# ============================================================================
+
+var _cache_dir = ""
+var _cache_modules_dir = ""
+var _cache_ast_dir = ""
+var _cache_manifest_path = ""
+var _cache_enabled = 0
+var _cache_explain = 0
+# --cache-ro: reads hit, every write (qzmod artifacts, whole-program IR,
+# manifest, module fragments, string pool, AST cache) becomes a no-op.
+var _cache_writable = 1
+
+# Manifest entries as parallel vectors
+var _cache_module_paths = vec_new<String>()
+var _cache_content_hashes = vec_new<String>()
+var _cache_interface_hashes = vec_new<String>()
+var _cache_ir_files = vec_new<String>()
+
+# PF3-P1 — AstStorage id-registry. `cache_load_ast` returns its loaded
+# `AstStorage` to the resolver through a `Vec<Int>` boundary (the Cache
+# effect-op return type), which cannot carry a value-layout struct without
+# erasing its COW pointer to an i64 and dropping the refcount. Instead it
+# pushes the storage's stable `id` into the result Vec and registers the
+# struct here; the resolver recovers it via `cache_lookup_ast_by_id(id)`.
+# Parallel vecs (id → storage) — small (one entry per cache-hit module per
+# compile), so linear lookup is fine.
+var _cache_ast_reg_ids = vec_new<Int>()
+var _cache_ast_reg_stores = vec_new<ast::AstStorage>()
+
+## Register a loaded AstStorage under its stable id so a consumer that only
+## has the id (recovered across a `Vec<Int>` boundary) can fetch the struct.
+def cache_register_ast(storage: ast::AstStorage): Void
+  _cache_ast_reg_ids.push(storage.id)
+  _cache_ast_reg_stores.push(storage)
+end
+
+## Recover a registered AstStorage by its stable id. Returns the matching
+## struct; on miss returns the last-registered store (callers gate on the
+## `id != 0` cache-hit check before calling, so a miss is a programmer error,
+## not a runtime path).
+def cache_lookup_ast_by_id(id: Int): ast::AstStorage
+  var i = _cache_ast_reg_ids.size - 1
+  while i >= 0
+    if _cache_ast_reg_ids[i] == id
+      return _cache_ast_reg_stores[i]
+    end
+    i -= 1
+  end
+  return _cache_ast_reg_stores[_cache_ast_reg_stores.size - 1]
+end
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+## Initialize the build cache at the given directory.
+def cache_open(cache_dir: String): Void
+  _cache_dir = cache_dir
+  _cache_modules_dir = "#{cache_dir}/modules"
+  _cache_ast_dir = "#{cache_dir}/ast"
+  _cache_manifest_path = "#{cache_dir}/manifest"
+  _cache_enabled = 1
+  # Default writable; --cache-ro flips it off after cache_open returns.
+  # Reset here so read-only stays per-invocation in persistent-worker mode.
+  _cache_writable = 1
+
+  # Ensure directories exist
+  mkdir(cache_dir)
+  mkdir(_cache_modules_dir)
+  mkdir(_cache_ast_dir)
+
+  # Load existing manifest
+  _load_manifest()
+end
+
+## Enable --explain-cache diagnostic output.
+def cache_set_explain(enabled: Int): Void
+  _cache_explain = enabled
+end
+
+## Check if --explain-cache is enabled.
+def cache_get_explain(): Int = _cache_explain
+
+## Disable the cache entirely (--no-cache flag).
+def cache_disable(): Void
+  _cache_enabled = 0
+end
+
+## Check if the cache is enabled.
+def cache_is_enabled(): Int = _cache_enabled
+
+## Mark the cache read-only (--cache-ro): reads still hit `.qzmod` and
+## cached IR, but every write becomes a no-op. The qspec suite pre-warms
+## a `.qzmod` cache once, single-threaded, then runs every spec read-only
+## so parallel workers only ever READ shared stdlib artifacts — no two
+## workers can race on a cache write.
+def cache_set_read_only(): Void
+  _cache_writable = 0
+end
+
+## Check if the cache may be written. 1 normally, 0 under --cache-ro.
+def cache_is_writable(): Int = _cache_writable
+
+## Return the active cache directory (set by cache_open). Used by
+## downstream code that writes ancillary cache files (manifest, whole-
+## program IR, dep_graph, per-module IR) so the --cache-dir flag is
+## honoured everywhere, not just at the cache_open entry point.
+## Returns "" if cache_open was never called (--no-cache mode).
+def cache_get_dir(): String = _cache_dir
+
+## Look up cached IR for a module by its content hash.
+## Returns the cached IR string, or "" if cache miss.
+def cache_lookup(module_path: String, hash: String): String
+  if _cache_enabled == 0
+    return ""
+  end
+
+  var result = ""
+  var done = false
+  for i in 0.._cache_module_paths.size
+    if not done and _cache_module_paths[i] == module_path
+      if _cache_content_hashes[i] == hash
+        var ir_path = "#{_cache_modules_dir}/#{_cache_ir_files[i]}"
+        if fio_exists(ir_path)
+          result = fio_read(ir_path)
+        end
+      end
+      done = true
+    end
+  end
+  return result
+end
+
+## Store compiled IR for a module in the cache.
+def cache_store(module_path: String, hash: String, ir: String): Void
+  if _cache_enabled == 0 or _cache_writable == 0
+    return
+  end
+
+  var ir_file = "#{hash}.ll"
+  var ir_path = "#{_cache_modules_dir}/#{ir_file}"
+
+  var _wr = fio_write(ir_path, ir)
+
+  # Update existing entry or append new one
+  var found = 0
+  for i in 0.._cache_module_paths.size
+    if _cache_module_paths[i] == module_path
+      _cache_content_hashes[i] = hash
+      _cache_interface_hashes[i] = ""
+      _cache_ir_files[i] = ir_file
+      found = 1
+    end
+  end
+
+  if found == 0
+    _cache_module_paths.push(module_path)
+    _cache_content_hashes.push(hash)
+    _cache_interface_hashes.push("")
+    _cache_ir_files.push(ir_file)
+  end
+end
+
+## Flush the manifest to disk. Call after all stores are complete.
+def cache_flush(): Void
+  if _cache_enabled == 0 or _cache_writable == 0
+    return
+  end
+  _save_manifest()
+end
+
+## Clean the entire cache directory.
+def cache_clean(): Void
+  if str_byte_len(_cache_dir) == 0
+    return
+  end
+
+  for i in 0.._cache_ir_files.size
+    var ir_path = "#{_cache_modules_dir}/#{_cache_ir_files[i]}"
+    if fio_exists(ir_path)
+      var _wr = fio_write(ir_path, "")
+    end
+  end
+  var _wr2 = fio_write(_cache_manifest_path, "")
+
+  _cache_module_paths = vec_new<String>()
+  _cache_content_hashes = vec_new<String>()
+  _cache_interface_hashes = vec_new<String>()
+  _cache_ir_files = vec_new<String>()
+end
+
+# ============================================================================
+# Internal: Manifest serialization
+# ============================================================================
+# Format: one entry per line, pipe-separated:
+#   module_path|content_hash|interface_hash|ir_file
+
+## Load manifest entries from disk into module globals.
+def _load_manifest(): Void
+  _cache_module_paths = vec_new<String>()
+  _cache_content_hashes = vec_new<String>()
+  _cache_interface_hashes = vec_new<String>()
+  _cache_ir_files = vec_new<String>()
+
+  if not fio_exists(_cache_manifest_path)
+    return
+  end
+
+  var content = fio_read(_cache_manifest_path)
+  if str_byte_len(content) == 0
+    return
+  end
+
+  var lines = str_split(content, "\n")
+  for i in 0..lines.size
+    var line = lines[i]
+    if str_byte_len(line) > 0
+      var parts = str_split(line, "|")
+      if parts.size >= 4
+        _cache_module_paths.push(parts[0])
+        _cache_content_hashes.push(parts[1])
+        _cache_interface_hashes.push(parts[2])
+        _cache_ir_files.push(parts[3])
+      end
+    end
+  end
+end
+
+## Save the string pool to .quartz-cache/string_pool.txt.
+## Each string is stored on its own line with minimal escaping:
+## newlines → \n, backslashes → \\.
+def cache_save_string_pool(strings: Vec<String>): Void
+  if _cache_enabled == 0 or _cache_writable == 0
+    return
+  end
+  # First line: count of strings (needed to preserve empty strings)
+  var out = "#{strings.size}\n"
+  for i in 0..strings.size
+    var s = strings[i]
+    # Escape backslashes first, then newlines
+    var escaped = ""
+    var j = 0
+    while j < str_byte_len(s)
+      var c = str_byte_at(s, j)
+      if c == '\\'  # backslash
+        escaped = "#{escaped}\\\\"
+      elsif c == '\n'  # newline
+        escaped = "#{escaped}\\n"
+      else
+        escaped = escaped.concat(str_from_char(c))
+      end
+      j += 1
+    end
+    out = "#{out}#{escaped}\n"
+  end
+  var pool_path = "#{_cache_dir}/string_pool.txt"
+  var _wr = fio_write(pool_path, out)
+end
+
+## Load the string pool from .quartz-cache/string_pool.txt.
+## Returns empty Vec if cache is disabled or file doesn't exist.
+def cache_load_string_pool(): Vec<String>
+  var result = vec_new<String>()
+  if _cache_enabled == 0
+    return result
+  end
+  var path = "#{_cache_dir}/string_pool.txt"
+  var content = ""
+  if fio_exists(path)
+    content = fio_read(path)
+  end
+  if str_byte_len(content) == 0
+    return result
+  end
+  var lines = str_split(content, "\n")
+  if lines.size == 0
+    return result
+  end
+  # First line is the count of strings
+  var count = str_to_int(lines[0])
+  var i = 1
+  while i <= count
+    if i >= lines.size
+      # Unexpected truncation — push empty string as placeholder
+      result.push("")
+    else
+      var line = lines[i]
+      # Unescape: \n → newline, \\ → backslash
+      var unescaped = ""
+      var j = 0
+      while j < str_byte_len(line)
+        var c = str_byte_at(line, j)
+        if c == '\\'  # backslash
+          if j + 1 < str_byte_len(line)
+            var next = str_byte_at(line, j + 1)
+            if next == 110  # 'n'
+              unescaped = "#{unescaped}\n"
+              j += 2
+            elsif next == 92  # backslash
+              unescaped = "#{unescaped}\\"
+              j += 2
+            else
+              unescaped = unescaped.concat(str_from_char(c))
+              j += 1
+            end
+          else
+            unescaped = unescaped.concat(str_from_char(c))
+            j += 1
+          end
+        else
+          unescaped = unescaped.concat(str_from_char(c))
+          j += 1
+        end
+      end
+      result.push(unescaped)
+    end
+    i += 1
+  end
+  return result
+end
+
+## Save manifest entries from module globals to disk.
+def _save_manifest(): Void
+  var manifest_path = _cache_manifest_path
+  var content = ""
+  for i in 0.._cache_module_paths.size
+    content = "#{content}#{_cache_module_paths[i]}"
+    content = "#{content}|"
+    content = "#{content}#{_cache_content_hashes[i]}"
+    content = "#{content}|"
+    content = "#{content}#{_cache_interface_hashes[i]}"
+    content = "#{content}|"
+    content = "#{content}#{_cache_ir_files[i]}"
+    content = "#{content}\n"
+  end
+  var _wr = fio_write(manifest_path, content)
+end
+
+# ============================================================================
+# AST Cache — Per-module parsed AST serialization (Binary V4, global interner)
+# ============================================================================
+# Binary format: one directory per module containing:
+#   header.txt      - version, content_hash, root, node_count (text, 4 lines)
+#   kinds.bin       - Vec<Int> binary (vec_save)
+#   lines.bin       - Vec<Int> binary (vec_save)
+#   cols.bin        - Vec<Int> binary (vec_save)
+#   int_vals.bin    - Vec<Int> binary (vec_save)
+#   str1s.bin       - Vec<Int> binary (interned IDs)
+#   str2s.bin       - Vec<Int> binary (interned IDs)
+#   ops.bin         - Vec<Int> binary (vec_save)
+#   lefts.bin       - Vec<Int> binary (vec_save)
+#   rights.bin      - Vec<Int> binary (vec_save)
+#   extras.bin      - Vec<Int> binary (vec_save)
+#   children_off.bin - Vec<Int> binary: per-node child offset (-1 = none)
+#   children_dat.bin - Vec<Int> binary: flattened child indices
+#   docs.bin        - Vec<Int> binary (interned IDs)
+#   interner.bin    - Vec<String> binary (interner string table)
+
+## Sanitize a module name for use as a cache directory name.
+## Replaces '/' with '_' to avoid subdirectory issues.
+def _ast_cache_dir(module_name: String): String
+  var out = ""
+  for i in 0..str_byte_len(module_name)
+    var c = str_byte_at(module_name, i)
+    if c == '/'  # '/'
+      out = "#{out}_"
+    else
+      out = "#{out}#{str_from_char(c)}"
+    end
+  end
+  return "#{_cache_ast_dir}/#{out}"
+end
+
+## Save a parsed AST to the cache using binary Vec I/O.
+def cache_save_ast(module_name: String, content_hash: String, storage: ast::AstStorage, root: Int): Void
+  if _cache_enabled == 0 or _cache_writable == 0
+    return
+  end
+  var dir = _ast_cache_dir(module_name)
+  mkdir(dir)
+  var node_count = ast::ast_node_count(storage)
+
+  # Skip AST caching for modules with nodes that store heap pointers in
+  # ops/extras/lefts fields (Vec<String> pointers cast to Int via as_int).
+  # These become dangling after deserialization, causing SIGSEGV on cache hit.
+  # Problematic: NODE_FUNCTION(34), NODE_LAMBDA(19), NODE_ENUM_ACCESS(39),
+  # NODE_TRAIT_DEF(50), NODE_IMPL_BLOCK(51), NODE_EXTEND_BLOCK(52),
+  # NODE_TYPE_ALIAS(64), NODE_NEWTYPE(65).
+  var has_ptr_nodes = false
+  var si = 0
+  while si < node_count and not has_ptr_nodes
+    var k = storage.kinds[si]
+    if k == 34 or k == 19 or k == 39 or k == 50 or k == 51 or k == 52 or k == 64 or k == 65
+      has_ptr_nodes = true
+    end
+    si += 1
+  end
+  if has_ptr_nodes
+    return
+  end
+
+  # Write text header: version, hash, root, count
+  var header = "AST_CACHE_V5\n"
+  header = "#{header}#{content_hash}\n"
+  header = "#{header}#{root.to_s()}\n"
+  header = "#{header}#{node_count.to_s()}\n"
+  var header_path = "#{dir}/header.txt"
+  var _wr = fio_write(header_path, header)
+
+  # Save 7 Vec<Int> fields with vec_save
+  var _r1 = vec_save(storage.kinds, "#{dir}/kinds.bin")
+  var _r2 = vec_save(storage.lines, "#{dir}/lines.bin")
+  var _r3 = vec_save(storage.cols, "#{dir}/cols.bin")
+  var _r4 = vec_save(storage.int_vals, "#{dir}/int_vals.bin")
+  var _r5 = vec_save(storage.ops, "#{dir}/ops.bin")
+  var _r6 = vec_save(storage.lefts, "#{dir}/lefts.bin")
+  var _r7 = vec_save(storage.rights, "#{dir}/rights.bin")
+  var _r8 = vec_save(storage.extras, "#{dir}/extras.bin")
+
+  # Save 3 Vec<Int> interned ID fields with vec_save
+  var _r9 = vec_save(storage.str1s, "#{dir}/str1s.bin")
+  var _r10 = vec_save(storage.str2s, "#{dir}/str2s.bin")
+  var _r11 = vec_save(storage.docs, "#{dir}/docs.bin")
+
+  # Save interner string table for ID resolution on load
+  var _r12 = strvec_save(string_intern::intern_get_strings(storage.interner), "#{dir}/interner.bin")
+
+  # Flatten children: each node has either 0 (no children) or a Vec<Int> pointer.
+  # Serialize as two parallel vectors:
+  #   children_off[i] = -1 if no children, else index into children_dat where data starts
+  #   children_dat = [count0, c0_0, c0_1, ..., count1, c1_0, ...]
+  var ch_off = vec_new()
+  var ch_dat = vec_new()
+  for i in 0..node_count
+    var ch = ast::ast_get_children(storage, i)
+    if as_int(ch) == 0
+      ch_off.push(-1)
+    else
+      ch_off.push(ch_dat.size)
+      ch_dat.push(ch.size)
+      var ci = 0
+      while ci < ch.size
+        ch_dat.push(ch[ci])
+        ci += 1
+      end
+    end
+  end
+  var _r12 = vec_save(ch_off, "#{dir}/children_off.bin")
+  var _r13 = vec_save(ch_dat, "#{dir}/children_dat.bin")
+end
+
+## Load a cached AST for a module using binary Vec I/O.
+## Returns [ast_storage, root] on hit, [0, 0] on miss or hash mismatch.
+def cache_load_ast(module_name: String, expected_hash: String): Vec<Int>
+  var miss = vec_new()
+  miss.push(0)
+  miss.push(0)
+
+  if _cache_enabled == 0
+    return miss
+  end
+  var dir = _ast_cache_dir(module_name)
+  var header_path = "#{dir}/header.txt"
+  var content = ""
+  if fio_exists(header_path)
+    content = fio_read(header_path)
+  end
+  if str_byte_len(content) == 0
+    return miss
+  end
+
+  var hdr_lines = str_split(content, "\n")
+  if hdr_lines.size < 4
+    return miss
+  end
+
+  # Validate version
+  if not hdr_lines[0].eq("AST_CACHE_V5")
+    return miss
+  end
+
+  # Validate content hash
+  if not hdr_lines[1].eq(expected_hash)
+    return miss
+  end
+
+  var root = str_to_int(hdr_lines[2])
+  var node_count = str_to_int(hdr_lines[3])
+
+  # Load saved string table and remap IDs into the global interner.
+  # The saved interner.bin contains the string table snapshot from save time.
+  # We re-intern each string into the current global interner to get new IDs,
+  # then remap all str1s/str2s/docs from saved IDs to current global IDs.
+  var interner_path = "#{dir}/interner.bin"
+  var remap = vec_new()
+  var interner_exists = fio_exists(interner_path)
+  if interner_exists
+    var saved_strings = strvec_load(interner_path)
+    # Phase 5.5 · P5.5.c Pass 2b: bare `intern(...)` dispatch through
+    # the prelude-installed default `Intern` handler. Outer callers
+    # wrapping `compile()` with `with Intern { intern: my_mock }` now
+    # mock cache-load interning end-to-end (the per-loop body-wrap
+    # that previously shadowed user overrides has been removed).
+    for ri in 0..saved_strings.size
+      remap.push(intern(saved_strings[ri]))
+    end
+  end
+
+  var storage = ast::AstStorage {
+    kinds: vec_load("#{dir}/kinds.bin"),
+    lines: vec_load("#{dir}/lines.bin"),
+    cols: vec_load("#{dir}/cols.bin"),
+    int_vals: vec_load("#{dir}/int_vals.bin"),
+    str1s: vec_load("#{dir}/str1s.bin"),
+    str2s: vec_load("#{dir}/str2s.bin"),
+    ops: vec_load("#{dir}/ops.bin"),
+    lefts: vec_load("#{dir}/lefts.bin"),
+    rights: vec_load("#{dir}/rights.bin"),
+    extras: vec_load("#{dir}/extras.bin"),
+    children: vec_new(),
+    docs: vec_load("#{dir}/docs.bin"),
+    interner: string_intern::intern_global(),
+    effect_annotations: vec_new(),
+    func_can_present: vec_new(),
+    func_can_label_strs: vec_new<String>(),
+    func_can_tail_strs: vec_new<String>(),
+    op_call_effect_names: vec_new<String>(),
+    op_call_op_names: vec_new<String>(),
+    op_call_kinds: vec_new(),
+    expansion_idx: vec_new(),
+    scope_set_idx: vec_new(),
+    id: ast::ast_next_storage_id()
+  }
+
+  # Remap intern IDs from saved values to current global interner IDs
+  if remap.size > 0
+    var ri = 0
+    while ri < storage.str1s.size
+      var old_id = storage.str1s[ri]
+      if old_id >= 0 and old_id < remap.size
+        storage.str1s[ri] = remap[old_id]
+      end
+      ri += 1
+    end
+    ri = 0
+    while ri < storage.str2s.size
+      var old_id = storage.str2s[ri]
+      if old_id >= 0 and old_id < remap.size
+        storage.str2s[ri] = remap[old_id]
+      end
+      ri += 1
+    end
+    ri = 0
+    while ri < storage.docs.size
+      var old_id = storage.docs[ri]
+      if old_id >= 0 and old_id < remap.size
+        storage.docs[ri] = remap[old_id]
+      end
+      ri += 1
+    end
+  end
+
+  # Reconstruct children from flattened format
+  var ch_off = vec_load("#{dir}/children_off.bin")
+  var ch_dat = vec_load("#{dir}/children_dat.bin")
+  for i in 0..node_count
+    if i >= ch_off.size
+      storage.children.push(0)
+    elsif ch_off[i] < 0
+      storage.children.push(0)
+    else
+      var off = ch_off[i]
+      var count = ch_dat[off]
+      var ch_vec = vec_new()
+      var ci = 0
+      while ci < count
+        ch_vec.push(ch_dat[off + 1 + ci])
+        ci += 1
+      end
+      storage.children.push(as_int(ch_vec))
+    end
+  end
+
+  # Validate loaded sizes match expected
+  if storage.kinds.size != node_count
+    return miss
+  end
+
+  # PF3-P1: register the struct and return its stable id (not `as_int`).
+  # The resolver recovers the real AstStorage via cache_lookup_ast_by_id.
+  cache_register_ast(storage)
+  var result = vec_new()
+  result.push(storage.id)
+  result.push(root)
+  return result
+end
+

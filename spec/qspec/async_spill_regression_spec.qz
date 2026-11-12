@@ -1,0 +1,249 @@
+##! Regression tests for async/concurrency codegen fixes.
+##!
+##! Protects three fixes committed in session 3:
+##!
+##!   3440903f — Async cross-suspend spill/reload for binary expressions
+##!   e2f829fd — MIR_AWAIT double-use UAF (re-await handle in loop condition)
+##!   73a14d56 — Closure capture walker async cases (NODE_AWAIT / NODE_GO /
+##!              NODE_ASYNC_CALL)
+##!
+##! Each case was a genuine runtime crash or wrong result in the pre-fix state.
+
+import * from qspec
+
+def rs_double(n: Int): Int = n * 2
+def rs_triple(n: Int): Int = n * 3
+
+# ============================================================================
+# Fix 1: cross-suspend value lifetimes in binary expressions
+# ============================================================================
+
+## String literal concat across an await — pre-fix this crashed llc with
+## "Instruction does not dominate all uses" because the string literal pointer
+## computed in state-0 was referenced in the post-resume block.
+def rs_string_concat_across_await(): Int
+  h = go rs_double(21)
+  s = "ans=" + "#{await h}"
+  if s == "ans=42"
+    return 1
+  end
+  return 0
+end
+
+## Multiple literals bracketing an await — stress the spill/reload path.
+def rs_literals_bracket_await(): Int
+  h = go rs_triple(4)
+  s = "[" + "before " + "#{await h}" + " after" + "]"
+  if s == "[before 12 after]"
+    return 1
+  end
+  return 0
+end
+
+## Chain of awaits in a single arithmetic expression.
+def rs_arith_chain(): Int
+  h1 = go rs_double(10)
+  h2 = go rs_double(20)
+  h3 = go rs_double(30)
+  total = 100 + await h1 + 200 + await h2 + await h3
+  # 100 + 20 + 200 + 40 + 60 = 420
+  if total == 420
+    return 1
+  end
+  return 0
+end
+
+## Await on RHS of nested binary — should recursively spill.
+def rs_nested_await(): Int
+  h1 = go rs_double(5)
+  h2 = go rs_double(6)
+  # (10 + await h1) * (20 + await h2) = 20 * 32 = 640
+  x = (10 + await h1) * (20 + await h2)
+  if x == 640
+    return 1
+  end
+  return 0
+end
+
+# ============================================================================
+# Fix 2: MIR_AWAIT idempotent — no UAF on re-await in loop condition
+# ============================================================================
+
+## Await in while condition — pre-fix this segfaulted on iteration 2 because
+## pthread_join + free left the handle memory dangling.
+def rs_await_in_while_cond(): Int
+  var count = 0
+  h = go rs_double(3)
+  while count < await h
+    count += 1
+  end
+  if count == 6
+    return 1
+  end
+  return 0
+end
+
+## Await the same handle multiple times in straight-line code.
+def rs_await_reuse(): Int
+  h = go rs_double(7)
+  v1 = await h
+  v2 = await h
+  v3 = await h
+  if v1 == 14 and v2 == 14 and v3 == 14
+    return 1
+  end
+  return 0
+end
+
+# ============================================================================
+# Fix 3: closure capture walker follows async node children
+# ============================================================================
+
+## Lambda capturing a spawn handle — pre-fix emitted `load ptr %h` against an
+## undefined alloca because mir_collect_captures_walk didn't visit NODE_AWAIT's
+## left child.
+def rs_lambda_captures_handle(): Int
+  h = go rs_double(9)
+  f = x -> x + await h
+  r = f(10)
+  # 10 + 18 = 28
+  if r == 28
+    return 1
+  end
+  return 0
+end
+
+## Zero-arg lambda capturing handle.
+def rs_zero_arg_lambda(): Int
+  h = go rs_triple(4)
+  g = -> await h * 2
+  r = g()
+  # 12 * 2 = 24
+  if r == 24
+    return 1
+  end
+  return 0
+end
+
+# ============================================================================
+# Fix 4: select-send on a ready channel from synchronous (no-scheduler) code
+# Pre-fix this crashed with a null-pointer deref: try_send unconditionally
+# read @__qz_sched[12] (the iomap pointer) and indexed it, but in a sync
+# program the scheduler never initializes so slot 12 is zero.
+# ============================================================================
+
+## select send on a buffered channel that has room — the classic repro.
+def rs_select_send_ready(): Int
+  ch = channel_new(1)
+  select
+    case _ = send(ch, 42) => 0
+  end
+  return recv(ch)
+end
+
+## select send with multiple arms, send branch fires on empty buffered channel.
+def rs_select_send_multi(): Int
+  ready = channel_new(1)
+  select
+    case _ = send(ready, 7) => 0
+    default => 99
+  end
+  return recv(ready)
+end
+
+# ============================================================================
+# Fix 5: channel_close after sched_shutdown — iomap dangling pointer
+# Pre-fix, sched_shutdown freed the iomap but left @__qz_sched[12] pointing
+# at the freed memory, so any subsequent channel_close chased a dangling
+# pointer.
+# ============================================================================
+
+def rs_close_producer(ch: Int): Int
+  send(ch, 88)
+  return 0
+end
+
+def rs_close_after_shutdown(): Int
+  sched_init(0)
+  ch = channel_new(1)
+  h = go rs_close_producer(ch)
+  v = recv(ch)
+  await h
+  sched_shutdown()
+  channel_close(ch)
+  return v
+end
+
+## spawn + await after sched_shutdown — pre-fix this hung forever because
+## @__qz_completion_map[3] (the scheduler-active mutex slot) was freed but
+## not nulled, so await walked into the dangling completion-pipe path on
+## a dead scheduler.
+def rs_spawn_after_shutdown(): Int
+  sched_init(0)
+  var h1 = go rs_double(5)
+  var r1 = await h1
+  sched_shutdown()
+  # Scheduler is shut down — spawn must fall through to pthread_join,
+  # not chase the stale completion_map mutex.
+  var h2 = go rs_double(9)
+  var r2 = await h2
+  return r1 + r2
+end
+
+def main(): Int
+  describe("async cross-suspend spill/reload (fix 3440903f)") do ->
+    it("string concat across await") do ->
+      assert_eq(rs_string_concat_across_await(), 1)
+    end
+    it("multiple literals bracket an await") do ->
+      assert_eq(rs_literals_bracket_await(), 1)
+    end
+    it("arithmetic chain of awaits") do ->
+      assert_eq(rs_arith_chain(), 1)
+    end
+    it("nested binary with await in RHS") do ->
+      assert_eq(rs_nested_await(), 1)
+    end
+  end
+
+  describe("await idempotent — no UAF (fix e2f829fd)") do ->
+    it("await in while condition") do ->
+      assert_eq(rs_await_in_while_cond(), 1)
+    end
+    it("reuse same handle with multiple awaits") do ->
+      assert_eq(rs_await_reuse(), 1)
+    end
+  end
+
+  describe("closure capture walks async nodes (fix 73a14d56)") do ->
+    it("lambda captures spawn handle via await") do ->
+      assert_eq(rs_lambda_captures_handle(), 1)
+    end
+    it("zero-arg lambda captures spawn handle") do ->
+      assert_eq(rs_zero_arg_lambda(), 1)
+    end
+  end
+
+  describe("select-send in sync context (null iomap guard)") do ->
+    it("select-send on empty buffered channel from sync code") do ->
+      assert_eq(rs_select_send_ready(), 42)
+    end
+    it("select-send with default arm picks send when ready") do ->
+      assert_eq(rs_select_send_multi(), 7)
+    end
+  end
+
+  describe("channel_close after sched_shutdown") do ->
+    it("does not chase dangling iomap pointer") do ->
+      assert_eq(rs_close_after_shutdown(), 88)
+    end
+  end
+
+  describe("spawn + await after sched_shutdown") do ->
+    it("falls through to pthread_join path without hanging") do ->
+      assert_eq(rs_spawn_after_shutdown(), 28)
+    end
+  end
+
+  return qspec_main()
+end

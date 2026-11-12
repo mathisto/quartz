@@ -1,0 +1,114 @@
+## TUI v0.2 Phase 1 smoke test: scope_cancel actively wakes a task
+## parked inside `term_read_key_cancellable`.
+##
+## Setup: redirect fd 0 to a pipe whose writer end is held open with no
+## data ever written. The cancellable key reader sets stdin O_NONBLOCK,
+## sees EAGAIN, parks via `io_suspend_timeout(0, 50ms, READ)`. After a
+## brief delay, main thread cancels the runtime scope. The parked
+## worker observes the cancel via the chunked-poll loop's
+## `scope_is_cancelled` check (next chunk boundary, ≤50ms latency) and
+## throws via the unified Throws transport.
+##
+## Asserts cancel→throw latency < 200ms (well within the 50ms chunk
+## floor + scheduler round-trip + fork/dup overhead). The 50ms ceiling
+## is the bug-doc acceptance criterion ("program_run returns within
+## bounded time (< 50ms) of Cmd::Quit or EOF, including cancellation").
+##
+## Standalone (not qspec): qspec describe/it lambdas treat `go fn()`
+## as a Future created+polled inline (not a real worker-thread spawn),
+## so the worker-blocks-then-cancel pattern can't be expressed there.
+## See feedback memory entry "Spec authoring caveat for go fn() inside
+## qspec lambdas".
+
+import * from std/sync/composition/scope
+import * from std/throws
+import * from std/terminal
+import * from std/ffi/socket
+
+extern "C" def dup2(oldfd: CInt, newfd: CInt): CInt
+
+var done = 0
+var caught_msg = ""
+var throw_observed_ns = 0
+
+def cap(op_name: Int, argc: Int, argv: Int): Int
+  caught_msg = as_type<String>(load(argv, 0))
+  return 0
+end
+
+var s = 0
+
+def worker_body(): Int
+  # Should park here until scope_cancel fires; cancel observed
+  # via chunked-poll inside term_read_key_cancellable, throws.
+  term_read_key_cancellable(s)
+  return 0
+end
+
+def worker(): Int
+  with Throws { throw: cap } do ->
+    scope_with(s, worker_body)
+    0
+  end
+  throw_observed_ns = time_mono_ns()
+  done = 1
+  return 0
+end
+
+def main(): Int
+  # Replace fd 0 with the read end of a pipe. Writer end stays open
+  # in this process (we never close it), so read(0, ...) blocks
+  # indefinitely with O_NONBLOCK -> EAGAIN.
+  var fds = pipe_create()
+  if fds.size != 2
+    puts("FAIL: pipe_create returned size #{str_from_int(fds.size)}")
+    return 10
+  end
+  if dup2(fds[0], 0) < 0
+    puts("FAIL: dup2 returned <0")
+    return 11
+  end
+
+  # Required for term_read_key_cancellable to return non-immediately.
+  # Without raw mode the helper still works (it manages O_NONBLOCK
+  # itself), but enter_raw_mode is harmless on a pipe and exercises
+  # the production path.
+  term_enter_raw_mode()
+
+  s = scope_with_cancel(scope_root())
+  go worker()
+
+  # Give the worker time to park inside io_suspend_timeout.
+  sched_sleep(50)
+
+  var cancel_ns = time_mono_ns()
+  scope_cancel_with(s, "test-cancel")
+
+  var t0 = time_mono_ns()
+  while done == 0
+    sched_sleep(5)
+    if (time_mono_ns() - t0) / 1_000_000 > 1_000
+      term_exit_raw_mode()
+      puts("FAIL: worker did not finish within 1s of cancel")
+      return 1
+    end
+  end
+
+  term_exit_raw_mode()
+
+  var latency_ms = (throw_observed_ns - cancel_ns) / 1_000_000
+  if caught_msg != "test-cancel"
+    puts("FAIL: expected msg 'test-cancel', got '#{caught_msg}'")
+    return 2
+  end
+  if latency_ms < 0
+    puts("FAIL: negative latency #{str_from_int(latency_ms)}ms")
+    return 3
+  end
+  if latency_ms > 200
+    puts("FAIL: cancel->throw latency #{str_from_int(latency_ms)}ms exceeds 200ms bound")
+    return 4
+  end
+  puts("OK: cancel->throw latency #{str_from_int(latency_ms)}ms (under 200ms bound)")
+  return 0
+end

@@ -1,0 +1,337 @@
+## Built-in `Result<&A,&B>` niche — M2 LIVE behavioral tests (enum-niche workstream).
+## Design: docs/design/ENUM_NICHE_M2_RESULT.md + MEMORY_MODEL_V3.md §14.10.
+##
+## ┌─────────────────────────────────────────────────────────────────────────┐
+## │ M2 GATE LIVE (`mir_multi_niche_result_live()` == 1, flipped 2026-06-14).   │
+## │ The built-in `Result<T,E>` whose BOTH type args resolve to boxed heap      │
+## │ pointers niches into ONE word, `payload_ptr | tag`: Ok ⇒ ptr|0 = ptr,      │
+## │ Err ⇒ ptr|1; read tag = value & 7, payload = value & ~7 — TYPE-INDEPENDENT │
+## │ mask. No 16-byte tagged Result box, no tag word: the construction site      │
+## │ emits the bare payload pointer (`Ok(p)` = `p`) or `p | 1` (`Err(p)`); ONE   │
+## │ i64 SSA value end-to-end (invariant #5). These round-trips assert the LIVE  │
+## │ niche behavior — they were authored under the gate-0 scaffold as a          │
+## │ differential oracle (they pass under both tagged box and niche) and are now │
+## │ un-staled to the post-flip representation.                                  │
+## │                                                                            │
+## │ Alloc-free oracle: `Ok(p)` emits no Result box (the value IS `p`), `Err(p)` │
+## │ is `p | 1` — no `alloca [2 x i64]`/tag-store for the Result envelope at the │
+## │ construction site (the payload struct itself is still boxed, as before).    │
+## └─────────────────────────────────────────────────────────────────────────┘
+##
+## Coverage (RFC §7 / task spec):
+##   1. Result<&A,&B> (boxed/boxed) construct + match round-trip, BOTH Ok and Err.
+##   2. is_ok / is_err / unwrap_ok / unwrap_err over a boxed Result (hot intercepts).
+##   3. unwrap_or_ok / result_or (the 2-arg hot intercepts).
+##   4. `?`/try and try-catch over a Result.
+##   5. COLD combinators (result_map / result_map_err / result_and_then / ok / err)
+##      over BOTH a SCALAR Result (Result<Int,String> — never niches, routes through
+##      the real erased body) AND a niche-eligible boxed Result (M2.3 call-site
+##      interception: real blocks + branch invoke the closure ONLY in the taken arm).
+##      Both differential oracles locked here.
+##   6. Result<Int,String> SPILL floor — scalar Ok payload has no spare bit, MUST
+##      stay tagged (never niche). Round-trips correctly regardless.
+##   7. Vec<Result<&A,&B>> element-position round-trip.
+##   8. nested Option<Result<&A,&B>>.
+##   9. async-suspend round-trip is a STANDALONE smoke (spec/qz/result_niche_poll_
+##      smoke.qz) per the qspec-lambda go-fn caveat (CLAUDE.md) — invariant #5
+##      (one i64 SSA value live across a yield).
+import * from qspec
+
+# ───────────────────────── behavioral fixtures ─────────────────────────
+
+# Two distinct boxed payload structs (non-@value ⇒ niche-eligible boxed pointers).
+# `Result<OkPayload, ErrPayload>` is the M2 flagship shape: both payloads boxed.
+struct OkPayload
+  a: Int
+end
+struct ErrPayload
+  b: Int
+end
+
+def res_ok(n: Int): Result<OkPayload, ErrPayload> = Result::Ok(OkPayload { a: n })
+def res_err(n: Int): Result<OkPayload, ErrPayload> = Result::Err(ErrPayload { b: n })
+
+## Match round-trip — Ok carries +value, Err carries -value (sign distinguishes arm).
+def res_code(r: Result<OkPayload, ErrPayload>): Int
+  return match r
+    Ok(n) => n.a
+    Err(e) => 0 - e.b
+  end
+end
+
+# Result<Vec, String> — collection/string boxed payloads (another boxed/boxed shape).
+def vres_ok(): Result<Vec, String> = Result::Ok([10, 20, 30])
+def vres_err(): Result<Vec, String> = Result::Err("boom")
+
+# Scalar-payload Result — Result<Int, String>: Ok payload Int has NO spare bit ⇒
+# MUST SPILL (the information-theoretic floor). Must still round-trip correctly.
+def ires_ok(n: Int): Result<Int, String> = Result::Ok(n)
+def ires_err(s: String): Result<Int, String> = Result::Err(s)
+
+# `?`/try fixtures — a function that propagates an Err via `?` over a boxed Result.
+def try_double(r: Result<OkPayload, ErrPayload>): Result<OkPayload, ErrPayload>
+  var inner = try r
+  return Result::Ok(OkPayload { a: inner.a * 2 })
+end
+
+# try-catch fixtures (scalar payloads — exercises the NODE_TRY_CATCH spill/niche path).
+def tc_ok(): Result<Int, String> = Result::Ok(7)
+def tc_err(): Result<Int, String> = Result::Err("nope")
+
+# COLD combinator fixtures (closure-taking — exercised over a SCALAR Result, which
+# never niches and routes through the real erased body — a differential oracle).
+def cold_plus(x: Int): Result<Int, String> = Result::Ok(x + 10)
+
+# ─── M2.3 boxed/boxed COLD combinator fixtures (call-site interception) ───
+# A third boxed struct so result_map can map OkPayload → MappedPayload (a boxed U,
+# keeping the result Result niche-eligible).
+struct MappedPayload
+  m: Int
+end
+
+# Closures over the niche Result. Inline arrow lambdas are also valid combinator
+# args; named fns let result_and_then chain to a freshly-CONSTRUCTED niche Result.
+def box_map(p: OkPayload): MappedPayload = MappedPayload { m: p.a * 3 }
+def box_map_err(e: ErrPayload): MappedPayload = MappedPayload { m: e.b + 100 }
+# result_and_then's closure body constructs its OWN niche Result (the f-body niche
+# construct seam, mir_lower.qz ~3835): Ok ⇒ bare ptr, Err ⇒ ptr|1.
+def box_chain(p: OkPayload): Result<MappedPayload, ErrPayload>
+  return Result::Ok(MappedPayload { m: p.a + 1 })
+end
+def box_chain_err(p: OkPayload): Result<MappedPayload, ErrPayload>
+  return Result::Err(ErrPayload { b: 77 })
+end
+
+# item 17 — TYPE-ANNOTATED LOCAL niche-multi Result. The construct side niches
+# (bare payload ptr, no tag word); the read side must track the var as niche-multi
+# to decode it, else `r is Ok` reads the bare ptr as a legacy 2-word tagged box and
+# loads word[0] (the payload field) as the tag ⇒ wrong arm. Helpers build the
+# annotated-local form `r: Result<A,B> = Result::Ok(...)` directly (NOT a fn-return
+# or inferred local, both of which already worked) and return the predicate verdict.
+def annot_local_ok_is_ok(): Bool
+  r: Result<OkPayload, ErrPayload> = Result::Ok(OkPayload { a: 7 })
+  return r is Ok
+end
+def annot_local_err_is_err(): Bool
+  r: Result<OkPayload, ErrPayload> = Result::Err(ErrPayload { b: 3 })
+  return r is Err
+end
+def annot_local_ok_payload(): Int
+  r: Result<OkPayload, ErrPayload> = Result::Ok(OkPayload { a: 42 })
+  return res_code(r)
+end
+def annot_local_err_payload(): Int
+  r: Result<OkPayload, ErrPayload> = Result::Err(ErrPayload { b: 9 })
+  return res_code(r)
+end
+
+def main(): Int
+  describe("result niche M2 — boxed/boxed construct + match round-trip (gate 1 = NICHE)") do ->
+    it("Ok payload survives the round-trip") do ->
+      assert_eq(res_code(res_ok(42)), 42)
+    end
+    it("Err payload survives the round-trip") do ->
+      assert_eq(res_code(res_err(7)), 0 - 7)
+    end
+    it("Result<Vec,String> Ok carries the vector") do ->
+      var r = vres_ok()
+      assert_eq(unwrap_ok(r).size, 3)
+    end
+    it("Result<Vec,String> Err carries the string") do ->
+      var r = vres_err()
+      assert_eq(is_err(r), true)
+    end
+  end
+
+  describe("result niche M2 — hot combinators (intercept targets)") do ->
+    it("is_ok is true on Ok") do ->
+      assert_eq(is_ok(res_ok(1)), true)
+    end
+    it("is_ok is false on Err") do ->
+      assert_eq(is_ok(res_err(1)), false)
+    end
+    it("is_err is true on Err") do ->
+      assert_eq(is_err(res_err(1)), true)
+    end
+    it("is_err is false on Ok") do ->
+      assert_eq(is_err(res_ok(1)), false)
+    end
+    it("unwrap_ok recovers the Ok payload") do ->
+      assert_eq(unwrap_ok(res_ok(99)).a, 99)
+    end
+    it("unwrap_err recovers the Err payload") do ->
+      assert_eq(unwrap_err(res_err(13)).b, 13)
+    end
+  end
+
+  describe("result niche M2 — 2-arg hot combinators (unwrap_or_ok / result_or)") do ->
+    it("unwrap_or_ok returns the Ok payload when Ok") do ->
+      var fallback = OkPayload { a: 0 }
+      assert_eq(unwrap_or_ok(res_ok(55), fallback).a, 55)
+    end
+    it("unwrap_or_ok returns the fallback when Err") do ->
+      var fallback = OkPayload { a: 88 }
+      assert_eq(unwrap_or_ok(res_err(1), fallback).a, 88)
+    end
+    it("result_or returns the Ok value when Ok (scalar Result)") do ->
+      assert_eq(result_or(ires_ok(42), 0), 42)
+    end
+    it("result_or returns the fallback when Err (scalar Result)") do ->
+      assert_eq(result_or(ires_err("x"), 99), 99)
+    end
+  end
+
+  describe("result niche M2 — ?/try and try-catch") do ->
+    it("? propagates the Ok payload through try_double") do ->
+      var r = try_double(res_ok(5))
+      assert_eq(unwrap_ok(r).a, 10)
+    end
+    it("? short-circuits on Err through try_double") do ->
+      var r = try_double(res_err(3))
+      assert_eq(is_err(r), true)
+    end
+    it("try-catch returns the Ok value") do ->
+      var x = try tc_ok() catch Err(e) 0
+      assert_eq(x, 7)
+    end
+    it("try-catch runs the handler on Err") do ->
+      var x = try tc_err() catch Err(e) 0 - 1
+      assert_eq(x, 0 - 1)
+    end
+  end
+
+  describe("result niche M2 — COLD combinators over SCALAR Result (never niche)") do ->
+    # Scalar Result is not niche-eligible, so result_map on a Result<Int,String>
+    # routes through the real erased combinator body — the differential oracle that
+    # proves the spill path still works alongside the M2.3 niche interception.
+    it("result_map maps the Ok value (scalar Result, never niches)") do ->
+      var r = result_map(ires_ok(10), x -> x * 2)
+      assert_eq(unwrap_ok(r), 20)
+    end
+    it("result_map passes Err through (scalar Result)") do ->
+      var r = result_map(ires_err("bad"), x -> x * 2)
+      assert_eq(is_err(r), true)
+    end
+    it("result_and_then chains on Ok (scalar Result)") do ->
+      var r = result_and_then(ires_ok(5), cold_plus)
+      assert_eq(unwrap_ok(r), 15)
+    end
+    it("result_and_then short-circuits on Err (scalar Result)") do ->
+      var r = result_and_then(ires_err("fail"), cold_plus)
+      assert_eq(is_err(r), true)
+    end
+  end
+
+  describe("result niche M2.3 — COLD combinators over a NICHE boxed Result (call-site intercept)") do ->
+    # M2.3: result_map / result_map_err / result_and_then / ok / err are intercepted
+    # at the call site when the receiver is a niche-multi Result. Real blocks + branch
+    # invoke the closure ONLY in the taken arm (eager select would call f(garbage)).
+    # NOTE: chained `.field` directly on `unwrap_*(combinator(...))` trips an
+    # orthogonal typecheck-layer generic-return-resolution limitation (QZ0301
+    # "Unknown struct: error"); split into two statements so `r`/`u` carry a
+    # concrete inferred type. Unrelated to M2.3 (the split form exercises the
+    # same intercepted lowering).
+    it("result_map maps the Ok payload (boxed niche Result)") do ->
+      var r = result_map(res_ok(7), box_map)
+      var u = unwrap_ok(r)
+      assert_eq(u.m, 21)
+    end
+    it("result_map passes Err through unchanged (boxed niche Result)") do ->
+      var r = result_map(res_err(4), box_map)
+      assert_eq(is_err(r), true)
+    end
+    it("result_map_err maps the Err payload (boxed niche Result)") do ->
+      var r = result_map_err(res_err(5), box_map_err)
+      var u = unwrap_err(r)
+      assert_eq(u.m, 105)
+    end
+    it("result_map_err passes Ok through unchanged (boxed niche Result)") do ->
+      var r = result_map_err(res_ok(8), box_map_err)
+      var u = unwrap_ok(r)
+      assert_eq(u.a, 8)
+    end
+    it("result_and_then chains on Ok (boxed niche Result)") do ->
+      var r = result_and_then(res_ok(10), box_chain)
+      var u = unwrap_ok(r)
+      assert_eq(u.m, 11)
+    end
+    it("result_and_then chained closure can return Err (boxed niche Result)") do ->
+      var r = result_and_then(res_ok(10), box_chain_err)
+      assert_eq(is_err(r), true)
+    end
+    it("result_and_then short-circuits on Err without invoking f (boxed niche Result)") do ->
+      var r = result_and_then(res_err(3), box_chain)
+      assert_eq(is_err(r), true)
+    end
+    it("ok() yields Some on Ok (boxed niche Result)") do ->
+      var o = ok(res_ok(12))
+      var u = unwrap(o)
+      assert_eq(u.a, 12)
+    end
+    it("ok() yields None on Err (boxed niche Result)") do ->
+      var o = ok(res_err(1))
+      assert_eq(is_none(o), true)
+    end
+    it("err() yields Some on Err (boxed niche Result)") do ->
+      var o = err(res_err(6))
+      var u = unwrap(o)
+      assert_eq(u.b, 6)
+    end
+    it("err() yields None on Ok (boxed niche Result)") do ->
+      var o = err(res_ok(1))
+      assert_eq(is_none(o), true)
+    end
+  end
+
+  describe("result niche — item 17: type-annotated local niche-multi Result reads the right arm") do ->
+    it("annotated-local Ok reads as Ok (was mis-read as Err)") do ->
+      assert_eq(annot_local_ok_is_ok(), true)
+    end
+    it("annotated-local Err reads as Err") do ->
+      assert_eq(annot_local_err_is_err(), true)
+    end
+    it("annotated-local Ok carries its payload through a match") do ->
+      assert_eq(annot_local_ok_payload(), 42)
+    end
+    it("annotated-local Err carries its payload through a match") do ->
+      assert_eq(annot_local_err_payload(), 0 - 9)
+    end
+  end
+
+  describe("result niche M2 — Result<Int,String> SPILL floor (must NOT niche)") do ->
+    it("scalar Ok payload round-trips") do ->
+      assert_eq(unwrap_ok(ires_ok(123)), 123)
+    end
+    it("scalar Err string round-trips") do ->
+      assert_eq_str(unwrap_err(ires_err("oops")), "oops")
+    end
+    it("is_ok / is_err agree on a scalar Result") do ->
+      assert_eq(is_ok(ires_ok(1)), true)
+      assert_eq(is_err(ires_err("e")), true)
+    end
+  end
+
+  describe("result niche M2 — Vec<Result<&A,&B>> element-position round-trip") do ->
+    it("push then get preserves Ok and Err elements") do ->
+      # NOTE: the element type is inferred from the literal — `vec_new<Result<A,B>>()`
+      # with an explicit nested-generic arg hangs the compiler (pre-existing bug,
+      # filed docs/bugs/VEC_NEW_NESTED_GENERIC_RESULT_ARG_HANGS.md). Use the literal.
+      var v = [res_ok(1), res_err(2)]
+      assert_eq(res_code(v[0]), 1)
+      assert_eq(res_code(v[1]), 0 - 2)
+    end
+  end
+
+  describe("result niche M2 — nested Option<Result<&A,&B>>") do ->
+    it("Some(Ok) unwraps to the inner Ok payload") do ->
+      var o: Option<Result<OkPayload, ErrPayload>> = Option::Some(res_ok(9))
+      assert_eq(res_code(unwrap(o)), 9)
+    end
+    it("Some(Err) unwraps to the inner Err payload") do ->
+      var o: Option<Result<OkPayload, ErrPayload>> = Option::Some(res_err(4))
+      assert_eq(res_code(unwrap(o)), 0 - 4)
+    end
+  end
+
+  return qspec_main()
+end

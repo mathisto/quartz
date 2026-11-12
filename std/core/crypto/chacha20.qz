@@ -1,0 +1,339 @@
+## std/core/crypto/chacha20 - Pure-Quartz ChaCha20 + HChaCha20 (RFC 8439, draft-irtf-cfrg-xchacha)
+##
+## Two related stream-cipher primitives:
+##   - `hchacha20`             (Step 2.8) — 32-byte subkey, no counter, no XOR.
+##                              Used by XChaCha20 to derive the inner key.
+##   - `chacha20_block`        (Step 2.14) — 64-byte keystream block at a given
+##                              counter value (RFC 8439 §2.3).
+##   - `chacha20_encrypt`      (Step 2.14) — XOR-keystream encrypt over an
+##                              arbitrary-length plaintext (RFC 8439 §2.4).
+##                              Caller supplies the starting counter; AEAD
+##                              uses counter=1 (counter=0 is the Poly1305 key).
+##
+## Why these are stdlib primitives (rather than HACL\* shims):
+##   - WireGuard cookie reply (NET.1 Phase 2) needs XChaCha20-Poly1305.
+##     Vendored HACL\* exposes only the 12-byte-nonce variant; XChaCha20
+##     is composed locally on top of native HChaCha20 + native ChaCha20.
+##   - ChaCha20 is the second-smallest WG primitive (after BLAKE2s): 20 rounds
+##     of the same quarter-round mixer HChaCha20 already uses, plus the
+##     add-original-state final step and a counter-incrementing block loop.
+##     ~150 LoC total (HChaCha20 + ChaCha20). Going native here drops
+##     `Hacl_AEAD_Chacha20Poly1305.c` + `Hacl_Chacha20.c` from the build —
+##     Step 2.14 composes the AEAD natively against HACL's Poly1305 (which
+##     itself goes native in Step 2.15).
+##
+## All buffers are caller-owned (ptr, len) pairs — typically `malloc`'d. State
+## lives on the call stack as 16 scalar locals (s0..s15); no intermediate
+## malloc per block. Counter wraps at 2^32 per RFC 8439 §2.4 (caller's
+## responsibility — at 64 KB/block × 2^32 blocks ≈ 256 GB max per (key,nonce)).
+##
+## See:
+## - RFC 8439 §2.1, §2.2 (ChaCha20 quarter-round + state layout)
+## - RFC 8439 §2.3 (ChaCha20 block function), §2.4 (ChaCha20 encrypt)
+## - draft-irtf-cfrg-xchacha-03 §2.2 (HChaCha20 construction)
+## - docs/design/CRYPTO_STDLIB_DESIGN.md (Phase 2 native-primitive plan)
+
+# =============================================================================
+# u32 ARX helpers — Quartz Int is i64; mask to 32 bits where wrap matters.
+# =============================================================================
+
+def _u32(x: Int): Int = x & 4294967295
+
+def _u32_add(a: Int, b: Int): Int = (a + b) & 4294967295
+
+def _u32_rotl(v: Int, n: Int): Int
+  var x = v & 4294967295
+  return ((x << n) | (x >> (32 - n))) & 4294967295
+end
+
+## Read 4 bytes from `p` little-endian as a u32.
+def _u32_read_le(p: Int): Int
+  var b0 = ptr_read_byte(p)
+  var b1 = ptr_read_byte(p + 1)
+  var b2 = ptr_read_byte(p + 2)
+  var b3 = ptr_read_byte(p + 3)
+  return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+end
+
+## Write u32 `v` to `p` little-endian (4 bytes).
+def _u32_write_le(p: Int, v: Int): Void
+  ptr_write_byte(p, v & 255)
+  ptr_write_byte(p + 1, (v >> 8) & 255)
+  ptr_write_byte(p + 2, (v >> 16) & 255)
+  ptr_write_byte(p + 3, (v >> 24) & 255)
+end
+
+# =============================================================================
+# HChaCha20 — RFC 8439 quarter-round + draft-xchacha §2.2 truncated output
+# =============================================================================
+#
+# State (16 u32, RFC 8439 §2.3):
+#   [ 0..4 ) constants  = "expand 32-byte k"
+#   [ 4..12) key        = key[0..32]  (8 LE u32)
+#   [12..16) input      = nonce[0..16] (4 LE u32) — REPLACES the standard
+#                         counter+nonce; HChaCha20 has no counter.
+#
+# 20 rounds = 10 column rounds (QR(0,4,8,12), (1,5,9,13), (2,6,10,14),
+#                               (3,7,11,15)) interleaved with 10 diagonal
+# rounds (QR(0,5,10,15), (1,6,11,12), (2,7,8,13), (3,4,9,14)).
+#
+# Output: state[0..4] || state[12..16]  (8 u32 = 32 bytes LE).
+# CRITICAL: HChaCha20 does NOT add the original state — that's the difference
+# from standard ChaCha20's stream-block function.
+
+## Compute HChaCha20(key, input) -> subkey.
+##
+## Args:
+## - key:    32-byte input key buffer.
+## - input:  16-byte input buffer (XChaCha20 nonce[0..16]).
+## - subkey: 32-byte output buffer.
+def hchacha20(key: Int, input: Int, subkey: Int): Void
+  # Constants — "expand 32-byte k" as 4 LE u32.
+  var s0  = 1634760805    # 0x61707865 "expa"
+  var s1  = 857760878     # 0x3320646e "nd 3"
+  var s2  = 2036477234    # 0x79622d32 "2-by"
+  var s3  = 1797285236    # 0x6b206574 "te k"
+
+  var s4  = _u32_read_le(key)
+  var s5  = _u32_read_le(key + 4)
+  var s6  = _u32_read_le(key + 8)
+  var s7  = _u32_read_le(key + 12)
+  var s8  = _u32_read_le(key + 16)
+  var s9  = _u32_read_le(key + 20)
+  var s10 = _u32_read_le(key + 24)
+  var s11 = _u32_read_le(key + 28)
+
+  var s12 = _u32_read_le(input)
+  var s13 = _u32_read_le(input + 4)
+  var s14 = _u32_read_le(input + 8)
+  var s15 = _u32_read_le(input + 12)
+
+  # 10 double-rounds = 20 rounds.
+  var i = 0
+  while i < 10
+    # Column round.
+    # QR(s0, s4, s8, s12)
+    s0 = _u32_add(s0, s4); s12 = _u32_rotl(s12 ^ s0, 16)
+    s8 = _u32_add(s8, s12); s4 = _u32_rotl(s4 ^ s8, 12)
+    s0 = _u32_add(s0, s4); s12 = _u32_rotl(s12 ^ s0, 8)
+    s8 = _u32_add(s8, s12); s4 = _u32_rotl(s4 ^ s8, 7)
+    # QR(s1, s5, s9, s13)
+    s1 = _u32_add(s1, s5); s13 = _u32_rotl(s13 ^ s1, 16)
+    s9 = _u32_add(s9, s13); s5 = _u32_rotl(s5 ^ s9, 12)
+    s1 = _u32_add(s1, s5); s13 = _u32_rotl(s13 ^ s1, 8)
+    s9 = _u32_add(s9, s13); s5 = _u32_rotl(s5 ^ s9, 7)
+    # QR(s2, s6, s10, s14)
+    s2 = _u32_add(s2, s6); s14 = _u32_rotl(s14 ^ s2, 16)
+    s10 = _u32_add(s10, s14); s6 = _u32_rotl(s6 ^ s10, 12)
+    s2 = _u32_add(s2, s6); s14 = _u32_rotl(s14 ^ s2, 8)
+    s10 = _u32_add(s10, s14); s6 = _u32_rotl(s6 ^ s10, 7)
+    # QR(s3, s7, s11, s15)
+    s3 = _u32_add(s3, s7); s15 = _u32_rotl(s15 ^ s3, 16)
+    s11 = _u32_add(s11, s15); s7 = _u32_rotl(s7 ^ s11, 12)
+    s3 = _u32_add(s3, s7); s15 = _u32_rotl(s15 ^ s3, 8)
+    s11 = _u32_add(s11, s15); s7 = _u32_rotl(s7 ^ s11, 7)
+
+    # Diagonal round.
+    # QR(s0, s5, s10, s15)
+    s0 = _u32_add(s0, s5); s15 = _u32_rotl(s15 ^ s0, 16)
+    s10 = _u32_add(s10, s15); s5 = _u32_rotl(s5 ^ s10, 12)
+    s0 = _u32_add(s0, s5); s15 = _u32_rotl(s15 ^ s0, 8)
+    s10 = _u32_add(s10, s15); s5 = _u32_rotl(s5 ^ s10, 7)
+    # QR(s1, s6, s11, s12)
+    s1 = _u32_add(s1, s6); s12 = _u32_rotl(s12 ^ s1, 16)
+    s11 = _u32_add(s11, s12); s6 = _u32_rotl(s6 ^ s11, 12)
+    s1 = _u32_add(s1, s6); s12 = _u32_rotl(s12 ^ s1, 8)
+    s11 = _u32_add(s11, s12); s6 = _u32_rotl(s6 ^ s11, 7)
+    # QR(s2, s7, s8, s13)
+    s2 = _u32_add(s2, s7); s13 = _u32_rotl(s13 ^ s2, 16)
+    s8 = _u32_add(s8, s13); s7 = _u32_rotl(s7 ^ s8, 12)
+    s2 = _u32_add(s2, s7); s13 = _u32_rotl(s13 ^ s2, 8)
+    s8 = _u32_add(s8, s13); s7 = _u32_rotl(s7 ^ s8, 7)
+    # QR(s3, s4, s9, s14)
+    s3 = _u32_add(s3, s4); s14 = _u32_rotl(s14 ^ s3, 16)
+    s9 = _u32_add(s9, s14); s4 = _u32_rotl(s4 ^ s9, 12)
+    s3 = _u32_add(s3, s4); s14 = _u32_rotl(s14 ^ s3, 8)
+    s9 = _u32_add(s9, s14); s4 = _u32_rotl(s4 ^ s9, 7)
+
+    i += 1
+  end
+
+  # Truncated output: state[0..4] || state[12..16].
+  _u32_write_le(subkey, s0)
+  _u32_write_le(subkey + 4, s1)
+  _u32_write_le(subkey + 8, s2)
+  _u32_write_le(subkey + 12, s3)
+  _u32_write_le(subkey + 16, s12)
+  _u32_write_le(subkey + 20, s13)
+  _u32_write_le(subkey + 24, s14)
+  _u32_write_le(subkey + 28, s15)
+end
+
+# =============================================================================
+# ChaCha20 — RFC 8439 §2.3 (block function) + §2.4 (encrypt)
+# =============================================================================
+#
+# State (16 u32, RFC 8439 §2.3):
+#   [ 0..4 ) constants  = "expand 32-byte k"
+#   [ 4..12) key        = key[0..32]   (8 LE u32)
+#   [12..13) counter    = u32 LE
+#   [13..16) nonce      = nonce[0..12] (3 LE u32)
+#
+# Difference from HChaCha20:
+#   1. Counter takes the s12 slot; HChaCha20 had nonce there.
+#   2. After 20 rounds, the FINAL step adds back the original state and emits
+#      all 16 words as the keystream block (HChaCha20 truncates + skips add).
+
+## ChaCha20-Block — emit a 64-byte keystream block at counter `counter`.
+##
+## Args:
+## - key:      32-byte input key buffer.
+## - counter:  Int (0..2^32-1). u32 starting counter.
+## - nonce:    12-byte nonce buffer (RFC 8439 IV format).
+## - block_64: 64-byte output buffer.
+def chacha20_block(key: Int, counter: Int, nonce: Int, block_64: Int): Void
+  # Constants — "expand 32-byte k" as 4 LE u32.
+  var s0  = 1634760805    # 0x61707865 "expa"
+  var s1  = 857760878     # 0x3320646e "nd 3"
+  var s2  = 2036477234    # 0x79622d32 "2-by"
+  var s3  = 1797285236    # 0x6b206574 "te k"
+
+  var s4  = _u32_read_le(key)
+  var s5  = _u32_read_le(key + 4)
+  var s6  = _u32_read_le(key + 8)
+  var s7  = _u32_read_le(key + 12)
+  var s8  = _u32_read_le(key + 16)
+  var s9  = _u32_read_le(key + 20)
+  var s10 = _u32_read_le(key + 24)
+  var s11 = _u32_read_le(key + 28)
+
+  var s12 = counter & 4294967295
+  var s13 = _u32_read_le(nonce)
+  var s14 = _u32_read_le(nonce + 4)
+  var s15 = _u32_read_le(nonce + 8)
+
+  # Save originals for the final add-back step.
+  var o0 = s0; var o1 = s1; var o2 = s2; var o3 = s3
+  var o4 = s4; var o5 = s5; var o6 = s6; var o7 = s7
+  var o8 = s8; var o9 = s9; var o10 = s10; var o11 = s11
+  var o12 = s12; var o13 = s13; var o14 = s14; var o15 = s15
+
+  # 10 double-rounds = 20 rounds. (Same QR mixer as HChaCha20.)
+  var i = 0
+  while i < 10
+    # Column round.
+    s0 = _u32_add(s0, s4); s12 = _u32_rotl(s12 ^ s0, 16)
+    s8 = _u32_add(s8, s12); s4 = _u32_rotl(s4 ^ s8, 12)
+    s0 = _u32_add(s0, s4); s12 = _u32_rotl(s12 ^ s0, 8)
+    s8 = _u32_add(s8, s12); s4 = _u32_rotl(s4 ^ s8, 7)
+
+    s1 = _u32_add(s1, s5); s13 = _u32_rotl(s13 ^ s1, 16)
+    s9 = _u32_add(s9, s13); s5 = _u32_rotl(s5 ^ s9, 12)
+    s1 = _u32_add(s1, s5); s13 = _u32_rotl(s13 ^ s1, 8)
+    s9 = _u32_add(s9, s13); s5 = _u32_rotl(s5 ^ s9, 7)
+
+    s2 = _u32_add(s2, s6); s14 = _u32_rotl(s14 ^ s2, 16)
+    s10 = _u32_add(s10, s14); s6 = _u32_rotl(s6 ^ s10, 12)
+    s2 = _u32_add(s2, s6); s14 = _u32_rotl(s14 ^ s2, 8)
+    s10 = _u32_add(s10, s14); s6 = _u32_rotl(s6 ^ s10, 7)
+
+    s3 = _u32_add(s3, s7); s15 = _u32_rotl(s15 ^ s3, 16)
+    s11 = _u32_add(s11, s15); s7 = _u32_rotl(s7 ^ s11, 12)
+    s3 = _u32_add(s3, s7); s15 = _u32_rotl(s15 ^ s3, 8)
+    s11 = _u32_add(s11, s15); s7 = _u32_rotl(s7 ^ s11, 7)
+
+    # Diagonal round.
+    s0 = _u32_add(s0, s5); s15 = _u32_rotl(s15 ^ s0, 16)
+    s10 = _u32_add(s10, s15); s5 = _u32_rotl(s5 ^ s10, 12)
+    s0 = _u32_add(s0, s5); s15 = _u32_rotl(s15 ^ s0, 8)
+    s10 = _u32_add(s10, s15); s5 = _u32_rotl(s5 ^ s10, 7)
+
+    s1 = _u32_add(s1, s6); s12 = _u32_rotl(s12 ^ s1, 16)
+    s11 = _u32_add(s11, s12); s6 = _u32_rotl(s6 ^ s11, 12)
+    s1 = _u32_add(s1, s6); s12 = _u32_rotl(s12 ^ s1, 8)
+    s11 = _u32_add(s11, s12); s6 = _u32_rotl(s6 ^ s11, 7)
+
+    s2 = _u32_add(s2, s7); s13 = _u32_rotl(s13 ^ s2, 16)
+    s8 = _u32_add(s8, s13); s7 = _u32_rotl(s7 ^ s8, 12)
+    s2 = _u32_add(s2, s7); s13 = _u32_rotl(s13 ^ s2, 8)
+    s8 = _u32_add(s8, s13); s7 = _u32_rotl(s7 ^ s8, 7)
+
+    s3 = _u32_add(s3, s4); s14 = _u32_rotl(s14 ^ s3, 16)
+    s9 = _u32_add(s9, s14); s4 = _u32_rotl(s4 ^ s9, 12)
+    s3 = _u32_add(s3, s4); s14 = _u32_rotl(s14 ^ s3, 8)
+    s9 = _u32_add(s9, s14); s4 = _u32_rotl(s4 ^ s9, 7)
+
+    i += 1
+  end
+
+  # Add original state back (THIS is what HChaCha20 omits) + emit 16 LE u32.
+  _u32_write_le(block_64,      _u32_add(s0, o0))
+  _u32_write_le(block_64 + 4,  _u32_add(s1, o1))
+  _u32_write_le(block_64 + 8,  _u32_add(s2, o2))
+  _u32_write_le(block_64 + 12, _u32_add(s3, o3))
+  _u32_write_le(block_64 + 16, _u32_add(s4, o4))
+  _u32_write_le(block_64 + 20, _u32_add(s5, o5))
+  _u32_write_le(block_64 + 24, _u32_add(s6, o6))
+  _u32_write_le(block_64 + 28, _u32_add(s7, o7))
+  _u32_write_le(block_64 + 32, _u32_add(s8, o8))
+  _u32_write_le(block_64 + 36, _u32_add(s9, o9))
+  _u32_write_le(block_64 + 40, _u32_add(s10, o10))
+  _u32_write_le(block_64 + 44, _u32_add(s11, o11))
+  _u32_write_le(block_64 + 48, _u32_add(s12, o12))
+  _u32_write_le(block_64 + 52, _u32_add(s13, o13))
+  _u32_write_le(block_64 + 56, _u32_add(s14, o14))
+  _u32_write_le(block_64 + 60, _u32_add(s15, o15))
+end
+
+## ChaCha20-Encrypt — XOR `input_len` bytes from `input` with the keystream
+## starting at `counter`, write to `output`. Decrypt is the same operation
+## (XOR-keystream is involutive); this single primitive serves both directions.
+##
+## Args:
+## - output:    output buffer of at least input_len bytes (may overlap input).
+## - input:     plaintext (or ciphertext on decrypt) buffer.
+## - input_len: length in bytes (any non-negative value; 0 is a no-op).
+## - key:       32-byte key buffer.
+## - counter:   starting u32 counter. AEAD uses 1 (counter=0 is the Poly1305
+##              key block in the AEAD construction).
+## - nonce:     12-byte nonce buffer (RFC 8439 IV format).
+def chacha20_encrypt(
+  output: Int,
+  input: Int,
+  input_len: Int,
+  key: Int,
+  counter: Int,
+  nonce: Int
+): Void
+  if input_len == 0
+    return
+  end
+  var ks = malloc(64)
+  var processed = 0
+  var blk = counter & 4294967295
+  while processed < input_len
+    chacha20_block(key, blk, nonce, ks)
+    var remaining = input_len - processed
+    var n = 64
+    if remaining < 64
+      n = remaining
+    end
+    var i = 0
+    while i < n
+      ptr_write_byte(
+        output + processed + i,
+        ptr_read_byte(input + processed + i) ^ ptr_read_byte(ks + i)
+      )
+      i += 1
+    end
+    processed = processed + n
+    blk = (blk + 1) & 4294967295
+  end
+  # Wipe keystream scratch — it's correlated with the key.
+  var z = 0
+  while z < 64
+    ptr_write_byte(ks + z, 0)
+    z += 1
+  end
+  free(ks)
+end

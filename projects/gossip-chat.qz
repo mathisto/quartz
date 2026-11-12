@@ -1,0 +1,425 @@
+# projects/gossip-chat.qz — P2P Gossip Chat
+#
+# A peer-to-peer chat program using gossip protocol.
+# Each node accepts connections, connects to seeds, and relays messages.
+#
+# Usage:
+#   ./chat <name> <port> [seed_host:seed_port]
+#
+# Build:
+#   quartz -I . projects/gossip-chat.qz > /tmp/chat.ll
+#   clang -O2 -x ir /tmp/chat.ll -o chat -lpthread
+#
+# Protocol: newline-delimited text messages
+#   MSG:<id>:<sender>:<text>
+#   JOIN:<name>:<host>:<port>
+#   PING
+
+import std/ffi/socket
+
+# We need read() for stdin
+extern "C" def read(fd: CInt, buf: CPtr, count: CSize): Int
+
+# =============================================================================
+# Globals via mutex/atomic
+# =============================================================================
+
+# Read a line from a file descriptor (recv byte-by-byte until \n or EOF)
+# Returns empty string on EOF/error
+def fd_read_line(fd: Int): String
+  var sb = sb_new()
+  var buf = alloc(1)
+  var done = 0
+  while done == 0
+    var n = recv(fd, buf, 1, 0)
+    if n <= 0
+      done = 1
+    else
+      var ch = ptr_read_byte(buf)
+      if ch == '\n'
+        done = 1
+      else
+        sb.append_char(ch)
+      end
+    end
+  end
+  qz_free(buf)
+  var result = sb_to_string(sb)
+  sb.free()
+  return result
+end
+
+# Write a line to a file descriptor (send + newline)
+def fd_write_line(fd: Int, msg: String): Int
+  var line = msg + "\n"
+  var cstr = string_to_cstr(line)
+  var len = str_size(line)
+  var sent = 0
+  while sent < len
+    var n = send(fd, ptr_add(cstr, sent), len - sent, 0)
+    if n <= 0
+      return -1
+    end
+    sent += n
+  end
+  return sent
+end
+
+# Read a line from stdin
+def stdin_read_line(): String
+  var sb = sb_new()
+  var buf = alloc(1)
+  var done = 0
+  while done == 0
+    var n = read(0, buf, 1)
+    if n <= 0
+      done = 1
+    else
+      var ch = ptr_read_byte(buf)
+      if ch == '\n'
+        done = 1
+      else
+        sb.append_char(ch)
+      end
+    end
+  end
+  qz_free(buf)
+  var result = sb_to_string(sb)
+  sb.free()
+  return result
+end
+
+# =============================================================================
+# Shared state accessors
+# Mutex holds a Vec (as i64 pointer) for peers, HashMap for seen messages
+# =============================================================================
+
+def peers_add(peer_lock: Int, fd: Int): Int
+  var peers = mutex_lock(peer_lock)
+  vec_push(peers, fd)
+  mutex_unlock(peer_lock, peers)
+  return 0
+end
+
+def peers_remove(peer_lock: Int, fd: Int): Int
+  var peers = mutex_lock(peer_lock)
+  var new_peers = vec_new()
+  var i = 0
+  while i < vec_size(peers)
+    var p = vec_get(peers, i)
+    if p != fd
+      vec_push(new_peers, p)
+    end
+    i += 1
+  end
+  mutex_unlock(peer_lock, new_peers)
+  return 0
+end
+
+def broadcast(peer_lock: Int, msg: String, exclude_fd: Int): Int
+  var peers = mutex_lock(peer_lock)
+  var i = 0
+  while i < vec_size(peers)
+    var pfd = vec_get(peers, i)
+    if pfd != exclude_fd
+      fd_write_line(pfd, msg)
+    end
+    i += 1
+  end
+  mutex_unlock(peer_lock, peers)
+  return 0
+end
+
+def seen_check_and_add(seen_lock: Int, msg_id: String): Int
+  var seen = mutex_lock(seen_lock)
+  if hashmap_has(seen, msg_id) == 1
+    mutex_unlock(seen_lock, seen)
+    return 1
+  end
+  hashmap_set(seen, msg_id, 1)
+  mutex_unlock(seen_lock, seen)
+  return 0
+end
+
+# =============================================================================
+# Message handling
+# =============================================================================
+
+# Parse and handle an incoming message line
+# Returns 0 on success, -1 on disconnect
+def handle_message(line: String, fd: Int, peer_lock: Int, seen_lock: Int, my_name: String): Int
+  if str_size(line) == 0
+    return -1
+  end
+
+  # MSG:<id>:<sender>:<text>
+  if str_starts_with(line, "MSG:") == 1
+    var payload = str_slice(line, 4, str_size(line))
+    var colon1 = str_find(payload, ":")
+    if colon1 < 0
+      return 0
+    end
+    var msg_id = str_slice(payload, 0, colon1)
+    var rest = str_slice(payload, colon1 + 1, str_size(payload))
+    var colon2 = str_find(rest, ":")
+    if colon2 < 0
+      return 0
+    end
+    var sender = str_slice(rest, 0, colon2)
+    var text = str_slice(rest, colon2 + 1, str_size(rest))
+
+    # Dedup: skip if already seen
+    if seen_check_and_add(seen_lock, msg_id) == 1
+      return 0
+    end
+
+    # Display
+    puts("[" + sender + "] " + text)
+
+    # Relay to all other peers
+    broadcast(peer_lock, line, fd)
+    return 0
+  end
+
+  # PING — respond with PONG
+  if str_starts_with(line, "PING") == 1
+    fd_write_line(fd, "PONG")
+    return 0
+  end
+
+  # JOIN:<name>:<host>:<port> — informational
+  if str_starts_with(line, "JOIN:") == 1
+    var info = str_slice(line, 5, str_size(line))
+    puts("* " + info + " joined the network")
+    # Relay join to other peers
+    broadcast(peer_lock, line, fd)
+    return 0
+  end
+
+  return 0
+end
+
+# =============================================================================
+# Thread entry points
+# =============================================================================
+
+# Per-peer reader thread
+def peer_reader(fd: Int, peer_lock: Int, seen_lock: Int, my_name: String): Int
+  var running = 1
+  while running == 1
+    var line = fd_read_line(fd)
+    if str_size(line) == 0
+      running = 0
+    else
+      var rc = handle_message(line, fd, peer_lock, seen_lock, my_name)
+      if rc < 0
+        running = 0
+      end
+    end
+  end
+
+  # Peer disconnected
+  peers_remove(peer_lock, fd)
+  close(fd)
+  return 0
+end
+
+# Acceptor thread — accepts incoming connections and spawns readers
+def acceptor(listen_fd: Int, peer_lock: Int, seen_lock: Int, my_name: String): Int
+  while true
+    var client_fd = accept(listen_fd, 0, 0)
+    if client_fd >= 0
+      peers_add(peer_lock, client_fd)
+      go peer_reader(client_fd, peer_lock, seen_lock, my_name)
+    end
+  end
+  return 0
+end
+
+# =============================================================================
+# Network setup — manual sockaddr_in construction
+# =============================================================================
+
+# Build a sockaddr_in at a 16-byte buffer for INADDR_ANY
+# macOS: [sin_len:1=16, sin_family:1=2, sin_port:2(BE), sin_addr:4=0, sin_zero:8=0]
+# Linux: [sin_family:2=2(LE), sin_port:2(BE), sin_addr:4=0, sin_zero:8=0]
+@cfg(os: "macos")
+def build_sockaddr_any(buf: Int, port: Int): Int
+  memset(buf, 0, 16)
+  ptr_write_byte(buf, 16)
+  ptr_write_byte(ptr_add(buf, 1), 2)
+  ptr_write_byte(ptr_add(buf, 2), (port >> 8) & 255)
+  ptr_write_byte(ptr_add(buf, 3), port & 255)
+  return 0
+end
+
+@cfg(os: "linux")
+def build_sockaddr_any(buf: Int, port: Int): Int
+  memset(buf, 0, 16)
+  ptr_write_byte(buf, 2)
+  ptr_write_byte(ptr_add(buf, 1), 0)
+  ptr_write_byte(ptr_add(buf, 2), (port >> 8) & 255)
+  ptr_write_byte(ptr_add(buf, 3), port & 255)
+  return 0
+end
+
+@cfg(os: "macos")
+def build_sockaddr(buf: Int, port: Int, host: String): Int
+  memset(buf, 0, 16)
+  ptr_write_byte(buf, 16)
+  ptr_write_byte(ptr_add(buf, 1), 2)
+  ptr_write_byte(ptr_add(buf, 2), (port >> 8) & 255)
+  ptr_write_byte(ptr_add(buf, 3), port & 255)
+  var host_cstr = string_to_cstr(host)
+  return inet_pton(2, host_cstr, ptr_add(buf, 4))
+end
+
+@cfg(os: "linux")
+def build_sockaddr(buf: Int, port: Int, host: String): Int
+  memset(buf, 0, 16)
+  ptr_write_byte(buf, 2)
+  ptr_write_byte(ptr_add(buf, 1), 0)
+  ptr_write_byte(ptr_add(buf, 2), (port >> 8) & 255)
+  ptr_write_byte(ptr_add(buf, 3), port & 255)
+  var host_cstr = string_to_cstr(host)
+  return inet_pton(2, host_cstr, ptr_add(buf, 4))
+end
+
+# Create a listening TCP socket on the given port
+def create_listener(port: Int): Int
+  var fd = socket(AF_INET(), SOCK_STREAM(), 0)
+  if fd < 0
+    return -1
+  end
+
+  # SO_REUSEADDR
+  var optbuf = alloc(4)
+  ptr_write_byte(optbuf, 1)
+  ptr_write_byte(ptr_add(optbuf, 1), 0)
+  ptr_write_byte(ptr_add(optbuf, 2), 0)
+  ptr_write_byte(ptr_add(optbuf, 3), 0)
+  setsockopt(fd, SOL_SOCKET(), SO_REUSEADDR(), optbuf, 4)
+  qz_free(optbuf)
+
+  var addr = alloc(16)
+  build_sockaddr_any(addr, port)
+
+  var ret = bind(fd, addr, 16)
+  if ret < 0
+    close(fd)
+    qz_free(addr)
+    return -1
+  end
+  qz_free(addr)
+
+  ret = listen(fd, 16)
+  if ret < 0
+    close(fd)
+    return -1
+  end
+  return fd
+end
+
+# Connect to a peer at host:port, returns fd or -1
+def connect_to_peer(host: String, port: Int): Int
+  var fd = socket(AF_INET(), SOCK_STREAM(), 0)
+  if fd < 0
+    return -1
+  end
+
+  var addr = alloc(16)
+  var ret = build_sockaddr(addr, port, host)
+  if ret <= 0
+    close(fd)
+    qz_free(addr)
+    return -1
+  end
+
+  ret = connect(fd, addr, 16)
+  qz_free(addr)
+  if ret < 0
+    close(fd)
+    return -1
+  end
+  return fd
+end
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main(): Int
+  if argc() < 3
+    puts("Usage: chat <name> <port> [seed_host:seed_port]")
+    return 1
+  end
+
+  var my_name = argv(1)
+  var port = str_to_int(argv(2))
+
+  # Shared state
+  var peer_lock = mutex_new(vec_new())
+  var seen_lock = mutex_new(hashmap_new())
+  var msg_counter = atomic_new(0)
+
+  # Start listener
+  var listen_fd = create_listener(port)
+  if listen_fd < 0
+    puts("ERROR: Could not listen on port " + argv(2))
+    return 1
+  end
+  puts("* Listening on port " + argv(2))
+
+  go acceptor(listen_fd, peer_lock, seen_lock, my_name)
+
+  # Connect to seed peer if provided
+  if argc() > 3
+    var seed = argv(3)
+    var colon = str_find(seed, ":")
+    if colon > 0
+      var seed_host = str_slice(seed, 0, colon)
+      var seed_port = str_to_int(str_slice(seed, colon + 1, str_size(seed)))
+      puts("* Connecting to seed " + seed + "...")
+      var seed_fd = connect_to_peer(seed_host, seed_port)
+      if seed_fd >= 0
+        puts("* Connected to seed")
+        peers_add(peer_lock, seed_fd)
+
+        # Announce join
+        var join_msg = "JOIN:" + my_name + ":127.0.0.1:" + argv(2)
+        fd_write_line(seed_fd, join_msg)
+
+        # Spawn reader for seed
+        go peer_reader(seed_fd, peer_lock, seen_lock, my_name)
+      else
+        puts("* WARNING: Could not connect to seed")
+      end
+    end
+  end
+
+  puts("* Type a message and press Enter to send. Ctrl-C to quit.")
+
+  # Main thread: read stdin and broadcast
+  while true
+    var text = stdin_read_line()
+    if str_size(text) == 0
+      # EOF on stdin — exit
+      puts("* Goodbye!")
+      close(listen_fd)
+      return 0
+    end
+
+    # Build message with unique ID
+    var id = atomic_add(msg_counter, 1)
+    var msg_id = my_name + "-" + str_from_int(id)
+    var line = "MSG:" + msg_id + ":" + my_name + ":" + text
+
+    # Mark as seen (so we don't echo our own)
+    seen_check_and_add(seen_lock, msg_id)
+
+    # Broadcast to all peers
+    broadcast(peer_lock, line, -1)
+  end
+
+  return 0
+end

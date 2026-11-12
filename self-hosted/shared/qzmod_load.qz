@@ -1,0 +1,1073 @@
+##! qzmod_load — Decode a `.qzmod` module artifact directory back into
+##! a typecheck-shaped result (Phase 1.2).
+##!
+##! Design memo: `docs/design/QZMOD_FORMAT.md`. Mirror image of
+##! `qzmod_emit.qz` (Phase 1.1).
+##!
+##! ## Validation chain
+##!
+##! The loader is the gate that decides whether to trust a cached
+##! `.qzmod` directory. Per design § 5 the chain is:
+##!
+##!   1. header.txt exists                             → miss if not
+##!   2. qzmod_header_parse → is_valid                 → fail-on-parse
+##!   3. header.compiler_hash == expected               → "wrong compiler"
+##!   4. header.source_hash == expected                 → "source changed"
+##!   5. header.flags_hash == expected                  → "compile flags changed"
+##!   6. header.dep_iface_hashes == expected            → "dep ABI changed"
+##!   7. qzmod_compute_output_hash(dir) == header.hash  → "torn write / tamper"
+##!
+##! Each step short-circuits with `ok=0` + a diagnostic in `error_reason`.
+##! Per design Principle #6 the cache is advisory: NO failure path
+##! panics, NO exit() calls, NO unwound throws. Caller (Phase 1.4
+##! `resolve_load_module` integration) logs the reason when
+##! `--explain-cache` is on and falls back to from-source compile.
+##!
+##! ## Type-ID semantics (Phase 1.2 + Phase 1.4.a/b)
+##!
+##! Loader surfaces:
+##!   - Sig/field blobs verbatim — producer-global type IDs (Phase 1.2).
+##!   - TYPES section as raw `Vec<Int>` triples (Phase 1.4.a/b) — the
+##!     producer's `tc.ptype_*` arena verbatim. The decoder doesn't
+##!     remap; that's Phase 1.4.c (`tc_inject_qzmod`)'s job. Inject walks
+##!     the TYPES table in order, building
+##!     `producer_ptype_idx → consumer_type_id` and then rewrites sig/
+##!     field blob IDs through that remap.
+##!
+##! ## Pool resolution
+##!
+##! `strings.bin` is decoded once up-front into `strings: Vec<String>`.
+##! Per-section `*_name_idx.bin` files hold indices into that table; the
+##! loader RESOLVES indices to string values during decode so the caller
+##! receives `Vec<String>` directly (mirrors the consumer's normal
+##! `tc.registry.*_names` shape). Blob files hold mixed int data —
+##! some are name indices, some are type IDs — and are returned as raw
+##! `Vec<Int>` for the caller (Phase 1.3 adaptor) to interpret.
+
+import file_io
+import content_hash
+import qzmod_format
+import mir
+import * from str_compat
+
+# =============================================================================
+# QzmodLoadResult — decode output. Mirror shape of QzmodEmitInput so the
+# Phase 1.3 caller can use the same field walk for register.
+#
+# Names are RESOLVED — every Vec<String> here holds string values, not
+# pool indices. Blob fields hold raw integer data (type IDs in producer-
+# global space, plus encoded name indices for the per-section blob layouts
+# documented in qzmod_emit.qz). Index→name resolution within blobs is the
+# caller's job (Phase 1.3) because some blob ints are name indices and
+# some are type IDs, and the rule is per-section.
+# =============================================================================
+
+struct QzmodLoadResult
+  ok: Int                          # 1 = loaded, 0 = miss/mismatch/error
+  error_reason: String             # diagnostic for cache-miss telemetry
+  module_name: String              # taken from input arg (not stored in header today)
+
+  # --- Pool ---
+  strings: Vec<String>             # the on-disk strings.bin
+
+  # --- Functions ---
+  func_names: Vec<String>          # resolved from funcs_name.bin
+  func_sig_blob: Vec<Int>          # raw funcs_sig_blob.bin
+  func_sig_off: Vec<Int>           # raw funcs_sig_off.bin
+  # Phase 1.4.c.3 — per-function effect rows. State tri-state per slot:
+  # 0 = untracked, 1 = closed row, 2 = open row. Labels parallel-decoded
+  # through the pool. `funcs_effect_state.bin` absent on disk decodes
+  # as a zero-filled vector (all funcs untracked), preserving
+  # backward compatibility with pre-1.4.c.3 .qzmod directories.
+  func_effect_state: Vec<Int>
+  func_effect_labels: Vec<Vec<String>>
+
+  # Phase 1.4.c.3 — per-function string annotations (parallel to
+  # func_names). Empty strings preserve positional indexing.
+  func_return_annotations: Vec<String>
+  func_param_annotations: Vec<String>
+  func_param_names: Vec<String>
+  func_type_params: Vec<String>
+  func_type_param_bounds: Vec<String>
+
+  # Per-function Fn(...) annotations. Flat strvec; per-func range is
+  # `[func_param_fn_anns_starts[i] .. + func_param_fn_anns_counts[i]]`.
+  # Inner empty string = non-Fn param (consumer pushes 0 into Vec<Int>).
+  func_param_fn_anns: Vec<String>
+  func_param_fn_anns_starts: Vec<Int>
+  func_param_fn_anns_counts: Vec<Int>
+
+  # --- Structs ---
+  struct_names: Vec<String>
+  struct_fields_blob: Vec<Int>
+  struct_fields_off: Vec<Int>
+
+  # --- Enums ---
+  enum_names: Vec<String>
+  enum_variants_blob: Vec<Int>
+  enum_variants_off: Vec<Int>
+
+  # --- Traits ---
+  trait_names: Vec<String>
+  trait_methods_blob: Vec<Int>
+  trait_methods_off: Vec<Int>
+
+  # --- Impls (Phase 1.4.d — variable-stride-ready; v1 stride is 2). ---
+  # `impls_blob` holds the flat per-impl records; `impls_off[i]` is the
+  # start of impl i in the blob (consumer uses for direct lookup without
+  # scanning).
+  impls_blob: Vec<Int>
+  impls_off: Vec<Int>
+
+  # --- Type aliases ---
+  type_alias_names: Vec<String>
+  type_alias_targets: Vec<String>
+
+  # --- Newtypes ---
+  newtype_names: Vec<String>
+  newtype_wrapped: Vec<String>
+  # INC.1.9 — producer-global newtype type IDs (TYPE_NEWTYPE_BASE + i in
+  # the producer's tc.registry.newtype_type_ids slot). Parallel to
+  # `newtype_names`. Consumer's tc_inject_qzmod Step 5 reads this to
+  # build a producer→consumer newtype remap so func sigs that reference
+  # newtypes inject cleanly. Absent / empty for older `.qzmod` files —
+  # consumer falls back to the prior advisory-miss behavior.
+  newtype_type_ids: Vec<Int>
+  # STRICT_NEWTYPES_QZMOD — per-newtype `@strict` flag (1 / 0). Parallel
+  # to `newtype_names`. Absent / empty for `.qzmod` files emitted before
+  # MINOR=1 or for modules without any `@strict` newtype — consumer
+  # defaults missing slots to 0 (loose), preserving pre-strict semantics.
+  newtype_strict_flags: Vec<Int>
+
+  # --- Effects ---
+  effect_names: Vec<String>
+  effect_ops_blob: Vec<Int>
+  effect_ops_off: Vec<Int>
+
+  # --- Consts / globals (Phase 1.1 names-only) ---
+  const_names: Vec<String>
+  const_types: Vec<Int>
+  global_names: Vec<String>
+  global_types: Vec<Int>
+
+  # --- TYPES section (Phase 1.4.a) — producer ptype arena, verbatim ---
+  types_tag: Vec<Int>
+  types_arg1: Vec<Int>
+  types_arg2: Vec<Int>
+
+  # --- Per-ptype identity strings (Phase 1.4.b.1) ---
+  # Parallel to types_tag. Producer's `tc.ptype_names` verbatim. The
+  # remap helper (qzmod_remap.qz) calls `tc_ptype_set_name` on the
+  # consumer ptype using this string after making it.
+  ptype_names: Vec<String>
+
+  # --- Producer fn_type registry annotations (Phase 1.4.b.1) ---
+  # Indexed by producer fn_id. TYPE_FUNCTION ptypes carry arg1 = producer
+  # fn_id; remap looks up annotation here and re-interns via
+  # `tc_register_fn_type` to get the consumer fn_id.
+  fn_type_annotations: Vec<String>
+
+  # --- Union / record structural-signature tables (D3) ---
+  # Anonymous structural value types the producer's blobs referenced in the
+  # TYPE_UNION_BASE..TYPE_RECORD_BASE band. `tc_inject_qzmod` walks these
+  # once up-front to build producer→consumer remaps for the band (mirroring
+  # the newtype_remap prepass) before decoding sig / field / payload blobs.
+  # Absent on disk (older `.qzmod` caches, or modules with no cross-module
+  # structural value) → empty vecs → the band stays advisory-miss, exactly
+  # the pre-D3 behavior.
+  #
+  # `union_sig_ids[k]` producer-global union id; `union_sig_members[k]` the
+  # pipe-joined member string. Parallel.
+  union_sig_ids: Vec<Int>
+  union_sig_members: Vec<String>
+  # `record_sig_ids[k]` producer-global record id; the field list lives in
+  # `record_sig_blob` at `record_sig_off[k]` as
+  # [n_fields, name_idx_0, type_idx_0, ...] (both pool-resolved on decode).
+  record_sig_ids: Vec<Int>
+  record_sig_blob: Vec<Int>
+  record_sig_off: Vec<Int>
+
+  # --- Generic / sub-trait / annotation enrichment (Phase 1.4.c.0) ---
+  # Parallel to the matching name vec (struct_names / enum_names /
+  # trait_names). Inject (Phase 1.4.c.1) reads these to reproduce
+  # the AST-path's registry shape verbatim.
+  struct_type_params: Vec<String>
+  enum_type_params: Vec<String>
+  trait_type_params: Vec<String>
+  trait_super_traits: Vec<String>
+
+  # Annotations resolved through the strings pool. Outer parallel to
+  # struct_names / enum_names; inner is one annotation per field / variant.
+  struct_field_annotations: Vec<Vec<String>>
+  enum_variant_field_annotations: Vec<Vec<String>>
+
+  # --- MIR bodies (INC.1.2 producer / INC.1.3 consumer) ---
+  # Raw section data from `mir_bodies.bin` + `mir_bodies_off.bin` +
+  # `mir_bodies_name.bin`. Empty Vecs when the module shipped no MIR
+  # bodies (synthetic / constant-only modules). Consumer integration
+  # calls `qzmod_load_mir_bodies` to walk these and produce a
+  # `Vec<MirFunc>` via `mir_unpickle_function`.
+  mir_bodies_blob: Vec<Int>
+  mir_bodies_off: Vec<Int>
+  mir_bodies_name: Vec<String>
+end
+
+## Construct a miss result with the given diagnostic reason. All
+## payload Vecs are empty. Helper for early-exit paths inside the
+## validation chain.
+def qzmod_load_miss(reason: String, module_name: String): QzmodLoadResult
+  return QzmodLoadResult {
+    ok: 0,
+    error_reason: reason,
+    module_name: module_name,
+    strings: vec_new<String>(),
+    func_names: vec_new<String>(),
+    func_sig_blob: vec_new(),
+    func_sig_off: vec_new(),
+    func_effect_state: vec_new(),
+    func_effect_labels: vec_new<Vec<String>>(),
+    func_return_annotations: vec_new<String>(),
+    func_param_annotations: vec_new<String>(),
+    func_param_names: vec_new<String>(),
+    func_type_params: vec_new<String>(),
+    func_type_param_bounds: vec_new<String>(),
+    func_param_fn_anns: vec_new<String>(),
+    func_param_fn_anns_starts: vec_new(),
+    func_param_fn_anns_counts: vec_new(),
+    struct_names: vec_new<String>(),
+    struct_fields_blob: vec_new(),
+    struct_fields_off: vec_new(),
+    enum_names: vec_new<String>(),
+    enum_variants_blob: vec_new(),
+    enum_variants_off: vec_new(),
+    trait_names: vec_new<String>(),
+    trait_methods_blob: vec_new(),
+    trait_methods_off: vec_new(),
+    impls_blob: vec_new(),
+    impls_off: vec_new(),
+    type_alias_names: vec_new<String>(),
+    type_alias_targets: vec_new<String>(),
+    newtype_names: vec_new<String>(),
+    newtype_wrapped: vec_new<String>(),
+    newtype_type_ids: vec_new<Int>(),
+    newtype_strict_flags: vec_new<Int>(),
+    effect_names: vec_new<String>(),
+    effect_ops_blob: vec_new(),
+    effect_ops_off: vec_new(),
+    const_names: vec_new<String>(),
+    const_types: vec_new(),
+    global_names: vec_new<String>(),
+    global_types: vec_new(),
+    types_tag: vec_new(),
+    types_arg1: vec_new(),
+    types_arg2: vec_new(),
+    ptype_names: vec_new<String>(),
+    fn_type_annotations: vec_new<String>(),
+    union_sig_ids: vec_new<Int>(),
+    union_sig_members: vec_new<String>(),
+    record_sig_ids: vec_new<Int>(),
+    record_sig_blob: vec_new<Int>(),
+    record_sig_off: vec_new<Int>(),
+    struct_type_params: vec_new<String>(),
+    enum_type_params: vec_new<String>(),
+    trait_type_params: vec_new<String>(),
+    trait_super_traits: vec_new<String>(),
+    struct_field_annotations: vec_new<Vec<String>>(),
+    enum_variant_field_annotations: vec_new<Vec<String>>(),
+    mir_bodies_blob: vec_new<Int>(),
+    mir_bodies_off: vec_new<Int>(),
+    mir_bodies_name: vec_new<String>(),
+  }
+end
+
+# =============================================================================
+# Helpers — read-or-empty wrappers around vec_load / strvec_load so that
+# absent files are treated as empty sections (the encoder skips writing
+# empty .bin files; per design § 4.2 missing file = section absent).
+# =============================================================================
+
+def _qzmod_load_int_or_empty(path: String): Vec<Int>
+  if fio_exists(path)
+    return vec_load(path)
+  end
+  return vec_new()
+end
+
+def _qzmod_load_strvec_or_empty(path: String): Vec<String>
+  if fio_exists(path)
+    return strvec_load(path)
+  end
+  return vec_new<String>()
+end
+
+## Resolve a Vec<Int> of pool indices into a Vec<String> of names. Out-of-
+## bounds indices (corruption indicator) resolve to "" rather than crashing.
+def _qzmod_resolve_names(name_idx: Vec<Int>, strings: Vec<String>): Vec<String>
+  var out = vec_new<String>()
+  for i in 0..name_idx.size
+    var idx = name_idx[i]
+    if idx >= 0 and idx < strings.size
+      out.push(strings[idx])
+    else
+      out.push("")
+    end
+  end
+  return out
+end
+
+## Resolve a Vec<Int> of pool indices into a Vec<String> for two parallel
+## files (e.g. `type_aliases_target.bin` is Vec<Int> of indexes into
+## `strings.bin`).
+def _qzmod_resolve_index_string_file(path: String, strings: Vec<String>): Vec<String>
+  return _qzmod_resolve_names(_qzmod_load_int_or_empty(path), strings)
+end
+
+## Decode a 2-D Vec<Vec<String>> annotation list from the blob/offsets
+## pair written by `_qzmod_emit_anns_2d`. Pool indices resolve through
+## `strings`; out-of-bounds entries decode as "" (corruption-tolerant).
+##
+## Returns a Vec parallel to `offsets` whose i-th entry is the annotation
+## list for the i-th outer slot (struct / enum / etc).
+def _qzmod_load_anns_2d(blob: Vec<Int>, offsets: Vec<Int>, strings: Vec<String>): Vec<Vec<String>>
+  var out = vec_new<Vec<String>>()
+  for oi in 0..offsets.size
+    var start = offsets[oi]
+    if start < 0 or start >= blob.size
+      out.push(vec_new<String>())
+    else
+      var n = blob[start]
+      var anns = vec_new<String>()
+      for ii in 0..n
+        var slot = start + 1 + ii
+        var s = ""
+        if slot < blob.size
+          var idx = blob[slot]
+          if idx >= 0 and idx < strings.size
+            s = strings[idx]
+          end
+        end
+        anns.push(s)
+      end
+      out.push(anns)
+    end
+  end
+  return out
+end
+
+## Phase 1.4.c.2.b — build the per-enum / per-variant / per-payload-field
+## annotations vec. Returns Vec<Vec<String>> declared, but the heap
+## content is actually Vec<Vec<Vec<String>>> — each outer entry is an
+## as_int-laundered Vec<Vec<String>> handle. The triple-nested generic
+## isn't spellable as a Quartz type annotation; this function smuggles
+## the 3-D vec through the typecheck by storing each per-enum handle
+## as an opaque Int in a Vec<Int> outer, then casting the outer through
+## `_qzmod_launder_anns_3d` to fit the declared return type. Pattern
+## binding walks the value as 3-D via `as_int`-laundered indexing.
+def _qzmod_build_enum_variant_anns(blob: Vec<Int>, offsets: Vec<Int>, strings: Vec<String>): Vec<Vec<String>>
+  var out_handles = vec_new<Int>()
+  for ei in 0..offsets.size
+    var start = offsets[ei]
+    var per_enum = vec_new<Vec<String>>()
+    if start >= 0 and start < blob.size
+      var n_variants = blob[start]
+      var cur = start + 1
+      for _vi in 0..n_variants
+        if cur < blob.size
+          var n_anns = blob[cur]
+          cur = cur + 1
+          var anns = vec_new<String>()
+          for _ai in 0..n_anns
+            var s = ""
+            if cur < blob.size
+              var idx = blob[cur]
+              if idx >= 0 and idx < strings.size
+                s = strings[idx]
+              end
+            end
+            cur = cur + 1
+            anns.push(s)
+          end
+          per_enum.push(anns)
+        else
+          per_enum.push(vec_new<String>())
+        end
+      end
+    end
+    out_handles.push(as_int(per_enum))
+  end
+  return _qzmod_launder_anns_3d(out_handles)
+end
+
+## Phase 1.4.c.2.b — typecheck launderer. Quartz tolerates a single-level
+## Vec element-type mismatch at function-call boundaries (per
+## `typecheck.qz`'s AST-path: passing `Vec<Vec<String>>` into a
+## `tc_register_enum` parameter declared `Vec<String>` typechecks
+## cleanly). Calling this with a `Vec<Int>` whose elements are
+## `as_int`-cast Vec<Vec<String>> handles binds the typecheck-tracked
+## return type to `Vec<Vec<String>>` while leaving the heap object
+## untouched.
+def _qzmod_launder_anns_3d(v: Vec<Vec<String>>): Vec<Vec<String>>
+  return v
+end
+
+## Compare two `Vec<String>` for elementwise equality. The dep-iface-hash
+## check uses this. Returns 1 on match, 0 on any mismatch.
+def _qzmod_strvec_eq(a: Vec<String>, b: Vec<String>): Int
+  if a.size != b.size
+    return 0
+  end
+  for i in 0..a.size
+    if not str_eq(a[i], b[i])
+      return 0
+    end
+  end
+  return 1
+end
+
+# =============================================================================
+# Public entry point
+# =============================================================================
+
+## Load a `.qzmod` directory. Returns a QzmodLoadResult; check `ok` first.
+##
+## Parameters:
+##   module_dir              — absolute directory path; usually
+##                             `qzmod_module_dir(...)` from the resolver.
+##   module_name             — canonical module name; copied into result.
+##   expected_compiler_hash  — running compiler's binary hash; usually
+##                             `qzmod_compiler_hash()` from caller.
+##   expected_source_hash    — `content_hash` of caller's view of the
+##                             module's current source bytes.
+##   expected_flags_hash     — `content_hash` of the active compile flags
+##                             (target, debug, no_opt, overflow). Usually
+##                             `qzmod_active_flags_hash()` from caller. Empty
+##                             string means "skip flags gate" (legacy / test
+##                             driver). Without this gate a native compile's
+##                             cache hides Windows `@cfg` overloads on a
+##                             follow-on cross-compile — see
+##                             `feedback_cold_cache_def_body_not_emitted`.
+##   expected_dep_iface_hashes — caller's view of each dep's output_hash.
+##                               Parallel ordering to dep names emitted at
+##                               write time. Order-sensitive (encoder writes
+##                               in caller-provided order; loader compares
+##                               positionally).
+def qzmod_load_module(
+  module_dir: String,
+  module_name: String,
+  expected_compiler_hash: String,
+  expected_source_hash: String,
+  expected_flags_hash: String,
+  expected_dep_iface_hashes: Vec<String>
+): QzmodLoadResult
+  # --- 0. Sanity: directory parameter ---
+  if str_byte_len(module_dir) == 0
+    return qzmod_load_miss("module_dir empty", module_name)
+  end
+
+  # --- 1. Header file exists ---
+  var header_path = qzmod_format::qzmod_header_path(module_dir)
+  if not fio_exists(header_path)
+    return qzmod_load_miss("header.txt absent", module_name)
+  end
+
+  # --- 2. Header parses cleanly ---
+  var header_content = fio_read(header_path)
+  var hdr = qzmod_format::qzmod_header_parse(header_content)
+  if hdr.is_valid == 0
+    return qzmod_load_miss("header parse failed (wrong magic / version / structure)", module_name)
+  end
+
+  # --- 3. Compiler hash matches running binary ---
+  if not str_eq(hdr.compiler_hash, expected_compiler_hash)
+    return qzmod_load_miss("compiler_hash mismatch (binary changed since emit)", module_name)
+  end
+
+  # --- 4. Source hash matches caller's view of source ---
+  if not str_eq(hdr.source_hash, expected_source_hash)
+    return qzmod_load_miss("source_hash mismatch (source edited)", module_name)
+  end
+
+  # --- 5. Compile flags hash matches caller's view ---
+  # Empty `expected_flags_hash` is the opt-out (legacy callers / tests that
+  # don't thread compile flags). Non-empty: must match the header verbatim;
+  # mismatch means the cache was produced under different target / debug /
+  # noopt / overflow flags and its MIR likely contains the wrong `@cfg`
+  # overloads or wrong debug-info gates.
+  if str_byte_len(expected_flags_hash) > 0
+    if not str_eq(hdr.flags_hash, expected_flags_hash)
+      return qzmod_load_miss("flags_hash mismatch (target/debug/noopt/overflow changed since emit)", module_name)
+    end
+  end
+
+  # --- 6. Dep interface hashes match caller's view ---
+  if _qzmod_strvec_eq(hdr.dep_iface_hashes, expected_dep_iface_hashes) == 0
+    return qzmod_load_miss("dep_iface_hashes mismatch (transitive dep ABI changed)", module_name)
+  end
+
+  # --- 7. Integrity: recompute output_hash, compare to header ---
+  # This is the torn-write / corruption / tamper detector. Per design § 4.2
+  # output_hash is the FNV-1a over every section .bin file's contents in
+  # canonical order. Reproducing it from disk and comparing to what the
+  # header claims rules out the cases where (a) writes were interrupted,
+  # (b) a .bin file was edited by hand, (c) disk corruption mangled bytes.
+  var recomputed = qzmod_format::qzmod_compute_output_hash(module_dir)
+  if not str_eq(recomputed, hdr.output_hash)
+    return qzmod_load_miss("output_hash mismatch (torn write or corrupted cache)", module_name)
+  end
+
+  # All gates passed — decode the section files into the result struct.
+  return _qzmod_load_decode_sections(module_dir, module_name)
+end
+
+## Decode every section into the result. Caller has already validated the
+## header; this function trusts that the on-disk files match the encoder's
+## contract. Absent files become empty section vecs (per § 4.2 — absent =
+## section omitted, encoder skips empty sections).
+def _qzmod_load_decode_sections(module_dir: String, module_name: String): QzmodLoadResult
+  # --- Strings pool: single source of truth for name resolution.
+  var strings = _qzmod_load_strvec_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_strings()))
+
+  # --- Funcs
+  var func_name_idx = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_funcs_name()))
+  var func_names = _qzmod_resolve_names(func_name_idx, strings)
+  var func_sig_blob = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_funcs_sig_blob()))
+  var func_sig_off = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_funcs_sig_off()))
+
+  # Phase 1.4.c.3 — per-function effect rows. State file absent means
+  # all funcs untracked (zero-filled vec parallel to func_names);
+  # the encoder skips writing it when every slot is 0. Labels blob/off
+  # always present when funcs are (2-D layout; per-func entry is a
+  # zero-length list for untracked entries — preserves parallel-array
+  # invariant with `func_names`).
+  var func_effect_state = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_funcs_effect_state()))
+  if func_effect_state.size == 0 and func_names.size > 0
+    for _i in 0..func_names.size
+      func_effect_state.push(0)
+    end
+  end
+  var func_effect_labels_blob = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_funcs_effect_labels_blob()))
+  var func_effect_labels_off  = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_funcs_effect_labels_off()))
+  var func_effect_labels = _qzmod_load_anns_2d(func_effect_labels_blob, func_effect_labels_off, strings)
+
+  # Phase 1.4.c.3 — per-function string annotations. Absent files
+  # decode as empty vecs; consumers fall through to default
+  # ("") behavior in `tc_inject_qzmod` Step 7.
+  var func_return_annotations = _qzmod_load_strvec_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_funcs_return_annotations()))
+  var func_param_annotations = _qzmod_load_strvec_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_funcs_param_annotations()))
+  var func_param_names = _qzmod_load_strvec_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_funcs_param_names()))
+  var func_type_params = _qzmod_load_strvec_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_funcs_type_params()))
+  var func_type_param_bounds = _qzmod_load_strvec_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_funcs_type_param_bounds()))
+  var func_param_fn_anns = _qzmod_load_strvec_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_funcs_param_fn_anns()))
+  # Unpack starts+counts from packed [starts...counts...] layout.
+  var fn_anns_off_packed = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_funcs_param_fn_anns_off()))
+  var func_param_fn_anns_starts = vec_new<Int>()
+  var func_param_fn_anns_counts = vec_new<Int>()
+  var _half = fn_anns_off_packed.size / 2
+  for _si in 0.._half
+    func_param_fn_anns_starts.push(fn_anns_off_packed[_si])
+  end
+  for _ci in 0.._half
+    func_param_fn_anns_counts.push(fn_anns_off_packed[_half + _ci])
+  end
+
+  # --- Structs
+  var struct_name_idx = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_structs_name()))
+  var struct_names = _qzmod_resolve_names(struct_name_idx, strings)
+  var struct_fields_blob = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_structs_fields_blob()))
+  var struct_fields_off = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_structs_fields_off()))
+
+  # --- Enums
+  var enum_name_idx = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_enums_name()))
+  var enum_names = _qzmod_resolve_names(enum_name_idx, strings)
+  var enum_variants_blob = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_enums_variants_blob()))
+  var enum_variants_off = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_enums_variants_off()))
+
+  # --- Traits
+  var trait_name_idx = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_traits_name()))
+  var trait_names = _qzmod_resolve_names(trait_name_idx, strings)
+  var trait_methods_blob = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_traits_methods_blob()))
+  var trait_methods_off = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_traits_methods_off()))
+
+  # --- Impls (Phase 1.4.d — variable-stride-ready) ---
+  var impls_blob = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_impls_blob()))
+  var impls_off  = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_impls_off()))
+
+  # --- Type aliases
+  var alias_name_idx = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_type_aliases_name()))
+  var alias_names = _qzmod_resolve_names(alias_name_idx, strings)
+  var alias_target_idx = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_type_aliases_target()))
+  var alias_targets = _qzmod_resolve_names(alias_target_idx, strings)
+
+  # --- Newtypes
+  var newtype_name_idx = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_newtypes_name()))
+  var newtype_names = _qzmod_resolve_names(newtype_name_idx, strings)
+  var newtype_wrapped_idx = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_newtypes_wrapped()))
+  var newtype_wrapped = _qzmod_resolve_names(newtype_wrapped_idx, strings)
+  # INC.1.9 — producer-global newtype type IDs, parallel to newtype_names.
+  var newtype_type_ids = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_newtypes_type_id()))
+  # STRICT_NEWTYPES_QZMOD — per-newtype `@strict` flag, parallel to
+  # newtype_names. Empty when older `.qzmod` or module had no strict
+  # newtypes — consumer defaults missing slots to 0 (loose) on remap.
+  var newtype_strict_flags = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_newtypes_strict()))
+
+  # --- Effects
+  var effect_name_idx = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_effects_name()))
+  var effect_names = _qzmod_resolve_names(effect_name_idx, strings)
+  var effect_ops_blob = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_effects_ops_blob()))
+  var effect_ops_off = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_effects_ops_off()))
+
+  # --- Consts / globals (names-only in Phase 1.1; types are 0-padded)
+  var const_name_idx = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_consts_name()))
+  var const_names = _qzmod_resolve_names(const_name_idx, strings)
+  var const_types = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_consts_type()))
+
+  var global_name_idx = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_globals_name()))
+  var global_names = _qzmod_resolve_names(global_name_idx, strings)
+  var global_types = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_globals_type()))
+
+  # --- TYPES section (Phase 1.4.a) — raw ptype arena, inject's job to
+  # walk + remap.
+  var types_tag  = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_types_tag()))
+  var types_arg1 = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_types_arg1()))
+  var types_arg2 = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_types_arg2()))
+
+  # --- Per-ptype identity + fn_type annotations (Phase 1.4.b.1)
+  var ptype_names         = _qzmod_load_strvec_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_types_names()))
+  var fn_type_annotations = _qzmod_load_strvec_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_fn_type_annotations()))
+
+  # --- Union / record structural-signature tables (D3). Absent on disk for
+  # pre-D3 caches or modules with no cross-module structural value → empty
+  # vecs → `tc_inject_qzmod` leaves the band advisory-miss (pre-D3 behavior).
+  var union_sig_ids     = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_union_sig_ids()))
+  var union_sig_members = _qzmod_load_strvec_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_union_sig_members()))
+  var record_sig_ids    = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_record_sig_ids()))
+  var record_sig_blob   = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_record_sig_blob()))
+  var record_sig_off    = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_record_sig_off()))
+
+  # --- Generic / sub-trait / annotation enrichment (Phase 1.4.c.0)
+  var struct_type_params = _qzmod_load_strvec_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_structs_type_params()))
+  var enum_type_params   = _qzmod_load_strvec_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_enums_type_params()))
+  var trait_type_params  = _qzmod_load_strvec_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_traits_type_params()))
+  var trait_super_traits = _qzmod_load_strvec_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_traits_super_traits()))
+
+  var sfa_blob = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_structs_field_anns_blob()))
+  var sfa_off  = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_structs_field_anns_off()))
+  var struct_field_annotations = _qzmod_load_anns_2d(sfa_blob, sfa_off, strings)
+
+  var eva_blob = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_enums_variant_anns_blob()))
+  var eva_off  = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_enums_variant_anns_off()))
+  # Phase 1.4.c.2.b — 3-D shape: per-enum × per-variant × per-payload-field.
+  # Built up via the inject helper `_qzmod_build_enum_variant_anns` so the
+  # struct-literal init can pin the inferred outer-Vec type to 2-D (the
+  # helper's declared return type is Vec<Vec<String>>, masking the
+  # actual 3-D heap shape — same lenient-arg trick the AST-path uses
+  # when passing Vec<Vec<String>> as a Vec<String> parameter to
+  # tc_register_enum).
+  var enum_variant_field_annotations = _qzmod_build_enum_variant_anns(eva_blob, eva_off, strings)
+
+  # --- MIR bodies (INC.1.2 producer / INC.1.3 consumer) ---
+  # Three parallel files; absent on disk when the module shipped no
+  # bodies (synthetic / constant-only). Decoder reads raw; unpickle
+  # is deferred to `qzmod_load_mir_bodies` so loads stay cheap when
+  # the caller (e.g. just probing for an interface-only inject) won't
+  # use them.
+  var mir_bodies_blob = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_mir_bodies()))
+  var mir_bodies_off  = _qzmod_load_int_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_mir_bodies_off()))
+  var mir_bodies_name = _qzmod_load_strvec_or_empty(qzmod_format::qzmod_section_path(module_dir, qzmod_format::qzmod_file_mir_bodies_name()))
+
+  return QzmodLoadResult {
+    ok: 1,
+    error_reason: "",
+    module_name: module_name,
+    strings: strings,
+    func_names: func_names,
+    func_sig_blob: func_sig_blob,
+    func_sig_off: func_sig_off,
+    func_effect_state: func_effect_state,
+    func_effect_labels: func_effect_labels,
+    func_return_annotations: func_return_annotations,
+    func_param_annotations: func_param_annotations,
+    func_param_names: func_param_names,
+    func_type_params: func_type_params,
+    func_type_param_bounds: func_type_param_bounds,
+    func_param_fn_anns: func_param_fn_anns,
+    func_param_fn_anns_starts: func_param_fn_anns_starts,
+    func_param_fn_anns_counts: func_param_fn_anns_counts,
+    struct_names: struct_names,
+    struct_fields_blob: struct_fields_blob,
+    struct_fields_off: struct_fields_off,
+    enum_names: enum_names,
+    enum_variants_blob: enum_variants_blob,
+    enum_variants_off: enum_variants_off,
+    trait_names: trait_names,
+    trait_methods_blob: trait_methods_blob,
+    trait_methods_off: trait_methods_off,
+    impls_blob: impls_blob,
+    impls_off: impls_off,
+    type_alias_names: alias_names,
+    type_alias_targets: alias_targets,
+    newtype_names: newtype_names,
+    newtype_wrapped: newtype_wrapped,
+    newtype_type_ids: newtype_type_ids,
+    newtype_strict_flags: newtype_strict_flags,
+    effect_names: effect_names,
+    effect_ops_blob: effect_ops_blob,
+    effect_ops_off: effect_ops_off,
+    const_names: const_names,
+    const_types: const_types,
+    global_names: global_names,
+    global_types: global_types,
+    types_tag: types_tag,
+    types_arg1: types_arg1,
+    types_arg2: types_arg2,
+    ptype_names: ptype_names,
+    fn_type_annotations: fn_type_annotations,
+    union_sig_ids: union_sig_ids,
+    union_sig_members: union_sig_members,
+    record_sig_ids: record_sig_ids,
+    record_sig_blob: record_sig_blob,
+    record_sig_off: record_sig_off,
+    struct_type_params: struct_type_params,
+    enum_type_params: enum_type_params,
+    trait_type_params: trait_type_params,
+    trait_super_traits: trait_super_traits,
+    struct_field_annotations: struct_field_annotations,
+    enum_variant_field_annotations: enum_variant_field_annotations,
+    mir_bodies_blob: mir_bodies_blob,
+    mir_bodies_off: mir_bodies_off,
+    mir_bodies_name: mir_bodies_name,
+  }
+end
+
+
+# =============================================================================
+# MIR Body Unpickling — INC.1.1 (`.qzmod` MIR_BODIES section primitive).
+# =============================================================================
+#
+# Reverse of `mir_pickle_function` in `qzmod_emit.qz`. Consumer integration
+# (INC.1.3) will call `mir_unpickle_function` per per-function start offset
+# loaded from `mir_bodies_off.bin`, reading from `mir_bodies.bin` and using
+# the same `strings.bin` pool the rest of the qzmod sections share. INC.1.1
+# is the primitive only — no consumer integration yet.
+#
+# Per design Principle #6 (advisory cache): every structural fault — out-
+# of-bounds blob read, out-of-bounds pool index, malformed instr record —
+# returns `None`. The caller falls back to MIR-lowering from source for
+# that function. NO panics, NO exit() calls.
+
+## Cursor state for streaming a `Vec<Int>` blob. Read helpers advance
+## `off`; out-of-bounds reads flip `ok` to 0, after which subsequent reads
+## are no-ops returning 0. Callers check `ok` at section boundaries rather
+## than after every primitive read.
+struct _MirUnpickleCursor
+  blob: Vec<Int>
+  strings: Vec<String>
+  off: Int
+  ok: Int
+end
+
+def _mc_read(cur: _MirUnpickleCursor): Int
+  if cur.ok == 0
+    return 0
+  end
+  if cur.off >= cur.blob.size
+    cur.ok = 0
+    return 0
+  end
+  var v = cur.blob[cur.off]
+  cur.off = cur.off + 1
+  return v
+end
+
+## Decode a string-typed instr operand (pool_idx + 1 → as_int(s); 0 → 0).
+## Returns 0 on absent / corruption (and flips `cur.ok = 0` in the
+## corruption case).
+def _mc_decode_string_slot(cur: _MirUnpickleCursor): Int
+  var enc = _mc_read(cur)
+  if cur.ok == 0
+    return 0
+  end
+  if enc == 0
+    return 0
+  end
+  var idx = enc - 1
+  if idx < 0 or idx >= cur.strings.size
+    cur.ok = 0
+    return 0
+  end
+  return as_int(cur.strings[idx])
+end
+
+## Decode a pool-indexed plain string (for func/param/local NAMES that
+## are stored as String in MirFunc fields, not as as_int handles).
+def _mc_decode_pool_string(cur: _MirUnpickleCursor): String
+  var idx = _mc_read(cur)
+  if cur.ok == 0
+    return ""
+  end
+  if idx < 0 or idx >= cur.strings.size
+    cur.ok = 0
+    return ""
+  end
+  return cur.strings[idx]
+end
+
+## Unpickle one MirInstr from the cursor. Mirrors `_mir_pickle_instr` in
+## qzmod_emit.qz (§4.1 layout).
+def _mir_unpickle_instr(cur: _MirUnpickleCursor): MirInstr
+  var kind = _mc_read(cur)
+  var dest_id = _mc_read(cur)
+  var dest_type = _mc_read(cur)
+  var instr = mir::mir_new_instr(kind, dest_id, dest_type)
+  var mask = mir::mir_kind_string_mask(kind)
+
+  if (mask & mir::MIR_KIND_OP1_STR) != 0
+    instr.operand1 = _mc_decode_string_slot(cur)
+  else
+    instr.operand1 = _mc_read(cur)
+  end
+  if (mask & mir::MIR_KIND_OP2_STR) != 0
+    instr.operand2 = _mc_decode_string_slot(cur)
+  else
+    instr.operand2 = _mc_read(cur)
+  end
+  if (mask & mir::MIR_KIND_OP_STR) != 0
+    instr.op = _mc_decode_string_slot(cur)
+  else
+    instr.op = _mc_read(cur)
+  end
+
+  var n_args = _mc_read(cur)
+  var args = vec_new<Int>()
+  var args_are_strings = (mask & mir::MIR_KIND_ARGS_STR) != 0
+  for ai in 0..n_args
+    if args_are_strings
+      args.push(_mc_decode_string_slot(cur))
+    else
+      args.push(_mc_read(cur))
+    end
+  end
+  instr.args = args
+
+  if (mask & mir::MIR_KIND_SLOT1_STR) != 0
+    instr.slot1 = _mc_decode_string_slot(cur)
+  else
+    instr.slot1 = _mc_read(cur)
+  end
+  if (mask & mir::MIR_KIND_SLOT2_STR) != 0
+    instr.slot2 = _mc_decode_string_slot(cur)
+  else
+    instr.slot2 = _mc_read(cur)
+  end
+  instr.line = _mc_read(cur)
+  instr.col = _mc_read(cur)
+  return instr
+end
+
+## Unpickle one MirBlock from the cursor. Mirrors `_mir_pickle_block`.
+def _mir_unpickle_block(cur: _MirUnpickleCursor): MirBlock
+  var label = _mc_decode_pool_string(cur)
+  var block = mir::mir_new_block(label)
+  var n_instr = _mc_read(cur)
+  if cur.ok == 0
+    return block
+  end
+  for ii in 0..n_instr
+    var instr = _mir_unpickle_instr(cur)
+    if cur.ok == 0
+      return block
+    end
+    block.instructions.push(instr)
+  end
+  block.term_kind = _mc_read(cur)
+  block.term_data = _mc_read(cur)
+  block.branch_true = _mc_read(cur)
+  block.branch_false = _mc_read(cur)
+  block.terminated = _mc_read(cur)
+  return block
+end
+
+## Unpickle one MirFunc from `blob` starting at byte offset `off`, using
+## `strings` as the on-disk pool. Returns `Some(func)` on success; `None`
+## on any structural fault. The caller is expected to track per-function
+## start offsets from `mir_bodies_off.bin` (INC.1.3 producer/consumer
+## integration); INC.1.1 only ships the primitive.
+##
+## Layout per `docs/design/QZMOD_MIR_BODIES.md` §4.1; mirrors
+## `mir_pickle_function` in `qzmod_emit.qz`.
+def mir_unpickle_function(blob: Vec<Int>, off: Int, strings: Vec<String>): Option<MirFunc>
+  var cur = _MirUnpickleCursor {
+    blob: blob,
+    strings: strings,
+    off: off,
+    ok: 1
+  }
+
+  var name = _mc_decode_pool_string(cur)
+  var origin_module = _mc_decode_pool_string(cur)
+  var return_type = _mc_read(cur)
+  if cur.ok == 0
+    return option_none()
+  end
+
+  var func = mir::mir_new_function(name, return_type)
+  mir::mir_func_set_origin_module(func, origin_module)
+
+  var n_params = _mc_read(cur)
+  if cur.ok == 0
+    return option_none()
+  end
+  var param_names = vec_new<String>()
+  for pi in 0..n_params
+    param_names.push(_mc_decode_pool_string(cur))
+  end
+  var param_types = vec_new<Int>()
+  for pi in 0..n_params
+    param_types.push(_mc_read(cur))
+  end
+  var param_anns = vec_new<String>()
+  for pi in 0..n_params
+    param_anns.push(_mc_decode_pool_string(cur))
+  end
+  if cur.ok == 0
+    return option_none()
+  end
+  for pi in 0..n_params
+    func.params.push(param_names[pi])
+    func.param_types.push(param_types[pi])
+    func.param_type_names.push(param_anns[pi])
+  end
+
+  func.return_type_name = _mc_decode_pool_string(cur)
+
+  var n_locals = _mc_read(cur)
+  if cur.ok == 0
+    return option_none()
+  end
+  for li in 0..n_locals
+    func.locals.push(_mc_decode_pool_string(cur))
+  end
+
+  var n_narrow = _mc_read(cur)
+  if cur.ok == 0
+    return option_none()
+  end
+  var narrow_names = vec_new<String>()
+  for li in 0..n_narrow
+    narrow_names.push(_mc_decode_pool_string(cur))
+  end
+  for li in 0..n_narrow
+    var nt = _mc_decode_pool_string(cur)
+    func.local_narrow_names.push(narrow_names[li])
+    func.local_narrow_types.push(nt)
+  end
+  if cur.ok == 0
+    return option_none()
+  end
+
+  var flags = _mc_read(cur)
+  func.is_naked = flags % 2
+  func.is_no_preempt = (flags / 2) % 2
+  func.is_weak = (flags / 4) % 2
+  func.is_export = (flags / 8) % 2
+  func.is_noinline = (flags / 16) % 2
+  # item 20 P1 — bit 5: direct-self-field-mutation marker.
+  func.mutates_self_field = (flags / 32) % 2
+  # item 38 — bit 6: associated-fn phantom-self marker.
+  func.assoc_phantom_self = (flags / 64) % 2
+
+  # INC.1.3 block-ref fix: entry is an index into the about-to-be-loaded
+  # blocks vec; fix-up pass below replaces it with the live MirBlock ptr.
+  var entry_idx = _mc_read(cur)
+  func.value_counter = _mc_read(cur)
+  func.block_counter = _mc_read(cur)
+  func.line = _mc_read(cur)
+  func.col = _mc_read(cur)
+  if cur.ok == 0
+    return option_none()
+  end
+
+  var n_blocks = _mc_read(cur)
+  if cur.ok == 0
+    return option_none()
+  end
+  for bi in 0..n_blocks
+    var block = _mir_unpickle_block(cur)
+    if cur.ok == 0
+      return option_none()
+    end
+    func.blocks.push(block)
+  end
+
+  # INC.1.3 block-ref fix-up pass — translate stored indices back to live
+  # MirBlock heap pointers now that every block in the func has been
+  # allocated. Indices < 0 (sentinel for "not set") become 0 (matches
+  # `mir_new_block`'s default for branch_true/branch_false). Uses
+  # accessor helpers consistently so Vec<Int> element handles get
+  # struct-typed at the function-arg boundary — `var x: T = vec[i]`
+  # field access doesn't always resolve through `Vec<Int>` element type.
+  func.entry = _fixup_block_ref(func.blocks, entry_idx)
+  for bi in 0..n_blocks
+    var block: MirBlock = func.blocks[bi]
+    if mir::mir_block_get_term_kind(block) == mir::TERM_JUMP
+      mir::mir_block_set_term_data(block, _fixup_block_ref(func.blocks, mir::mir_block_get_term_data(block)))
+    end
+    mir::mir_block_set_branch_true(block, _fixup_block_ref(func.blocks, mir::mir_block_get_branch_true(block)))
+    mir::mir_block_set_branch_false(block, _fixup_block_ref(func.blocks, mir::mir_block_get_branch_false(block)))
+    var instrs = mir::mir_block_get_instructions(block)
+    for ii in 0..instrs.size
+      var instr_handle = instrs[ii]
+      var kind = mir::mir_instr_get_kind(instr_handle)
+      if kind == mir::MIR_PHI
+        var s1 = mir::mir_instr_get_slot1(instr_handle)
+        var s2 = mir::mir_instr_get_slot2(instr_handle)
+        mir::mir_instr_set_slot1(instr_handle, _fixup_block_ref(func.blocks, s1))
+        mir::mir_instr_set_slot2(instr_handle, _fixup_block_ref(func.blocks, s2))
+      end
+    end
+  end
+
+  return option_some(func)
+end
+
+## Resolve a block-ref index (as written by `_mir_pickle_block_ref`) back
+## to its consumer-side MirBlock heap pointer. `-1` (sentinel for unset /
+## stale) decodes to `0`, which matches `mir_new_block`'s default for
+## branch_true / branch_false fields.
+def _fixup_block_ref(blocks: Vec<mir::MirBlock>, idx: Int): mir::MirBlock
+  if idx < 0
+    return 0
+  end
+  if idx >= blocks.size
+    return 0
+  end
+  return blocks[idx]
+end
+
+# =============================================================================
+# MIR Bodies — INC.1.3 consumer integration entry point.
+# =============================================================================
+#
+# Walk a loaded module's `mir_bodies_off` + `mir_bodies_name` parallel arrays,
+# unpickling each non-sentinel slot into a `MirFunc`. Sentinel slots (offset
+# == -1, from producer-side `input.mir_funcs[i] == 0`) are skipped — the
+# consumer falls back to live MIR lowering for those functions per
+# Principle #6 (advisory cache).
+#
+# Decode-level corruption (mir_unpickle_function returns None) is also
+# treated as a skip; the rest of the section continues to unpickle. A
+# bad slot doesn't poison the module.
+def qzmod_load_mir_bodies(result: QzmodLoadResult): Vec<MirFunc>
+  var out = vec_new<MirFunc>()
+  for i in 0..result.mir_bodies_off.size
+    var off = result.mir_bodies_off[i]
+    if off >= 0
+      var maybe = mir_unpickle_function(result.mir_bodies_blob, off, result.strings)
+      if maybe.some?
+        var func: MirFunc = maybe.unwrap()
+        out.push(func)
+      end
+    end
+  end
+  return out
+end

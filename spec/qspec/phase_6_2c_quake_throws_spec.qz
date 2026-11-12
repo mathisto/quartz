@@ -1,0 +1,204 @@
+## Phase 6.2.c — Quake Throws + BuildError + --keep-going acceptance spec.
+##
+## Operation Piezoelectric Effects, Phase 6 (user-tool dogfooding),
+## subphase 6.2.c.
+##
+## Validates the migration of std/quake.qz's `_quake_fail() → exit(1)`
+## fatal-error path to `throw(msg)` routed through std/throws's
+## algebraic effect. Adds a typed `enum BuildError` for structured
+## error construction at high-value sites (sh failure, task lookup),
+## and a `--keep-going`/`-k` launcher flag that wraps each task action
+## in a per-task collect Throws handler so a single task's throw
+## doesn't abort the run.
+##
+## Migration semantics:
+## - `enum BuildError { CommandFailed(cmd, exit_code), TaskNotFound(name),
+##   AssertionFailed(msg), IOError(path, msg) }` documents the variants
+##   the migration site emits today. New variants land here as more
+##   call sites move from `_quake_fail(stringly-typed)` to typed.
+## - `fail_typed(err)` formats via `_build_error_to_string` and calls
+##   `throw(msg)` on std/throws. `fail(msg)` and `_quake_fail(msg)`
+##   both wrap as `BuildError::AssertionFailed(msg)` for backwards
+##   compat with the ~17 existing call sites.
+## - `quake_main()` installs `with Throws { throw: _quake_throws_print_and_exit }`
+##   at outer scope (preserves pre-6.2.c "✗ FAILED + exit 1" UX). When
+##   `--keep-going` is passed, `_execute_task` wraps each `call_fn(action)`
+##   in `with Throws { throw: _quake_throws_collect }` instead, which
+##   shadows the outer handler for the duration of the task action.
+## - The collect handler pushes msg to `_quake_collected_errors` (a
+##   module global, reset per quake_main run) and prints a non-fatal
+##   yellow "⚠ task failed: <msg>" header. After all tasks finish,
+##   `quake_main` prints a summary of collected errors and exits 1.
+##
+## What this spec covers:
+## - Module-shape sanity: BuildError enum + Throws import compose cleanly.
+## - `fail(msg)` routes through std/throws — `with Throws { throw: cap }`
+##   captures the formatted message.
+## - `fail_typed(BuildError::CommandFailed(cmd, code))` routes the
+##   stringified form through Throws — caller asserts on the captured
+##   format (`Command failed (exit N): cmd`).
+## - `fail_typed(BuildError::TaskNotFound(name))` formats correctly
+##   (`Unknown task: name`).
+## - `sh()` failure under default Exec handler routes through Throws
+##   end-to-end — capture handler sees the CommandFailed message.
+## - `_quake_throws_collect` handler accumulates throws into
+##   `_quake_collected_errors` and resumes the with-block.
+##
+## What this spec does NOT cover (filed for follow-on):
+## - End-to-end via real `quake` binary `--keep-going` flag: same
+##   subprocess-args limitation as 6.2.a. Smoke-tested manually at
+##   migration time (see commit message).
+## - Stdout/stderr interleaving in the --keep-going summary: stdio
+##   line buffering means task-action `puts(...)` may print AFTER the
+##   summary banner. Cosmetic; covered by the manual smoke test.
+## - Distinguishing variants on the receive side: the collect handler
+##   only sees stringified BuildError (because std/throws's `throw`
+##   takes a String). A future `BuildErrors` typed effect would let
+##   handlers decode variants and aggregate by kind. Filed as a
+##   Phase 7+ ergonomics improvement.
+
+import * from qspec
+import * from qspec/subprocess
+
+def main(): Int
+  describe("quake Throws migration + --keep-going (Phase 6.2.c)") do ->
+
+    it("std/quake compiles with std/throws + BuildError enum") do ->
+      assert_run_exits("""
+import * from quake
+
+def main(): Int
+  return 0
+end
+""", 0)
+    end
+
+    it("fail(msg) routes through std/throws — capture handler intercepts") do ->
+      # The headline migration test: the legacy `_quake_fail(msg) →
+      # exit(1)` is replaced with `throw(msg)`. A `with Throws { throw:
+      # cap } do -> fail("...") end` install captures the message
+      # without aborting. Pre-6.2.c, calling `fail(...)` would have
+      # exited the process with code 1, which assert_run_stdout_eq
+      # would observe as "Failed to compile/run".
+      assert_run_stdout_eq("""
+import * from quake
+
+def cap(op_name: Int, argc: Int, argv: Int): Int
+  puts("CAPTURED: " + as_string(load(argv, 0)))
+  return 1
+end
+
+def main(): Int
+  with Throws { throw: cap } do ->
+    fail("oh no")
+  end
+  return 0
+end
+""", "CAPTURED: oh no\n")
+    end
+
+    it("fail_typed(BuildError::CommandFailed) formats and throws") do ->
+      assert_run_stdout_eq("""
+import * from quake
+
+def cap(op_name: Int, argc: Int, argv: Int): Int
+  puts("CAUGHT: " + as_string(load(argv, 0)))
+  return 1
+end
+
+def main(): Int
+  with Throws { throw: cap } do ->
+    fail_typed(BuildError::CommandFailed("clang -O2 foo.c", 134))
+  end
+  return 0
+end
+""", "CAUGHT: Command failed (exit 134): clang -O2 foo.c\n")
+    end
+
+    it("fail_typed(BuildError::TaskNotFound) formats correctly") do ->
+      assert_run_stdout_eq("""
+import * from quake
+
+def cap(op_name: Int, argc: Int, argv: Int): Int
+  puts("CAUGHT: " + as_string(load(argv, 0)))
+  return 1
+end
+
+def main(): Int
+  with Throws { throw: cap } do ->
+    fail_typed(BuildError::TaskNotFound("nope"))
+  end
+  return 0
+end
+""", "CAUGHT: Unknown task: nope\n")
+    end
+
+    it("sh() failure under default Exec handler routes through Throws") do ->
+      # The full effect stack: Reader + Log + Throws + Exec all
+      # installed; sh("false") fails → default_exec_handler returns
+      # ExecResult { exit_code: 256, ... } → sh() calls fail_typed →
+      # throws → outer Throws capture handler sees the formatted msg.
+      # Confirms that the 6.2.b Exec migration + 6.2.c Throws
+      # migration compose end-to-end through the actual sh() public API.
+      assert_run_stdout_eq("""
+import * from quake
+
+def cap(op_name: Int, argc: Int, argv: Int): Int
+  puts("CAUGHT: " + as_string(load(argv, 0)))
+  return 1
+end
+
+def main(): Int
+  with Reader(0) do ->
+    with Log { emit: _quake_log_stdout } do ->
+      with Throws { throw: cap } do ->
+        with Exec { exec: default_exec_handler } do ->
+          var _r = sh("false")
+        end
+      end
+    end
+  end
+  return 0
+end
+""", "CAUGHT: Command failed (exit 256): false\n")
+    end
+
+    it("multiple throws under collect handler accumulate (--keep-going core)") do ->
+      # Demonstrates the kind=2 unwind semantics + per-block resume:
+      # a single `with Throws { throw: cap } do -> ... end` block
+      # captures one throw, resumes (with-block evaluates to handler
+      # return), control returns to caller. Doing this twice in
+      # sequence catches two errors. This is what _execute_task does
+      # under --keep-going: each task action gets its own collect
+      # wrap, so each task's first throw is captured and the next
+      # task runs.
+      assert_run_stdout_eq("""
+import * from quake
+
+var _accum = vec_new<String>()
+
+def cap(op_name: Int, argc: Int, argv: Int): Int
+  _accum.push(as_string(load(argv, 0)))
+  return 1
+end
+
+def main(): Int
+  var _wb1 = with Throws { throw: cap } do ->
+    fail("first")
+    return 0
+  end
+  var _wb2 = with Throws { throw: cap } do ->
+    fail("second")
+    return 0
+  end
+  for msg in _accum
+    puts(msg)
+  end
+  return 0
+end
+""", "first\nsecond\n")
+    end
+
+  end
+  return qspec_main()
+end

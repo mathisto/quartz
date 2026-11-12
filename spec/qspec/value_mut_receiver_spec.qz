@@ -1,0 +1,317 @@
+import * from qspec
+
+# item 20 P1 — mutating value-struct receivers persist their `self.<field>` write.
+#
+# Two coupled compiler changes make a mutating `@value` method observable by the
+# caller:
+#   1. DECOMPOSE EXCLUSION (mir.qz): a value-struct method whose body stores to
+#      `self.<field>` keeps its `self` param a single construct-buffer pointer
+#      (NOT register-decomposed into scalar fields rebuilt into a callee-local
+#      copy). Generalizes the 14A `$next`-only exclusion. The `mutates_self_field`
+#      flag is computed on BOTH lowering paths (free `mir_lower_function` AND the
+#      method/extend `mir_lower_function_with_name`).
+#   2. CALL-SITE COPY ELISION (mir_lower_expr_handlers.qz): the RECEIVER argument
+#      of such a callee is passed by the caller's slot ADDRESS, skipping the
+#      alloca+memcpy value-copy, so the in-place mutation lands in the caller's
+#      live storage instead of a throwaway copy.
+#
+# REALITY (D5): at gate 0 the compiler uses zero `@value` structs, so both changes
+# are dead in self-host (guard is byte-identical). P1 scoped to the ≤16B NON-cow
+# value receiver.
+#
+# item 20 P2 — the >16B COW receiver. A >16B `@value` struct uses copy-on-write
+# layout ([refcount@word0, fields...], passed as a buffer pointer). For a BORROWED
+# mutating `self`, three CoW behaviors are suppressed together: (a) the call site
+# skips the retain (cow_rc_inc) and passes the caller's live buffer pointer; (b) the
+# callee does NOT register `self` droppable, so no scope-exit cow_release; (c) a
+# `self.field=` does NOT make-unique — it mutates the caller's buffer IN PLACE.
+# Retain-skip and release-skip move together (else rc imbalance → double-free/leak);
+# make-unique-skip is what lets the mutation persist (and prevents the item-21
+# iterator infinite-loop / mutation-loss). Gate-0-inert (cow-layout false off-flip).
+
+@value
+struct MVCounter
+  cur: Int
+  hi: Int
+end
+
+extend MVCounter
+  def bump(&mut self): Void
+    self.cur = self.cur + 1
+  end
+  def total(self): Int
+    return self.cur + self.hi
+  end
+end
+
+def mv_persists_method_call(): Void
+  var c = MVCounter { cur: 1, hi: 10 }
+  c.bump()
+  # the write to self.cur is observed by the caller's slot
+  print(c.cur.to_s())
+  print("\n")
+end
+
+def mv_persists_free_call(): Void
+  var c = MVCounter { cur: 0, hi: 0 }
+  bump(c)
+  bump(c)
+  print(c.cur.to_s())
+  print("\n")
+end
+
+def mv_readonly_unaffected(): Void
+  var c = MVCounter { cur: 3, hi: 4 }
+  var t = c.total()
+  print(t.to_s())
+  print("\n")
+  # the read-only value method observes both fields; the receiver is unchanged
+  print(c.cur.to_s())
+  print("\n")
+end
+
+def mv_temporary_receiver_ok(): Void
+  # a non-addressable temporary receiver: mutation is discarded (nothing to
+  # persist) but must not crash — its own fresh slot is passed.
+  MVCounter { cur: 9, hi: 9 }.bump()
+  print("ok\n")
+end
+
+# --- item 20 P2: >16B COW value receiver (3 Int fields = 24B → cow layout) ---
+
+@value
+struct MVBig
+  a: Int
+  b: Int
+  c: Int
+end
+
+extend MVBig
+  def bump(&mut self): Void
+    self.a = self.a + 1
+  end
+  def sum3(self): Int
+    return self.a + self.b + self.c
+  end
+end
+
+# A COW @value iterator: a mutating-self `next` that advances a cursor (item 21).
+@value
+struct MVIter
+  cursor: Int
+  limit: Int
+  pad: Int
+end
+
+extend MVIter
+  def step(&mut self): Option<Int>
+    if self.cursor >= self.limit
+      return option_none()
+    end
+    var v = self.cursor
+    self.cursor = self.cursor + 1
+    return option_some(v)
+  end
+end
+
+def mvbig_persists_method_call(): Void
+  # COW (>16B): the in-place mutation must persist across repeated method calls.
+  var c = MVBig { a: 0, b: 10, c: 20 }
+  c.bump()
+  c.bump()
+  c.bump()
+  print(c.a.to_s())
+  print("\n")
+end
+
+def mvbig_readonly_unaffected(): Void
+  # read-only COW method: receiver retained+released normally, not mutated.
+  var c = MVBig { a: 1, b: 2, c: 3 }
+  var t = c.sum3()
+  print(t.to_s())
+  print("\n")
+  print(c.a.to_s())
+  print("\n")
+end
+
+def mvbig_cow_iterator_advances(): Void
+  # item 21: a COW @value iterator's mutating `step` must advance the cursor in
+  # place across calls (previously summed 0 / hung / infinite-looped). Sum 0..4 = 10.
+  var c = MVIter { cursor: 0, limit: 5, pad: 99 }
+  var sum = 0
+  var done = 0
+  while done == 0
+    var r = c.step()
+    if r is Some(v)
+      sum = sum + v
+    else
+      done = 1
+    end
+  end
+  print(sum.to_s())
+  print("\n")
+end
+
+# --- item 22: ≤16B @value EAGER-COPY aliasing (mir_emit_value_copy field count) ---
+#
+# mir_emit_value_copy's ≤16B eager word-copy needs the struct's field count from
+# mir_ctx_struct_field_count, which does an EXACT (unresolved) registry match. For
+# a module-qualified registry key reached by a bare var-type name the lookup
+# returned -1 ⇒ the `n <= 0` guard SKIPPED the copy ⇒ the callee/RHS ALIASED the
+# caller's storage (§14.11.8 silent wrong-value). Fixed by resolving the name
+# (mir_resolve_struct_name) before the field-count lookup, mirroring the cow path.
+#
+# REALITY: in user code the registry key and the tracked var-type name come from
+# the SAME resolution machinery, so they stay consistent (both bare under
+# `import *`, both qualified under `import mod`) and a single-file spec can't force
+# the desync that yields -1. These tests therefore lock in the EAGER-COPY behavior
+# (copy actually happens, no aliasing) for a ≤16B @value struct across the assign
+# and free-call copy sites; the desync repro is documented + proven IR-inert in the
+# item-22 report. A 2-Int @value struct (16B) stays on the eager path (not cow).
+
+@value
+struct VPair
+  x: Int
+  y: Int
+end
+
+def vc_assign_copy_no_alias(): Void
+  # `var b = a` must produce an INDEPENDENT copy: mutating b leaves a untouched.
+  var a = VPair { x: 1, y: 2 }
+  var b = a
+  b.x = 999
+  print(a.x.to_s())
+  print("\n")
+  print(b.x.to_s())
+  print("\n")
+end
+
+def vc_take(p: VPair): Void
+  p.x = 777
+end
+
+def vc_freecall_copy_no_alias(): Void
+  # passing a ≤16B @value lvalue by value must copy: the callee's mutation of its
+  # param must NOT be visible to the caller.
+  var a = VPair { x: 5, y: 6 }
+  vc_take(a)
+  print(a.x.to_s())
+  print("\n")
+end
+
+# --- item 31b: >16B COW @value FIELD-ACCESS read passed as a by-value receiver ---
+#
+# A >16B cow `@value` struct read OUT of a field access (`holder.style`) and passed
+# as a BY-VALUE method receiver returns the bare cow buffer POINTER aliasing the
+# field's storage. The droppable read-only by-value receiver cow_releases at the
+# callee's scope exit; WITHOUT a matching caller cow_rc_inc retain that release
+# drops the shared buffer to rc 0 and FREES storage the field still aliases ⇒
+# double-free / UAF at teardown (the tui_viewport @value-Style SIGABRT, exit 134
+# under the default allocator). The call site now retains a cow field-access
+# receiver (mir_lower_expr_handlers.qz V2b NODE_FIELD_ACCESS branch), balancing the
+# callee's release. Exercised in a LOOP so a leaked-or-double-freed buffer compounds.
+# Gate-0-inert: the field-access retain is gated on mir_value_is_cow_layout, false
+# for every non-@value struct off-flip ⇒ self-build byte-identical.
+
+@value
+struct MVStyle
+  fg: Int
+  bg: Int
+  attrs: Int
+end
+
+# A by-value cow consumer of `self`. Routing the receiver THROUGH a second by-value
+# call (mirroring Style.render → _style_render) is what makes the receiver's `self`
+# a DROPPABLE cow param that cow_releases at scope exit — the release the caller's
+# field-access retain must balance. (A leaf method that never forwards self emits no
+# release, so it cannot exhibit the imbalance.)
+def mv_consume(s: MVStyle): Int
+  return s.fg + s.bg + s.attrs
+end
+
+extend MVStyle
+  def render(self): Int
+    return mv_consume(self)
+  end
+end
+
+# Nested field access (`h.styles.scrollbar`) — the exact tui_viewport shape: the
+# receiver is a field of a field, read out as the bare cow buffer pointer.
+struct MVInner
+  scrollbar: MVStyle
+end
+
+struct MVHolder
+  styles: MVInner
+  tag: Int
+end
+
+def mv_field_receiver_loop(): Void
+  # `h.styles.scrollbar.render()` — a >16B cow @value field-access read passed as a
+  # by-value receiver whose `self` forwards into mv_consume (droppable ⇒ released).
+  # Without the caller-side cow_rc_inc, the callee release drops the field's shared
+  # buffer to rc 0 and frees it ⇒ double-free (SIGABRT exit 134 under the default
+  # allocator). Looped so the corruption compounds.
+  var h = MVHolder { styles: MVInner { scrollbar: MVStyle { fg: 1, bg: 2, attrs: 3 } }, tag: 7 }
+  var total = 0
+  for _i in 0..64
+    total = total + h.styles.scrollbar.render()
+  end
+  # 6 (=1+2+3) * 64 = 384; the field's buffer must survive every iteration.
+  print(total.to_s())
+  print("\n")
+  print(h.styles.scrollbar.fg.to_s())
+  print("\n")
+end
+
+def main(): Int
+  describe("value eager-copy aliasing — ≤16B @value (item 22)") do ->
+    it("assignment copy is independent (b mutation does not alias a)") do ->
+      assert_output("1\n999\n", vc_assign_copy_no_alias)
+    end
+
+    it("by-value free call copies (callee mutation not seen by caller)") do ->
+      assert_output("5\n", vc_freecall_copy_no_alias)
+    end
+  end
+
+  describe("value mutating-self receiver (item 20 P1)") do ->
+    it("method-call mutation persists into the caller's receiver slot") do ->
+      assert_output("2\n", mv_persists_method_call)
+    end
+
+    it("free-call (UFCS) mutation persists across repeated calls") do ->
+      assert_output("2\n", mv_persists_free_call)
+    end
+
+    it("read-only @value method reads its receiver without disturbing it") do ->
+      assert_output("7\n3\n", mv_readonly_unaffected)
+    end
+
+    it("temporary receiver does not crash (mutation discarded)") do ->
+      assert_output("ok\n", mv_temporary_receiver_ok)
+    end
+  end
+
+  describe("value mutating-self receiver — COW >16B (item 20 P2 / item 21)") do ->
+    it("COW method mutation persists in place across repeated calls") do ->
+      assert_output("3\n", mvbig_persists_method_call)
+    end
+
+    it("read-only COW @value method leaves its receiver intact") do ->
+      assert_output("6\n1\n", mvbig_readonly_unaffected)
+    end
+
+    it("COW @value iterator advances its cursor in place (no loss/hang)") do ->
+      assert_output("10\n", mvbig_cow_iterator_advances)
+    end
+  end
+
+  describe("value COW field-access receiver retain — >16B @value (item 31b)") do ->
+    it("cow field-access read passed as by-value receiver does not double-free") do ->
+      assert_output("384\n1\n", mv_field_receiver_loop)
+    end
+  end
+
+  return qspec_main()
+end
